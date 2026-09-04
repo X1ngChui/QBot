@@ -1,0 +1,74 @@
+# Fixture config for the test suite.
+#
+# Deliberately separate from config/, which holds real deployment values: a test that
+# reads the live config starts failing the moment someone renames the bot or adds a group,
+# and that failure says nothing about the code. Values here are chosen to be convenient to
+# assert on, not to be realistic.
+
+owners: ["10000", "10001"]
+timezone: "Asia/Shanghai"
+
+gateway:
+  merge_window_sec: 2.5
+  dedup_ttl_sec: 300
+  max_msg_len: 2000
+
+trigger:
+  nicknames: ["小X", "小x", "X酱"]
+  max_replies_per_min: 4
+
+llm:
+  text:
+    backend: openai_compat
+    base_url: https://example.invalid/v1
+    api_key_env: TEXT_API_KEY
+    model: test-light
+    reads_images: true
+    max_concurrency: 3
+    timeout_sec: 30
+    retries: 2
+  vision:
+    backend: openai_compat
+    base_url: https://example.invalid/v1
+    api_key_env: MEDIA_API_KEY
+    model: test-vision
+    max_images_per_min: 6
+    max_image_mb: 8
+    timeout_sec: 30
+  asr:
+    backend: openai_compat
+    base_url: https://example.invalid/v1
+    api_key_env: MEDIA_API_KEY
+    model: test-asr
+    max_audio_sec: 300
+    timeout_sec: 60
+  embedding:
+    backend: dashscope
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key_env: MEDIA_API_KEY
+    model: text-embedding-v4
+    dimensions: 2048
+    timeout_sec: 60
+  search:
+    backend: tavily
+    base_url: https://api.tavily.com
+    api_key_env: SEARCH_API_KEY
+    count: 5
+    depth: basic
+    monthly_quota: 1000
+    timeout_sec: 20
+
+budget:
+  daily_cny_cap: 5.0
+
+
+memory:
+  consolidate: { reasoning_effort: low }
+
+schedule:
+  forget_cron:       "0 4 * * *"
+  backup_cron:      "30 4 * * *"
+  cache_clean_cron: "0 5 * * *"
+  report_cron:      "0 9 * * *"
+  backup_keep: 14
+  napcat_cache_days: 7

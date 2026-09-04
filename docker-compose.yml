@@ -1,0 +1,97 @@
+services:
+  postgres:
+    image: ${REGISTRY:-docker.io}/pgvector/pgvector:0.8.5-pg17
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "3" }
+    environment:
+      POSTGRES_DB: qqbot
+      POSTGRES_USER: qqbot
+      POSTGRES_PASSWORD: ${PG_PASSWORD:?set PG_PASSWORD in .env}
+      TZ: Asia/Shanghai
+    # SSD tuning (section 9); checkpoint_completion_target flattens write spikes
+    # so Postgres stays a light IO neighbour on a shared box.
+    command: >
+      postgres
+      -c shared_buffers=1GB
+      -c effective_cache_size=8GB
+      -c max_wal_size=2GB
+      -c checkpoint_completion_target=0.9
+      -c random_page_cost=1.1
+    volumes:
+      - ./data/pg:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    mem_limit: 4g
+    shm_size: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U qqbot -d qqbot"]
+      interval: 10s
+      retries: 5
+
+  napcat:
+    image: ${REGISTRY:-docker.io}/mlikiowa/napcat-docker:v4.18.13   # pinned, tag keeps the leading v
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "3" }
+    environment:
+      TZ: Asia/Shanghai
+      # Quick-login with the saved session. Without it every restart drops back to a QR
+      # scan, which would make `restart: unless-stopped` meaningless and turn any reboot
+      # into manual work - the opposite of section 7.4's "routine ops = zero".
+      # Set NAPCAT_ACCOUNT in .env after the first scan.
+      ACCOUNT: ${NAPCAT_ACCOUNT:-}
+    volumes:
+      - ./data/napcat/config:/app/napcat/config
+      - ./data/napcat/qq:/app/.config/QQ
+    ports:
+      - "127.0.0.1:6099:6099"          # WebUI bound to loopback only; reach it over an SSH tunnel
+    mem_limit: 2g
+
+  bot:
+    build:
+      context: .
+      # Build-time only (section 7.3). Set BUILD_PROXY in .env when the build host cannot
+      # reach deb.debian.org / pypi directly - a container gets no
+      # IPv6 on the default bridge, so a host that only has IPv6 egress to a mirror will
+      # build fine by hand and fail inside docker. Runtime never sees these: the
+      # environment block below sets no proxy, and the API path stays direct.
+      args:
+        HTTP_PROXY: ${BUILD_PROXY:-}
+        HTTPS_PROXY: ${BUILD_PROXY:-}
+        NO_PROXY: ${BUILD_NO_PROXY:-localhost,127.0.0.1}
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "3" }
+    depends_on:
+      postgres: { condition: service_healthy }
+      napcat:   { condition: service_started }
+    environment:
+      - DATABASE_URL=postgresql://qqbot@postgres:5432/qqbot
+      - DATABASE_PASSWORD=${PG_PASSWORD:?set PG_PASSWORD in .env}
+      - TZ=Asia/Shanghai
+      - CONFIG_DIR=/app/config
+      - NAPCAT_DATA_DIR=/app/napcat_data
+      - BACKUP_DIR=/app/backups
+      - HOST=0.0.0.0
+      - PORT=8080
+      # Credentials come from .env, named after the capability they serve, never after
+      # a platform: which platform answers is decided in config/settings.yaml. The
+      # :?-form makes a missing entry fail the `up`, not the first API call hours in.
+      - TEXT_API_KEY=${TEXT_API_KEY:?set TEXT_API_KEY in .env}
+      - MEDIA_API_KEY=${MEDIA_API_KEY:?set MEDIA_API_KEY in .env}
+      - SEARCH_API_KEY=${SEARCH_API_KEY:?set SEARCH_API_KEY in .env}
+      # :- not :? on purpose - moderation is optional at the compose level, so a
+      # deployment with moderation.backend unset still comes up. When settings.yaml
+      # does name a backend, empty credentials fail the boot instead.
+      - MODERATION_SECRET_ID=${MODERATION_SECRET_ID:-}
+      - MODERATION_SECRET_KEY=${MODERATION_SECRET_KEY:-}
+    volumes:
+      - ./config:/app/config:ro
+      - ./logs:/app/logs
+      - ./backups:/app/backups                  # point this at a NAS mount for off-box backups
+      - ./data/napcat/qq:/app/napcat_data       # only used by the daily media cache cleanup (7.4)
+    mem_limit: 4g
+

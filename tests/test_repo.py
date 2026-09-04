@@ -1,0 +1,347 @@
+"""What db/repo.py still owns, against a real postgres.
+
+Everything about people moved to the repositories package and is covered by
+test_repositories.py. What is left here is the group-level plumbing: the L0 archive, the
+image cache, the group switches and the cost ledger.
+
+Raw events are written through the Ingestor rather than by an INSERT here, because that
+is now the only way they are written in production - a test with its own INSERT would
+keep passing after the real path broke.
+"""
+import os
+import pathlib
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+os.environ.setdefault("CONFIG_DIR", str(ROOT / "tests" / "fixtures" / "config"))
+os.environ.setdefault("PROMPTS_DIR", str(ROOT / "config" / "prompts"))
+os.environ.setdefault("DATABASE_URL", "postgresql://qqbot@127.0.0.1:15432/qqbot")
+os.environ.setdefault("DATABASE_PASSWORD", "testpw")
+import asyncio
+import itertools
+
+
+from qqbot.db import init_pool, close_pool, pool
+from qqbot.db import repo
+from qqbot.gateway.ingest import ingestor
+from qqbot.gateway.onebot import GroupMessage, Sender
+from qqbot.util import now_local, today_local
+from _db import reset
+
+fails = []
+G1 = 7001
+G2 = 7002
+_SEQ = itertools.count(1)
+
+
+def check(name, cond, detail=""):
+    print(f"[{'ok ' if cond else 'FAIL'}] {name}  {detail}")
+    if not cond:
+        fails.append(name)
+
+
+async def say(group, uid, name, text, *, msg_id=None, at=None):
+    """One message through the real inbound path."""
+    mid = msg_id or f"auto{next(_SEQ)}"
+    await ingestor().ingest(
+        GroupMessage(
+            message_id=mid, group_id=group,
+            sender=Sender(user_id=uid, card=name), segments=[],
+            self_id="999", occurred_at=at or now_local(), plain_text=text,
+        )
+    )
+    return mid
+
+
+async def main():
+    await init_pool()
+    await reset()
+
+    # -- raw events ---------------------------------------------------------
+    await say(G1, "u1", "阿强", "hi", msg_id="m1")
+    await say(G1, "u1", "阿强", "dup", msg_id="m1")   # a replay after a reconnect
+    n = await pool().fetchval(
+        "SELECT count(*) FROM raw_event WHERE platform_event_id='m1'")
+    check("a replayed message id does not land twice", n == 1, f"{n} rows")
+
+    await repo.backfill_plain_text("m1", "hi [图片:一只猫]")
+    got = await pool().fetchval(
+        "SELECT plain_text FROM raw_event WHERE platform_event_id='m1'")
+    check("backfill_plain_text rewrites the reading", got == "hi [图片:一只猫]", str(got))
+    segs = await pool().fetchval(
+        "SELECT payload->'segments' FROM raw_event WHERE platform_event_id='m1'")
+    check("and leaves the original segments in place", segs is not None, str(segs))
+
+    # -- image cache --------------------------------------------------------
+    check("image_cache miss", await repo.image_cache_get("k1") is None)
+    await repo.image_cache_put("k1", "[表情:开心]")
+    check("image_cache hit", await repo.image_cache_get("k1") == "[表情:开心]")
+    await repo.image_cache_get("k1")
+    hits = await pool().fetchval("SELECT hit_count FROM image_cache WHERE key='k1'")
+    check("image_cache counts hits", hits == 2, str(hits))
+    stats = await repo.image_cache_stats()
+    check("image_cache_stats", stats["n"] == 1 and stats["hits"] == 2, str(dict(stats)))
+
+    # The upload half can land before the describing half, and neither may clobber the
+    # other: a row with only a file_id reads as an undescribed picture, and the later
+    # description fills the same row in.
+    await repo.image_cache_set_file("k2", "file-api-abc")
+    check("a file_id alone is not a description hit",
+          await repo.image_cache_get("k2") is None)
+    await repo.image_cache_put("k2", "[图片:占位测试]")
+    check("the description fills the same row",
+          await repo.image_cache_get("k2") == "[图片:占位测试]")
+    check("and the file_id survives it",
+          await repo.image_cache_file("k2") == "file-api-abc")
+    check("a picture never uploaded has no file_id",
+          await repo.image_cache_file("k1") is None)
+
+    # -- group_state and the blocklist --------------------------------------
+    # Typed columns and a proper relation. The blocklist was an array column for a day,
+    # which first normal form has opinions about: a group blocking people is one-to-many,
+    # so it is a table with a two-column key, and membership is a WHERE clause.
+    check("a group with no rows reads as all-off",
+          await repo.group_switches(G1) == (False, {}))
+    await repo.set_group_muted(G1, True)
+    await repo.block(G1, "u9")
+    await repo.block(G1, "u8")
+    await repo.block(G1, "u9")   # blocking twice is once
+    check("switches round-trip",
+          await repo.group_switches(G1) == (True, {"u8": None, "u9": None}))
+    check("unblocking reports whether anything changed",
+          await repo.unblock(G1, "u9") and not await repo.unblock(G1, "u9"))
+    await repo.set_group_muted(G1, False)
+    await repo.unblock(G1, "u8")
+    check("and can be cleared", await repo.group_switches(G1) == (False, {}))
+    await repo.set_group_muted(G2, True)
+    check("groups_with_state lists every group that has a row",
+          {G1, G2} <= set(await repo.groups_with_state()))
+    # From the table, not the in-memory registry: the daily report must list a
+    # group muted before the last restart and quiet ever since.
+    check("muted_groups reads the persisted flag",
+          await repo.muted_groups() == [G2])
+
+    # -- the extraction watermark -------------------------------------------
+    # The watermark records what an extraction has *read*. Queueing a pass must not move
+    # it: the worker reads this to decide whether a model call is justified at all, and a
+    # mark set at queue time would tell it its own batch had already been handled.
+    from datetime import timedelta as _td
+    from qqbot.repositories import JobQueue as _JQ
+    from qqbot.repositories.job import JobType as _JT
+
+    G3 = 7003
+    n0, _ = await repo.unread_since_extract(G3)
+    check("a group nobody has read has nothing unread", n0 == 0, str(n0))
+    for i in range(4):
+        await say(G3, "u1", "阿强", f"第 {i} 句")
+    n1, newest = await repo.unread_since_extract(G3)
+    check("messages arrive unread", n1 == 4 and newest is not None, str(n1))
+
+    await _JQ("t").submit(_JT.EXTRACT_MEMORY, {"group_id": G3}, priority=1)
+    n2, _ = await repo.unread_since_extract(G3)
+    check("queueing a pass reads nothing, so the count does not move", n2 == 4, str(n2))
+
+    await repo.mark_extracted(G3, newest)
+    n3, _ = await repo.unread_since_extract(G3)
+    check("marking what was read is what clears them", n3 == 0, str(n3))
+
+    # A watermark never goes backwards: two passes can overlap, and the one that finishes
+    # later must not reopen what the other already read.
+    await repo.mark_extracted(G3, newest - _td(hours=1))
+    n4, _ = await repo.unread_since_extract(G3)
+    check("and it never moves backwards", n4 == 0, str(n4))
+
+    # ...except for the one sanctioned reset: /relearn means "read it again", and the
+    # gate answering "nothing new" to that request would be the gate malfunctioning.
+    # The reset pulls back exactly one window and no further - extraction drains
+    # oldest-first from the watermark now, and a bare NULL would send the next
+    # drain through the entire archive at model prices.
+    from qqbot.settings import EXTRACT_WINDOW as _EW
+    await repo.reset_extract_watermark(G3, keep=_EW)
+    n5, _ = await repo.unread_since_extract(G3)
+    check("a reset makes the window count as unread again", n5 == 4, str(n5))
+    await repo.mark_extracted(G3, newest)
+
+    # -- cost ledger --------------------------------------------------------
+    day = today_local()
+    await repo.ledger_add(group_id=str(G1), kind="reply", model="deepseek-v4-flash",
+                          in_hit=1000, in_miss=200, out=80, cny=0.00036)
+    await repo.ledger_add(group_id=str(G1), kind="extract", model="deepseek-v4-flash",
+                          in_hit=800, in_miss=10, out=8, cny=0.000042)
+    await repo.ledger_add(group_id=None, kind="search", model="search_std", cny=0.01)
+    total = await repo.day_cost(day)
+    check("day_cost sums", abs(total - 0.010402) < 1e-6, f"{total:.6f}")
+    bd = await repo.day_breakdown(day)
+    check("day_breakdown groups", len(bd) == 3 and bd[0]["kind"] == "search",
+          str([r["kind"] for r in bd]))
+    # Without a group id the ledger covers every group, which is what the shared cap is
+    # measured against - the budget is not per-group.
+    one = await repo.day_breakdown(day, str(G1))
+    check("a per-group breakdown leaves out the shared rows",
+          {r["kind"] for r in one} == {"reply", "extract"}, str([r["kind"] for r in one]))
+
+    # -- the search allowance, metered off the ledger ------------------------
+    # The search backend is free within a monthly credit allowance, and the ledger's
+    # call count is the meter itself: no separate counter to drift, and a refusal at
+    # the allowance that never reaches the vendor.
+    import os as _os
+    import httpx as _hx
+    from qqbot.providers.tavily import TavilySearch
+    from qqbot.providers.base import QuotaExhausted
+    from qqbot.settings import config as _config
+
+    _os.environ.setdefault("SEARCH_API_KEY", "tvly-test-key")
+    scfg = _config().default.llm.search.model_copy(deep=True)
+    seen_reqs = []
+
+    def _fake_tavily(req):
+        seen_reqs.append(req)
+        if req.url.path == "/extract":
+            return _hx.Response(200, json={"results": [
+                {"url": "https://a.example/page", "raw_content": "  正文   开头  "}]})
+        return _hx.Response(200, json={"results": [
+            {"title": "t1", "url": "https://a.example/1", "content": "  spaced   out  "},
+            {"title": "t2", "url": "https://a.example/2", "content": "two"},
+        ]})
+
+    ts = TavilySearch()
+    ts._client = _hx.AsyncClient(transport=_hx.MockTransport(_fake_tavily))
+    ts._proxy = scfg.proxy
+
+    spent_before = await repo.day_cost(day)
+    items = await ts.search("天气 上海", cfg=scfg, group_id=str(G1))
+    req = seen_reqs[0]
+    check("the request carries the key and the query",
+          req.headers.get("authorization", "").startswith("Bearer tvly-")
+          and b"search_depth" in req.content and req.url.path == "/search")
+    check("results are normalised to title/link/content",
+          items[0] == {"title": "t1", "link": "https://a.example/1",
+                       "content": "spaced out"}, str(items[:1]))
+    check("a free call books a row but no money",
+          await repo.month_calls("search", "tavily") == 1
+          and abs(await repo.day_cost(day) - spent_before) < 1e-9)
+    check("rows of another backend do not eat the allowance",
+          await repo.month_calls("search", "search_std") >= 1)
+
+    scfg.monthly_quota = 1
+    try:
+        await ts.search("再来一次", cfg=scfg, group_id=str(G1))
+        check("at the allowance the backend refuses", False, "it searched")
+    except QuotaExhausted:
+        check("at the allowance the backend refuses", True)
+    check("and the refusal never reached the vendor", len(seen_reqs) == 1)
+
+    # Advanced depth debits two vendor credits per call, and the meter counts what
+    # the vendor counts - metered by calls, the real 1000 would be gone at ~500
+    # while the meter read half-full, and every search past that would fail as a
+    # transport error instead of the clean quota silence.
+    scfg.monthly_quota = 100
+    scfg.depth = "advanced"
+    await ts.search("深度搜一次", cfg=scfg, group_id=str(G1))
+    check("an advanced search books two credits",
+          await repo.month_calls("search", "tavily") == 3,
+          str(await repo.month_calls("search", "tavily")))
+
+    # Page extraction rides the same allowance: same key, same proxy, same meter,
+    # same refusal at the ceiling.
+    text = await ts.extract("https://a.example/page", cfg=scfg, group_id=str(G1))
+    check("extract returns the page text normalised", text == "正文 开头", repr(text))
+    check("and debits the shared allowance",
+          await repo.month_calls("search", "tavily") == 4,
+          str(await repo.month_calls("search", "tavily")))
+    scfg.monthly_quota = 4
+    try:
+        await ts.extract("https://a.example/page", cfg=scfg, group_id=str(G1))
+        check("extract refuses at the allowance", False, "it extracted")
+    except QuotaExhausted:
+        check("extract refuses at the allowance", True)
+    await ts.aclose()
+
+    # -- a timed-out attempt still books its spend ---------------------------
+    # Usage travels in the stream's final chunk, which a timeout never reads; the
+    # vendor billed the prompt and everything generated up to the cut all the same.
+    # This was the one spending path that systematically understated, in a design
+    # whose every other guess deliberately leans high.
+    from qqbot.providers.openai_compat import OpenAICompatChat
+
+    class TimingOut(OpenAICompatChat):
+        async def _stream_once(self, *a, **kw):
+            raise asyncio.TimeoutError
+
+    tcfg = _config().default.llm.text.model_copy(deep=True)
+    tcfg.retries = 0
+    before_to = await repo.day_cost(day)
+    try:
+        await TimingOut().chat([{"role": "user", "content": "你好"}],
+                               cfg=tcfg, max_tokens=100, kind="reply",
+                               group_id=str(G1))
+        check("a timed-out chat still raises", False, "it returned")
+    except asyncio.TimeoutError:
+        check("a timed-out chat still raises", True)
+    after_to = await repo.day_cost(day)
+    check("and its estimated spend reaches the ledger", after_to > before_to,
+          f"{before_to:.6f} -> {after_to:.6f}")
+
+    # -- the window rebuilt from the archive --------------------------------
+    # A deque that starts empty on deploy has the bot rejoin conversations it was
+    # part of thirty seconds earlier knowing nothing - while the archive holds
+    # every message, its own replies included. So the window comes back from the
+    # archive.
+    from qqbot.core.state import GroupState
+    from qqbot.gateway.ingest import ingestor as _ing
+
+    await say(G1, "u1", "阿强", "昨天的图在这 https://x.example/cat.jpg")
+    await say(G1, "u2", "阿花", "收到了")
+    await _ing().record_own_reply(group_id=G1, self_id="999", message_id="bot-r1",
+                                  text="我也看看", at=now_local(), name="小X")
+
+    rows = await repo.recent_messages(G1, limit=50)
+    _stamps = [r["occurred_at"] for r in rows]
+    check("recent_messages returns oldest first", _stamps == sorted(_stamps), "")
+    check("and only this group's",
+          not any(r for r in await repo.recent_messages(G2, limit=50)
+                  if "阿强" in str(r["payload"])), "")
+
+    st = GroupState(group_id=str(G1))
+    await st.load_history(self_id="999", owners={"u1"})
+    texts = [m.text for m in st.recent]
+    check("the window is rebuilt from the archive",
+          "收到了" in texts and any("cat.jpg" in t for t in texts), str(texts[-4:]))
+    by_text = {m.text: m for m in st.recent}
+    check("the bot's own replies come back marked as its own",
+          by_text["我也看看"].is_bot and by_text["我也看看"].nickname == "小X")
+    check("and an owner comes back marked as an owner",
+          by_text["收到了"].is_owner is False
+          and any(m.is_owner for m in st.recent if m.user_id == "u1"))
+    n_before = len(st.recent)
+    await st.load_history(self_id="999", owners=set())
+    check("loading twice does not double the window", len(st.recent) == n_before)
+
+    # -- the archive, searched ----------------------------------------------
+    # The pull half of context: the prompt pushes a fixed window, and everything behind
+    # it was unreachable - a link posted yesterday might as well not have existed.
+    from qqbot.core.tools import search_history
+    hit = await search_history(G1, "cat.jpg")
+    check("the archive answers a keyword", "https://x.example/cat.jpg" in hit, hit)
+    check("with when and who", "阿强" in hit and "]" in hit, hit)
+    check("all keywords must hit, not any",
+          "没有搜到" in await search_history(G1, "阿强 不存在的词"))
+    check("another group's archive is out of reach",
+          "没有搜到" in await search_history(G2, "cat.jpg"))
+    check("LIKE pattern characters are literal, not wildcards",
+          "没有搜到" in await search_history(G1, "%"),
+          "a bare % must not match everything")
+    check("an empty query is refused", "关键词为空" in await search_history(G1, "  "))
+
+    # -- schema self-check ---------------------------------------------------
+    await repo.ensure_schema()
+    check("ensure_schema passes on a live schema", True)
+
+    await close_pool()
+    print()
+    print("FAILED:", fails if fails else "none")
+    return 1 if fails else 0
+
+
+sys.exit(asyncio.run(main()))

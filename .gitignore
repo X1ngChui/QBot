@@ -1,0 +1,25 @@
+# Runtime data (Postgres / NapCat / model weights)
+data/
+logs/
+backups/
+
+# Secrets: only commit .example files
+
+# Local configuration: real owners and real group personas are not committed;
+# only .example files are committed.
+# (deploy.sh packages workspace files, so untracked local configuration will
+# still be included in deployments as usual)
+config/settings.yaml
+config/personas/*.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Local environment overrides
+.env

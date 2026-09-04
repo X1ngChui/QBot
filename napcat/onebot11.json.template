@@ -1,0 +1,30 @@
+{
+  "_comment": [
+    "NapCat OneBot v11 config template.",
+    "Copy to data/napcat/config/onebot11_<your QQ number>.json AFTER the first login,",
+    "or edit the file NapCat generates there. Restart the napcat container to apply.",
+    "The reverse WebSocket host is the compose service name, reachable on the bot network."
+  ],
+  "network": {
+    "httpServers": [],
+    "httpSseServers": [],
+    "httpClients": [],
+    "websocketServers": [],
+    "websocketClients": [
+      {
+        "enable": true,
+        "name": "qqbot",
+        "url": "ws://bot:8080/onebot/v11/ws",
+        "reportSelfMessage": false,
+        "messagePostFormat": "array",
+        "token": "",
+        "debug": false,
+        "heartInterval": 30000,
+        "reconnectInterval": 5000
+      }
+    ]
+  },
+  "musicSignUrl": "",
+  "enableLocalFile2Url": false,
+  "parseMultMsg": true
+}

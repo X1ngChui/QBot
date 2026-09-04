@@ -1,0 +1,13 @@
+# The server-side build context is the whole deploy directory, which also holds the
+# database files, the napcat media cache, logs and backups. BuildKit only transfers
+# COPYd paths, but that is builder behaviour, not a guarantee: under the classic
+# builder the context is tarred whole - gigabytes per deploy, and root-owned data/pg
+# fails the build outright on permissions.
+data/
+logs/
+backups/
+.git/
+.env
+secrets/
+__pycache__/
+*.pyc

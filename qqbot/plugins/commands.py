@@ -1,0 +1,795 @@
+"""The ops commands: the owner's console.
+
+Human intervention is meant to be one thing only: read the daily report, change what is
+wrong. These commands exist to make that loop short.
+
+Every one of them is the owner's. A member who wants to know what the bot remembers about
+them asks the bot, and one who wants to correct it says so - the roster is already in the
+prompt, and the next extraction pass reads a self-correction as evidence. That is why
+there is no member-facing command set: it would be a second interface to the same two
+things.
+
+Almost nothing is decided here. Whether a person may run a command is decided in
+core.perms, what each command is is declared in core.command_catalog, and what it does to
+memory is done by services.Directory. What is left is parsing an argument and formatting
+an answer - because this module cannot be imported without a live NoneBot runtime
+(on_command runs at import time) and therefore cannot be tested, anything worth testing
+is deliberately somewhere else.
+
+One rule runs through all of it: a person is named by @ and no other way. A typed name is
+a guess at an account - two members can display one nickname, a nickname changes, and a
+name that matched yesterday quietly matches somebody else today. An @ segment carries the
+account id outright.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from datetime import datetime
+from pathlib import Path
+
+from nonebot import on_command
+from nonebot.adapters.onebot.v11 import GroupMessageEvent
+from nonebot.matcher import Matcher
+
+from ..core import censor, command_catalog, debug, errors, perms
+from ..core.budget import BUDGET, hit_split
+from ..core.nickname import register as register_nicknames
+from ..core.retrieval import directory
+from ..core.state import REGISTRY
+from ..db import repo
+from ..providers import Kind, providers
+from ..services import NameTaken, PersonCard, UnknownAccount
+from ..providers.moderation import build as build_moderation
+from ..settings import config, reload_config
+from ..util import fmt_when, now_local, parse_duration, today_local, why
+
+log = logging.getLogger("qqbot.cmd")
+
+#: Command output has to survive the same send-side truncation as a reply, and a silently
+#: cut-off answer is worse than an explicitly shortened one.
+OUT_MARGIN = 200
+LOG_LINES_DEFAULT = 15
+LOG_LINES_MAX = 60
+#: Enough tail to hold LOG_LINES_MAX lines of any plausible length.
+LOG_TAIL_BYTES = 64 * 1024
+#: How many people one /who all lists in full before it is trimmed to fit.
+ROSTER_MAX = 60
+
+#: Prefix that marks an argument as a removal rather than an addition.
+DROP = "-"
+
+
+def _fit(text: str, *, head: bool = True, gid: str | None = None) -> str:
+    """Trim to what a single QQ message can carry, saying so rather than just stopping.
+
+    `gid` selects the group's own max_msg_len; without it the global default applies.
+    Sizing by the wrong group's limit re-creates the silent send-side truncation this
+    function exists to prevent.
+    """
+    cfg = config().for_group(gid)[0] if gid else config().default
+    limit = cfg.gateway.max_msg_len - OUT_MARGIN
+    if len(text) <= limit:
+        return text
+    kept = text[:limit] if head else text[-limit:]
+    return (kept + "\n…（已截断）") if head else ("…（已截断）\n" + kept)
+
+
+async def _gate(matcher: Matcher, event: GroupMessageEvent,
+                *, global_only: bool = False) -> None:
+    """Stop here unless the speaker owns this bot.
+
+    Silence rather than a refusal, and deliberately: to anyone who is not the owner these
+    commands do not exist, and answering "you are not allowed" is how they find out that
+    they do.
+
+    Reads the *group's* owner list: a per-group config may override it, and the gateway
+    reads it the same way - taking them from two places would let an override move who
+    the bot addresses as owner without moving who may command it.
+
+    `global_only` restricts to the default (all-group) owner list. It is for the
+    commands whose blast radius is every group at once - /merge and /split rewrite
+    the platform-global identity graph, /reload swaps every group's config, /debug
+    captures every group's model rounds, /log reads the global log - so an owner a
+    single group's override added must not hold any of them.
+
+    event.sender.role is deliberately not consulted. Running the QQ group is not running
+    the bot.
+    """
+    owners = (config().default.owners if global_only
+              else config().for_group(str(event.group_id))[0].owners)
+    if not perms.is_owner(str(event.user_id), owners):
+        await matcher.finish()
+
+
+reload_cmd = on_command("reload", block=True, priority=1)
+mute_cmd = on_command("mute", block=True, priority=1)
+block_cmd = on_command("block", block=True, priority=1)
+unblock_cmd = on_command("unblock", block=True, priority=1)
+unmute_cmd = on_command("unmute", block=True, priority=1)
+stats_cmd = on_command("stats", block=True, priority=1)
+groupstats_cmd = on_command("groupstats", block=True, priority=1)
+top_cmd = on_command("top", block=True, priority=1)
+card_cmd = on_command("card", block=True, priority=1)
+who_cmd = on_command("who", block=True, priority=1)
+# Registered in their own right rather than left to fall through: NoneBot matches the
+# longest registered prefix, so an unregistered name that contains a registered one
+# arrives as the shorter command carrying the rest as its argument. /relearn against
+# /reload is the live case.
+note_cmd = on_command("note", block=True, priority=1)
+alias_cmd = on_command("alias", block=True, priority=1)
+forget_cmd = on_command("forget", block=True, priority=1)
+merge_cmd = on_command("merge", block=True, priority=1)
+split_cmd = on_command("split", block=True, priority=1)
+relearn_cmd = on_command("relearn", block=True, priority=1)
+log_cmd = on_command("log", block=True, priority=1)
+debug_cmd = on_command("debug", block=True, priority=1)
+help_cmd = on_command("help", block=True, priority=1)
+
+
+# -- argument parsing -------------------------------------------------------
+
+
+def _strip_cmd(text: str, name: str) -> str:
+    text = text.strip()
+    for cmd in (f"/{name}", name):
+        if text.startswith(cmd):
+            return text[len(cmd):].strip()
+    return text
+
+
+def _mentioned(event: GroupMessageEvent) -> list[str]:
+    """Accounts @-ed in this command, in order.
+
+    An @ segment carries the account id outright, so it names somebody exactly - no
+    matching, no ambiguity when two people display the same name, and it works for a
+    nickname nobody can type. get_plaintext() drops these, so they have to be read off
+    the raw message.
+    """
+    return [
+        str(seg.data.get("qq"))
+        for seg in event.message
+        if seg.type == "at" and str(seg.data.get("qq", "")).isdigit()
+    ]
+
+
+# -- rendering --------------------------------------------------------------
+
+
+def _one_line(card: PersonCard) -> str:
+    """One person on one line, for the whole-group listing."""
+    bits = f"{card.display}（{card.messages} 条）"
+    tags = []
+    if card.merged:
+        tags.append(f"{len(card.accounts)} 个账号")
+    if others := card.other_names:
+        tags.append("称呼 " + "、".join(others[:3]))
+    if tags:
+        bits += "｜" + "；".join(tags)
+    summary = card.summary
+    if summary:
+        bits += "｜" + (summary[:24] + "…" if len(summary) > 24 else summary)
+    return bits
+
+
+def _one_person(card: PersonCard) -> str:
+    """One person in full, with the numbers /forget takes and what each entry rests on."""
+    lines = [f"{card.display}（{card.messages} 条发言）"]
+    if card.merged:
+        lines.append(f"  账号：{len(card.accounts)} 个已合并")
+    if named := [n for n in card.names if n.text != card.display]:
+        lines.append("  称呼：" + "、".join(
+            f"{n.text}（{n.confidence:.2f}）" for n in named))
+    if card.candidates:
+        lines.append("  未确认：" + "、".join(
+            f"{n.text}（{n.confidence:.2f}）" for n in card.candidates))
+    if not card.facts:
+        lines.append("  记录：（暂无）")
+        return "\n".join(lines)
+
+    lines.append("  记录：")
+    for f in card.facts:
+        if not f.text:
+            continue
+        tail = "（人工）" if f.manual else f"（{f.confidence:.2f}）"
+        lines.append(f"　{f.index}. {f.text}{tail}")
+    return "\n".join(lines)
+
+
+async def _card_of(matcher: Matcher, group_id: int, user_id: str) -> PersonCard:
+    """The person behind an @, or a refusal saying which of the two things went wrong."""
+    try:
+        return await directory().person(group_id, user_id)
+    except UnknownAccount:
+        await matcher.finish("本群还没有这个账号的记录。多聊几句就有了。")
+
+
+# -- configuration ----------------------------------------------------------
+
+
+@reload_cmd.handle()
+async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
+    # global_only: the reload lands on every group at once, so an owner a single
+    # group's override added must not hold the trigger. Same for /debug and /log -
+    # the tap captures every group's model rounds and the log tail is global.
+    await _gate(matcher, event, global_only=True)
+    try:
+        bundle = reload_config()
+    except Exception as e:
+        log.warning("config reload rejected: %s", why(e))
+        # A multi-error validation dump can outgrow a QQ message; oversize is
+        # refused whole, and the one command that reports what broke must not
+        # answer with silence.
+        await matcher.finish(_fit(f"配置未通过校验，本次重载未生效：{e}",
+                                  gid=str(event.group_id)))
+        return
+    for gid in list(bundle.personas):
+        cfg, _ = bundle.for_group(gid)
+        register_nicknames(cfg.trigger.nicknames)
+    register_nicknames(bundle.default.trigger.nicknames)
+    # The exit guard's judge is config too: rebuild it so region/policy edits
+    # land without a restart. Guarded on its own: the config swap above already
+    # happened, so a rebuild that dies (missing credentials, say) must be said
+    # out loud here - the old judge stays armed, and silence would leave the
+    # mismatch to detonate as a boot failure at the next restart.
+    try:
+        censor.set_moderation(build_moderation(bundle.default))
+    except Exception as e:
+        log.error("moderation judge rebuild failed after reload: %s", why(e))
+        await matcher.finish(_fit(
+            f"配置已重载：{len(bundle.personas)} 份人设。但内容审核后端重建失败，"
+            f"出口守卫维持重载前的状态：{e}", gid=str(event.group_id)))
+
+    # The contract's edge - cron and timezone edits are accepted here but only take
+    # effect at the next restart - is documented in /help reload, not repeated in
+    # every acknowledgement.
+    await matcher.finish(f"配置已重载：{len(bundle.personas)} 份人设。")
+
+
+@block_cmd.handle()
+async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
+    """Ignore an account in this group entirely.
+
+    Stronger than not replying, and deliberately: a member who wants to pollute the bot's
+    memory does not need to be answered to manage it - being read is enough. Blocked
+    means unread: no reply, no archive, no memory.
+    """
+    await _gate(matcher, event)
+    gid = str(event.group_id)
+    cfg, _ = config().for_group(gid)
+    st = await REGISTRY.get(gid)
+    at = _mentioned(event)
+    if not at:
+        # Filtered at display time: a lapsed timed entry waits for its account's
+        # next message to be swept, and a listing must not show it as blocked.
+        live = {u: t for u, t in st.blocked.items()
+                if t is None or t > now_local()}
+        if not live:
+            await matcher.finish("本群没有屏蔽任何人。用法：/block @某人")
+        shown = "、".join(
+            uid + (f"（至 {fmt_when(t)}）" if t else "")
+            for uid, t in sorted(live.items()))
+        await matcher.finish(_fit(f"本群已屏蔽 {shown}（共 {len(live)} 个账号）",
+                                  gid=gid))
+    target = at[0]
+    arg = _strip_cmd(event.get_plaintext(), "block").strip()
+    until = None
+    if arg:
+        span = parse_duration(arg)
+        if span is None:
+            await matcher.finish("时长看不懂。示例：/block @某人 3d（m 分钟、h 小时、d 天）")
+        until = now_local() + span
+    if perms.is_owner(target, cfg.owners):
+        await matcher.finish("不能屏蔽拥有者。")
+    if str(event.self_id) == target:
+        await matcher.finish("这是我自己。")
+    # A merge made several accounts one person, and blocking the account that was
+    # @-ed while the alt keeps talking is not blocking anybody.
+    accounts = await directory().accounts_of_person(target)
+    if any(perms.is_owner(a, cfg.owners) for a in accounts):
+        await matcher.finish("不能屏蔽拥有者。")
+    st.blocked.update({a: until for a in accounts})
+    await repo.block(int(gid), accounts, until=until)
+    log.info("group %s: person %s blocked by owner (%d account(s)%s)",
+             gid, target, len(accounts),
+             f", until {until:%m-%d %H:%M}" if until else "")
+    extra = f"（同一人的 {len(accounts)} 个账号）" if len(accounts) > 1 else ""
+    lapse = f"，{fmt_when(until)} 自动解除" if until else ""
+    await matcher.finish(f"已屏蔽 {target}{extra}{lapse}。")
+
+
+@unblock_cmd.handle()
+async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
+    await _gate(matcher, event)
+    gid = str(event.group_id)
+    st = await REGISTRY.get(gid)
+    at = _mentioned(event)
+    if not at:
+        await matcher.finish("要解除谁？用法：/unblock @某人")
+    target = at[0]
+    accounts = await directory().accounts_of_person(target)
+    if not any(a in st.blocked for a in accounts):
+        await matcher.finish(f"{target} 不在本群的屏蔽名单里。")
+    # Lifted for the whole person, like it was applied: leaving one account of a
+    # merged pair blocked would look like the command silently failed.
+    for a in accounts:
+        st.blocked.pop(a, None)
+    await repo.unblock(int(gid), accounts)
+    log.info("group %s: person %s unblocked by owner (%d account(s))",
+             gid, target, len(accounts))
+    extra = f"（同一人的 {len(accounts)} 个账号）" if len(accounts) > 1 else ""
+    await matcher.finish(f"已解除对 {target}{extra} 的屏蔽。")
+
+
+@mute_cmd.handle()
+async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
+    await _gate(matcher, event)
+    st = await REGISTRY.get(str(event.group_id))
+    st.muted = True
+    await st.persist()
+    await matcher.finish("已静音。")
+
+
+@unmute_cmd.handle()
+async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
+    await _gate(matcher, event)
+    st = await REGISTRY.get(str(event.group_id))
+    st.muted = False
+    await st.persist()
+    await matcher.finish("已解除静音。")
+
+
+# -- usage ------------------------------------------------------------------
+
+
+def _calls(rows: list[dict], kind: str) -> int:
+    return sum(int(r["calls"]) for r in rows if r["kind"] == kind)
+
+
+@stats_cmd.handle()
+async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
+    """Everything the groups share: one budget, one search quota, one cache.
+
+    Deliberately carries no per-group number - a global call count reads as this group's
+    the moment it sits next to a per-group cap, so those live in /groupstats instead.
+    """
+    await _gate(matcher, event)
+    day = today_local()
+    cfg = config().default
+
+    rows = await repo.day_breakdown(day)
+    spent = await BUDGET.spent_today()
+    # The month is the search allowance's period, so the day count alone reads as
+    # "plenty left" right up until the refusal. Metered per backend name, the same way
+    # the backend meters itself.
+    month_search = await repo.month_calls(Kind.SEARCH, providers().search.name)
+
+    # Extraction is one nightly drain now, so a daytime call count reads zero and
+    # says nothing. What an owner can act on is the backlog waiting for tonight -
+    # the number that climbs when the group outruns the drain, or when the worker
+    # is stuck (the daily report watches the queue side of that).
+    backlog = 0
+    for g in await repo.groups_with_state():
+        n, _newest = await repo.unread_since_extract(int(g))
+        backlog += n
+    lines = [
+        "全局用量（所有群合计）",
+        f"预算　　¥{spent:.3f} / ¥{cfg.budget.daily_cny_cap:.2f}",
+        f"回复　　{_calls(rows, Kind.REPLY)} 次",
+        f"搜索　　今日 {_calls(rows, Kind.SEARCH)} 次　本月 "
+        f"{month_search}/{cfg.llm.search.monthly_quota}",
+        f"记忆　　待归纳 {backlog} 条",
+        f"媒体　　识图 {_calls(rows, Kind.VISION)} 次　转写 {_calls(rows, Kind.ASR)} 次",
+    ]
+    if cache := hit_split(rows):
+        lines.append(f"缓存　　命中率 {cache}")
+    if caught := sum(censor.SUPPRESSED.values()):
+        lines.append(f"拦截　　{caught} 次（重启以来）")
+    if errors.count():
+        lines.append(f"异常　　{errors.count()} 条，详见每日报告")
+    await matcher.finish("\n".join(lines))
+
+
+@top_cmd.handle()
+async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
+    """This month's costliest people in this group, merged accounts counted as one.
+
+    Person-level by construction: the ledger stores the causing account, and
+    repo.top_spenders aggregates through identity_account at query time - so a
+    /merge issued after the spending still pulls the history together.
+    """
+    await _gate(matcher, event)
+    gid = str(event.group_id)
+    arg = _strip_cmd(event.get_plaintext(), "top")
+    k = min(int(arg), 20) if arg.isdigit() and int(arg) > 0 else 5
+    rows = await repo.top_spenders(int(gid), k=k)
+    if not rows:
+        await matcher.finish("本月本群还没有可归因的花费。")
+    lines = ["本群本月花费排行"]
+    for i, r in enumerate(rows, 1):
+        accounts = list(r["accounts"])
+        try:
+            name = (await directory().person(int(gid), accounts[0])).display
+        except UnknownAccount:
+            name = accounts[0]
+        tag = f"（{len(accounts)} 个账号）" if len(accounts) > 1 else ""
+        lines.append(f"{i}. {name}{tag}　¥{float(r['cny']):.3f}　{int(r['calls'])} 次")
+    await matcher.finish(_fit("\n".join(lines), gid=gid))
+
+
+@groupstats_cmd.handle()
+async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
+    """This group's own numbers, including the two caps that are genuinely per-group."""
+    await _gate(matcher, event)
+    day = today_local()
+    gid = str(event.group_id)
+    _cfg, persona = config().for_group(gid)
+    st = await REGISTRY.get(gid)
+
+    rows = await repo.day_breakdown(day, gid)
+    spent = sum(float(r["cny"]) for r in rows)
+
+    unread, _newest = await repo.unread_since_extract(int(gid))
+    lines = [
+        f"本群用量（{gid}）",
+        f"人设　　{persona.name}",
+        f"花费　　¥{spent:.3f}",
+        f"回复　　{_calls(rows, Kind.REPLY)} 次",
+        f"记忆　　待归纳 {unread} 条",
+        f"状态　　{'已静音' if st.muted else '正常'}",
+    ]
+    blocked_live = sum(1 for t in st.blocked.values()
+                       if t is None or t > now_local())
+    if blocked_live:
+        lines.append(f"屏蔽　　{blocked_live} 个账号")
+    await matcher.finish("\n".join(lines))
+
+
+# -- group knowledge --------------------------------------------------------
+
+
+@card_cmd.handle()
+async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
+    """What the bot has worked out about the group itself.
+
+    These are facts like any other - the group is an entity, and what it is for and what
+    its words mean are facts about it. That is why they are numbered here and deleted
+    with the same /forget that deletes a fact about a person, and why the extraction pass
+    that learns everything else (and /relearn) is what refreshes them.
+    """
+    await _gate(matcher, event)
+    gid = str(event.group_id)
+    _cfg, persona = config().for_group(gid)
+    learned = await directory().group_facts(int(gid))
+    fixed = persona.group_knowledge.strip()
+
+    parts = []
+    if fixed:
+        parts.append("固定资料（人工写在人设里）：\n" + fixed)
+    if learned:
+        parts.append("自动归纳：\n" + "\n".join(
+            f"　{f.index}. {f.text}（{f.confidence:.2f}）" for f in learned))
+    else:
+        parts.append("自动归纳：（暂为空）")
+    await matcher.finish(_fit("\n\n".join(parts), gid=str(gid)))
+
+
+# -- what is known about people ---------------------------------------------
+
+
+@who_cmd.handle()
+async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
+    """The whole group, or one person by @.
+
+    A person is named by @ and no other way. A typed name is a guess at an account: two
+    members can display one nickname, a nickname changes, and a name that matched
+    yesterday quietly matches somebody else today - so a lookup could hand back the wrong
+    person's record and read as though it were right.
+    """
+    await _gate(matcher, event)
+    gid = int(event.group_id)
+
+    if at := _mentioned(event):
+        cards = []
+        for q in at[:3]:
+            try:
+                cards.append(await directory().person(gid, q))
+            except UnknownAccount:
+                continue
+        if not cards:
+            await matcher.finish("这些账号在本群还没有说过话，暂时没有记录。")
+        await matcher.finish(_fit("\n".join(_one_person(c) for c in cards),
+                                  gid=str(gid)))
+
+    if wanted := _strip_cmd(event.get_plaintext(), "who"):
+        await matcher.finish(
+            f"要查「{wanted}」请用 /who @{wanted}，直接 @ 他。\n"
+            "名字会重复、会改，@ 带的是账号，指到的一定是那个人。"
+        )
+
+    rows = await directory().roster(gid)
+    if not rows:
+        await matcher.finish("本群还没有任何成员记录。")
+    head = f"本群 {len(rows)} 人有记录（发言数｜记录节选）："
+    body = "\n".join("· " + _one_line(c) for c in rows[:ROSTER_MAX])
+    await matcher.finish(_fit(head + "\n" + body, gid=str(gid)))
+
+
+@note_cmd.handle()
+async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
+    """Write the hand-written half of a record.
+
+    Stored as an ordinary fact under its own predicate, so extraction cannot overwrite it
+    and the prompt reads it through the same path as everything else.
+
+    What goes in here is handed to the model as established fact, which is exactly why it
+    is the owner's alone: it is a way to put words in the bot's mouth about somebody.
+    """
+    await _gate(matcher, event)
+    gid = int(event.group_id)
+    at = _mentioned(event)
+    if not at:
+        await matcher.finish("要指定成员，请 @ 他：/note @某人 内容")
+
+    target = at[0]
+    text = _strip_cmd(event.get_plaintext(), "note").strip()
+    card = await _card_of(matcher, gid, target)
+
+    if not text:
+        if not card.note:
+            await matcher.finish(
+                f"{card.display} 目前没有备注。\n"
+                "用法：/note @某人 内容　写入；内容写 - 清除"
+            )
+        await matcher.finish(f"{card.display} 当前的备注：\n{card.note}")
+
+    note = "" if text == DROP else text
+    await directory().note(gid, target, note)
+    if not note:
+        await matcher.finish(f"已清除 {card.display} 的备注。")
+    await matcher.finish(f"已记下 {card.display} 的备注：\n{note}")
+
+
+@alias_cmd.handle()
+async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
+    """Bind or retire a name by hand.
+
+    The escape hatch for names a group says but never types: the extractor only ever sees
+    what was written down, so a name that lives entirely in speech is unlearnable unless
+    somebody happens to write the sentence that coins it. A name bound here counts as
+    certain, which is what lets it settle an argument the model would otherwise keep
+    having with itself.
+    """
+    await _gate(matcher, event)
+    gid = int(event.group_id)
+    at = _mentioned(event)
+    if not at:
+        await matcher.finish("要指定成员，请 @ 他：/alias @某人 称呼")
+
+    target = at[0]
+    arg = _strip_cmd(event.get_plaintext(), "alias").strip()
+    card = await _card_of(matcher, gid, target)
+
+    if not arg:
+        if not card.names and not card.candidates:
+            await matcher.finish(f"{card.display} 目前没有记录在案的称呼。")
+        lines = [f"· {n.text}（{n.confidence:.2f}）"
+                 + ("（平台）" if n.platform_given else "")
+                 + ("（全局）" if n.is_global else "")
+                 for n in card.names]
+        if card.candidates:
+            lines.append("未确认：")
+            lines += [f"· {n.text}（{n.confidence:.2f}）" for n in card.candidates]
+        await matcher.finish(_fit(f"{card.display} 的称呼：\n" + "\n".join(lines),
+                                  gid=str(gid)))
+
+    if arg.startswith(DROP):
+        name = arg[len(DROP):].strip()
+        if not name:
+            await matcher.finish("要撤销哪个称呼？用法：/alias @某人 -称呼")
+        if await directory().unname(gid, target, name):
+            await matcher.finish(f"已撤销 {card.display} 的称呼「{name}」。")
+        await matcher.finish(f"{card.display} 名下没有「{name}」这个称呼。")
+
+    # name=0.4 sets how much the name is trusted; a bare name binds at full trust.
+    if "=" in arg:
+        name, _, value = arg.rpartition("=")
+        name = name.strip()
+        try:
+            conf = float(value.strip())
+        except ValueError:
+            await matcher.finish("置信度需为 0 到 1 的数字，例如：/alias @某人 阿明=0.6")
+            return
+        if not name:
+            await matcher.finish("要设置哪个称呼？用法：/alias @某人 称呼=0.6")
+        try:
+            n = await directory().set_confidence(gid, target, name, conf)
+        except NameTaken as e:
+            await matcher.finish(
+                f"「{e.text}」在本群已经指向 {e.holder}，一个称呼只能指一个人。")
+            return
+        state = "可以使用" if n.confidence >= 0.75 else "已保留记录，暂不使用"
+        await matcher.finish(
+            f"已设置：{card.display} 的「{n.text}」置信度 {n.confidence:.2f}（{state}）。")
+
+    try:
+        await directory().name(gid, target, arg)
+    except NameTaken as e:
+        await matcher.finish(
+            f"「{e.text}」在本群已经指向 {e.holder}，一个称呼只能指一个人。\n"
+            f"要改的话，先在他名下撤销：/alias @他 -{e.text}")
+        return
+    await matcher.finish(f"已登记：{card.display} 也叫「{arg}」。")
+
+
+@forget_cmd.handle()
+async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
+    """Retract one entry by the number that listed it.
+
+    By number rather than by text: the alternative is matching on what the owner retypes,
+    and a near-miss there deletes the wrong entry while reporting success.
+
+    With an @ it is that person's record; without one it is the group's own, because the
+    group is an entity too and its facts are numbered by /card.
+    """
+    await _gate(matcher, event)
+    gid = int(event.group_id)
+    arg = _strip_cmd(event.get_plaintext(), "forget").strip()
+    digits = next((w for w in arg.split() if w.isdigit()), "")
+    if not digits:
+        await matcher.finish("要删除哪一条？编号取自 /who @某人 或 /card。")
+
+    at = _mentioned(event)
+    dropped = (await directory().forget(gid, at[0], int(digits)) if at
+               else await directory().forget_group_fact(gid, int(digits)))
+    if dropped is None:
+        await matcher.finish(
+            f"没有编号 {digits} 这一条。用 /who @某人 或 /card 看当前的编号。")
+    await matcher.finish(f"已删除：{dropped.text}")
+
+
+# -- identity ---------------------------------------------------------------
+
+
+@merge_cmd.handle()
+async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
+    """Declare two accounts to be the same person.
+
+    Owner only; the model may only ever propose it. A wrong merge puts two people's
+    histories under one name, and nothing downstream can tell which half came from
+    where - so the one operation that can cause it stays in human hands.
+    """
+    await _gate(matcher, event, global_only=True)
+    at = _mentioned(event)
+    if len(at) < 2:
+        await matcher.finish("要合并哪两个账号？用法：/merge @小号 @大号")
+    loser, winner = at[0], at[1]
+    if loser == winner:
+        await matcher.finish("这是同一个账号。")
+    try:
+        changed = await directory().merge(loser, winner)
+    except UnknownAccount as e:
+        await matcher.finish(f"账号 {e.user_id} 没有任何记录，无法合并。")
+        return
+    # Being blocked is a decision about a person, so it follows them across the
+    # merge: an alt that stayed unblocked would keep talking, keep being archived
+    # and keep feeding memory, which is exactly what the block refused. Runs even
+    # when the merge itself was a no-op: a pair merged before blocks became
+    # person-wide can be half-blocked, and re-issuing /merge is the one natural
+    # repair the owner will actually try.
+    accounts = await directory().accounts_of_person(winner)
+    spread: list[tuple[int, datetime | None]] = []
+    if str(event.self_id) not in accounts:
+        def shielded(gid: int) -> bool:
+            # The same two refusals /block makes, per group: never the owner.
+            return any(perms.is_owner(a, config().for_group(str(gid))[0].owners)
+                       for a in accounts)
+        spread = await directory().blocks_after_merge(winner, shielded=shielded)
+    for gid, until in spread:
+        if (st := REGISTRY.loaded(str(gid))) is not None:
+            st.blocked.update({a: until for a in accounts})
+    tail = f"两者在 {len(spread)} 个群的屏蔽状态已统一。" if spread else ""
+    if not changed:
+        await matcher.finish("这两个账号本来就属于同一个人。" + tail)
+    await matcher.finish("已合并。" + tail)
+
+
+@split_cmd.handle()
+async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
+    """Undo a merge for one account. The counterpart to /merge - possible only because
+    every record keeps which account produced it, so the split knows what to take."""
+    await _gate(matcher, event, global_only=True)
+    at = _mentioned(event)
+    if not at:
+        await matcher.finish("要拆分哪个账号？用法：/split @某人")
+    try:
+        await directory().split(at[0])
+    except UnknownAccount as e:
+        await matcher.finish(f"账号 {e.user_id} 没有任何记录，无法拆分。")
+        return
+    await matcher.finish("已拆分。")
+
+
+@relearn_cmd.handle()
+async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
+    """Ask for an extraction pass now rather than at tonight's drain.
+
+    Queued, not run inline: it is a paid model call, and holding the handler open on one
+    is long enough for QQ to time the reply out.
+    """
+    await _gate(matcher, event)
+    try:
+        await directory().relearn(int(event.group_id))
+    except Exception as e:
+        log.warning("group %s: /relearn failed: %s", event.group_id, why(e))
+        await matcher.finish("排入失败，详见日志。")
+        return
+    await matcher.finish("已排入归纳队列。")
+
+
+# -- diagnostics ------------------------------------------------------------
+
+
+@debug_cmd.handle()
+async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
+    """Arm the model-round capture tap. The files land server-side; this only turns
+    the tap on and says how many rounds it took."""
+    await _gate(matcher, event, global_only=True)
+    arg = _strip_cmd(event.get_plaintext(), "debug").strip().lower()
+    if not arg:
+        n = debug.armed()
+        await matcher.finish(f"捕获中：还剩 {n} 轮。" if n else "未在捕获。")
+    if arg in ("off", "0"):
+        debug.arm(0)
+        await matcher.finish("已关闭捕获。")
+    if not arg.isdigit():
+        await matcher.finish("用法：/debug 轮数（最多 50），/debug off 关闭。")
+    took = debug.arm(int(arg))
+    await matcher.finish(f"已开启：接下来 {took} 轮模型调用写入 logs/debug/。")
+
+
+@log_cmd.handle()
+async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
+    """The tail of the log file, for when something looks wrong from inside the group."""
+    await _gate(matcher, event, global_only=True)
+    arg = event.get_plaintext().strip().split()
+    n = LOG_LINES_DEFAULT
+    if len(arg) > 1 and arg[-1].isdigit():
+        n = max(1, min(int(arg[-1]), LOG_LINES_MAX))
+    path = Path(os.getenv("LOG_DIR", "/app/logs")) / "qqbot.log"
+    try:
+        # Read the tail rather than the file: it grows without bound and only the end
+        # is ever wanted.
+        with path.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - LOG_TAIL_BYTES))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError as e:
+        await matcher.finish(f"读不到日志文件：{e}")
+        return
+    lines = [ln for ln in tail.splitlines() if ln.strip()][-n:]
+    if not lines:
+        await matcher.finish("日志是空的。")
+        return
+    await matcher.finish(_fit("\n".join(lines), head=False, gid=str(event.group_id)))
+
+
+@help_cmd.handle()
+async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
+    """The listing, or one command in full.
+
+    Splitting the two is what lets the listing stay one line per command: usage, caveats
+    and what a number means all live in the detail text, which is only ever read by
+    someone who asked for it.
+    """
+    await _gate(matcher, event)
+    wanted = _strip_cmd(event.get_plaintext(), "help")
+    if not wanted:
+        await matcher.finish(_fit(command_catalog.help_text(), gid=str(event.group_id)))
+
+    cmd = command_catalog.find(wanted)
+    if cmd is None:
+        await matcher.finish(f"没有「{wanted}」这条指令。用 /help 看全部。")
+    await matcher.finish(_fit(command_catalog.detail_text(cmd), gid=str(event.group_id)))

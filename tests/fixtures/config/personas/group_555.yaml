@@ -1,0 +1,7 @@
+# Fixture: a group that states only its differences, to pin persona inheritance.
+system_prompt_extra: |
+  这个群专门聊测试。
+
+# Set outright rather than appended, which is the other half of the merge rule.
+group_knowledge: |
+  这个群的固定资料只有这一句。

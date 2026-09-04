@@ -1,0 +1,136 @@
+# Copy to settings.yaml, then make it yours: owners, nicknames, models. The real
+# settings.yaml stays out of version control (it names real accounts); everything
+# structural about the file is documented here.
+# Per-group overrides go in config/personas/group_<gid>.yaml under `overrides`.
+
+# Everyone who can run /reload, /mute and /stats, and who gets the 09:00 daily report.
+# QQ numbers, as strings.
+owners: ["10001"]
+
+# Local time for everything a person sees: the clock line in the prompt, the cron jobs, the
+# daily report, and the day boundary the budget resets on. An IANA name, not an offset, so
+# DST is handled where it applies.
+timezone: "Asia/Shanghai"
+
+gateway:
+  merge_window_sec: 2.5
+  dedup_ttl_sec: 300
+  max_msg_len: 2000
+  # There is no group allowlist: the account is a dedicated bot account, and a group is
+  # served from its first message.
+
+trigger:
+  # Every name people actually call the bot. Any one matching as a jieba token is a direct
+  # mention - word-level, not substring (section 4).
+  #
+  # Note a nickname that is also an ordinary word will trip the must-answer path whenever
+  # the group talks about that word. That is handled in the persona rather than in code:
+  # the trigger fires, and the prompt tells the bot to shrug the mistake off in one line.
+  # If it ever gets annoying, keep only the unambiguous names - @ still works.
+  nicknames: ["小X", "小叉", "叉子"]
+  max_replies_per_min: 4         # ban-avoidance floor, and the only rate limit there is
+
+# Five capabilities, each an independent provider with its own endpoint, model and
+# credential, and no automatic fallback between them (D6).
+#
+# This block is the only place a platform is named. The code above it deals in capabilities
+# (text / vision / asr / search) and never learns who serves them, so retargeting one is an
+# edit here and nothing else.
+#
+# `backend` picks the implementation class (providers/registry.py). Everything peculiar to
+# a platform - how it reports prompt-cache hits, how to tell it not to deliberate, what
+# extra fields its requests need - lives in that class, so this file stays declarative.
+#
+# api_key_env names a credential, it does not hold one; the value comes from .env
+# (docker-compose injects it - see .env.example). text and vision share TEXT_API_KEY
+# because one account serves both; asr and embedding share MEDIA_API_KEY likewise.
+# To split any pair: new entry in .env and compose, new name here.
+llm:
+  text:
+    backend: deepseek
+    base_url: https://api.deepseek.com
+    api_key_env: TEXT_API_KEY
+    model: deepseek-v4-pro
+    # Whether the reply model accepts image blocks. Off, pictures reach the prompt as
+    # descriptions only and nothing is uploaded to the Files store.
+    reads_images: false
+    # "low" keeps sanity-check thinking without paying the full deliberation
+    # habit at pro output prices.
+    reasoning_effort: low
+    max_concurrency: 3
+    timeout_sec: 30
+    retries: 2
+  # The multimodal model's one remaining job: describing pictures for the archive.
+  vision:
+    backend: deepseek
+    base_url: https://api.deepseek.com
+    api_key_env: TEXT_API_KEY
+    model: deepseek-v4-flash-vision-exp
+    # Deliberation grade for the describing call: "low" buys meme-reading
+    # judgement for a fraction of the vendor default's cost; "off" disables it.
+    reasoning_effort: low
+    max_images_per_min: 6
+    max_image_mb: 8
+    timeout_sec: 30
+  asr:
+    backend: dashscope
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key_env: MEDIA_API_KEY
+    model: qwen3-asr-flash
+    max_audio_sec: 300
+    timeout_sec: 60
+  embedding:
+    backend: dashscope
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key_env: MEDIA_API_KEY
+    model: text-embedding-v4
+    dimensions: 2048
+    timeout_sec: 60
+  search:
+    backend: tavily
+    base_url: https://api.tavily.com
+    api_key_env: SEARCH_API_KEY
+    count: 5
+    depth: basic              # 1 credit; "advanced" costs 2
+    monthly_quota: 1000       # the free tier; at it search refuses, nothing bills
+    # The host's proxy, as seen from inside the container (172.17.0.1 is the default
+    # docker bridge gateway). Only the search client uses it; model traffic stays
+    # direct. Empty means direct.
+    proxy: http://172.17.0.1:7890
+    timeout_sec: 20
+
+budget:
+  # A real ceiling: at it the bot stops answering until the day rolls over in the
+  # timezone above.
+  daily_cny_cap: 3.0
+  # What one reply may spend, in CNY, tool loop included. Money is the only
+  # constraint: free tools run without limit, paid rounds account against this
+  # figure. A reply that hits it stops unanswered - limits mean silence.
+  per_reply_cny: 0.30
+
+
+memory:
+  # Extraction runs once nightly (schedule.extract_cron), draining the day
+  # oldest-first in chunks cut at conversation gaps - there are no batching knobs
+  # left. reasoning_effort is extraction's own grade: the schema and Validator
+  # carry most of the thinking, so "low" covers joke-vs-fact and predicate choice.
+  consolidate: { reasoning_effort: low }
+
+# The exit guard's judge (TMS TextModeration), the only one: a failed or
+# timed-out call silences the reply rather than falling back to anything -
+# unjudged text does not leave. biz_type is the console-configured policy;
+# the default policy is tuned for nobody. Credentials:
+# MODERATION_SECRET_ID / MODERATION_SECRET_KEY in .env.
+moderation:
+  backend: tencent_tms
+  region: ap-shanghai
+  biz_type: output_text
+
+schedule:
+  extract_cron:     "30 2 * * *"
+  forget_cron:       "0 4 * * *"
+  backup_cron:      "30 4 * * *"
+  cache_clean_cron: "0 5 * * *"
+  report_cron:      "0 9 * * *"
+  backup_keep: 14
+  napcat_cache_days: 7
