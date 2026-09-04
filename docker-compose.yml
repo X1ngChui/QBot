@@ -83,11 +83,6 @@ services:
       - TEXT_API_KEY=${TEXT_API_KEY:?set TEXT_API_KEY in .env}
       - MEDIA_API_KEY=${MEDIA_API_KEY:?set MEDIA_API_KEY in .env}
       - SEARCH_API_KEY=${SEARCH_API_KEY:?set SEARCH_API_KEY in .env}
-      # :- not :? on purpose - moderation is optional at the compose level, so a
-      # deployment with moderation.backend unset still comes up. When settings.yaml
-      # does name a backend, empty credentials fail the boot instead.
-      - MODERATION_SECRET_ID=${MODERATION_SECRET_ID:-}
-      - MODERATION_SECRET_KEY=${MODERATION_SECRET_KEY:-}
     volumes:
       - ./config:/app/config:ro
       - ./logs:/app/logs

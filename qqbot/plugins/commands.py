@@ -33,7 +33,7 @@ from nonebot import on_command
 from nonebot.adapters.onebot.v11 import GroupMessageEvent
 from nonebot.matcher import Matcher
 
-from ..core import censor, command_catalog, debug, errors, perms
+from ..core import agreement, command_catalog, debug, errors, perms
 from ..core.budget import BUDGET, hit_split
 from ..core.nickname import register as register_nicknames
 from ..core.retrieval import directory
@@ -41,7 +41,6 @@ from ..core.state import REGISTRY
 from ..db import repo
 from ..providers import Kind, providers
 from ..services import NameTaken, PersonCard, UnknownAccount
-from ..providers.moderation import build as build_moderation
 from ..settings import config, reload_config
 from ..util import fmt_when, now_local, parse_duration, today_local, why
 
@@ -77,12 +76,17 @@ def _fit(text: str, *, head: bool = True, gid: str | None = None) -> str:
 
 
 async def _gate(matcher: Matcher, event: GroupMessageEvent,
-                *, global_only: bool = False) -> None:
-    """Stop here unless the speaker owns this bot.
+                *, global_only: bool = False, self_serve: bool = False,
+                open_to_members: bool = False) -> bool:
+    """Who is calling: True for the owner, False for a member allowed through.
 
-    Silence rather than a refusal, and deliberately: to anyone who is not the owner these
-    commands do not exist, and answering "you are not allowed" is how they find out that
-    they do.
+    A member gets through on `self_serve` - the catalog-flagged commands whose
+    handlers then narrow every operation to the caller's own person (the
+    handler's job, via `_own_accounts`) - or on `open_to_members`, the
+    read-only surfaces a member sees whole. Everyone
+    else is stopped here with silence rather than a refusal, deliberately: to
+    anyone who cannot run a command it does not exist, and answering "you are
+    not allowed" is how they find out that it does.
 
     Reads the *group's* owner list: a per-group config may override it, and the gateway
     reads it the same way - taking them from two places would let an override move who
@@ -99,10 +103,21 @@ async def _gate(matcher: Matcher, event: GroupMessageEvent,
     """
     owners = (config().default.owners if global_only
               else config().for_group(str(event.group_id))[0].owners)
-    if not perms.is_owner(str(event.user_id), owners):
-        await matcher.finish()
+    if perms.is_owner(str(event.user_id), owners):
+        return True
+    if (self_serve or open_to_members) and not global_only:
+        return False
+    await matcher.finish()
+    return False  # unreachable; finish() raises
 
 
+async def _own_accounts(event: GroupMessageEvent) -> list[str]:
+    """Every account of the person speaking - "yourself" means the person, so
+    a merged alt operates its main's record, same as /block treats them."""
+    return await directory().accounts_of_person(str(event.user_id))
+
+
+agree_cmd = on_command("agree", block=True, priority=1)
 reload_cmd = on_command("reload", block=True, priority=1)
 mute_cmd = on_command("mute", block=True, priority=1)
 block_cmd = on_command("block", block=True, priority=1)
@@ -208,6 +223,19 @@ async def _card_of(matcher: Matcher, group_id: int, user_id: str) -> PersonCard:
 # -- configuration ----------------------------------------------------------
 
 
+@agree_cmd.handle()
+async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
+    """Record that the speaker accepts the user agreement.
+
+    The one command whose subject is always the speaker themselves - there is
+    no target to narrow, so the self-serve gate is the entire check.
+    """
+    await _gate(matcher, event, self_serve=True)
+    if await agreement.accept(str(event.user_id)):
+        await matcher.finish("已记录：你同意了用户协议。")
+    await matcher.finish("你已同意过用户协议，无需重复发送。")
+
+
 @reload_cmd.handle()
 async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     # global_only: the reload lands on every group at once, so an owner a single
@@ -228,19 +256,6 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
         cfg, _ = bundle.for_group(gid)
         register_nicknames(cfg.trigger.nicknames)
     register_nicknames(bundle.default.trigger.nicknames)
-    # The exit guard's judge is config too: rebuild it so region/policy edits
-    # land without a restart. Guarded on its own: the config swap above already
-    # happened, so a rebuild that dies (missing credentials, say) must be said
-    # out loud here - the old judge stays armed, and silence would leave the
-    # mismatch to detonate as a boot failure at the next restart.
-    try:
-        censor.set_moderation(build_moderation(bundle.default))
-    except Exception as e:
-        log.error("moderation judge rebuild failed after reload: %s", why(e))
-        await matcher.finish(_fit(
-            f"配置已重载：{len(bundle.personas)} 份人设。但内容审核后端重建失败，"
-            f"出口守卫维持重载前的状态：{e}", gid=str(event.group_id)))
-
     # The contract's edge - cron and timezone edits are accepted here but only take
     # effect at the next restart - is documented in /help reload, not repeated in
     # every acknowledgement.
@@ -249,11 +264,11 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
 
 @block_cmd.handle()
 async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
-    """Ignore an account in this group entirely.
+    """Withhold replies from an account in this group.
 
-    Stronger than not replying, and deliberately: a member who wants to pollute the bot's
-    memory does not need to be answered to manage it - being read is enough. Blocked
-    means unread: no reply, no archive, no memory.
+    Only replies: the account's messages still arrive, archive and feed memory,
+    so the window stays coherent around them - by owner decision, context
+    continuity outweighs keeping a nuisance out of the bot's memory.
     """
     await _gate(matcher, event)
     gid = str(event.group_id)
@@ -354,7 +369,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     Deliberately carries no per-group number - a global call count reads as this group's
     the moment it sits next to a per-group cap, so those live in /groupstats instead.
     """
-    await _gate(matcher, event)
+    await _gate(matcher, event, open_to_members=True)
     day = today_local()
     cfg = config().default
 
@@ -384,8 +399,6 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     ]
     if cache := hit_split(rows):
         lines.append(f"缓存　　命中率 {cache}")
-    if caught := sum(censor.SUPPRESSED.values()):
-        lines.append(f"拦截　　{caught} 次（重启以来）")
     if errors.count():
         lines.append(f"异常　　{errors.count()} 条，详见每日报告")
     await matcher.finish("\n".join(lines))
@@ -399,7 +412,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     repo.top_spenders aggregates through identity_account at query time - so a
     /merge issued after the spending still pulls the history together.
     """
-    await _gate(matcher, event)
+    await _gate(matcher, event, open_to_members=True)
     gid = str(event.group_id)
     arg = _strip_cmd(event.get_plaintext(), "top")
     k = min(int(arg), 20) if arg.isdigit() and int(arg) > 0 else 5
@@ -421,7 +434,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
 @groupstats_cmd.handle()
 async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     """This group's own numbers, including the two caps that are genuinely per-group."""
-    await _gate(matcher, event)
+    await _gate(matcher, event, open_to_members=True)
     day = today_local()
     gid = str(event.group_id)
     _cfg, persona = config().for_group(gid)
@@ -458,7 +471,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     with the same /forget that deletes a fact about a person, and why the extraction pass
     that learns everything else (and /relearn) is what refreshes them.
     """
-    await _gate(matcher, event)
+    await _gate(matcher, event, open_to_members=True)
     gid = str(event.group_id)
     _cfg, persona = config().for_group(gid)
     learned = await directory().group_facts(int(gid))
@@ -486,9 +499,21 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     members can display one nickname, a nickname changes, and a name that matched
     yesterday quietly matches somebody else today - so a lookup could hand back the wrong
     person's record and read as though it were right.
+
+    A member gets exactly one shape of it: their own record, bare or @-ing one
+    of their own accounts. Anything else - another person, a typed name, the
+    roster - stays silent, the same silence an ungranted command gives.
     """
-    await _gate(matcher, event)
+    owner = await _gate(matcher, event, self_serve=True)
     gid = int(event.group_id)
+
+    if not owner:
+        mine = await _own_accounts(event)
+        if (any(q not in mine for q in _mentioned(event))
+                or _strip_cmd(event.get_plaintext(), "who").strip()):
+            await matcher.finish()
+        card = await _card_of(matcher, gid, str(event.user_id))
+        await matcher.finish(_fit(_one_person(card), gid=str(gid)))
 
     if at := _mentioned(event):
         cards = []
@@ -523,14 +548,21 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     Stored as an ordinary fact under its own predicate, so extraction cannot overwrite it
     and the prompt reads it through the same path as everything else.
 
-    What goes in here is handed to the model as established fact, which is exactly why it
-    is the owner's alone: it is a way to put words in the bot's mouth about somebody.
+    What goes in here is handed to the model as established fact, which is why writing
+    about *somebody else* stays the owner's alone: it is a way to put words in the bot's
+    mouth about them. A member writes only their own note - by owner decision it carries
+    the same established-fact weight as the owner's hand.
     """
-    await _gate(matcher, event)
+    owner = await _gate(matcher, event, self_serve=True)
     gid = int(event.group_id)
     at = _mentioned(event)
     if not at:
         await matcher.finish("要指定成员，请 @ 他：/note @某人 内容")
+    if not owner:
+        if at[0] not in await _own_accounts(event):
+            await matcher.finish()
+        # The one trace of a member rewriting their own note, for /log.
+        log.info("group %s: member %s self-serves /note", gid, event.user_id)
 
     target = at[0]
     text = _strip_cmd(event.get_plaintext(), "note").strip()
@@ -560,12 +592,21 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     somebody happens to write the sentence that coins it. A name bound here counts as
     certain, which is what lets it settle an argument the model would otherwise keep
     having with itself.
+
+    A member may do all of it to themselves - they are the best source for what
+    they are called, and their entry binds at the same full trust as the
+    owner's. Anyone else's name draws silence.
     """
-    await _gate(matcher, event)
+    owner = await _gate(matcher, event, self_serve=True)
     gid = int(event.group_id)
     at = _mentioned(event)
     if not at:
         await matcher.finish("要指定成员，请 @ 他：/alias @某人 称呼")
+    if not owner:
+        if at[0] not in await _own_accounts(event):
+            await matcher.finish()
+        # The one trace of a member rewriting their own names, for /log.
+        log.info("group %s: member %s self-serves /alias", gid, event.user_id)
 
     target = at[0]
     arg = _strip_cmd(event.get_plaintext(), "alias").strip()
@@ -632,8 +673,12 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
 
     With an @ it is that person's record; without one it is the group's own, because the
     group is an entity too and its facts are numbered by /card.
+
+    A member may delete from their own record only - being the subject is the
+    licence. The bare group-fact form and other people's entries stay the
+    owner's, answered with silence.
     """
-    await _gate(matcher, event)
+    owner = await _gate(matcher, event, self_serve=True)
     gid = int(event.group_id)
     arg = _strip_cmd(event.get_plaintext(), "forget").strip()
     digits = next((w for w in arg.split() if w.isdigit()), "")
@@ -641,6 +686,11 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
         await matcher.finish("要删除哪一条？编号取自 /who @某人 或 /card。")
 
     at = _mentioned(event)
+    if not owner:
+        if not at or at[0] not in await _own_accounts(event):
+            await matcher.finish()
+        # The one trace of a member pruning their own record, for /log.
+        log.info("group %s: member %s self-serves /forget", gid, event.user_id)
     dropped = (await directory().forget(gid, at[0], int(digits)) if at
                else await directory().forget_group_fact(gid, int(digits)))
     if dropped is None:
@@ -783,13 +833,19 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     Splitting the two is what lets the listing stay one line per command: usage, caveats
     and what a number means all live in the detail text, which is only ever read by
     someone who asked for it.
+
+    A member's listing carries only the self-serve commands, and asking for an
+    owner command's detail answers exactly like asking for one that does not
+    exist - the two must be indistinguishable, or the error message becomes a
+    directory of what is being hidden.
     """
-    await _gate(matcher, event)
+    owner = await _gate(matcher, event, self_serve=True)
     wanted = _strip_cmd(event.get_plaintext(), "help")
     if not wanted:
-        await matcher.finish(_fit(command_catalog.help_text(), gid=str(event.group_id)))
+        await matcher.finish(_fit(command_catalog.help_text(owner=owner),
+                                  gid=str(event.group_id)))
 
     cmd = command_catalog.find(wanted)
-    if cmd is None:
+    if cmd is None or not (owner or cmd.self_serve or cmd.member):
         await matcher.finish(f"没有「{wanted}」这条指令。用 /help 看全部。")
     await matcher.finish(_fit(command_catalog.detail_text(cmd), gid=str(event.group_id)))

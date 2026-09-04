@@ -63,6 +63,29 @@ def catalogue() -> None:
 
     listing = help_text()
     check("every command is listed", all(c.name in listing for c in CATALOG), listing)
+    # The permission levels, pinned at the data: self-serve is the record
+    # commands a member runs against themselves, `member` the read-only
+    # surfaces they see whole, and a member's listing shows those and nothing
+    # else - an owner command in it would advertise what silence hides.
+    check("self-serve is exactly the six subject commands",
+          {c.name for c in CATALOG if c.self_serve}
+          == {"/help", "/agree", "/who", "/note", "/alias", "/forget"},
+          str({c.name for c in CATALOG if c.self_serve}))
+    check("member-whole is exactly the four read-only surfaces",
+          {c.name for c in CATALOG if c.member}
+          == {"/card", "/stats", "/top", "/groupstats"},
+          str({c.name for c in CATALOG if c.member}))
+    check("no command is both self-serve and member-whole",
+          not any(c.self_serve and c.member for c in CATALOG))
+    member = help_text(owner=False)
+    check("a member's listing shows exactly what a member can run",
+          all((c.name in member) == (c.self_serve or c.member) for c in CATALOG),
+          member)
+    check("every open command's detail says so",
+          all("普通成员" in c.detail for c in CATALOG
+              if (c.self_serve or c.member) and c.name != "/help"),
+          str([c.name for c in CATALOG
+               if (c.self_serve or c.member) and "普通成员" not in c.detail]))
     check("every command carries a description", all(c.what for c in CATALOG))
     # The listing is one line each; anything longer belongs in the detail text, which is
     # only read by someone who asked for it.

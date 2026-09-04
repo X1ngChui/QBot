@@ -89,7 +89,7 @@ def strip_markdown(text: str) -> str:
 
 #: How often each marker stripper actually fired, since the process started.
 #: Every hit is a near-miss leak - the model wrote a system marker and only the
-#: exit guard kept it from the group - so the counts are the online signal that
+#: stripper kept it from the group - so the counts are the online signal that
 #: format discipline is regressing, surfaced in the daily report. In-memory like
 #: the error ring: a restart resets it, and that is accepted for the same reason.
 STRIPPED: Counter[str] = Counter()

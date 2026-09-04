@@ -24,7 +24,7 @@ from ..gateway.ingest import ingestor
 from ..gateway.onebot import GroupMessage
 from ..settings import Settings, config
 from ..util import now_local, tz, why
-from . import engine, prompt, trigger
+from . import agreement, engine, perms, prompt, trigger
 from .botapi import BotApi
 from .budget import BUDGET
 from .command_catalog import PREFIXES as COMMANDS
@@ -126,14 +126,11 @@ class Gateway:
             # the message is neither archived nor answered.
             self._dedup_set().discard(msg_id)
             raise
-        # Checked this early on purpose: a blocked account must leave no trace - no
-        # archive row, no memory - not merely draw no reply, or it keeps feeding the
-        # group's memory without ever being answered. /block is the whole mechanism.
-        # Through blocked_now, never `in`: a timed block lapses the moment this
-        # very check notices it has.
-        if await st.blocked_now(user_id):
-            return
-
+        # A blocked account is NOT dropped here: its messages arrive, archive and
+        # feed memory like anyone's, so the window stays coherent around them - a
+        # hole where a person used to be reads as broken context (the owner's
+        # call; the price is that a blocked account still feeds memory). The one
+        # thing withheld is the reply, at the dispatch gate.
         segments = [
             {"type": seg.type, "data": dict(seg.data)} for seg in event.get_message()
         ]
@@ -305,12 +302,36 @@ class Gateway:
                         "until the day rolls over", group_id, cfg.budget.daily_cny_cap)
             return
 
+        who = decision.initiator
+        # /block withholds exactly the reply. Checked through blocked_now, never
+        # `in`: a timed block lapses the moment this check notices it has.
+        if who and await st.blocked_now(who):
+            log.debug("group %s: no reply, initiator %s is blocked", group_id, who)
+            return
+        # The consent gate, before anything is paid for: a member who has not
+        # accepted the user agreement gets the agreement itself instead of a
+        # reply - at most once per cooldown - and nothing is spent on their
+        # behalf. Commands keep working (they are how /agree reaches them),
+        # archiving is untouched, owners are exempt.
+        if (who and not perms.is_owner(who, cfg.owners)
+                and not await agreement.ok(who)):
+            if agreement.should_prompt(who):
+                try:
+                    await bot.send_group_msg(
+                        group_id=int(group_id),
+                        message=[{"type": "at", "data": {"qq": who}},
+                                 {"type": "text",
+                                  "data": {"text": " " + agreement.text()}}])
+                except Exception as e:
+                    log.warning("group %s: agreement prompt failed: %s",
+                                group_id, why(e))
+            return
+
         # Every yuan this reply spends - the transcribes and backlog describes it
         # forces, the tool calls, the model tokens - is booked to the initiator
         # the trigger decision already named. An attribution, not a charge: the
         # budget stays shared, this only feeds the /top leaderboard's ledger
         # column.
-        who = decision.initiator
         with BUDGET.attribute(who):
             # Only now is anything paid for. Understanding a picture is worth money
             # exactly when the model is about to read the message it is in - which,

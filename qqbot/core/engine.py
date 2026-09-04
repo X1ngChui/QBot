@@ -16,7 +16,7 @@ from ..providers import Kind, providers
 from ..providers.base import QuotaExhausted
 from ..settings import Persona, Settings
 from ..util import now_local, why
-from . import censor, debug, prompt, retrieval, tools
+from . import debug, prompt, retrieval, tools
 from .budget import BUDGET
 from .members import MEMBERS
 from .output import clean_reply
@@ -315,19 +315,6 @@ async def respond(
     if len(text) > cfg.gateway.max_msg_len:
         text = text[: cfg.gateway.max_msg_len]
 
-    # The exit guard: an unsafe outgoing text drops the whole reply - silence,
-    # like every other limit - and it is never archived, so a baited near-miss
-    # cannot become a demonstration in the bot's own window. Nothing happens to
-    # whoever asked; the money already spent is the accepted price, same as a
-    # reply the budget drops. This runs after the reply's BUDGET.scope closed,
-    # so the moderation fee books to the day total but never to per_reply_cny -
-    # at a quarter-cent a call, not worth reopening the scope for.
-    action, detail = await censor.screen(text, group_id=st.group_id)
-    if action != "pass":
-        censor.SUPPRESSED[st.group_id] += 1
-        log.warning("group %s: reply suppressed by the exit guard (%s: %s)",
-                    st.group_id, action, detail)
-        return False
     # What the group reads and what the bot remembers differ by exactly the
     # provenance marker: the archived/window form carries what this answer rested
     # on, so a later turn can cite a searched answer instead of re-searching, and

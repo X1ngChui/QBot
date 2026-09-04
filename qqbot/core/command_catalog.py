@@ -8,8 +8,12 @@ goes undocumented or gets answered twice.
 Data only, so it imports without a NoneBot runtime and can therefore be tested. The
 handlers in plugins/commands.py cannot: on_command() runs at import time.
 
-Every command here is the owner's. What a member wants from the bot, they get by talking
-to it - see core.perms for why that is the whole rule.
+Most commands here are the owner's. Two kinds of exception, both catalog data:
+`self_serve` commands any member may run against themselves - their own record,
+names, note - because the data subject is the member; `member` commands any
+member may run whole, because they only read shared state. The command path
+answers for free where the chat path costs a model call. See core.perms for
+the boundary.
 """
 
 from __future__ import annotations
@@ -26,6 +30,13 @@ class Command:
     #: listing has one line per command and has to stay readable in a chat window, so
     #: anything longer than a clause belongs here instead of in `what`.
     detail: str = ""
+    #: Whether a non-owner may run this against themselves. The handler must
+    #: implement the self-only narrowing; this flag is what /help's filtered
+    #: listing and the gate read. Everything else stays owner-only.
+    self_serve: bool = False
+    #: Whether a non-owner may run this whole - the read-only surfaces with
+    #: nothing to narrow.
+    member: bool = False
 
 
 #: The order is the listing's only structure - there are no headings - so what a reader
@@ -39,7 +50,15 @@ CATALOG: tuple[Command, ...] = (
     Command("/help", "显示指令列表", """/help　　　　　显示指令列表
 /help 指令名　显示该指令的详细用法
 
-示例：/help who"""),
+示例：/help who""", self_serve=True),
+    Command("/agree", "同意用户协议", """/agree
+
+发送本指令，表示你已阅读并同意用户协议。
+同意之前，机器人不会回复你的消息，但消息仍照常接收；各指令仍可使用。
+第一次叫机器人时会收到协议全文。同意一次后持续有效，无需重复发送。
+普通成员也可使用。
+
+示例：/agree""", self_serve=True),
     # This group exists because the memory system is otherwise unobservable: what it
     # learned goes into a prompt nobody sees, and a wrong fact looks exactly like a right
     # one until the bot says something odd.
@@ -50,14 +69,19 @@ CATALOG: tuple[Command, ...] = (
 括号内的数字是置信度（0 到 1）：由不同消息反复确认的次数算出，说得越多越高。
 条目前的编号用于 /forget。
 
-示例：/who @小明"""),
+普通成员也可使用，但只能查自己：/who 或 /who @自己。
+
+示例：/who @小明""", self_serve=True),
     Command("/note", "补充或更正成员记录", """/note @某人　　　　查看该成员的备注
 /note @某人 内容　写入，覆盖原有内容
 /note @某人 -　　　清除
 
 备注不会被自动改写，并作为确定信息供后续归纳使用。
 
-示例：/note @小明 只在周末上线"""),
+普通成员也可使用，但只能 @自己，查看、写入自己的备注；
+写入的内容同样视作确定信息。
+
+示例：/note @小明 只在周末上线""", self_serve=True),
     # Names a group says out loud but never types at anyone. The extractor only ever
     # sees what was written down, so a name that lives entirely in speech cannot be
     # learned unless somebody happens to write the sentence that coins it.
@@ -69,7 +93,9 @@ CATALOG: tuple[Command, ...] = (
 置信度达到 0.75 才会启用该称呼。手动设置的数值为最终决定，
 后续自动观察不会覆盖它。撤销仅标记为不再使用，历史消息仍可识别。
 
-示例：/alias @小明 阿明"""),
+普通成员也可使用，但只能 @自己：登记、撤销自己的称呼，效力与拥有者录入的相同。
+
+示例：/alias @小明 阿明""", self_serve=True),
     # Two accounts, one person. The identity layer exists to make this expressible; these
     # two commands are the only way to state it, because the model may only propose.
     Command("/merge", "合并两个账号", """/merge @小号 @大号
@@ -92,15 +118,19 @@ CATALOG: tuple[Command, ...] = (
 显示关于本群本身的记录：群的主题，以及群内术语的含义。
 与成员记录同源，同样由模型从聊天记录归纳，同样会因长期无人再提而淡出。
 括号内的数字是置信度，与 /who 相同。条目前的编号用于 /forget（不带 @）。
+普通成员也可查看。
 
-示例：/card"""),
+示例：/card""", member=True),
     Command("/forget", "删除一条记录", """/forget @某人 编号　删除该成员的一条记录
 /forget 编号　　　　删除本群的一条记录
 
 编号取自 /who @某人 或 /card 的列表。删除后不再用于回复。
 称呼请用 /alias 撤销。
 
-示例：/forget @小明 2"""),
+普通成员也可使用，但只能 @自己 删除自己记录里的条目；
+不带 @ 的群条目操作仍仅限拥有者。
+
+示例：/forget @小明 2""", self_serve=True),
     Command("/relearn", "立即重新归纳",
             "归纳通常在每天凌晨集中进行；此指令不等今晚，立即重读本群最近的\n"
             "聊天记录（至多一窗）归纳一次。消耗模型调用，结果稍后生效，不即时返回。\n\n"
@@ -110,11 +140,10 @@ CATALOG: tuple[Command, ...] = (
     # mute switch belong to this one alone.
     Command("/stats", "查看全局用量",
             "所有群合计的数据，除搜索额度按月外均为当日：预算用量、回复次数、"
-            "媒体调用次数、搜索额度、待归纳积压、缓存命中率、拦截次数、异常条数。\n"
-            "待归纳的内容在每天凌晨集中处理。拦截次数指未通过内容审核而被扣下的\n"
-            "回复条数：每条待发出的回复都先经云端审核，未通过的整条不发出，\n"
-            "对成员没有其他影响。本群单独的数据用 /groupstats。\n\n"
-            "示例：/stats"),
+            "媒体调用次数、搜索额度、待归纳积压、缓存命中率、异常条数。\n"
+            "待归纳的内容在每天凌晨集中处理。本群单独的数据用 /groupstats。\n"
+            "普通成员也可查看。\n\n"
+            "示例：/stats", member=True),
     Command("/top", "查看本群花费排行", """/top　　　默认列出本月花费最高的 5 人
 /top 数量　最多 20
 
@@ -122,17 +151,20 @@ CATALOG: tuple[Command, ...] = (
 回复只在被 @ 或叫到名字时发生，一次回复的全部开销（含其间的
 语音转写、看图与搜索）都记在发起的人头上；图片的入档描述记在
 发图的人头上。归纳等大家共同引发的开销不计入。
+普通成员也可查看。
 
-示例：/top 10"""),
+示例：/top 10""", member=True),
     Command("/groupstats", "查看本群用量",
-            "本群当日数据：人设、花费、回复次数、待归纳条数、静音状态。\n\n"
-            "示例：/groupstats"),
+            "本群当日数据：人设、花费、回复次数、待归纳条数、静音状态。\n"
+            "普通成员也可查看。\n\n"
+            "示例：/groupstats", member=True),
     Command("/block", "屏蔽某个成员", """/block　　　　　　　列出本群的屏蔽名单
 /block @某人　　　　屏蔽该成员，直到手动解除
 /block @某人 时长　到期自动解除，如 30m、12h、3d
 /unblock @某人　　 解除屏蔽
 
-被屏蔽的成员在本群被完全忽略：不回复，其消息也不存档、不进入记忆。
+被屏蔽的成员只是得不到回复；其消息照常接收、存档并纳入记忆，
+以保持上下文连贯。
 若该成员有多个账号已用 /merge 合并，屏蔽与解除都对其全部账号生效。
 再次 /block 会覆盖时长：不带时长转为永久，带时长重新计时。
 名单随群保存，重启后仍有效。不能屏蔽拥有者。
@@ -140,8 +172,7 @@ CATALOG: tuple[Command, ...] = (
 示例：/block @某人 3d"""),
     Command("/unblock", "解除屏蔽", """/unblock @某人
 
-解除后恢复正常：回复照常，消息重新存档并参与归纳。
-与 /block 一样，作用于该成员的全部账号。
+解除后恢复回复。与 /block 一样，作用于该成员的全部账号。
 
 示例：/unblock @某人"""),
     Command("/mute", "本群静音",
@@ -178,11 +209,16 @@ def find(name: str) -> Command | None:
     return _BY_NAME.get((name or "").strip().lstrip("/").lower())
 
 
-def help_text() -> str:
-    """The listing: one line each, and how to get more."""
-    width = max(len(c.name) for c in CATALOG)
+def help_text(*, owner: bool = True) -> str:
+    """The listing: one line each, and how to get more.
+
+    A member's listing shows only what a member can run - the rest must not
+    be advertised to whoever cannot run it.
+    """
+    shown = [c for c in CATALOG if owner or c.self_serve or c.member]
+    width = max(len(c.name) for c in shown)
     lines = ["可用指令："]
-    lines.extend(f"{c.name.ljust(width)}  {c.what}" for c in CATALOG)
+    lines.extend(f"{c.name.ljust(width)}  {c.what}" for c in shown)
     lines.append("详细用法：/help 指令名")
     return "\n".join(lines)
 

@@ -42,7 +42,7 @@ async def ensure_schema() -> None:
                'episode','episode_participant','episode_event',
                'memory_job','embedding_index',
                'cost_ledger','group_state','group_blocklist','image_cache',
-               'reply_trace'
+               'reply_trace','user_agreement'
            ]) AS t(name)
            LEFT JOIN information_schema.tables i
                   ON i.table_name = t.name AND i.table_schema = 'public'
@@ -389,6 +389,22 @@ async def groups_first_seen_on(day: str | date) -> list[int]:
 async def groups_with_state() -> list[int]:
     rows = await pool().fetch("SELECT group_id FROM group_state")
     return [r["group_id"] for r in rows]
+
+
+async def has_agreed(user_id: str) -> bool:
+    """Whether this account ever accepted the user agreement (platform-wide)."""
+    return await pool().fetchval(
+        "SELECT EXISTS(SELECT 1 FROM user_agreement WHERE user_id=$1)", user_id)
+
+
+async def record_agreement(user_id: str) -> bool:
+    """File one acceptance; True when it was the first, False on a repeat."""
+    return bool(await pool().fetchval(
+        """INSERT INTO user_agreement (user_id) VALUES ($1)
+           ON CONFLICT (user_id) DO NOTHING
+        RETURNING TRUE""",
+        user_id,
+    ))
 
 
 async def muted_groups() -> list[int]:

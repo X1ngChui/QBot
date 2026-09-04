@@ -13,6 +13,12 @@ Apply with:
 docker exec qbot-postgres-1 psql -U qqbot -d qqbot -c "<statement>"
 ```
 
+## 2026-09-04 — the user agreement gate
+
+```sql
+-- New table: run the CREATE TABLE user_agreement block from init.sql verbatim.
+```
+
 ## 2026-09-04 — the exit guard stops punishing
 
 A flagged reply is simply dropped; no member is auto-blocked, so the strike

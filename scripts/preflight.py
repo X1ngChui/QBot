@@ -161,27 +161,6 @@ async def check_embedding() -> None:
         record(label, False, repr(e))
 
 
-async def check_moderation() -> None:
-    """The exit guard's only judge. When a backend is configured, a failing
-    call means every reply is silenced (fail-closed, by owner decision) - which
-    makes a misconfigured credential here a total outage worth failing over."""
-    from qqbot.providers.moderation import build as build_moderation
-
-    m = config().default.moderation
-    if not m.backend:
-        record("moderation", True, "off (no backend configured)")
-        return
-    label = f"moderation ({m.backend})"
-    try:
-        model = build_moderation(config().default)
-        v = await model.screen("预检")
-        await model.aclose()
-        record(label, v.suggestion == "Pass",
-               f"{m.region}/{m.biz_type or 'default'} -> {v.suggestion}")
-    except Exception as e:
-        record(label, False, repr(e))
-
-
 def check_keys() -> None:
     """Check the key each capability actually points at, not a hardcoded list - two
     capabilities may share one name or not, and only the config knows."""
@@ -220,7 +199,6 @@ async def main() -> int:
     await check_asr()
     await check_search()
     await check_embedding()
-    await check_moderation()
 
     from qqbot.db import close_pool
 

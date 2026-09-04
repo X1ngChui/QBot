@@ -12,10 +12,9 @@ QQ <-> napcat <-OneBot v11 reverse WS-> bot <-asyncpg-> postgres
 Everything about behaviour lives in `config/`; credentials live in `.env`; runtime
 state lives in the DB.
 
-The code knows five capabilities - text, vision, ASR, search, moderation - and
-reaches the first four through `providers()`, the fifth through `core/censor.py`.
-Which platform serves each one, on which endpoint, with which model and
-credential, is stated only in `config/settings.yaml`.
+The code knows four capabilities - text, vision, ASR, search - and reaches them
+through `providers()`. Which platform serves each one, on which endpoint, with
+which model and credential, is stated only in `config/settings.yaml`.
 
 Each backend is its own subclass of the ABC in `qqbot/providers/base.py`, because platforms
 differ in more than their URL and those differences should be forced into a named class
@@ -33,7 +32,6 @@ rather than accumulate as flags. Adding one is: write the subclass, add a line t
 | `qqbot/core/trigger.py` | whether this message is addressed to the bot |
 | `qqbot/core/prompt.py` | cache-friendly prompt ordering |
 | `qqbot/core/retrieval.py` | what the prompt reads: the roster, the group's facts, this turn's episodes |
-| `qqbot/core/censor.py` | the exit guard: cloud moderation on every outgoing reply |
 | `qqbot/domain/`, `qqbot/repositories/`, `qqbot/services/` | the memory model: people, names, facts, episodes, evidence |
 | `qqbot/gateway/` | the platform edge and the inbound chain |
 | `qqbot/workers/memory.py` | the background extractor and consolidator |
@@ -41,7 +39,7 @@ rather than accumulate as flags. Adding one is: write the subclass, add a line t
 | `qqbot/core/budget.py` | the single daily spend gate |
 | `qqbot/providers/base.py` | the capability ABCs - names no vendor |
 | `qqbot/providers/openai_compat.py` | shared plumbing for chat-protocol backends, quirks as hooks |
-| `qqbot/providers/deepseek.py`, `dashscope.py`, `tavily.py`, `moderation.py` | one module per backend |
+| `qqbot/providers/deepseek.py`, `dashscope.py`, `tavily.py` | one module per backend |
 | `qqbot/providers/registry.py` | backend name from config -> class |
 | `qqbot/plugins/tasks.py` | the five scheduled jobs |
 | `scripts/preflight.py` | one real minimal call per capability, run before going live |
@@ -52,6 +50,12 @@ rather than accumulate as flags. Adding one is: write the subclass, add a line t
   word (jieba token plus an ASCII boundary check, so a Latin-lettered nickname
   cannot match inside a longer Latin word). Everything else is read, archived,
   and left alone; the bot never speaks uninvited.
+- **Replies require consent.** A member who has not accepted the user agreement
+  (`config/agreement.txt`) gets the agreement text instead of a reply, at most
+  once per cooldown; `/agree` records acceptance once, permanently. Reading,
+  archiving and the command surface are untouched; owners are exempt. A
+  `/block`ed member is the converse: read and remembered as always, only never
+  answered - context stays coherent either way.
 - **Memory is one store of facts.** What is known about a person and what is
   known about the group are rows in `memory_fact` - the group is an entity too -
   each with a verbatim quote as evidence, a validity window, and a predicate
@@ -68,13 +72,6 @@ rather than accumulate as flags. Adding one is: write the subclass, add a line t
   Prices live in the backend classes as rate tables (peak/off-peak included);
   an unknown model bills at the priciest tier. `/top` attributes each reply's
   full cost to the member who triggered it.
-- **Every outgoing reply is screened** by the exit guard (`core/censor.py`)
-  through cloud moderation (Tencent TMS; `moderation:` in settings.yaml,
-  credentials `MODERATION_SECRET_ID/KEY` in `.env`, policy tuned in the vendor
-  console). Anything short of a pass - a Block, a Review, or a failed call,
-  fail-closed with no fallback - drops the reply whole: unjudged text does not
-  leave, and nothing happens to the member who asked. Suppression counts appear
-  in `/stats` and the daily report.
 - **The text models deliberate before answering.** Reasoning tokens bill as
   output and arrive in a separate field, so they never reach the group but do
   reach the invoice. Memory calls ask for terse answers (each backend's
@@ -158,9 +155,14 @@ with `pg_restore --list` before old ones rotate out.
 
 ## Ops
 
-Every command is the owner's - `/help` lists them. A member who wants to know what the
-bot remembers about them asks the bot; the roster is already in its prompt, and a
-correction they say out loud is picked up by the next extraction pass.
+The console is the owner's, with two carve-outs. Any member may run `/who`,
+`/note`, `/alias` and `/forget` against themselves - their own record, note and
+names, at the same full trust as the owner's hand - plus `/agree` for
+themselves by nature; and the read-only surfaces `/card`, `/stats`, `/top` and
+`/groupstats` whole. `/help` lists each reader exactly what they may run;
+everything else answers members with silence. A member can still just ask the
+bot in conversation - the roster is already in its prompt - but the command
+path answers for free.
 
 Scheduled: memory extraction 02:30 (the nightly drain), memory decay 04:00, `pg_dump -Fc`
 04:30 (keeps 14, into `backups/` - point that volume at a NAS mount; until then the dumps
@@ -173,8 +175,7 @@ the real model from the workstation (needs the test DB and `.env`; ~CNY 0.02 a r
 it before and after any prompt or model change. `/debug N` captures the next N model
 rounds' full requests and responses into `logs/debug/` for when a reply misbehaves and
 you need to see what the model was actually shown. The daily report carries the output
-stripper's and the exit guard's counters: every stripper hit is a marker the model wrote
-and the guard caught; every guard count is a reply moderation held back.
+stripper's hit counters: every hit is a marker the model wrote and the stripper caught.
 
 ## Local development
 

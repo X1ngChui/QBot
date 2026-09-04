@@ -20,7 +20,7 @@ import nonebot
 from apscheduler.triggers.cron import CronTrigger
 from nonebot_plugin_apscheduler import scheduler
 
-from ..core import censor, errors, output
+from ..core import errors, output
 from ..core.budget import hit_split
 from ..core.state import REGISTRY
 from ..db import repo
@@ -244,17 +244,11 @@ async def daily_report() -> None:
                      else f"{note}——已 {age_h / 24:.1f} 天未更新！")
 
     # Every stripper hit is a near-miss leak: the model wrote a system marker and
-    # only the exit guard kept it from a group. Counts since the last restart -
+    # only the stripper kept it from a group. Counts since the last restart -
     # a climbing number here means format discipline is regressing at the source.
     if hits := {k: v for k, v in output.STRIPPED.items() if v}:
         lines.append("输出剥离（重启以来） "
                      + "，".join(f"{k} {v}" for k, v in sorted(hits.items())))
-
-    # Every count is a reply the exit guard swallowed instead of sending.
-    if caught := {k: v for k, v in censor.SUPPRESSED.items() if v}:
-        lines.append("出口拦截 "
-                     + "，".join(f"{k} {v}" for k, v in sorted(caught.items()))
-                     + "（重启以来）")
 
     errs = errors.recent(8)
     if errs:

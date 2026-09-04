@@ -41,10 +41,6 @@ class Kind(StrEnum):
     #: the ledger read exactly like a quiet day - the daily cap, /stats and the
     #: report all measure only what is booked.
     EMBED = "embed"
-    #: The exit guard asking whether an outgoing reply is safe to send. One call
-    #: per reply when the cloud backend is configured; booked for the same
-    #: reason EMBED is.
-    MODERATION = "moderation"
 
 
 #: Strong references to in-flight retirement tasks: asyncio holds tasks weakly,

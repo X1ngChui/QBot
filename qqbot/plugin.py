@@ -21,13 +21,12 @@ from nonebot.plugin import PluginMetadata
 require("nonebot_plugin_apscheduler")
 
 from . import util
-from .core import censor, errors, nickname  # noqa: E402
+from .core import errors, nickname  # noqa: E402
 from .core import retrieval  # noqa: E402
 from .core.pipeline import GATEWAY  # noqa: E402
 from .core.media import MEDIA  # noqa: E402
 from .db import close_pool, init_pool  # noqa: E402
 from .providers.embedding import build as build_embedding  # noqa: E402
-from .providers.moderation import build as build_moderation  # noqa: E402
 from .workers import MemoryWorker  # noqa: E402
 from .db import repo  # noqa: E402
 from .plugins import commands as _commands  # noqa: F401,E402
@@ -87,11 +86,6 @@ async def _startup() -> None:
     embed = build_embedding(bundle.default)
     retrieval.set_embedding(embed)
 
-    # The exit guard's judge, wired here and re-wired on /reload. Same
-    # no-try/except rule as embedding above: missing credentials are a
-    # configuration error that belongs in the boot log, not a disarmed guard.
-    censor.set_moderation(build_moderation(bundle.default))
-
     worker = MemoryWorker(bundle.default, embed=embed)
     _worker_task = asyncio.create_task(worker.run_forever())
     log.info("qqbot ready (memory worker running)")
@@ -111,7 +105,6 @@ async def _shutdown() -> None:
     await GATEWAY.shutdown()
     await MEDIA.close()
     await providers().aclose()
-    await censor.aclose()
     await close_pool()
     log.info("qqbot stopped")
 

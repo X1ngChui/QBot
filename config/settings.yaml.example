@@ -116,16 +116,6 @@ memory:
   # carry most of the thinking, so "low" covers joke-vs-fact and predicate choice.
   consolidate: { reasoning_effort: low }
 
-# The exit guard's judge (TMS TextModeration), the only one: a failed or
-# timed-out call silences the reply rather than falling back to anything -
-# unjudged text does not leave. biz_type is the console-configured policy;
-# the default policy is tuned for nobody. Credentials:
-# MODERATION_SECRET_ID / MODERATION_SECRET_KEY in .env.
-moderation:
-  backend: tencent_tms
-  region: ap-shanghai
-  biz_type: output_text
-
 schedule:
   extract_cron:     "30 2 * * *"
   forget_cron:       "0 4 * * *"

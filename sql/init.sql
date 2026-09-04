@@ -372,6 +372,14 @@ CREATE TABLE IF NOT EXISTS group_blocklist (
     PRIMARY KEY (group_id, user_id)
 );
 
+-- User-agreement acceptances (core/agreement.py). Platform-wide, not per
+-- group: the agreement is with the bot. A row is permanent; there is no
+-- revocation command.
+CREATE TABLE IF NOT EXISTS user_agreement (
+    user_id   VARCHAR(128) PRIMARY KEY,
+    agreed_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
 -- Image description cache. Keyed by image md5 or sticker id, deliberately without a
 -- group: the same picture is the same picture wherever it is posted.
 CREATE TABLE IF NOT EXISTS image_cache (

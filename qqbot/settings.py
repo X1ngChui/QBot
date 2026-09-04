@@ -218,35 +218,6 @@ class ScheduleCfg(_M):
         return v
 
 
-class ModerationCfg(_M):
-    """The exit guard's judge, the only one. Empty backend means no guard at
-    all - a test/dev state. With a backend named, every failure is closed: a
-    failed or timed-out call silences the reply (core/censor.py), there is no
-    fallback behind it."""
-
-    backend: str = ""
-    region: str = "ap-guangzhou"
-    #: The console-configured policy. Empty uses the vendor's default policy,
-    #: which is tuned for nobody in particular - name the real one.
-    biz_type: str = ""
-    secret_id_env: str = "MODERATION_SECRET_ID"
-    secret_key_env: str = "MODERATION_SECRET_KEY"
-    #: Tight on purpose: this sits on the reply's critical path, and a slow
-    #: judge delays every reply while a timeout only forfeits one.
-    timeout_sec: float = 3.0
-
-    @field_validator("backend")
-    @classmethod
-    def _known_backend(cls, v: str) -> str:
-        # Mirrors the table in providers/moderation.py (which settings cannot
-        # import without a cycle); test_logic pins the two lists equal. Checked
-        # at load for the same reason the cron fields are: a typo accepted by
-        # /reload otherwise detonates at the next restart.
-        if v not in ("", "tencent_tms"):
-            raise ValueError(f"unknown moderation backend: {v!r}")
-        return v
-
-
 class Settings(_M):
     # Everyone allowed to run ops commands and receive the daily report. A list because
     # a bot outliving one person's attention needs more than one pair of hands.
@@ -260,7 +231,6 @@ class Settings(_M):
     budget: BudgetCfg = Field(default_factory=BudgetCfg)
     memory: MemoryCfg = Field(default_factory=MemoryCfg)
     schedule: ScheduleCfg = Field(default_factory=ScheduleCfg)
-    moderation: ModerationCfg = Field(default_factory=ModerationCfg)
 
 
 class Persona(_M):

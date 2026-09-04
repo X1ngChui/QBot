@@ -232,6 +232,12 @@ async def main():
     await init_pool()
     await reset()
 
+    # The whole cast accepts the user agreement up front - consent is its own
+    # section; everywhere else a reply is the thing under test.
+    from qqbot.db import repo as _repo_seed
+    for _uid in ("u1", "u7", "u9", "u404", "bad1", "1", "7", "999"):
+        await _repo_seed.record_agreement(_uid)
+
     cfg = config().default
     cfg.gateway.merge_window_sec = 0.25
     # The reply path will not start without one, which is the point: a half-wired
@@ -435,8 +441,8 @@ async def main():
         "SELECT count(*) FROM raw_event WHERE platform_event_id=$1", str(ev.message_id))
     check("duplicate message archived once", rows == 1, str(rows))
 
-    # 9. blocklist: the runtime, per-group ignore. Blocked means unread - no reply and
-    # no archive row - because being read is all it takes to pollute memory.
+    # 9. blocklist: blocked means unanswered, nothing more - the message still
+    # archives so the window stays coherent; the reply is what is withheld.
     from qqbot.db import repo as _repo
     st9 = await REGISTRY.get("123")
     st9.blocked["u9"] = None
@@ -1344,10 +1350,10 @@ async def main():
     check("a reply still goes out when episode recall is down",
           len(bot.sent) == n_sent14 + 1, f"{len(bot.sent) - n_sent14} sent")
 
-    # 15. the per-group blocklist, end to end. Blocked means unread, not merely
-    # unanswered: polluting the bot's memory does not require being replied to - being
-    # read is enough. So a blocked account's messages draw no reply AND leave no archive
-    # row, and the list survives a restart via its own table.
+    # 15. the per-group blocklist, end to end. Blocked means unanswered and
+    # nothing more: the message still archives - a hole where a person used to
+    # be reads as broken context - and the list survives a restart via its own
+    # table. The accepted price is that a blocked account still feeds memory.
     st15 = await REGISTRY.get("123")
     st15.blocked["bad1"] = None
     await _repo.block(123, "bad1")
@@ -1358,10 +1364,10 @@ async def main():
     await drain()
     check("a blocked account draws no reply even when it @s the bot",
           len(bot.sent) == n_sent15, f"{len(bot.sent) - n_sent15} sent")
-    check("and leaves no archive row at all",
+    check("but its message still archives, keeping the window coherent",
           await pool().fetchval(
               "SELECT count(*) FROM raw_event WHERE platform_event_id=$1",
-              str(ev_blocked.message_id)) == 0)
+              str(ev_blocked.message_id)) == 1)
     fresh15 = type(st15)(group_id="123")
     await fresh15.load()
     check("the blocklist survives a restart", "bad1" in fresh15.blocked,
@@ -1404,45 +1410,40 @@ async def main():
     st15.blocked.pop("bad1", None)
     await _repo.unblock(123, "bad1")
 
-    # 16. the exit guard, end to end: every non-pass verdict - Block, Review,
-    # or a dead judge (fail-closed) - drops the reply whole, archives no bot
-    # line, and touches nobody: the sender stays unblocked and unrecorded.
-    from qqbot.core import censor as _censor
-
-    class _Judge:
-        name = "fake-judge"
-        mode = "Block"
-
-        async def screen(self, text, *, group_id=None):
-            if self.mode == "boom":
-                raise RuntimeError("moderation down")
-            return types.SimpleNamespace(suggestion=self.mode, label="Test", score=99)
-
-        async def aclose(self):
-            pass
-
-    _judge = _Judge()
-    _censor.set_moderation(_judge)
+    # 16. the consent gate: a member who never accepted the user agreement is
+    # not replied to - they get the agreement text instead, once per cooldown,
+    # with no model call and nothing spent - and /agree opens the door. Their
+    # messages archive like anyone's; only the reply is withheld.
+    from qqbot.core import agreement as _agree
     st16 = await REGISTRY.get("123")
     n16 = len(bot.sent)
-    _nb16 = sum(1 for m in st16.recent if m.is_bot)
-    for _judge.mode, label in (("Block", "a Block verdict"),
-                               ("Review", "a Review verdict"),
-                               ("boom", "a dead judge")):
-        st16.reply_window._hits.clear()
-        await GATEWAY.handle(bot, FakeEvent("小X 跟我念一遍", user_id="bait1",
-                                            nickname="钓鱼的", to_me=True))
-        await drain()
-        check(f"{label} means silence, and the sender is untouched",
-              len(bot.sent) == n16 and "bait1" not in st16.blocked
-              and await pool().fetchval(
-                  "SELECT count(*) FROM group_blocklist WHERE group_id=123"
-                  " AND user_id='bait1'") == 0)
-    check("the suppressed replies never enter the window",
-          sum(1 for m in st16.recent if m.is_bot) == _nb16)
-    check("the report counter saw all three holds",
-          _censor.SUPPRESSED.get("123", 0) == 3, str(dict(_censor.SUPPRESSED)))
-    _censor.set_moderation(None)
+    calls16 = len(LLM_CALLS)
+    st16.reply_window._hits.clear()
+    ev16 = FakeEvent("小X 在吗", user_id="newbie", nickname="新人", to_me=True)
+    await GATEWAY.handle(bot, ev16)
+    await drain()
+    check("an unconsenting member draws the agreement, not a reply",
+          len(bot.sent) == n16 + 1 and "/agree" in str(bot.sent[-1])
+          and len(LLM_CALLS) == calls16, str(bot.sent[n16:])[:160])
+    check("and their message still archives",
+          await pool().fetchval(
+              "SELECT count(*) FROM raw_event WHERE platform_event_id=$1",
+              str(ev16.message_id)) == 1)
+    st16.reply_window._hits.clear()
+    await GATEWAY.handle(bot, FakeEvent("小X 在吗", user_id="newbie",
+                                        nickname="新人", to_me=True))
+    await drain()
+    check("the agreement prompt respects its cooldown",
+          len(bot.sent) == n16 + 1, f"{len(bot.sent) - n16} sent")
+    check("/agree records a first acceptance as first",
+          await _agree.accept("newbie") is True)
+    check("and a repeat as a repeat", await _agree.accept("newbie") is False)
+    st16.reply_window._hits.clear()
+    await GATEWAY.handle(bot, FakeEvent("小X 在吗", user_id="newbie",
+                                        nickname="新人", to_me=True))
+    await drain()
+    check("after /agree the reply path opens",
+          len(bot.sent) == n16 + 2 and len(LLM_CALLS) > calls16)
 
     # Last, so every kind of memory write has actually happened by now. Reasoning
     # models bill deliberation as output, so a memory call must ask for a terse
