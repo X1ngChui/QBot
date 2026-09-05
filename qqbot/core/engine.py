@@ -146,6 +146,7 @@ async def generate(
     cfg: Settings,
     persona: Persona,
     batch: list[ChatMsg],
+    window: list[ChatMsg] | None = None,
 ) -> tuple[str | None, str, str]:
     """Returns (reply text, provenance marker, trajectory entry). Both extras are ""
     for a reply that used no tools; the caller appends the marker to the archived
@@ -172,15 +173,18 @@ async def generate(
         log.warning("group %s: episode recall failed, replying without it: %s",
                     st.group_id, why(e))
         episodes = ""
-    # The window and numbering are computed exactly once, here, and handed both to
+    # The window and numbering are computed exactly once and handed both to
     # the tool context and to assemble: the seq->message map inspect_image resolves
     # against and the numbers the model reads must come from the same pass. The
-    # stored trajectories for the window's own replies are fetched by id - the
-    # table is the single source of truth, the deque holds only conversation - and
-    # render_history seats each one right before the reply it fed. Eviction needs
-    # no bookkeeping: a reply that slides out of the window simply stops being
-    # asked about.
-    window = prompt.history_window(st, batch, cfg)
+    # caller normally passes the window in - the slice was cut when the message
+    # arrived, so concurrent tasks and later arrivals cannot shift what this
+    # reply is looking at. The stored trajectories for the window's own replies
+    # are fetched by id - the table is the single source of truth, the deque
+    # holds only conversation - and render_history seats each one right before
+    # the reply it fed. Eviction needs no bookkeeping: a reply that slides out
+    # of the window simply stops being asked about.
+    if window is None:
+        window = prompt.history_window(st, batch, cfg)
     nums, marks = prompt.numbered(window + list(batch))
     ctx = tools.ToolCtx(bot=bot,
                         by_seq={nums[m.msg_id]: m for m in window + list(batch)})
@@ -299,12 +303,13 @@ async def respond(
     cfg: Settings,
     persona: Persona,
     batch: list[ChatMsg],
+    window: list[ChatMsg] | None = None,
     reply_to: str = "",
     initiator: str = "",
 ) -> bool:
     try:
         raw, prov, trace = await generate(
-            bot=bot, st=st, cfg=cfg, persona=persona, batch=batch)
+            bot=bot, st=st, cfg=cfg, persona=persona, batch=batch, window=window)
     except Exception as e:
         log.warning("group %s: generation failed, staying silent: %s", st.group_id, why(e))
         return False
@@ -320,11 +325,6 @@ async def respond(
     # on, so a later turn can cite a searched answer instead of re-searching, and
     # knows an unmarked one was improvised off the context.
     kept = f"{text} {prov}" if prov else text
-
-    # Consume a rate-limit slot only when actually sending (section 1).
-    if not st.reply_window.take(cfg.trigger.max_replies_per_min):
-        log.info("group %s: rate limit hit right before send, dropped", st.group_id)
-        return False
 
     # The reply quotes the message that asked for it and @-es its sender - the
     # exact shape QQ's own reply button produces, so the answer reads native and

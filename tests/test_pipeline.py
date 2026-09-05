@@ -236,10 +236,9 @@ async def main():
     # section; everywhere else a reply is the thing under test.
     from qqbot.db import repo as _repo_seed
     for _uid in ("u1", "u7", "u9", "u404", "bad1", "1", "7", "999"):
-        await _repo_seed.record_agreement(_uid)
+        await _repo_seed.record_agreement(123, _uid, 1)
 
     cfg = config().default
-    cfg.gateway.merge_window_sec = 0.25
     # The reply path will not start without one, which is the point: a half-wired
     # deployment must fail at boot, not quietly degrade recall.
     from qqbot.core import retrieval as _retr_wire
@@ -349,7 +348,6 @@ async def main():
     # 1b. A real @ arrives as to_me with the segment already stripped by the adapter.
     # Relying on the at segment alone means the must-answer path never fires for @.
     st_at = await REGISTRY.get("123")
-    st_at.reply_window._hits.clear()
     n_at = len(bot.sent)
     await GATEWAY.handle(bot, FakeEvent("你好，介绍一下自己", to_me=True))
     await drain()
@@ -363,12 +361,10 @@ async def main():
     # they change their group card.
     cfg.owners = ["u9"]
     st_o = await REGISTRY.get("123")
-    st_o.reply_window._hits.clear()
     await GATEWAY.handle(bot, FakeEvent("在吗", to_me=True, user_id="u9", nickname="随便改的名字"))
     await drain()
     own_tail = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["messages"][-1]["content"]
     check("owner is tagged in the prompt", "随便改的名字（拥有者）" in own_tail, own_tail[-90:])
-    st_o.reply_window._hits.clear()
     await GATEWAY.handle(bot, FakeEvent("在吗", to_me=True, user_id="u1", nickname="阿强"))
     await drain()
     plain_tail = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["messages"][-1]["content"]
@@ -411,25 +407,46 @@ async def main():
     check("a muted group stays silent even when addressed", len(bot.sent) == n1)
     st.muted = False
 
-    # 6. merge window collapses a burst into one reply
+    # 6. one message, one verdict: in a burst only the addressed fragment draws a
+    # reply, immediately - later fragments are ordinary background, not merged in.
+    st6 = await REGISTRY.get("123")
     n2 = len(bot.sent)
-    for t in ("小X", "你看", "这个"):
-        await GATEWAY.handle(bot, FakeEvent(t))
+    ev6 = FakeEvent("小X 你看")
+    for e in (ev6, FakeEvent("这个"), FakeEvent("怎么样")):
+        await GATEWAY.handle(bot, e)
         await asyncio.sleep(0.05)
     await drain()
-    check("burst merges into one reply", len(bot.sent) == n2 + 1, f"{len(bot.sent) - n2} replies")
-    tail = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["messages"][-1]["content"]
-    check("all burst messages reach the prompt",
-          "小X" in tail and "你看" in tail and "这个" in tail, tail[-60:])
+    check("only the addressed fragment replies", len(bot.sent) == n2 + 1,
+          f"{len(bot.sent) - n2} replies")
+    check("and the reply quotes exactly that fragment",
+          bot.quoted[-1] == str(ev6.message_id), f"quoted {bot.quoted[-1]}")
+    tail6 = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["messages"][-1]["content"]
+    check("the slice ends at the addressed message - later fragments stay out",
+          "小X 你看" in tail6 and "怎么样" not in tail6, tail6[-80:])
 
-    # 7. per-minute cap is the hard floor even for direct mentions
+    # 6b. two people asking almost at once each get their own reply, each quoting
+    # its own asker - the misdirected-reply failure this design exists to end.
+    n2b = len(bot.sent)
+    ev_a = FakeEvent("小X 第一个问", user_id="u1", nickname="阿强", to_me=True)
+    ev_b = FakeEvent("小X 第二个问", user_id="u7", nickname="小南", to_me=True)
+    await GATEWAY.handle(bot, ev_a)
+    await GATEWAY.handle(bot, ev_b)
+    await drain()
+    check("two near-simultaneous askers get two replies",
+          len(bot.sent) == n2b + 2, f"{len(bot.sent) - n2b} replies")
+    check("each reply quotes and @s its own asker, whatever the finish order",
+          dict(zip(bot.quoted[-2:], bot.ats[-2:]))
+          == {str(ev_a.message_id): "u1", str(ev_b.message_id): "u7"},
+          f"{bot.quoted[-2:]} {bot.ats[-2:]}")
+
+    # 7. no rate cap: every addressed message earns its one reply attempt -
+    # money and the provider concurrency semaphore are what bound the pace.
     n3 = len(bot.sent)
-    for i in range(8):
+    for i in range(5):
         await GATEWAY.handle(bot, FakeEvent(f"小X 第{i}次"))
-        await drain(0.45)
-    sent_now = len(bot.sent) - n3
-    check("per-minute cap holds", sent_now <= cfg.trigger.max_replies_per_min,
-          f"{sent_now} sent, cap {cfg.trigger.max_replies_per_min}")
+    await drain()
+    check("every ask is answered, none rate-dropped", len(bot.sent) - n3 == 5,
+          f"{len(bot.sent) - n3} sent")
 
     # 8. dedup
     ev = FakeEvent("小X 重复消息")
@@ -456,7 +473,6 @@ async def main():
 
     # 11. nothing that changes every turn may sit in the cached system block.
     st2 = await REGISTRY.get("123")
-    st2.reply_window._hits.clear()
     await GATEWAY.handle(bot, FakeEvent("小X 显卡现在多少钱"))
     await drain()
     msgs = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["messages"]
@@ -470,7 +486,6 @@ async def main():
     # been decorative for as long as the proactive path had been gone.
     cfg.budget.daily_cny_cap = 0.0000001
     BUDGET._loaded = False
-    st2.reply_window._hits.clear()
     n6 = len(bot.sent)
     await GATEWAY.handle(bot, FakeEvent("随便说点什么"))
     await drain()
@@ -576,7 +591,6 @@ async def main():
     _MEDIA._img_windows.clear()      # earlier sections consumed per-minute slots
 
     st_m = await REGISTRY.get("123")
-    st_m.reply_window._hits.clear()
     n_before = len(bot.sent)
     img_event = FakeEvent(segments=[
         Seg("at", {"qq": "24680"}),
@@ -598,7 +612,6 @@ async def main():
 
     # A question about it later pays nothing more: the description was bought when the
     # picture arrived and has been sitting in the history since.
-    st_m.reply_window._hits.clear()
     await GATEWAY.handle(bot, FakeEvent("小X 刚那张图是什么"))
     await drain(2.0)
     check("a question about it pays nothing more",
@@ -613,14 +626,12 @@ async def main():
         "SELECT plain_text FROM raw_event WHERE platform_event_id=$1", str(img_event.message_id))
     check("the archive is corrected too, so memory keeps the description",
           "橘猫" in (backfilled or ""), repr(backfilled))
-    st_m.reply_window._hits.clear()
     await GATEWAY.handle(bot, FakeEvent("小X 那图呢"))
     await drain(2.0)
     check("and asking again does not pay for it a second time",
           len(VISION_SEEN) == 1, str(VISION_SEEN))
 
     # Nor does reposting it: the cache keys on the picture, not the message.
-    st_m.reply_window._hits.clear()
     await GATEWAY.handle(bot, FakeEvent(segments=[
         Seg("image", {"file": "A" * 32 + ".png", "url": "http://x/y2.png", "summary": ""}),
     ]))
@@ -630,7 +641,6 @@ async def main():
 
     # A picture in the message that draws the reply is likewise understood on arrival -
     # in the prompt in time for the answer.
-    st_m.reply_window._hits.clear()
     img2 = FakeEvent(segments=[
         Seg("text", {"text": "小X 这图什么意思"}),
         Seg("image", {"file": "B" * 32 + ".png", "url": "http://x/z.png", "summary": ""}),
@@ -659,7 +669,6 @@ async def main():
     cap_was = cfg.budget.daily_cny_cap
     cfg.budget.daily_cny_cap = 0.000001
     BUDGET._loaded = False
-    st_m.reply_window._hits.clear()
     capped = FakeEvent(segments=[
         Seg("image", {"file": "E" * 32 + ".png", "url": "http://x/e.png", "summary": ""})])
     await GATEWAY.handle(bot, capped)
@@ -678,7 +687,6 @@ async def main():
     # Before the Unsettled distinction, the paid pass cleared pending on the fallback
     # and a cap-blocked picture could never be described again (a regression this
     # pins).
-    st_m.reply_window._hits.clear()
     await GATEWAY.handle(bot, FakeEvent("小X 刚才那张图是什么"))
     await drain(2.0)
     check("with money back, a cap-blocked picture is described on the next ask",
@@ -690,7 +698,6 @@ async def main():
 
     # A picture nobody addresses costs exactly one describing call - the whole rule is
     # now pay per unique picture, not per reply that happens to read one.
-    st_m.reply_window._hits.clear()
     n_sent, n_seen = len(bot.sent), len(VISION_SEEN)
     img3 = FakeEvent(segments=[
         Seg("text", {"text": "随手发张图"}),
@@ -841,7 +848,6 @@ async def main():
 
     # 12e. reply and forward segments reach the model as content
     st_r = await REGISTRY.get("123")
-    st_r.reply_window._hits.clear()
     # Addressed, because that is the only way a reply happens now - and quoting somebody
     # while asking the bot about it is exactly the shape this checks.
     await GATEWAY.handle(bot, FakeEvent(segments=[
@@ -861,7 +867,6 @@ async def main():
     # member list, which is both simpler and answers for people who never spoke.
     from qqbot.core.media import MEDIA as _M
     check("media keeps no name cache of its own", not hasattr(_M, "_names"))
-    st_r.reply_window._hits.clear()
     await GATEWAY.handle(bot, FakeEvent(segments=[
         Seg("forward", {"id": "ff"}),
         Seg("text", {"text": "小X 看看这个"}),
@@ -1048,7 +1053,8 @@ async def main():
     # the model answered whichever thread in the history looked livelier - leaving the
     # person who had actually addressed it with no answer.
     check("and the tail says which message to answer",
-          "只回复其中叫你的那条" in _tail and "背景" in _tail, _tail[-140:])
+          "只回复「刚收到的消息」下面的那一条" in _tail and "背景" in _tail,
+          _tail[-140:])
     # And says it without pointing two ways at once: the messages are introduced as being
     # below, so the instruction must not then refer to them as being above.
     check("and refers to it by description, not by direction",
@@ -1056,7 +1062,7 @@ async def main():
     # The exception matters as much as the rule. Being asked to answer something raised
     # earlier is ordinary, and a flat ban on the history would refuse it.
     check("while still allowing a question the message points at",
-          "除非叫你的那条明确要你答" in _tail, _tail[-140:])
+          "除非这条刚收到的消息明确要你代答" in _tail, _tail[-140:])
     check("but never in the cached system block",
           "老周答应周末把切片做完" not in prompt_mod.build_system(persona_k, _cfg_o, [], []))
 
@@ -1246,7 +1252,6 @@ async def main():
     set_providers(Providers(text=OneSearchText(), vision=UnusedVision(),
                             asr=UnusedAsr(), search=EndlessSearch()))
     st_pv = await REGISTRY.get("123")
-    st_pv.reply_window._hits.clear()
     ok_pv = await _eng.respond(
         bot=bot, st=st_pv, cfg=cfg, persona=config().for_group("123")[1],
         batch=[_CM0(msg_id="pv1", user_id="u1", nickname="阿强",
@@ -1339,7 +1344,6 @@ async def main():
     _retr.episodes_for = _broken_recall
     try:
         st14b = await REGISTRY.get("123")
-        st14b.reply_window._hits.clear()
         n_sent14 = len(bot.sent)
         await GATEWAY.handle(bot, FakeEvent("小X 还记得上次说的吗", to_me=True))
         await drain(2.0)
@@ -1357,7 +1361,6 @@ async def main():
     st15 = await REGISTRY.get("123")
     st15.blocked["bad1"] = None
     await _repo.block(123, "bad1")
-    st15.reply_window._hits.clear()
     n_sent15 = len(bot.sent)
     ev_blocked = FakeEvent("小X 在吗", user_id="bad1", nickname="捣乱的", to_me=True)
     await GATEWAY.handle(bot, ev_blocked)
@@ -1374,7 +1377,6 @@ async def main():
           str(fresh15.blocked))
     st15.blocked.pop("bad1", None)
     await _repo.unblock(123, "bad1")
-    st15.reply_window._hits.clear()
     await GATEWAY.handle(bot, FakeEvent("小X 还在吗", user_id="bad1",
                                         nickname="捣乱的", to_me=True))
     await drain()
@@ -1385,7 +1387,6 @@ async def main():
     from datetime import timedelta as _btd
     st15.blocked["bad1"] = _nl0() - _btd(seconds=1)
     await _repo.block(123, "bad1", until=_nl0() - _btd(seconds=1))
-    st15.reply_window._hits.clear()
     n_lapse = len(bot.sent)
     await GATEWAY.handle(bot, FakeEvent("小X 醒了吗", user_id="bad1",
                                         nickname="捣乱的", to_me=True))
@@ -1401,7 +1402,6 @@ async def main():
     # A still-running timed block behaves like any block.
     st15.blocked["bad1"] = _nl0() + _btd(hours=1)
     await _repo.block(123, "bad1", until=_nl0() + _btd(hours=1))
-    st15.reply_window._hits.clear()
     n_live = len(bot.sent)
     await GATEWAY.handle(bot, FakeEvent("小X 在么", user_id="bad1",
                                         nickname="捣乱的", to_me=True))
@@ -1418,7 +1418,6 @@ async def main():
     st16 = await REGISTRY.get("123")
     n16 = len(bot.sent)
     calls16 = len(LLM_CALLS)
-    st16.reply_window._hits.clear()
     ev16 = FakeEvent("小X 在吗", user_id="newbie", nickname="新人", to_me=True)
     await GATEWAY.handle(bot, ev16)
     await drain()
@@ -1429,16 +1428,26 @@ async def main():
           await pool().fetchval(
               "SELECT count(*) FROM raw_event WHERE platform_event_id=$1",
               str(ev16.message_id)) == 1)
-    st16.reply_window._hits.clear()
     await GATEWAY.handle(bot, FakeEvent("小X 在吗", user_id="newbie",
                                         nickname="新人", to_me=True))
     await drain()
     check("the agreement prompt respects its cooldown",
           len(bot.sent) == n16 + 1, f"{len(bot.sent) - n16} sent")
     check("/agree records a first acceptance as first",
-          await _agree.accept("newbie") is True)
-    check("and a repeat as a repeat", await _agree.accept("newbie") is False)
-    st16.reply_window._hits.clear()
+          await _agree.accept("123", "newbie") is True)
+    check("and a repeat as a repeat", await _agree.accept("123", "newbie") is False)
+    check("consent in one group says nothing about another",
+          not await _agree.ok("456", "newbie"))
+    # A version bump voids old acceptances: everyone re-consents to the new
+    # text, and re-accepting registers as a change, not a repeat.
+    _orig_version = _agree.version
+    _agree.version = lambda: 2
+    check("a version bump voids the old acceptance",
+          not await _agree.ok("123", "newbie"))
+    check("re-accepting the new version counts as a change",
+          await _agree.accept("123", "newbie") is True)
+    check("and satisfies the gate again", await _agree.ok("123", "newbie"))
+    _agree.version = _orig_version
     await GATEWAY.handle(bot, FakeEvent("小X 在吗", user_id="newbie",
                                         nickname="新人", to_me=True))
     await drain()

@@ -1,12 +1,17 @@
 """The message pipeline (section 2): what happens to a message between arriving and
 being answered. (`gateway/` is the protocol layer - OneBot in, typed events out.)
 
-  arrive -> dedup / blocklist -> ingest -> free media lookups
-  -> per-group merge buffer (2.5s of silence) -> trigger -> paid media -> reply
+  arrive -> dedup -> ingest -> free media lookups -> trigger
+  -> context slice -> reply task (paid media -> reply)
 
-One coroutine plus one queue per group. The order is what keeps the cost down: everything
-before the trigger is free, and nothing is paid for until the bot has decided to answer -
-which, since it only speaks when spoken to, is settled by a nickname match.
+Every addressed message gets exactly one reply task, cut loose at the moment it
+arrives with its own slice of the conversation. Tasks run concurrently: each
+quotes and @s its own initiator and bills its own asker (task-local budget
+attribution), so two people asking at once each get their own answer instead of
+the later ask absorbing the earlier one. The order is what keeps the cost down:
+everything before the trigger is free, and nothing is paid for until the bot has
+decided to answer - which, since it only speaks when spoken to, is settled by a
+nickname match.
 
 The archive runs off the hot path in the background, because the text has to reach the
 history whether or not anything is answered.
@@ -39,15 +44,9 @@ log = logging.getLogger("qqbot.pipeline")
 #: describe measures 10-20s; the person is already waiting for an answer about the
 #: picture, so waiting beats answering that it could not be seen. Timing out is
 #: still safe either way - the work completes and lands for the next turn. Only a
-#: replying batch waits at all: the tasks persist their own results, so a batch
-#: that draws no reply costs the worker nothing.
+#: replying message waits at all: the media tasks persist their own results, so a
+#: message that draws no reply costs nothing here.
 MEDIA_WAIT_PAID_SEC = 25.0
-#: The merge loop gives up on quiet at this many messages. A group sustaining
-#: sub-window gaps would otherwise grow one batch - and defer its reply and its
-#: media settles - for as long as the flood lasts; whoever @-ed the bot at the
-#: start would be answered when it ends. One chunk's worth is already far past
-#: any conversational pause; the overflow just opens the next batch.
-MERGE_CAP = 30
 
 
 class Inbound:
@@ -58,21 +57,19 @@ class Inbound:
         self.parsed = parsed
         self.media_task = media_task
         self.archive_task = archive_task
-        #: The text as it arrived, before any media patch. The patch mutates msg in
-        #: place - possibly during the merge wait - so ordering alone cannot keep
-        #: the trigger reading what was typed; only a snapshot can.
+        #: The text as it arrived, before any media patch. The patch task mutates
+        #: msg in place on its own schedule, so ordering alone cannot keep the
+        #: trigger reading what was typed; only a snapshot can.
         self.heard = msg.text
 
 
 class Gateway:
     def __init__(self) -> None:
         self._dedup: DedupSet | None = None
-        self._queues: dict[str, asyncio.Queue[Inbound]] = {}
-        self._workers: dict[str, asyncio.Task] = {}
-        #: The most recent Bot per group. A reconnect creates a new Bot object and the
-        #: old one's API calls fail forever, so a worker must never capture one - it
-        #: reads the latest here at each use.
-        self._bots: dict[str, BotApi] = {}
+        #: In-flight reply tasks, one per addressed message. Cancelled at
+        #: shutdown: a half-generated reply is money already spent either way,
+        #: and holding the restart for a 30s model call helps nobody.
+        self._replies: set[asyncio.Task] = set()
         #: Fire-and-forget tasks (archive writes, media patches) still in flight.
         #: Tracked so shutdown can wait them out; every restart is a deploy, and an
         #: archive insert dropped by the closing pool is a message lost for good.
@@ -92,12 +89,12 @@ class Gateway:
         return self._dedup
 
     async def shutdown(self) -> None:
-        """Stop the per-group workers and wait for them.
+        """Stop the in-flight reply tasks and wait for them.
 
         Cancelling alone does not wait: the gather keeps shutdown from returning while a
-        worker is still inside a query, with the pool about to close underneath it.
+        task is still inside a query, with the pool about to close underneath it.
         """
-        tasks = list(self._workers.values())
+        tasks = list(self._replies)
         for task in tasks:
             task.cancel()
         if tasks:
@@ -106,8 +103,7 @@ class Gateway:
         # only waited for, briefly: a hung one must not hold the whole shutdown.
         if self._loose:
             await asyncio.wait(self._loose, timeout=5)
-        self._workers.clear()
-        self._queues.clear()
+        self._replies.clear()
 
     # -- producer ---------------------------------------------------------
     async def handle(self, bot: BotApi, event) -> None:
@@ -210,9 +206,43 @@ class Gateway:
                 archive_task=archive_task,
             ))
 
-        await self._queue(bot, group_id).put(
-            Inbound(msg, parsed, media_task, archive_task)
-        )
+        item = Inbound(msg, parsed, media_task, archive_task)
+        # Hold on to anything still unresolved and expensive. A picture is usually
+        # asked about in the message *after* it - a separate task by then, whose
+        # backlog settle is what pays for it - see ChatMsg.pending.
+        if parsed.needs_model:
+            msg.pending = parsed
+        st.add(msg)
+
+        # Decided on the text as it arrived (Inbound.heard), never the resolved
+        # form: patched content - a forwarded conversation whose body names the
+        # bot, a mention rendering to a card that matches a nickname - can contain
+        # the trigger word without anyone having typed it at the bot, and being
+        # spoken to means something somebody typed deliberately. A typed nickname
+        # is in the arrival text and an @ is a parse-time flag, so no legitimate
+        # trigger needs the resolved form. The media tasks keep running and patch
+        # the window on their own; the paid settle in the reply task waits for
+        # them before the prompt reads the text.
+        decision = trigger.decide(replace(msg, text=item.heard), parsed.at_bot,
+                                  st=st, cfg=cfg)
+        if not decision.reply:
+            # Being addressed and still saying nothing is never normal, and silence is the
+            # one symptom that looks identical whether the bot chose not to speak or
+            # something broke. Not being addressed at all is the ordinary case.
+            if parsed.at_bot:
+                log.info("group %s: addressed but not replying (%s)", group_id, decision.reason)
+            else:
+                log.debug("group %s: no reply (%s)", group_id, decision.reason)
+            return
+
+        # The context slice is cut here, at arrival, and travels with the task:
+        # no await sits between st.add above and this line, so the slice ends
+        # exactly at the message being answered, and whatever arrives while the
+        # task is generating can neither leak in nor steal the reply's target.
+        window = prompt.history_window(st, [msg], cfg)
+        task = asyncio.create_task(self._reply(bot, group_id, item, decision, window))
+        self._replies.add(task)
+        task.add_done_callback(self._replies.discard)
 
     @staticmethod
     async def _archive(inbound: GroupMessage, *, at_accounts: list[str]) -> None:
@@ -230,73 +260,21 @@ class Gateway:
         except Exception:
             log.exception("failed to archive message %s", inbound.message_id)
 
-    def _queue(self, bot: BotApi, group_id: str) -> asyncio.Queue:
-        self._bots[group_id] = bot
-        q = self._queues.get(group_id)
-        if q is None:
-            q = asyncio.Queue()
-            self._queues[group_id] = q
-            self._workers[group_id] = asyncio.create_task(self._worker(group_id, q))
-        return q
+    async def _reply(self, bot: BotApi, group_id: str, item: Inbound,
+                     decision: trigger.Decision, window: list[ChatMsg]) -> None:
+        """One reply attempt for one addressed message, start to finish.
 
-    # -- consumer ---------------------------------------------------------
-    async def _worker(self, group_id: str, q: asyncio.Queue) -> None:
-        while True:
-            try:
-                first = await q.get()
-                batch = [first]
-                window = config().for_group(group_id)[0].gateway.merge_window_sec
-                while len(batch) < MERGE_CAP:  # merge until the group goes quiet
-                    try:
-                        batch.append(await asyncio.wait_for(q.get(), timeout=window))
-                    except asyncio.TimeoutError:
-                        break
-                # The Bot is read at use time, not captured at worker creation: after a
-                # reconnect only the latest object can still reach the platform.
-                await self._process(self._bots[group_id], group_id, batch)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("group %s: worker loop error", group_id)
-
-    async def _process(self, bot: BotApi, group_id: str, batch: list[Inbound]) -> None:
+        Tasks run concurrently. Each carries its own context slice (cut at
+        arrival), quotes and @s its own initiator, and bills its own asker
+        through the budget's task-local attribution - so simultaneous asks
+        answer independently, in whatever order the model finishes them.
+        """
         cfg, persona = config().for_group(group_id)
         st = await REGISTRY.get(group_id)
 
-        for item in batch:
-            # Hold on to anything still unresolved and expensive. A picture is usually
-            # asked about in the message *after* it, by which point this batch is done and
-            # its refs would be gone - see ChatMsg.pending.
-            if item.parsed.needs_model:
-                item.msg.pending = item.parsed
-            st.add(item.msg)
-
-        # Decided on the text as it arrived (Inbound.heard), never the resolved
-        # form: patched content - a forwarded conversation whose body names the
-        # bot, a mention rendering to a card that matches a nickname - can contain
-        # the trigger word without anyone having typed it at the bot, and being
-        # spoken to means something somebody typed deliberately. A typed nickname
-        # is in the arrival text and an @ is a parse-time flag, so no legitimate
-        # trigger needs the resolved form. The media tasks keep running and patch
-        # the window on their own; the paid settle below waits for them before the
-        # prompt reads the text.
-        decision = trigger.decide(
-            [(replace(i.msg, text=i.heard), i.parsed.at_bot) for i in batch],
-            st=st, cfg=cfg)
-
-        if not decision.reply:
-            # Being addressed and still saying nothing is never normal, and silence is the
-            # one symptom that looks identical whether the bot chose not to speak or
-            # something broke. Not being addressed at all is the ordinary case.
-            if any(i.parsed.at_bot for i in batch):
-                log.info("group %s: addressed but not replying (%s)", group_id, decision.reason)
-            else:
-                log.debug("group %s: no reply (%s)", group_id, decision.reason)
-            return
-
         if await BUDGET.exceeded(cfg.budget.daily_cny_cap):
             # After the trigger on purpose: it fires once per suppressed reply, not
-            # once per batch all afternoon - hundreds of identical warnings would
+            # once per message all afternoon - hundreds of identical warnings would
             # walk the actionable failures out of the ring the daily report reads.
             log.warning("group %s: daily budget cap of %.2f reached, staying quiet "
                         "until the day rolls over", group_id, cfg.budget.daily_cny_cap)
@@ -311,11 +289,12 @@ class Gateway:
         # The consent gate, before anything is paid for: a member who has not
         # accepted the user agreement gets the agreement itself instead of a
         # reply - at most once per cooldown - and nothing is spent on their
-        # behalf. Commands keep working (they are how /agree reaches them),
-        # archiving is untouched, owners are exempt.
+        # behalf. Of the commands only /agree answers before consent
+        # (commands._gate holds the rest); archiving is untouched, owners are
+        # exempt.
         if (who and not perms.is_owner(who, cfg.owners)
-                and not await agreement.ok(who)):
-            if agreement.should_prompt(who):
+                and not await agreement.ok(group_id, who)):
+            if agreement.should_prompt(group_id, who):
                 try:
                     await bot.send_group_msg(
                         group_id=int(group_id),
@@ -332,25 +311,30 @@ class Gateway:
         # the trigger decision already named. An attribution, not a charge: the
         # budget stays shared, this only feeds the /top leaderboard's ledger
         # column.
-        with BUDGET.attribute(who):
-            # Only now is anything paid for. Understanding a picture is worth money
-            # exactly when the model is about to read the message it is in - which,
-            # since the bot only speaks when spoken to, is a question that has
-            # already been answered by here.
-            await self._settle_media(batch, group_id, bot=bot, cfg=cfg, who=who)
-            # And whatever is still unread in the history about to be sent: a
-            # question about a voice clip refers to the message before it, which
-            # was never worth paying for on its own.
-            await self._settle_backlog(
-                st, group_id, bot=bot, cfg=cfg, batch=[i.msg for i in batch],
-                who=who,
-            )
-            await engine.respond(
-                bot=bot, st=st, cfg=cfg, persona=persona,
-                batch=[i.msg for i in batch],
-                reply_to=decision.initiator_msg_id,
-                initiator=decision.initiator,
-            )
+        try:
+            with BUDGET.attribute(who):
+                # Only now is anything paid for. Understanding a picture is worth money
+                # exactly when the model is about to read the message it is in - which,
+                # since the bot only speaks when spoken to, is a question that has
+                # already been answered by here.
+                await self._settle_media([item], group_id, bot=bot, cfg=cfg, who=who)
+                # And whatever is still unread in the history about to be sent: a
+                # question about a voice clip refers to the message before it, which
+                # was never worth paying for on its own.
+                await self._settle_backlog(
+                    st, group_id, bot=bot, cfg=cfg, batch=[item.msg], who=who,
+                )
+                await engine.respond(
+                    bot=bot, st=st, cfg=cfg, persona=persona,
+                    batch=[item.msg], window=window,
+                    reply_to=decision.initiator_msg_id,
+                    initiator=decision.initiator,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A bare task has no worker loop above it to log for it.
+            log.exception("group %s: reply task failed", group_id)
 
     async def _settle_backlog(
         self, st, group_id: str, *, bot: BotApi, cfg, batch: list[ChatMsg],

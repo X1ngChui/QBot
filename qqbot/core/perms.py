@@ -12,9 +12,10 @@ call. "Themselves" means the person, not the account: the handlers resolve it
 through accounts_of_person, so a merged alt operates its main's record, the
 same way /block treats them.
 
-Everything outside that boundary is answered with silence, never a refusal: to
-whoever cannot run a command it does not exist, and /help's listing is filtered
-the same way.
+The member surface opens only past the user agreement: before /agree, the one
+command that answers is /agree itself. Everything outside the boundary is
+answered with silence, never a refusal: to whoever cannot run a command it
+does not exist, and /help's listing is filtered the same way.
 
 The QQ group role is never consulted - running the QQ group is not running the bot - and
 nothing the platform says about a speaker can reach this decision, because there is no

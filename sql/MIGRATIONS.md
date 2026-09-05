@@ -16,7 +16,11 @@ docker exec qbot-postgres-1 psql -U qqbot -d qqbot -c "<statement>"
 ## 2026-09-04 — the user agreement gate
 
 ```sql
--- New table: run the CREATE TABLE user_agreement block from init.sql verbatim.
+-- Same-day reshapes: the first cut was keyed by user alone (consent is per
+-- (group, user)), the second lacked the version column. Drop and re-run the
+-- CREATE TABLE user_agreement block from init.sql verbatim, or on the
+-- two-column shape:
+ALTER TABLE user_agreement ADD COLUMN IF NOT EXISTS version INT NOT NULL DEFAULT 1;
 ```
 
 ## 2026-09-04 — the exit guard stops punishing

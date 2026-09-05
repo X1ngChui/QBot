@@ -44,19 +44,18 @@ class _M(BaseModel):
 
 
 class GatewayCfg(_M):
-    merge_window_sec: float = 2.5
     dedup_ttl_sec: int = 300
     max_msg_len: int = 2000
 
 
 class TriggerCfg(_M):
-    """When the bot answers. Two fields, because there are only two things to decide:
-    which names count as being addressed, and how often it may speak at all.
+    """When the bot answers: which names count as being addressed. There is no
+    rate cap - every addressed message earns its one reply attempt, and money
+    (plus the provider concurrency semaphore) is what bounds the pace.
     """
 
     # Every name the bot answers to, canonical plus variants.
     nicknames: list[str] = Field(default_factory=list)
-    max_replies_per_min: int = 4
 
 
 # One section per capability, each carrying its own endpoint, model and credential name

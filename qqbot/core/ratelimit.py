@@ -1,8 +1,7 @@
-"""Sliding-window rate limiting.
+"""Sliding-window rate limiting and inbound dedup.
 
-max_replies_per_min guards against getting the account banned, not against overspending.
-That is why it sits at level 0 and no path - including the must-answer path - may bypass
-it.
+The window backs the per-group image-describe cap (media.py); DedupSet drops
+the adapter's replayed events.
 """
 
 from __future__ import annotations

@@ -31,7 +31,7 @@ def check(name, cond, detail=""):
 
 # ---- config
 b = config()
-check("config loads", b.default.trigger.max_replies_per_min == 4,
+check("config loads", b.default.gateway.max_msg_len == 2000,
       f"nicknames={b.default.trigger.nicknames}")
 check("persona loaded", "default" in b.personas, str(list(b.personas)))
 cfg, persona = b.for_group("12345")
@@ -151,41 +151,34 @@ def _tm(uid, text, is_bot=False):
 
 
 check("an @ is answered",
-      trigger.decide([(_tm("u1", "在吗"), True)], st=_st, cfg=_tcfg).reply)
+      trigger.decide(_tm("u1", "在吗"), True, st=_st, cfg=_tcfg).reply)
 check("a nickname is answered",
-      trigger.decide([(_tm("u1", "小X 在吗"), False)], st=_st, cfg=_tcfg).reply)
+      trigger.decide(_tm("u1", "小X 在吗"), False, st=_st, cfg=_tcfg).reply)
 check("anything else is not",
-      not trigger.decide([(_tm("u1", "今天天气不错"), False)], st=_st, cfg=_tcfg).reply)
+      not trigger.decide(_tm("u1", "今天天气不错"), False, st=_st, cfg=_tcfg).reply)
 
-# The initiator is settled by the same look that decides to reply, and travels on
-# the Decision - the reply quotes their message, the spend is attributed to them.
-# Nothing downstream re-derives it.
+# One message, one verdict: the initiator is the addressed message's own sender,
+# settled by the same look that decides to reply, and travels on the Decision -
+# the reply quotes their message, the spend is attributed to them. Nothing
+# downstream re-derives it, and nobody else's message can steal it.
 _m1 = _tm("u1", "小X 来评评理")
-_d = trigger.decide([(_m1, False), (_tm("u2", "别理他"), False)], st=_st, cfg=_tcfg)
-check("the decision names the addresser, not the last speaker",
+_d = trigger.decide(_m1, False, st=_st, cfg=_tcfg)
+check("the decision names the addresser",
       _d.reply and _d.initiator == "u1" and _d.initiator_msg_id == _m1.msg_id,
       str(_d))
-_d = trigger.decide([(_tm("u1", "在吗"), True),
-                     (_tm("u2", "小X 你说说"), False)], st=_st, cfg=_tcfg)
-check("when two people call, the later ask is the initiator", _d.initiator == "u2")
-_d = trigger.decide([(_tm("u1", "小X 在吗"), False),
-                     (_tm("999", "在的", True), False)], st=_st, cfg=_tcfg)
-check("the bot's own line is never the initiator", _d.initiator == "u1")
-_d = trigger.decide([(_tm("u1", "早"), False), (_tm("u2", "早啊"), False)],
-                    st=_st, cfg=_tcfg)
-check("no addresser, no initiator", not _d.reply and _d.initiator == "")
+_da = trigger.decide(_tm("u1", "在吗"), True, st=_st, cfg=_tcfg)
+_db = trigger.decide(_tm("u2", "小X 你说说"), False, st=_st, cfg=_tcfg)
+check("two callers each earn their own decision",
+      _da.initiator == "u1" and _db.initiator == "u2")
+check("the bot's own line is never the initiator",
+      not trigger.decide(_tm("999", "在的", True), False, st=_st, cfg=_tcfg).reply)
+check("no addresser, no initiator",
+      not trigger.decide(_tm("u2", "早啊"), False, st=_st, cfg=_tcfg).reply)
 
 _st.muted = True
 check("and muting outranks being addressed",
-      not trigger.decide([(_tm("u1", "在吗"), True)], st=_st, cfg=_tcfg).reply)
+      not trigger.decide(_tm("u1", "在吗"), True, st=_st, cfg=_tcfg).reply)
 _st.muted = False
-# The per-minute cap is the ban-avoidance floor, so it outranks being addressed too: a bot
-# that can be made to talk without limit by @-ing it repeatedly gets the account
-# restricted.
-for _ in range(_tcfg.trigger.max_replies_per_min):
-    _st.reply_window.take(_tcfg.trigger.max_replies_per_min)
-check("the rate cap outranks being addressed",
-      not trigger.decide([(_tm("u1", "在吗"), True)], st=_st, cfg=_tcfg).reply)
 
 # ---- segment parsing
 segs = [
@@ -449,7 +442,7 @@ with _tf.TemporaryDirectory() as _td:
     finally:
         os.environ["PROMPTS_DIR"] = _envdir
 check("the live bundle serves the shipped texts",
-      b.prompts["legend"].startswith("聊天记录中的以下标记由系统生成"))
+      b.prompts["legend"].startswith("聊天记录中的下列标记由系统生成"))
 
 # Config numbers with a blast radius validate at load, not at detonation time:
 # backup_keep=0 deletes the backup just written, nightly; a 4-field cron used to

@@ -391,19 +391,28 @@ async def groups_with_state() -> list[int]:
     return [r["group_id"] for r in rows]
 
 
-async def has_agreed(user_id: str) -> bool:
-    """Whether this account ever accepted the user agreement (platform-wide)."""
+async def has_agreed(group_id: int, user_id: str, version: int) -> bool:
+    """Whether this account accepted the agreement, at this version or later,
+    in this group. An older acceptance does not count: bumping the version is
+    how the owner voids it."""
     return await pool().fetchval(
-        "SELECT EXISTS(SELECT 1 FROM user_agreement WHERE user_id=$1)", user_id)
+        "SELECT EXISTS(SELECT 1 FROM user_agreement"
+        " WHERE group_id=$1 AND user_id=$2 AND version >= $3)",
+        group_id, user_id, version)
 
 
-async def record_agreement(user_id: str) -> bool:
-    """File one acceptance; True when it was the first, False on a repeat."""
+async def record_agreement(group_id: int, user_id: str, version: int) -> bool:
+    """File one acceptance of this version; True when it changed anything - a
+    first acceptance or an upgrade - False when already at this version or
+    later."""
     return bool(await pool().fetchval(
-        """INSERT INTO user_agreement (user_id) VALUES ($1)
-           ON CONFLICT (user_id) DO NOTHING
+        """INSERT INTO user_agreement (group_id, user_id, version)
+           VALUES ($1,$2,$3)
+           ON CONFLICT (group_id, user_id)
+           DO UPDATE SET version = EXCLUDED.version, agreed_at = NOW()
+                   WHERE user_agreement.version < EXCLUDED.version
         RETURNING TRUE""",
-        user_id,
+        group_id, user_id, version,
     ))
 
 

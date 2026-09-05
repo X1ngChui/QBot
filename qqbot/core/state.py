@@ -17,7 +17,6 @@ from datetime import datetime
 from ..db import repo
 from ..settings import config
 from ..util import fmt_when, now_local, why
-from .ratelimit import SlidingWindow
 from .segments import ImageRef, parse_segments
 
 log = logging.getLogger("qqbot.state")
@@ -95,14 +94,14 @@ class GroupState:
     recent: deque[ChatMsg] = field(default_factory=lambda: deque(maxlen=200))
     history_anchor: str | None = None
     muted: bool = False
-    #: Accounts this group's owner has told the bot to ignore entirely: no reply, no
-    #: archive, no memory. Managed by /block from inside the group. Keyed by account
+    #: Accounts this group's owner has told the bot not to answer: their messages
+    #: still arrive, archive and feed memory - only the reply is withheld.
+    #: Managed by /block from inside the group. Keyed by account
     #: id because an id is the one thing about a person that cannot be renamed
     #: around; the value is when the block lapses on its own, or None for one that
     #: waits for /unblock. Test membership through blocked_now, never `in` - a
     #: timed entry may already be dead.
     blocked: dict[str, datetime | None] = field(default_factory=dict)
-    reply_window: SlidingWindow = field(default_factory=lambda: SlidingWindow(4))
     loaded: bool = False
     history_loaded: bool = False
 

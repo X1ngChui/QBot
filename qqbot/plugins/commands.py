@@ -1,13 +1,9 @@
-"""The ops commands: the owner's console.
+"""The ops commands: the owner's console, with a member-facing edge.
 
 Human intervention is meant to be one thing only: read the daily report, change what is
-wrong. These commands exist to make that loop short.
-
-Every one of them is the owner's. A member who wants to know what the bot remembers about
-them asks the bot, and one who wants to correct it says so - the roster is already in the
-prompt, and the next extraction pass reads a self-correction as evidence. That is why
-there is no member-facing command set: it would be a second interface to the same two
-things.
+wrong. These commands exist to make that loop short. Members hold the slice the catalog
+flags for them - their own record and names, the read-only surfaces, /agree - once they
+have accepted the user agreement; everything else answers them with silence.
 
 Almost nothing is decided here. Whether a person may run a command is decided in
 core.perms, what each command is is declared in core.command_catalog, and what it does to
@@ -77,7 +73,8 @@ def _fit(text: str, *, head: bool = True, gid: str | None = None) -> str:
 
 async def _gate(matcher: Matcher, event: GroupMessageEvent,
                 *, global_only: bool = False, self_serve: bool = False,
-                open_to_members: bool = False) -> bool:
+                open_to_members: bool = False,
+                pre_agreement: bool = False) -> bool:
     """Who is calling: True for the owner, False for a member allowed through.
 
     A member gets through on `self_serve` - the catalog-flagged commands whose
@@ -106,7 +103,12 @@ async def _gate(matcher: Matcher, event: GroupMessageEvent,
     if perms.is_owner(str(event.user_id), owners):
         return True
     if (self_serve or open_to_members) and not global_only:
-        return False
+        # The member surface opens only past the user agreement; before it the
+        # one command that exists is /agree itself (its handler sets
+        # pre_agreement). Same silence as any other refusal.
+        if pre_agreement or await agreement.ok(str(event.group_id),
+                                               str(event.user_id)):
+            return False
     await matcher.finish()
     return False  # unreachable; finish() raises
 
@@ -115,6 +117,18 @@ async def _own_accounts(event: GroupMessageEvent) -> list[str]:
     """Every account of the person speaking - "yourself" means the person, so
     a merged alt operates its main's record, same as /block treats them."""
     return await directory().accounts_of_person(str(event.user_id))
+
+
+async def _finish(matcher: Matcher, message: str) -> None:
+    """Answer a command by quoting it and @-ing whoever sent it.
+
+    Commands are open to members now, so several people can be talking to the
+    console at once - the same quote-plus-@ shape the chat path uses keeps
+    every answer visibly attached to its question. Refusals stay bare
+    matcher.finish(): an @ with nothing behind it would advertise exactly what
+    the silence hides.
+    """
+    await matcher.finish(message, at_sender=True, reply_message=True)
 
 
 agree_cmd = on_command("agree", block=True, priority=1)
@@ -217,7 +231,7 @@ async def _card_of(matcher: Matcher, group_id: int, user_id: str) -> PersonCard:
     try:
         return await directory().person(group_id, user_id)
     except UnknownAccount:
-        await matcher.finish("本群还没有这个账号的记录。多聊几句就有了。")
+        await _finish(matcher, "本群还没有这个账号的记录。多聊几句就有了。")
 
 
 # -- configuration ----------------------------------------------------------
@@ -228,12 +242,13 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     """Record that the speaker accepts the user agreement.
 
     The one command whose subject is always the speaker themselves - there is
-    no target to narrow, so the self-serve gate is the entire check.
+    no target to narrow - and the one that must work before consent, or nobody
+    could ever consent.
     """
-    await _gate(matcher, event, self_serve=True)
-    if await agreement.accept(str(event.user_id)):
-        await matcher.finish("已记录：你同意了用户协议。")
-    await matcher.finish("你已同意过用户协议，无需重复发送。")
+    await _gate(matcher, event, self_serve=True, pre_agreement=True)
+    if await agreement.accept(str(event.group_id), str(event.user_id)):
+        await _finish(matcher, "已记录：你在本群同意了用户协议。")
+    await _finish(matcher, "你已在本群同意过用户协议，无需重复发送。")
 
 
 @reload_cmd.handle()
@@ -249,7 +264,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
         # A multi-error validation dump can outgrow a QQ message; oversize is
         # refused whole, and the one command that reports what broke must not
         # answer with silence.
-        await matcher.finish(_fit(f"配置未通过校验，本次重载未生效：{e}",
+        await _finish(matcher, _fit(f"配置未通过校验，本次重载未生效：{e}",
                                   gid=str(event.group_id)))
         return
     for gid in list(bundle.personas):
@@ -259,7 +274,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     # The contract's edge - cron and timezone edits are accepted here but only take
     # effect at the next restart - is documented in /help reload, not repeated in
     # every acknowledgement.
-    await matcher.finish(f"配置已重载：{len(bundle.personas)} 份人设。")
+    await _finish(matcher, f"配置已重载：{len(bundle.personas)} 份人设。")
 
 
 @block_cmd.handle()
@@ -281,11 +296,11 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
         live = {u: t for u, t in st.blocked.items()
                 if t is None or t > now_local()}
         if not live:
-            await matcher.finish("本群没有屏蔽任何人。用法：/block @某人")
+            await _finish(matcher, "本群没有屏蔽任何人。用法：/block @某人")
         shown = "、".join(
             uid + (f"（至 {fmt_when(t)}）" if t else "")
             for uid, t in sorted(live.items()))
-        await matcher.finish(_fit(f"本群已屏蔽 {shown}（共 {len(live)} 个账号）",
+        await _finish(matcher, _fit(f"本群已屏蔽 {shown}（共 {len(live)} 个账号）",
                                   gid=gid))
     target = at[0]
     arg = _strip_cmd(event.get_plaintext(), "block").strip()
@@ -293,17 +308,17 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     if arg:
         span = parse_duration(arg)
         if span is None:
-            await matcher.finish("时长看不懂。示例：/block @某人 3d（m 分钟、h 小时、d 天）")
+            await _finish(matcher, "时长看不懂。示例：/block @某人 3d（m 分钟、h 小时、d 天）")
         until = now_local() + span
     if perms.is_owner(target, cfg.owners):
-        await matcher.finish("不能屏蔽拥有者。")
+        await _finish(matcher, "不能屏蔽拥有者。")
     if str(event.self_id) == target:
-        await matcher.finish("这是我自己。")
+        await _finish(matcher, "这是我自己。")
     # A merge made several accounts one person, and blocking the account that was
     # @-ed while the alt keeps talking is not blocking anybody.
     accounts = await directory().accounts_of_person(target)
     if any(perms.is_owner(a, cfg.owners) for a in accounts):
-        await matcher.finish("不能屏蔽拥有者。")
+        await _finish(matcher, "不能屏蔽拥有者。")
     st.blocked.update({a: until for a in accounts})
     await repo.block(int(gid), accounts, until=until)
     log.info("group %s: person %s blocked by owner (%d account(s)%s)",
@@ -311,7 +326,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
              f", until {until:%m-%d %H:%M}" if until else "")
     extra = f"（同一人的 {len(accounts)} 个账号）" if len(accounts) > 1 else ""
     lapse = f"，{fmt_when(until)} 自动解除" if until else ""
-    await matcher.finish(f"已屏蔽 {target}{extra}{lapse}。")
+    await _finish(matcher, f"已屏蔽 {target}{extra}{lapse}。")
 
 
 @unblock_cmd.handle()
@@ -321,11 +336,11 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     st = await REGISTRY.get(gid)
     at = _mentioned(event)
     if not at:
-        await matcher.finish("要解除谁？用法：/unblock @某人")
+        await _finish(matcher, "要解除谁？用法：/unblock @某人")
     target = at[0]
     accounts = await directory().accounts_of_person(target)
     if not any(a in st.blocked for a in accounts):
-        await matcher.finish(f"{target} 不在本群的屏蔽名单里。")
+        await _finish(matcher, f"{target} 不在本群的屏蔽名单里。")
     # Lifted for the whole person, like it was applied: leaving one account of a
     # merged pair blocked would look like the command silently failed.
     for a in accounts:
@@ -334,7 +349,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     log.info("group %s: person %s unblocked by owner (%d account(s))",
              gid, target, len(accounts))
     extra = f"（同一人的 {len(accounts)} 个账号）" if len(accounts) > 1 else ""
-    await matcher.finish(f"已解除对 {target}{extra} 的屏蔽。")
+    await _finish(matcher, f"已解除对 {target}{extra} 的屏蔽。")
 
 
 @mute_cmd.handle()
@@ -343,7 +358,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     st = await REGISTRY.get(str(event.group_id))
     st.muted = True
     await st.persist()
-    await matcher.finish("已静音。")
+    await _finish(matcher, "已静音。")
 
 
 @unmute_cmd.handle()
@@ -352,7 +367,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     st = await REGISTRY.get(str(event.group_id))
     st.muted = False
     await st.persist()
-    await matcher.finish("已解除静音。")
+    await _finish(matcher, "已解除静音。")
 
 
 # -- usage ------------------------------------------------------------------
@@ -401,7 +416,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
         lines.append(f"缓存　　命中率 {cache}")
     if errors.count():
         lines.append(f"异常　　{errors.count()} 条，详见每日报告")
-    await matcher.finish("\n".join(lines))
+    await _finish(matcher, "\n".join(lines))
 
 
 @top_cmd.handle()
@@ -418,7 +433,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     k = min(int(arg), 20) if arg.isdigit() and int(arg) > 0 else 5
     rows = await repo.top_spenders(int(gid), k=k)
     if not rows:
-        await matcher.finish("本月本群还没有可归因的花费。")
+        await _finish(matcher, "本月本群还没有可归因的花费。")
     lines = ["本群本月花费排行"]
     for i, r in enumerate(rows, 1):
         accounts = list(r["accounts"])
@@ -428,7 +443,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
             name = accounts[0]
         tag = f"（{len(accounts)} 个账号）" if len(accounts) > 1 else ""
         lines.append(f"{i}. {name}{tag}　¥{float(r['cny']):.3f}　{int(r['calls'])} 次")
-    await matcher.finish(_fit("\n".join(lines), gid=gid))
+    await _finish(matcher, _fit("\n".join(lines), gid=gid))
 
 
 @groupstats_cmd.handle()
@@ -456,7 +471,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
                        if t is None or t > now_local())
     if blocked_live:
         lines.append(f"屏蔽　　{blocked_live} 个账号")
-    await matcher.finish("\n".join(lines))
+    await _finish(matcher, "\n".join(lines))
 
 
 # -- group knowledge --------------------------------------------------------
@@ -485,7 +500,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
             f"　{f.index}. {f.text}（{f.confidence:.2f}）" for f in learned))
     else:
         parts.append("自动归纳：（暂为空）")
-    await matcher.finish(_fit("\n\n".join(parts), gid=str(gid)))
+    await _finish(matcher, _fit("\n\n".join(parts), gid=str(gid)))
 
 
 # -- what is known about people ---------------------------------------------
@@ -513,7 +528,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
                 or _strip_cmd(event.get_plaintext(), "who").strip()):
             await matcher.finish()
         card = await _card_of(matcher, gid, str(event.user_id))
-        await matcher.finish(_fit(_one_person(card), gid=str(gid)))
+        await _finish(matcher, _fit(_one_person(card), gid=str(gid)))
 
     if at := _mentioned(event):
         cards = []
@@ -523,22 +538,22 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
             except UnknownAccount:
                 continue
         if not cards:
-            await matcher.finish("这些账号在本群还没有说过话，暂时没有记录。")
-        await matcher.finish(_fit("\n".join(_one_person(c) for c in cards),
+            await _finish(matcher, "这些账号在本群还没有说过话，暂时没有记录。")
+        await _finish(matcher, _fit("\n".join(_one_person(c) for c in cards),
                                   gid=str(gid)))
 
     if wanted := _strip_cmd(event.get_plaintext(), "who"):
-        await matcher.finish(
+        await _finish(matcher, 
             f"要查「{wanted}」请用 /who @{wanted}，直接 @ 他。\n"
             "名字会重复、会改，@ 带的是账号，指到的一定是那个人。"
         )
 
     rows = await directory().roster(gid)
     if not rows:
-        await matcher.finish("本群还没有任何成员记录。")
+        await _finish(matcher, "本群还没有任何成员记录。")
     head = f"本群 {len(rows)} 人有记录（发言数｜记录节选）："
     body = "\n".join("· " + _one_line(c) for c in rows[:ROSTER_MAX])
-    await matcher.finish(_fit(head + "\n" + body, gid=str(gid)))
+    await _finish(matcher, _fit(head + "\n" + body, gid=str(gid)))
 
 
 @note_cmd.handle()
@@ -557,7 +572,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     gid = int(event.group_id)
     at = _mentioned(event)
     if not at:
-        await matcher.finish("要指定成员，请 @ 他：/note @某人 内容")
+        await _finish(matcher, "要指定成员，请 @ 他：/note @某人 内容")
     if not owner:
         if at[0] not in await _own_accounts(event):
             await matcher.finish()
@@ -570,17 +585,17 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
 
     if not text:
         if not card.note:
-            await matcher.finish(
+            await _finish(matcher, 
                 f"{card.display} 目前没有备注。\n"
                 "用法：/note @某人 内容　写入；内容写 - 清除"
             )
-        await matcher.finish(f"{card.display} 当前的备注：\n{card.note}")
+        await _finish(matcher, f"{card.display} 当前的备注：\n{card.note}")
 
     note = "" if text == DROP else text
     await directory().note(gid, target, note)
     if not note:
-        await matcher.finish(f"已清除 {card.display} 的备注。")
-    await matcher.finish(f"已记下 {card.display} 的备注：\n{note}")
+        await _finish(matcher, f"已清除 {card.display} 的备注。")
+    await _finish(matcher, f"已记下 {card.display} 的备注：\n{note}")
 
 
 @alias_cmd.handle()
@@ -601,7 +616,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     gid = int(event.group_id)
     at = _mentioned(event)
     if not at:
-        await matcher.finish("要指定成员，请 @ 他：/alias @某人 称呼")
+        await _finish(matcher, "要指定成员，请 @ 他：/alias @某人 称呼")
     if not owner:
         if at[0] not in await _own_accounts(event):
             await matcher.finish()
@@ -614,7 +629,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
 
     if not arg:
         if not card.names and not card.candidates:
-            await matcher.finish(f"{card.display} 目前没有记录在案的称呼。")
+            await _finish(matcher, f"{card.display} 目前没有记录在案的称呼。")
         lines = [f"· {n.text}（{n.confidence:.2f}）"
                  + ("（平台）" if n.platform_given else "")
                  + ("（全局）" if n.is_global else "")
@@ -622,16 +637,16 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
         if card.candidates:
             lines.append("未确认：")
             lines += [f"· {n.text}（{n.confidence:.2f}）" for n in card.candidates]
-        await matcher.finish(_fit(f"{card.display} 的称呼：\n" + "\n".join(lines),
+        await _finish(matcher, _fit(f"{card.display} 的称呼：\n" + "\n".join(lines),
                                   gid=str(gid)))
 
     if arg.startswith(DROP):
         name = arg[len(DROP):].strip()
         if not name:
-            await matcher.finish("要撤销哪个称呼？用法：/alias @某人 -称呼")
+            await _finish(matcher, "要撤销哪个称呼？用法：/alias @某人 -称呼")
         if await directory().unname(gid, target, name):
-            await matcher.finish(f"已撤销 {card.display} 的称呼「{name}」。")
-        await matcher.finish(f"{card.display} 名下没有「{name}」这个称呼。")
+            await _finish(matcher, f"已撤销 {card.display} 的称呼「{name}」。")
+        await _finish(matcher, f"{card.display} 名下没有「{name}」这个称呼。")
 
     # name=0.4 sets how much the name is trusted; a bare name binds at full trust.
     if "=" in arg:
@@ -640,28 +655,28 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
         try:
             conf = float(value.strip())
         except ValueError:
-            await matcher.finish("置信度需为 0 到 1 的数字，例如：/alias @某人 阿明=0.6")
+            await _finish(matcher, "置信度需为 0 到 1 的数字，例如：/alias @某人 阿明=0.6")
             return
         if not name:
-            await matcher.finish("要设置哪个称呼？用法：/alias @某人 称呼=0.6")
+            await _finish(matcher, "要设置哪个称呼？用法：/alias @某人 称呼=0.6")
         try:
             n = await directory().set_confidence(gid, target, name, conf)
         except NameTaken as e:
-            await matcher.finish(
+            await _finish(matcher, 
                 f"「{e.text}」在本群已经指向 {e.holder}，一个称呼只能指一个人。")
             return
         state = "可以使用" if n.confidence >= 0.75 else "已保留记录，暂不使用"
-        await matcher.finish(
+        await _finish(matcher, 
             f"已设置：{card.display} 的「{n.text}」置信度 {n.confidence:.2f}（{state}）。")
 
     try:
         await directory().name(gid, target, arg)
     except NameTaken as e:
-        await matcher.finish(
+        await _finish(matcher, 
             f"「{e.text}」在本群已经指向 {e.holder}，一个称呼只能指一个人。\n"
             f"要改的话，先在他名下撤销：/alias @他 -{e.text}")
         return
-    await matcher.finish(f"已登记：{card.display} 也叫「{arg}」。")
+    await _finish(matcher, f"已登记：{card.display} 也叫「{arg}」。")
 
 
 @forget_cmd.handle()
@@ -683,7 +698,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     arg = _strip_cmd(event.get_plaintext(), "forget").strip()
     digits = next((w for w in arg.split() if w.isdigit()), "")
     if not digits:
-        await matcher.finish("要删除哪一条？编号取自 /who @某人 或 /card。")
+        await _finish(matcher, "要删除哪一条？编号取自 /who @某人 或 /card。")
 
     at = _mentioned(event)
     if not owner:
@@ -694,9 +709,9 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     dropped = (await directory().forget(gid, at[0], int(digits)) if at
                else await directory().forget_group_fact(gid, int(digits)))
     if dropped is None:
-        await matcher.finish(
+        await _finish(matcher, 
             f"没有编号 {digits} 这一条。用 /who @某人 或 /card 看当前的编号。")
-    await matcher.finish(f"已删除：{dropped.text}")
+    await _finish(matcher, f"已删除：{dropped.text}")
 
 
 # -- identity ---------------------------------------------------------------
@@ -713,14 +728,14 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     await _gate(matcher, event, global_only=True)
     at = _mentioned(event)
     if len(at) < 2:
-        await matcher.finish("要合并哪两个账号？用法：/merge @小号 @大号")
+        await _finish(matcher, "要合并哪两个账号？用法：/merge @小号 @大号")
     loser, winner = at[0], at[1]
     if loser == winner:
-        await matcher.finish("这是同一个账号。")
+        await _finish(matcher, "这是同一个账号。")
     try:
         changed = await directory().merge(loser, winner)
     except UnknownAccount as e:
-        await matcher.finish(f"账号 {e.user_id} 没有任何记录，无法合并。")
+        await _finish(matcher, f"账号 {e.user_id} 没有任何记录，无法合并。")
         return
     # Being blocked is a decision about a person, so it follows them across the
     # merge: an alt that stayed unblocked would keep talking, keep being archived
@@ -741,8 +756,8 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
             st.blocked.update({a: until for a in accounts})
     tail = f"两者在 {len(spread)} 个群的屏蔽状态已统一。" if spread else ""
     if not changed:
-        await matcher.finish("这两个账号本来就属于同一个人。" + tail)
-    await matcher.finish("已合并。" + tail)
+        await _finish(matcher, "这两个账号本来就属于同一个人。" + tail)
+    await _finish(matcher, "已合并。" + tail)
 
 
 @split_cmd.handle()
@@ -752,13 +767,13 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     await _gate(matcher, event, global_only=True)
     at = _mentioned(event)
     if not at:
-        await matcher.finish("要拆分哪个账号？用法：/split @某人")
+        await _finish(matcher, "要拆分哪个账号？用法：/split @某人")
     try:
         await directory().split(at[0])
     except UnknownAccount as e:
-        await matcher.finish(f"账号 {e.user_id} 没有任何记录，无法拆分。")
+        await _finish(matcher, f"账号 {e.user_id} 没有任何记录，无法拆分。")
         return
-    await matcher.finish("已拆分。")
+    await _finish(matcher, "已拆分。")
 
 
 @relearn_cmd.handle()
@@ -773,9 +788,9 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
         await directory().relearn(int(event.group_id))
     except Exception as e:
         log.warning("group %s: /relearn failed: %s", event.group_id, why(e))
-        await matcher.finish("排入失败，详见日志。")
+        await _finish(matcher, "排入失败，详见日志。")
         return
-    await matcher.finish("已排入归纳队列。")
+    await _finish(matcher, "已排入归纳队列。")
 
 
 # -- diagnostics ------------------------------------------------------------
@@ -789,14 +804,14 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     arg = _strip_cmd(event.get_plaintext(), "debug").strip().lower()
     if not arg:
         n = debug.armed()
-        await matcher.finish(f"捕获中：还剩 {n} 轮。" if n else "未在捕获。")
+        await _finish(matcher, f"捕获中：还剩 {n} 轮。" if n else "未在捕获。")
     if arg in ("off", "0"):
         debug.arm(0)
-        await matcher.finish("已关闭捕获。")
+        await _finish(matcher, "已关闭捕获。")
     if not arg.isdigit():
-        await matcher.finish("用法：/debug 轮数（最多 50），/debug off 关闭。")
+        await _finish(matcher, "用法：/debug 轮数（最多 50），/debug off 关闭。")
     took = debug.arm(int(arg))
-    await matcher.finish(f"已开启：接下来 {took} 轮模型调用写入 logs/debug/。")
+    await _finish(matcher, f"已开启：接下来 {took} 轮模型调用写入 logs/debug/。")
 
 
 @log_cmd.handle()
@@ -817,13 +832,13 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
             f.seek(max(0, size - LOG_TAIL_BYTES))
             tail = f.read().decode("utf-8", "replace")
     except OSError as e:
-        await matcher.finish(f"读不到日志文件：{e}")
+        await _finish(matcher, f"读不到日志文件：{e}")
         return
     lines = [ln for ln in tail.splitlines() if ln.strip()][-n:]
     if not lines:
-        await matcher.finish("日志是空的。")
+        await _finish(matcher, "日志是空的。")
         return
-    await matcher.finish(_fit("\n".join(lines), head=False, gid=str(event.group_id)))
+    await _finish(matcher, _fit("\n".join(lines), head=False, gid=str(event.group_id)))
 
 
 @help_cmd.handle()
@@ -842,10 +857,10 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     owner = await _gate(matcher, event, self_serve=True)
     wanted = _strip_cmd(event.get_plaintext(), "help")
     if not wanted:
-        await matcher.finish(_fit(command_catalog.help_text(owner=owner),
+        await _finish(matcher, _fit(command_catalog.help_text(owner=owner),
                                   gid=str(event.group_id)))
 
     cmd = command_catalog.find(wanted)
     if cmd is None or not (owner or cmd.self_serve or cmd.member):
-        await matcher.finish(f"没有「{wanted}」这条指令。用 /help 看全部。")
-    await matcher.finish(_fit(command_catalog.detail_text(cmd), gid=str(event.group_id)))
+        await _finish(matcher, f"没有「{wanted}」这条指令。用 /help 看全部。")
+    await _finish(matcher, _fit(command_catalog.detail_text(cmd), gid=str(event.group_id)))

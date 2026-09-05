@@ -28,7 +28,7 @@ rather than accumulate as flags. Adding one is: write the subclass, add a line t
 | `bot.py` | entrypoint; NoneBot2 serves the reverse WS at `/onebot/v11/ws` |
 | `qqbot/plugin.py` | plugin wiring: startup order, the message handler |
 | `qqbot/settings.py` | pydantic config models, two-layer merge, `/reload` |
-| `qqbot/core/pipeline.py` | the pipeline: dedup, archive, merge buffer, dispatch |
+| `qqbot/core/pipeline.py` | the pipeline: dedup, archive, one reply task per addressed message |
 | `qqbot/core/trigger.py` | whether this message is addressed to the bot |
 | `qqbot/core/prompt.py` | cache-friendly prompt ordering |
 | `qqbot/core/retrieval.py` | what the prompt reads: the roster, the group's facts, this turn's episodes |
@@ -52,10 +52,10 @@ rather than accumulate as flags. Adding one is: write the subclass, add a line t
   and left alone; the bot never speaks uninvited.
 - **Replies require consent.** A member who has not accepted the user agreement
   (`config/agreement.txt`) gets the agreement text instead of a reply, at most
-  once per cooldown; `/agree` records acceptance once, permanently. Reading,
-  archiving and the command surface are untouched; owners are exempt. A
-  `/block`ed member is the converse: read and remembered as always, only never
-  answered - context stays coherent either way.
+  once per cooldown; `/agree` records acceptance permanently, per group and
+  account, and is the one command that answers before consent. Reading and archiving are untouched;
+  owners are exempt. A `/block`ed member is the converse: read and remembered
+  as always, only never answered - context stays coherent either way.
 - **Memory is one store of facts.** What is known about a person and what is
   known about the group are rows in `memory_fact` - the group is an entity too -
   each with a verbatim quote as evidence, a validity window, and a predicate

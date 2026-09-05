@@ -45,7 +45,7 @@ Cited by number from code comments; the numbering must not be reshuffled:
 Third-party protocol clients violate Tencent's ToS; the account can be banned. Accepted, and enforced in code:
 
 - A secondary account, warmed up before going live; fixed IP.
-- `max_replies_per_min: 4` per group is the level-zero defence — against ban-worthy flooding, not against overspending. It consumes its slot at the last moment before sending and outranks being addressed.
+- No reply rate cap: each addressed message gets exactly one reply attempt, and the pace is bounded naturally by the budget and the provider-layer concurrency semaphore (`max_concurrency: 3`).
 
 ## 2. Architecture
 
@@ -57,18 +57,21 @@ QQ ←→ napcat container ←OneBot v11 reverse WS→ bot container ←asyncpg�
 
 ```
 message arrives
- ↓ dedup, group blocklist (blocked accounts: unread, unanswered, unarchived)
+ ↓ dedup
  ↓ write raw_event                      async, unconditional; replays never land twice
  ↓ free resolution + pictures           @s, quotes, forwards; pictures download now →
                                         Files API upload → async description backfill
- ↓ per-group merge buffer               processed after 2.5s of silence
- ↓ daily-budget gate → trigger (§4) ──no──→ done
+ ↓ trigger (§4) ──no──→ done            each message decides for itself; an addressed one
+                                        cuts its context slice on the spot and spawns a
+                                        concurrent reply task (quote, @ and billing all
+                                        belong to this message's sender)
+ ↓ in the task: daily-budget gate → block (withholds only the reply) → agreement gate
  ↓ voice transcribed only now, paid (§5.3)
  ↓ retrieval: roster/cards → group knowledge → episode recall (sequential;
    recall failure degrades to a reply with less memory, never to silence)
  ↓ prompt assembly (cache-friendly ordering §6.2, recent originals inline)
  ↓ money-bounded tool loop (§2, engine)
- ↓ strip_markdown → rate-limit gate → send (quoting the trigger message and @-ing its sender) → the bot's own reply is archived too
+ ↓ strip_markdown → send (quoting the trigger message and @-ing its sender) → the bot's own reply is archived too
 ```
 
 ### The conversation engine (agent loop)
@@ -91,7 +94,7 @@ Five tools: `web_search` (Tavily, via proxy), `search_history` (SQL AND-search o
 
 ### Concurrency
 
-A global `max_concurrency: 3` semaphore at the provider layer; one serial worker queue per group; background work (extraction, embeddings) rides a DB job queue (FOR UPDATE SKIP LOCKED + leases + a pending-dedup index).
+A global `max_concurrency: 3` semaphore at the provider layer; one independent reply task per addressed message, running concurrently (each with the context slice cut at its arrival; budget attribution is contextvar task-local); background work (extraction, embeddings) rides a DB job queue (FOR UPDATE SKIP LOCKED + leases + a pending-dedup index).
 
 ### Output
 
@@ -99,12 +102,12 @@ Only `clean_reply` (strips Markdown, every system marker - line numbers, timesta
 
 ## 3. Scope
 
-In: must-answer when addressed; group memory (people, events, group knowledge); picture understanding (original pixels for the model + archived descriptions); voice transcription; web search; archive search; a command surface that recognises only the bot's owners, never QQ group admins - with two carve-outs: /who /note /alias /forget are open to any member against themselves only (at the same full manual trust as the owner's hand; /agree is theirs by nature), and the read-only /card /stats /top /groupstats are open whole; /help filters its listing per reader, and anything beyond the boundary draws silence. A user-agreement gate holds replies from members who have not sent /agree: they get the agreement text (config/agreement.txt, edited live) instead, rate-limited; reading, archiving and commands are untouched, owners exempt. A block withholds exactly the reply - the account's messages still arrive, archive and feed memory, keeping context coherent; blocks can carry a duration (30m/12h/3d), lifted lazily the next time the account addresses the bot, no scheduler.
+In: must-answer when addressed; group memory (people, events, group knowledge); picture understanding (original pixels for the model + archived descriptions); voice transcription; web search; archive search; a command surface that recognises only the bot's owners, never QQ group admins - with two carve-outs: /who /note /alias /forget are open to any member against themselves only (at the same full manual trust as the owner's hand; /agree is theirs by nature), and the read-only /card /stats /top /groupstats are open whole; /help filters its listing per reader, and anything beyond the boundary draws silence. A user-agreement gate holds replies from members who have not sent /agree: they get the agreement text (config/agreement.txt, edited live) instead, rate-limited; acceptance is recorded per group and account, reading and archiving are untouched, /agree is the one command that answers first, owners exempt. A block withholds exactly the reply - the account's messages still arrive, archive and feed memory, keeping context coherent; blocks can carry a duration (30m/12h/3d), lifted lazily the next time the account addresses the bot, no scheduler.
 Out: speaking uninvited (the arbiter is gone); sending pictures or voice; cross-group memory; multiple accounts.
 
 ## 4. Trigger
 
-One rule: an @ or a nickname hit → must answer; otherwise silence. Nicknames match as jieba **words**, not substrings (小夜曲 does not trigger 小夜). Muting (/mute) and the per-minute cap outrank being addressed.
+One rule: an @ or a nickname hit → must answer; otherwise silence. Nicknames match as jieba **words**, not substrings (小夜曲 does not trigger 小夜). Muting (/mute) outranks being addressed.
 
 v5's probability gate, Flash arbiter and adaptive p_max are deleted as a layer: once the bot only speaks when spoken to, the judgement they existed for no longer exists (appendix D1, D7).
 

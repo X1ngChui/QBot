@@ -13,7 +13,6 @@ owners: ["10001"]
 timezone: "Asia/Shanghai"
 
 gateway:
-  merge_window_sec: 2.5
   dedup_ttl_sec: 300
   max_msg_len: 2000
   # There is no group allowlist: the account is a dedicated bot account, and a group is
@@ -28,7 +27,6 @@ trigger:
   # the trigger fires, and the prompt tells the bot to shrug the mistake off in one line.
   # If it ever gets annoying, keep only the unambiguous names - @ still works.
   nicknames: ["小X", "小叉", "叉子"]
-  max_replies_per_min: 4         # ban-avoidance floor, and the only rate limit there is
 
 # Five capabilities, each an independent provider with its own endpoint, model and
 # credential, and no automatic fallback between them (D6).

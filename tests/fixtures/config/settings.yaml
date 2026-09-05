@@ -9,13 +9,11 @@ owners: ["10000", "10001"]
 timezone: "Asia/Shanghai"
 
 gateway:
-  merge_window_sec: 2.5
   dedup_ttl_sec: 300
   max_msg_len: 2000
 
 trigger:
   nicknames: ["小X", "小x", "X酱"]
-  max_replies_per_min: 4
 
 llm:
   text:
