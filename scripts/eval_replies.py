@@ -29,7 +29,6 @@ from datetime import timedelta
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("CONFIG_DIR", str(ROOT / "config"))
-os.environ.setdefault("PROMPTS_DIR", str(ROOT / "config" / "prompts"))
 os.environ["DATABASE_URL"] = "postgresql://qqbot@127.0.0.1:15432/qqbot"
 os.environ["DATABASE_PASSWORD"] = "testpw"
 

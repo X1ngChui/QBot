@@ -51,9 +51,12 @@ rather than accumulate as flags. Adding one is: write the subclass, add a line t
   cannot match inside a longer Latin word). Everything else is read, archived,
   and left alone; the bot never speaks uninvited.
 - **Replies require consent.** A member who has not accepted the user agreement
-  (`config/agreement.txt`) gets the agreement text instead of a reply, at most
-  once per cooldown; `/agree` records acceptance permanently, per group and
-  account, and is the one command that answers before consent. Reading and archiving are untouched;
+  gets a one-line pointer instead of a reply, at most once per cooldown:
+  `/terms` shows the full text, `/agree` records acceptance permanently, per
+  group, account and agreement version - and those two are the only commands
+  that answer before consent. The version and the text file's path are
+  mandatory config (the `agreement:` block in settings.yaml; a missing or
+  empty file fails the load); bumping the version re-asks everyone. Reading and archiving are untouched;
   owners are exempt. A `/block`ed member is the converse: read and remembered
   as always, only never answered - context stays coherent either way.
 - **Memory is one store of facts.** What is known about a person and what is

@@ -16,11 +16,12 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from . import util
-#: Every prompt the system may read, by key. The texts themselves are data -
-#: config/prompts/<key>.txt, one file per key, edited without touching code and
-#: re-read on /reload - and this manifest is what makes the data checkable: a missing
-#: file and a stray file both fail the load, so the key set cannot drift silently.
-#: The rationale behind each text's wording lives in config/prompts/README.md.
+#: Every prompt the system may read, by key. The texts are data: settings.yaml
+#: maps each key to its file (`prompts:`), edited without touching code and
+#: re-read on /reload. This manifest is what keeps the mapping checkable in
+#: both directions - a key missing from the config and a key the code does not
+#: know both fail the load, so the set cannot drift silently. The rationale
+#: behind each text's wording lives in config/prompts/README.md.
 PROMPT_KEYS = frozenset({
     # transcript legend, shared by reply and extraction; plus each side's addendum
     "legend", "legend_reply_note", "extract_legend_note",
@@ -81,7 +82,7 @@ class TextCfg(_M):
     reads_images: bool = False
     #: How hard replies may think: "off" disables deliberation, low/high/max map to
     #: the vendor's reasoning_effort grades. Extraction and describing carry their own
-    #: grades (memory.consolidate.reasoning_effort, llm.vision.reasoning_effort).
+    #: grades (memory.reasoning_effort, llm.vision.reasoning_effort).
     reasoning_effort: Literal["off", "low", "high", "max"] = "off"
     max_concurrency: int = 3
     timeout_sec: float = 30.0
@@ -166,21 +167,14 @@ class BudgetCfg(_M):
 EXTRACT_WINDOW = 120
 
 
-class ConsolidateCfg(_M):
-    #: Deliberation grade for the extraction pass. The schema and the Validator carry
-    #: most of the think-it-through duty, so "low" buys ambiguity checks (joke or
-    #: fact, which predicate) without the ~6k thought tokens a pass that "high"
-    #: measured at; "off" disables thinking entirely.
-    #:
-    #: The batching knobs (every_n_msgs, idle_min, idle_min_msgs) are gone with the
-    #: real-time triggers: extraction now runs once nightly (schedule.extract_cron),
-    #: draining the day oldest-first in gap-aligned chunks - there is no second
-    #: choice left to configure.
-    reasoning_effort: Literal["off", "low", "high", "max"] = "off"
-
-
 class MemoryCfg(_M):
-    consolidate: ConsolidateCfg = Field(default_factory=ConsolidateCfg)
+    #: Deliberation grade for the extraction pass. The schema and the Validator
+    #: carry most of the think-it-through duty, so "low" buys ambiguity checks
+    #: (joke or fact, which predicate) at a fraction of "high"'s thought-token
+    #: bill; "off" disables thinking entirely. The one memory knob there is:
+    #: extraction runs once nightly (schedule.extract_cron), draining the day
+    #: oldest-first in gap-aligned chunks, with nothing else to configure.
+    reasoning_effort: Literal["off", "low", "high", "max"] = "off"
 
 
 class ScheduleCfg(_M):
@@ -217,19 +211,58 @@ class ScheduleCfg(_M):
         return v
 
 
+class AgreementCfg(_M):
+    """The user agreement. The version is a number the owner sets - bumping it
+    voids every older acceptance - and the text lives in its own file, named
+    here by path. Both fields are mandatory and the file must exist and be
+    non-empty, so a deployment without an agreement fails at load instead of
+    showing members a placeholder."""
+
+    #: Acceptances are stored against this number; raise it to re-ask everyone.
+    version: int
+    #: Path of the file holding the full text /terms shows, relative to the
+    #: config directory (absolute allowed). The accept instruction is appended
+    #: in code, so an edited body can never lose it.
+    file: str
+
+
 class Settings(_M):
+    """Field order mirrors settings.yaml's narrative: who runs it and on what
+    clock, when it speaks, how messages come in, which models serve it, what
+    it may spend, what it remembers, when the jobs run, and finally where the
+    config directory keeps its files."""
+
     # Everyone allowed to run ops commands and receive the daily report. A list because
     # a bot outliving one person's attention needs more than one pair of hands.
     owners: list[str] = Field(default_factory=list)
     # IANA zone name. Applied at startup to every local-time reading: the clock the model
     # is told, the cron schedules, and the day the budget rolls over on.
     timezone: str = "Asia/Shanghai"
-    gateway: GatewayCfg = Field(default_factory=GatewayCfg)
     trigger: TriggerCfg = Field(default_factory=TriggerCfg)
+    gateway: GatewayCfg = Field(default_factory=GatewayCfg)
     llm: LlmCfg
     budget: BudgetCfg = Field(default_factory=BudgetCfg)
     memory: MemoryCfg = Field(default_factory=MemoryCfg)
     schedule: ScheduleCfg = Field(default_factory=ScheduleCfg)
+
+    # -- files: paths relative to the config directory (absolute allowed) ----
+    personas_dir: str = "personas"
+    agreement: AgreementCfg
+    #: One file per prompt key - the full mapping, so what the system reads is
+    #: visible in config at a glance. Checked against PROMPT_KEYS both ways.
+    prompts: dict[str, str]
+
+    @field_validator("prompts")
+    @classmethod
+    def _prompt_keys_complete(cls, v: dict[str, str]) -> dict[str, str]:
+        missing = PROMPT_KEYS - v.keys()
+        stray = v.keys() - PROMPT_KEYS
+        if missing or stray:
+            raise ValueError(
+                "prompts mapping out of step with the code's manifest: "
+                + (f"missing {sorted(missing)} " if missing else "")
+                + (f"unknown {sorted(stray)}" if stray else ""))
+        return v
 
 
 class Persona(_M):
@@ -304,13 +337,19 @@ class ConfigBundle:
     """One disk read: global defaults, every persona, and a cache of merged per-group Settings."""
 
     def __init__(self, raw_settings: dict, personas: dict[str, Persona],
-                 prompts: dict[str, str] | None = None):
+                 prompts: dict[str, str] | None = None,
+                 agreement_text: str = ""):
         self._raw = raw_settings
         self.default = Settings.model_validate(raw_settings)
         self.personas = personas
         #: Model-facing text by key, loaded from the prompt files. Read through
         #: ptext(); empty only for a bundle built outside load_bundle.
         self.prompts: dict[str, str] = prompts or {}
+        #: The user agreement's full text, loaded from agreement.file at the
+        #: same moment as everything else - /reload swaps it atomically with
+        #: the version number it belongs to. Empty only for a bundle built
+        #: outside load_bundle.
+        self.agreement_text: str = agreement_text
         self._merged: dict[str, Settings] = {}
         self._resolved_personas: dict[str, Persona] = {}
 
@@ -334,34 +373,54 @@ class ConfigBundle:
         return cached, persona
 
 
+def _resolve(root: Path, p: str) -> Path:
+    q = Path(p)
+    return q if q.is_absolute() else root / q
+
+
 def load_bundle(config_dir: Path | None = None) -> ConfigBundle:
     root = config_dir or CONFIG_DIR
     raw = _read_yaml(root / "settings.yaml")
+    # Validated up front: the directory layout below comes from the config
+    # itself, so the schema has to hold before anything else is read.
+    settings = Settings.model_validate(raw)
 
     personas: dict[str, Persona] = {}
-    pdir = root / "personas"
+    pdir = _resolve(root, settings.personas_dir)
     if pdir.is_dir():
         for path in sorted(pdir.glob("*.yaml")):
             stem = path.stem
             key = stem[len("group_"):] if stem.startswith("group_") else stem
             personas[key] = Persona.model_validate(_read_yaml(path))
 
-    # Prompts are data: one file per manifest key, no defaults in code. Both drift
-    # directions fail the load - a missing file would silently blank an instruction,
-    # a stray file is a typo shipping a prompt nobody reads. PROMPTS_DIR lets a test
-    # config borrow the real texts instead of copying every prompt file into fixtures.
-    pdir = Path(os.getenv("PROMPTS_DIR") or (root / "prompts"))
-    found = {p.stem: p for p in pdir.glob("*.txt")} if pdir.is_dir() else {}
-    missing = PROMPT_KEYS - set(found)
-    stray = set(found) - PROMPT_KEYS
-    if missing or stray:
-        raise ValueError(
-            f"prompt files out of step with the manifest in {pdir}: "
-            + (f"missing {sorted(missing)} " if missing else "")
-            + (f"unknown {sorted(stray)}" if stray else ""))
-    prompts = {k: p.read_text(encoding="utf-8-sig").strip() for k, p in found.items()}
+    # Prompts are data: the config maps every manifest key to its file (the
+    # schema validator holds the two key sets equal), and each file must exist
+    # and be non-empty - a missing one would silently blank an instruction. A
+    # test config points the mapping at the real texts instead of copying
+    # every file into fixtures.
+    prompts: dict[str, str] = {}
+    for key, rel in settings.prompts.items():
+        ppath = _resolve(root, rel)
+        try:
+            body = ppath.read_text(encoding="utf-8-sig").strip()
+        except OSError as e:
+            raise ValueError(f"prompt file unreadable: {key}: {ppath}: {e}") from None
+        if not body:
+            raise ValueError(f"prompt file is empty: {key}: {ppath}")
+        prompts[key] = body
 
-    bundle = ConfigBundle(raw, personas, prompts)
+    # The agreement text follows its configured path, loaded with everything
+    # else so /reload swaps text and version together. Mandatory like the
+    # prompts: a missing or empty file fails the load, never a placeholder.
+    apath = _resolve(root, settings.agreement.file)
+    try:
+        agreement_text = apath.read_text(encoding="utf-8-sig").strip()
+    except OSError as e:
+        raise ValueError(f"agreement file unreadable: {apath}: {e}") from None
+    if not agreement_text:
+        raise ValueError(f"agreement file is empty: {apath}")
+
+    bundle = ConfigBundle(raw, personas, prompts, agreement_text)
     # Validate eagerly: a bad config should blow up at startup / reload, not on the
     # first incoming message. Every group's merged overrides included - for_group
     # merges lazily, and before this a typo in one group's overrides sailed through

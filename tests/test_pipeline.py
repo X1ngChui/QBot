@@ -6,7 +6,6 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("CONFIG_DIR", str(ROOT / "tests" / "fixtures" / "config"))
-os.environ.setdefault("PROMPTS_DIR", str(ROOT / "config" / "prompts"))
 os.environ.setdefault("DATABASE_URL", "postgresql://qqbot@127.0.0.1:15432/qqbot")
 os.environ.setdefault("DATABASE_PASSWORD", "testpw")
 import asyncio
@@ -1421,8 +1420,10 @@ async def main():
     ev16 = FakeEvent("小X 在吗", user_id="newbie", nickname="新人", to_me=True)
     await GATEWAY.handle(bot, ev16)
     await drain()
-    check("an unconsenting member draws the agreement, not a reply",
+    check("an unconsenting member draws a one-line pointer, not a reply",
           len(bot.sent) == n16 + 1 and "/agree" in str(bot.sent[-1])
+          and "/terms" in str(bot.sent[-1])
+          and "【用户协议】" not in str(bot.sent[-1])  # the pointer, never the full text
           and len(LLM_CALLS) == calls16, str(bot.sent[n16:])[:160])
     check("and their message still archives",
           await pool().fetchval(
@@ -1462,7 +1463,7 @@ async def main():
           not any(c["kind"] in ("knowledge", "summary") for c in LLM_CALLS),
           str({c["kind"] for c in LLM_CALLS}))
     check("extraction carries its configured grade; replies carry none",
-          all(c["effort"] == config().default.memory.consolidate.reasoning_effort
+          all(c["effort"] == config().default.memory.reasoning_effort
               for c in LLM_CALLS if c["kind"] == "extract")
           and all(c["effort"] is None for c in LLM_CALLS if c["kind"] == "reply"))
 

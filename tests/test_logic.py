@@ -6,7 +6,6 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("CONFIG_DIR", str(ROOT / "tests" / "fixtures" / "config"))
-os.environ.setdefault("PROMPTS_DIR", str(ROOT / "config" / "prompts"))
 os.environ.setdefault("DATABASE_URL", "postgresql://qqbot@127.0.0.1:15432/qqbot")
 os.environ.setdefault("DATABASE_PASSWORD", "testpw")
 
@@ -403,44 +402,51 @@ with _tf.TemporaryDirectory() as _td:
     _sh.copytree(ROOT / "config" / "prompts", _cd / "prompts")
     for _f in (_cd / "prompts").glob("*.md"):
         _f.unlink()
-    _envdir = os.environ.pop("PROMPTS_DIR")   # let config_dir resolution act
+    # The fixture borrows the real prompts through relative mapping paths,
+    # which no longer resolve from the copy's location - point the copy at
+    # its own prompts directory.
+    _sy = _cd / "settings.yaml"
+    _sy.write_text(_sy.read_text(encoding="utf-8").replace(
+        "../../../config/prompts/", "prompts/"), encoding="utf-8")
+    (_cd / "prompts" / "describe_image.txt").write_text("换一种描述方式。", encoding="utf-8")
+    _bo = _lb(config_dir=_cd)
+    check("editing a prompt file changes what the bundle serves",
+          _bo.prompts["describe_image"] == "换一种描述方式。")
+    check("every manifest key was loaded from disk", set(_bo.prompts) == set(_PK))
+    # The mapping is the manifest's mirror: a key the code does not know fails
+    # the load, so a typo cannot ship a prompt nobody reads.
+    _sy.write_text(_sy.read_text(encoding="utf-8").replace(
+        "prompts:\n", "prompts:\n  no_such_key: prompts/legend.txt\n", 1),
+        encoding="utf-8")
     try:
-        (_cd / "prompts" / "describe_image.txt").write_text("换一种描述方式。", encoding="utf-8")
-        _bo = _lb(config_dir=_cd)
-        check("editing a prompt file changes what the bundle serves",
-              _bo.prompts["describe_image"] == "换一种描述方式。")
-        check("every manifest key was loaded from disk", set(_bo.prompts) == set(_PK))
-        (_cd / "prompts" / "no_such_key.txt").write_text("x", encoding="utf-8")
-        try:
-            _lb(config_dir=_cd)
-            check("a stray prompt file fails the load", False, "it loaded")
-        except ValueError as e:
-            check("a stray prompt file fails the load", "no_such_key" in str(e))
-        (_cd / "prompts" / "no_such_key.txt").unlink()
-        # Per-group overrides validate at load time too: for_group merges lazily,
-        # so a typo in one group's overrides allowed through /reload would fail on
-        # that group's every message - no reply, no archive - until the file was
-        # fixed.
-        _pd = _cd / "personas"
-        _pd.mkdir(exist_ok=True)
-        (_pd / "group_777.yaml").write_text(
-            "system_prompt: 测试人设\noverrides:\n  triger:\n    nicknames: [x]\n",
-            encoding="utf-8")
-        try:
-            _lb(config_dir=_cd)
-            check("a bad per-group override fails the load", False, "it loaded")
-        except Exception as e:
-            check("a bad per-group override fails the load",
-                  "triger" in str(e), str(e)[:160])
-        (_pd / "group_777.yaml").unlink()
-        (_cd / "prompts" / "legend.txt").unlink()
-        try:
-            _lb(config_dir=_cd)
-            check("a missing prompt file fails the load", False, "it loaded")
-        except ValueError as e:
-            check("a missing prompt file fails the load", "legend" in str(e))
-    finally:
-        os.environ["PROMPTS_DIR"] = _envdir
+        _lb(config_dir=_cd)
+        check("a stray prompt key fails the load", False, "it loaded")
+    except Exception as e:
+        check("a stray prompt key fails the load", "no_such_key" in str(e))
+    _sy.write_text(_sy.read_text(encoding="utf-8").replace(
+        "  no_such_key: prompts/legend.txt\n", "", 1), encoding="utf-8")
+    # Per-group overrides validate at load time too: for_group merges lazily,
+    # so a typo in one group's overrides allowed through /reload would fail on
+    # that group's every message - no reply, no archive - until the file was
+    # fixed.
+    _pd = _cd / "personas"
+    _pd.mkdir(exist_ok=True)
+    (_pd / "group_777.yaml").write_text(
+        "system_prompt: 测试人设\noverrides:\n  triger:\n    nicknames: [x]\n",
+        encoding="utf-8")
+    try:
+        _lb(config_dir=_cd)
+        check("a bad per-group override fails the load", False, "it loaded")
+    except Exception as e:
+        check("a bad per-group override fails the load",
+              "triger" in str(e), str(e)[:160])
+    (_pd / "group_777.yaml").unlink()
+    (_cd / "prompts" / "legend.txt").unlink()
+    try:
+        _lb(config_dir=_cd)
+        check("a missing prompt file fails the load", False, "it loaded")
+    except ValueError as e:
+        check("a missing prompt file fails the load", "legend" in str(e))
 check("the live bundle serves the shipped texts",
       b.prompts["legend"].startswith("聊天记录中的下列标记由系统生成"))
 

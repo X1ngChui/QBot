@@ -12,8 +12,9 @@ call. "Themselves" means the person, not the account: the handlers resolve it
 through accounts_of_person, so a merged alt operates its main's record, the
 same way /block treats them.
 
-The member surface opens only past the user agreement: before /agree, the one
-command that answers is /agree itself. Everything outside the boundary is
+The member surface opens only past the user agreement: before /agree, the only
+commands that answer are /agree itself and /terms, which shows what is being
+agreed to. Everything outside the boundary is
 answered with silence, never a refusal: to whoever cannot run a command it
 does not exist, and /help's listing is filtered the same way.
 

@@ -2,64 +2,53 @@
 
 A member who has not accepted the agreement is not replied to: the reply path
 holds at dispatch, and what they get instead - at most once per cooldown - is
-the agreement text and how to accept it. Everything else stays untouched:
-their messages are read and archived as always, and the command surface keeps
-working, which is how /agree can reach them. Owners are exempt.
+a one-line pointer at /terms (the full text on demand) and /agree. Their
+messages are still read and archived as always, but of the commands only
+those two answer before consent. Owners are exempt.
 
 Acceptance is per group, account and version: each group is its own audience,
-and an upgraded agreement (the vN on the file's title line) voids every older
-acceptance, so the gate walks everyone through consent again. The in-memory
-set caches only "yes" answers - a "no" must stay re-checkable the moment
-/agree lands.
+and a bumped `agreement.version` in the config voids every older acceptance,
+so the gate walks everyone through consent again. The version and the path of
+the text file are mandatory config (settings.yaml `agreement:`); the file is
+read at load, so /reload swaps text and version together and a deployment
+without an agreement fails at load - there is no placeholder state. The
+in-memory set caches only "yes" answers - a "no" must stay re-checkable the
+moment /agree lands.
 """
 
 from __future__ import annotations
 
-import os
-import re
 import time
-from pathlib import Path
 
 from ..db import repo
+from ..settings import config
 
 #: (group, account, version) triples known to have accepted - yes answers only.
 _AGREED: set[tuple[str, str, int]] = set()
 
 #: When each (group, account) was last shown the agreement (monotonic
-#: seconds). A member who keeps addressing the bot sees the text once per
+#: seconds). A member who keeps addressing the bot sees the pointer once per
 #: window, not once per message - the gate must not become spam.
 _PROMPTED: dict[tuple[str, str], float] = {}
 PROMPT_EVERY_SEC = 600.0
 
-_FALLBACK = "（用户协议内容暂缺，请联系拥有者。）"
-
-
-def _body() -> str:
-    """The file as it currently stands - read fresh so the owner edits it
-    without needing a /reload."""
-    path = Path(os.getenv("CONFIG_DIR", "config")) / "agreement.txt"
-    try:
-        return path.read_text(encoding="utf-8").strip() or _FALLBACK
-    except OSError:
-        return _FALLBACK
+#: What an unconsenting member is told instead of a reply - one line, because
+#: the full agreement re-sent on every cooldown reads as spam. /terms serves
+#: the full text on demand; both commands answer before consent.
+POINTER = "使用机器人前，请先同意用户协议：发送 /terms 查看全文，发送 /agree 表示同意。"
 
 
 def text() -> str:
     """The agreement body plus the fixed how-to-accept line, appended in code
     so an edited body can never lose it."""
-    return _body() + "\n\n同意请发送：/agree"
+    return config().agreement_text + "\n\n同意请发送：/agree"
 
 
 def version() -> int:
-    """The agreement's version: the vN on its first line, 1 when unmarked.
-
-    Bumping it is how the owner voids old acceptances - consent is stored
-    against the version it was given for, so everyone on an older number is
-    walked through the agreement again.
-    """
-    first = _body().splitlines()[0]
-    m = re.search(r"[vV](\d+)", first)
-    return int(m.group(1)) if m else 1
+    """The agreement's configured version. Bumping it is how the owner voids
+    old acceptances - consent is stored against the version it was given for,
+    so everyone on an older number is walked through the agreement again."""
+    return config().default.agreement.version
 
 
 async def ok(group_id: str, user_id: str) -> bool:
@@ -84,7 +73,7 @@ async def accept(group_id: str, user_id: str) -> bool:
 
 
 def should_prompt(group_id: str, user_id: str) -> bool:
-    """Whether to show the agreement now, marking the moment when yes."""
+    """Whether to show the pointer now, marking the moment when yes."""
     key = (str(group_id), user_id)
     now = time.monotonic()
     last = _PROMPTED.get(key)

@@ -53,13 +53,19 @@ CATALOG: tuple[Command, ...] = (
 示例：/help who""", self_serve=True),
     Command("/agree", "同意用户协议", """/agree
 
-发送本指令，即视为你已阅读并同意用户协议。
-同意之前，机器人不会回复你的消息，除 /agree 外的指令也不可用；
-你发的消息仍会照常接收。未同意时第一次叫机器人，会收到协议全文。
+发送本指令，即视为你已阅读并同意用户协议；协议全文可通过 /terms 查看。
+同意之前，机器人不回复你的消息、只提示你查看协议，可用指令仅 /agree
+和 /terms；你发的消息仍会照常接收。
 同意按群、按协议版本记录：在本群同意一次即持续有效，其他群需分别同意；
 协议更新版本后需重新同意。普通成员也可使用。
 
 示例：/agree""", self_serve=True),
+    Command("/terms", "查看用户协议", """/terms
+
+显示用户协议全文。未同意用户协议时也可使用——先看协议，
+再决定是否发送 /agree。普通成员也可使用。
+
+示例：/terms""", self_serve=True),
     # This group exists because the memory system is otherwise unobservable: what it
     # learned goes into a prompt nobody sees, and a wrong fact looks exactly like a right
     # one until the bot says something odd.

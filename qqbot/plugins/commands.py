@@ -104,8 +104,9 @@ async def _gate(matcher: Matcher, event: GroupMessageEvent,
         return True
     if (self_serve or open_to_members) and not global_only:
         # The member surface opens only past the user agreement; before it the
-        # one command that exists is /agree itself (its handler sets
-        # pre_agreement). Same silence as any other refusal.
+        # only commands that exist are /agree and /terms (their handlers set
+        # pre_agreement - consenting needs both the pen and the document).
+        # Same silence as any other refusal.
         if pre_agreement or await agreement.ok(str(event.group_id),
                                                str(event.user_id)):
             return False
@@ -132,6 +133,7 @@ async def _finish(matcher: Matcher, message: str) -> None:
 
 
 agree_cmd = on_command("agree", block=True, priority=1)
+terms_cmd = on_command("terms", block=True, priority=1)
 reload_cmd = on_command("reload", block=True, priority=1)
 mute_cmd = on_command("mute", block=True, priority=1)
 block_cmd = on_command("block", block=True, priority=1)
@@ -249,6 +251,18 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     if await agreement.accept(str(event.group_id), str(event.user_id)):
         await _finish(matcher, "已记录：你在本群同意了用户协议。")
     await _finish(matcher, "你已在本群同意过用户协议，无需重复发送。")
+
+
+@terms_cmd.handle()
+async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
+    """Show the user agreement in full.
+
+    Answers before consent, necessarily: the gate points the unconsenting
+    here, and a viewer that itself required consent would be a locked door
+    in front of the thing to be read.
+    """
+    await _gate(matcher, event, self_serve=True, pre_agreement=True)
+    await _finish(matcher, _fit(agreement.text(), gid=str(event.group_id)))
 
 
 @reload_cmd.handle()

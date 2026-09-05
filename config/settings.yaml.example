@@ -12,12 +12,6 @@ owners: ["10001"]
 # DST is handled where it applies.
 timezone: "Asia/Shanghai"
 
-gateway:
-  dedup_ttl_sec: 300
-  max_msg_len: 2000
-  # There is no group allowlist: the account is a dedicated bot account, and a group is
-  # served from its first message.
-
 trigger:
   # Every name people actually call the bot. Any one matching as a jieba token is a direct
   # mention - word-level, not substring (section 4).
@@ -27,6 +21,12 @@ trigger:
   # the trigger fires, and the prompt tells the bot to shrug the mistake off in one line.
   # If it ever gets annoying, keep only the unambiguous names - @ still works.
   nicknames: ["小X", "小叉", "叉子"]
+
+gateway:
+  dedup_ttl_sec: 300
+  max_msg_len: 2000
+  # There is no group allowlist: the account is a dedicated bot account, and a group is
+  # served from its first message.
 
 # Five capabilities, each an independent provider with its own endpoint, model and
 # credential, and no automatic fallback between them (D6).
@@ -106,13 +106,12 @@ budget:
   # figure. A reply that hits it stops unanswered - limits mean silence.
   per_reply_cny: 0.30
 
-
 memory:
-  # Extraction runs once nightly (schedule.extract_cron), draining the day
-  # oldest-first in chunks cut at conversation gaps - there are no batching knobs
-  # left. reasoning_effort is extraction's own grade: the schema and Validator
-  # carry most of the thinking, so "low" covers joke-vs-fact and predicate choice.
-  consolidate: { reasoning_effort: low }
+  # Extraction's own deliberation grade - the schema and Validator carry most of
+  # the thinking, so "low" covers joke-vs-fact and predicate choice. Extraction
+  # runs once nightly (schedule.extract_cron), draining the day oldest-first in
+  # chunks cut at conversation gaps; there is nothing else to configure.
+  reasoning_effort: low
 
 schedule:
   extract_cron:     "30 2 * * *"
@@ -122,3 +121,43 @@ schedule:
   report_cron:      "0 9 * * *"
   backup_keep: 14
   napcat_cache_days: 7
+
+# -- files --------------------------------------------------------------------
+# Paths are relative to this config directory (absolute allowed).
+
+# Per-group persona files (default.yaml + group_<gid>.yaml) live here.
+personas_dir: personas
+
+# The user agreement /terms shows. Both fields are mandatory and the file must
+# exist and be non-empty - a deployment without an agreement fails at load, so
+# there is no placeholder state. Acceptances are stored against `version`: bump
+# it to void them all and re-ask everyone; text edits without a bump do not
+# re-ask. /reload applies both.
+agreement:
+  version: 1
+  file: agreement.txt
+
+# One file per prompt the model reads - the complete set, so what the system
+# consumes is visible here at a glance. A key missing or unknown, and a file
+# missing or empty, all fail the load. Wording rationale: prompts/README.md.
+prompts:
+  # transcript legend, shared by reply and extraction; plus each side's addendum
+  legend: prompts/legend.txt
+  legend_reply_note: prompts/legend_reply_note.txt
+  extract_legend_note: prompts/extract_legend_note.txt
+  # the reply path's standing rules
+  reading_rules: prompts/reading_rules.txt
+  private_rules: prompts/private_rules.txt
+  tone_rules: prompts/tone_rules.txt
+  tone_reply_note: prompts/tone_reply_note.txt
+  reply_final: prompts/reply_final.txt
+  # the whole extraction rulebook
+  extract: prompts/extract.txt
+  # media and tools
+  describe_image: prompts/describe_image.txt
+  inspect_image: prompts/inspect_image.txt
+  tool_web_search: prompts/tool_web_search.txt
+  tool_search_history: prompts/tool_search_history.txt
+  tool_recall_events: prompts/tool_recall_events.txt
+  tool_read_url: prompts/tool_read_url.txt
+  tool_inspect_image: prompts/tool_inspect_image.txt

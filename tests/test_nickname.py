@@ -14,7 +14,6 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("CONFIG_DIR", str(ROOT / "tests" / "fixtures" / "config"))
-os.environ.setdefault("PROMPTS_DIR", str(ROOT / "config" / "prompts"))
 
 from qqbot.core import nickname
 

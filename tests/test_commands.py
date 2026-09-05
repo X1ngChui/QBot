@@ -19,7 +19,6 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("CONFIG_DIR", str(ROOT / "tests" / "fixtures" / "config"))
-os.environ.setdefault("PROMPTS_DIR", str(ROOT / "config" / "prompts"))
 os.environ.setdefault("DATABASE_URL", "postgresql://qqbot@127.0.0.1:15432/qqbot")
 os.environ.setdefault("DATABASE_PASSWORD", "testpw")
 import asyncio
@@ -67,9 +66,9 @@ def catalogue() -> None:
     # commands a member runs against themselves, `member` the read-only
     # surfaces they see whole, and a member's listing shows those and nothing
     # else - an owner command in it would advertise what silence hides.
-    check("self-serve is exactly the six subject commands",
+    check("self-serve is exactly the seven subject commands",
           {c.name for c in CATALOG if c.self_serve}
-          == {"/help", "/agree", "/who", "/note", "/alias", "/forget"},
+          == {"/help", "/agree", "/terms", "/who", "/note", "/alias", "/forget"},
           str({c.name for c in CATALOG if c.self_serve}))
     check("member-whole is exactly the four read-only surfaces",
           {c.name for c in CATALOG if c.member}

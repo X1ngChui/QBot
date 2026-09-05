@@ -317,7 +317,7 @@ class MemoryExtractor:
             # Validator carry most of the thinking, so anything above "low" measured
             # as waste here (~6k thought tokens a pass at the vendor default). If the
             # rejection rate climbs at "off", the grade is the lever.
-            effort=self._cfg.memory.consolidate.reasoning_effort,
+            effort=self._cfg.memory.reasoning_effort,
             kind=Kind.EXTRACT,
             group_id=str(inp.group_id),
         )

@@ -6,6 +6,34 @@
 # assert on, not to be realistic.
 
 owners: ["10000", "10001"]
+
+# Borrow the real prompt texts instead of copying every file into fixtures;
+# paths are relative to this fixture config directory.
+prompts:
+  # transcript legend, shared by reply and extraction; plus each side's addendum
+  legend: ../../../config/prompts/legend.txt
+  legend_reply_note: ../../../config/prompts/legend_reply_note.txt
+  extract_legend_note: ../../../config/prompts/extract_legend_note.txt
+  # the reply path's standing rules
+  reading_rules: ../../../config/prompts/reading_rules.txt
+  private_rules: ../../../config/prompts/private_rules.txt
+  tone_rules: ../../../config/prompts/tone_rules.txt
+  tone_reply_note: ../../../config/prompts/tone_reply_note.txt
+  reply_final: ../../../config/prompts/reply_final.txt
+  # the whole extraction rulebook
+  extract: ../../../config/prompts/extract.txt
+  # media and tools
+  describe_image: ../../../config/prompts/describe_image.txt
+  inspect_image: ../../../config/prompts/inspect_image.txt
+  tool_web_search: ../../../config/prompts/tool_web_search.txt
+  tool_search_history: ../../../config/prompts/tool_search_history.txt
+  tool_recall_events: ../../../config/prompts/tool_recall_events.txt
+  tool_read_url: ../../../config/prompts/tool_read_url.txt
+  tool_inspect_image: ../../../config/prompts/tool_inspect_image.txt
+
+agreement:
+  version: 1
+  file: agreement.txt
 timezone: "Asia/Shanghai"
 
 gateway:
@@ -61,7 +89,7 @@ budget:
 
 
 memory:
-  consolidate: { reasoning_effort: low }
+  reasoning_effort: low
 
 schedule:
   forget_cron:       "0 4 * * *"

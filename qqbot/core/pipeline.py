@@ -287,11 +287,12 @@ class Gateway:
             log.debug("group %s: no reply, initiator %s is blocked", group_id, who)
             return
         # The consent gate, before anything is paid for: a member who has not
-        # accepted the user agreement gets the agreement itself instead of a
-        # reply - at most once per cooldown - and nothing is spent on their
-        # behalf. Of the commands only /agree answers before consent
-        # (commands._gate holds the rest); archiving is untouched, owners are
-        # exempt.
+        # accepted the user agreement gets a one-line pointer at /terms and
+        # /agree instead of a reply - at most once per cooldown, and one line
+        # rather than the full text, which re-sent every cooldown reads as
+        # spam - and nothing is spent on their behalf. Of the commands only
+        # /agree and /terms answer before consent (commands._gate holds the
+        # rest); archiving is untouched, owners are exempt.
         if (who and not perms.is_owner(who, cfg.owners)
                 and not await agreement.ok(group_id, who)):
             if agreement.should_prompt(group_id, who):
@@ -300,7 +301,7 @@ class Gateway:
                         group_id=int(group_id),
                         message=[{"type": "at", "data": {"qq": who}},
                                  {"type": "text",
-                                  "data": {"text": " " + agreement.text()}}])
+                                  "data": {"text": " " + agreement.POINTER}}])
                 except Exception as e:
                     log.warning("group %s: agreement prompt failed: %s",
                                 group_id, why(e))
