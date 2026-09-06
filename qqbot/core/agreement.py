@@ -69,6 +69,9 @@ async def accept(group_id: str, user_id: str) -> bool:
     v = version()
     fresh = await repo.record_agreement(int(group_id), user_id, v)
     _AGREED.add((str(group_id), user_id, v))
+    # An accepted member never sees the pointer again; their cooldown entry
+    # is dead weight from here on.
+    _PROMPTED.pop((str(group_id), user_id), None)
     return fresh
 
 

@@ -342,7 +342,11 @@ async def respond(
         # The quoted message can be recalled between trigger and send, and a
         # reply segment pointing at a recalled id may be refused whole. The
         # words are already paid for - retry them once, bare, before giving up.
-        if len(message) == 1:
+        # Only when the API itself refused (ActionFailed, matched by name so
+        # core stays importable without the adapter) is the send known
+        # undelivered; a transport error may have delivered it, and a retry
+        # then would say the same thing twice.
+        if len(message) == 1 or type(e).__name__ != "ActionFailed":
             log.warning("group %s: send failed: %s", st.group_id, why(e))
             return False
         log.warning("group %s: quoted send failed (%s), retrying as plain text",

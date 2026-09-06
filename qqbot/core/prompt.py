@@ -358,10 +358,8 @@ def build_tail(*, batch: list[ChatMsg], cfg: Settings,
     now = "\n".join(
         m.render(seq=nums.get(m.msg_id, 0), quote=marks.get(m.msg_id, "")) for m in batch
     )
-    # The header says "just arrived", not "addressed to you": the merge buffer can
-    # put several people's messages in one batch, only some of which called the
-    # bot - a header claiming they all did fights reply_final's answer-the-caller
-    # rule.
+    # Each reply task carries exactly one addressed message; this header is the
+    # anchor reply_final points at when naming which message to answer.
     parts.append("下面是刚收到的消息：\n" + now)
     # Which message to answer, said outright: the history is context; only this block
     # is the question (the wording's full rationale sits in config/prompts/README.md,

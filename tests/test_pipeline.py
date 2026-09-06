@@ -1455,6 +1455,68 @@ async def main():
     check("after /agree the reply path opens",
           len(bot.sent) == n16 + 2 and len(LLM_CALLS) > calls16)
 
+    # 17. group notices become transcript lines: archived, in the window, and
+    # never a reply - even a poke aimed at the bot itself only transcribes.
+    st17 = await REGISTRY.get("123")
+    n17 = len(bot.sent)
+    _t17 = int(_nl0().timestamp())
+    ev_note = types.SimpleNamespace(
+        group_id=123, user_id="u9", notice_type="group_recall",
+        operator_id="u9", time=_t17)
+    await GATEWAY.handle_notice(bot, ev_note)
+    await drain(0.3)
+    check("a recall becomes a window line",
+          any(m.text == "[撤回了自己的一条消息]" and m.user_id == "u9"
+              for m in st17.recent))
+    check("and is archived once",
+          await pool().fetchval(
+              "SELECT count(*) FROM raw_event WHERE platform_event_id"
+              " LIKE 'notice-group_recall-123-u9-%'") == 1)
+    await GATEWAY.handle_notice(bot, ev_note)   # the adapter replays; dedup eats it
+    await drain(0.2)
+    check("a replayed notice lands only once",
+          sum(1 for m in st17.recent
+              if m.msg_id.startswith("notice-group_recall")) == 1)
+    await GATEWAY.handle_notice(bot, types.SimpleNamespace(
+        group_id=123, user_id="u1", notice_type="notify", sub_type="poke",
+        target_id="999", time=_t17 + 1))
+    await GATEWAY.handle_notice(bot, types.SimpleNamespace(
+        group_id=123, user_id="u7", notice_type="group_increase",
+        sub_type="approve", time=_t17 + 2))
+    await GATEWAY.handle_notice(bot, types.SimpleNamespace(
+        group_id=123, user_id="u7", notice_type="group_ban",
+        sub_type="ban", duration=600, time=_t17 + 3))
+    await drain(0.3)
+    check("a poke at the bot is transcribed, never answered",
+          any(m.text == "[戳了戳你]" for m in st17.recent)
+          and len(bot.sent) == n17)
+    check("a join is transcribed",
+          any(m.text == "[加入了本群]" for m in st17.recent))
+    check("a ban is transcribed with its span",
+          any(m.text == "[被禁言 10 分钟]" for m in st17.recent))
+    for mid in ("r1", "r2"):   # an admin mass-recall: one author, same second
+        await GATEWAY.handle_notice(bot, types.SimpleNamespace(
+            group_id=123, user_id="u9", operator_id="u1", message_id=mid,
+            notice_type="group_recall", time=_t17 + 4))
+    # Mute-all arrives as user_id 0 with duration -1: group state, no member.
+    await GATEWAY.handle_notice(bot, types.SimpleNamespace(
+        group_id=123, user_id=0, operator_id="u1", notice_type="group_ban",
+        sub_type="ban", duration=-1, time=_t17 + 5))
+    # The bot's own message recalled by an admin: not transcribed - archiving
+    # would mint an identity entity for the bot.
+    await GATEWAY.handle_notice(bot, types.SimpleNamespace(
+        group_id=123, user_id="999", operator_id="u1", message_id="r3",
+        notice_type="group_recall", time=_t17 + 6))
+    await drain(0.3)
+    check("same-second recalls of one author each get their line",
+          sum(1 for m in st17.recent
+              if m.text == "[一条消息被管理员撤回]" and m.user_id == "u9") == 2)
+    check("mute-all credits no phantom account",
+          not any(m.user_id == "0" for m in st17.recent))
+    check("the bot's own events are not transcribed",
+          not any(m.msg_id.startswith("notice") and m.user_id == "999"
+                  for m in st17.recent))
+
     # Last, so every kind of memory write has actually happened by now. Reasoning
     # models bill deliberation as output, so a memory call must ask for a terse
     # direct answer - deliberating under a word limit truncates the answer itself,

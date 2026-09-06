@@ -49,7 +49,9 @@ rather than accumulate as flags. Adding one is: write the subclass, add a line t
 - **The trigger is being addressed** - an @ or a nickname matching as a whole
   word (jieba token plus an ASCII boundary check, so a Latin-lettered nickname
   cannot match inside a longer Latin word). Everything else is read, archived,
-  and left alone; the bot never speaks uninvited.
+  and left alone; the bot never speaks uninvited. Group notices - joins,
+  leaves, recalls, bans, pokes - are transcribed as bracketed lines into the
+  window and archive, and never draw a reply.
 - **Replies require consent.** A member who has not accepted the user agreement
   gets a one-line pointer instead of a reply, at most once per cooldown:
   `/terms` shows the full text, `/agree` records acceptance permanently, per
@@ -70,16 +72,16 @@ rather than accumulate as flags. Adding one is: write the subclass, add a line t
   repeats stays and a passing remark fades in a fortnight.
 - **Money is the only limit.** The daily cap and the per-reply cap both mean
   silence when hit - no degraded answers. There is no token budget anywhere:
-  the history window is counted in messages and evicts ten at a time to keep
+  the history window is counted in messages and evicts thirty at a time to keep
   the prefix cache warm, and billing always uses the usage the API returns.
   Prices live in the backend classes as rate tables (peak/off-peak included);
   an unknown model bills at the priciest tier. `/top` attributes each reply's
   full cost to the member who triggered it.
 - **The text models deliberate before answering.** Reasoning tokens bill as
   output and arrive in a separate field, so they never reach the group but do
-  reach the invoice. Memory calls ask for terse answers (each backend's
-  `_terse_body`, selected by `reasoning_effort: off`); replies keep their
-  configured grade - that is what the quality is for.
+  reach the invoice. Replies, extraction and describing each carry their own
+  `reasoning_effort` grade (`off` selects a backend's `_terse_body` and asks
+  for terse answers); all three currently run `low`.
 - **Ops state has its own tables.** `group_state` holds what must survive a
   restart (the mute switch, extraction watermarks); `cost_ledger` is what the
   budget gate, `/stats`, `/top` and the daily report read. Neither carries
@@ -160,8 +162,8 @@ with `pg_restore --list` before old ones rotate out.
 
 The console is the owner's, with two carve-outs. Any member may run `/who`,
 `/note`, `/alias` and `/forget` against themselves - their own record, note and
-names, at the same full trust as the owner's hand - plus `/agree` for
-themselves by nature; and the read-only surfaces `/card`, `/stats`, `/top` and
+names, at the same full trust as the owner's hand - plus `/agree` and `/terms`
+for themselves by nature; and the read-only surfaces `/card`, `/stats`, `/top` and
 `/groupstats` whole. `/help` lists each reader exactly what they may run;
 everything else answers members with silence. A member can still just ask the
 bot in conversation - the roster is already in its prompt - but the command

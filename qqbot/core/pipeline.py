@@ -26,7 +26,7 @@ from datetime import datetime
 
 from ..db import repo
 from ..gateway.ingest import ingestor
-from ..gateway.onebot import GroupMessage
+from ..gateway.onebot import GroupMessage, Sender
 from ..settings import Settings, config
 from ..util import now_local, tz, why
 from . import agreement, engine, perms, prompt, trigger
@@ -34,6 +34,7 @@ from .botapi import BotApi
 from .budget import BUDGET
 from .command_catalog import PREFIXES as COMMANDS
 from .media import MEDIA
+from .members import MEMBERS
 from .segments import ImageRef, ParsedMessage, parse_segments
 from .ratelimit import DedupSet
 from .state import REGISTRY, ChatMsg
@@ -243,6 +244,102 @@ class Gateway:
         task = asyncio.create_task(self._reply(bot, group_id, item, decision, window))
         self._replies.add(task)
         task.add_done_callback(self._replies.discard)
+
+    async def handle_notice(self, bot: BotApi, event) -> None:
+        """Group notices, transcribed: a recall, a join, a leave, a ban or a
+        poke becomes one bracketed line in the window and the archive, so the
+        conversation around it stays readable ("he deleted it" no longer
+        points at nothing). Never a reply: these lines skip the trigger
+        entirely - a poke whose target name contains the bot's nickname must
+        not read as being addressed.
+        """
+        group_id = str(getattr(event, "group_id", "") or "")
+        if not group_id:
+            return
+        actor, text = await self._notice_line(bot, group_id, event)
+        if not text:
+            return
+        if actor == str(bot.self_id):
+            # The bot as the event's subject - its message recalled, itself
+            # added, removed or muted - is not transcribed: archiving would
+            # mint an identity entity for the bot (the invariant
+            # record_own_reply keeps), and a window rebuilt after a restart
+            # would re-read the line as one the bot spoke.
+            return
+        # Notices carry no message id; the dedup set and the archive's
+        # platform key both need one stable per event, so it is synthesized
+        # from what identifies the event. Recalls add the recalled message's
+        # id and pokes their target: the timestamp has second resolution, and
+        # an admin mass-recalling one author lands many events in one second.
+        when = int(getattr(event, "time", 0) or 0)
+        mark = str(getattr(event, "message_id", "")
+                   or getattr(event, "target_id", "") or "")
+        nid = (f"notice-{getattr(event, 'notice_type', '')}"
+               f"-{group_id}-{actor}-{when}" + (f"-{mark}" if mark else ""))
+        if self._dedup_set().seen(nid):
+            return
+        cfg, _persona = config().for_group(group_id)
+        try:
+            st = await REGISTRY.get(group_id)
+            await st.load_history(self_id=str(bot.self_id), owners=set(cfg.owners))
+        except Exception:
+            self._dedup_set().discard(nid)   # same rule as handle(): fail unmarked
+            raise
+        name = (await MEMBERS.name_of(bot, group_id, actor)) or actor
+        ts = datetime.fromtimestamp(when, tz()) if when else now_local()
+        msg = ChatMsg(msg_id=nid, user_id=actor, nickname=name, text=text,
+                      ts=ts, is_owner=actor in cfg.owners)
+        st.add(msg)
+        inbound = GroupMessage(
+            message_id=nid, group_id=int(group_id),
+            sender=Sender(user_id=actor, nickname=name),
+            segments=[{"type": "text", "data": {"text": text}}],
+            self_id=str(bot.self_id), occurred_at=ts, sub_type="notice",
+            plain_text=text)
+        self._track(self._archive(inbound, at_accounts=[]))
+
+    async def _notice_line(self, bot: BotApi, group_id: str,
+                           event) -> tuple[str, str]:
+        """(actor account, transcript line) for one notice; ("", "") for the
+        kinds deliberately not transcribed (title changes, honors, uploads)."""
+        ntype = str(getattr(event, "notice_type", "") or "")
+        uid = str(getattr(event, "user_id", "") or "")
+        if not uid or uid == "0":
+            # user_id 0 is the whole-group gesture (mute-all and its lift):
+            # group state, not a member event - transcribing it would credit
+            # a phantom account "0".
+            return "", ""
+        if ntype == "group_recall":
+            op = str(getattr(event, "operator_id", "") or "")
+            if op and op != uid:
+                return uid, "[一条消息被管理员撤回]"
+            return uid, "[撤回了自己的一条消息]"
+        if ntype == "group_increase":
+            return uid, "[加入了本群]"
+        if ntype == "group_decrease":
+            sub = str(getattr(event, "sub_type", "") or "")
+            return uid, ("[被移出了本群]" if sub == "kick" else "[退出了本群]")
+        if ntype == "group_ban":
+            # sub_type is the authoritative direction where present; the
+            # duration alone misreads shapes that mark a lift with -1.
+            sub = str(getattr(event, "sub_type", "") or "")
+            dur = int(getattr(event, "duration", 0) or 0)
+            if sub == "lift_ban" or (not sub and dur <= 0):
+                return uid, "[被解除禁言]"
+            if dur <= 0:
+                return uid, "[被禁言]"
+            if dur >= 60:
+                return uid, f"[被禁言 {dur // 60} 分钟]"
+            return uid, f"[被禁言 {dur} 秒]"
+        if ntype == "notify" and str(getattr(event, "sub_type", "")) == "poke":
+            target = str(getattr(event, "target_id", "") or "")
+            if target == str(bot.self_id):
+                return uid, "[戳了戳你]"
+            if not target:
+                return uid, "[戳了戳别人]"
+            tname = (await MEMBERS.name_of(bot, group_id, target)) or target
+            return uid, f"[戳了戳 {tname}]"
+        return "", ""
 
     @staticmethod
     async def _archive(inbound: GroupMessage, *, at_accounts: list[str]) -> None:

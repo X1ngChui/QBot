@@ -142,8 +142,8 @@ class LlmCfg(_M):
     text: TextCfg
     vision: VisionCfg
     asr: AsrCfg
-    search: SearchCfg
     embedding: EmbeddingCfg
+    search: SearchCfg
 
 
 class BudgetCfg(_M):

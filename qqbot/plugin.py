@@ -14,8 +14,8 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from nonebot import get_driver, on_message, require
-from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent
+from nonebot import get_driver, on_message, on_notice, require
+from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, NoticeEvent
 from nonebot.plugin import PluginMetadata
 
 require("nonebot_plugin_apscheduler")
@@ -115,3 +115,13 @@ group_message = on_message(priority=10, block=False)
 @group_message.handle()
 async def _(bot: Bot, event: GroupMessageEvent) -> None:
     await GATEWAY.handle(bot, event)
+
+
+group_notice = on_notice(priority=10, block=False)
+
+
+@group_notice.handle()
+async def _(bot: Bot, event: NoticeEvent) -> None:
+    # Recalls, joins, leaves, bans and pokes become transcript lines; the
+    # gateway ignores every other notice kind.
+    await GATEWAY.handle_notice(bot, event)

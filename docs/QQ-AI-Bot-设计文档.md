@@ -27,7 +27,7 @@
 | 协议端 NapCat（OneBot v11，反向 WS） | 唯一活跃的选择；接受第三方协议端的封号风险 |
 | 框架 NoneBot2 | Python 生态最成熟，插件体系不碍事 |
 | 文本：`deepseek-v4-pro`（回复+抽取）；视觉：`vision-exp` 专职描述 | 实测 vision-exp 语言太弱，pro 是必需品；图片理解回到描述制，`reads_images` 开关保留原图内嵌机制待有视觉的 pro 级模型 |
-| 深思分级：回复/抽取/描述各有 `reasoning_effort` 配置（off/low/high/max） | 思考按输出计费；回复 high（思考量本就小），抽取与描述 low（schema 与 Validator 承担大头，high 档在抽取实测 6k token/趟） |
+| 深思分级：回复/抽取/描述各有 `reasoning_effort` 配置（off/low/high/max） | 思考按输出计费；三条路径当前都跑 low——schema 与 Validator 承担大头，high 档在抽取实测 6k token/趟 |
 | ASR：百炼 `qwen3-asr-flash`；Embedding：百炼 `text-embedding-v4`（2048 维，API） | DeepSeek 无 ASR/embedding；共用一把 key |
 | 搜索：Tavily 免费档（1000 次/月），独立调用 (D5) | 零边际成本；不用模型内置搜索（双重计费且破坏前缀缓存） |
 | 存储：Postgres 17 + pgvector，本地磁盘 | 十八张表一个向量存储；NFS 的 fsync 不可靠，NAS 只做备份 |
@@ -96,7 +96,7 @@ with BUDGET.scope(per_reply_cny):
 
 ## 3. 功能范围
 
-做：被点名必答；群聊记忆（人、事、群知识）；图片理解（原图直读 + 归档描述）；语音转写；联网搜索；存档检索；指令面（只认 bot 拥有者、不认群管理，两类例外：/who /note /alias /forget 对普通成员开放「仅限自己」，成员手工录入与拥有者同效，/agree /terms 天然属于本人；/card /stats /top /groupstats 只读、成员可整体查看。/help 列表按身份过滤，越权一律沉默）；用户协议门槛（未 /agree 的成员叫到 bot 时得到一句指引而非回复，按冷却限频：/terms 展示协议全文、/agree 表示同意，二者也是同意前仅有的可用指令；同意按（群，账号）+ 协议版本记录、各群分别同意、版本升级需重新同意；消息照常接收存档，拥有者豁免；版本号与正文文件路径是强制配置（settings.yaml 的 agreement 块，正文随配置一并加载、缺文件拒绝启动，/reload 同步生效）。屏蔽仅意味着不回复：消息照常接收、存档、进入记忆，保持上下文连贯；可带时长（30m/12h/3d），到期在其下一次叫到 bot 时惰性解除，不设调度器。
+做：被点名必答；群聊记忆（人、事、群知识）；图片理解（原图直读 + 归档描述）；语音转写；联网搜索；存档检索；指令面（只认 bot 拥有者、不认群管理，两类例外：/who /note /alias /forget 对普通成员开放「仅限自己」，成员手工录入与拥有者同效，/agree /terms 天然属于本人；/card /stats /top /groupstats 只读、成员可整体查看。/help 列表按身份过滤，越权一律沉默）；用户协议门槛（未 /agree 的成员叫到 bot 时得到一句指引而非回复，按冷却限频：/terms 展示协议全文、/agree 表示同意，二者也是同意前仅有的可用指令；同意按（群，账号）+ 协议版本记录、各群分别同意、版本升级需重新同意；消息照常接收存档，拥有者豁免；版本号与正文文件路径是强制配置（settings.yaml 的 agreement 块，正文随配置一并加载、缺文件拒绝启动，/reload 同步生效）。屏蔽仅意味着不回复：消息照常接收、存档、进入记忆，保持上下文连贯；可带时长（30m/12h/3d），到期在其下一次叫到 bot 时惰性解除，不设调度器。群事件（入群、退群/被踢、撤回、禁言、戳一戳）转写为一行方括号文本进入窗口与存档，绝不触发回复。
 不做：主动插话（仲裁器已删）；发图发语音；跨群记忆共享；多账号。
 
 ## 4. 触发
@@ -214,7 +214,7 @@ compose 三服务：postgres（pgvector 镜像，bind mount `data/pg`）、napca
 
 `config/settings.yaml`（全局）+ `config/personas/group_<gid>.yaml`（人格与每群 overrides，只写差异）。纪律：**每个字段都必须有读者、都必须是真选择**——单值旋钮、死机制的开关一律删除（`heavy_when`、token 预算块、`enabled_groups` 都是这么没的）。校验在加载时全量报错（pydantic `extra="forbid"`）。新群零配置：首条消息即服务、默认人格、日报可见。
 
-**提示词是数据**：全部模型可见指令文本以 `config/prompts/<key>.txt` 存放，文件即事实源；代码只持键清单（`settings.PROMPT_KEYS`），缺文件、多文件都拒绝启动，`/reload` 生效（抽取提示词构造时组合，重启生效）。各段措辞的事故注释在 `config/prompts/README.md`。标记格式本身、章节标题、机械性单行告知仍是代码——代码既产生也解析它们。
+**提示词是数据**：全部模型可见指令文本以独立文本文件存放，文件即事实源；`settings.yaml` 的 `prompts:` 映射逐键给出路径（相对配置目录解析），代码只持键清单（`settings.PROMPT_KEYS`），映射与清单双向核对，缺键、多键、文件缺失或为空都拒绝启动；`/reload` 生效（抽取提示词构造时组合，重启生效）。各段措辞的事故注释在 `config/prompts/README.md`。标记格式本身、章节标题、机械性单行告知仍是代码——代码既产生也解析它们。
 
 ## 9. 存储
 
@@ -251,7 +251,7 @@ compose 三服务：postgres（pgvector 镜像，bind mount `data/pg`）、napca
 
 **D9 视觉单模型**（2026-08-27）：`vision-exp` 文本持平 V4-Flash 且同价，回复从 Pro 切来省约 3 倍，还免去双档路由。文本弱于 Pro 是接受的代价。
 
-**D10 ~~全线禁思~~ → 深思分级**（2026-08-27，08-29 修订）：抽取一趟曾思考 6k token 而产出只值其十分之一——schema 与 Validator 已承担「想清楚」的职责，抽取与描述保持强制关闭。但全关后回复变笨，拥有者要求恢复：回复路径的思考改为配置分级（`llm.text.reasoning_effort`: off/low/high/max，映射厂商同名参数），实测回复即便在 high 档思考量也很小，费用以分计。
+**D10 ~~全线禁思~~ → 深思分级**（2026-08-27，08-29 修订）：抽取一趟曾思考 6k token 而产出只值其十分之一——schema 与 Validator 已承担「想清楚」的职责。但全关后回复变笨，拥有者要求恢复：三条路径的思考各自配置分级（`reasoning_effort`: off/low/high/max，映射厂商同名参数，off 走各后端的免思考通道），当前均为 low；实测回复即便在 high 档思考量也很小，费用以分计。
 
 **D11 图片到达即理解**（2026-08-27）：链接新鲜、每图只付一次（缓存）、不回复的群也有可读归档，且回复延迟不再等渲染。「付费动作等回复」的旧纪律只对语音仍然成立。
 
