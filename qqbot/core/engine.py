@@ -1,7 +1,8 @@
 """The conversation engine: retrieve -> assemble -> call -> strip -> send (section 2).
 
 The tool loop is bounded; there is no fallback and no downgrade, so any failure means the
-bot simply says nothing.
+bot simply says nothing. A mid-reply limit is not a failure: it ends the spending, and a
+tool-less wrap-up round answers from what was already fetched (see RUNAWAY_ROUNDS).
 """
 
 from __future__ import annotations
@@ -26,15 +27,24 @@ log = logging.getLogger("qqbot.engine")
 
 #: The loop's constraint is money: every round is itself a paid model call, so the scope
 #: opened around the reply is what ends the loop - when what remains cannot cover
-#: another round, the reply is dropped. Dropped, not wrapped up: a limit reached means
-#: silence (the owner's rule, same as the daily cap), so there is no closing round that
-#: answers with what it has. No round count, no per-tool quota: free tools run as often
-#: as they like, and what bounds them is that the rounds carrying them are not free.
+#: another round, the searching stops and one tool-less wrap-up round answers from what
+#: is already fetched. The owner's rule (design goal 6, revised): a mid-reply limit
+#: stops the *spending*, not the speech - what the reply has already paid for is worth
+#: one bounded closing call, and the daily cap, checked before anything is spent, still
+#: means silence. No round count, no per-tool quota: free tools run as often as they
+#: like, and what bounds them is that the rounds carrying them are not free.
 #:
 #: This one number is not a policy but a tripwire. A backend that reported zero cost
 #: would make a money-bounded loop unbounded, and that failure should be a loud log and
 #: a stop, not an infinite loop.
 RUNAWAY_ROUNDS = 20
+
+#: What an unexecuted tool request is answered with once the allowance died mid-round,
+#: and what the wrap-up round is told. Mechanical one-line notices, so they live in
+#: code like the repeated-call notice, not in the prompt registry.
+QUOTA_NOTE = "（检索额度已用完，这个查询没有执行。）"
+WRAP_UP_NOTE = ("（本次回复的额度已用完，不能再执行任何检索或查看；"
+                "请只依据上文已有的材料直接作答，不要提及额度或系统限制。）")
 
 #: What one round is assumed to cost when deciding whether another is affordable:
 #: (cache-hit, cache-miss, output) tokens, priced at the moment of asking. An estimate
@@ -60,6 +70,30 @@ TRACE_TOTAL_CHARS = 900
 TOOL_VERB = {"web_search": "搜索", "search_history": "查档", "recall_events": "回忆"}
 
 
+async def _wrap_up(messages: list, *, cfg: Settings, st: GroupState,
+                   executed: list[tuple[str, dict, str]],
+                   round_no: int) -> tuple[str | None, str, str]:
+    """One last tool-less call after a limit trips mid-reply.
+
+    The material already fetched is sitting in the tail, paid for; discarding it
+    bought nothing but silence. So the limit stops the spending, not the speech:
+    no tools are offered, the note says why, and the overshoot is exactly one
+    bounded round - the same slack the affordability gate's estimate already
+    tolerates. A failure here still ends in silence; the wrap-up is a chance,
+    not a guarantee.
+    """
+    messages.append({"role": "user", "content": WRAP_UP_NOTE})
+    try:
+        res = await providers().text.chat(
+            messages, cfg=cfg.llm.text, kind=Kind.REPLY, group_id=st.group_id)
+    except Exception as e:
+        log.warning("group %s: wrap-up round failed, staying silent: %s",
+                    st.group_id, why(e))
+        return None, "", ""
+    debug.capture(st.group_id, round_no, messages, res)
+    return res.text or None, _provenance(executed), _trace(executed)
+
+
 def _provenance(executed: list[tuple[str, dict, str]]) -> str:
     """The provenance marker for a reply that used tools - what this answer rested on.
 
@@ -68,7 +102,7 @@ def _provenance(executed: list[tuple[str, dict, str]]) -> str:
     tool work leaves: without it, a later turn cannot tell an answer backed by a
     search from one improvised off the context, so it either re-searches what was
     just searched or - worse - cites its own guess as fact. Fixed at send time, so
-    the line stays byte-identical between turns (cache-safe), and reading_rules
+    the line stays byte-identical between turns (cache-safe), and credibility_rules
     explains the epistemics: marked lines may be cited, unmarked ones re-verified.
     """
     parts: list[str] = []
@@ -213,9 +247,8 @@ async def generate(
     seen_calls: set[tuple[str, str]] = set()
     executed: list[tuple[str, dict, str]] = []
 
-    # A limit reached means silence, not a degraded answer (the owner's rule; the
-    # module comment above holds the full statement). Money already spent on a reply
-    # that never happens is the accepted price of keeping limits mean.
+    # The scope is what ends the loop; when it does, the wrap-up round speaks from
+    # what was already paid for (the module comment above holds the full statement).
     with BUDGET.scope(cfg.budget.per_reply_cny) as spend:
         for round_no in range(RUNAWAY_ROUNDS):
             res = await providers().text.chat(
@@ -235,24 +268,33 @@ async def generate(
             # execution: the first round always runs (a plain answer must never be
             # silenced by a rough estimate exceeding a tight cap), but tools whose
             # results no affordable round could ever read are not worth running -
-            # they would burn search allowance and latency for a guaranteed drop.
+            # they would burn search allowance and latency without being usable.
             # Priced at the moment of asking, because the price moves with the clock.
+            # The requested calls are dropped unexecuted; the wrap-up answers from
+            # what earlier rounds already fetched.
             round_cost = providers().text.rate_for(model).tokens(*ROUND_TOKENS)
             if not spend.can_afford(round_cost):
                 log.info("group %s: per-reply budget exhausted after %d round(s), "
-                         "staying silent (%.4f of %.4f used)",
+                         "wrapping up without tools (%.4f of %.4f used)",
                          st.group_id, round_no + 1, spend.spent, spend.cap)
-                return None, "", ""
+                return await _wrap_up(messages, cfg=cfg, st=st,
+                                      executed=executed, round_no=round_no + 1)
 
             # Tool results stay at the very tail, after the cache boundary (section 6.2).
             messages.append(
                 {"role": "assistant", "content": res.text or None,
                  "tool_calls": res.tool_calls}
             )
+            quota_hit = False
             for call in res.tool_calls:
                 fn = call.get("function", {}) or {}
                 key = (fn.get("name") or "", (fn.get("arguments") or "").strip())
-                if key in seen_calls:
+                if quota_hit:
+                    # The allowance died mid-round; the remaining requests are
+                    # answered with the placeholder so every tool_call id gets
+                    # its reply and the wrap-up call is protocol-clean.
+                    out = QUOTA_NOTE
+                elif key in seen_calls:
                     # Nothing here is paginated, so the same call again returns the same
                     # bytes. Answered in words rather than re-executed: a model repeating
                     # itself is a model stuck, and handing it identical results once more
@@ -273,11 +315,13 @@ async def generate(
                         out = await tools.execute(call, cfg=cfg, group_id=st.group_id,
                                                   ctx=ctx)
                     except QuotaExhausted as e:
-                        log.info("group %s: %s - a limit, so the reply is dropped, "
-                                 "not degraded", st.group_id, why(e))
-                        return None, "", ""
-                    executed.append(
-                        (key[0], _args if isinstance(_args, dict) else {}, out))
+                        log.info("group %s: %s - wrapping up on what is already "
+                                 "fetched", st.group_id, why(e))
+                        quota_hit = True
+                        out = QUOTA_NOTE
+                    else:
+                        executed.append(
+                            (key[0], _args if isinstance(_args, dict) else {}, out))
                     # A round carrying several inspect_image calls can overshoot
                     # the scope by their sum before the next gate reads it - a
                     # known, bounded slack (vision runs at flash rates; one
@@ -286,6 +330,9 @@ async def generate(
                 messages.append(
                     {"role": "tool", "tool_call_id": call.get("id", ""), "content": out}
                 )
+            if quota_hit:
+                return await _wrap_up(messages, cfg=cfg, st=st,
+                                      executed=executed, round_no=round_no + 1)
             log.info("group %s: tool round %d done (%.4f CNY of %.4f used)",
                      st.group_id, round_no + 1, spend.spent, spend.cap)
 

@@ -51,7 +51,10 @@ rather than accumulate as flags. Adding one is: write the subclass, add a line t
   cannot match inside a longer Latin word). Everything else is read, archived,
   and left alone; the bot never speaks uninvited. Group notices - joins,
   leaves, recalls, bans, pokes - are transcribed as bracketed lines into the
-  window and archive, and never draw a reply.
+  window and archive, and never draw a reply. Members sharing a display name
+  render apart as name(N), N a permanent per-group serial (`member_seq`);
+  renames dissolve and restore the suffix on the next member-list refresh,
+  never the number.
 - **Replies require consent.** A member who has not accepted the user agreement
   gets a one-line pointer instead of a reply, at most once per cooldown:
   `/terms` shows the full text, `/agree` records acceptance permanently, per
@@ -70,8 +73,11 @@ rather than accumulate as flags. Adding one is: write the subclass, add a line t
   propose. A wrong entry is deleted by number (`/forget`), and everything
   expires: a fact survives one half-life per supporting event, so what a group
   repeats stays and a passing remark fades in a fortnight.
-- **Money is the only limit.** The daily cap and the per-reply cap both mean
-  silence when hit - no degraded answers. There is no token budget anywhere:
+- **Money is the only limit.** The daily cap, checked before anything is spent,
+  means silence when hit. A limit tripping mid-reply - the per-reply cap, the
+  monthly search allowance - stops the spending instead: one tool-less wrap-up
+  round answers from what was already fetched, an overshoot of exactly one
+  bounded round. There is no token budget anywhere:
   the history window is counted in messages and evicts thirty at a time to keep
   the prefix cache warm, and billing always uses the usage the API returns.
   Prices live in the backend classes as rate tables (peak/off-peak included);

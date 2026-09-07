@@ -1119,7 +1119,8 @@ async def main():
     # every round is a paid model call charged to the reply's scope, the first round
     # always runs, and the affordability gate sits between a round's tool requests and
     # their execution - tools whose results no affordable round could read never run.
-    # Either limit (the purse, the search allowance) ends the reply in silence. Every
+    # Either limit (the purse, the search allowance) ends the *spending*: one tool-less
+    # wrap-up round then answers from what the paid rounds already fetched. Every
     # number below is arranged so the arithmetic is checkable by hand.
     from qqbot.core import engine as _eng
 
@@ -1167,6 +1168,8 @@ async def main():
                               "tools": tools, "effort": effort, "max_tokens": max_tokens})
             await BUDGET.record(kind=kind, model=self.MODEL, cny=ROUND_CHARGE,
                                 group_id=group_id)
+            if tools is None:   # the wrap-up round: no tools offered, answer given
+                return ChatResult(text="就查到这些了", model=self.MODEL)
             return ChatResult(text="", model=self.MODEL,
                               tool_calls=[_tc("话题A"), _tc("话题A"), _tc(f"话题{len(LLM_CALLS)}")])
 
@@ -1178,13 +1181,18 @@ async def main():
         bot=bot, st=st13, cfg=cfg, persona=config().for_group("123")[1],
         batch=[_CM0(msg_id="loop1", user_id="u1", nickname="阿强",
                     text="帮我查个东西", ts=_nl0())])
-    # The scripted allowance dies on the third search, in round two: a limit reached
-    # means the reply is dropped outright - no closing round, no answer-from-what-you-
-    # have. Silence is the owner's chosen behaviour for every limit, daily cap included.
-    check("a reply that hits the search allowance is dropped, not degraded",
-          text is None, repr(text))
-    check("the loop stopped at the limit",
-          len(LLM_CALLS) - n_llm == 2, f"{len(LLM_CALLS) - n_llm} rounds")
+    # The scripted allowance dies on the third search, in round two: the limit ends
+    # the spending, and a tool-less wrap-up round answers from what rounds one and
+    # two already fetched (the daily cap, checked before anything is spent, still
+    # means silence).
+    check("a reply that hits the search allowance wraps up with an answer",
+          text == "就查到这些了", repr(text))
+    check("the wrap-up is one extra round, offered no tools",
+          len(LLM_CALLS) - n_llm == 3 and LLM_CALLS[-1]["tools"] is None,
+          f"{len(LLM_CALLS) - n_llm} rounds, tools={LLM_CALLS[-1]['tools']!r}")
+    check("the wrap-up round is told the allowance is gone",
+          any("额度已用完" in (m.get("content") or "")
+              for m in LLM_CALLS[-1]["messages"] if m.get("role") == "user"))
     check("free searches are not gated by the reply's purse",
           len(CountingSearch.calls) == 2,
           f"{len(CountingSearch.calls)} calls: {CountingSearch.calls}")
@@ -1194,11 +1202,13 @@ async def main():
                   if m.get("role") == "tool"]
     check("the model is told about the duplicate in words",
           any("刚执行过" in t for t in tool_texts))
+    check("the unexecuted request got its placeholder result",
+          any("没有执行" in t for t in tool_texts))
 
     # And the other limit the same way: with the allowance out of the picture and the
-    # purse shrunk to 0.04, round one runs (the first round always does), its two
-    # searches execute, and the gate then finds the purse cannot cover reading a
-    # second round's results - the tools of round two never run, the reply drops.
+    # purse shrunk to 0.04, rounds one and two run, and the gate then finds the purse
+    # cannot cover reading a third round's results - the pending tool requests never
+    # run, and the wrap-up answers from what the first two rounds fetched.
     class EndlessSearch(CountingSearch):
         """CountingSearch without the allowance: only the purse can end this one."""
 
@@ -1216,14 +1226,15 @@ async def main():
         bot=bot, st=st13, cfg=cfg, persona=config().for_group("123")[1],
         batch=[_CM0(msg_id="loop2", user_id="u1", nickname="阿强",
                     text="再查个东西", ts=_nl0())])
-    check("a reply that runs out of money is dropped the same way",
-          text2 is None and len(LLM_CALLS) - n_llm2 == 2,
+    check("a reply that runs out of money wraps up the same way",
+          text2 == "就查到这些了" and len(LLM_CALLS) - n_llm2 == 3
+          and LLM_CALLS[-1]["tools"] is None,
           f"{text2!r}, {len(LLM_CALLS) - n_llm2} rounds")
     check("and the unaffordable round's tools were never executed",
           len(EndlessSearch.calls) == 2, str(EndlessSearch.calls))
 
     # A reply that searched leaves its provenance on the archived line: what the
-    # group read carries no marker, what the bot remembers does. reading_rules then
+    # group read carries no marker, what the bot remembers does. credibility_rules then
     # lets a later turn cite the marked line instead of re-searching, and treats
     # unmarked lines as improvised off the context.
     from qqbot.core.engine import _provenance as _pvfn

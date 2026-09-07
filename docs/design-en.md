@@ -16,7 +16,7 @@ Cited by number from code comments; the numbering must not be reshuffled:
 3. **What can go undone, goes undone**: a mechanism whose upkeep exceeds what it saves is a liability (the three questions in appendix D8).
 4. **Group isolation**: every table carrying a group_id indexes it first, and no retrieval path crosses groups; the one exception is a global alias an owner establishes by hand.
 5. **Money is the only limit**: free things run without count; paid actions answer to money, never to call quotas — proxies that drift whenever prices move.
-6. **A limit reached means silence**: any cap hitting its ceiling (daily budget, per-reply budget, monthly search allowance) drops the reply outright; there is no degraded answer.
+6. **A limit stops the spending**: the constraint is bounded consumption, not money already spent going to waste. The daily cap is checked before anything is spent and means silence; a limit tripping mid-reply (the per-reply cap, the monthly search allowance) stops everything that would still cost money and adds one tool-less wrap-up round answering from what was already fetched - an overshoot of exactly one bounded round.
 7. **Structured output goes through function calls**: whenever the model writes into the system (memory candidates, aliases) it does so via tool-call schemas, never free-text JSON to parse.
 8. **Text is the archival form**: the model reads original pixels; the archive stores text descriptions — search, extraction and restart-rebuild all consume text.
 
@@ -30,7 +30,7 @@ Cited by number from code comments; the numbering must not be reshuffled:
 | Deliberation graded per path: replies, extraction and describing each carry a `reasoning_effort` config (off/low/high/max) | Thinking bills at output price; all three paths currently run low - the schema and Validator carry the bulk, and high once billed ~6k thought tokens an extraction pass |
 | ASR: Bailian `qwen3-asr-flash`; embedding: Bailian `text-embedding-v4` (2048-dim, API) | DeepSeek has neither; the two share one credential |
 | Search: Tavily free tier (1000/month), called directly (D5) | Zero marginal cost; never the model's built-in search (double billing, breaks the prefix cache) |
-| Storage: Postgres 17 + pgvector on local disk | Eighteen tables and one vector store; NFS fsync is unreliable, the NAS is for backups only |
+| Storage: Postgres 17 + pgvector on local disk | Twenty tables and one vector store; NFS fsync is unreliable, the NAS is for backups only |
 | Trigger = must-answer on @/nickname, silence otherwise | Arbiter, interest vectors and adaptive intensity all deleted (appendix D1/D7); one rule, no knobs |
 | Structured memory: entity/alias/fact/episode layers with evidence-driven confidence | Wilson lower bound + channel fusion + per-predicate decay; v5's prose profiles are dead (appendix D2) |
 | Text-only output | Pictures and voice are understood inbound only; the output layer is just `clean_reply()` |
@@ -147,7 +147,7 @@ Two levels, both in `core/budget.py`:
 
 Attribution (a contextvar; it feeds the /top leaderboard only and never changes the shared budget): the bot only ever replies when spoken to, so a reply's entire spend - the transcribes, image looks and searches it forces included - is booked to its initiator, the sender of the last message that @-ed the bot or said its name; a picture's archival description is booked to whoever posted the picture; extraction and other communal spend stays unattributed.
 
-A limit reached means silence (design goal 6): no closing round that wraps up with what it has, no "the allowance is gone, answer from what you know". The monthly search allowance (1000 credits) is metered off the ledger's calendar-month calls count — booked in the vendor's own unit, so an advanced-depth search books two, and `read_url` page reads debit the same pool; past it, `QuotaExhausted` propagates and ends the whole reply. A transport failure is a different thing — the model is told "search failed" and carries on, because a broken network is an error, not a limit.
+A limit stops the spending (design goal 6, revised 2026-09-07): the daily cap, checked at entry, still means silence; a mid-reply limit (the per-reply cap, the monthly search allowance) no longer discards the reply - unexecuted tool requests are completed with a placeholder result and one tool-less wrap-up round answers from the material already fetched, with the model told the allowance is gone. The monthly search allowance (1000 credits) is metered off the ledger's calendar-month calls count — booked in the vendor's own unit, so an advanced-depth search books two, and `read_url` page reads debit the same pool. A transport failure is a different thing — the model is told "search failed" and carries on, because a broken network is an error, not a limit.
 
 Price tables live inside the backend classes, including DeepSeek's peak/off-peak split (weekdays 9–12 / 14–18 Beijing, ×2) and the two-era table around the 2026-08-17 repricing; an unknown model bills at the priciest tier, so a rename trips the gate early rather than under-billing. All figures verified against vendor pages (2026-08-27).
 
@@ -155,7 +155,7 @@ Price tables live inside the backend classes, including DeepSeek's peak/off-peak
 
 ### 6.1 Storage
 
-Eighteen tables, layered (L2 is deliberately absent: every reference the system receives is an @ or a quote where the platform states the account outright, so there is no judgement to record):
+Twenty tables, layered (L2 is deliberately absent: every reference the system receives is an @ or a quote where the platform states the account outright, so there is no judgement to record):
 
 - **L0 `raw_event`**: append-only archive; `payload` is the platform's verbatim message and is never modified, `plain_text` is the updatable derived reading (picture descriptions and voice transcripts land there).
 - **L1 `entity` / `identity_account` / `alias`(+evidence)**: person, account and name kept apart. Person-level operations reduce to two primitives: write-side **expansion** (`accounts_of_person` - /block acts on the person) and read-side **aggregation by entity** (join `identity_account`, group by entity_id - the /top leaderboard ranks people). A merge physically repoints the account rows, so read-side aggregation is correct even for merges declared after the fact; a new person-level feature picks one of the two instead of inventing its own. The account is the strong identity; names carry scope, an evidence trail and a status. Alias confidence = max within a channel, noisy-OR across channels; a platform name's first day only makes it a candidate (against rename games); manual evidence is authoritative, and a retired name stays dead against automatic evidence.
@@ -182,7 +182,7 @@ Every line carries its own send time (`[MM-dd HH:mm]`, one format shared by the 
 
 Pull-style retrieval complements the pushed window: anything behind it is reachable on demand via `search_history` / `recall_events`.
 
-Names are the model's only handle on people, and two members sharing a group card is ordinary: the member-list refresh checks the current cards for clashes and renders every clashing member as name(N), where N is the account's permanent per-group serial (the `member_seq` table - assigned once, never reused, never reassigned, so a numbered name in any old transcript still points at the same person). Renames create new clashes and dissolve old ones; both converge on the next refresh, and the refresh is the single choke point for current names (window relabelling, the roster, @-resolution and the notice lines all read it), so the numbering happens exactly once. `search_history`'s speaker argument accepts the numbered form and narrows by the serial's account rather than by name. Extraction is untouched: its transcript already names accounts by per-batch code, and every write takes codes only.
+Names are the model's only handle on people, and two members sharing a group card is ordinary: the member-list refresh checks the current cards for clashes and renders every clashing member as name(N), where N is the account's permanent per-group serial (the `member_seq` table - assigned once, never reused, never reassigned, so a numbered name in any old transcript still points at the same person). Renames create new clashes and dissolve old ones; both converge on the next refresh, and the refresh is the single choke point for current names (window relabelling, the roster, @-resolution and the notice lines all read it); the roster keeps one fallback pass for rows showing archived names (a departed namesake). `search_history`'s speaker argument accepts the numbered form and narrows by the serial's account rather than by name. Extraction is untouched: its transcript already names accounts by per-batch code, and every write takes codes only.
 
 ### 6.3 Writing: extract → validate → consolidate
 
@@ -264,7 +264,7 @@ Kept for reference; ~~struck-through~~ entries were overturned by later practice
 
 **D11 Pictures understood on arrival** (2026-08-27): the link is freshest, each unique picture is paid for once (cached), groups the bot never answers still get a readable archive, and replies stop waiting on rendering. The old pay-at-reply discipline survives only for voice.
 
-**D12 Limits mean silence** (2026-08-27): all three caps now behave identically. Money already spent mid-reply being discarded is the price of limits that mean what they say.
+**D12 ~~Limits mean silence~~ → limits stop the spending** (2026-08-27, revised 09-07): the three caps were once unified on silence, money already spent discarded with the reply. The owner ruled the constraint is bounded consumption, not strict non-overshoot: a mid-reply limit now ends in one tool-less wrap-up round, so the money spent produces a reply and the overshoot is bounded at exactly one round; the daily cap sits before any spending and still means silence.
 
 **D13 Token-budget machinery deleted** (2026-08-27): money is already the only limit; token caps were a second budget dressed as layout. The surviving message-count window serves context and cache, not cost.
 

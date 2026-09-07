@@ -147,6 +147,17 @@ CASES = [
         "checks": None,  # OBSERVE
     },
     {
+        "name": "third_person_jab",
+        "why": "eyeball case: the reply goes to the asker, so a jab aimed at a "
+               "third person must name them - a 你-voiced jab reads as aimed at "
+               "the asker (a real complaint)",
+        "window": [
+            _msg("u2", "小北", "今天摸鱼一整天，真舒服", 4),
+        ],
+        "trigger": _msg("u1", "阿强", "@我 帮我挖苦一下小北", 0),
+        "checks": None,  # OBSERVE
+    },
+    {
         "name": "meme_vs_fact",
         "why": "eyeball case: memes about a person should be labelled, not opened "
                "with as if they were the facts (a real reply once led with them)",

@@ -151,7 +151,7 @@ def build_system(
     # truth, /reload applies.
     blocks = [
         H_LEGEND + "\n" + ptext("legend") + "\n\n" + ptext("legend_reply_note"),
-        H_RULES + "\n" + ptext("reading_rules"),
+        H_RULES + "\n" + ptext("identity_rules") + "\n\n" + ptext("credibility_rules"),
         H_PRIVATE + "\n" + ptext("private_rules"),
         H_TONE + "\n" + ptext("tone_rules") + "\n\n" + ptext("tone_reply_note"),
         H_PERSONA + "\n" + persona.system_prompt.strip(),

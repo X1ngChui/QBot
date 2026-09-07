@@ -146,7 +146,8 @@ prompts:
   legend_reply_note: prompts/legend_reply_note.txt
   extract_legend_note: prompts/extract_legend_note.txt
   # the reply path's standing rules
-  reading_rules: prompts/reading_rules.txt
+  identity_rules: prompts/identity_rules.txt
+  credibility_rules: prompts/credibility_rules.txt
   private_rules: prompts/private_rules.txt
   tone_rules: prompts/tone_rules.txt
   tone_reply_note: prompts/tone_reply_note.txt

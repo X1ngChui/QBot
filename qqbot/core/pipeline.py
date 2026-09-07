@@ -285,14 +285,21 @@ class Gateway:
         except Exception:
             self._dedup_set().discard(nid)   # same rule as handle(): fail unmarked
             raise
+        # The window line wears the rendered (possibly numbered) name; the
+        # archived sender must carry the raw card or nothing, because the
+        # ingest chain files sender names into the alias table as
+        # platform-reported - a namesake suffix (or a bare account number)
+        # written there would assert the platform reported a name nobody
+        # carries, and it would stick.
         name = (await MEMBERS.name_of(bot, group_id, actor)) or actor
+        raw = await MEMBERS.raw_name_of(bot, group_id, actor)
         ts = datetime.fromtimestamp(when, tz()) if when else now_local()
         msg = ChatMsg(msg_id=nid, user_id=actor, nickname=name, text=text,
                       ts=ts, is_owner=actor in cfg.owners)
         st.add(msg)
         inbound = GroupMessage(
             message_id=nid, group_id=int(group_id),
-            sender=Sender(user_id=actor, nickname=name),
+            sender=Sender(user_id=actor, nickname=raw or ""),
             segments=[{"type": "text", "data": {"text": text}}],
             self_id=str(bot.self_id), occurred_at=ts, sub_type="notice",
             plain_text=text)

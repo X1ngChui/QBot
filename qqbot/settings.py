@@ -25,8 +25,9 @@ from . import util
 PROMPT_KEYS = frozenset({
     # transcript legend, shared by reply and extraction; plus each side's addendum
     "legend", "legend_reply_note", "extract_legend_note",
-    # the reply path's standing rules
-    "reading_rules", "private_rules", "tone_rules", "tone_reply_note", "reply_final",
+    # the reply path's standing rules (identity and credibility share one heading)
+    "identity_rules", "credibility_rules",
+    "private_rules", "tone_rules", "tone_reply_note", "reply_final",
     # the whole extraction rulebook (its joke-vs-fact rule lives inline, beside
     # the fact criteria it qualifies - there is no memory-side tone addendum)
     "extract",
@@ -155,8 +156,11 @@ class BudgetCfg(_M):
     daily_cny_cap: float = 5.0
     #: What one reply may spend, tool loop included. Money is the only limit - there is
     #: no per-day search count or per-reply round count, which are proxies for cost that
-    #: drift whenever prices move. A reply that cannot afford another round is dropped:
-    #: limits mean silence, same as the daily cap.
+    #: drift whenever prices move. A reply that cannot afford another round stops
+    #: searching and answers from what it has in one tool-less wrap-up round: the cap
+    #: bounds the spending (overshoot is exactly that one round), it does not discard
+    #: what was already paid for. Only the daily cap, checked before anything is spent,
+    #: means silence.
     per_reply_cny: float = 0.30
 
 

@@ -15,7 +15,8 @@ prompts:
   legend_reply_note: ../../../config/prompts/legend_reply_note.txt
   extract_legend_note: ../../../config/prompts/extract_legend_note.txt
   # the reply path's standing rules
-  reading_rules: ../../../config/prompts/reading_rules.txt
+  identity_rules: ../../../config/prompts/identity_rules.txt
+  credibility_rules: ../../../config/prompts/credibility_rules.txt
   private_rules: ../../../config/prompts/private_rules.txt
   tone_rules: ../../../config/prompts/tone_rules.txt
   tone_reply_note: ../../../config/prompts/tone_reply_note.txt

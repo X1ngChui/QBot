@@ -158,6 +158,18 @@ HISTORY_SNIPPET = 200
 _SEQ_NAME = re.compile(r"^(.+)\((\d{1,9})\)$")
 
 
+async def _carried_name(group_id: int, uid: str, name: str) -> bool:
+    """Whether this account has ever spoken here under this display name."""
+    if not name:
+        return False
+    return bool(await pool().fetchval(
+        """SELECT EXISTS(SELECT 1 FROM raw_event
+             WHERE group_id=$1 AND platform_user_id=$2 AND event_type='message'
+               AND (payload->'sender'->>'card' = $3
+                    OR payload->'sender'->>'nickname' = $3))""",
+        group_id, uid, name))
+
+
 def _like(word: str) -> str:
     """One keyword as a LIKE pattern, with the pattern characters made literal."""
     return "%" + word.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_") + "%"
@@ -185,6 +197,12 @@ async def search_history(group_id: int, query: str, *, speaker: str | None = Non
     uid: str | None = None
     if m := _SEQ_NAME.fullmatch(sp):
         uid = await repo.member_of_seq(group_id, int(m.group(2)))
+        if uid is not None and not await _carried_name(group_id, uid,
+                                                       m.group(1).strip()):
+            # A member whose literal card ends in (3) must not resolve through
+            # serial 3 to an unrelated account: the serial only decides when
+            # its account has actually carried the name half.
+            uid = None
     rows = await pool().fetch(
         """SELECT occurred_at, payload, plain_text FROM raw_event
             WHERE group_id=$1 AND event_type='message'

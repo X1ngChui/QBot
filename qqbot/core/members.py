@@ -35,6 +35,11 @@ TTL_SEC = 1800
 class MemberDirectory:
     def __init__(self) -> None:
         self._by_group: dict[str, dict[str, str]] = {}
+        #: The same table before namesake suffixing. Anything that files a name
+        #: into storage or compares against stored names must read this one:
+        #: the suffix is a rendering, and a rendering written into the alias
+        #: table would assert the platform reported a name nobody carries.
+        self._raw_by_group: dict[str, dict[str, str]] = {}
         self._fetched: dict[str, float] = {}
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -66,6 +71,7 @@ class MemberDirectory:
                 name = (r.get("card") or r.get("nickname") or "").strip()
                 if qq and name:
                     table[qq] = name
+            self._raw_by_group[group_id] = dict(table)
             # Two members sharing one display name is ordinary, and a name is
             # all the model ever sees - so each clashing member's entry becomes
             # name(N), with N the group's permanent serial for that account
@@ -74,8 +80,9 @@ class MemberDirectory:
             # it). This runs on every refresh, which is what tracks renames:
             # a new clash gains suffixes, a dissolved one loses them. Every
             # reader of current names sits behind this table - relabel, the
-            # roster's live names, @-resolution, the notice lines - so the
-            # numbering happens exactly once, here. A numbering failure
+            # roster's live names, @-resolution, the notice lines - so live
+            # names are numbered only here (the roster keeps its own pass for
+            # rows falling back to archived names). A numbering failure
             # degrades to bare names rather than losing the fetch.
             names: dict[str, list[str]] = {}
             for qq, name in table.items():
@@ -124,6 +131,27 @@ class MemberDirectory:
             table = self._by_group.get(group_id) or {}
         return {q: table[q] for q in wanted if q in table}
 
+    async def raw_name_of(self, bot: BotApi, group_id: str, qq: str) -> str | None:
+        """The display name before namesake suffixing - for anything that files
+        a name into storage or compares against stored names. The suffix is a
+        transcript rendering, never a name anyone carries."""
+        if not qq:
+            return None
+        if not self._fresh(group_id):
+            await self._fetch(bot, group_id)
+        return (self._raw_by_group.get(group_id) or {}).get(qq)
+
+    async def raw_names_of(self, bot: BotApi, group_id: str,
+                           qqs: list[str]) -> dict[str, str]:
+        """Pre-suffix display names for several members - see raw_name_of."""
+        wanted = [q for q in qqs if q]
+        if not wanted:
+            return {}
+        if not self._fresh(group_id):
+            await self._fetch(bot, group_id)
+        table = self._raw_by_group.get(group_id) or {}
+        return {q: table[q] for q in wanted if q in table}
+
     async def relabel(self, bot: BotApi, group_id: str, msgs) -> int:
         """Update the speaker names on a batch of ChatMsg to the current group card.
 
@@ -150,9 +178,11 @@ class MemberDirectory:
     def forget(self, group_id: str | None = None) -> None:
         if group_id is None:
             self._by_group.clear()
+            self._raw_by_group.clear()
             self._fetched.clear()
         else:
             self._by_group.pop(group_id, None)
+            self._raw_by_group.pop(group_id, None)
             self._fetched.pop(group_id, None)
 
 

@@ -113,7 +113,13 @@ async def gather(*, group_id: str, bot=None) -> list[dict]:
     live = await _live(speakers)
     stamp = await _stamp(gid, live)
 
-    cards = await _DIRECTORY.roster(gid, display=live, exclude=exclude)
+    # The bare names ride along so the "other names" filters can recognize a
+    # numbered member's own current card among the stored (bare) aliases -
+    # without them the card renders as a name the person supposedly dropped.
+    raw_live = ({} if bot is None
+                else await MEMBERS.raw_names_of(bot, group_id, list(live)))
+    cards = await _DIRECTORY.roster(gid, display=live, bare=raw_live,
+                                    exclude=exclude)
 
     out: list[dict] = []
     for c in cards:
