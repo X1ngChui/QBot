@@ -369,13 +369,8 @@ async def main():
           await retrieval.group_knowledge(str(G))
           == ["做音乐的群", "切片：把采样切成小段再重排"],
           str(await retrieval.group_knowledge(str(G))))
-    # Episodes are fetched per turn and go after the cache boundary, so they are looked up
-    # by the people in the turn rather than held whole like the roster.
-    involved = await retrieval.episodes_for(str(G), ["u1", "u2"], "切片")
-    check("an episode is reachable by the people who were in it",
-          "老周答应周末把切片做完" in involved, repr(involved))
-    check("and not by somebody who was not",
-          not await retrieval.episodes_for(str(G), ["nobody"], "切片"))
+    # Episodes reach a reply only through the recall_events tool (covered above):
+    # nothing episodic is pushed per turn, so there is no per-message lookup here.
     roster = await retrieval.gather(group_id=str(G))
     check("the roster carries the person's fact, not the group's",
           [(r["nickname"], r["persona_card"]) for r in roster] == [("董自豪", "在玩鸣潮")],

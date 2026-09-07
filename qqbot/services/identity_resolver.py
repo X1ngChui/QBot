@@ -92,15 +92,6 @@ class IdentityResolver:
         acc = await self._repo.account_of(PLATFORM, user_id)
         return acc.entity_id if acc else None
 
-    async def entities_of(self, user_ids: list[str]) -> dict[str, uuid.UUID]:
-        """Who each of a batch of accounts belongs to, deduplicated. Accounts never
-        seen are simply absent from the result."""
-        out: dict[str, uuid.UUID] = {}
-        for uid in dict.fromkeys(user_ids):
-            if (eid := await self.entity_of(uid)) is not None:
-                out[uid] = eid
-        return out
-
     async def merge(self, loser_account: str, winner_account: str) -> bool:
         """Declare two accounts to be the same person. Owner-triggered only (design
         doc 55).

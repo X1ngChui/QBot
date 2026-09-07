@@ -26,7 +26,6 @@ from ..repositories import (
     MemoryRepository, VectorRepository,
 )
 from ..services import Directory, IdentityResolver, Retriever
-from ..services.context_builder import render_episodes
 from ..services.memory_extractor import GROUP_TERM, GROUP_TOPIC
 from .members import MEMBERS
 
@@ -178,35 +177,17 @@ def set_embedding(embed) -> None:
     )
 
 
-async def episodes_for(group_id: str, accounts: list[str], question: str = "") -> str:
-    """Things that happened, involving the people in this turn. Rendered, or "".
-
-    This is the one part of memory that is fetched per turn rather than held whole, and it
-    goes *after* the cache boundary for exactly that reason: the roster is the same on
-    every call and belongs in the cached prefix, while which episodes matter changes with
-    every message. Putting these in the system block would invalidate it each turn.
-
-    Filtered by participant before anything looks at similarity (design doc 46): whether
-    this is the right person matters more than whether the text resembles the question.
-    """
-    gid = int(group_id)
-    entity_ids = list((await _RESOLVER.entities_of(accounts)).values())
-    if not entity_ids:
-        return ""
-    if _RETRIEVER is None:
-        raise RuntimeError("retrieval.set_embedding has not been called")
-    episodes = await _RETRIEVER.episodes_only(gid, entity_ids, question or None)
-    return render_episodes(episodes)
-
-
 async def episode_lookup(group_id: str, question: str) -> str:
     """Episodic memory searched on demand, rendered. "" when nothing is close.
 
-    The pull counterpart of `episodes_for`: that one runs on every reply and is filtered
-    by who is present, this one runs when the model asks and is filtered by nothing but
-    the group. Cross-person questions live here - who promised what, when something was
-    decided - because their answer is precisely about people the current turn does not
-    contain.
+    On demand is the only way the past reaches a reply: episodes used to be
+    pushed per turn, filtered by who was present, and the pushed block - sitting
+    right next to the incoming message - once captured an elliptical question
+    that actually referred to the conversation. The model pulls when it wants
+    the past; what arrives uninvited stays limited to what every reply needs.
+    Filtered by nothing but the group: cross-person questions - who promised
+    what, when something was decided - are precisely about people the current
+    turn does not contain.
     """
     if _RETRIEVER is None:
         raise RuntimeError("retrieval.set_embedding has not been called")
@@ -242,5 +223,5 @@ async def group_knowledge(group_id: str) -> list[str]:
     return out
 
 
-__all__ = ["gather", "group_knowledge", "episodes_for", "episode_lookup", "directory",
+__all__ = ["gather", "group_knowledge", "episode_lookup", "directory",
            "set_embedding"]

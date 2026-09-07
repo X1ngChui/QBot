@@ -1037,18 +1037,14 @@ async def main():
     check("identity is in the system block, not the tail",
           "曾用名" not in prompt_mod.build_tail(batch=_one, cfg=_cfg_o))
 
-    # Episodes are the other half of that split, and the one that was broken: which
-    # episodes matter changes every turn, so they go in the tail - and build_tail took
-    # them as an argument and never rendered it. The engine retrieved them, paid for an
-    # embedding and a vector search, and handed the result to a function that dropped it.
-    # Nothing could show that from outside: a bot that never brings up what happened last
-    # week reads exactly like a bot with nothing recorded yet.
-    _tail = prompt_mod.build_tail(
-        batch=_one, cfg=_cfg_o,
-        episodes="【相关的事】\n- 老周答应周末把切片做完")
-    check("an episode reaches the model", "老周答应周末把切片做完" in _tail, _tail[:120])
-    check("and sits ahead of the message being answered",
-          _tail.index("老周答应周末把切片做完") < _tail.index("下面是刚收到的消息"))
+    # The tail carries nothing but the clock and the message on purpose: whatever
+    # sits here is the nearest context the incoming message has, and a pushed block
+    # of past events once captured an elliptical question that referred to the
+    # conversation. The past is pulled through recall_events, never pushed.
+    _tail = prompt_mod.build_tail(batch=_one, cfg=_cfg_o)
+    check("the tail is the clock and the message, nothing pushed beside them",
+          _tail.index("当前时间") < _tail.index("下面是刚收到的消息")
+          and "相关的事" not in _tail, _tail[:120])
     # The tail has to say which message is the question. Without that, "reply with a
     # message" and "reply to one of the messages" are the same sentence in Chinese, and
     # the model answered whichever thread in the history looked livelier - leaving the
@@ -1342,29 +1338,6 @@ async def main():
           _cr("[检索记录]\n搜索“x”：y\n好的") == "搜索“x”：y\n好的",
           repr(_cr("[检索记录]\n搜索“x”：y\n好的")))
     set_providers(providers_bundle)
-
-    # Recall going dark must not take replies with it: episodes are auxiliary memory,
-    # and being addressed then silent is the failure nothing can tell from working.
-    # (The embedding backend once followed vision to a platform with no /embeddings,
-    # and every reply died on the 404 while commands kept answering.)
-    from qqbot.core import retrieval as _retr
-    _ep_saved = _retr.episodes_for
-
-    async def _broken_recall(*a, **k):
-        raise RuntimeError("embedding endpoint 404")
-
-    _retr.episodes_for = _broken_recall
-    try:
-        st14b = await REGISTRY.get("123")
-        n_sent14 = len(bot.sent)
-        await GATEWAY.handle(bot, FakeEvent("小X 还记得上次说的吗", to_me=True))
-        await drain(2.0)
-    finally:
-        # An exception above must not leave recall broken for every later section,
-        # or the failure it reports points at the wrong test.
-        _retr.episodes_for = _ep_saved
-    check("a reply still goes out when episode recall is down",
-          len(bot.sent) == n_sent14 + 1, f"{len(bot.sent) - n_sent14} sent")
 
     # 15. the per-group blocklist, end to end. Blocked means unanswered and
     # nothing more: the message still archives - a hole where a person used to

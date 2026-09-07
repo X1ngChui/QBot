@@ -5,7 +5,7 @@ particular model backend (providers abstracts those). So every service here can 
 constructed without a bot runtime, which is what makes them testable.
 """
 
-from .context_builder import render_episodes, render_fact
+from .context_builder import render_fact
 from .directory import Directory, FactCard, NameCard, NameTaken, PersonCard
 from .identity_resolver import IdentityResolver, UnknownAccount
 from .memory_consolidator import MemoryConsolidator, Validator, Verdict
@@ -21,7 +21,6 @@ __all__ = [
     "Validator",
     "Verdict",
     "Retriever",
-    "render_episodes",
     "render_fact",
     "Directory",
     "PersonCard",

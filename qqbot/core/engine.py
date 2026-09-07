@@ -191,22 +191,10 @@ async def generate(
     await MEMBERS.relabel(bot, st.group_id, list(st.recent))
 
     profiles = await retrieval.gather(group_id=st.group_id, bot=bot)
-    # Who this turn is about: whoever spoke, plus anyone they addressed. Being talked
-    # *about* is as good a reason to load somebody's history as speaking.
-    involved = [m.user_id for m in batch if not m.is_bot]
-    involved += [uid for m in batch for uid in m.mentions]
-    # Recall is auxiliary context, so its failure degrades the reply rather than
-    # killing it: being addressed and staying silent is the one failure mode nothing
-    # downstream can distinguish from working - a reply without episodes is just a
-    # reply with less memory, while an embedding backend allowed to raise here
-    # would take every reply down with it.
-    try:
-        episodes = await retrieval.episodes_for(
-            st.group_id, involved, "\n".join(m.text for m in batch))
-    except Exception as e:
-        log.warning("group %s: episode recall failed, replying without it: %s",
-                    st.group_id, why(e))
-        episodes = ""
+    # Episodic memory is deliberately not pushed here: what is injected uninvited
+    # sits right next to the incoming message, and an elliptical question resolves
+    # against it instead of the conversation (a real misfire, not a hypothetical).
+    # The model pulls with recall_events when it actually wants the past.
     # The window and numbering are computed exactly once and handed both to
     # the tool context and to assemble: the seq->message map inspect_image resolves
     # against and the numbers the model reads must come from the same pass. The
@@ -231,7 +219,6 @@ async def generate(
         batch=batch,
         profiles=profiles,
         group_facts=await retrieval.group_knowledge(st.group_id),
-        episodes=episodes,
         traces=traces,
         window=window, nums=nums, marks=marks,
     )

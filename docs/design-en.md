@@ -67,8 +67,8 @@ message arrives
                                         belong to this message's sender)
  ↓ in the task: daily-budget gate → block (withholds only the reply) → agreement gate
  ↓ voice transcribed only now, paid (§5.3)
- ↓ retrieval: roster/cards → group knowledge → episode recall (sequential;
-   recall failure degrades to a reply with less memory, never to silence)
+ ↓ retrieval: roster/cards → group knowledge (episodic memory is never pushed -
+   the model pulls it with recall_events)
  ↓ prompt assembly (cache-friendly ordering §6.2, recent originals inline)
  ↓ money-bounded tool loop (§2, engine)
  ↓ strip_markdown → send (quoting the trigger message and @-ing its sender) → the bot's own reply is archived too
@@ -173,7 +173,7 @@ The ordering is cost discipline (design goal 1), most stable first:
 global constants (legend, reading rules, private rules, tone) → persona → group knowledge
 → roster & cards (account order, stable)
 → conversation history (append-only; 3 chunks × 30 entries = 90 cap, evicted a whole chunk at a time)
-→ [cache boundary] → clock → episode recall → tool results → current message
+→ [cache boundary] → clock → tool results → current message
 ```
 
 There is no token budget anywhere: every block renders whole, and each block's author (the owner, or a generation prompt with its own length discipline) is responsible for restraint. The only two numbers left are the window size and the eviction chunk, which serve finite context and the cache, not cost. Originals ride inline in their messages, text block first; a message without attached originals stays a plain string — so an untouched message renders byte-identical between turns.
@@ -252,7 +252,7 @@ Kept for reference; ~~struck-through~~ entries were overturned by later practice
 
 **D5 Search wired directly**: built-in search double-bills and its insertion point breaks the prefix cache. Still true in the Tavily era.
 
-**D6 No fallback / no automatic downgrade**: failover is the least-tested code path. The one refinement: auxiliary retrieval (episode recall) failing degrades to a reply with less memory rather than silence — being addressed yet silent is the one failure indistinguishable from breakage; a limit at its ceiling is the opposite case, where silence is the defined meaning (goal 6).
+**D6 No fallback / no automatic downgrade**: failover is the least-tested code path. Being addressed yet silent is the one failure indistinguishable from breakage; a limit at its ceiling is the opposite case, where silence is the defined meaning (goal 6, revised 09-07 to stop-the-spending mid-reply). (The old refinement - per-turn episode recall degrading to a reply with less memory - was deleted along with the push itself, see D14.)
 
 **D7 Interest-vector layer deleted**: its upkeep exceeded what it saved (as in v5).
 
@@ -267,6 +267,8 @@ Kept for reference; ~~struck-through~~ entries were overturned by later practice
 **D12 ~~Limits mean silence~~ → limits stop the spending** (2026-08-27, revised 09-07): the three caps were once unified on silence, money already spent discarded with the reply. The owner ruled the constraint is bounded consumption, not strict non-overshoot: a mid-reply limit now ends in one tool-less wrap-up round, so the money spent produces a reply and the overshoot is bounded at exactly one round; the daily cap sits before any spending and still means silence.
 
 **D13 Token-budget machinery deleted** (2026-08-27): money is already the only limit; token caps were a second budget dressed as layout. The surviving message-count window serves context and cache, not cost.
+
+**D14 Episodic memory pulls only, never pushes** (2026-09-07): a per-turn block of related events used to be pushed - participant-filtered by the turn's speaker and @-targets, vector-ranked, seated right above the incoming message. A real misfire: an elliptical question @-ing a member resolved against that member's recalled past instead of the conversation, and the pushed block - undated, unexplained, in the position most sensitive to reference resolution - was the structural lure. The push is deleted; the past reaches a reply only through the recall_events tool, and every reply saves an embedding call. What arrives unasked is limited to what every reply needs.
 
 ### Key references
 

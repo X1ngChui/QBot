@@ -4,14 +4,10 @@ repositories produced, output is the exact wording the model (and the owner, thr
 
 The roster and the facts are rendered elsewhere (core.retrieval builds the whole-roster
 system block); what remains here is the piece every layer shares: how one fact reads as
-a phrase, and how a handful of episodes read as a block.
+a phrase.
 """
 
 from __future__ import annotations
-
-from ..domain.memory import Episode
-
-H_EPISODES = "【相关的事】"
 
 #: The predicate a hand-written note is filed under. It renders as itself, with no verb
 #: in front: an owner who types a note has already written the sentence they want.
@@ -76,8 +72,3 @@ def render_fact(predicate: str, object_value, object_key: str | None = None) -> 
     return verb.format(obj) if "{}" in verb else f"{verb}{obj}"
 
 
-def render_episodes(episodes: list[Episode]) -> str:
-    """A handful of episodes as one prompt block, or "" when there are none."""
-    if not episodes:
-        return ""
-    return H_EPISODES + "\n" + "\n".join(f"- {e.summary}" for e in episodes)

@@ -6,7 +6,7 @@ backend a prefix-cache hit is 50x cheaper than a miss:
   legend + rules (global constants) -> persona (per group, changes when config does)
   -> group knowledge (rewritten daily) -> who is who (renames, then impressions)
   -> conversation history (append-only)
-  -> [cache boundary] -> episodes -> tool results -> current message
+  -> [cache boundary] -> tool results -> current message
 
 Ordered by how often each part changes, most stable first, because a prefix cache matches
 from the beginning: anything above a changed block is re-read as well. The constants lead
@@ -337,9 +337,15 @@ def attached_images(window: list[ChatMsg], batch: list[ChatMsg],
 
 def build_tail(*, batch: list[ChatMsg], cfg: Settings,
                nums: dict[str, int] | None = None,
-               marks: dict[str, str] | None = None,
-               episodes: str = "") -> str:
-    """Everything after the cache boundary: episodes -> current message."""
+               marks: dict[str, str] | None = None) -> str:
+    """Everything after the cache boundary: the clock, then the current message.
+
+    Nothing else is pushed here on purpose. Whatever sits in this tail is the
+    nearest context the incoming message has, and an elliptical question will
+    resolve against it in preference to the transcript above - an injected
+    block of past events once hijacked exactly that way. The past is pulled
+    (recall_events), never pushed.
+    """
     parts: list[str] = []
 
     # A model has no clock. This has to sit after the cache boundary: in the system block
@@ -347,12 +353,6 @@ def build_tail(*, batch: list[ChatMsg], cfg: Settings,
     # the 50x difference section 6.2 is built around. Here it is already past the boundary,
     # so it is free.
     parts.append("当前时间：" + describe_now() + "。")
-
-    # Which episodes matter changes with every message, so this belongs after the boundary
-    # too - in the system block it would invalidate the cached prefix on each turn, which
-    # is the whole reason the roster is up there and this is down here.
-    if episodes:
-        parts.append(episodes)
 
     nums, marks = nums or {}, marks or {}
     now = "\n".join(
@@ -376,7 +376,6 @@ def assemble(
     batch: list[ChatMsg],
     profiles: list[dict],
     group_facts: list[str] | None = None,
-    episodes: str = "",
     traces: dict[str, str] | None = None,
     window: list[ChatMsg] | None = None,
     nums: dict[str, int] | None = None,
@@ -399,8 +398,7 @@ def assemble(
         nums, marks = numbered(window + list(batch))
     images = attached_images(window, batch, cfg)
     messages.extend(render_history(window, nums, marks, images, traces))
-    tail = build_tail(batch=batch, cfg=cfg,
-                      nums=nums, marks=marks, episodes=episodes)
+    tail = build_tail(batch=batch, cfg=cfg, nums=nums, marks=marks)
     # The batch renders inside the tail text, so its pictures attach here - behind the
     # text, like every other message's. The legend explains what a block behind a
     # picture marker is; no per-turn notice needed.
