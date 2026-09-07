@@ -163,6 +163,9 @@ class FakeBot:
         self.quoted = []
         self.ats = []
         self.member_list_calls = 0
+        self.members = [
+            {"user_id": 24680, "card": "群里的阿明", "nickname": "阿明"},
+            {"user_id": 7, "card": "小南", "nickname": "dong"}]
 
     async def send_group_msg(self, *, group_id, message):
         # The engine sends segment arrays; the tests assert on words, so keep the
@@ -192,8 +195,7 @@ class FakeBot:
                                           "message": [{"type": "text", "data": {"text": "第二条"}}]}}]}
         if api == "get_group_member_list":
             self.member_list_calls += 1
-            return [{"user_id": 24680, "card": "群里的阿明", "nickname": "阿明"},
-                    {"user_id": 7, "card": "小南", "nickname": "dong"}]
+            return list(self.members)
         return {}
 
 
@@ -1516,6 +1518,45 @@ async def main():
     check("the bot's own events are not transcribed",
           not any(m.msg_id.startswith("notice") and m.user_id == "999"
                   for m in st17.recent))
+
+    # 18. namesakes: two members sharing a card are told apart by a permanent
+    # serial - renames dissolve and restore the suffix, never the number.
+    from qqbot.core import tools as _tools
+    from qqbot.core.members import MEMBERS as _MEM18
+    bot.members += [{"user_id": "u31", "card": "张伟", "nickname": "zw"},
+                    {"user_id": "u32", "card": "张伟", "nickname": "wei"}]
+    _MEM18.forget("123")
+    named = await _MEM18.names_of(bot, "123", ["u31", "u32"])
+    check("namesakes render as distinct numbered names",
+          named.get("u31", "").startswith("张伟(")
+          and named.get("u32", "").startswith("张伟(")
+          and named["u31"] != named["u32"], str(named))
+    first = dict(named)
+    for r in bot.members:
+        if r["user_id"] == "u32":
+            r["card"] = "李芳"
+    _MEM18.forget("123")
+    named = await _MEM18.names_of(bot, "123", ["u31", "u32"])
+    check("a rename dissolves the clash and the suffixes go",
+          named.get("u31") == "张伟" and named.get("u32") == "李芳", str(named))
+    for r in bot.members:
+        if r["user_id"] == "u32":
+            r["card"] = "张伟"
+    _MEM18.forget("123")
+    named = await _MEM18.names_of(bot, "123", ["u31", "u32"])
+    check("re-clashing restores the very same serials", named == first,
+          f"{named} vs {first}")
+    line18 = _CM0(msg_id="ns-1", user_id="u31", nickname="张伟",
+                  text="改锥在我这", ts=_nl0())
+    await _MEM18.relabel(bot, "123", [line18])
+    check("relabel carries the numbered name onto window lines",
+          line18.nickname == first["u31"], line18.nickname)
+    await seed(123, "u31", "张伟", text="改锥昨天借给阿强了")
+    await seed(123, "u32", "张伟", text="改锥我根本没见过")
+    n31 = int(first["u31"].split("(")[1].rstrip(")"))
+    got = await _tools.search_history(123, "改锥", speaker=f"张伟({n31})")
+    check("search_history narrows by the serial, not the shared name",
+          "借给阿强" in got and "没见过" not in got, got)
 
     # Last, so every kind of memory write has actually happened by now. Reasoning
     # models bill deliberation as output, so a memory call must ask for a terse

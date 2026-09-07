@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 
-from ..db import pool
+from ..db import pool, repo
 from ..repositories import (
     EpisodeRepository, EventRepository, IdentityRepository, JobQueue,
     MemoryRepository, VectorRepository,
@@ -132,6 +132,25 @@ async def gather(*, group_id: str, bot=None) -> list[dict]:
             "manual_note": c.note,
             "msg_count": c.messages,
         })
+    # Live names arrive already told apart (members.py numbers clashing cards),
+    # but a row can still show an archived name - somebody who left, or a member
+    # fetch that failed - and clash with another row's. Number whatever still
+    # collides, by the account the row shows; the serials are permanent, so the
+    # rendering is deterministic and the stamp cache stays coherent.
+    by_name: dict[str, list[dict]] = {}
+    for row in out:
+        by_name.setdefault(row["nickname"], []).append(row)
+    clashing = [r for rows in by_name.values() if len(rows) > 1 for r in rows]
+    if clashing:
+        try:
+            seqs = await repo.member_seqs(
+                gid, [str(r["user_id"]) for r in clashing])
+            for row in clashing:
+                if s := seqs.get(str(row["user_id"])):
+                    row["nickname"] = f"{row['nickname']}({s})"
+        except Exception as e:
+            log.warning("group %s: roster namesake numbering unavailable: %s",
+                        group_id, e)
     _CACHE[group_id] = (stamp, out, speakers)
     return out
 

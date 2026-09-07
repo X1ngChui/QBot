@@ -13,6 +13,14 @@ Apply with:
 docker exec qbot-postgres-1 psql -U qqbot -d qqbot -c "<statement>"
 ```
 
+## 2026-09-07 — namesake serials
+
+```sql
+-- New table: run the CREATE TABLE member_seq block from init.sql verbatim
+-- (the UNIQUE (group_id, seq) constraint is part of the block and the
+-- assignment relies on it).
+```
+
 ## 2026-09-04 — the user agreement gate
 
 ```sql

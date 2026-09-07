@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 
-from ..db import pool
+from ..db import pool, repo
 from ..providers import providers
 from ..providers.base import QuotaExhausted
 from ..settings import Settings, ptext
@@ -69,7 +70,9 @@ def tool_defs() -> list[dict]:
                         },
                         "speaker": {
                             "type": "string",
-                            "description": "只看这个人说的话，填昵称；不填则不限发言人",
+                            "description": "只看这个人说的话，填昵称；不填则不限发言人；"
+                                           "若记录中该人名字带括号编号（如「小明(3)」），"
+                                           "需连编号一起原样填入，以精确锁定该人，避免混入同名者",
                         },
                         "days": {
                             "type": "integer",
@@ -149,6 +152,12 @@ HISTORY_HITS = 8
 HISTORY_SNIPPET = 200
 
 
+#: The namesake form current names render as: name(N), N the permanent serial.
+#: A speaker argument in this shape narrows by the serial's account, never by
+#: the name half - the name is exactly what the two people share.
+_SEQ_NAME = re.compile(r"^(.+)\((\d{1,9})\)$")
+
+
 def _like(word: str) -> str:
     """One keyword as a LIKE pattern, with the pattern characters made literal."""
     return "%" + word.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_") + "%"
@@ -164,12 +173,18 @@ async def search_history(group_id: int, query: str, *, speaker: str | None = Non
 
     `speaker` narrows to one person's lines by display name - "what did X say about Y"
     is unanswerable with keywords alone, which match everyone who mentioned X. A name,
-    not an account id: names are all the model ever sees. `days` narrows to the recent
+    not an account id: names are all the model ever sees. The numbered form the prompt
+    shows for namesakes - name(N) - is accepted too: the serial maps to exactly one
+    account, where the name half would match both people. `days` narrows to the recent
     past the same way.
     """
     words = [w for w in (query or "").split() if w][:5]
     if not words:
         return "（关键词为空）"
+    sp = (speaker or "").strip()
+    uid: str | None = None
+    if m := _SEQ_NAME.fullmatch(sp):
+        uid = await repo.member_of_seq(group_id, int(m.group(2)))
     rows = await pool().fetch(
         """SELECT occurred_at, payload, plain_text FROM raw_event
             WHERE group_id=$1 AND event_type='message'
@@ -179,10 +194,12 @@ async def search_history(group_id: int, query: str, *, speaker: str | None = Non
                    OR payload->'sender'->>'nickname' ILIKE $4)
               AND ($5::int IS NULL
                    OR occurred_at >= NOW() - make_interval(days => $5))
+              AND ($6::text IS NULL OR platform_user_id = $6)
             ORDER BY occurred_at DESC, id DESC LIMIT $3""",
         group_id, [_like(w) for w in words], HISTORY_HITS,
-        _like(speaker.strip()) if speaker and speaker.strip() else None,
+        _like(sp) if sp and uid is None else None,
         days if days and days > 0 else None,
+        uid,
     )
     if not rows:
         return "（存档里没有搜到）"

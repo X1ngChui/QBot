@@ -42,7 +42,7 @@ async def ensure_schema() -> None:
                'episode','episode_participant','episode_event',
                'memory_job','embedding_index',
                'cost_ledger','group_state','group_blocklist','image_cache',
-               'reply_trace','user_agreement'
+               'reply_trace','user_agreement','member_seq'
            ]) AS t(name)
            LEFT JOIN information_schema.tables i
                   ON i.table_name = t.name AND i.table_schema = 'public'
@@ -414,6 +414,51 @@ async def record_agreement(group_id: int, user_id: str, version: int) -> bool:
         RETURNING TRUE""",
         group_id, user_id, version,
     ))
+
+
+async def member_seqs(group_id: int, user_ids: list[str]) -> dict[str, int]:
+    """Permanent per-group serials for these accounts, assigned on first need.
+
+    The serial is the disambiguator rendered as name(N) when two members share
+    a display name. Never reused and never reassigned: once N has pointed at an
+    account it points there forever, so a suffixed name in an old transcript
+    still names the right person. The insert numbers from the group's current
+    maximum and absorbs both conflicts - an account already numbered, and a
+    concurrent assignment landing on the same N - by doing nothing; the loop
+    re-reads and renumbers whatever is still missing.
+    """
+    want = sorted({u for u in user_ids if u})
+    if not want:
+        return {}
+    for _ in range(3):
+        rows = await pool().fetch(
+            "SELECT platform_user_id, seq FROM member_seq"
+            " WHERE group_id=$1 AND platform_user_id = ANY($2::text[])",
+            group_id, want)
+        have = {r["platform_user_id"]: r["seq"] for r in rows}
+        missing = [u for u in want if u not in have]
+        if not missing:
+            return have
+        await pool().execute(
+            """INSERT INTO member_seq (group_id, platform_user_id, seq)
+               SELECT $1, u,
+                      (SELECT COALESCE(MAX(seq), 0) FROM member_seq
+                        WHERE group_id=$1) + n
+                 FROM unnest($2::text[]) WITH ORDINALITY AS m(u, n)
+               ON CONFLICT DO NOTHING""",
+            group_id, missing)
+    rows = await pool().fetch(
+        "SELECT platform_user_id, seq FROM member_seq"
+        " WHERE group_id=$1 AND platform_user_id = ANY($2::text[])",
+        group_id, want)
+    return {r["platform_user_id"]: r["seq"] for r in rows}
+
+
+async def member_of_seq(group_id: int, seq: int) -> str | None:
+    """The account a serial points at, or None for a number never assigned."""
+    return await pool().fetchval(
+        "SELECT platform_user_id FROM member_seq WHERE group_id=$1 AND seq=$2",
+        group_id, seq)
 
 
 async def muted_groups() -> list[int]:

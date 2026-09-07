@@ -372,6 +372,19 @@ CREATE TABLE IF NOT EXISTS group_blocklist (
     PRIMARY KEY (group_id, user_id)
 );
 
+-- Per-group permanent member serials (core/members.py). The serial is the
+-- disambiguator rendered as name(N) when two members currently share a display
+-- name: assigned on first need, never reused, never reassigned, so a suffixed
+-- name in any transcript ever written keeps pointing at the same account.
+CREATE TABLE IF NOT EXISTS member_seq (
+    group_id         BIGINT       NOT NULL,
+    platform_user_id VARCHAR(128) NOT NULL,
+    seq              INT          NOT NULL,
+    assigned_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (group_id, platform_user_id),
+    UNIQUE (group_id, seq)
+);
+
 -- User-agreement acceptances (core/agreement.py), one per group and account:
 -- each group is its own audience, so consent given in one says nothing about
 -- another. The row remembers which version was accepted; a bumped agreement

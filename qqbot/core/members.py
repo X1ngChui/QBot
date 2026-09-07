@@ -8,6 +8,11 @@ Fetched lazily: a group with no mentions and no configured roster never triggers
 The TTL exists only to stop a group full of mentions asking once per message - it is a
 refresh interval, not a coherence mechanism, and a name that is a few minutes stale is not
 a problem worth more machinery than this.
+
+This is also where namesakes are told apart. The fetch sees every member's current card
+at once, so it is the one place a clash can be detected whole: members sharing a display
+name get it suffixed with their permanent per-group serial (the member_seq table) before
+the table is stored, and every consumer of current names inherits the distinction.
 """
 
 from __future__ import annotations
@@ -16,6 +21,7 @@ import asyncio
 import logging
 import time
 
+from ..db import repo
 from ..util import why
 from .botapi import BotApi
 
@@ -60,6 +66,31 @@ class MemberDirectory:
                 name = (r.get("card") or r.get("nickname") or "").strip()
                 if qq and name:
                     table[qq] = name
+            # Two members sharing one display name is ordinary, and a name is
+            # all the model ever sees - so each clashing member's entry becomes
+            # name(N), with N the group's permanent serial for that account
+            # (member_seq: never reused, never reassigned, so a suffixed name
+            # keeps meaning the same person in every transcript that carried
+            # it). This runs on every refresh, which is what tracks renames:
+            # a new clash gains suffixes, a dissolved one loses them. Every
+            # reader of current names sits behind this table - relabel, the
+            # roster's live names, @-resolution, the notice lines - so the
+            # numbering happens exactly once, here. A numbering failure
+            # degrades to bare names rather than losing the fetch.
+            names: dict[str, list[str]] = {}
+            for qq, name in table.items():
+                names.setdefault(name, []).append(qq)
+            clashing = sorted(
+                q for qqs in names.values() if len(qqs) > 1 for q in qqs)
+            if clashing:
+                try:
+                    seqs = await repo.member_seqs(int(group_id), clashing)
+                    for qq in clashing:
+                        if qq in seqs:
+                            table[qq] = f"{table[qq]}({seqs[qq]})"
+                except Exception as e:
+                    log.warning("group %s: namesake numbering unavailable, "
+                                "names stay bare: %s", group_id, why(e))
             self._by_group[group_id] = table
             self._fetched[group_id] = time.monotonic()
             log.info("group %s: member list refreshed (%d people)", group_id, len(table))
