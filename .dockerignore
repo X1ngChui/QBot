@@ -6,6 +6,7 @@
 data/
 logs/
 backups/
+models/
 .git/
 .env
 secrets/

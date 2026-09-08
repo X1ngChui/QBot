@@ -29,8 +29,8 @@ from ..services import ExtractionInput, MemoryConsolidator, MemoryExtractor
 from ..services.memory_extractor import (DEFAULT_DAYS, FAST_DAYS, FAST_PREDICATES,
                                           STABLE_DAYS, STABLE_PREDICATES, SourceLine)
 from ..services.context_builder import NOTE
-from ..settings import EXTRACT_WINDOW, Settings, ptext
-from ..util import fmt_when, now_local, why
+from ..settings import EXTRACT_WINDOW, Settings, config, ptext
+from ..util import defang, fmt_when, now_local, sysmark, why
 
 log = logging.getLogger("qqbot.worker")
 
@@ -71,9 +71,11 @@ def transcript_legend() -> str:
     when the worker is built. The extract_legend_note paragraph is one the reply path
     does not need: these markers are annotations this system wrote, not things a
     member typed - without it the model records that the group can send pictures.
+    (tone_rules used to ride along here unlabelled; it now enters through the
+    extractor's own composition, under its heading and with the extract-side
+    consequence note.)
     """
-    return (ptext("legend") + "\n\n" + ptext("extract_legend_note") + "\n\n"
-            + ptext("tone_rules"))
+    return ptext("legend") + "\n\n" + ptext("extract_legend_note")
 
 
 #: Fact lifetimes come from the predicate class tables in memory_extractor - the kind of
@@ -272,25 +274,53 @@ class MemoryWorker:
         subject = await self._ids.group_entity(group_id)
         out: list[str] = []
 
+        # The owner's hand-written group background, the same text the reply
+        # path reads as fixed material. Injected here because understanding is
+        # upstream of extraction: the slang, the standing relationships, who the
+        # other bots are. Read-only like the per-member notes - the prompt's
+        # fixed-material section forbids deriving candidates from it, and the
+        # Validator's quote rule holds mechanically (it is not a transcript
+        # line, so nothing quoted from it can validate).
+        if fixed := config().persona_for(str(group_id)).group_knowledge.strip():
+            out.append(f"本群固定资料：\n{fixed}")
+
         if group_facts := await self._mem.current_facts(group_id, [subject]):
             out.append("本群：")
+            # defang stored values on render, like every other path that reads
+            # old rows back into a prompt.
             out += [f"- {f.predicate}"
-                    + (f" {f.object_key}" if f.object_key else "")
-                    + f" = {f.object_value}"
+                    + (f" {defang(str(f.object_key))}" if f.object_key else "")
+                    + f" = {defang(str(f.object_value))}"
                     for f in sorted(group_facts,
                                     key=lambda f: (f.predicate, f.object_key or ""))]
 
         by_entity = {eid: code for code, eid in codes.items()}
         facts = await self._mem.current_facts(group_id, list(by_entity))
         per: dict[int, list[str]] = {}
+        notes: dict[int, str] = {}
         for f in facts:
-            if f.predicate == NOTE:
-                continue      # what an owner typed is not the model's to revise
             code = by_entity.get(f.subject_entity_id)
-            if code is not None:
-                per.setdefault(code, []).append(f"{f.predicate} = {f.object_value}")
-        for code in sorted(per):
-            out.append(f"[{code}]：" + "；".join(sorted(per[code])))
+            if code is None:
+                continue
+            if f.predicate == NOTE:
+                # Injected read-only, under its own label: an owner's note is
+                # often the comprehension key (a real name, a schedule) that
+                # resolves references nothing else can. The prompt forbids
+                # deriving candidates from it, and the Validator's quote rule
+                # holds the line mechanically - a note is not a transcript
+                # line, so nothing quoted from it can ever validate.
+                notes[code] = str(f.object_value)
+                continue
+            per.setdefault(code, []).append(
+                f"{f.predicate} = {defang(str(f.object_value))}")
+        for code in sorted(per.keys() | notes.keys()):
+            bits = "；".join(sorted(per.get(code, [])))
+            note = f"拥有者注：{notes[code]}" if code in notes else ""
+            joined = "；".join(x for x in (bits, note) if x)
+            # The same reserved account-code form the roster and the transcript
+            # lines wear, so "already recorded" is recognisably about the same
+            # person the model is about to cite.
+            out.append(f"{sysmark(str(code))}：{joined}")
 
         # Episodes are appended, never superseded - one thing that happened does not
         # overturn another - so a conversation read twice becomes two near-identical
@@ -302,7 +332,7 @@ class MemoryWorker:
                     seen.append(ep.summary)
         if seen:
             out.append("已记过的事：")
-            out += [f"- {s}" for s in seen[:KNOWN_EPISODES]]
+            out += [f"- {defang(s)}" for s in seen[:KNOWN_EPISODES]]
         return "\n".join(out)
 
     async def extract(self, group_id: int, *, force: bool = False) -> int:
@@ -359,6 +389,7 @@ class MemoryWorker:
             account_codes=codes, lines=tuple(lines), source_event_id=anchor,
             batch_size=len(rows),
             known=await self._known(group_id, codes),
+            self_names="、".join(self._cfg.trigger.nicknames),
         ))
         # The watermark moves for what was read, not for what was learned from it: a
         # batch of nothing but stickers is still a batch nobody should pay to read
@@ -396,10 +427,15 @@ class MemoryWorker:
         citation pointed at one message, the count would always be one and no observed
         nickname could reach the prompt.
 
-        An account with no identity is skipped, and that is what keeps the bot's own
-        replies out of what it learns: they are archived so the history survives a
-        restart, but nothing creates an entity for the bot, so it can never take a code
-        here. That is the whole mechanism - there is no second check downstream.
+        An account with no identity is the bot itself: every member gets an entity
+        at ingest, and nothing ever creates one for the bot. Its lines used to be
+        dropped whole, which kept the self-loop shut but fed the extractor
+        one-sided conversations - "like you said" pointed at a reply that did not
+        exist. Now they render with the self marker after the name, codeless and
+        outside the roster, and stay out of evidence by construction: their
+        SourceLine is own=True, source_of skips it, and a candidate quoting one
+        fails validation. The model reads both halves; only the members' half
+        counts.
         """
         codes: dict[int, uuid.UUID] = {}
         by_account: dict[str, int] = {}
@@ -410,19 +446,32 @@ class MemoryWorker:
             uid = r["platform_user_id"]
             payload = r["payload"]
             sender = (payload or {}).get("sender") or {}
-            name = (sender.get("card") or sender.get("nickname") or uid or "").strip()
+            # defang on render: rows archived before Sender.parse neutralized
+            # names can carry anything, and the account code appended below is
+            # only unforgeable if the name half cannot contain the brackets.
+            name = defang((sender.get("card") or sender.get("nickname")
+                           or uid or "")).strip()
             if not uid:
                 continue
             if uid not in by_account:
                 eid = await self._identity_of(uid)
                 if eid is None:
                     by_account[uid] = 0  # remember the answer; one lookup per account
-                    continue
-                code = len(codes) + 1
-                by_account[uid] = code
-                codes[code] = eid
-                roster.append(f"{name}[{code}]")
+                else:
+                    code = len(codes) + 1
+                    by_account[uid] = code
+                    codes[code] = eid
+                    akas = await self._known_names(group_id, eid, name)
+                    roster.append(name + sysmark(str(code))
+                                  + (f"（也叫：{'、'.join(defang(a) for a in akas)}）"
+                                     if akas else ""))
             if not by_account[uid]:
+                text = self._plain(r)
+                if text:
+                    who = (name + sysmark("你")) if name else sysmark("你")
+                    lines.append(SourceLine(
+                        event_id=r["id"], own=True,
+                        text=f"{sysmark(fmt_when(r['occurred_at']))} {who}: {text}"))
                 continue
             text = self._plain(r)
             if text:
@@ -433,13 +482,32 @@ class MemoryWorker:
                 # time is byte-identical to what the extractor read.
                 lines.append(SourceLine(
                     event_id=r["id"],
-                    text=f"[{fmt_when(r['occurred_at'])}] "
-                         f"{name}[{by_account[uid]}]: {text}"))
+                    text=f"{sysmark(fmt_when(r['occurred_at']))} "
+                         f"{name}{sysmark(str(by_account[uid]))}: {text}"))
         return codes, "\n".join(roster), lines
 
     async def _identity_of(self, user_id: str) -> uuid.UUID | None:
         acc = await self._ids.account_of("qq", user_id)
         return acc.entity_id if acc else None
+
+    async def _known_names(self, group_id: int, eid: uuid.UUID,
+                           current: str) -> list[str]:
+        """Usable names for this account besides its current card, for the roster.
+
+        The comprehension key the transcript alone cannot provide: with bare
+        current cards, every in-chat nickname is a guess, and the extractor's
+        no-guessing rule then drops records it could have filed with certainty.
+        A lookup failure degrades to a bare roster line, never to a lost batch.
+        """
+        try:
+            aliases = await self._ids.aliases_for(group_id, eid)
+        except Exception as e:
+            log.warning("group %s: alias lookup for the roster failed: %s",
+                        group_id, why(e))
+            return []
+        out = [a.alias_text for a in aliases
+               if a.is_usable and a.alias_text != current]
+        return list(dict.fromkeys(out))[:4]
 
     @staticmethod
     def _plain(row) -> str:

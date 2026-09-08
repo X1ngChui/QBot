@@ -287,15 +287,15 @@ async def main():
     # Without this the bot denies seeing an image while holding its description - it does
     # not know that the picture marker is its own eyesight rather than something a person
     # typed.
-    check("the reply prompt explains the markers", "[图片:…]" in sys_prompt)
+    check("the reply prompt explains the markers", "⟦图片:描述⟧" in sys_prompt)
     # The transcript carries names but never account ids, so two people with similar names
     # are indistinguishable to the model - three members rearranging the same joke
     # nickname read as one person renaming himself, and it said so out loud. The system
     # knows better on both counts, and now says so.
     check("the prompt says similar names are still different people",
-          "昵称不同的消息按不同账号处理" in sys_prompt)
+          "昵称不同按不同账号处理" in sys_prompt)
     check("and that a rename is only a rename when it was recorded",
-          "该账号改名" in sys_prompt,
+          "断言该账号改过或没改过名" in sys_prompt,
           sys_prompt[sys_prompt.find("曾用名"):][:120])
     # A name the account displayed and a name the group calls him are different claims,
     # and the prompt has to say so or the second gets reported as the first.
@@ -312,7 +312,7 @@ async def main():
           "一个人可持有多个账号" in sys_prompt
           and "不得断言二者一定不属于同一人" in sys_prompt)
     check("and stop short of what is not known",
-          "你能确认的身份仅限于账号一级" in sys_prompt
+          "身份确认能力止于账号一级" in sys_prompt
           and "未告知的信息即为未知信息" in sys_prompt)
     check("the persona follows the constants",
           sys_prompt.index("【信息解读规则】") < sys_prompt.index("【你的身份】"))
@@ -332,15 +332,15 @@ async def main():
     _CP = MemoryExtractor(cfg, legend=transcript_legend()).prompt
     check("the memory path gets the same reading, minus the part about speaking",
           "不能按字面当真" in _CP and "不要一本正经地解释或纠正" not in _CP)
-    # The joke rule lives inline in the extraction rulebook, beside the fact
-    # criteria it qualifies - there is no separate memory-side tone addendum.
+    # One discernment, two consequences: the judgment half is the shared
+    # tone_rules, and extraction's own note says what not to record.
     check("with its own instruction for what to do with a joke",
-          "玩梗、反串、表演本身不作为事实提取" in _CP)
+          "没有被当真的话不产生任何候选" in _CP)
 
     check("the sections are marked",
           all(h in sys_prompt for h in
               (prompt_mod.H_PERSONA, prompt_mod.H_LEGEND, prompt_mod.H_RULES)))
-    check("and says not to deny having them", "我看不到图" in sys_prompt)
+    check("and says not to deny having them", "不要声称看不到图" in sys_prompt)
     from qqbot.settings import ptext as _ptext
     _LEG = _ptext("legend")
     check("one legend, shared by the reply and memory paths",
@@ -365,7 +365,7 @@ async def main():
     await GATEWAY.handle(bot, FakeEvent("在吗", to_me=True, user_id="u9", nickname="随便改的名字"))
     await drain()
     own_tail = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["messages"][-1]["content"]
-    check("owner is tagged in the prompt", "随便改的名字（拥有者）" in own_tail, own_tail[-90:])
+    check("owner is tagged in the prompt", "随便改的名字⟦拥有者⟧" in own_tail, own_tail[-90:])
     await GATEWAY.handle(bot, FakeEvent("在吗", to_me=True, user_id="u1", nickname="阿强"))
     await drain()
     plain_tail = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["messages"][-1]["content"]
@@ -622,7 +622,7 @@ async def main():
         else " ".join(b["text"] for b in m["content"] if b.get("type") == "text")
         for m in [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["messages"])
     check("and the description lands in the history, where the question points",
-          "橘猫" in hist and "群里的阿明 [图片]" not in hist, hist[-200:])
+          "橘猫" in hist and "群里的阿明 ⟦图片⟧" not in hist, hist[-200:])
     backfilled = await pool().fetchval(
         "SELECT plain_text FROM raw_event WHERE platform_event_id=$1", str(img_event.message_id))
     check("the archive is corrected too, so memory keeps the description",
@@ -679,7 +679,7 @@ async def main():
     stored_e = await pool().fetchval(
         "SELECT plain_text FROM raw_event WHERE platform_event_id=$1", str(capped.message_id))
     check("and its marker stays bare, ready for a cheaper day",
-          "[图片]" in (stored_e or "") and "橘猫" not in (stored_e or ""), repr(stored_e))
+          "⟦图片⟧" in (stored_e or "") and "橘猫" not in (stored_e or ""), repr(stored_e))
     cfg.budget.daily_cny_cap = cap_was
     BUDGET._loaded = False
 
@@ -747,7 +747,7 @@ async def main():
           len(VISION_SEEN) == _slow_seen + 1, str(VISION_SEEN[_slow_seen:]))
     await drain(1.2)
     check("and its description lands after every waiter gave up",
-          await _repo.image_cache_get("d" * 32) == "[图片:慢速描述完成]",
+          await _repo.image_cache_get("d" * 32) == "⟦图片:慢速描述完成⟧",
           str(await _repo.image_cache_get("d" * 32)))
     _slow_stored = await pool().fetchval(
         "SELECT plain_text FROM raw_event WHERE platform_event_id=$1", str(slow1.message_id))
@@ -860,7 +860,7 @@ async def main():
     # Message 555 is not one the bot has seen, so the quote is reported as unavailable
     # rather than fetched: text on screen belonging to no visible line is the ambiguity
     # numbering replaced.
-    check("a quote of something off screen says so", "[回复更早的消息]" in tail_r,
+    check("a quote of something off screen says so", "⟦回复更早的消息⟧" in tail_r,
           tail_r[-140:])
     check("@someone resolves to a name, not a number",
           "群里的阿明" in tail_r and "@24680" not in tail_r, tail_r[-120:])
@@ -1237,7 +1237,7 @@ async def main():
     from qqbot.core.output import clean_reply as _cr
     check("provenance names the tool and the query",
           _pvfn([("web_search", {"query": "明天 天气"}, "1. T C")])
-          == "[依据:搜索“明天 天气”]",
+          == "⟦依据:搜索“明天 天气”⟧",
           _pvfn([("web_search", {"query": "明天 天气"}, "1. T C")]))
     check("no tools means no marker", _pvfn([]) == "")
     from qqbot.core.engine import _trace as _trfn
@@ -1268,12 +1268,12 @@ async def main():
           ok_pv and bot.sent[-1][1] == "明天多云", str(bot.sent[-1:]))
     _pv_line = st_pv.recent[-1]
     check("but the window remembers what it rested on",
-          _pv_line.is_bot and _pv_line.text == "明天多云 [依据:搜索“明天 天气”]",
+          _pv_line.is_bot and _pv_line.text == "明天多云 ⟦依据:搜索“明天 天气”⟧",
           repr(_pv_line.text))
     _pv_row = await pool().fetchval(
         "SELECT plain_text FROM raw_event WHERE platform_event_id=$1", _pv_line.msg_id)
     check("and so does the archive",
-          "[依据:搜索“明天 天气”]" in (_pv_row or ""), repr(_pv_row))
+          "⟦依据:搜索“明天 天气”⟧" in (_pv_row or ""), repr(_pv_row))
     check("an imitated provenance marker never reaches the group",
           _cr("明天多云 [依据:搜索“天气”]") == "明天多云",
           repr(_cr("明天多云 [依据:搜索“天气”]")))
@@ -1311,7 +1311,7 @@ async def main():
     # conversation, and prompt assembly queries the table for the window's replies
     # and seats each entry directly before the reply it fed - which also covers
     # the restart case with no re-seating logic at all.
-    _expected_trace = "[检索记录]\n搜索“明天 天气”：1. T C"
+    _expected_trace = "⟦检索记录⟧\n搜索“明天 天气”：1. T C"
     check("the trajectory persists in its own table",
           await pool().fetchval(
               "SELECT content FROM reply_trace WHERE reply_event_id=$1",
@@ -1329,7 +1329,7 @@ async def main():
     _ri = next(i for i, m in enumerate(_msgs2)
                if m.get("role") == "assistant"
                and isinstance(m.get("content"), str)
-               and "[依据:搜索“明天 天气”]" in m["content"])
+               and "⟦依据:搜索“明天 天气”⟧" in m["content"])
     check("assembly seats the stored trace directly before its reply",
           _msgs2[_ri - 1].get("role") == "assistant"
           and _msgs2[_ri - 1].get("content") == _expected_trace,
@@ -1452,7 +1452,7 @@ async def main():
     await GATEWAY.handle_notice(bot, ev_note)
     await drain(0.3)
     check("a recall becomes a window line",
-          any(m.text == "[撤回了自己的一条消息]" and m.user_id == "u9"
+          any(m.text == "⟦撤回了自己的一条消息⟧" and m.user_id == "u9"
               for m in st17.recent))
     check("and is archived once",
           await pool().fetchval(
@@ -1474,12 +1474,12 @@ async def main():
         sub_type="ban", duration=600, time=_t17 + 3))
     await drain(0.3)
     check("a poke at the bot is transcribed, never answered",
-          any(m.text == "[戳了戳你]" for m in st17.recent)
+          any(m.text == "⟦戳了戳你⟧" for m in st17.recent)
           and len(bot.sent) == n17)
     check("a join is transcribed",
-          any(m.text == "[加入了本群]" for m in st17.recent))
+          any(m.text == "⟦加入了本群⟧" for m in st17.recent))
     check("a ban is transcribed with its span",
-          any(m.text == "[被禁言 10 分钟]" for m in st17.recent))
+          any(m.text == "⟦被禁言 10 分钟⟧" for m in st17.recent))
     for mid in ("r1", "r2"):   # an admin mass-recall: one author, same second
         await GATEWAY.handle_notice(bot, types.SimpleNamespace(
             group_id=123, user_id="u9", operator_id="u1", message_id=mid,
@@ -1496,12 +1496,33 @@ async def main():
     await drain(0.3)
     check("same-second recalls of one author each get their line",
           sum(1 for m in st17.recent
-              if m.text == "[一条消息被管理员撤回]" and m.user_id == "u9") == 2)
+              if m.text == "⟦一条消息被管理员撤回⟧" and m.user_id == "u9") == 2)
     check("mute-all credits no phantom account",
           not any(m.user_id == "0" for m in st17.recent))
     check("the bot's own events are not transcribed",
           not any(m.msg_id.startswith("notice") and m.user_id == "999"
                   for m in st17.recent))
+
+    # 17b. quoting the bot's own line is being addressed, even with the reply
+    # button's auto-@ stripped off by hand; quoting anybody else without an @
+    # stays silence. Window-scoped: the check must stay synchronous.
+    st17b = await REGISTRY.get("123")
+    bot_line = next(m for m in reversed(st17b.recent) if m.is_bot)
+    user_line = next(m for m in reversed(st17b.recent)
+                     if not m.is_bot and m.user_id)
+    n17b = len(bot.sent)
+    await GATEWAY.handle(bot, FakeEvent("你确定吗", user_id="u1",
+                                        reply_id=bot_line.msg_id,
+                                        reply_from="999"))
+    await drain()
+    check("a de-@'d quote of the bot's line still draws a reply",
+          len(bot.sent) == n17b + 1, f"{len(bot.sent) - n17b} sent")
+    await GATEWAY.handle(bot, FakeEvent("你确定吗", user_id="u1",
+                                        reply_id=user_line.msg_id,
+                                        reply_from=user_line.user_id))
+    await drain()
+    check("quoting anybody else without an @ stays silence",
+          len(bot.sent) == n17b + 1, f"{len(bot.sent) - n17b - 1} extra")
 
     # 18. namesakes: two members sharing a card are told apart by a permanent
     # serial - renames dissolve and restore the suffix, never the number.
@@ -1512,8 +1533,8 @@ async def main():
     _MEM18.forget("123")
     named = await _MEM18.names_of(bot, "123", ["u31", "u32"])
     check("namesakes render as distinct numbered names",
-          named.get("u31", "").startswith("张伟(")
-          and named.get("u32", "").startswith("张伟(")
+          named.get("u31", "").startswith("张伟⟦同名")
+          and named.get("u32", "").startswith("张伟⟦同名")
           and named["u31"] != named["u32"], str(named))
     first = dict(named)
     for r in bot.members:
@@ -1537,10 +1558,20 @@ async def main():
           line18.nickname == first["u31"], line18.nickname)
     await seed(123, "u31", "张伟", text="改锥昨天借给阿强了")
     await seed(123, "u32", "张伟", text="改锥我根本没见过")
-    n31 = int(first["u31"].split("(")[1].rstrip(")"))
-    got = await _tools.search_history(123, "改锥", speaker=f"张伟({n31})")
+    n31 = int(first["u31"].split("⟦同名")[1].rstrip("⟧"))
+    # Bare-hit mode: the pin is about which lines are *hits* - with context on,
+    # the other namesake's line would legitimately appear as surroundings.
+    _rcfg18 = config().default.retrieval
+    _ctx18, _rcfg18.history_context = _rcfg18.history_context, 0
+    got = await _tools.search_history(123, "改锥", speaker=f"张伟⟦同名{n31}⟧")
+    got_legacy = await _tools.search_history(123, "改锥", speaker=f"张伟({n31})")
+    _rcfg18.history_context = _ctx18
     check("search_history narrows by the serial, not the shared name",
           "借给阿强" in got and "没见过" not in got, got)
+    # Old transcripts and archived @-resolutions still carry name(N); a speaker
+    # copied from one must keep narrowing by the same serial.
+    check("the legacy namesake form still narrows",
+          "借给阿强" in got_legacy and "没见过" not in got_legacy, got_legacy)
 
     # Last, so every kind of memory write has actually happened by now. Reasoning
     # models bill deliberation as output, so a memory call must ask for a terse

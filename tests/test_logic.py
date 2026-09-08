@@ -196,8 +196,8 @@ check("mface summary kept", pm.refs[1].summary == "开心")
 # model as a pointer to a numbered line (prompt.numbered), not as an excerpt pasted
 # here - an excerpt says what was said but not which line said it.
 check("a quote adds no text of its own",
-      pm.render() == "@我 看看这个 [图片] [图片]", repr(pm.render()))
-check("resolved render", "[图片:猫]" in pm.render({0: "[图片:猫]"}))
+      pm.render() == "@我 看看这个 ⟦图片⟧ ⟦图片⟧", repr(pm.render()))
+check("resolved render", "⟦图片:猫⟧" in pm.render({0: "⟦图片:猫⟧"}))
 
 # Shapes copied from what NapCat actually archived, not from the spec's examples.
 real_img = parse_segments([{"type": "image", "data": {
@@ -242,7 +242,7 @@ card = parse_segments([{"type": "json", "data": {"data": json.dumps(
 check("share card yields its title and description",
       "标题党" in card.render() and "正文摘要" in card.render(), card.render())
 bad_card = parse_segments([{"type": "json", "data": {"data": "not json"}}], "999")
-check("an unparseable card degrades quietly", bad_card.render() == "[卡片消息]", bad_card.render())
+check("an unparseable card degrades quietly", bad_card.render() == "⟦卡片消息⟧", bad_card.render())
 
 check("only media costs a model call",
       real_img.needs_model and not quoted.needs_model and not at_other.needs_model)
@@ -270,9 +270,9 @@ _qc = ChatMsg(msg_id="q3", user_id="u2", nickname="阿花", text="哦哦", ts=no
 _qn, _qm = prompt.numbered([_qa, _qb, _qc])
 _qh = prompt.render_history([_qa, _qb, _qc], _qn, _qm)
 check("the bot's own line renders without the quote mark",
-      "[回复" not in _qh[1]["content"], repr(_qh[1]["content"]))
+      "⟦回复" not in _qh[1]["content"], repr(_qh[1]["content"]))
 check("a member's line keeps its quote mark",
-      "[回复 #1]" in _qh[2]["content"], repr(_qh[2]["content"]))
+      "⟦回复 #1⟧" in _qh[2]["content"], repr(_qh[2]["content"]))
 
 # A message the adapter replays across a restart must not enter the window twice:
 # the pipeline's dedup set is process-local, and load_history - triggered by that
@@ -448,7 +448,7 @@ with _tf.TemporaryDirectory() as _td:
     except ValueError as e:
         check("a missing prompt file fails the load", "legend" in str(e))
 check("the live bundle serves the shipped texts",
-      b.prompts["legend"].startswith("聊天记录中的下列标记由系统生成"))
+      b.prompts["legend"].startswith("【系统括号原则】"))
 
 # Config numbers with a blast radius validate at load, not at detonation time:
 # backup_keep=0 deletes the backup just written, nightly; a 4-field cron used to

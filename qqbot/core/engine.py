@@ -16,7 +16,7 @@ from ..gateway.ingest import ingestor
 from ..providers import Kind, providers
 from ..providers.base import QuotaExhausted
 from ..settings import Persona, Settings
-from ..util import now_local, why
+from ..util import defang, now_local, sysmark, why
 from . import debug, prompt, retrieval, tools
 from .budget import BUDGET
 from .members import MEMBERS
@@ -128,7 +128,9 @@ def _provenance(executed: list[tuple[str, dict, str]]) -> str:
     if not parts:
         return ""
     shown, extra = parts[:PROV_ITEMS], len(parts) - PROV_ITEMS
-    return "[依据:" + "、".join(shown) + ("等" if extra > 0 else "") + "]"
+    # defang the queries: they are model-written, and a model echoing chat can
+    # echo anything. The wrap itself is the reserved pair.
+    return sysmark("依据:" + defang("、".join(shown)) + ("等" if extra > 0 else ""))
 
 
 def _label(name: str, args: dict) -> str:
@@ -160,10 +162,12 @@ def _trace(executed: list[tuple[str, dict, str]]) -> str:
     """
     if not executed:
         return ""
-    lines = ["[检索记录]"]
+    lines = [sysmark("检索记录")]
     used = 0
     for name, args, out in executed:
-        digest = " ".join((out or "").split())[:TRACE_RESULT_CHARS]
+        # Web pages and search results are outside text; a page carrying the
+        # system brackets must not smuggle markup into the frozen trace.
+        digest = defang(" ".join((out or "").split()))[:TRACE_RESULT_CHARS]
         line = f"{_label(name, args)}：{digest}"
         if used + len(line) > TRACE_TOTAL_CHARS:
             lines.append("（其余从略）")

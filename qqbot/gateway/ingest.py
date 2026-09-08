@@ -79,8 +79,10 @@ class Ingestor:
         writes them - and memory is read back out of the archive, so an archive without
         them holds only one side of every conversation the bot took part in.
 
-        They are excluded again when anything reads the archive to learn about the group:
-        what the bot said is not evidence about the people it said it to.
+        When extraction reads the archive these lines render marked as the bot's
+        own - readable for coherence, and excluded from evidence (see
+        MemoryWorker._render): what the bot said is never proof about the people
+        it said it to.
 
         No identity is created for it. The bot is not a group member with a history to be
         learned, and giving it an entity would put it in its own roster.

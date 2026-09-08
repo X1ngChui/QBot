@@ -317,6 +317,24 @@ async def main():
     await st.load_history(self_id="999", owners=set())
     check("loading twice does not double the window", len(st.recent) == n_before)
 
+    # Console output is on the record too: a /who card the model never saw made
+    # the very next question about it unanswerable - the one speaker in the room
+    # whose words vanished.
+    from qqbot.core.pipeline import note_console_reply
+    from qqbot.core.state import REGISTRY as _REG
+
+    _REG._groups[str(G1)] = st
+    await note_console_reply(group_id=G1, self_id="999",
+                             text="阿强：住在苏州；备注：只在周末上线", name="小X")
+    check("a command answer lands in the window as the bot's own line",
+          any(m.text.startswith("阿强：住在苏州") and m.is_bot for m in st.recent))
+    st_rebuilt = GroupState(group_id=str(G1))
+    await st_rebuilt.load_history(self_id="999", owners=set())
+    check("and survives into a rebuilt window",
+          any(m.text.startswith("阿强：住在苏州") and m.is_bot
+              for m in st_rebuilt.recent))
+    _REG._groups.pop(str(G1), None)
+
     # -- the archive, searched ----------------------------------------------
     # The pull half of context: the prompt pushes a fixed window, and everything behind
     # it was unreachable - a link posted yesterday might as well not have existed.
@@ -332,6 +350,34 @@ async def main():
           "没有搜到" in await search_history(G1, "%"),
           "a bare % must not match everything")
     check("an empty query is refused", "关键词为空" in await search_history(G1, "  "))
+
+    # -- hits wrapped in their surroundings ----------------------------------
+    # Chat is fragments: the line after the link is part of the story. Close
+    # hits merge into one block; far-apart hits stay apart with an ellipsis
+    # line between them, and the window is exactly history_context each way.
+    check("a hit carries the lines around it",
+          "收到了" in hit and "我也看看" in hit, hit)
+    await say(G1, "u1", "阿强", "上次说的螺丝刀在哪")
+    for i in range(12):
+        await say(G1, "u2", "阿花", f"填充话题第{i}句")
+    await say(G1, "u2", "阿花", "螺丝刀在工具箱第二层")
+    two = await search_history(G1, "螺丝刀")
+    check("far-apart hits render as separate blocks", "……" in two, two)
+    check("each block shows its own surroundings, cut at the window",
+          "填充话题第0句" in two and "填充话题第11句" in two
+          and "填充话题第5句" not in two, two)
+    await say(G1, "u1", "阿强", "今晚麻辣香锅怎么样")
+    await say(G1, "u2", "阿花", "麻辣香锅可以")
+    one = await search_history(G1, "麻辣香锅")
+    check("adjacent hits merge into one block", "……" not in one
+          and "麻辣香锅怎么样" in one and "麻辣香锅可以" in one, one)
+    _rcfg = _config().default.retrieval
+    _saved_ctx = _rcfg.history_context
+    _rcfg.history_context = 0
+    bare = await search_history(G1, "cat.jpg")
+    check("history_context 0 restores bare hits",
+          "cat.jpg" in bare and "收到了" not in bare, bare)
+    _rcfg.history_context = _saved_ctx
 
     # -- schema self-check ---------------------------------------------------
     await repo.ensure_schema()

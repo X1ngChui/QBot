@@ -39,20 +39,21 @@ rather than accumulate as flags. Adding one is: write the subclass, add a line t
 | `qqbot/core/budget.py` | the single daily spend gate |
 | `qqbot/providers/base.py` | the capability ABCs - names no vendor |
 | `qqbot/providers/openai_compat.py` | shared plumbing for chat-protocol backends, quirks as hooks |
-| `qqbot/providers/deepseek.py`, `dashscope.py`, `tavily.py` | one module per backend |
+| `qqbot/providers/deepseek.py`, `dashscope.py`, `tavily.py`, `sherpa.py` | one module per backend; sherpa is the in-process one - CPU speech recognition, no endpoint |
 | `qqbot/providers/registry.py` | backend name from config -> class |
 | `qqbot/plugins/tasks.py` | the five scheduled jobs |
 | `scripts/preflight.py` | one real minimal call per capability, run before going live |
 
 ## How it behaves
 
-- **The trigger is being addressed** - an @ or a nickname matching as a whole
+- **The trigger is being addressed** - an @, a nickname matching as a whole
   word (jieba token plus an ASCII boundary check, so a Latin-lettered nickname
-  cannot match inside a longer Latin word). Everything else is read, archived,
+  cannot match inside a longer Latin word), or a quote of one of the bot's own
+  lines still in the window. Everything else is read, archived,
   and left alone; the bot never speaks uninvited. Group notices - joins,
   leaves, recalls, bans, pokes - are transcribed as bracketed lines into the
   window and archive, and never draw a reply. Members sharing a display name
-  render apart as name(N), N a permanent per-group serial (`member_seq`);
+  render apart under a reserved namesake tag, N a permanent per-group serial (`member_seq`);
   renames dissolve and restore the suffix on the next member-list refresh,
   never the number.
 - **Replies require consent.** A member who has not accepted the user agreement
@@ -74,7 +75,10 @@ rather than accumulate as flags. Adding one is: write the subclass, add a line t
   expires: a fact survives one half-life per supporting event, so what a group
   repeats stays and a passing remark fades in a fortnight.
 - **Money is the only limit.** The daily cap, checked before anything is spent,
-  means silence when hit. A limit tripping mid-reply - the per-reply cap, the
+  means silence when hit. What costs nothing is not gated by it: voice
+  transcription runs in-process (sherpa-onnx + SenseVoice on CPU, zero rates,
+  still booked to the ledger) and keeps the archive whole even on an exhausted
+  day. A limit tripping mid-reply - the per-reply cap, the
   monthly search allowance - stops the spending instead: one tool-less wrap-up
   round answers from what was already fetched, an overshoot of exactly one
   bounded round. There is no token budget anywhere:
@@ -104,6 +108,8 @@ $EDITOR config/personas/default.yaml      # persona, group knowledge
 # Both copies stay untracked: they name real accounts and real groups, so only
 # the .example templates live in version control. deploy.sh ships the working
 # tree, untracked local config included.
+
+bash scripts/fetch_asr_model.sh           # once: the ASR weights, into models/ (mounted, not baked in)
 
 docker compose up -d postgres napcat
 docker compose build bot
@@ -173,7 +179,9 @@ for themselves by nature; and the read-only surfaces `/card`, `/stats`, `/top` a
 `/groupstats` whole. `/help` lists each reader exactly what they may run;
 everything else answers members with silence. A member can still just ask the
 bot in conversation - the roster is already in its prompt - but the command
-path answers for free.
+path answers for free. Command answers are on the record like any bot line -
+window and archive both - so the model can be asked about a card or a table
+it just posted.
 
 Scheduled: memory extraction 02:30 (the nightly drain), memory decay 04:00, `pg_dump -Fc`
 04:30 (keeps 14, into `backups/` - point that volume at a NAS mount; until then the dumps
@@ -181,7 +189,12 @@ share the disk they protect), NapCat media cleanup 05:00, daily report to the ow
 
 Routine intervention is meant to be one thing: read the daily report, change the config.
 
-Model-behaviour tooling: `scripts/eval_replies.py` runs the deterministic eval set against
+Model-behaviour tooling: `scripts/eval_extract.py` does the same for the extraction
+path (joke stays out, known stays unrepeated, a reused alias still confirms, nothing
+derives from an owner's note, episode summaries stay objective even against an
+infected style planted in the known block, the bot's own name never becomes a
+member's alias) - run it around any change to the extract prompt family.
+`scripts/eval_replies.py` runs the deterministic eval set against
 the real model from the workstation (needs the test DB and `.env`; ~CNY 0.02 a run) — run
 it before and after any prompt or model change. `/debug N` captures the next N model
 rounds' full requests and responses into `logs/debug/` for when a reply misbehaves and

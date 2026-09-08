@@ -19,8 +19,11 @@ omits it.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 
 from ..db import pool, repo
+from ..settings import config
+from ..util import defang, merge_overlapping, sysmark
 from ..repositories import (
     EpisodeRepository, EventRepository, IdentityRepository, JobQueue,
     MemoryRepository, VectorRepository,
@@ -152,7 +155,9 @@ async def gather(*, group_id: str, bot=None) -> list[dict]:
                 gid, [str(r["user_id"]) for r in clashing])
             for row in clashing:
                 if s := seqs.get(str(row["user_id"])):
-                    row["nickname"] = f"{row['nickname']}({s})"
+                    # The same reserved namesake tag members.py renders, so the
+                    # roster and the transcript spell one member one way.
+                    row["nickname"] = row["nickname"] + sysmark(f"同名{s}")
         except Exception as e:
             log.warning("group %s: roster namesake numbering unavailable: %s",
                         group_id, e)
@@ -188,14 +193,50 @@ async def episode_lookup(group_id: str, question: str) -> str:
     Filtered by nothing but the group: cross-person questions - who promised
     what, when something was decided - are precisely about people the current
     turn does not contain.
+
+    Each recalled episode comes framed by its neighbours in group time
+    (retrieval.episode_context each way): an episode summarises one stretch of
+    conversation, and what led to it or came of it is usually the adjacent
+    stretch. Touching windows merge into one block, blocks are separated by an
+    ellipsis line, and an undated episode stands alone.
     """
     if _RETRIEVER is None:
         raise RuntimeError("retrieval.set_embedding has not been called")
     eps = await _RETRIEVER.search_episodes(int(group_id), question)
-    return "\n".join(
-        f"[{e.started_at:%m-%d}] {e.summary}" if e.started_at else f"- {e.summary}"
-        for e in eps
-    )
+    if not eps:
+        return ""
+
+    def line(e) -> str:
+        # defang the summary: episodes are prose the extractor wrote and carry
+        # no legitimate system markup; the date wears the reserved brackets.
+        return (f"{sysmark(f'{e.started_at:%m-%d}')} {defang(e.summary)}"
+                if e.started_at else f"- {defang(e.summary)}")
+
+    ctx = max(0, config().default.retrieval.episode_context)
+    windows = (await EpisodeRepository().around(
+        int(group_id), [e.id for e in eps], ctx)) if ctx else {}
+    if not windows:
+        return "\n".join(line(e) for e in eps)
+    by_id = {e.id: e for w in windows.values() for e in w} | {e.id: e for e in eps}
+    covered = {i for w in windows.values() for i in (e.id for e in w)}
+    blocks = merge_overlapping(
+        [{e.id for e in w} for w in windows.values()]
+        # A hit the window query could not place (undated) still renders,
+        # as a block of one - after the dated story, in recall order.
+        + [{e.id} for e in eps if e.id not in covered])
+
+    def order(i) -> tuple:
+        e = by_id[i]
+        # None-dated blocks are singletons, so the naive fallback datetime is
+        # only ever compared against itself - never against an aware one.
+        return (e.started_at is None, e.started_at or datetime.min, str(i))
+
+    out: list[str] = []
+    for b in sorted(blocks, key=lambda b: min(order(i) for i in b)):
+        if out:
+            out.append("……")
+        out.extend(line(by_id[i]) for i in sorted(b, key=order))
+    return "\n".join(out)
 
 
 async def group_knowledge(group_id: str) -> list[str]:

@@ -49,6 +49,14 @@ def decide(msg: ChatMsg, at_bot: bool, *, st: GroupState,
         reason = "at"
     elif (hit := nickname.word_hit(msg.text, cfg.trigger.nicknames)) is not None:
         reason = f"nick:{hit}"
+    elif msg.reply_to and any(m.msg_id == msg.reply_to and m.is_bot
+                              for m in st.recent):
+        # Quoting the bot's own line is speech aimed at the bot, even with the
+        # auto-@ the reply button adds stripped off by hand. Window-scoped on
+        # purpose: the check must stay synchronous (the caller cuts the context
+        # slice right after), and a quote of a line already evicted is old
+        # enough that answering it uninvited would surprise more than silence.
+        reason = "reply_to_bot"
     else:
         return Decision(False, reason="not_addressed")
 

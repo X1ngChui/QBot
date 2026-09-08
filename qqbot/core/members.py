@@ -11,8 +11,9 @@ a problem worth more machinery than this.
 
 This is also where namesakes are told apart. The fetch sees every member's current card
 at once, so it is the one place a clash can be detected whole: members sharing a display
-name get it suffixed with their permanent per-group serial (the member_seq table) before
-the table is stored, and every consumer of current names inherits the distinction.
+name get it tagged with their permanent per-group serial (the member_seq table, worn
+in the reserved system brackets) before the table is stored, and every consumer of
+current names inherits the distinction.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ import logging
 import time
 
 from ..db import repo
-from ..util import why
+from ..util import defang, sysmark, why
 from .botapi import BotApi
 
 log = logging.getLogger("qqbot.members")
@@ -68,7 +69,10 @@ class MemberDirectory:
             table: dict[str, str] = {}
             for r in rows or []:
                 qq = str(r.get("user_id") or "").strip()
-                name = (r.get("card") or r.get("nickname") or "").strip()
+                # defang at the fetch: these names flow to transcripts, notice
+                # lines and @-resolution, and the namesake tag appended below is
+                # only unforgeable if the name half cannot carry system brackets.
+                name = defang((r.get("card") or r.get("nickname") or "")).strip()
                 if qq and name:
                     table[qq] = name
             self._raw_by_group[group_id] = dict(table)
@@ -94,7 +98,11 @@ class MemberDirectory:
                     seqs = await repo.member_seqs(int(group_id), clashing)
                     for qq in clashing:
                         if qq in seqs:
-                            table[qq] = f"{table[qq]}({seqs[qq]})"
+                            # The namesake tag wears the system brackets: a member
+                            # whose literal card ends in "(3)" used to be
+                            # indistinguishable from a numbered namesake, and the
+                            # reserved pair is what a card can no longer contain.
+                            table[qq] = table[qq] + sysmark(f"同名{seqs[qq]}")
                 except Exception as e:
                     log.warning("group %s: namesake numbering unavailable, "
                                 "names stay bare: %s", group_id, why(e))

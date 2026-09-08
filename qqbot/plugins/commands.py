@@ -27,9 +27,10 @@ from pathlib import Path
 
 from nonebot import on_command
 from nonebot.adapters.onebot.v11 import GroupMessageEvent
-from nonebot.matcher import Matcher
+from nonebot.matcher import Matcher, current_bot, current_event
 
 from ..core import agreement, command_catalog, debug, errors, perms
+from ..core.pipeline import note_console_reply
 from ..core.budget import BUDGET, hit_split
 from ..core.nickname import register as register_nicknames
 from ..core.retrieval import directory
@@ -128,8 +129,25 @@ async def _finish(matcher: Matcher, message: str) -> None:
     every answer visibly attached to its question. Refusals stay bare
     matcher.finish(): an @ with nothing behind it would advertise exactly what
     the silence hides.
+
+    send-then-finish rather than one finish call: the console's answers enter
+    the window and the archive like any other line the bot speaks (see
+    note_console_reply), and only send returns the platform message id that
+    makes a later quote of the answer resolvable. Recording failure never
+    unsends what the group already saw, so it only logs.
     """
-    await matcher.finish(message, at_sender=True, reply_message=True)
+    sent = await matcher.send(message, at_sender=True, reply_message=True)
+    try:
+        bot, event = current_bot.get(), current_event.get()
+        await note_console_reply(
+            group_id=str(getattr(event, "group_id", "")),
+            self_id=str(bot.self_id), text=message,
+            message_id=str((sent or {}).get("message_id") or ""),
+            reply_to=str(getattr(event, "message_id", "") or ""),
+            name=config().persona_for(str(getattr(event, "group_id", ""))).name)
+    except Exception as e:
+        log.warning("command reply not recorded: %s", why(e))
+    await matcher.finish()
 
 
 agree_cmd = on_command("agree", block=True, priority=1)

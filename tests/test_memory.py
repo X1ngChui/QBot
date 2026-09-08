@@ -291,19 +291,28 @@ async def main():
     check("and a fact cites the message that stated it", cited_fact == "e1",
           str(cited_fact))
 
-    # What the bot said is not evidence about the group. It is archived so the history
-    # survives a restart, and kept out of what memory reads by the one mechanism that can
-    # be relied on: nothing gives the bot an entity, so it can never take a code in the
-    # roster an extraction is given.
+    # What the bot said is readable but never evidence. It renders into the
+    # transcript with the self marker so the extractor reads both halves of
+    # every conversation it took part in - and it stays out of the roster (nothing
+    # gives the bot an entity, so it can never take a code) and out of
+    # evidence (own=True lines are skipped by source_of, so a candidate
+    # quoting one dies in validation).
     await ingestor().record_own_reply(
         group_id=G, self_id="999", message_id="b1", text="我也在玩鸣潮",
         at=now_local(), name="小X")
     _codes, _roster, lines = await w._render(G, await pool().fetch(
         """SELECT id, platform_user_id, occurred_at, payload, plain_text FROM raw_event
             WHERE group_id=$1 AND event_type='message' ORDER BY occurred_at""", G))
-    check("the bot is not in the transcript it learns from",
-          all("我也在玩鸣潮" not in ln.text for ln in lines),
+    _own0 = [ln for ln in lines if ln.own]
+    check("the bot's own line is in the transcript, marked as its own",
+          len(_own0) == 1 and "小X⟦你⟧: 我也在玩鸣潮" in _own0[0].text,
           str([ln.text for ln in lines]))
+    from qqbot.services import ExtractionInput as _EI0
+    _probe = _EI0(group_id=G, transcript="", roster=_roster, account_codes=_codes,
+                  lines=tuple(lines))
+    check("but never on the roster and never a source",
+          "小X" not in _roster and _probe.source_of("我也在玩鸣潮") is None,
+          _roster)
 
     ep = await pool().fetchrow("SELECT id, summary FROM episode WHERE group_id=$1", G)
     people = await pool().fetchval(
@@ -341,7 +350,7 @@ async def main():
     got = await tools_mod.execute(_call("recall_events", question="切片的约定"),
                                   cfg=config().default, group_id=str(G))
     check("recalled events answer a question", "老周答应周末把切片做完" in got, got)
-    check("dated, so the model can say when", "[" in got and "]" in got, got)
+    check("dated, so the model can say when", "⟦" in got and "⟧" in got, got)
     check("another group's memory is out of reach",
           "没有相关的事" in await tools_mod.execute(
               _call("recall_events", question="切片的约定"),
@@ -351,11 +360,41 @@ async def main():
               _call("recall_events", question="  "), cfg=config().default,
               group_id=str(G)))
 
+    # A recalled episode arrives framed by its neighbours in group time: the
+    # stretches before and after are the story's cause and consequence. The
+    # neighbours have no vectors on purpose - they must arrive by adjacency,
+    # not by similarity.
+    from datetime import timedelta as _td
+
+    from qqbot.domain.memory.episode import Episode as _Ep
+    from qqbot.repositories import EpisodeRepository as _EpRepo
+
+    _anchor = await pool().fetchrow(
+        "SELECT started_at FROM episode WHERE group_id=$1", G)
+    await _EpRepo().add(_Ep(group_id=G, summary="大家商量下个月团建去哪",
+                            started_at=_anchor["started_at"] - _td(days=1),
+                            ended_at=_anchor["started_at"] - _td(days=1)))
+    await _EpRepo().add(_Ep(group_id=G, summary="切片如期交上来了",
+                            started_at=_anchor["started_at"] + _td(days=1),
+                            ended_at=_anchor["started_at"] + _td(days=1)))
+    framed = await tools_mod.execute(_call("recall_events", question="切片的约定"),
+                                     cfg=config().default, group_id=str(G))
+    check("a recalled event brings its neighbours in time",
+          "团建" in framed and "如期交上来" in framed, framed)
+    check("and the frame reads chronologically",
+          framed.index("团建") < framed.index("老周答应")
+          < framed.index("如期交上来"), framed)
+
     # search_history narrows by speaker: keywords alone match everyone who mentioned
     # the word, and "what did X say about Y" needs the person, not the topic.
+    # Bare-hit mode for the pin: with context on, the other speaker's line would
+    # legitimately come back as the hit's surroundings.
+    _rcfg = config().default.retrieval
+    _ctx_saved, _rcfg.history_context = _rcfg.history_context, 0
     by_person = await tools_mod.execute(
         _call("search_history", query="切片", speaker="小北"),
         cfg=config().default, group_id=str(G))
+    _rcfg.history_context = _ctx_saved
     check("a speaker filter keeps only that person's lines",
           "老周你那个切片做完没" in by_person and "采样切成小段" not in by_person,
           by_person)
@@ -375,6 +414,54 @@ async def main():
     check("the roster carries the person's fact, not the group's",
           [(r["nickname"], r["persona_card"]) for r in roster] == [("董自豪", "在玩鸣潮")],
           str(roster))
+    # A confirmed name rides the extraction roster as a comprehension key: the
+    # extractor can resolve in-chat nicknames it would otherwise have to guess
+    # at. (Registered after the reply-roster pins above - a new alias row is
+    # roster content there too.)
+    from qqbot.core.retrieval import directory as _dir
+    await _dir().name(G, "u2", "小豪豪")
+    _codes2, _roster2, _ = await w._render(G, await pool().fetch(
+        """SELECT id, platform_user_id, occurred_at, payload, plain_text FROM raw_event
+            WHERE group_id=$1 AND event_type='message' ORDER BY occurred_at""", G))
+    check("the extraction roster lists known names beside the current card",
+          "（也叫：" in _roster2 and "小豪豪" in _roster2, _roster2)
+    # An owner's note reaches extraction read-only, under its own label - a
+    # comprehension key, never a source of candidates (the prompt forbids it,
+    # and no quote from a note can validate: it is not a transcript line).
+    await _dir().note(G, "u1", "只在周末上线")
+    _known2 = await w._known(G, _codes2)
+    check("the owner's note rides the known block under its own label",
+          "拥有者注：只在周末上线" in _known2, _known2)
+    # The persona's hand-written group background reaches extraction too - the
+    # same fixed material the reply path reads, because understanding is
+    # upstream of extraction.
+    check("the owner's group background heads the known block",
+          "本群固定资料：" in _known2 and "测试群。" in _known2, _known2)
+
+    # The bot's own lines enter the transcript marked and codeless, and stay
+    # out of evidence by construction: comprehension without the self-loop.
+    from qqbot.gateway.ingest import ingestor as _ing2
+    from qqbot.services import ExtractionInput as _EI
+
+    await _ing2().record_own_reply(group_id=G, self_id="999", message_id="own-1",
+                                   text="切片记得用新采样", at=now_local(),
+                                   name="小X")
+    _rows3 = await pool().fetch(
+        """SELECT id, platform_user_id, occurred_at, payload, plain_text FROM raw_event
+            WHERE group_id=$1 AND event_type='message' ORDER BY occurred_at""", G)
+    _codes3, _roster3, _lines3 = await w._render(G, _rows3)
+    _own = [ln for ln in _lines3 if ln.own]
+    check("the bot's own line renders marked, codeless and off the roster",
+          any("小X⟦你⟧: 切片记得用新采样" in ln.text for ln in _own)
+          and "小X" not in _roster3, str(_own))
+    _inp3 = _EI(group_id=G, transcript="\n".join(ln.text for ln in _lines3),
+                roster=_roster3, account_codes=_codes3, lines=tuple(_lines3))
+    check("a quote from the bot's own line validates nowhere",
+          _inp3.source_of("切片记得用新采样") is None)
+    check("while a member's line still sources",
+          _inp3.source_of("我最近在玩鸣潮") is not None)
+    # Left in place on purpose: the decay pin below reads u2, and u1 is
+    # nobody else's subject.
 
     # -- what a reply costs to look up ---------------------------------------
     # The roster is deliberately identical between turns - that is why it is ordered by

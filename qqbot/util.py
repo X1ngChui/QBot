@@ -135,6 +135,60 @@ def fmt_when(dt: datetime) -> str:
         dt = dt.astimezone(_TZ)
     return f"{dt:%m-%d %H:%M}"
 
+#: The system bracket pair, U+27E6/U+27E7. Every marker the system writes into a
+#: transcript - timestamps, media descriptions, owner/self/namesake tags, quote
+#: pointers, notice lines, provenance - uses these and only these. They are
+#: unforgeable because defang() replaces them with ASCII square brackets in every
+#: untrusted string before it can reach a rendered line: a card imitating the
+#: owner tag, or a message body imitating a media marker, produces plain text
+#: that no longer collides with any marker the model is taught to trust.
+SYS_L = "⟦"
+SYS_R = "⟧"
+
+
+def defang(text: str) -> str:
+    """Strip the system brackets out of an untrusted string, preserving its look.
+
+    Replacement rather than deletion: the characters are legitimate (if exotic)
+    typography, and a pasted maths snippet should stay readable - it just loses
+    the one property that matters, being mistakable for system markup. Applied at
+    the boundaries where outside text enters a transcript: segment parsing, media
+    descriptions, member names, tool digests. Idempotent, cheap, total.
+    """
+    if not text:
+        return text
+    return text.replace(SYS_L, "[").replace(SYS_R, "]")
+
+
+def sysmark(body: str) -> str:
+    """One system marker, in the reserved brackets. The single spelling of the
+    grammar, so a marker written here can never drift from the defang() pair."""
+    return f"{SYS_L}{body}{SYS_R}"
+
+
+def merge_overlapping(sets: list[set]) -> list[set]:
+    """Union together every group of sets that share members, transitively.
+
+    Both retrieval tools use it the same way: a hit's context window is a
+    contiguous run in some archive order, so two windows overlap exactly when
+    they share an element, and overlapping windows must render as one block
+    rather than repeat their shared lines. Order of the returned blocks is
+    unspecified - callers sort by their own key.
+    """
+    blocks: list[set] = []
+    for w in sets:
+        merged = set(w)
+        rest = []
+        for b in blocks:
+            if b & merged:
+                merged |= b
+            else:
+                rest.append(b)
+        rest.append(merged)
+        blocks = rest
+    return blocks
+
+
 _DURATION = re.compile(r"^(\d{1,5})\s*([mhd])$", re.I)
 _UNIT_MINUTES = {"m": 1, "h": 60, "d": 1440}
 

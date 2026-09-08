@@ -20,6 +20,7 @@ prompts:
   private_rules: ../../../config/prompts/private_rules.txt
   tone_rules: ../../../config/prompts/tone_rules.txt
   tone_reply_note: ../../../config/prompts/tone_reply_note.txt
+  tone_extract_note: ../../../config/prompts/tone_extract_note.txt
   reply_final: ../../../config/prompts/reply_final.txt
   # the whole extraction rulebook
   extract: ../../../config/prompts/extract.txt

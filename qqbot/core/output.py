@@ -15,6 +15,8 @@ import logging
 import re
 from collections import Counter
 
+from ..util import SYS_L, SYS_R, defang
+
 log = logging.getLogger("qqbot.output")
 
 _FENCE = re.compile(r"```[a-zA-Z0-9_+-]*\n?")
@@ -36,7 +38,7 @@ _MULTI_NL = re.compile(r"\n{3,}")
 #: collide, the guard declines. The character class is the short list of classifiers a
 #: number can take.
 _LINE_NO = re.compile(
-    r"^\s*#\d{1,4}(?:\s+\[\d{2}-\d{2} \d{2}:\d{2}\])?(?:\s+[^\s:：]{1,20}[:：])?"
+    r"^\s*#\d{1,4}(?:\s+[\[⟦]\d{2}-\d{2} \d{2}:\d{2}[\]⟧])?(?:\s+[^\s:：]{1,20}[:：])?"
     r"\s*+(?![号位名楼队班组层期版区])",
     re.M,  # every line: a multi-line reply imitates the numbered format on each one
 )
@@ -44,17 +46,19 @@ _LINE_NO = re.compile(
 #: A time stamp copied back out of the history without its line number. Only the stamp
 #: is eaten, never a speaker after it: a bracketed date-time opening a line is format
 #: imitation, but "X：" after one could be the reply's own words - where the readings
-#: collide, the guard declines, same as _LINE_NO.
-_TS_ONLY = re.compile(r"^\s*\[\d{2}-\d{2} \d{2}:\d{2}\]\s*", re.M)
+#: collide, the guard declines, same as _LINE_NO. Both bracket generations are
+#: matched: the reserved pair is what the history teaches now, the square pair is
+#: what old archive lines surfaced by search_history still carry.
+_TS_ONLY = re.compile(r"^\s*[\[⟦]\d{2}-\d{2} \d{2}:\d{2}[\]⟧]\s*", re.M)
 #: The provenance marker the engine appends to the bot's own archived lines. The
 #: history is an example the model may follow, and a reply that imitates it would
 #: leak a system annotation into the group. Nobody writes the bracketed form by
 #: hand, so this one is stripped wherever it appears.
-_PROV = re.compile(r"\s*\[依据[:：][^\]]*\]")
+_PROV = re.compile(r"\s*[\[⟦]依据[:：][^\]⟧]*[\]⟧]")
 #: A line imitating the trajectory-entry marker. Whole lines carrying it are
 #: dropped: the marker is system-written and must never reach the group, while the
 #: digest lines that follow one read as ordinary speech and are left to stand.
-_TRACE_LINE = re.compile(r"^.*\[检索记录\].*$\n?", re.M)
+_TRACE_LINE = re.compile(r"^.*[\[⟦]检索记录[\]⟧].*$\n?", re.M)
 #: The quote pointer copied back out of the history. The real quote is the reply
 #: segment the send path attaches; the bracketed form is transcript notation, and
 #: the prompt asking not to reproduce it did not hold (twice) - one reached a
@@ -63,7 +67,11 @@ _TRACE_LINE = re.compile(r"^.*\[检索记录\].*$\n?", re.M)
 #: while one sitting mid-sentence is likelier the reply's own content (somebody's
 #: words restated, or the notation being talked about) - where the readings
 #: collide, the guard declines.
-_REPLY_MARK = re.compile(r"^\s*\[回复\s*(?:#\d{1,4}|更早的消息)\]\s*", re.M)
+_REPLY_MARK = re.compile(r"^\s*[\[⟦]回复\s*(?:#\d{1,4}|更早的消息)[\]⟧]\s*", re.M)
+#: Speaker tags copied out of the history: the owner/self/namesake annotations
+#: that ride behind names in transcripts. Dropped whole wherever they appear -
+#: they are annotations about a line, never words anyone says.
+_NAME_TAG = re.compile(r"⟦(?:拥有者|你|同名\d{1,9})⟧")
 
 
 def strip_markdown(text: str) -> str:
@@ -100,6 +108,7 @@ _MARKER_STAGES = (
     ("timestamp", _TS_ONLY),
     ("provenance", _PROV),
     ("trace_line", _TRACE_LINE),
+    ("name_tag", _NAME_TAG),
 )
 
 
@@ -110,6 +119,11 @@ def clean_reply(text: str) -> str:
     quote mark and hides the line number behind it, and _LINE_NO declines lines
     that do not start with the number - stripping in the other order would
     uncover a line number and then keep it.
+
+    The last stage is the floor under the whole reserved-bracket grammar: no
+    reply may carry the system brackets into the group, whatever surrounds them.
+    Ingest would defang them right back on the next archive read, and a marker
+    shape the strippers above did not anticipate must still not reach members.
     """
     t = strip_markdown(_before_markup(text))
     for name, rx in _MARKER_STAGES:
@@ -117,6 +131,9 @@ def clean_reply(text: str) -> str:
         if new != t:
             STRIPPED[name] += 1
             t = new
+    if SYS_L in t or SYS_R in t:
+        STRIPPED["reserved"] += 1
+        t = defang(t)
     return t.strip()
 
 

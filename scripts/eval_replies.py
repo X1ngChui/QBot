@@ -80,10 +80,12 @@ NO_MARKERS = [
     # reply (a broken pipeline, a silent budget gate) would pass them all, and a
     # harness that scores a regression PASS is worse than none.
     ("says something", lambda t: bool(t.strip())),
-    ("no quote pointer", lambda t: "[回复" not in t),
+    ("no quote pointer", lambda t: "[回复" not in t and "⟦回复" not in t),
     ("no line number prefix", lambda t: not re.search(r"^\s*#\d", t, re.M)),
-    ("no provenance marker", lambda t: "[依据" not in t),
-    ("no trace marker", lambda t: "[检索记录" not in t),
+    ("no provenance marker", lambda t: "[依据" not in t and "⟦依据" not in t),
+    ("no trace marker", lambda t: "[检索记录" not in t and "⟦检索记录" not in t),
+    # The reserved pair is system writing, full stop: no reply may carry it.
+    ("no reserved bracket", lambda t: "⟦" not in t and "⟧" not in t),
     ("does not open with @", lambda t: not t.lstrip().startswith(("@", "＠"))),
 ]
 

@@ -71,12 +71,24 @@ llm:
     max_image_mb: 8
     timeout_sec: 30
   asr:
-    backend: dashscope
-    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-    api_key_env: MEDIA_API_KEY
-    model: qwen3-asr-flash
+    # In-process CPU transcription, no key and no per-second bill. Needs the
+    # model bundle on disk first: run scripts/fetch_asr_model.sh once on the
+    # deploy host (models/ is mounted into the container read-only).
+    backend: sherpa
+    model: sense-voice          # ledger label, not an API model id
+    model_dir: /app/models/asr/sense-voice
+    threads: 2
     max_audio_sec: 300
+    # Arrival-time transcription needs its own pace gate, like pictures'
+    # max_images_per_min. With the free backend this is a CPU guard; for a
+    # paid one (below) it is what stands before the daily cap, so lower it.
+    max_clips_per_min: 20
     timeout_sec: 60
+    # API alternative (per-second billing, MEDIA_API_KEY):
+    #   backend: dashscope
+    #   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    #   model: qwen3-asr-flash
+    #   max_clips_per_min: 6
   embedding:
     backend: dashscope
     base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
@@ -112,6 +124,16 @@ memory:
   # runs once nightly (schedule.extract_cron), draining the day oldest-first in
   # chunks cut at conversation gaps; there is nothing else to configure.
   reasoning_effort: low
+
+retrieval:
+  # Lines of surrounding conversation around each search_history hit, each way.
+  # Chat is fragments - a matched line is often a bare answer to the line above
+  # it. Costs only prompt tokens (~30/line, evicted next turn); 0 = bare hits.
+  history_context: 5
+  # Same idea for recall_events, in coarser units: episodes this many before and
+  # after each recalled one. An episode covers a whole stretch of conversation,
+  # so a couple either side frames the story. 0 = bare recall.
+  episode_context: 2
 
 schedule:
   extract_cron:     "30 2 * * *"
@@ -151,6 +173,7 @@ prompts:
   private_rules: prompts/private_rules.txt
   tone_rules: prompts/tone_rules.txt
   tone_reply_note: prompts/tone_reply_note.txt
+  tone_extract_note: prompts/tone_extract_note.txt
   reply_final: prompts/reply_final.txt
   # the whole extraction rulebook
   extract: prompts/extract.txt

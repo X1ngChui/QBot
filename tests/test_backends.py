@@ -37,9 +37,14 @@ def main() -> int:
 
     # -- registry ---------------------------------------------------------
     bundle = build(settings)
+    # Against what the config asks for, not a hardcoded vendor: the text slot
+    # legitimately swings between deepseek and the local toy.
+    _cfg_names = (f"text={settings.llm.text.backend}"
+                  f" vision={settings.llm.vision.backend}"
+                  f" asr={settings.llm.asr.backend}"
+                  f" search={settings.llm.search.backend}")
     check("shipped config wires the expected backends",
-          bundle.describe() == "text=deepseek vision=deepseek asr=dashscope search=tavily",
-          bundle.describe())
+          bundle.describe() == _cfg_names, bundle.describe())
     asyncio.run(bundle.aclose())
 
     bad = load_bundle().default
@@ -164,10 +169,17 @@ def main() -> int:
     bundle2 = build(settings)
     llm = settings.llm
     rate = bundle2.text.rate_for(llm.text.model)
-    check("text backend prices its own model",
-          rate.unit == "Mtoken" and rate.in_miss > 0, str(rate))
-    check("a cache hit is far cheaper than a miss",
-          rate.in_miss / rate.in_hit > 10, f"{rate.in_miss}/{rate.in_hit}")
+    if llm.text.backend == "local":
+        # Self-hosted burns watts, not CNY: anything nonzero here would spend
+        # the real daily budget on fake costs.
+        check("the local backend is free in every direction",
+              rate.unit == "Mtoken"
+              and rate.in_hit == rate.in_miss == rate.out == 0.0, str(rate))
+    else:
+        check("text backend prices its own model",
+              rate.unit == "Mtoken" and rate.in_miss > 0, str(rate))
+        check("a cache hit is far cheaper than a miss",
+              rate.in_miss / rate.in_hit > 10, f"{rate.in_miss}/{rate.in_hit}")
     check("asr is priced per second of audio",
           bundle2.asr.rate_for(llm.asr.model).unit == "second")
     check("search is priced per call",

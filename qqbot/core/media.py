@@ -47,7 +47,7 @@ from ..providers.openai_compat import NEVER_BILLED
 from .budget import BUDGET
 from ..settings import Settings, ptext
 from ..services import UnknownAccount
-from ..util import why
+from ..util import defang, sysmark, why
 from .botapi import BotApi
 from .members import MEMBERS
 from .output import strip_markdown
@@ -121,6 +121,7 @@ class MediaProcessor:
     def __init__(self) -> None:
         self._http: httpx.AsyncClient | None = None
         self._img_windows: dict[str, SlidingWindow] = {}
+        self._asr_windows: dict[str, SlidingWindow] = {}
         #: Describe calls in the air, by image key - the single-flight registry.
         self._describing: dict[str, asyncio.Task] = {}
         #: And ASR calls in the air, by clip file id - same rule, dearer stakes:
@@ -138,10 +139,18 @@ class MediaProcessor:
             self._http = None
 
     def _img_window(self, group_id: str, limit: int) -> SlidingWindow:
-        w = self._img_windows.get(group_id)
+        return self._window(self._img_windows, group_id, limit)
+
+    def _asr_window(self, group_id: str, limit: int) -> SlidingWindow:
+        return self._window(self._asr_windows, group_id, limit)
+
+    @staticmethod
+    def _window(table: dict[str, SlidingWindow], group_id: str,
+                limit: int) -> SlidingWindow:
+        w = table.get(group_id)
         if w is None:
             w = SlidingWindow(limit)
-            self._img_windows[group_id] = w
+            table[group_id] = w
         w.limit = limit
         return w
 
@@ -291,7 +300,8 @@ class MediaProcessor:
                              cfg: Settings) -> str | None:
         vcfg = cfg.llm.vision
         label = "表情" if ref.sticker else "图片"
-        fallback = f"[{label}:{ref.summary}]" if ref.summary else None
+        # ref.summary was defanged at segment parse; the wrap is system-authored.
+        fallback = sysmark(f"{label}:{ref.summary}") if ref.summary else None
 
         if ref.key:
             cached = await repo.image_cache_get(ref.key)
@@ -332,7 +342,7 @@ class MediaProcessor:
                 # failures someone actually has to act on.
                 log.info("vision backend declined an image; recording it as unseen")
                 if ref.key:
-                    await repo.image_cache_put(ref.key, fallback or f"[{label}]")
+                    await repo.image_cache_put(ref.key, fallback or sysmark(label))
                 return fallback
             log.warning("vision model call failed: %s", why(e))
             return retry_later
@@ -341,7 +351,9 @@ class MediaProcessor:
         # The vision backend writes for a reader, so it bolds things. Left in, every
         # picture puts ** in the transcript the model is imitating, against a persona whose
         # first rule is not to use Markdown.
-        desc = f"[{label}:{strip_markdown(desc)}]"
+        # defang the model's words too: it read the picture, and a picture can carry
+        # printed text - which makes the description a channel for outside bytes.
+        desc = sysmark(f"{label}:{defang(strip_markdown(desc))}")
         if ref.key:
             await repo.image_cache_put(ref.key, desc)
         return desc
@@ -395,6 +407,19 @@ class MediaProcessor:
     async def _transcribe_once(self, ref: AudioRef, *, bot: BotApi, group_id: str,
                                cfg: Settings) -> str | None:
         acfg = cfg.llm.asr
+        # Transcription now happens on arrival rather than behind a reply, so
+        # the arrival gates live here - there is no upstream gate on this path.
+        # None keeps the slot unsettled, so a reply-path settle can retry later.
+        if not self._asr_window(group_id, acfg.max_clips_per_min).take():
+            log.info("voice transcription rate limited, deferred (%s)", group_id)
+            return None
+        # The daily cap guards spending, so a backend whose rate is zero (the
+        # in-process one) transcribes right through it: a group that exhausted
+        # the budget on replies should not also get a degraded archive for free
+        # audio. The per-minute gate above still applies - it paces CPU now.
+        if (providers().asr.rate_for(acfg.model).units(1.0) > 0
+                and await BUDGET.exceeded(cfg.budget.daily_cny_cap)):
+            return None
         # Never the stored file, never the CDN link: both hold QQ's native SILK v3
         # whatever the ".amr" suffix claims (magic '#!SILK_V3'), and SILK bytes labelled
         # amr get a polite empty transcript from the ASR backend - a perfectly clear
@@ -437,8 +462,10 @@ class MediaProcessor:
             # the message evicts. One paid attempt per clip; the fetch failures
             # above stay retryable because retrying them is free.
             log.warning("ASR call failed, clip abandoned: %s", why(e))
-            return "[语音]"
-        return f"[语音:{text}]" if text else "[语音:没听清]"
+            return sysmark("语音")
+        # defang the transcription: it is the speaker's words, machine-transcribed,
+        # and spoken text is as member-controlled as typed text.
+        return sysmark(f"语音:{defang(text)}") if text else sysmark("语音:没听清")
 
     async def name_for(self, ref: AtRef, *, bot: BotApi, group_id: str) -> str | None:
         """A bare QQ number tells the model nothing about who was addressed.
@@ -516,10 +543,10 @@ class MediaProcessor:
             data = node.get("data") if node.get("type") == "node" else node
             data = data or {}
             sender = data.get("sender") or {}
-            who = (
+            who = defang((
                 sender.get("card") or sender.get("nickname")
                 or data.get("nickname") or ""
-            ).strip()
+            )).strip()
             body = await self._body_of(data, bot=bot, group_id=group_id, self_id=self_id)
             if not body:
                 continue
@@ -529,7 +556,10 @@ class MediaProcessor:
         if not lines:
             return None
         more = "" if len(nodes) <= FORWARD_NODES else f" 等{len(nodes)}条"
-        return "[转发的聊天记录" + more + "：" + " / ".join(lines) + "]"
+        # The nested bodies came through parse_segments and are already defanged;
+        # their own media markers keep the system brackets - a nested description
+        # is system writing even inside a forward.
+        return sysmark("转发的聊天记录" + more + "：" + " / ".join(lines))
 
     async def resolve(
         self,
@@ -539,27 +569,29 @@ class MediaProcessor:
         group_id: str,
         cfg: Settings,
         allow_models: bool = True,
-        images_now: bool = False,
+        media_now: bool = False,
     ) -> dict[int, str]:
         """`allow_models=False` keeps the free lookups (who was @-ed, what was quoted,
-        what was forwarded) and skips what costs money; `images_now=True` re-admits the
-        pictures alone.
+        what was forwarded) and skips what costs money; `media_now=True` re-admits
+        pictures and voice.
 
         The schedule this encodes: mentions, quotes and forwards resolve on arrival
-        because a bare account number must not reach the archive. Pictures also resolve
-        on arrival (images_now) - the download link is freshest then, the upload it
-        feeds is free, and the describing call is cached per unique picture, rate
-        limited and behind the daily cap, so arrival-time understanding is the same
-        money at better latency, and it reaches groups the bot never replies in. Voice
-        is the one thing that still waits for a reply: billed per second, never
-        repeated, and only ever discussed right after being sent. Calling this twice on
-        the same message is expected and cheap - the second pass hits warm caches."""
+        because a bare account number must not reach the archive. Pictures and voice
+        also resolve on arrival (media_now): understood now, archived as text (design
+        goal 8) - the download link is freshest then, the describing call is cached
+        per unique picture, and both sit behind the daily cap, so arrival-time
+        understanding is the same money at better latency, and it reaches groups the
+        bot never replies in. Voice clips are rarer than pictures and bill by the
+        second; without an arrival transcript they were a blind spot in extraction,
+        which reads only text. Calling this twice on the same message is expected and
+        cheap - the second pass hits warm caches or the in-flight registries."""
         if not pm.refs:
             return {}
         self_id = str(getattr(bot, "self_id", ""))
 
         async def one(ref: Ref):
-            if ref.free or allow_models or (images_now and isinstance(ref, ImageRef)):
+            if (ref.free or allow_models
+                    or (media_now and isinstance(ref, (ImageRef, AudioRef)))):
                 return await ref.resolve(self, bot=bot, group_id=group_id, cfg=cfg,
                                          self_id=self_id)
             # A description already paid for costs nothing to reuse, and stickers repeat

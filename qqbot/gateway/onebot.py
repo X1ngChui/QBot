@@ -25,7 +25,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Self
 
-from ..util import now_local, tz
+from ..util import defang, now_local, tz
 
 
 class Role(StrEnum):
@@ -63,13 +63,16 @@ class Sender:
 
     @classmethod
     def parse(cls, raw: dict | None, fallback_id: str = "") -> Self:
+        # Names are member-chosen bytes headed for transcripts and the archive's
+        # sender payloads, so the system brackets are neutralized at the envelope -
+        # a card written to imitate a system tag arrives already harmless.
         raw = raw or {}
         return cls(
             user_id=str(raw.get("user_id") or fallback_id or ""),
-            nickname=str(raw.get("nickname") or ""),
-            card=str(raw.get("card") or ""),
+            nickname=defang(str(raw.get("nickname") or "")),
+            card=defang(str(raw.get("card") or "")),
             role=Role.parse(raw.get("role")),
-            title=str(raw.get("title") or ""),
+            title=defang(str(raw.get("title") or "")),
         )
 
 

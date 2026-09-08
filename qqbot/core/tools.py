@@ -17,8 +17,8 @@ from dataclasses import dataclass, field
 from ..db import pool, repo
 from ..providers import providers
 from ..providers.base import QuotaExhausted
-from ..settings import Settings, ptext
-from ..util import fmt_when, why
+from ..settings import Settings, config, ptext
+from ..util import SYS_L, SYS_R, defang, fmt_when, merge_overlapping, sysmark, why
 from . import retrieval
 from .media import MEDIA
 
@@ -71,8 +71,8 @@ def tool_defs() -> list[dict]:
                         "speaker": {
                             "type": "string",
                             "description": "只看这个人说的话，填昵称；不填则不限发言人；"
-                                           "若记录中该人名字带括号编号（如「小明(3)」），"
-                                           "需连编号一起原样填入，以精确锁定该人，避免混入同名者",
+                                           "若上文中该人名字后带同名编号标注，"
+                                           "需连标注一起原样填入，以精确锁定该人，避免混入同名者",
                         },
                         "days": {
                             "type": "integer",
@@ -152,10 +152,14 @@ HISTORY_HITS = 8
 HISTORY_SNIPPET = 200
 
 
-#: The namesake form current names render as: name(N), N the permanent serial.
-#: A speaker argument in this shape narrows by the serial's account, never by
-#: the name half - the name is exactly what the two people share.
-_SEQ_NAME = re.compile(r"^(.+)\((\d{1,9})\)$")
+#: The namesake form current names render as: the name plus the reserved
+#: namesake tag carrying the permanent serial. A speaker argument in this shape
+#: narrows by the serial's account, never by the name half - the name is exactly
+#: what the two people share. The legacy parenthesised form (name(N)) is still
+#: accepted: old transcripts and archived @-resolutions carry it, and the model
+#: copies speaker names verbatim from whatever line it read.
+_SEQ_NAME = re.compile(rf"^(.+){SYS_L}同名(\d{{1,9}}){SYS_R}$")
+_SEQ_NAME_LEGACY = re.compile(r"^(.+)\((\d{1,9})\)$")
 
 
 async def _carried_name(group_id: int, uid: str, name: str) -> bool:
@@ -189,22 +193,31 @@ async def search_history(group_id: int, query: str, *, speaker: str | None = Non
     shows for namesakes - name(N) - is accepted too: the serial maps to exactly one
     account, where the name half would match both people. `days` narrows to the recent
     past the same way.
+
+    Each hit comes wrapped in its surrounding lines (retrieval.history_context each
+    way): chat is written in fragments, and the matched line is routinely a bare
+    answer to the line above it. The filters pick the hits; the context is whatever
+    actually surrounds them - group notices included, since a recall or a mute is
+    often the very thing a line responds to. Windows that touch merge into one
+    block; blocks are separated by an ellipsis line.
     """
     words = [w for w in (query or "").split() if w][:5]
     if not words:
         return "（关键词为空）"
     sp = (speaker or "").strip()
     uid: str | None = None
-    if m := _SEQ_NAME.fullmatch(sp):
+    if m := (_SEQ_NAME.fullmatch(sp) or _SEQ_NAME_LEGACY.fullmatch(sp)):
         uid = await repo.member_of_seq(group_id, int(m.group(2)))
         if uid is not None and not await _carried_name(group_id, uid,
                                                        m.group(1).strip()):
             # A member whose literal card ends in (3) must not resolve through
             # serial 3 to an unrelated account: the serial only decides when
-            # its account has actually carried the name half.
+            # its account has actually carried the name half. (The reserved form
+            # cannot be a literal card, but the guard is kept uniform - the
+            # model can mistype a serial either way.)
             uid = None
     rows = await pool().fetch(
-        """SELECT occurred_at, payload, plain_text FROM raw_event
+        """SELECT id, occurred_at, payload, plain_text FROM raw_event
             WHERE group_id=$1 AND event_type='message'
               AND plain_text ILIKE ALL($2::text[])
               AND ($4::text IS NULL
@@ -221,15 +234,64 @@ async def search_history(group_id: int, query: str, *, speaker: str | None = Non
     )
     if not rows:
         return "（存档里没有搜到）"
-    lines = []
-    for r in reversed(rows):
-        payload = r["payload"] or {}
-        sender = payload.get("sender") or {}
-        who = (sender.get("card") or sender.get("nickname") or "?").strip()
-        text = (r["plain_text"] or "").strip()[:HISTORY_SNIPPET]
-        # fmt_when, not strftime on the raw value: asyncpg returns timestamptz in UTC,
-        # and a UTC wall time here would disagree with every stamp in the history window.
-        lines.append(f"[{fmt_when(r['occurred_at'])}] {who}: {text}")
+    ctx = max(0, config().default.retrieval.history_context)
+    if not ctx:
+        return "\n".join(_history_line(r) for r in reversed(rows))
+    return await _with_context(group_id, [r["id"] for r in rows], ctx)
+
+
+def _history_line(r) -> str:
+    payload = r["payload"] or {}
+    sender = payload.get("sender") or {}
+    # defang the name on render: rows filed before Sender.parse neutralized
+    # names can carry anything. The text is left as stored - its markers are
+    # system writing, and defanging would destroy them.
+    who = defang((sender.get("card") or sender.get("nickname") or "?")).strip()
+    text = (r["plain_text"] or "").strip()[:HISTORY_SNIPPET]
+    # fmt_when, not strftime on the raw value: asyncpg returns timestamptz in UTC,
+    # and a UTC wall time here would disagree with every stamp in the history window.
+    return f"{sysmark(fmt_when(r['occurred_at']))} {who}: {text}"
+
+
+async def _with_context(group_id: int, hit_ids: list, ctx: int) -> str:
+    """The hits rendered inside their surrounding conversation.
+
+    One query fetches, per hit, the ctx archive lines on either side of it (by
+    the archive's own order, (occurred_at, id) - the id is a UUID, so it breaks
+    ties without meaning anything). A window is contiguous by construction, so
+    two windows overlap exactly when they share a row: overlapping windows are
+    merged into one block, and blocks render oldest first with an ellipsis line
+    between them. Worst case is HISTORY_HITS disjoint blocks of 2*ctx+1 lines.
+    """
+    nrows = await pool().fetch(
+        """SELECT h.id AS hit, n.id, n.occurred_at, n.payload, n.plain_text
+             FROM unnest($2::uuid[]) AS h(id)
+             JOIN raw_event he ON he.id = h.id
+            CROSS JOIN LATERAL (
+              (SELECT id, occurred_at, payload, plain_text FROM raw_event
+                WHERE group_id=$1 AND event_type='message'
+                  AND (occurred_at, id) <= (he.occurred_at, he.id)
+                ORDER BY occurred_at DESC, id DESC LIMIT $3)
+              UNION ALL
+              (SELECT id, occurred_at, payload, plain_text FROM raw_event
+                WHERE group_id=$1 AND event_type='message'
+                  AND (occurred_at, id) > (he.occurred_at, he.id)
+                ORDER BY occurred_at ASC, id ASC LIMIT $4)
+            ) n""",
+        group_id, hit_ids, ctx + 1, ctx,
+    )
+    by_id = {}
+    windows: dict = {}
+    for r in nrows:
+        by_id[r["id"]] = r
+        windows.setdefault(r["hit"], set()).add(r["id"])
+    blocks = merge_overlapping(list(windows.values()))
+    order = lambda rid: (by_id[rid]["occurred_at"], by_id[rid]["id"])  # noqa: E731
+    lines: list[str] = []
+    for b in sorted(blocks, key=lambda b: min(order(rid) for rid in b)):
+        if lines:
+            lines.append("……")
+        lines.extend(_history_line(by_id[rid]) for rid in sorted(b, key=order))
     return "\n".join(lines)
 
 
@@ -320,7 +382,9 @@ async def execute(call: dict, *, cfg: Settings, group_id: str,
             return Failure("（网页读取失败）")
         if not text:
             return Failure("（这个网页没有可读的正文）")
-        return text[:URL_CONTENT_CHARS]
+        # Outside text: a page carrying the system brackets must not read as
+        # system markup to the model, here or later in the frozen trace digest.
+        return defang(text)[:URL_CONTENT_CHARS]
 
     if name == "recall_events":
         question = (args.get("question") or args.get("query") or "").strip()
@@ -371,4 +435,5 @@ async def execute(call: dict, *, cfg: Settings, group_id: str,
     except Exception as e:
         log.warning("web_search failed: %s", why(e))
         return Failure("（搜索失败）")
-    return render_results(items)
+    # Same rule as read_url: search snippets are outside text.
+    return defang(render_results(items))

@@ -17,7 +17,9 @@ from ..settings import Settings
 from .base import AsrModel, Providers, SearchEngine, TextModel, VisionModel
 from .dashscope import DashScopeAsr
 from .deepseek import DeepSeekChat, DeepSeekVision
+from .local import LocalChat
 from .openai_compat import OpenAICompatAsr, OpenAICompatChat, OpenAICompatVision
+from .sherpa import SherpaAsr
 from .tavily import TavilySearch
 
 log = logging.getLogger("qqbot.providers")
@@ -25,6 +27,8 @@ log = logging.getLogger("qqbot.providers")
 TEXT_BACKENDS: dict[str, type[TextModel]] = {
     "deepseek": DeepSeekChat,
     "openai_compat": OpenAICompatChat,
+    # Self-hosted endpoint (the NPU/CPU toy): generic protocol, zero rates.
+    "local": LocalChat,
 }
 
 VISION_BACKENDS: dict[str, type[VisionModel]] = {
@@ -35,6 +39,8 @@ VISION_BACKENDS: dict[str, type[VisionModel]] = {
 ASR_BACKENDS: dict[str, type[AsrModel]] = {
     "dashscope": DashScopeAsr,
     "openai_compat": OpenAICompatAsr,
+    # In-process sherpa-onnx (SenseVoice): CPU decoding, zero rates.
+    "sherpa": SherpaAsr,
 }
 
 SEARCH_BACKENDS: dict[str, type[SearchEngine]] = {

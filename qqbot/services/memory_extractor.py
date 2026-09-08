@@ -227,6 +227,11 @@ class SourceLine:
 
     event_id: uuid.UUID
     text: str
+    #: The bot's own line. Rendered into the transcript so the model reads both
+    #: halves of a conversation, and excluded from evidence: source_of skips it,
+    #: so any candidate quoting it fails validation mechanically. Comprehension
+    #: without the self-loop - the bot's words never come back as evidence.
+    own: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,6 +256,11 @@ class ExtractionInput:
     #: What is already on record for this group, rendered. Given to the model so it
     #: proposes what is new rather than re-deriving what is known - see the extract prompt.
     known: str = ""
+    #: The bot's own trigger names, joined for display. Without them the extractor
+    #: cannot recognise its own name in other people's mouths and files it as an
+    #: alias of whichever member happens to sit nearby - measured in production,
+    #: where the bot's name ended up a confirmed alias of another bot's account.
+    self_names: str = ""
 
     def source_of(self, quote: str) -> uuid.UUID | None:
         """Which message a quote came from, or None if no single message contains it.
@@ -266,6 +276,10 @@ class ExtractionInput:
         if not quote:
             return None
         for line in self.lines:
+            if line.own:
+                # The bot's own lines are context, never evidence: a quote found
+                # only there validates nowhere, and the candidate dies for it.
+                continue
             if quote in line.text:
                 return line.event_id
         return None
@@ -286,8 +300,11 @@ class MemoryExtractor:
         self._cfg = cfg
         # Composed once, at construction: the fixed half lives in the prefix cache for
         # the worker's lifetime, so a prompt override applies from the next restart
-        # rather than mid-batch.
-        base = ptext("extract")
+        # rather than mid-batch. tone_rules is the discernment core shared with the
+        # reply path - what counts as said-in-earnest is one judgment, stated once -
+        # followed by this path's consequence note (what not to record).
+        base = (ptext("extract") + "\n\n【群聊语用】\n"
+                + ptext("tone_rules") + "\n\n" + ptext("tone_extract_note"))
         self._prompt = (base + "\n\n" + legend.strip()) if legend.strip() else base
 
     @property
@@ -305,6 +322,7 @@ class MemoryExtractor:
                 # Ordered by how often each part changes, as everywhere else: the accounts
                 # and what is already known move once a day, the transcript every batch.
                 {"role": "user", "content": "\n\n".join(p for p in (
+                    f"你的名字：{inp.self_names}" if inp.self_names else "",
                     f"本群账号：\n{inp.roster}",
                     f"【已经记过的】\n{inp.known}" if inp.known else "",
                     f"群聊记录：\n{inp.transcript}",

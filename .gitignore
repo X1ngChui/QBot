@@ -2,6 +2,8 @@
 data/
 logs/
 backups/
+# Local inference weights (scripts/fetch_asr_model.sh); mounted, never shipped
+models/
 
 # Secrets: only commit .example files
 

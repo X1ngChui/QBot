@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from dataclasses import replace
 from datetime import datetime
 
@@ -28,7 +29,7 @@ from ..db import repo
 from ..gateway.ingest import ingestor
 from ..gateway.onebot import GroupMessage, Sender
 from ..settings import Settings, config
-from ..util import now_local, tz, why
+from ..util import defang, now_local, sysmark, tz, why
 from . import agreement, engine, perms, prompt, trigger
 from .botapi import BotApi
 from .budget import BUDGET
@@ -48,6 +49,30 @@ log = logging.getLogger("qqbot.pipeline")
 #: replying message waits at all: the media tasks persist their own results, so a
 #: message that draws no reply costs nothing here.
 MEDIA_WAIT_PAID_SEC = 25.0
+
+
+async def note_console_reply(*, group_id: str | int, self_id: str, text: str,
+                             message_id: str = "", reply_to: str = "",
+                             name: str = "") -> None:
+    """A command's answer, entered into the window and the archive like any
+    other line the bot speaks.
+
+    The console used to answer off the record: /who's card or /stats' table
+    landed in the group but reached neither the window nor L0, so the very
+    next question about it ("what does that note mean?") met a model that had
+    never seen it - the one speaker in the room whose words vanished. Both writes
+    mirror the engine's own send path. A missing platform id falls back to a
+    synthetic one; that only costs the quote-pointer render if someone
+    replies to that exact message.
+    """
+    now = now_local()
+    mid = message_id or f"cmd-{uuid.uuid4().hex[:12]}"
+    if (st := REGISTRY.loaded(str(group_id))) is not None:
+        st.add(ChatMsg(msg_id=mid, user_id=str(self_id), nickname=name,
+                       text=text, ts=now, is_bot=True, reply_to=reply_to or None))
+    await ingestor().record_own_reply(
+        group_id=int(group_id), self_id=str(self_id), message_id=mid,
+        text=text, at=now, name=name, reply_to=reply_to)
 
 
 class Inbound:
@@ -157,7 +182,10 @@ class Gateway:
             text = text[: cfg.gateway.max_msg_len]
 
         sender = event.sender
-        nickname = (getattr(sender, "card", "") or getattr(sender, "nickname", "") or user_id).strip()
+        # The reply path reads the live event, not gateway.Sender - so it defangs
+        # here, in step with Sender.parse doing the same for the archived copy.
+        nickname = defang((getattr(sender, "card", "")
+                           or getattr(sender, "nickname", "") or user_id)).strip()
 
         # The event's own timestamp when it carries one, so the line's [MM-dd HH:mm]
         # stamp and the archive's occurred_at agree - late-delivered messages after
@@ -319,33 +347,33 @@ class Gateway:
         if ntype == "group_recall":
             op = str(getattr(event, "operator_id", "") or "")
             if op and op != uid:
-                return uid, "[一条消息被管理员撤回]"
-            return uid, "[撤回了自己的一条消息]"
+                return uid, sysmark("一条消息被管理员撤回")
+            return uid, sysmark("撤回了自己的一条消息")
         if ntype == "group_increase":
-            return uid, "[加入了本群]"
+            return uid, sysmark("加入了本群")
         if ntype == "group_decrease":
             sub = str(getattr(event, "sub_type", "") or "")
-            return uid, ("[被移出了本群]" if sub == "kick" else "[退出了本群]")
+            return uid, sysmark("被移出了本群" if sub == "kick" else "退出了本群")
         if ntype == "group_ban":
             # sub_type is the authoritative direction where present; the
             # duration alone misreads shapes that mark a lift with -1.
             sub = str(getattr(event, "sub_type", "") or "")
             dur = int(getattr(event, "duration", 0) or 0)
             if sub == "lift_ban" or (not sub and dur <= 0):
-                return uid, "[被解除禁言]"
+                return uid, sysmark("被解除禁言")
             if dur <= 0:
-                return uid, "[被禁言]"
+                return uid, sysmark("被禁言")
             if dur >= 60:
-                return uid, f"[被禁言 {dur // 60} 分钟]"
-            return uid, f"[被禁言 {dur} 秒]"
+                return uid, sysmark(f"被禁言 {dur // 60} 分钟")
+            return uid, sysmark(f"被禁言 {dur} 秒")
         if ntype == "notify" and str(getattr(event, "sub_type", "")) == "poke":
             target = str(getattr(event, "target_id", "") or "")
             if target == str(bot.self_id):
-                return uid, "[戳了戳你]"
+                return uid, sysmark("戳了戳你")
             if not target:
-                return uid, "[戳了戳别人]"
+                return uid, sysmark("戳了戳别人")
             tname = (await MEMBERS.name_of(bot, group_id, target)) or target
-            return uid, f"[戳了戳 {tname}]"
+            return uid, sysmark(f"戳了戳 {tname}")
         return "", ""
 
     @staticmethod
@@ -401,11 +429,18 @@ class Gateway:
                 and not await agreement.ok(group_id, who)):
             if agreement.should_prompt(group_id, who):
                 try:
-                    await bot.send_group_msg(
+                    sent = await bot.send_group_msg(
                         group_id=int(group_id),
                         message=[{"type": "at", "data": {"qq": who}},
                                  {"type": "text",
                                   "data": {"text": " " + agreement.POINTER}}])
+                    # On the record like any bot line: the pointer is speech in
+                    # the group, and the model gets asked about it too.
+                    await note_console_reply(
+                        group_id=group_id, self_id=str(bot.self_id),
+                        text=agreement.POINTER,
+                        message_id=str((sent or {}).get("message_id") or ""),
+                        name=config().persona_for(group_id).name)
                 except Exception as e:
                     log.warning("group %s: agreement prompt failed: %s",
                                 group_id, why(e))
@@ -479,7 +514,7 @@ class Gateway:
 
     async def _resolve_and_patch(
         self, pm, msg: ChatMsg, *, bot: BotApi, group_id: str, cfg: Settings,
-        allow_models: bool = False, images_now: bool = True,
+        allow_models: bool = False, media_now: bool = True,
         archive_task=None, note: str | None = None,
         after: asyncio.Task | None = None, who: str | None = None,
     ) -> None:
@@ -509,15 +544,18 @@ class Gateway:
             with BUDGET.attribute(who if who is not None else msg.user_id):
                 resolved = await MEDIA.resolve(
                     pm, bot=bot, group_id=group_id, cfg=cfg,
-                    allow_models=allow_models, images_now=images_now,
+                    allow_models=allow_models, media_now=media_now,
                 )
         except Exception as e:
             log.warning("group %s: media resolution failed: %s", group_id, why(e))
             return
         _carry_file_ids(pm, msg)
-        if allow_models and MEDIA.settled(pm, resolved):
-            # The paid content is in (or was refused with a cached verdict); the
-            # backlog has nothing left to buy for this message. A transient failure
+        if MEDIA.settled(pm, resolved):
+            # The paid content is in (or was refused with a cached verdict); nothing
+            # is left to buy for this message - and that verdict now matters on the
+            # arrival pass too: a voice transcript has no result cache, so leaving
+            # pending set after a successful arrival transcription would let the
+            # next reply's backlog pay for the same clip again. A transient failure
             # comes back as an Unsettled fallback (or an absent slot) instead, and
             # keeps pending alive so the next turn can try again - clearing it
             # regardless would make the first rate-limited burst permanent, empty

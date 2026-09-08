@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from ..settings import Settings
+from ..util import defang, sysmark
 from .botapi import BotApi
 
 if TYPE_CHECKING:                       # resolve() delegates to it; importing it here
@@ -53,7 +54,7 @@ class Ref:
 
     def placeholder(self) -> str:
         """What the model sees when this could not be resolved."""
-        return "[消息]"
+        return sysmark("消息")
 
     async def resolve(self, proc: MediaProcessor, *, bot: BotApi, group_id: str,
                       cfg: Settings, self_id: str) -> str | None:
@@ -93,7 +94,7 @@ class ImageRef(Ref):
     size: int | None = None
 
     def placeholder(self) -> str:
-        return "[图片]"
+        return sysmark("图片")
 
     async def resolve(self, proc: MediaProcessor, *, bot: BotApi, group_id: str,
                       cfg: Settings, self_id: str) -> str | None:
@@ -115,7 +116,7 @@ class AudioRef(Ref):
     size: int | None = None
 
     def placeholder(self) -> str:
-        return "[语音]"
+        return sysmark("语音")
 
     async def resolve(self, proc: MediaProcessor, *, bot: BotApi, group_id: str,
                       cfg: Settings, self_id: str) -> str | None:
@@ -129,7 +130,7 @@ class ForwardRef(Ref):
     ident: str = ""
 
     def placeholder(self) -> str:
-        return "[转发的聊天记录]"
+        return sysmark("转发的聊天记录")
 
     async def resolve(self, proc: MediaProcessor, *, bot: BotApi, group_id: str,
                       cfg: Settings, self_id: str) -> str | None:
@@ -211,7 +212,7 @@ def _markdown_text(md: str) -> str:
     with formatting. The markup itself is noise: mqqapi:// links, sizing hints, an empty
     link at the top carrying a version number.
     """
-    text = _MD_IMAGE.sub("[图片]", md or "")
+    text = _MD_IMAGE.sub(sysmark("图片"), defang(md or ""))
     text = _MD_LINK.sub(r"\1", text)      # keep the label, drop the target
     text = _MD_HEADING.sub("", text)
     text = _MD_QUOTE.sub("", text)
@@ -225,18 +226,18 @@ def _card_text(raw: str) -> str:
     try:
         data = json.loads(raw)
     except (ValueError, TypeError):
-        return "[卡片消息]"
-    prompt = (data.get("prompt") or "").strip()
+        return sysmark("卡片消息")
+    prompt = defang((data.get("prompt") or "").strip())
     meta = data.get("meta") or {}
     for entry in meta.values():
         if not isinstance(entry, dict):
             continue
-        title = (entry.get("title") or entry.get("tag") or "").strip()
-        desc = (entry.get("desc") or entry.get("summary") or "").strip()
+        title = defang((entry.get("title") or entry.get("tag") or "").strip())
+        desc = defang((entry.get("desc") or entry.get("summary") or "").strip())
         if title or desc:
             body = f"{title}：{desc}" if title and desc else (title or desc)
-            return f"[分享:{body[:80]}]"
-    return f"[分享:{prompt[:80]}]" if prompt else "[卡片消息]"
+            return sysmark(f"分享:{body[:80]}")
+    return sysmark(f"分享:{prompt[:80]}") if prompt else sysmark("卡片消息")
 
 
 def parse_segments(segments: list[dict], self_id: str) -> ParsedMessage:
@@ -256,7 +257,10 @@ def parse_segments(segments: list[dict], self_id: str) -> ParsedMessage:
         data = seg.get("data") or {}
 
         if stype == "text":
-            txt = (data.get("text") or "").strip()
+            # defang before anything else: member-typed text is the one string an
+            # adversary fully controls, and stripping the system brackets here is
+            # what makes every marker downstream trustworthy by construction.
+            txt = defang((data.get("text") or "")).strip()
             if txt:
                 pm.parts.append(txt)
         elif stype == "at":
@@ -272,22 +276,22 @@ def parse_segments(segments: list[dict], self_id: str) -> ParsedMessage:
                 # even though they have not spoken.
                 pm.mentions.append(qq)
                 if data.get("name"):
-                    pm.parts.append(f"@{data['name']}")
+                    pm.parts.append(f"@{defang(str(data['name']))}")
                 else:
                     # Only the number is given, which is meaningless to the model.
                     add_ref(AtRef, ident=qq)
         elif stype == "face":
             raw = data.get("raw") if isinstance(data.get("raw"), dict) else {}
-            name = (raw.get("faceText") or "").strip().lstrip("/")
+            name = defang((raw.get("faceText") or "")).strip().lstrip("/")
             name = name or FACE_NAMES.get(str(data.get("id") or ""), "")
-            pm.parts.append(f"[表情:{name}]" if name else "[表情]")
+            pm.parts.append(sysmark(f"表情:{name}") if name else sysmark("表情"))
         elif stype == "mface":
             add_ref(
                 ImageRef,
                 sticker=True,
                 key=str(data.get("emoji_id") or "") or None,
                 url=data.get("url"),
-                summary=(data.get("summary") or "").strip("[]") or None,
+                summary=defang((data.get("summary") or "")).strip("[]") or None,
             )
         elif stype == "image":
             file_field = str(data.get("file") or "")
@@ -299,7 +303,7 @@ def parse_segments(segments: list[dict], self_id: str) -> ParsedMessage:
                 file=file_field or None,
                 path=data.get("path"),
                 size=int(data.get("file_size") or 0) or None,
-                summary=(data.get("summary") or "").strip("[]") or None,
+                summary=defang((data.get("summary") or "")).strip("[]") or None,
             )
         elif stype == "record":
             add_ref(
@@ -318,18 +322,19 @@ def parse_segments(segments: list[dict], self_id: str) -> ParsedMessage:
             pm.reply_to = str(data.get("id") or "") or None
         elif stype == "forward":
             fid = str(data.get("id") or "")
-            add_ref(ForwardRef, ident=fid) if fid else pm.parts.append("[转发的聊天记录]")
+            add_ref(ForwardRef, ident=fid) if fid else pm.parts.append(
+                sysmark("转发的聊天记录"))
         elif stype == "json":
             pm.parts.append(_card_text(data.get("data") or ""))
         elif stype == "xml":
-            pm.parts.append("[卡片消息]")
+            pm.parts.append(sysmark("卡片消息"))
         elif stype == "video":
-            pm.parts.append("[视频]")
+            pm.parts.append(sysmark("视频"))
         elif stype == "file":
-            name = (data.get("file") or data.get("name") or "").strip()
-            pm.parts.append(f"[文件:{name}]" if name else "[文件]")
+            name = defang((data.get("file") or data.get("name") or "")).strip()
+            pm.parts.append(sysmark(f"文件:{name}") if name else sysmark("文件"))
         elif stype == "poke":
-            pm.parts.append("[戳一戳]")
+            pm.parts.append(sysmark("戳一戳"))
         elif stype == "markdown":
             # Bots on QQ send their output as markdown, and the segment carries the
             # whole body, not a decoration on it - dropping it drops the entire message.
@@ -337,10 +342,11 @@ def parse_segments(segments: list[dict], self_id: str) -> ParsedMessage:
             if body:
                 pm.parts.append(body)
         elif stype == "dice":
-            pm.parts.append(f"[骰子:{data.get('result')}点]" if data.get("result") else "[骰子]")
+            pm.parts.append(sysmark(f"骰子:{data.get('result')}点")
+                            if data.get("result") else sysmark("骰子"))
         elif stype == "rps":
             name = RPS_NAMES.get(str(data.get("result") or ""))
-            pm.parts.append(f"[猜拳:{name}]" if name else "[猜拳]")
+            pm.parts.append(sysmark(f"猜拳:{name}") if name else sysmark("猜拳"))
         elif stype:
             # A type nobody has taught this function about. Say something rather than
             # drop the message on the floor, and log it once so it can be added - QQ
@@ -348,7 +354,7 @@ def parse_segments(segments: list[dict], self_id: str) -> ParsedMessage:
             if stype not in _SEEN_UNKNOWN:
                 _SEEN_UNKNOWN.add(stype)
                 log.info("unhandled message segment type %r: %s", stype, list(data)[:8])
-            pm.parts.append(f"[{stype}]")
+            pm.parts.append(sysmark(defang(str(stype))))
     return pm
 
 

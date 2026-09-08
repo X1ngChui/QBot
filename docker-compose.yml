@@ -88,5 +88,6 @@ services:
       - ./logs:/app/logs
       - ./backups:/app/backups                  # point this at a NAS mount for off-box backups
       - ./data/napcat/qq:/app/napcat_data       # only used by the daily media cache cleanup (7.4)
+      - ./models:/app/models:ro                 # local inference weights (fetch_asr_model.sh); not image content
     mem_limit: 4g
 

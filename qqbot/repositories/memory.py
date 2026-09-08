@@ -356,6 +356,46 @@ class EpisodeRepository:
         )
         return [_episode(r) for r in rows]
 
+    async def around(
+        self, group_id: int, ids: list[uuid.UUID], ctx: int
+    ) -> dict[uuid.UUID, list[Episode]]:
+        """Per id, the ctx active episodes either side of it in group time order
+        plus the episode itself, each window sorted oldest first.
+
+        Order is (started_at, id) - the UUID breaks ties without meaning
+        anything, the same trick the archive search uses. An undated episode
+        cannot be placed on that line, so it neither gets neighbours nor
+        appears as one: absent from the result, and the caller renders the hit
+        alone.
+        """
+        if not ids or ctx <= 0:
+            return {}
+        rows = await pool().fetch(
+            """SELECT h.id AS hit_id, n.* FROM unnest($2::uuid[]) AS h(id)
+                 JOIN episode he ON he.id = h.id AND he.group_id=$1
+                                AND he.started_at IS NOT NULL
+                CROSS JOIN LATERAL (
+                  (SELECT e.* FROM episode e
+                    WHERE e.group_id=$1 AND e.status='active'
+                      AND e.started_at IS NOT NULL
+                      AND (e.started_at, e.id) <= (he.started_at, he.id)
+                    ORDER BY e.started_at DESC, e.id DESC LIMIT $3)
+                  UNION ALL
+                  (SELECT e.* FROM episode e
+                    WHERE e.group_id=$1 AND e.status='active'
+                      AND e.started_at IS NOT NULL
+                      AND (e.started_at, e.id) > (he.started_at, he.id)
+                    ORDER BY e.started_at ASC, e.id ASC LIMIT $4)
+                ) n""",
+            group_id, ids, ctx + 1, ctx,
+        )
+        out: dict[uuid.UUID, list[Episode]] = {}
+        for r in rows:
+            out.setdefault(r["hit_id"], []).append(_episode(r))
+        for eps in out.values():
+            eps.sort(key=lambda e: (e.started_at, e.id))
+        return out
+
     async def by_ids(self, group_id: int, ids: list[uuid.UUID]) -> list[Episode]:
         """The episodes behind a set of ids, in the order the ids arrive.
 

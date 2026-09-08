@@ -22,7 +22,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 from ..settings import Persona, Settings, ptext
-from ..util import describe_now, now_local
+from ..util import defang, describe_now, now_local, sysmark
 from .state import ChatMsg, GroupState
 
 #: The history window, in messages. There is no token budget anywhere in the prompt:
@@ -103,11 +103,15 @@ def _known_block(profiles: list[dict]) -> str:
     """
     lines = []
     for p in profiles:
-        name = p.get("nickname") or ""
+        # defang on render, not only at ingest: rows filed before the reserved
+        # grammar existed can still carry anything.
+        name = defang(p.get("nickname") or "")
         bits = []
-        if former := [n for n in (p.get("former_names") or []) if n and n != name]:
+        if former := [defang(n) for n in (p.get("former_names") or [])
+                      if n and defang(n) != name]:
             bits.append("曾用名：" + "、".join(former))
-        if aliases := [n for n in (p.get("aliases") or []) if n and n != name]:
+        if aliases := [defang(n) for n in (p.get("aliases") or [])
+                       if n and defang(n) != name]:
             bits.append("别名：" + "、".join(aliases))
         if note := (p.get("manual_note") or "").strip():
             bits.append(note)
@@ -129,8 +133,8 @@ def _guessed_block(profiles: list[dict]) -> str:
     """
     lines = []
     for p in profiles:
-        name = p.get("nickname") or p.get("user_id") or ""
-        card = (p.get("persona_card") or "").strip()
+        name = defang(p.get("nickname") or p.get("user_id") or "")
+        card = defang((p.get("persona_card") or "")).strip()
         if not card:
             continue
         lines.append((str(p.get("user_id") or ""), f"- {name}。{card}"))
@@ -247,7 +251,8 @@ def numbered(visible: list[ChatMsg]) -> tuple[dict[str, int], dict[str, str]]:
             continue
         quoted = by_id.get(m.reply_to)
         marks[m.msg_id] = (
-            f"[回复 #{nums[quoted.msg_id]}]" if quoted is not None else "[回复更早的消息]"
+            sysmark(f"回复 #{nums[quoted.msg_id]}") if quoted is not None
+            else sysmark("回复更早的消息")
         )
     return nums, marks
 

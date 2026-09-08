@@ -8,6 +8,10 @@ nonebot-plugin-apscheduler==0.5.0
 
 openai==3.8.0
 httpx==0.28.1
+# In-process speech recognition (the "sherpa" ASR backend): ONNX runtime included,
+# no system deps. The model file itself lives outside the image - see
+# scripts/fetch_asr_model.sh and the models/ mount in docker-compose.yml.
+sherpa-onnx==1.13.7
 asyncpg==0.31.0
 pydantic==2.13.5
 PyYAML==6.0.3

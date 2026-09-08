@@ -16,12 +16,14 @@ from datetime import datetime
 
 from ..db import repo
 from ..settings import config
-from ..util import fmt_when, now_local, why
+from ..util import defang, fmt_when, now_local, sysmark, why
 from .segments import ImageRef, parse_segments
 
 log = logging.getLogger("qqbot.state")
 
-OWNER_TAG = "（拥有者）"
+#: Worn in the system brackets so no display name can imitate it: defang()
+#: neutralizes the pair in every member-controlled string before it renders.
+OWNER_TAG = sysmark("拥有者")
 
 
 @dataclass
@@ -78,7 +80,7 @@ class ChatMsg:
         """
         body = f"{quote} {self.text}".strip() if quote else self.text
         head = f"#{seq} " if seq else ""
-        when = f"[{fmt_when(self.ts)}] "
+        when = sysmark(fmt_when(self.ts)) + " "
         if self.is_bot:
             return f"{head}{when}{body}"
         tag = OWNER_TAG if self.is_owner else ""
@@ -195,7 +197,8 @@ class GroupState:
             msgs.append(ChatMsg(
                 msg_id=str(r["platform_event_id"] or r["id"]),
                 user_id=uid,
-                nickname=(sender.get("card") or sender.get("nickname") or uid).strip(),
+                nickname=defang((sender.get("card") or sender.get("nickname")
+                                 or uid)).strip(),
                 text=text,
                 ts=r["occurred_at"],
                 is_bot=uid == self_id,

@@ -27,9 +27,12 @@ PROMPT_KEYS = frozenset({
     "legend", "legend_reply_note", "extract_legend_note",
     # the reply path's standing rules (identity and credibility share one heading)
     "identity_rules", "credibility_rules",
-    "private_rules", "tone_rules", "tone_reply_note", "reply_final",
-    # the whole extraction rulebook (its joke-vs-fact rule lives inline, beside
-    # the fact criteria it qualifies - there is no memory-side tone addendum)
+    # tone_rules is the shared discernment core (what counts as said-in-earnest);
+    # each path appends its own consequence note - reply: how to play along,
+    # extract: what not to record. One judgment, stated once.
+    "private_rules", "tone_rules", "tone_reply_note", "tone_extract_note",
+    "reply_final",
+    # the rest of the extraction rulebook
     "extract",
     # media and tools
     "describe_image", "inspect_image",
@@ -106,10 +109,22 @@ class VisionCfg(_M):
 
 class AsrCfg(_M):
     backend: str = "openai_compat"
-    base_url: str
+    #: Empty is valid for in-process backends (sherpa), which have no endpoint;
+    #: the API-backed ones fail their first call without it, loudly enough.
+    base_url: str = ""
     api_key_env: str = "MEDIA_API_KEY"
     model: str
+    #: For the sherpa backend only: directory holding the ONNX bundle
+    #: (model.int8.onnx + tokens.txt), as seen from inside the container.
+    model_dir: str = ""
+    #: CPU threads for in-process decoding. Clips are short and rare; two threads
+    #: keep a clip under a second without contending with the event loop's core.
+    threads: int = 2
     max_audio_sec: int = 300
+    #: Transcription happens on arrival, so a burst of long clips spends real
+    #: money before the daily cap can matter - the same reason pictures carry
+    #: max_images_per_min. Clips are rarer, so the same number is generous.
+    max_clips_per_min: int = 6
     timeout_sec: float = 60.0
 
 
@@ -181,6 +196,23 @@ class MemoryCfg(_M):
     reasoning_effort: Literal["off", "low", "high", "max"] = "off"
 
 
+class RetrievalCfg(_M):
+    #: Lines of surrounding conversation each search_history hit carries - this
+    #: many before and this many after, windows merged into one block when hits
+    #: sit close. Chat is written in fragments: the matched line is routinely a
+    #: bare answer to the line above it, and the archive has no other way to
+    #: read "around" a hit. Context is fetched by SQL, so the only cost is
+    #: prompt tokens (roughly thirty a line) in a result that evicts next turn.
+    #: 0 restores bare hits.
+    history_context: int = 5
+    #: Same idea for recall_events, in coarser units: episodes this many before
+    #: and after each recalled one, by group time order. An episode summarises a
+    #: whole stretch of conversation, so a couple either side already frames the
+    #: story ("what led to this, what came of it"); undated episodes stand
+    #: alone. 0 restores bare recall.
+    episode_context: int = 2
+
+
 class ScheduleCfg(_M):
     #: The day's one extraction drain. Small hours by design: the day's transcript
     #: is complete, the vendor bills off-peak, and nobody is waiting.
@@ -247,6 +279,7 @@ class Settings(_M):
     llm: LlmCfg
     budget: BudgetCfg = Field(default_factory=BudgetCfg)
     memory: MemoryCfg = Field(default_factory=MemoryCfg)
+    retrieval: RetrievalCfg = Field(default_factory=RetrievalCfg)
     schedule: ScheduleCfg = Field(default_factory=ScheduleCfg)
 
     # -- files: paths relative to the config directory (absolute allowed) ----

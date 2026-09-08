@@ -86,10 +86,10 @@ async def main():
               url="http://example/s.gif", summary="动画表情")
     out = await MEDIA.describe_image(ref, bot=bot, group_id="g", cfg=cfg)
     check("a sticker is described, not just labelled",
-          out == "[表情:一只橘猫在键盘上打滚]", str(out))
+          out == "⟦表情:一只橘猫在键盘上打滚⟧", str(out))
     check("and it keeps the sticker label", len(VISION_CALLS) == 1, str(VISION_CALLS))
     check("the description is cached under the sticker id",
-          await repo.image_cache_get("emoji-1") == "[表情:一只橘猫在键盘上打滚]")
+          await repo.image_cache_get("emoji-1") == "⟦表情:一只橘猫在键盘上打滚⟧")
     out = await MEDIA.describe_image(ref, bot=bot, group_id="g", cfg=cfg)
     check("a repeat sticker costs nothing - this is what makes it affordable",
           len(VISION_CALLS) == 1, str(VISION_CALLS))
@@ -99,7 +99,7 @@ async def main():
     ref_gone = ImageRef(slot=0, sticker=True, key="emoji-2",
                    url="http://example/gone.gif", summary="动画表情")
     out = await MEDIA.describe_image(ref_gone, bot=bot, group_id="g", cfg=cfg)
-    check("an unfetchable sticker falls back to its label", out == "[表情:动画表情]", str(out))
+    check("an unfetchable sticker falls back to its label", out == "⟦表情:动画表情⟧", str(out))
     MEDIA._fetch = _fetch
 
     # image: first sight calls the model, second is a cache hit
@@ -107,7 +107,7 @@ async def main():
     key = "a" * 32
     ref = ImageRef(slot=0, key=key, url="http://example/img.jpg")
     out1 = await MEDIA.describe_image(ref, bot=bot, group_id="g", cfg=cfg)
-    check("first sight describes", out1 == "[图片:一只橘猫在键盘上打滚]", str(out1))
+    check("first sight describes", out1 == "⟦图片:一只橘猫在键盘上打滚⟧", str(out1))
     check("first sight costs one vision call", len(VISION_CALLS) == base + 1, str(VISION_CALLS))
     out2 = await MEDIA.describe_image(ref, bot=bot, group_id="g", cfg=cfg)
     check("second sight hits the cache", out2 == out1, str(out2))
@@ -136,25 +136,25 @@ async def main():
           "今天的运势是中吉" in out and "【第 3 次抽签】" in out and "签文的一段说明" in out,
           out)
     check("and its markup does not", "mqqapi" not in out and "#####" not in out, out)
-    check("an inline image becomes a marker", "[图片]" in out, out)
+    check("an inline image becomes a marker", "⟦图片⟧" in out, out)
 
     def one(seg):
         return parse_segments([seg], "999").render()
 
     check("a named emoticon uses its name",
           one({"type": "face", "data": {"id": "425", "raw": {"faceText": "/求放过"}}})
-          == "[表情:求放过]")
+          == "⟦表情:求放过⟧")
     check("a classic emoticon is looked up by id",
-          one({"type": "face", "data": {"id": "9", "raw": {}}}) == "[表情:大哭]")
+          one({"type": "face", "data": {"id": "9", "raw": {}}}) == "⟦表情:大哭⟧")
     check("an unlisted one degrades to the bare marker",
-          one({"type": "face", "data": {"id": "99999", "raw": {}}}) == "[表情]")
-    check("dice shows the roll", one({"type": "dice", "data": {"result": "4"}}) == "[骰子:4点]")
+          one({"type": "face", "data": {"id": "99999", "raw": {}}}) == "⟦表情⟧")
+    check("dice shows the roll", one({"type": "dice", "data": {"result": "4"}}) == "⟦骰子:4点⟧")
     check("rps maps 2 to scissors, not paper",
-          one({"type": "rps", "data": {"result": "2"}}) == "[猜拳:剪刀]")
+          one({"type": "rps", "data": {"result": "2"}}) == "⟦猜拳:剪刀⟧")
     # QQ keeps inventing segment types. Saying something beats dropping the message, and
     # the log line is how the next one gets noticed instead of silently vanishing.
     check("an unknown type still says something",
-          one({"type": "keyboard", "data": {"rows": []}}) == "[keyboard]")
+          one({"type": "keyboard", "data": {"rows": []}}) == "⟦keyboard⟧")
 
     # A backend that looks at a picture and declines is behaving normally, not failing.
     # Paying to be refused again on every repost is the actual cost, so the outcome is
@@ -190,7 +190,7 @@ async def main():
     check("reposting it costs nothing more", len(VISION_CALLS) == before + 1,
           str(VISION_CALLS))
     check("the cached outcome still reads as not received",
-          out == "[图片]", str(out))
+          out == "⟦图片⟧", str(out))
     set_providers(Providers(text=_real.text, vision=_ok, asr=_real.asr, search=_real.search))
 
     # A received link carries an rkey that expires in about two hours, but the file id
@@ -224,7 +224,7 @@ async def main():
                   file="ABCDEF.jpg")
     out = await MEDIA.describe_image(ref_old, bot=RefreshingBot(), group_id="g", cfg=cfg)
     check("an expired link is refreshed rather than given up on",
-          out == "[图片:一只橘猫在键盘上打滚]" and RefreshingBot.calls == 1, str(out))
+          out == "⟦图片:一只橘猫在键盘上打滚⟧" and RefreshingBot.calls == 1, str(out))
     check("and the picture did reach the model", len(VISION_CALLS) == seen0 + 1)
     MEDIA._fetch = _fetch3
 
@@ -283,10 +283,83 @@ async def main():
     check("what reaches the ASR backend is the transcoded WAV, never SILK",
           _asr_seen.get("data") == _WAV and _asr_seen.get("fmt") == "wav",
           str(_asr_seen.get("data", b"")[:12]))
-    check("and the transcript comes back marked", _vout == "[语音:明天一起去吃饭]", repr(_vout))
+    check("and the transcript comes back marked", _vout == "⟦语音:明天一起去吃饭⟧", repr(_vout))
+    # Voice resolves on the arrival schedule now, like pictures: the free pass
+    # plus media_now must transcribe, so extraction reads text even in groups
+    # the bot never answers.
+    _pm_v = _PM([_AR(slot=0, file="v2.amr", url="http://cdn/v2.amr")])
+    _res_v = await MEDIA.resolve(_pm_v, bot=VoiceBot(), group_id="g9", cfg=cfg,
+                                 allow_models=False, media_now=True)
+    check("a voice clip transcribes on arrival, before any reply",
+          _res_v.get(0) == "⟦语音:明天一起去吃饭⟧", repr(_res_v))
     MEDIA._local = _local_saved
+
+    # The daily cap gates spending, not transcription: a zero-rate backend (the
+    # in-process one) keeps transcribing after the budget is gone, a priced one
+    # stays deferred. Pin both directions, with the cap forced to "exceeded".
+    from qqbot.core import media as _media_mod
+
+    class PricedAsr(CapturingAsr):
+        name = "priced"
+
+        def rate_for(self, model):
+            return _Rate("second", per_unit=0.001)
+
+    async def _true(cap):
+        return True
+
+    _budget_saved = _media_mod.BUDGET.exceeded
+    _media_mod.BUDGET.exceeded = _true
+    MEDIA._asr_windows.clear()
+    _vout = await MEDIA.transcribe(_AR(slot=0, file="free.amr"), bot=VoiceBot(),
+                                   group_id="g10", cfg=cfg)
+    check("a free ASR backend transcribes straight through an exhausted budget",
+          _vout == "⟦语音:明天一起去吃饭⟧", repr(_vout))
+    set_providers(Providers(text=_real.text, vision=FakeVision(),
+                            asr=PricedAsr(), search=_real.search))
+    _vout = await MEDIA.transcribe(_AR(slot=0, file="paid.amr"), bot=VoiceBot(),
+                                   group_id="g10", cfg=cfg)
+    check("a priced ASR backend still defers on an exhausted budget",
+          _vout is None, repr(_vout))
+    _media_mod.BUDGET.exceeded = _budget_saved
     set_providers(Providers(text=_real.text, vision=FakeVision(),
                             asr=_prev_asr, search=_real.search))
+
+    # The sherpa backend's model-free surface: WAV parsing and the format guard.
+    # Real decoding needs the wheel and the weights, which belong to the
+    # container; what must hold everywhere is that the guard fires before any
+    # model load, and that PCM comes out mono, normalised, at the header's rate.
+    import io as _io
+    import wave as _wave
+
+    from qqbot.providers.sherpa import SherpaAsr, _pcm_from_wav
+
+    def _wav(channels, rate, frames):
+        buf = _io.BytesIO()
+        with _wave.open(buf, "wb") as w:
+            w.setnchannels(channels)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(frames)
+        return buf.getvalue()
+
+    _mono = _wav(1, 16000, (16384).to_bytes(2, "little", signed=True) * 160)
+    _samples, _rate = _pcm_from_wav(_mono)
+    check("wav parse: mono keeps count, rate and scale",
+          len(_samples) == 160 and _rate == 16000
+          and abs(_samples[0] - 0.5) < 1e-3, f"{len(_samples)}@{_rate}")
+    _stereo = _wav(2, 24000, (16384).to_bytes(2, "little", signed=True) * 320)
+    _samples, _rate = _pcm_from_wav(_stereo)
+    check("wav parse: stereo folds to mono at the declared rate",
+          len(_samples) == 160 and _rate == 24000, f"{len(_samples)}@{_rate}")
+    _sherpa = SherpaAsr()
+    check("sherpa rate is zero in every direction",
+          _sherpa.rate_for("sense-voice").units(300.0) == 0.0)
+    try:
+        await _sherpa.transcribe(b"\x02#!SILK_V3", cfg=cfg.llm.asr, fmt="amr")
+        check("sherpa refuses non-wav input", False, "no exception")
+    except ValueError:
+        check("sherpa refuses non-wav input", True)
 
     # size cap
     base = len(VISION_CALLS)
@@ -320,11 +393,11 @@ async def main():
         {"type": "text", "data": {"text": "还有这个"}},
         {"type": "record", "data": {"file": "v.amr"}},
     ], "999")
-    check("order preserved", pm.render() == "看 [图片] 还有这个 [语音]", repr(pm.render()))
+    check("order preserved", pm.render() == "看 ⟦图片⟧ 还有这个 ⟦语音⟧", repr(pm.render()))
     check("audio ref built", isinstance(pm.refs[1], AudioRef))
     check("resolved text substituted in place",
-          pm.render({0: "[图片:猫]", 1: "[语音:你好]"}) == "看 [图片:猫] 还有这个 [语音:你好]",
-          repr(pm.render({0: "[图片:猫]", 1: "[语音:你好]"})))
+          pm.render({0: "⟦图片:猫⟧", 1: "⟦语音:你好⟧"}) == "看 ⟦图片:猫⟧ 还有这个 ⟦语音:你好⟧",
+          repr(pm.render({0: "⟦图片:猫⟧", 1: "⟦语音:你好⟧"})))
 
     # A quote contributes its id and no text of its own. What it points at is worked out
     # against the messages the model can actually see - an excerpt fetched over the wire
@@ -350,13 +423,13 @@ async def main():
     check("every line is numbered by its position, the bot's included",
           [nums["m1"], nums["m2"], nums["m3"]] == [1, 2, 3], str(nums))
     check("a quote points at the number of the line it quotes",
-          marks["m3"] == "[回复 #1]", marks.get("m3"))
+          marks["m3"] == "⟦回复 #1⟧", marks.get("m3"))
     # One mechanism, so quoting the bot is the same marker pointing at the same kind of
     # thing. Its number does land in an assistant turn; clean_reply takes it back off.
-    check("including a quote of the bot's own line", marks["m4"] == "[回复 #2]",
+    check("including a quote of the bot's own line", marks["m4"] == "⟦回复 #2⟧",
           marks.get("m4"))
     check("a quote of something off screen says so",
-          marks["m5"] == "[回复更早的消息]", marks.get("m5"))
+          marks["m5"] == "⟦回复更早的消息⟧", marks.get("m5"))
     check("and a message that quotes nothing gets no mark", "m1" not in marks, str(marks))
     # The stamp between number and speaker is the message's own fixed moment - it is
     # what stops the model bridging topics hours apart, and being fixed is what keeps
@@ -364,13 +437,13 @@ async def main():
     from qqbot.util import fmt_when as _fw
     check("the mark renders in front of the line, after the time stamp",
           c.render(seq=nums["m3"], quote=marks["m3"])
-          == f"#3 [{_fw(c.ts)}] 小北: [回复 #1] 那就辛苦了",
+          == f"#3 ⟦{_fw(c.ts)}⟧ 小北: ⟦回复 #1⟧ 那就辛苦了",
           c.render(seq=nums["m3"], quote=marks["m3"]))
     # The bot's own lines are assistant turns, so they carry the number and no speaker
     # prefix. There is nothing left that reads a flat transcript of these: the memory
     # worker builds its own lines, because it numbers accounts rather than naming them.
     check("the bot's line is numbered, stamped and unlabelled",
-          b.render(seq=nums["m2"]) == f"#2 [{_fw(b.ts)}] 我来吧，顺手的事",
+          b.render(seq=nums["m2"]) == f"#2 ⟦{_fw(b.ts)}⟧ 我来吧，顺手的事",
           b.render(seq=nums["m2"]))
 
     # `bot` is threaded through twenty-odd signatures and was annotated in none of them,

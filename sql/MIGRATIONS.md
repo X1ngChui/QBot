@@ -13,6 +13,19 @@ Apply with:
 docker exec qbot-postgres-1 psql -U qqbot -d qqbot -c "<statement>"
 ```
 
+## 2026-09-08 — reserved-bracket markers (data rewrite, no schema change)
+
+```sql
+-- No DDL. Transcript markers moved from ASCII square brackets to the reserved
+-- pair (see docs 6.2, "system markers are unforgeable"); the stored derived
+-- readings in raw_event.plain_text and image_cache.description were rewritten
+-- once by scripts/migrate_markers.py (best-effort pattern rules documented in
+-- the script). Run it inside the bot container while the bot is stopped or
+-- idle, and only with memory_candidate empty of pending rows - consolidation
+-- validates quotes against a re-rendered transcript:
+--   docker compose run --rm bot python scripts/migrate_markers.py
+```
+
 ## 2026-09-07 — namesake serials
 
 ```sql
