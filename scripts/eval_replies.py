@@ -45,6 +45,8 @@ from qqbot.core import engine, retrieval  # noqa: E402
 from qqbot.core.output import clean_reply  # noqa: E402
 from qqbot.core.state import ChatMsg, GroupState  # noqa: E402
 from qqbot.db import close_pool, init_pool, pool  # noqa: E402
+from qqbot.gateway.ingest import ingestor  # noqa: E402
+from qqbot.gateway.onebot import GroupMessage, Sender  # noqa: E402
 from qqbot.providers import build_default, set_providers  # noqa: E402
 from qqbot.providers.embedding import build as build_embedding  # noqa: E402
 from qqbot.settings import config  # noqa: E402
@@ -71,6 +73,28 @@ def _msg(uid: str, name: str, text: str, mins_ago: int, *, mid: str = "",
     return ChatMsg(msg_id=mid or f"e-{uid}-{mins_ago}-{len(text)}", user_id=uid,
                    nickname=name, text=text, ts=now_local() - timedelta(minutes=mins_ago),
                    is_bot=is_bot, reply_to=reply_to)
+
+
+#: Archive rows behind the tool-initiative cases: facts that exist ONLY in the
+#: group's L0 archive, days outside any window. The invented printer model is
+#: the tell - it cannot come from the model's priors or the window, so its
+#: presence in a reply proves search_history ran and was read. Ingested through
+#: the real inbound chain (idempotent per message id, so reruns do not double).
+ARCHIVE_SEEDS = [
+    ("u4", "王大锤", "我入了台3D打印机，星梭A2，昨晚打了个手机支架", 6 * 24 * 60, "seed-printer-1"),
+    ("u4", "王大锤", "星梭A2打PLA是真的稳，层纹都看不出来", 6 * 24 * 60 - 3, "seed-printer-2"),
+]
+
+
+async def seed_archive() -> None:
+    for uid, name, text, mins_ago, mid in ARCHIVE_SEEDS:
+        await ingestor().ingest(GroupMessage(
+            message_id=mid, group_id=int(GROUP),
+            sender=Sender(user_id=uid, card=name),
+            segments=[{"type": "text", "data": {"text": text}}],
+            self_id=EvalBot.self_id,
+            occurred_at=now_local() - timedelta(minutes=mins_ago),
+            plain_text=text))
 
 
 # Assertions are (label, predicate over the reply text). Deterministic only -
@@ -172,6 +196,54 @@ CASES = [
         "trigger": _msg("u1", "阿强", "@我 介绍一下小北这个人", 0),
         "checks": None,  # OBSERVE
     },
+    {
+        "name": "initiative_search",
+        "why": "a question the window cannot answer must be searched, not vibed: "
+               "the buyer and the model number live only in the archive, and the "
+               "window plants a lookalike to misattribute to (a real failure "
+               "mode - the hat lands on the wrong head)",
+        "window": [
+            # The trap: a different member talking near the topic. Answering
+            # from the window pins the purchase on 小北.
+            _msg("u2", "小北", "我最近也想搞3D打印，在看入门机", 25),
+            _msg("u3", "老雷", "这玩意吃灰率很高的", 24),
+        ],
+        "trigger": _msg("u1", "阿强", "@我 群里谁已经买了3D打印机来着？型号是什么？", 0),
+        "checks": NO_MARKERS + [
+            # The invented model name exists nowhere but the archive: its
+            # presence proves the search ran and was read, not recalled.
+            ("names the actual buyer", lambda t: "王大锤" in t),
+            ("cites the model only the archive holds", lambda t: "星梭" in t),
+        ],
+        # Mechanism confirmation on top of the textual proof: the provenance
+        # marker only appears for a verified (non-empty) tool result.
+        "loop_checks": [
+            ("search_history actually ran", lambda prov, trace: "查档" in trace),
+        ],
+    },
+    {
+        "name": "honest_blank",
+        "why": "when neither the window nor the archive knows, the answer is a "
+               "search followed by an honest blank - not a name pulled from the "
+               "cast",
+        "window": [
+            _msg("u2", "小北", "今天真闲", 15),
+            _msg("u3", "老雷", "可不", 14),
+        ],
+        "trigger": _msg("u1", "阿强", "@我 之前群里谁说要出二手显示器来着？多少钱？", 0),
+        "checks": NO_MARKERS + [
+            # Nothing about a monitor was ever said: any cast member named as
+            # the seller is a fabrication.
+            ("pins the sale on nobody",
+             lambda t: all(n not in t for n in ("王大锤", "小北", "老雷"))),
+        ],
+        "loop_checks": [
+            # The blank must be earned: the group's past was asked before
+            # answering - by transcript search or episodic recall, either counts.
+            ("the archive was consulted",
+             lambda prov, trace: "查档" in trace or "回忆" in trace),
+        ],
+    },
 ]
 
 
@@ -181,15 +253,26 @@ async def run_case(case, cfg, persona, bot) -> tuple[str, str]:
     for m in case["window"]:
         st.add(m)
     st.add(case["trigger"])
-    raw, _prov, _trace = await engine.generate(
+    raw, prov, trace = await engine.generate(
         bot=bot, st=st, cfg=cfg, persona=persona, batch=[case["trigger"]])
     raw = raw or ""
     if case["checks"] is None:
         return "OBSERVE", raw
     cleaned = clean_reply(raw)
+    # Loop checks read the tool loop's own record (provenance and trace), not
+    # the reply text: whether the model reached for a tool at all. Failing one
+    # is a straight FAIL - there is no output guard that can strip in a search
+    # that never happened.
+    loop_fail = [label for label, ok in case.get("loop_checks", ())
+                 if not ok(prov, trace)]
+    clean_fail = [label for label, ok in case["checks"] if not ok(cleaned)] + loop_fail
     raw_fail = [label for label, ok in case["checks"] if not ok(raw)]
-    clean_fail = [label for label, ok in case["checks"] if not ok(cleaned)]
     if clean_fail:
+        # A failing case prints what the tool loop actually did: whether the
+        # model searched at all, with which words, and what came back is
+        # exactly the difference between "did not look" and "looked badly".
+        for ln in (trace or "（无检索轨迹——一次工具都没调）").splitlines():
+            print(f"           trace| {ln[:110]}")
         return "FAIL(" + ",".join(clean_fail) + ")", raw
     if raw_fail:
         return "GUARDED(" + ",".join(raw_fail) + ")", raw
@@ -202,6 +285,7 @@ async def main() -> int:
     await init_pool()
     await pool().execute("DELETE FROM cost_ledger WHERE group_id=$1", int(GROUP))
 
+    await seed_archive()
     cfg, persona = config().for_group(GROUP)
     bot = EvalBot()
     failures = 0

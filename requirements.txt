@@ -16,3 +16,8 @@ asyncpg==0.31.0
 pydantic==2.13.5
 PyYAML==6.0.3
 jieba==0.42.1
+# Lucene-syntax parser behind search_history's boolean queries (the owner's
+# call: lean on the ecosystem rather than hand-roll a grammar). Only the
+# operator subset is accepted; core/tools.py rejects fields, ranges and the
+# rest at the AST.
+luqum==1.0.0

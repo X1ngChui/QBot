@@ -11,7 +11,7 @@ somebody's colleague is interpretation, and this layer reproduces the conversati
 rather than interpreting it.
 
 The chain does only free work (design doc 52): write, look up, resolve. Paid extraction
-does not happen here at all - the nightly drain (schedule.extract_cron) reads the day's
+does not happen here at all - the nightly drain (schedule.nightly_cron) reads the day's
 transcript in one sitting, through the job queue so half-learned work survives the
 process stopping.
 """
@@ -65,7 +65,7 @@ class Ingestor:
                 )
 
         # No extraction trigger here any more: reading the day's transcript is the
-        # nightly drain's job (schedule.extract_cron), at off-peak prices and in
+        # nightly drain's job (schedule.nightly_cron), at off-peak prices and in
         # gap-aligned batches. The message path only writes.
         return Ingested(raw_event_id=raw_id, speaker_entity_id=speaker.entity_id)
 

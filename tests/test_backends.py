@@ -103,10 +103,8 @@ def main() -> int:
                 "prompt_cache_hit_tokens": 60}
     check("a hit-only usage still bills the miss share",
           ds._usage_tokens(hit_only) == (60, 40, 5, 0), str(ds._usage_tokens(hit_only)))
-    check("deepseek can be told not to deliberate",
-          ds._terse_body() == {"thinking": {"type": "disabled"}}, str(ds._terse_body()))
-    # The old "no extras unless terse" claim is superseded by the graded checks in
-    # the deliberation section below - extras now depend on cfg.reasoning_effort too.
+    # How deepseek is told not to deliberate is checked with the other grades, in
+    # the deliberation section below.
 
     # -- generic backend makes no vendor assumptions ----------------------
     gen = OpenAICompatChat()

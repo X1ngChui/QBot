@@ -16,12 +16,12 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from . import util
-#: Every prompt the system may read, by key. The texts are data: settings.yaml
-#: maps each key to its file (`prompts:`), edited without touching code and
-#: re-read on /reload. This manifest is what keeps the mapping checkable in
-#: both directions - a key missing from the config and a key the code does not
-#: know both fail the load, so the set cannot drift silently. The rationale
-#: behind each text's wording lives in config/prompts/README.md.
+#: Every prompt the system may read, by key. The texts are data: each key is a
+#: `<key>.txt` under `prompts_dir`, edited without touching code and re-read on
+#: /reload. This manifest is the only list of them - the filename is the key, so
+#: a misspelled name is a missing file and fails the load rather than shipping a
+#: prompt nobody reads. The rationale behind each text's wording lives in
+#: config/prompts/README.md.
 PROMPT_KEYS = frozenset({
     # transcript legend, shared by reply and extraction; plus each side's addendum
     "legend", "legend_reply_note", "extract_legend_note",
@@ -46,6 +46,12 @@ DEFAULT_PERSONA_KEY = "default"
 
 class _M(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+#: How hard a model may think before answering. "off" disables deliberation; the
+#: rest map to the vendor's own reasoning_effort grades. Deliberation bills as
+#: output, so this is a cost knob as much as a quality one.
+Effort = Literal["off", "low", "high", "max"]
 
 
 class GatewayCfg(_M):
@@ -75,6 +81,21 @@ class TriggerCfg(_M):
 # `backend` picks the implementation class (see providers/registry.py). Backend quirks -
 # how usage is reported, how to ask it not to deliberate, what extra fields a request
 # needs - belong in that class, not in config.
+class TextUseCfg(_M):
+    """How one use of the text model differs from the reply path's settings.
+
+    Only what a purpose can legitimately change on its own: which model answers,
+    how hard it thinks, how long it may take. Endpoint, credential, concurrency
+    and retries stay shared - they describe the account, not the task, and two
+    copies of an endpoint is how one of them ends up pointing at a dead one.
+    None (or "" for the model) means "whatever the reply path uses".
+    """
+
+    model: str = ""
+    reasoning_effort: Effort | None = None
+    timeout_sec: float | None = None
+
+
 class TextCfg(_M):
     backend: str = "openai_compat"
     base_url: str
@@ -84,13 +105,32 @@ class TextCfg(_M):
     #: carries descriptions only and pictures are not uploaded to the Files store;
     #: a text-only model sent a file block rejects the whole request.
     reads_images: bool = False
-    #: How hard replies may think: "off" disables deliberation, low/high/max map to
-    #: the vendor's reasoning_effort grades. Extraction and describing carry their own
-    #: grades (memory.reasoning_effort, llm.vision.reasoning_effort).
-    reasoning_effort: Literal["off", "low", "high", "max"] = "off"
+    #: How hard replies may think. Other uses of this model carry their own grade:
+    #: extraction below, describing in llm.vision.
+    reasoning_effort: Effort = "off"
     max_concurrency: int = 3
     timeout_sec: float = 30.0
     retries: int = 2
+    #: Reading a batch of transcript into memory candidates - the same account and
+    #: endpoint, a different task. It is schema-guarded and eval-covered, which is
+    #: what makes it the one place a cheaper tier can measurably do the reply
+    #: model's work; it also reads a hundred messages per call, so it needs a
+    #: timeout the reply path would never grant.
+    extract: TextUseCfg = Field(default_factory=TextUseCfg)
+
+    def for_extract(self) -> "TextCfg":
+        """This config as the extraction call should see it.
+
+        One override point instead of three: before this, extraction patched the
+        model onto a copy, passed its grade as a call argument, and kept its
+        timeout as a constant in Python because config had nowhere to put it.
+        """
+        use = self.extract
+        return self.model_copy(update={
+            "model": use.model or self.model,
+            "reasoning_effort": use.reasoning_effort or self.reasoning_effort,
+            "timeout_sec": use.timeout_sec or self.timeout_sec,
+        })
 
 
 class VisionCfg(_M):
@@ -99,9 +139,18 @@ class VisionCfg(_M):
     api_key_env: str = "MEDIA_API_KEY"
     model: str
     #: Deliberation grade for the describing call. "low" keeps sanity-check thinking
-    #: (what a meme actually shows) at a fraction of "high"'s thought-token bill;
-    #: "off" disables deliberation.
-    reasoning_effort: Literal["off", "low", "high", "max"] = "off"
+    #: (what a meme actually shows) at a fraction of "high"'s thought-token bill.
+    reasoning_effort: Effort = "off"
+    #: How long a stored description stays current. Past it, the next sighting of
+    #: that picture pays to describe it again. Age rather than a model stamp,
+    #: because a vendor can put a better model behind an unchanged id - which no
+    #: stamp would notice. 0 disables expiry entirely.
+    #:
+    #: Refreshing is lazy by construction: only a picture actually posted again is
+    #: looked up, so one nobody ever reposts is never paid for twice, however old
+    #: its description gets. Already-archived transcript lines keep the wording
+    #: they were written with; this decides what the *next* sighting reads.
+    description_ttl_days: int = Field(15, ge=0)
     max_images_per_min: int = 6
     max_image_mb: float = 8.0
     timeout_sec: float = 30.0
@@ -186,16 +235,6 @@ class BudgetCfg(_M):
 EXTRACT_WINDOW = 120
 
 
-class MemoryCfg(_M):
-    #: Deliberation grade for the extraction pass. The schema and the Validator
-    #: carry most of the think-it-through duty, so "low" buys ambiguity checks
-    #: (joke or fact, which predicate) at a fraction of "high"'s thought-token
-    #: bill; "off" disables thinking entirely. The one memory knob there is:
-    #: extraction runs once nightly (schedule.extract_cron), draining the day
-    #: oldest-first in gap-aligned chunks, with nothing else to configure.
-    reasoning_effort: Literal["off", "low", "high", "max"] = "off"
-
-
 class RetrievalCfg(_M):
     #: Lines of surrounding conversation each search_history hit carries - this
     #: many before and this many after, windows merged into one block when hits
@@ -214,20 +253,26 @@ class RetrievalCfg(_M):
 
 
 class ScheduleCfg(_M):
-    #: The day's one extraction drain. Small hours by design: the day's transcript
-    #: is complete, the vendor bills off-peak, and nobody is waiting.
-    extract_cron: str = "30 2 * * *"
-    forget_cron: str = "0 4 * * *"
-    backup_cron: str = "30 4 * * *"
-    cache_clean_cron: str = "0 5 * * *"
-    report_cron: str = "0 9 * * *"
+    #: The nightly pipeline: extraction drain, then decay, then backup, then the
+    #: NapCat cache sweep - one trigger, stages run in order (tasks.nightly). One
+    #: trigger rather than four, because extraction drains through the job queue
+    #: and a night of retries would walk it past any fixed decay time. Small hours
+    #: by design: the day's transcript is complete, the vendor bills off-peak, and
+    #: nobody is waiting.
+    nightly_cron: str = "30 2 * * *"
+    #: The daily report keeps its own trigger, at the moment the ledger day
+    #: closes (midnight in the configured timezone - the same boundary the
+    #: budget resets on), so the closed day is reported at once rather than
+    #: hours later. No ordering stake in the pipeline: the report reads the
+    #: day that just ended, and its backup-age line alarms on a pipeline that
+    #: died a night ago.
+    report_cron: str = "0 0 * * *"
     #: At least 1: pruning keeps the newest `backup_keep` dumps, and 0 would read as
     #: "no pruning" while actually deleting the backup just written, every night.
     backup_keep: int = Field(14, ge=1)
     napcat_cache_days: int = 7
 
-    @field_validator("extract_cron", "forget_cron", "backup_cron",
-                     "cache_clean_cron", "report_cron")
+    @field_validator("nightly_cron", "report_cron")
     @classmethod
     def _five_fields(cls, v: str) -> str:
         # Checked at load with the scheduler's own parser, because the scheduler
@@ -264,9 +309,9 @@ class AgreementCfg(_M):
 
 class Settings(_M):
     """Field order mirrors settings.yaml's narrative: who runs it and on what
-    clock, when it speaks, how messages come in, which models serve it, what
-    it may spend, what it remembers, when the jobs run, and finally where the
-    config directory keeps its files."""
+    clock, when it speaks, how messages come in, which models serve it, what it
+    may spend, how much it reads around a memory, when the jobs run, and finally
+    where the config directory keeps its files."""
 
     # Everyone allowed to run ops commands and receive the daily report. A list because
     # a bot outliving one person's attention needs more than one pair of hands.
@@ -278,28 +323,14 @@ class Settings(_M):
     gateway: GatewayCfg = Field(default_factory=GatewayCfg)
     llm: LlmCfg
     budget: BudgetCfg = Field(default_factory=BudgetCfg)
-    memory: MemoryCfg = Field(default_factory=MemoryCfg)
     retrieval: RetrievalCfg = Field(default_factory=RetrievalCfg)
     schedule: ScheduleCfg = Field(default_factory=ScheduleCfg)
 
     # -- files: paths relative to the config directory (absolute allowed) ----
     personas_dir: str = "personas"
     agreement: AgreementCfg
-    #: One file per prompt key - the full mapping, so what the system reads is
-    #: visible in config at a glance. Checked against PROMPT_KEYS both ways.
-    prompts: dict[str, str]
-
-    @field_validator("prompts")
-    @classmethod
-    def _prompt_keys_complete(cls, v: dict[str, str]) -> dict[str, str]:
-        missing = PROMPT_KEYS - v.keys()
-        stray = v.keys() - PROMPT_KEYS
-        if missing or stray:
-            raise ValueError(
-                "prompts mapping out of step with the code's manifest: "
-                + (f"missing {sorted(missing)} " if missing else "")
-                + (f"unknown {sorted(stray)}" if stray else ""))
-        return v
+    #: Where the prompt texts live, one `<key>.txt` per entry in PROMPT_KEYS.
+    prompts_dir: str = "prompts"
 
 
 class Persona(_M):
@@ -423,21 +454,21 @@ def load_bundle(config_dir: Path | None = None) -> ConfigBundle:
     settings = Settings.model_validate(raw)
 
     personas: dict[str, Persona] = {}
-    pdir = _resolve(root, settings.personas_dir)
-    if pdir.is_dir():
-        for path in sorted(pdir.glob("*.yaml")):
+    persona_dir = _resolve(root, settings.personas_dir)
+    if persona_dir.is_dir():
+        for path in sorted(persona_dir.glob("*.yaml")):
             stem = path.stem
             key = stem[len("group_"):] if stem.startswith("group_") else stem
             personas[key] = Persona.model_validate(_read_yaml(path))
 
-    # Prompts are data: the config maps every manifest key to its file (the
-    # schema validator holds the two key sets equal), and each file must exist
-    # and be non-empty - a missing one would silently blank an instruction. A
-    # test config points the mapping at the real texts instead of copying
-    # every file into fixtures.
+    # Prompts are data: one file per manifest key, named by the key. Each must
+    # exist and be non-empty - a missing one would silently blank an
+    # instruction. A test config points prompts_dir at the real texts instead
+    # of copying every file into fixtures.
+    prompt_dir = _resolve(root, settings.prompts_dir)
     prompts: dict[str, str] = {}
-    for key, rel in settings.prompts.items():
-        ppath = _resolve(root, rel)
+    for key in sorted(PROMPT_KEYS):
+        ppath = prompt_dir / f"{key}.txt"
         try:
             body = ppath.read_text(encoding="utf-8-sig").strip()
         except OSError as e:

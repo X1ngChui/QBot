@@ -389,10 +389,10 @@ _mn = prompt.assemble(persona=persona, cfg=cfg, st=st, batch=batch, profiles=[])
 check("with no pictures every message is a plain string",
       all(isinstance(m["content"], str) for m in _mn))
 
-# Prompts are data: config/prompts/<key>.txt is the source of truth, the manifest in
-# settings.py is what keeps the file set honest, and both drift directions fail the
-# load - a missing file would silently blank an instruction, a stray file is a typo
-# shipping a prompt nobody reads.
+# Prompts are data: <prompts_dir>/<key>.txt is the source of truth and the manifest in
+# settings.py is the only list of keys. The filename IS the key, so there is no mapping
+# to drift: a misspelled name is a missing file, and a missing file fails the load
+# rather than silently blanking an instruction.
 import shutil as _sh
 import tempfile as _tf
 from qqbot.settings import PROMPT_KEYS as _PK, load_bundle as _lb
@@ -402,29 +402,23 @@ with _tf.TemporaryDirectory() as _td:
     _sh.copytree(ROOT / "config" / "prompts", _cd / "prompts")
     for _f in (_cd / "prompts").glob("*.md"):
         _f.unlink()
-    # The fixture borrows the real prompts through relative mapping paths,
-    # which no longer resolve from the copy's location - point the copy at
-    # its own prompts directory.
+    # The fixture points prompts_dir at the real texts by a relative path, which
+    # no longer resolves from the copy's location - point the copy at its own.
     _sy = _cd / "settings.yaml"
     _sy.write_text(_sy.read_text(encoding="utf-8").replace(
-        "../../../config/prompts/", "prompts/"), encoding="utf-8")
+        "prompts_dir: ../../../config/prompts", "prompts_dir: prompts"),
+        encoding="utf-8")
     (_cd / "prompts" / "describe_image.txt").write_text("换一种描述方式。", encoding="utf-8")
     _bo = _lb(config_dir=_cd)
     check("editing a prompt file changes what the bundle serves",
           _bo.prompts["describe_image"] == "换一种描述方式。")
     check("every manifest key was loaded from disk", set(_bo.prompts) == set(_PK))
-    # The mapping is the manifest's mirror: a key the code does not know fails
-    # the load, so a typo cannot ship a prompt nobody reads.
-    _sy.write_text(_sy.read_text(encoding="utf-8").replace(
-        "prompts:\n", "prompts:\n  no_such_key: prompts/legend.txt\n", 1),
-        encoding="utf-8")
-    try:
-        _lb(config_dir=_cd)
-        check("a stray prompt key fails the load", False, "it loaded")
-    except Exception as e:
-        check("a stray prompt key fails the load", "no_such_key" in str(e))
-    _sy.write_text(_sy.read_text(encoding="utf-8").replace(
-        "  no_such_key: prompts/legend.txt\n", "", 1), encoding="utf-8")
+    # A file nothing asks for is simply never read - it cannot ship a prompt the
+    # code does not know about, the way a stray mapping key once could.
+    (_cd / "prompts" / "no_such_key.txt").write_text("不该被读到。", encoding="utf-8")
+    check("a stray prompt file is ignored, not loaded",
+          set(_lb(config_dir=_cd).prompts) == set(_PK))
+    (_cd / "prompts" / "no_such_key.txt").unlink()
     # Per-group overrides validate at load time too: for_group merges lazily,
     # so a typo in one group's overrides allowed through /reload would fail on
     # that group's every message - no reply, no archive - until the file was
@@ -456,8 +450,8 @@ check("the live bundle serves the shipped texts",
 from qqbot.settings import ScheduleCfg as _SC
 for _name, _bad in (
     ("backup_keep below one", lambda: _SC(backup_keep=0)),
-    ("a cron missing a field", lambda: _SC(backup_cron="30 4 * *")),
-    ("a bad extract cron", lambda: _SC(extract_cron="bad")),
+    ("a cron missing a field", lambda: _SC(report_cron="30 4 * *")),
+    ("a bad nightly cron", lambda: _SC(nightly_cron="bad")),
 ):
     try:
         _bad()
@@ -483,24 +477,23 @@ check("no prompt tokens at all means no line", hit_split([]) == "")
 # The window is a message count, evicted in chunks: the anchor must survive several
 # turns so the prefix cache keeps hitting, and when it moves it moves by EVICT_CHUNK.
 # There is no token budget to test - money bounds spending, and nothing trims blocks.
-small = cfg.model_copy(deep=True)
 _saved_win = prompt.HISTORY_MSGS, prompt.EVICT_CHUNK
 prompt.HISTORY_MSGS, prompt.EVICT_CHUNK = 20, 5
 st2 = GroupState(group_id="9")
 for i in range(22):
     st2.add(ChatMsg(msg_id=f"x{i}", user_id="u", nickname="a", text="消息", ts=now_local()))
-h1 = prompt.history_window(st2, [], small)
+h1 = prompt.history_window(st2, [])
 a1 = st2.history_anchor
 check("an over-full window is cut back by whole chunks",
       len(h1) == 17 and a1 == "x5", f"{len(h1)} msgs, anchor {a1}")
 anchors = []
 for i in range(22, 25):
     st2.add(ChatMsg(msg_id=f"x{i}", user_id="u", nickname="a", text="短消息", ts=now_local()))
-    prompt.history_window(st2, [], small)
+    prompt.history_window(st2, [])
     anchors.append(st2.history_anchor)
 check("history anchor is stable across turns", all(a == a1 for a in anchors), f"{a1} -> {anchors}")
 st2.add(ChatMsg(msg_id="x25", user_id="u", nickname="a", text="压过线", ts=now_local()))
-prompt.history_window(st2, [], small)
+prompt.history_window(st2, [])
 check("and moves by a whole chunk when the window fills again",
       st2.history_anchor == "x10", str(st2.history_anchor))
 prompt.HISTORY_MSGS, prompt.EVICT_CHUNK = _saved_win

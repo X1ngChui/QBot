@@ -3,9 +3,9 @@
 Four things differ from a plain OpenAI-compatible endpoint, and they all live here:
 
 1. Prompt-cache accounting is reported as `prompt_cache_hit_tokens` /
-   `prompt_cache_miss_tokens`. A hit is 50x cheaper than a miss, which is what the whole
-   prompt ordering discipline in section 6.2 exists to earn - so the split has to be read,
-   not assumed.
+   `prompt_cache_miss_tokens`. A hit is ~30x cheaper than a miss, which is what the
+   prompt ordering discipline in section 6.2 exists to earn - so the split has to be
+   read, not assumed.
 2. These models deliberate before answering, and the deliberation bills as output. It
    arrives as `reasoning_content` and is reported under
    `completion_tokens_details.reasoning_tokens`.
@@ -16,6 +16,7 @@ Four things differ from a plain OpenAI-compatible endpoint, and they all live he
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from datetime import datetime
 from typing import Any
@@ -28,14 +29,13 @@ from ..util import read_api_key
 from .base import Rate
 from .openai_compat import OpenAICompatChat, OpenAICompatVision
 
+log = logging.getLogger("qqbot.deepseek")
+
 
 # CNY per 1M tokens, off-peak figures; peak doubles them - see _at_peak. Two eras,
-# because the vendor repriced: the increase teased on 2026-08-06 was published on 08-13
-# and takes effect 2026-08-17 00:00 Beijing time. Off-peak stays half of peak in the new
-# scheme, so the same table-plus-multiplier structure holds; only the numbers change.
-# New peak: flash 0.10 / 3 / 9, pro 0.30 / 9 / 27 (roughly 2-4.5x across the board, and
-# the hit/miss ratio narrows from 50x to 30x - the prompt-cache discipline stays the
-# dominant lever).
+# because the vendor repriced effective 2026-08-17 00:00 Beijing time. Off-peak stays
+# half of peak in both schemes, so the table-plus-multiplier structure holds and only
+# the numbers change. Figures re-verified against the official pricing page 2026-09-09.
 _PRICES_LEGACY = {
     "deepseek-v4-flash": Rate("Mtoken", in_hit=0.02, in_miss=1.0, out=2.0, source="deepseek docs"),
     "deepseek-v4-pro": Rate("Mtoken", in_hit=0.025, in_miss=3.0, out=6.0, source="deepseek docs"),
@@ -50,6 +50,16 @@ _PRICES_20260817 = {
                                          source="deepseek vision launch note: priced as V4-Flash"),
     "deepseek-v4-pro": Rate("Mtoken", in_hit=0.15, in_miss=4.5, out=13.5,
                             source="deepseek repricing eff. 2026-08-17"),
+    # V4.1-Flash, announced to bill exactly like V4-Flash. Both the timed beta
+    # id and the expected release id are listed: an unpriced model falls to the
+    # pessimistic tier, whose cache-hit rate is 30x pro's, and every reply it
+    # serves is then overbilled into the daily cap.
+    "deepseek-v4.1-flash-expires-on-0910": Rate(
+        "Mtoken", in_hit=0.05, in_miss=1.5, out=4.5,
+        source="deepseek beta notice: priced as V4-Flash"),
+    "deepseek-v4.1-flash": Rate(
+        "Mtoken", in_hit=0.05, in_miss=1.5, out=4.5,
+        source="deepseek beta notice: priced as V4-Flash; confirm at release"),
 }
 # An unlisted model bills at the most expensive tier known, so a rename cannot quietly
 # make spending look smaller than it is.
@@ -77,6 +87,9 @@ _BILLING_TZ = ZoneInfo("Asia/Shanghai")
 #: and either constant alone would misbill for however long the gap lasted.
 _REPRICE_AT = datetime(2026, 8, 17, tzinfo=_BILLING_TZ)
 
+#: Models already reported as unpriced, so the warning below fires once each.
+_WARNED_UNKNOWN: set[str] = set()
+
 
 def _rate_at(model: str, now: datetime) -> Rate:
     """The rate for one model at one moment: era table, then peak doubling.
@@ -86,10 +99,21 @@ def _rate_at(model: str, now: datetime) -> Rate:
     comments.
     """
     now = now.astimezone(_BILLING_TZ)
-    if now >= _REPRICE_AT:
-        rate = _PRICES_20260817.get(model, _UNKNOWN_20260817)
-    else:
-        rate = _PRICES_LEGACY.get(model, _UNKNOWN_LEGACY)
+    table, unknown = ((_PRICES_20260817, _UNKNOWN_20260817)
+                      if now >= _REPRICE_AT
+                      else (_PRICES_LEGACY, _UNKNOWN_LEGACY))
+    rate = table.get(model)
+    if rate is None:
+        # Loudly, once per model. The pessimistic tier keeps the daily cap safe
+        # by overbilling, which also means an unpriced model burns its reply
+        # scope several times faster than it should - fewer tool rounds per
+        # reply, and a daily cap that trips early.
+        if model not in _WARNED_UNKNOWN:
+            _WARNED_UNKNOWN.add(model)
+            log.warning("no price entry for model %r: billing at the priciest "
+                        "tier, so this model overspends its per-reply scope and "
+                        "the daily cap. Add it to the table.", model)
+        rate = unknown
     if not _at_peak(now):
         return rate
     return replace(
@@ -151,9 +175,6 @@ class DeepSeekChat(OpenAICompatChat):
             details.get("reasoning_tokens") or 0,
         )
 
-    def _terse_body(self) -> dict[str, Any]:
-        return {"thinking": {"type": "disabled"}}
-
     def _extra_body(self, *, cfg, effort: str) -> dict[str, Any]:
         """The resolved deliberation grade as this vendor's request fields: "off"
         disables thinking, low/high/max enable it at that reasoning_effort (the
@@ -190,10 +211,11 @@ class DeepSeekVision(OpenAICompatVision):
             return {"thinking": {"type": "disabled"}}
         return {"thinking": {"type": "enabled"}, "reasoning_effort": cfg.reasoning_effort}
 
-    #: Uploaded files expire at the vendor after this long. The reply prompt only ever
-    #: references pictures still in the conversation window - hours old, not weeks - so
-    #: a short lease keeps the account's 10k-file store from silting up, with no cleanup
-    #: job to run or forget.
+    #: Uploaded files expire at the vendor after this long, which is what keeps the
+    #: account's 10k-file store from silting up with no cleanup job to run or forget.
+    #: Comfortably past prompt.PROMPT_IMAGE_MAX_AGE, the age at which the reply prompt
+    #: stops attaching a picture at all: expiring first would leave the prompt holding
+    #: file ids the vendor has already dropped.
     FILE_TTL_SEC = 30 * 24 * 3600
 
     async def upload(

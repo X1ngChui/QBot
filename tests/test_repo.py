@@ -82,6 +82,42 @@ async def main():
     stats = await repo.image_cache_stats()
     check("image_cache_stats", stats["n"] == 1 and stats["hits"] == 2, str(dict(stats)))
 
+    # A description ages out so a better model gets to write it again: the paid
+    # describing path asks for one no older than the configured window and treats
+    # anything older as a miss. Free paths ask for no age at all - they cannot pay
+    # to replace what they reject, and a stale description beats a bare marker.
+    from datetime import timedelta as _td
+    check("a fresh description satisfies the paid path",
+          await repo.image_cache_get("k1", max_age=_td(days=15)) == "[表情:开心]")
+    await pool().execute(
+        "UPDATE image_cache SET described_at = now() - interval '20 days' WHERE key='k1'")
+    check("an aged one is a miss there, so it gets described again",
+          await repo.image_cache_get("k1", max_age=_td(days=15)) is None)
+    check("but the free path still serves it",
+          await repo.image_cache_get("k1") == "[表情:开心]")
+    # Rows written before described_at existed have descriptions of unknown age and
+    # count as expired - each is rewritten the next time that picture is posted.
+    await pool().execute("UPDATE image_cache SET described_at = NULL WHERE key='k1'")
+    check("an undated description counts as expired",
+          await repo.image_cache_get("k1", max_age=_td(days=15)) is None
+          and await repo.image_cache_get("k1") == "[表情:开心]")
+    # Re-describing stamps the row afresh, which is what ends the expiry.
+    await repo.image_cache_put("k1", "[表情:开心，重描]")
+    check("a rewrite is current again",
+          await repo.image_cache_get("k1", max_age=_td(days=15)) == "[表情:开心，重描]")
+
+    # A picture the backend's content filter declined is stored as a placeholder, and
+    # marked as one: it describes nothing, and a climbing count of them says the
+    # backend is turning away more than it looks at. It expires like any other, so a
+    # different backend - or the same one with different rules - gets to look again.
+    await repo.image_cache_put("k-refused", "⟦图片⟧", refused=True)
+    _st = await repo.image_cache_stats()
+    check("a refusal is stored as a refusal", _st["refused"] == 1, str(dict(_st)))
+    await repo.image_cache_put("k-refused", "⟦图片:一只猫⟧")
+    _st = await repo.image_cache_stats()
+    check("and stops being one once the backend does look",
+          _st["refused"] == 0, str(dict(_st)))
+
     # The upload half can land before the describing half, and neither may clobber the
     # other: a row with only a file_id reads as an undescribed picture, and the later
     # description fills the same row in.
@@ -282,6 +318,22 @@ async def main():
     check("and its estimated spend reaches the ledger", after_to > before_to,
           f"{before_to:.6f} -> {after_to:.6f}")
 
+    # -- the ledger names the model that actually served -------------------
+    # A vendor may retire an id and route it to a successor billed at another
+    # rate. Booking the requested name would price the call from a table entry
+    # that no longer describes it, in either direction.
+    from qqbot.providers.base import ChatResult as _CR
+
+    class Routed(OpenAICompatChat):
+        async def _stream_once(self, *a, **kw):
+            return _CR(model="served-elsewhere", text="好", in_miss=10, out=5)
+
+    await Routed().chat([{"role": "user", "content": "你好"}], cfg=tcfg,
+                        kind="reply", group_id=str(G1))
+    _models = {r["model"] for r in await repo.day_breakdown(day)}
+    check("a routed call books under the model that served it",
+          "served-elsewhere" in _models, str(sorted(_models)))
+
     # -- the window rebuilt from the archive --------------------------------
     # A deque that starts empty on deploy has the bot rejoin conversations it was
     # part of thirty seconds earlier knowing nothing - while the archive holds
@@ -377,6 +429,27 @@ async def main():
     bare = await search_history(G1, "cat.jpg")
     check("history_context 0 restores bare hits",
           "cat.jpg" in bare and "收到了" not in bare, bare)
+
+    # -- boolean queries ------------------------------------------------------
+    # Lucene syntax through luqum: juxtaposition stays AND, OR groups the
+    # synonyms colloquial chat actually needs, - excludes, quoted phrases match
+    # whole. Bare-hit mode, so the pins are about which lines are hits.
+    await say(G1, "u1", "阿强", "咖啡机到货了，明天开箱")
+    await say(G1, "u2", "阿花", "复印机又坏了，打印机也别想跑")
+    await say(G1, "u2", "阿花", "打印机换了新喷头 效果不错")
+    b1 = await search_history(G1, "(咖啡机 OR 打印机) -复印")
+    check("an OR group hits either word and the exclusion drops its row",
+          "到货" in b1 and "喷头" in b1 and "别想跑" not in b1, b1)
+    b2 = await search_history(G1, "（咖啡机 OR 复印机） 坏了")
+    check("full-width parentheses parse and compose with AND",
+          "别想跑" in b2 and "到货" not in b2, b2)
+    b3 = await search_history(G1, '"新喷头 效果"')
+    check("a quoted phrase matches whole, space included",
+          "喷头" in b3 and "到货" not in b3, b3)
+    check("a broken expression is answered in words, not raised",
+          "检索式有误" in await search_history(G1, "(("))
+    check("lucene features outside the boolean subset are refused in words",
+          "检索式有误" in await search_history(G1, "标签:值"))
     _rcfg.history_context = _saved_ctx
 
     # -- schema self-check ---------------------------------------------------

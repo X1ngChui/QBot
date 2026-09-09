@@ -13,7 +13,7 @@ from __future__ import annotations
 from .base import Rate
 from .openai_compat import OpenAICompatChat
 
-#: Free, in every direction. `source` names why, for the day someone wonders.
+#: Free, in every direction; `source` names why.
 _FREE = Rate("Mtoken", in_hit=0.0, in_miss=0.0, out=0.0,
              source="self-hosted: watts, not CNY")
 

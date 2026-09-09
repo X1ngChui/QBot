@@ -1,15 +1,19 @@
 """The conversation engine: retrieve -> assemble -> call -> strip -> send (section 2).
 
-The tool loop is bounded; there is no fallback and no downgrade, so any failure means the
-bot simply says nothing. A mid-reply limit is not a failure: it ends the spending, and a
-tool-less wrap-up round answers from what was already fetched (see RUNAWAY_ROUNDS).
+There is no fallback and no downgrade, so any failure means the bot says nothing.
+
+Money is what bounds the tool loop - no round count, no per-tool quota. Free tools
+run as often as they like; what bounds them is that the rounds carrying them are
+paid model calls, billed into the scope opened around this reply. Once that scope
+is spent the searching stops and one tool-less wrap-up round answers from what was
+already fetched: a mid-reply limit ends the spending, not the speech. Only the
+daily cap, checked before anything is spent, means silence.
 """
 
 from __future__ import annotations
 
-import logging
-
 import json
+import logging
 
 from ..db import repo
 from ..gateway.ingest import ingestor
@@ -25,18 +29,9 @@ from .state import ChatMsg, GroupState
 
 log = logging.getLogger("qqbot.engine")
 
-#: The loop's constraint is money: every round is itself a paid model call, so the scope
-#: opened around the reply is what ends the loop - when what remains cannot cover
-#: another round, the searching stops and one tool-less wrap-up round answers from what
-#: is already fetched. The owner's rule (design goal 6, revised): a mid-reply limit
-#: stops the *spending*, not the speech - what the reply has already paid for is worth
-#: one bounded closing call, and the daily cap, checked before anything is spent, still
-#: means silence. No round count, no per-tool quota: free tools run as often as they
-#: like, and what bounds them is that the rounds carrying them are not free.
-#:
-#: This one number is not a policy but a tripwire. A backend that reported zero cost
-#: would make a money-bounded loop unbounded, and that failure should be a loud log and
-#: a stop, not an infinite loop.
+#: A tripwire, not a policy: money ends the loop, and only a backend reporting zero
+#: cost could make a money-bounded loop unbounded. That failure deserves a loud log
+#: and a stop rather than an endless loop.
 RUNAWAY_ROUNDS = 20
 
 #: What an unexecuted tool request is answered with once the allowance died mid-round,
@@ -45,13 +40,6 @@ RUNAWAY_ROUNDS = 20
 QUOTA_NOTE = "（检索额度已用完，这个查询没有执行。）"
 WRAP_UP_NOTE = ("（本次回复的额度已用完，不能再执行任何检索或查看；"
                 "请只依据上文已有的材料直接作答，不要提及额度或系统限制。）")
-
-#: What one round is assumed to cost when deciding whether another is affordable:
-#: (cache-hit, cache-miss, output) tokens, priced at the moment of asking. An estimate
-#: for the money bound, not a budget - nothing limits what a round actually reads or
-#: writes. Deliberately rough: it decides when to stop searching, not what anything
-#: costs.
-ROUND_TOKENS = (20_000, 2_000, 2_000)
 
 #: Caps on the provenance marker appended to the bot's own archived line: how many
 #: tool uses it names, and how much of each query survives. A record, not a transcript
@@ -76,11 +64,9 @@ async def _wrap_up(messages: list, *, cfg: Settings, st: GroupState,
     """One last tool-less call after a limit trips mid-reply.
 
     The material already fetched is sitting in the tail, paid for; discarding it
-    bought nothing but silence. So the limit stops the spending, not the speech:
-    no tools are offered, the note says why, and the overshoot is exactly one
-    bounded round - the same slack the affordability gate's estimate already
-    tolerates. A failure here still ends in silence; the wrap-up is a chance,
-    not a guarantee.
+    buys nothing but silence. No tools are offered, the note says why, and the
+    overshoot is exactly this one round. A failure here still ends in silence -
+    the wrap-up is a chance, not a guarantee.
     """
     messages.append({"role": "user", "content": WRAP_UP_NOTE})
     try:
@@ -195,22 +181,19 @@ async def generate(
     await MEMBERS.relabel(bot, st.group_id, list(st.recent))
 
     profiles = await retrieval.gather(group_id=st.group_id, bot=bot)
-    # Episodic memory is deliberately not pushed here: what is injected uninvited
-    # sits right next to the incoming message, and an elliptical question resolves
-    # against it instead of the conversation (a real misfire, not a hypothetical).
-    # The model pulls with recall_events when it actually wants the past.
-    # The window and numbering are computed exactly once and handed both to
-    # the tool context and to assemble: the seq->message map inspect_image resolves
-    # against and the numbers the model reads must come from the same pass. The
-    # caller normally passes the window in - the slice was cut when the message
-    # arrived, so concurrent tasks and later arrivals cannot shift what this
-    # reply is looking at. The stored trajectories for the window's own replies
-    # are fetched by id - the table is the single source of truth, the deque
-    # holds only conversation - and render_history seats each one right before
-    # the reply it fed. Eviction needs no bookkeeping: a reply that slides out
-    # of the window simply stops being asked about.
+    # Episodic memory is not pushed here: what is injected uninvited sits right next
+    # to the incoming message, and an elliptical question resolves against it instead
+    # of against the conversation. The model pulls with recall_events instead.
+    #
+    # Window and numbering are computed once and handed to both the tool context and
+    # assemble: the seq->message map inspect_image resolves against and the numbers
+    # the model reads must come from the same pass. The caller normally passes the
+    # window in, cut when the message arrived, so later arrivals cannot shift what
+    # this reply is looking at. Trajectories are fetched from reply_trace by id - the
+    # deque holds only conversation - and render_history seats each before the reply
+    # it fed, so eviction needs no bookkeeping.
     if window is None:
-        window = prompt.history_window(st, batch, cfg)
+        window = prompt.history_window(st, batch)
     nums, marks = prompt.numbered(window + list(batch))
     ctx = tools.ToolCtx(bot=bot,
                         by_seq={nums[m.msg_id]: m for m in window + list(batch)})
@@ -234,12 +217,9 @@ async def generate(
     # half of context - the prompt pushes a fixed window, and they are the only way
     # to reach anything behind it.
     tool_defs = tools.tool_defs()
-    model = cfg.llm.text.model
     seen_calls: set[tuple[str, str]] = set()
     executed: list[tuple[str, dict, str]] = []
 
-    # The scope is what ends the loop; when it does, the wrap-up round speaks from
-    # what was already paid for (the module comment above holds the full statement).
     with BUDGET.scope(cfg.budget.per_reply_cny) as spend:
         for round_no in range(RUNAWAY_ROUNDS):
             res = await providers().text.chat(
@@ -255,16 +235,15 @@ async def generate(
             if not res.tool_calls:
                 return res.text or None, _provenance(executed), _trace(executed)
 
-            # The affordability gate sits between the request for tools and their
-            # execution: the first round always runs (a plain answer must never be
-            # silenced by a rough estimate exceeding a tight cap), but tools whose
-            # results no affordable round could ever read are not worth running -
-            # they would burn search allowance and latency without being usable.
-            # Priced at the moment of asking, because the price moves with the clock.
-            # The requested calls are dropped unexecuted; the wrap-up answers from
-            # what earlier rounds already fetched.
-            round_cost = providers().text.rate_for(model).tokens(*ROUND_TOKENS)
-            if not spend.can_afford(round_cost):
+            # The gate sits between the request for tools and their execution:
+            # tools whose results no further round could read would burn search
+            # allowance and latency for nothing. It reads money already spent,
+            # never a forecast of the next round - a forecast needs a price for
+            # the model, and one the price table does not know fails it forever,
+            # disarming the tool loop at zero spend. The requested calls are
+            # dropped unexecuted and the wrap-up answers from what earlier
+            # rounds fetched.
+            if spend.exhausted:
                 log.info("group %s: per-reply budget exhausted after %d round(s), "
                          "wrapping up without tools (%.4f of %.4f used)",
                          st.group_id, round_no + 1, spend.spent, spend.cap)
@@ -300,9 +279,7 @@ async def generate(
                     try:
                         # The retrieval tools are free per call; inspect_image is the
                         # one paid tool, and its vision call books itself into this
-                        # reply's scope like any other spend. Either way the loop is
-                        # what money bounds - each round carrying the calls is a paid
-                        # call, and the gate above already priced the next one.
+                        # reply's scope like any other spend.
                         out = await tools.execute(call, cfg=cfg, group_id=st.group_id,
                                                   ctx=ctx)
                     except QuotaExhausted as e:
@@ -327,8 +304,6 @@ async def generate(
             log.info("group %s: tool round %d done (%.4f CNY of %.4f used)",
                      st.group_id, round_no + 1, spend.spent, spend.cap)
 
-    # A tripwire, not a policy: money is the bound, and only a backend billing zero
-    # can run this many rounds without exhausting it.
     log.error("group %s: %d tool rounds without running out of money - a backend "
               "is billing zero; giving up", st.group_id, RUNAWAY_ROUNDS)
     return None, "", ""

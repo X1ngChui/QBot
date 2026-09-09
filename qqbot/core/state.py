@@ -1,10 +1,9 @@
 """Per-group runtime state.
 
-In memory: the recent messages (section 6.1, immediate context) and the reply rate
-window. What has and has not been read into long-term memory is tracked in SQL instead -
-a restart should not send a nearly-full batch back to zero.
-Persisted: the mute switch and the blocklist, in group_state, so a restart does not
-lose them.
+In memory: the recent messages (section 6.1, immediate context). What has and has not
+been read into long-term memory is tracked in SQL instead - a restart should not send a
+nearly-full batch back to zero. Persisted in group_state: the mute switch and the
+blocklist, so a restart does not lose them.
 """
 
 from __future__ import annotations
@@ -72,11 +71,11 @@ class ChatMsg:
         `seq` is this line's number in whatever is being shown, and `quote` the pointer to
         the line it replies to. Both are worked out per prompt - see prompt.numbered.
 
-        Every line carries its send time. Without one the model reads sixty messages as
-        one continuous conversation and bridges topics hours apart (a real complaint,
-        not a hypothetical). The stamp is the message's own fixed moment, so it never
-        changes between turns and the history stays cache-safe - unlike any relative
-        form ("5 minutes ago"), which would invalidate the prefix on every reply.
+        Every line carries its send time. Without one the model reads sixty messages
+        as one continuous conversation and bridges topics hours apart. The stamp is
+        the message's own fixed moment, so it never changes between turns and the
+        history stays cache-safe - unlike any relative form ("5 minutes ago"), which
+        would invalidate the prefix on every reply.
         """
         body = f"{quote} {self.text}".strip() if quote else self.text
         head = f"#{seq} " if seq else ""

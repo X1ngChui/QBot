@@ -34,7 +34,6 @@ _SEEN_UNKNOWN: set[str] = set()
 _MD5 = re.compile(r"([0-9a-fA-F]{32})")
 
 
-
 @dataclass
 class Ref:
     """A part of a message whose text has to be fetched or inferred.

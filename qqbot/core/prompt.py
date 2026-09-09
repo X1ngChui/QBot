@@ -1,7 +1,7 @@
 """Prompt assembly (section 6.2).
 
 The ordering is cost discipline and must not be violated - on the configured text
-backend a prefix-cache hit is 50x cheaper than a miss:
+backend a prefix-cache hit is ~30x cheaper than a miss:
 
   legend + rules (global constants) -> persona (per group, changes when config does)
   -> group knowledge (rewritten daily) -> who is who (renames, then impressions)
@@ -26,28 +26,19 @@ from ..util import defang, describe_now, now_local, sysmark
 from .state import ChatMsg, GroupState
 
 #: The history window, in messages. There is no token budget anywhere in the prompt:
-#: money bounds what a reply may spend (`budget:` in config), and every other block is
-#: rendered whole - persona and group knowledge are owner-edited, the roster and cards
-#: are written by prompts with their own length discipline, and gateway.max_msg_len
-#: bounds each transcript line (the bot's own may carry a capped provenance marker
-#: on top). These two counts are all that is left, and they exist
-#: for the context and the cache, not for cost: the window must be finite, and it must
-#: slide in chunks - one message per turn would invalidate the prefix on every reply.
-#: Production ledgers put reply cache hits at 60-77% with the eviction cadence the
-#: controllable share of the misses, so the chunk is deliberately large relative to
-#: the window. Sized from a ledger check (2026-08-30: ~6k tokens per reply, mostly at
-#: hit price - nowhere near any context limit): the constraints are money and slide
-#: frequency, not capacity. Ninety entries of pure conversation (trajectories are
-#: fetched from reply_trace at assembly and do not consume the count); the
-#: thirty-entry chunk keeps slides rare and leaves a
-#: two-chunk floor after each slide. Both lean on the same facts: prefix tokens are
-#: ~1/30 price, so a bigger window is nearly free per call, and every slide is the
-#: miss that costs.
+#: money bounds what a reply may spend, and every other block is rendered whole -
+#: persona and group knowledge are owner-edited, the roster and cards are written by
+#: prompts with their own length discipline, and gateway.max_msg_len bounds each
+#: transcript line. These two counts are all that is left, and they serve context
+#: and the cache rather than cost: a prefix token is ~1/30 price, so a wider window
+#: is nearly free per call and every slide is the miss that costs. Hence a chunk
+#: large relative to the window - it keeps slides rare and leaves two chunks
+#: standing after each one. Trajectories are fetched from reply_trace at assembly
+#: and do not consume the count.
 #:
-#: The window is expressed as a whole number of chunks rather than as its own count,
-#: so the multiple relationship holds by construction - two independent numbers
-#: whose ratio drifts is how a window ends up holding two and a half chunks and
-#: nobody can say what a slide leaves behind.
+#: The window is a whole number of chunks rather than its own count, so the multiple
+#: holds by construction: two independent numbers whose ratio drifts is how a window
+#: ends up holding two and a half chunks and nobody can say what a slide leaves.
 EVICT_CHUNK = 30
 WINDOW_CHUNKS = 3
 HISTORY_MSGS = EVICT_CHUNK * WINDOW_CHUNKS
@@ -62,8 +53,6 @@ H_RULES = "【信息解读规则】"
 H_PRIVATE = "【不写进回复的内容】"
 H_TONE = "【群聊语用】"
 H_WHO = "【群成员名册】"
-
-
 
 
 def _block(head: str, entries: list[tuple[str, str]]) -> str:
@@ -143,7 +132,6 @@ def _guessed_block(profiles: list[dict]) -> str:
 
 def build_system(
     persona: Persona,
-    cfg: Settings,
     profiles: list[dict],
     group_facts: list[str] | None = None,
 ) -> str:
@@ -192,9 +180,7 @@ def build_system(
     return "\n\n".join(x for x in blocks if x)
 
 
-def history_window(
-    st: GroupState, batch: list[ChatMsg], cfg: Settings
-) -> list[ChatMsg]:
+def history_window(st: GroupState, batch: list[ChatMsg]) -> list[ChatMsg]:
     """The messages that will actually appear in the prompt, oldest first.
 
     Separate from rendering them because the answer is needed before the prompt is
@@ -340,7 +326,7 @@ def attached_images(window: list[ChatMsg], batch: list[ChatMsg],
     return keep
 
 
-def build_tail(*, batch: list[ChatMsg], cfg: Settings,
+def build_tail(*, batch: list[ChatMsg],
                nums: dict[str, int] | None = None,
                marks: dict[str, str] | None = None) -> str:
     """Everything after the cache boundary: the clock, then the current message.
@@ -353,10 +339,9 @@ def build_tail(*, batch: list[ChatMsg], cfg: Settings,
     """
     parts: list[str] = []
 
-    # A model has no clock. This has to sit after the cache boundary: in the system block
-    # it would change every minute and cost the prefix cache on every single call, which is
-    # the 50x difference section 6.2 is built around. Here it is already past the boundary,
-    # so it is free.
+    # A model has no clock. This has to sit after the cache boundary: in the system
+    # block it would change every minute and cost the prefix cache on every call.
+    # Here it is already past the boundary, so it is free.
     parts.append("当前时间：" + describe_now() + "。")
 
     nums, marks = nums or {}, marks or {}
@@ -389,7 +374,7 @@ def assemble(
     messages = [
         {
             "role": "system",
-            "content": build_system(persona, cfg, profiles, group_facts),
+            "content": build_system(persona, profiles, group_facts),
         }
     ]
     # One pass over the window for both halves: the marks have to agree across the cache
@@ -399,11 +384,11 @@ def assemble(
     # the model reads have to come from one pass, not from two passes that merely
     # happen to agree while nothing appends to the deque in between.
     if window is None:
-        window = history_window(st, batch, cfg)
+        window = history_window(st, batch)
         nums, marks = numbered(window + list(batch))
     images = attached_images(window, batch, cfg)
     messages.extend(render_history(window, nums, marks, images, traces))
-    tail = build_tail(batch=batch, cfg=cfg, nums=nums, marks=marks)
+    tail = build_tail(batch=batch, nums=nums, marks=marks)
     # The batch renders inside the tail text, so its pictures attach here - behind the
     # text, like every other message's. The legend explains what a block behind a
     # picture marker is; no per-turn notice needed.

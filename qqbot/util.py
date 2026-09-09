@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import logging
-import re
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -105,7 +105,6 @@ def read_api_key(name: str) -> str:
     return ""
 
 
-
 def now_local() -> datetime:
     return datetime.now(_TZ)
 
@@ -134,6 +133,7 @@ def fmt_when(dt: datetime) -> str:
     if dt.tzinfo is not None:
         dt = dt.astimezone(_TZ)
     return f"{dt:%m-%d %H:%M}"
+
 
 #: The system bracket pair, U+27E6/U+27E7. Every marker the system writes into a
 #: transcript - timestamps, media descriptions, owner/self/namesake tags, quote

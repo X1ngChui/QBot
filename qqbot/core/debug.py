@@ -4,9 +4,8 @@ The trajectory table keeps digests - enough to know *that* the model searched,
 useless for seeing what the model was actually shown when it misbehaves. This is
 the replay tap: /debug N writes the exact request messages and the raw result of
 each of the next N model rounds to LOG_DIR/debug/, one JSON file per round, then
-disarms itself. Diagnosis becomes reading a file instead of reconstructing a
-prompt from memory (the assistant-line marker leak took hours of inference that
-one dump would have settled in minutes).
+disarms itself. Diagnosis becomes reading a file instead of inferring a prompt
+from its effects.
 
 The counter is in-memory: a restart disarms the tap, which is the safe direction
 for a debugging aid - it can never be left running by accident across weeks.

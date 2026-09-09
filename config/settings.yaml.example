@@ -3,8 +3,9 @@
 # structural about the file is documented here.
 # Per-group overrides go in config/personas/group_<gid>.yaml under `overrides`.
 
-# Everyone who can run /reload, /mute and /stats, and who gets the 09:00 daily report.
-# QQ numbers, as strings.
+# Everyone who holds the ops console (/help lists it) and receives the daily report,
+# which arrives when the ledger day closes - see schedule.report_cron. QQ numbers, as
+# strings.
 owners: ["10001"]
 
 # Local time for everything a person sees: the clock line in the prompt, the cron jobs, the
@@ -32,8 +33,8 @@ gateway:
 # credential, and no automatic fallback between them (D6).
 #
 # This block is the only place a platform is named. The code above it deals in capabilities
-# (text / vision / asr / search) and never learns who serves them, so retargeting one is an
-# edit here and nothing else.
+# (text / vision / asr / embedding / search) and never learns who serves them, so
+# retargeting one is an edit here and nothing else.
 #
 # `backend` picks the implementation class (providers/registry.py). Everything peculiar to
 # a platform - how it reports prompt-cache hits, how to tell it not to deliberate, what
@@ -58,6 +59,26 @@ llm:
     max_concurrency: 3
     timeout_sec: 30
     retries: 2
+    # Reading transcript into memory is the other use of this model: same
+    # account, same endpoint, its own task. Only what a task may change on
+    # its own is here - endpoint, credential and concurrency describe the
+    # account, and a second copy of an endpoint is how one goes stale.
+    # Anything left out follows the reply settings above.
+    extract:
+      # The one place a cheaper tier can measurably do the reply model's work,
+      # because extraction is schema-guarded and eval-covered. Empty = the
+      # reply model. Change this or the grade below, then re-run
+      # scripts/eval_extract.py.
+      model: ""
+      # The schema and the Validator carry most of the thinking, but not all:
+      # the counterintuitive rules travel with it, and alias reconfirmation
+      # fails consistently at "off". So "low" is the floor.
+      reasoning_effort: low
+      # One call reads a whole chunk of transcript and answers with a dozen
+      # tool calls, which is far slower than answering one line. Nobody is
+      # waiting at 02:30, and a timeout costs the batch twice - once now and
+      # once on the retry.
+      timeout_sec: 120
   # The multimodal model's one remaining job: describing pictures for the archive.
   vision:
     backend: deepseek
@@ -67,6 +88,14 @@ llm:
     # Deliberation grade for the describing call: "low" buys meme-reading
     # judgement for a fraction of the vendor default's cost; "off" disables it.
     reasoning_effort: low
+    # How long a stored description stays current. Past it, the next time that
+    # picture is posted the bot pays to describe it again - models improve, and
+    # a vendor can put a better model behind an unchanged id, which no model-id
+    # stamp would notice. Refreshing is lazy: only a picture actually posted
+    # again is looked up, so one nobody reposts is never paid for twice, and
+    # transcript lines already archived keep the wording they were written
+    # with. 0 disables expiry.
+    description_ttl_days: 15
     max_images_per_min: 6
     max_image_mb: 8
     timeout_sec: 30
@@ -103,10 +132,11 @@ llm:
     count: 5
     depth: basic              # 1 credit; "advanced" costs 2
     monthly_quota: 1000       # the free tier; at it search refuses, nothing bills
-    # The host's proxy, as seen from inside the container (172.17.0.1 is the default
-    # docker bridge gateway). Only the search client uses it; model traffic stays
-    # direct. Empty means direct.
-    proxy: http://172.17.0.1:7890
+    # HTTP proxy for the search client only; model traffic stays direct. Empty
+    # means direct. A proxy running on the deploy host is reached at the docker
+    # bridge gateway as seen from inside the container - by default
+    # http://172.17.0.1:7890.
+    proxy: ""
     timeout_sec: 20
 
 budget:
@@ -115,15 +145,10 @@ budget:
   daily_cny_cap: 3.0
   # What one reply may spend, in CNY, tool loop included. Money is the only
   # constraint: free tools run without limit, paid rounds account against this
-  # figure. A reply that hits it stops unanswered - limits mean silence.
+  # figure. Reaching it stops the searching, not the reply - one tool-less
+  # wrap-up round answers from what was already fetched. Only the daily cap
+  # above, checked before anything is spent, means silence.
   per_reply_cny: 0.30
-
-memory:
-  # Extraction's own deliberation grade - the schema and Validator carry most of
-  # the thinking, so "low" covers joke-vs-fact and predicate choice. Extraction
-  # runs once nightly (schedule.extract_cron), draining the day oldest-first in
-  # chunks cut at conversation gaps; there is nothing else to configure.
-  reasoning_effort: low
 
 retrieval:
   # Lines of surrounding conversation around each search_history hit, each way.
@@ -136,11 +161,12 @@ retrieval:
   episode_context: 2
 
 schedule:
-  extract_cron:     "30 2 * * *"
-  forget_cron:       "0 4 * * *"
-  backup_cron:      "30 4 * * *"
-  cache_clean_cron: "0 5 * * *"
-  report_cron:      "0 9 * * *"
+  # The whole night is one pipeline in dependency order - extraction drain,
+  # decay, pg_dump, napcat cache sweep - with a queue-drain wait between
+  # stages (tasks.nightly). The report fires the moment the ledger day
+  # closes, on the same midnight boundary the budget resets on.
+  nightly_cron: "30 2 * * *"
+  report_cron:  "0 0 * * *"
   backup_keep: 14
   napcat_cache_days: 7
 
@@ -159,29 +185,7 @@ agreement:
   version: 1
   file: agreement.txt
 
-# One file per prompt the model reads - the complete set, so what the system
-# consumes is visible here at a glance. A key missing or unknown, and a file
-# missing or empty, all fail the load. Wording rationale: prompts/README.md.
-prompts:
-  # transcript legend, shared by reply and extraction; plus each side's addendum
-  legend: prompts/legend.txt
-  legend_reply_note: prompts/legend_reply_note.txt
-  extract_legend_note: prompts/extract_legend_note.txt
-  # the reply path's standing rules
-  identity_rules: prompts/identity_rules.txt
-  credibility_rules: prompts/credibility_rules.txt
-  private_rules: prompts/private_rules.txt
-  tone_rules: prompts/tone_rules.txt
-  tone_reply_note: prompts/tone_reply_note.txt
-  tone_extract_note: prompts/tone_extract_note.txt
-  reply_final: prompts/reply_final.txt
-  # the whole extraction rulebook
-  extract: prompts/extract.txt
-  # media and tools
-  describe_image: prompts/describe_image.txt
-  inspect_image: prompts/inspect_image.txt
-  tool_web_search: prompts/tool_web_search.txt
-  tool_search_history: prompts/tool_search_history.txt
-  tool_recall_events: prompts/tool_recall_events.txt
-  tool_read_url: prompts/tool_read_url.txt
-  tool_inspect_image: prompts/tool_inspect_image.txt
+# The prompt texts the model reads, one <key>.txt per key in the code's manifest
+# (settings.PROMPT_KEYS); ls this directory to see the set. A file missing or
+# empty fails the load. Wording rationale: prompts/README.md.
+prompts_dir: prompts

@@ -52,13 +52,14 @@ class FakeText(TextModel):
         return self.RATE
 
     async def chat(self, messages, *, cfg, tools=None,
-                   max_tokens=None, timeout=None, effort=None, kind="reply", group_id=None):
+                   max_tokens=None, effort=None, kind="reply", group_id=None):
         LLM_CALLS.append({"kind": kind, "messages": messages, "tools": tools,
-                          "effort": effort, "max_tokens": max_tokens})
-        # Replies leave the deliberation grade to config (no per-call override);
-        # extraction passes its own configured grade. Pinned so neither direction
-        # regresses silently.
-        assert kind != "reply" or effort is None, "replies must not override the grade"
+                          "effort": effort, "max_tokens": max_tokens,
+                          "grade": cfg.reasoning_effort, "timeout": cfg.timeout_sec})
+        # No production path overrides the grade at the call: each use of the text
+        # model carries its settings in its own config. Pinned so the call-site
+        # exception does not creep back.
+        assert effort is None, "the grade belongs to the config, not the call"
         if kind == "extract":
             text = ""
         elif kind == "knowledge":
@@ -522,8 +523,8 @@ async def main():
           _facts == ["做音乐的群", "切片：把采样切成小段再重排"], str(_facts))
     check("the topic comes first", _facts[0] == "做音乐的群", str(_facts))
 
-    _cfg_k, persona_k = config().for_group("123")
-    _split = prompt_mod.build_system(persona_k, _cfg_k, [], _facts)
+    _, persona_k = config().for_group("123")
+    _split = prompt_mod.build_system(persona_k, [], _facts)
     check("they reach the prompt as the bot's own summary",
           "未确认（你自行归纳的印象" in _split and "切片：把采样切成小段再重排" in _split,
           _split[-200:])
@@ -951,8 +952,8 @@ async def main():
           _card.note == "note about a" and _card.summary == "喜欢打游戏",
           f"{_card.note!r} / {_card.summary!r}")
 
-    _cfg_o, _p_o = config().for_group(str(ORD))
-    _sys = prompt_mod.build_system(_p_o, _cfg_o, await _retr.gather(group_id=str(ORD)), "")
+    _, _p_o = config().for_group(str(ORD))
+    _sys = prompt_mod.build_system(_p_o, await _retr.gather(group_id=str(ORD)), "")
     check("the certain half is labelled certain", "已确认（系统记录的名字" in _sys, _sys[-200:])
     check("and the guessed half is labelled guessed",
           "未确认（你自行归纳的印象" in _sys and "喜欢打游戏" in _sys, _sys[-200:])
@@ -993,7 +994,7 @@ async def main():
           set(_named.displayed_names) == {"旧名字"} and set(_named.nicknames) == {"老哥"},
           f"{_named.displayed_names} / {_named.nicknames}")
     _row = next(r for r in await _retr.gather(group_id=str(ORD)) if r["user_id"] == "g")
-    _one = prompt_mod.build_system(_p_o, _cfg_o, [_row], "")
+    _one = prompt_mod.build_system(_p_o, [_row], "")
     check("and the prompt labels them separately",
           "曾用名：旧名字" in _one and "别名：老哥" in _one, _one[-200:])
 
@@ -1035,13 +1036,13 @@ async def main():
     # about while absent, and a tail rebuilt every turn would pay for it every turn.
     _one = [_CM0(msg_id="x", user_id="u7", nickname="小南", text="在", ts=_nl0())]
     check("identity is in the system block, not the tail",
-          "曾用名" not in prompt_mod.build_tail(batch=_one, cfg=_cfg_o))
+          "曾用名" not in prompt_mod.build_tail(batch=_one))
 
     # The tail carries nothing but the clock and the message on purpose: whatever
     # sits here is the nearest context the incoming message has, and a pushed block
     # of past events once captured an elliptical question that referred to the
     # conversation. The past is pulled through recall_events, never pushed.
-    _tail = prompt_mod.build_tail(batch=_one, cfg=_cfg_o)
+    _tail = prompt_mod.build_tail(batch=_one)
     check("the tail is the clock and the message, nothing pushed beside them",
           _tail.index("当前时间") < _tail.index("下面是刚收到的消息")
           and "相关的事" not in _tail, _tail[:120])
@@ -1061,7 +1062,7 @@ async def main():
     check("while still allowing a question the message points at",
           "除非这条刚收到的消息明确要你代答" in _tail, _tail[-140:])
     check("but never in the cached system block",
-          "老周答应周末把切片做完" not in prompt_mod.build_system(persona_k, _cfg_o, [], []))
+          "老周答应周末把切片做完" not in prompt_mod.build_system(persona_k, [], []))
 
     # 12g. A name is captured when a message arrives, so history would otherwise keep
     # showing whoever renamed themselves under their old name while the roster, the
@@ -1113,8 +1114,11 @@ async def main():
 
     # 14. the money-bounded agent loop. There is no round count and no per-tool quota:
     # every round is a paid model call charged to the reply's scope, the first round
-    # always runs, and the affordability gate sits between a round's tool requests and
-    # their execution - tools whose results no affordable round could read never run.
+    # always runs, and the budget gate sits between a round's tool requests and their
+    # execution - once the cap has been spent, tools whose results no further round
+    # could read never run. The gate reads money already spent, never a forecast of
+    # the next round: a forecast needs a price for the model, and an unpriced model
+    # then fails it forever, taking the tool loop dark at zero spend.
     # Either limit (the purse, the search allowance) ends the *spending*: one tool-less
     # wrap-up round then answers from what the paid rounds already fetched. Every
     # number below is arranged so the arithmetic is checkable by hand.
@@ -1122,10 +1126,9 @@ async def main():
 
     ROUND_CHARGE = 0.02    # what the scripted model books per round
     cfg.budget.per_reply_cny = 0.10
-    # round_cost estimate with the fixture rate (hit .02, miss 1.0, out 2.0 per M):
-    # (20000*.02 + 2000*1 + 2000*2)/1e6 = 0.0064. With a 0.10 purse the money never
-    # binds in this scenario: round one executes two searches, round two's fresh
-    # search is the third call and the scripted allowance dies there.
+    # With a 0.10 purse and 0.02 a round, the money never binds in this scenario:
+    # round one executes two searches, round two's fresh search is the third call
+    # and the scripted allowance dies there.
 
     class CountingSearch(SearchEngine):
         """Free like the real one, and out of allowance from the third call on."""
@@ -1158,10 +1161,13 @@ async def main():
         so only a limit can end the reply."""
 
         async def chat(self, messages, *, cfg, tools=None,
-                       max_tokens=None, timeout=None, effort=None, kind="reply",
+                       max_tokens=None, effort=None, kind="reply",
                        group_id=None):
             LLM_CALLS.append({"kind": kind, "messages": messages,
-                              "tools": tools, "effort": effort, "max_tokens": max_tokens})
+                              "tools": tools, "effort": effort,
+                              "max_tokens": max_tokens,
+                              "grade": cfg.reasoning_effort,
+                              "timeout": cfg.timeout_sec})
             await BUDGET.record(kind=kind, model=self.MODEL, cny=ROUND_CHARGE,
                                 group_id=group_id)
             if tools is None:   # the wrap-up round: no tools offered, answer given
@@ -1202,9 +1208,9 @@ async def main():
           any("没有执行" in t for t in tool_texts))
 
     # And the other limit the same way: with the allowance out of the picture and the
-    # purse shrunk to 0.04, rounds one and two run, and the gate then finds the purse
-    # cannot cover reading a third round's results - the pending tool requests never
-    # run, and the wrap-up answers from what the first two rounds fetched.
+    # purse shrunk to 0.04, rounds one and two run and spend it exactly - the gate
+    # then reads the purse as empty, the pending tool requests never run, and the
+    # wrap-up answers from what the first two rounds fetched.
     class EndlessSearch(CountingSearch):
         """CountingSearch without the allowance: only the purse can end this one."""
 
@@ -1247,9 +1253,11 @@ async def main():
         _asked = False
 
         async def chat(self, messages, *, cfg, tools=None, max_tokens=None,
-                       timeout=None, effort=None, kind="reply", group_id=None):
+                       effort=None, kind="reply", group_id=None):
             LLM_CALLS.append({"kind": kind, "messages": messages, "tools": tools,
-                              "effort": effort, "max_tokens": max_tokens})
+                              "effort": effort, "max_tokens": max_tokens,
+                              "grade": cfg.reasoning_effort,
+                              "timeout": cfg.timeout_sec})
             if not type(self)._asked:
                 type(self)._asked = True
                 return ChatResult(text="", model=self.MODEL,
@@ -1580,10 +1588,17 @@ async def main():
     check("the memory path never asks the model to write prose",
           not any(c["kind"] in ("knowledge", "summary") for c in LLM_CALLS),
           str({c["kind"] for c in LLM_CALLS}))
-    check("extraction carries its configured grade; replies carry none",
-          all(c["effort"] == config().default.memory.reasoning_effort
+    # Each use of the text model brings its own settings: extraction reads a whole
+    # chunk of transcript, so it carries a grade and a patience the reply path would
+    # never grant, and neither is a call-site exception.
+    _txtcfg = config().default.llm.text
+    check("extraction and replies each run on their own configured settings",
+          all(c["grade"] == _txtcfg.extract.reasoning_effort
+              and c["timeout"] == _txtcfg.extract.timeout_sec
               for c in LLM_CALLS if c["kind"] == "extract")
-          and all(c["effort"] is None for c in LLM_CALLS if c["kind"] == "reply"))
+          and all(c["grade"] == _txtcfg.reasoning_effort
+                  and c["timeout"] == _txtcfg.timeout_sec
+                  for c in LLM_CALLS if c["kind"] == "reply"))
 
     await GATEWAY.shutdown()
     await close_pool()

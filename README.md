@@ -90,8 +90,8 @@ rather than accumulate as flags. Adding one is: write the subclass, add a line t
 - **The text models deliberate before answering.** Reasoning tokens bill as
   output and arrive in a separate field, so they never reach the group but do
   reach the invoice. Replies, extraction and describing each carry their own
-  `reasoning_effort` grade (`off` selects a backend's `_terse_body` and asks
-  for terse answers); all three currently run `low`.
+  `reasoning_effort` grade — `off`, `low`, `high` or `max`, translated into
+  whatever request fields the backend uses; all three currently run `low`.
 - **Ops state has its own tables.** `group_state` holds what must survive a
   restart (the mute switch, extraction watermarks); `cost_ledger` is what the
   budget gate, `/stats`, `/top` and the daily report read. Neither carries
@@ -183,9 +183,12 @@ path answers for free. Command answers are on the record like any bot line -
 window and archive both - so the model can be asked about a card or a table
 it just posted.
 
-Scheduled: memory extraction 02:30 (the nightly drain), memory decay 04:00, `pg_dump -Fc`
-04:30 (keeps 14, into `backups/` - point that volume at a NAS mount; until then the dumps
-share the disk they protect), NapCat media cleanup 05:00, daily report to the owners 09:00.
+Scheduled: one nightly pipeline at 02:30 running its stages in dependency order -
+memory extraction (the drain), memory decay, `pg_dump -Fc` (keeps 14, into
+`backups/` - point that volume at a NAS mount; until then the dumps share the
+disk they protect), NapCat media cleanup - each stage waiting for the job queue
+to empty before the next; and the daily report to the owners at 00:00, the
+moment the ledger day closes.
 
 Routine intervention is meant to be one thing: read the daily report, change the config.
 
@@ -195,8 +198,13 @@ derives from an owner's note, episode summaries stay objective even against an
 infected style planted in the known block, the bot's own name never becomes a
 member's alias) - run it around any change to the extract prompt family.
 `scripts/eval_replies.py` runs the deterministic eval set against
-the real model from the workstation (needs the test DB and `.env`; ~CNY 0.02 a run) — run
-it before and after any prompt or model change. `/debug N` captures the next N model
+the real model from the workstation (needs the test DB and `.env`; a few fen a run) — run
+it before and after any prompt or model change. Beyond format discipline and
+injection inertness it now measures tool initiative: a question only the archive
+can answer must be searched (the planted fact's invented model number proves the
+search was read, the window plants a lookalike to misattribute to), an
+unanswerable one must end in a searched, honest blank — and failing cases print
+the tool-loop trace, so "did not look" and "looked badly" read apart. `/debug N` captures the next N model
 rounds' full requests and responses into `logs/debug/` for when a reply misbehaves and
 you need to see what the model was actually shown. The daily report carries the output
 stripper's hit counters: every hit is a marker the model wrote and the stripper caught.
@@ -207,7 +215,7 @@ The container is the only supported runtime, but the pure logic runs without a
 protocol side:
 
 ```bash
-python -m venv .venv && .venv/bin/pip install pydantic pyyaml jieba asyncpg openai httpx
+python -m venv .venv && .venv/bin/pip install pydantic pyyaml jieba asyncpg openai httpx luqum
 docker run -d --name qbot-pgtest -e POSTGRES_DB=qqbot -e POSTGRES_USER=qqbot \
   -e POSTGRES_PASSWORD=testpw -p 15432:5432 \
   -v "$PWD/sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro" \

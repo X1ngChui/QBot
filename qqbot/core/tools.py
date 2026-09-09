@@ -14,6 +14,10 @@ import logging
 import re
 from dataclasses import dataclass, field
 
+from luqum import tree as _lq
+from luqum.exceptions import ParseError as _LuqumParseError
+from luqum.parser import parser as _luqum_parser
+
 from ..db import pool, repo
 from ..providers import providers
 from ..providers.base import QuotaExhausted
@@ -66,7 +70,10 @@ def tool_defs() -> list[dict]:
                     "properties": {
                         "query": {
                             "type": "string",
-                            "description": "要找的关键词，可用空格分开多个，多个关键词需同时命中",
+                            "description": "检索式。空格分开的词都要命中（AND）；"
+                                           "OR 表示任一命中，-词 表示排除，括号分组，"
+                                           "引号内是含空格的原文片段。"
+                                           "例：(打印机 OR 打印) -复印",
                         },
                         "speaker": {
                             "type": "string",
@@ -179,13 +186,89 @@ def _like(word: str) -> str:
     return "%" + word.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_") + "%"
 
 
+# -- the boolean query language ----------------------------------------------
+# Lucene syntax, parsed by luqum rather than by hand. Juxtaposition is AND;
+# OR, NOT/-, parentheses and quoted phrases compose freely, and models write
+# this syntax fluently already. Only the boolean subset is accepted: fields,
+# ranges, fuzziness and the rest of the Lucene DSL are rejected at the AST
+# with a message the model can act on. _condition() walks the tree into one
+# parameterized ILIKE expression - member text reaches SQL only as ILIKE
+# parameters, never as SQL text.
+
+#: Complexity cap: a query is a filter, not a program. Terms beyond the cap
+#: mean the question should be split into two searches.
+MAX_QUERY_TERMS = 8
+
+_QUERY_NORMALIZE = str.maketrans({"（": "(", "）": ")", "“": '"', "”": '"',
+                                  "「": '"', "」": '"', "'": '"'})
+
+
+class QueryError(ValueError):
+    """A query the grammar cannot read, with a message meant for the model."""
+
+
+def _terms_of(node) -> int:
+    if isinstance(node, (_lq.Word, _lq.Phrase)):
+        return 1
+    return sum(_terms_of(c) for c in node.children)
+
+
+def _parse_query(q: str):
+    """The query as a validated luqum tree: boolean subset only, term cap applied."""
+    q = (q or "").translate(_QUERY_NORMALIZE).strip()
+    if not q:
+        raise QueryError("关键词为空")
+    try:
+        ast = _luqum_parser.parse(q)
+    except _LuqumParseError as e:
+        raise QueryError(f"无法解析（{e}）") from None
+    if _terms_of(ast) > MAX_QUERY_TERMS:
+        raise QueryError(f"关键词太多（最多 {MAX_QUERY_TERMS} 个），请拆成两次检索")
+    return ast
+
+
+def _condition(node, params: list, offset: int) -> str:
+    """The luqum tree as one SQL boolean expression over plain_text.
+
+    Only this function's own connectives reach the SQL string; every member
+    word travels as an ILIKE parameter, numbered past the query's fixed ones.
+    Node types outside the boolean subset raise, so an exotic Lucene feature
+    fails the call in words instead of silently matching everything.
+    """
+    if isinstance(node, _lq.Word):
+        params.append(_like(node.value))
+        return f"plain_text ILIKE ${offset + len(params)}"
+    if isinstance(node, _lq.Phrase):
+        params.append(_like(node.value[1:-1]))       # value keeps its quotes
+        return f"plain_text ILIKE ${offset + len(params)}"
+    if isinstance(node, (_lq.Not, _lq.Prohibit)):
+        return "NOT " + _condition(node.children[0], params, offset)
+    if isinstance(node, _lq.Group):
+        return _condition(node.children[0], params, offset)
+    if isinstance(node, (_lq.AndOperation, _lq.UnknownOperation)):
+        return ("(" + " AND ".join(_condition(c, params, offset)
+                                   for c in node.children) + ")")
+    if isinstance(node, _lq.OrOperation):
+        return ("(" + " OR ".join(_condition(c, params, offset)
+                                  for c in node.children) + ")")
+    if isinstance(node, _lq.SearchField):
+        raise QueryError("不支持「字段:值」写法，直接写关键词")
+    raise QueryError(f"不支持的语法（{node.__class__.__name__}）")
+
+
 async def search_history(group_id: int, query: str, *, speaker: str | None = None,
                          days: int | None = None) -> str:
     """The archive, searched. Free - one SQL query, no model involved.
 
-    All keywords must hit (ILIKE ALL), because the failure mode of OR over a chat archive
-    is a page of one-word matches. Newest first out of the database, shown oldest first,
-    so what the model reads scans like the conversation did.
+    The query is a boolean expression (_parse_query): juxtaposition is AND -
+    the default stays conjunction because the failure mode of OR over a chat
+    archive is a page of one-word matches - with OR, -exclusion, parentheses
+    and quoted phrases on top. The OR group is the home for synonyms:
+    colloquial chat rarely uses the word the question used, and stacking
+    guesses into AND is how a search comes back empty. A query the grammar
+    cannot read is answered in-band with the parser's own message. Newest
+    first out of the database, shown oldest first, so what the model reads
+    scans like the conversation did.
 
     `speaker` narrows to one person's lines by display name - "what did X say about Y"
     is unanswerable with keywords alone, which match everyone who mentioned X. A name,
@@ -201,9 +284,14 @@ async def search_history(group_id: int, query: str, *, speaker: str | None = Non
     often the very thing a line responds to. Windows that touch merge into one
     block; blocks are separated by an ellipsis line.
     """
-    words = [w for w in (query or "").split() if w][:5]
-    if not words:
-        return "（关键词为空）"
+    # Parse and compile under one roof: the subset check lives in the compile
+    # walk, and a rejected feature must answer in words exactly like a syntax
+    # error does.
+    terms: list[str] = []
+    try:
+        cond = _condition(_parse_query(query or ""), terms, offset=5)
+    except QueryError as e:
+        return f"（检索式有误：{e}）"
     sp = (speaker or "").strip()
     uid: str | None = None
     if m := (_SEQ_NAME.fullmatch(sp) or _SEQ_NAME_LEGACY.fullmatch(sp)):
@@ -216,21 +304,25 @@ async def search_history(group_id: int, query: str, *, speaker: str | None = Non
             # cannot be a literal card, but the guard is kept uniform - the
             # model can mistype a serial either way.)
             uid = None
+    # The condition string holds only this module's own connectives and ILIKE
+    # placeholders numbered past the five fixed parameters; the member's words
+    # travel in `terms`, never in SQL text.
     rows = await pool().fetch(
-        """SELECT id, occurred_at, payload, plain_text FROM raw_event
+        f"""SELECT id, occurred_at, payload, plain_text FROM raw_event
             WHERE group_id=$1 AND event_type='message'
-              AND plain_text ILIKE ALL($2::text[])
-              AND ($4::text IS NULL
-                   OR payload->'sender'->>'card' ILIKE $4
-                   OR payload->'sender'->>'nickname' ILIKE $4)
-              AND ($5::int IS NULL
-                   OR occurred_at >= NOW() - make_interval(days => $5))
-              AND ($6::text IS NULL OR platform_user_id = $6)
-            ORDER BY occurred_at DESC, id DESC LIMIT $3""",
-        group_id, [_like(w) for w in words], HISTORY_HITS,
+              AND {cond}
+              AND ($3::text IS NULL
+                   OR payload->'sender'->>'card' ILIKE $3
+                   OR payload->'sender'->>'nickname' ILIKE $3)
+              AND ($4::int IS NULL
+                   OR occurred_at >= NOW() - make_interval(days => $4))
+              AND ($5::text IS NULL OR platform_user_id = $5)
+            ORDER BY occurred_at DESC, id DESC LIMIT $2""",
+        group_id, HISTORY_HITS,
         _like(sp) if sp and uid is None else None,
         days if days and days > 0 else None,
         uid,
+        *terms,
     )
     if not rows:
         return "（存档里没有搜到）"
@@ -309,6 +401,7 @@ def render_results(items: list[dict]) -> str:
 #: snippets; the standing rules (private_rules) already cover text that tries to
 #: read as instructions.
 URL_CONTENT_CHARS = 3000
+
 
 class Failure(str):
     """A tool answer that obtained nothing - a transport failure, a bad argument,
@@ -425,9 +518,9 @@ async def execute(call: dict, *, cfg: Settings, group_id: str,
         return Failure(f"（未知工具 {name}）")
     # Free within a monthly allowance, so there is no per-reply money check here: the
     # backend meters the allowance itself and refuses at it. That refusal propagates -
-    # a limit reached means the reply is dropped, not answered in degraded form (the
-    # owner's rule) - while a transport failure stays a tool answer, because a broken
-    # network is an error to talk around, not a limit to respect.
+    # a limit reached means the reply is dropped, not answered in degraded form -
+    # while a transport failure stays a tool answer, because a broken network is an
+    # error to talk around, not a limit to respect.
     try:
         items = await providers().search.search(query, cfg=cfg.llm.search, group_id=group_id)
     except QuotaExhausted:

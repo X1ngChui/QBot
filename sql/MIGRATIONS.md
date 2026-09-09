@@ -13,6 +13,23 @@ Apply with:
 docker exec qbot-postgres-1 psql -U qqbot -d qqbot -c "<statement>"
 ```
 
+## 2026-09-10 — image descriptions expire
+
+```sql
+ALTER TABLE image_cache ADD COLUMN IF NOT EXISTS described_at TIMESTAMPTZ;
+ALTER TABLE image_cache ADD COLUMN IF NOT EXISTS refused BOOLEAN NOT NULL DEFAULT FALSE;
+```
+
+The cache had no expiry of any kind, so the first description a picture ever got
+was served forever - including the placeholder written when a content filter
+declined to look at one. Existing rows keep `described_at` NULL deliberately:
+their descriptions are of unknown age and count as expired, so each is rewritten
+the next time that picture is actually posted again. Nothing is refreshed in
+bulk, and a picture never seen twice is never paid for twice.
+
+`refused` is not backfilled either - the old placeholder rows are
+indistinguishable from real descriptions in the data, and they expire anyway.
+
 ## 2026-09-08 — reserved-bracket markers (data rewrite, no schema change)
 
 ```sql

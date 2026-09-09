@@ -6,36 +6,6 @@
 # assert on, not to be realistic.
 
 owners: ["10000", "10001"]
-
-# Borrow the real prompt texts instead of copying every file into fixtures;
-# paths are relative to this fixture config directory.
-prompts:
-  # transcript legend, shared by reply and extraction; plus each side's addendum
-  legend: ../../../config/prompts/legend.txt
-  legend_reply_note: ../../../config/prompts/legend_reply_note.txt
-  extract_legend_note: ../../../config/prompts/extract_legend_note.txt
-  # the reply path's standing rules
-  identity_rules: ../../../config/prompts/identity_rules.txt
-  credibility_rules: ../../../config/prompts/credibility_rules.txt
-  private_rules: ../../../config/prompts/private_rules.txt
-  tone_rules: ../../../config/prompts/tone_rules.txt
-  tone_reply_note: ../../../config/prompts/tone_reply_note.txt
-  tone_extract_note: ../../../config/prompts/tone_extract_note.txt
-  reply_final: ../../../config/prompts/reply_final.txt
-  # the whole extraction rulebook
-  extract: ../../../config/prompts/extract.txt
-  # media and tools
-  describe_image: ../../../config/prompts/describe_image.txt
-  inspect_image: ../../../config/prompts/inspect_image.txt
-  tool_web_search: ../../../config/prompts/tool_web_search.txt
-  tool_search_history: ../../../config/prompts/tool_search_history.txt
-  tool_recall_events: ../../../config/prompts/tool_recall_events.txt
-  tool_read_url: ../../../config/prompts/tool_read_url.txt
-  tool_inspect_image: ../../../config/prompts/tool_inspect_image.txt
-
-agreement:
-  version: 1
-  file: agreement.txt
 timezone: "Asia/Shanghai"
 
 gateway:
@@ -55,6 +25,9 @@ llm:
     max_concurrency: 3
     timeout_sec: 30
     retries: 2
+    extract:
+      reasoning_effort: low
+      timeout_sec: 120
   vision:
     backend: openai_compat
     base_url: https://example.invalid/v1
@@ -89,14 +62,16 @@ llm:
 budget:
   daily_cny_cap: 5.0
 
-
-memory:
-  reasoning_effort: low
-
 schedule:
-  forget_cron:       "0 4 * * *"
-  backup_cron:      "30 4 * * *"
-  cache_clean_cron: "0 5 * * *"
-  report_cron:      "0 9 * * *"
+  nightly_cron: "30 2 * * *"
+  report_cron:  "0 0 * * *"
   backup_keep: 14
   napcat_cache_days: 7
+
+agreement:
+  version: 1
+  file: agreement.txt
+
+# Borrow the real prompt texts instead of copying every file into fixtures;
+# the path is relative to this fixture config directory.
+prompts_dir: ../../../config/prompts

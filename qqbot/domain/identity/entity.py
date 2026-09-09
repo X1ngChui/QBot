@@ -67,7 +67,6 @@ class Entity:
         return cls(id=uuid.uuid4(), entity_type=entity_type, canonical_name=name)
 
 
-
 @dataclass(frozen=True, slots=True)
 class IdentityAccount:
     """A platform account. Strong identity: the platform guarantees the number is unique

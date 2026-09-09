@@ -185,14 +185,12 @@ def set_embedding(embed) -> None:
 async def episode_lookup(group_id: str, question: str) -> str:
     """Episodic memory searched on demand, rendered. "" when nothing is close.
 
-    On demand is the only way the past reaches a reply: episodes used to be
-    pushed per turn, filtered by who was present, and the pushed block - sitting
-    right next to the incoming message - once captured an elliptical question
-    that actually referred to the conversation. The model pulls when it wants
-    the past; what arrives uninvited stays limited to what every reply needs.
-    Filtered by nothing but the group: cross-person questions - who promised
-    what, when something was decided - are precisely about people the current
-    turn does not contain.
+    On demand is the only way the past reaches a reply: a block pushed per turn
+    sits right next to the incoming message, where an elliptical question
+    resolves against it instead of against the conversation. The model pulls
+    when it wants the past. Filtered by nothing but the group: cross-person
+    questions - who promised what, when something was decided - are precisely
+    about people the current turn does not contain.
 
     Each recalled episode comes framed by its neighbours in group time
     (retrieval.episode_context each way): an episode summarises one stretch of

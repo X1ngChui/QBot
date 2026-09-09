@@ -1,10 +1,18 @@
 """Scheduled jobs. APScheduler via nonebot-plugin-apscheduler.
 
-  memory extraction      02:30, the day's single drain
-  forgetting             04:00
-  pg_dump -Fc -> NAS     04:30, keep 14
-  napcat media cleanup   05:00, older than 7 days
-  daily report to owners 09:00
+  nightly pipeline       02:30 - extraction drain, then decay, then pg_dump
+                         (keep 14), then napcat media cleanup, in that order
+  daily report to owners 00:00 - the moment the ledger day closes
+
+The night is one job on purpose. The stages depend on each other softly -
+decay must see the day's confirmations land before it retires anything, and
+the dump should carry what the night learned - but extraction drains through
+the job queue with retries backing off up to an hour, so independent crons
+only ever ordered the stages by wall-clock luck. The pipeline waits for the
+queue to empty between stages instead, with a deadline per wait so one stuck
+job delays the night rather than cancelling it. Accepted cost: a restart
+mid-pipeline skips that night's remaining stages - decay catches up the next
+night, and the report's backup-age line is the alarm for a skipped dump.
 """
 
 from __future__ import annotations
@@ -24,15 +32,16 @@ from ..core import errors, output
 from ..core.budget import hit_split
 from ..core.state import REGISTRY
 from ..db import repo
+from ..db.pool import dsn
 from ..providers import providers
 from ..providers.base import Kind
 from ..repositories import JobQueue
 from ..repositories.job import JobType
-from ..db.pool import dsn
 from ..settings import config
 from ..util import now_local, read_secret, tz
 
 log = logging.getLogger("qqbot.tasks")
+
 
 def _trigger(expr: str) -> "CronTrigger":
     """One parser for registration and validation alike: settings validates these
@@ -44,48 +53,74 @@ def _trigger(expr: str) -> "CronTrigger":
     return CronTrigger.from_crontab(expr, timezone=tz())
 
 
-# -- 02:30 memory extraction ------------------------------------------------
+# -- the nightly pipeline ----------------------------------------------------
+
+#: How long each drain-wait may take before the pipeline moves on anyway.
+#: Extraction's worst honest night is MAX_PASSES model calls per group plus
+#: retry backoff capped at an hour; three hours covers that, and moving on
+#: late beats a night with no backup. Decay is one UPDATE per group.
+EXTRACT_DRAIN_DEADLINE = timedelta(hours=3)
+DECAY_DRAIN_DEADLINE = timedelta(minutes=30)
+#: Queue poll cadence during a drain-wait. Nobody is waiting at 03:00.
+DRAIN_POLL_SEC = 30.0
 
 
-async def nightly_extraction() -> None:
-    """Queue the day's one extraction drain for every known group.
-
-    The single event point (the owner's design): messages are only archived
-    during the day, and this is where they are read - oldest first, in chunks
-    cut at conversation gaps, at off-peak prices by virtue of the hour. The
-    worker drains until the unread floor, so one job per group covers however
-    much the day held. Freshness is the accepted price: the reply path's window
-    is the immediate context, and what extraction learns was always the past.
-    """
+async def _queue_groups() -> list[str]:
     scopes = ({str(g) for g in await repo.groups_with_state()}
               | {st.group_id for st in REGISTRY.all()})
+    return [g for g in sorted(scopes) if not g.startswith("_")]
+
+
+async def _drain_wait(queue: JobQueue, deadline: timedelta, stage: str) -> None:
+    """Block until the job queue is empty of live work, or the deadline passes.
+
+    Pending includes jobs sitting out a retry backoff - that is the point: the
+    next stage must not start while this stage's work can still land. On the
+    deadline the pipeline logs and continues; a wedged job already has the
+    report's queue-depth line as its alarm, and holding the backup hostage to
+    it would turn one failure into two.
+    """
+    started = now_local()
+    while now_local() - started < deadline:
+        depth = await queue.depth()
+        if not any(depth.get(k) for k in ("pending", "running")):
+            return
+        await asyncio.sleep(DRAIN_POLL_SEC)
+    log.error("nightly: %s stage still has live jobs after %s, moving on",
+              stage, deadline)
+
+
+async def nightly() -> None:
+    """The night's work, in dependency order: extract, decay, backup, sweep.
+
+    One pipeline instead of four crons, because the order is load-bearing and
+    a clock cannot enforce it: decay must not retire a fact whose confirmation
+    is still queued behind an extraction retry, and the dump should carry what
+    the night learned. Each stage waits for the queue to empty (with a
+    deadline) before the next begins.
+
+    Extraction is the single event point: messages are only archived during the
+    day, and this is where they are read - oldest first, in chunks cut at
+    conversation gaps, at off-peak prices by virtue of the hour. The worker
+    drains until the unread floor, so one job per group covers however much the
+    day held. Freshness is the accepted price: the reply path's window is the
+    immediate context, and what extraction learns was always the past.
+
+    Decay is free (one UPDATE per group, no model call) and runs on schedule
+    rather than on traffic, because the entire point is to let go of what
+    stopped being said.
+    """
     queue = JobQueue("nightly")
-    for gid in sorted(scopes):
-        if gid.startswith("_"):
-            continue
+
+    for gid in await _queue_groups():
         try:
             await queue.submit(JobType.EXTRACT_MEMORY, {"group_id": int(gid)},
                                priority=1)
         except Exception:
             log.exception("could not queue extraction for group %s", gid)
+    await _drain_wait(queue, EXTRACT_DRAIN_DEADLINE, "extraction")
 
-
-# -- 04:00 forgetting -------------------------------------------------------
-
-
-async def forget_stale_memory() -> None:
-    """Let each group forget what nothing has confirmed lately.
-
-    Free - it only queues decay jobs, no model call - and it has to run on a schedule
-    rather than on traffic, because the entire point is to let go of what stopped being
-    said.
-    """
-    scopes = ({str(g) for g in await repo.groups_with_state()}
-              | {st.group_id for st in REGISTRY.all()})
-    queue = JobQueue("nightly")
-    for gid in sorted(scopes):
-        if gid.startswith("_"):
-            continue
+    for gid in await _queue_groups():
         try:
             await queue.submit(JobType.DECAY, {"group_id": int(gid)})
         except Exception:
@@ -95,9 +130,15 @@ async def forget_stale_memory() -> None:
             log.info("purged %d finished jobs older than 30 days", n)
     except Exception:
         log.exception("job purge failed")
+    await _drain_wait(queue, DECAY_DRAIN_DEADLINE, "decay")
+
+    # The paid and destructive stages are behind the waits; these two are
+    # plain local work and each guards itself.
+    await backup()
+    await clean_napcat_cache()
 
 
-# -- 04:30 backup -----------------------------------------------------------
+# -- backup (nightly stage 3) ------------------------------------------------
 
 
 async def backup() -> None:
@@ -147,7 +188,7 @@ async def backup() -> None:
              target.name, target.stat().st_size / 1e6)
 
 
-# -- 05:00 napcat media cache cleanup ---------------------------------------
+# -- napcat media cache cleanup (nightly stage 4) ----------------------------
 
 
 def _sweep_dir(root: Path, cutoff: float) -> tuple[int, int]:
@@ -187,7 +228,7 @@ async def clean_napcat_cache() -> None:
     log.info("napcat cache cleanup: %d files, %.1f MB freed", total_n, total_b / 1e6)
 
 
-# -- 09:00 daily report -----------------------------------------------------
+# -- daily report (its own trigger) ------------------------------------------
 
 
 async def daily_report() -> None:
@@ -211,7 +252,10 @@ async def daily_report() -> None:
         lines.append(f"前缀缓存命中率 {cache}")
 
     img = await repo.image_cache_stats()
-    lines.append(f"图片缓存 {img['n']} 条，累计命中 {img['hits']} 次")
+    # The refusal count is the one worth watching: those rows describe nothing, and a
+    # number that climbs says the vision backend is turning away more than it looks at.
+    refused = f"，其中后端拒看 {img['refused']} 条" if img.get("refused") else ""
+    lines.append(f"图片缓存 {img['n']} 条，累计命中 {img['hits']} 次{refused}")
 
     used = await repo.month_calls(Kind.SEARCH.value, providers().search.name)
     lines.append(f"搜索额度 本月 {used}/{cfg.llm.search.monthly_quota}")
@@ -284,13 +328,10 @@ async def daily_report() -> None:
 
 def register() -> None:
     s = config().default.schedule
-    # misfire_grace_time: APScheduler's default is seconds - a loop busy at 04:30
-    # would silently skip that night's backup. An hour of grace runs it late
-    # instead; coalesce folds a pile-up into one run.
+    # misfire_grace_time: APScheduler's default is seconds - a loop busy at the
+    # trigger moment would silently skip that night. An hour of grace runs it
+    # late instead; coalesce folds a pile-up into one run.
     common = {"replace_existing": True, "misfire_grace_time": 3600, "coalesce": True}
-    scheduler.add_job(nightly_extraction, _trigger(s.extract_cron), id="extract", **common)
-    scheduler.add_job(forget_stale_memory, _trigger(s.forget_cron), id="forget", **common)
-    scheduler.add_job(backup, _trigger(s.backup_cron), id="backup", **common)
-    scheduler.add_job(clean_napcat_cache, _trigger(s.cache_clean_cron), id="cache_clean", **common)
+    scheduler.add_job(nightly, _trigger(s.nightly_cron), id="nightly", **common)
     scheduler.add_job(daily_report, _trigger(s.report_cron), id="report", **common)
     log.info("scheduled jobs registered")

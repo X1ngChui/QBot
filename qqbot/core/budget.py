@@ -30,9 +30,8 @@ log = logging.getLogger("qqbot.budget")
 
 
 class Scope:
-    """Money for one operation. Charged by `Budget.record` as the calls inside it are
-    booked; the operation reads `remaining` and `can_afford` to decide what it may still
-    do."""
+    """Money for one operation, charged by `Budget.record` as the calls inside it
+    are booked."""
 
     __slots__ = ("cap", "spent")
 
@@ -41,11 +40,16 @@ class Scope:
         self.spent = 0.0
 
     @property
-    def remaining(self) -> float:
-        return max(0.0, self.cap - self.spent)
+    def exhausted(self) -> bool:
+        """Whether this scope has spent its cap.
 
-    def can_afford(self, cny: float) -> bool:
-        return self.spent + cny <= self.cap
+        A reading of money already spent, never a forecast of the next call.
+        Forecasting needs a price for the model, so a model the price table
+        does not know fails the forecast on every call - which stops the work
+        without spending anything at all, and looks nothing like a budget
+        problem from the outside.
+        """
+        return self.spent >= self.cap
 
     def charge(self, cny: float) -> None:
         self.spent += cny
@@ -147,9 +151,8 @@ class Budget:
             # Not re-raised: the call it is booking has already happened and been paid
             # for, and killing the reply afterwards would not unspend the money. But it is
             # logged as an error rather than a note, because what is now wrong is the
-            # spend total - and therefore the daily cap, /stats and the report. A ledger
-            # that quietly stops accepting rows reads exactly like a quiet day (a real
-            # incident, not a hypothetical).
+            # spend total - and therefore the daily cap, /stats and the report. A
+            # ledger that quietly stops accepting rows reads exactly like a quiet day.
             log.exception("cost_ledger write failed: today's spend is now understated, "
                           "and the daily cap is measuring from the wrong number")
         return cny

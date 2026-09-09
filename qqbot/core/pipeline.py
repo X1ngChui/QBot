@@ -36,8 +36,8 @@ from .budget import BUDGET
 from .command_catalog import PREFIXES as COMMANDS
 from .media import MEDIA
 from .members import MEMBERS
-from .segments import ImageRef, ParsedMessage, parse_segments
 from .ratelimit import DedupSet
+from .segments import ImageRef, ParsedMessage, parse_segments
 from .state import REGISTRY, ChatMsg
 
 log = logging.getLogger("qqbot.pipeline")
@@ -57,13 +57,12 @@ async def note_console_reply(*, group_id: str | int, self_id: str, text: str,
     """A command's answer, entered into the window and the archive like any
     other line the bot speaks.
 
-    The console used to answer off the record: /who's card or /stats' table
-    landed in the group but reached neither the window nor L0, so the very
-    next question about it ("what does that note mean?") met a model that had
-    never seen it - the one speaker in the room whose words vanished. Both writes
-    mirror the engine's own send path. A missing platform id falls back to a
-    synthetic one; that only costs the quote-pointer render if someone
-    replies to that exact message.
+    Off the record, /who's card or /stats' table would land in the group but reach
+    neither the window nor L0, and the next question about it ("what does that note
+    mean?") would meet a model that had never seen it - the one speaker in the room
+    whose words vanish. Both writes mirror the engine's own send path. A missing
+    platform id falls back to a synthetic one, which costs only the quote-pointer
+    render if someone replies to that exact message.
     """
     now = now_local()
     mid = message_id or f"cmd-{uuid.uuid4().hex[:12]}"
@@ -150,9 +149,9 @@ class Gateway:
             raise
         # A blocked account is NOT dropped here: its messages arrive, archive and
         # feed memory like anyone's, so the window stays coherent around them - a
-        # hole where a person used to be reads as broken context (the owner's
-        # call; the price is that a blocked account still feeds memory). The one
-        # thing withheld is the reply, at the dispatch gate.
+        # hole where a person used to be reads as broken context. The price is that
+        # a blocked account still feeds memory; the one thing withheld is the reply,
+        # at the dispatch gate.
         segments = [
             {"type": seg.type, "data": dict(seg.data)} for seg in event.get_message()
         ]
@@ -268,7 +267,7 @@ class Gateway:
         # no await sits between st.add above and this line, so the slice ends
         # exactly at the message being answered, and whatever arrives while the
         # task is generating can neither leak in nor steal the reply's target.
-        window = prompt.history_window(st, [msg], cfg)
+        window = prompt.history_window(st, [msg])
         task = asyncio.create_task(self._reply(bot, group_id, item, decision, window))
         self._replies.add(task)
         task.add_done_callback(self._replies.discard)
@@ -492,7 +491,7 @@ class Gateway:
         one that has already fallen out of the window would be paid for and never seen.
         """
         stale = [
-            m for m in prompt.history_window(st, batch, cfg)
+            m for m in prompt.history_window(st, batch)
             if m.pending is not None and not m.is_bot
         ]
         # Each attempt owns its own persistence and survives this wait; `pending`

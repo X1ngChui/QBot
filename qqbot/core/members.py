@@ -98,10 +98,10 @@ class MemberDirectory:
                     seqs = await repo.member_seqs(int(group_id), clashing)
                     for qq in clashing:
                         if qq in seqs:
-                            # The namesake tag wears the system brackets: a member
-                            # whose literal card ends in "(3)" used to be
-                            # indistinguishable from a numbered namesake, and the
-                            # reserved pair is what a card can no longer contain.
+                            # The namesake tag wears the system brackets, which a
+                            # card cannot contain: in parentheses it would be
+                            # indistinguishable from a member whose literal card
+                            # ends in "(3)".
                             table[qq] = table[qq] + sysmark(f"同名{seqs[qq]}")
                 except Exception as e:
                     log.warning("group %s: namesake numbering unavailable, "

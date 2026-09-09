@@ -70,10 +70,10 @@ class QuotaExhausted(RuntimeError):
     """A capability's free allowance for the period is used up.
 
     Raised instead of billing, and it must propagate: a limit reached means the reply
-    is dropped (the owner's rule), never answered in degraded form - so a backend must
-    raise this rather than return an in-band message, and no handler between here and
-    the engine may swallow it. Distinct from a transport failure, which stays a tool
-    answer: a broken network is an error to talk around, not a limit to respect."""
+    is dropped, never answered in degraded form - so a backend must raise this rather
+    than return an in-band message, and no handler between here and the engine may
+    swallow it. Distinct from a transport failure, which stays a tool answer: a broken
+    network is an error to talk around, not a limit to respect."""
 
 
 @dataclass(frozen=True)
@@ -163,18 +163,18 @@ class TextModel(Capability):
         cfg: TextCfg,
         tools: list[dict] | None = None,
         max_tokens: int | None = None,
-        timeout: float | None = None,
         effort: str | None = None,
         kind: str = "reply",
         group_id: str | None = None,
     ) -> ChatResult:
-        """Run one completion.
+        """Run one completion. Model, deliberation grade and timeout come from `cfg`,
+        so a caller with different needs passes a different config rather than a pile
+        of exceptions.
 
-        `effort` is the deliberation grade for this call - "off", "low", "high" or
-        "max" - overriding cfg.reasoning_effort when set; None means the config
-        decides. A request, not a guarantee: backends that cannot deliberate ignore
-        it, and callers must not depend on it for correctness - only for cost,
-        latency and answer depth.
+        `effort` overrides cfg.reasoning_effort for the one call, and exists for
+        diagnostics that must pin a grade regardless of configuration. A request,
+        not a guarantee: backends that cannot deliberate ignore it, and no caller
+        may depend on it for correctness - only for cost, latency and depth.
         """
 
 

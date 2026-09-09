@@ -28,7 +28,6 @@ _ASR_PRICES = {
 _ASR_UNKNOWN = Rate("second", per_unit=0.001, source="pessimistic guess")
 
 
-
 class DashScopeAsr(OpenAICompatAsr):
     name = "dashscope"
 

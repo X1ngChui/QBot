@@ -408,6 +408,19 @@ CREATE TABLE IF NOT EXISTS image_cache (
     -- reply prompts to show the model the actual pixels; NULL when never uploaded, and
     -- stale once the backend's retention lapses - readers treat it as a hint.
     file_id     VARCHAR(64),
+    -- When the description was written, which is not when the row was last used.
+    -- The describing path treats one older than llm.vision.description_ttl_days as
+    -- a miss and pays to write a fresh one: models improve, and a vendor can put a
+    -- better model behind an unchanged id, so age is the only thing that tracks
+    -- description quality from here. NULL means "written before this column
+    -- existed" and counts as expired. Free paths ignore it - a stale description
+    -- still beats a bare marker when nothing may be spent.
+    described_at TIMESTAMPTZ,
+    -- The description is a placeholder standing in for a picture the backend's
+    -- content filter declined to look at, not something it saw. Expires on the same
+    -- clock as any other description: a different backend, or the same one with
+    -- different rules, may well look at it.
+    refused     BOOLEAN     NOT NULL DEFAULT FALSE,
     hit_count   BIGINT      NOT NULL DEFAULT 0,
     last_seen   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

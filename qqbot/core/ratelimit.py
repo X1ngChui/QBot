@@ -20,12 +20,6 @@ class SlidingWindow:
         while self._hits and now - self._hits[0] > self.window:
             self._hits.popleft()
 
-    def allow(self, limit: int | None = None) -> bool:
-        """Check whether quota remains, without consuming it."""
-        now = time.monotonic()
-        self._trim(now)
-        return len(self._hits) < (self.limit if limit is None else limit)
-
     def take(self, limit: int | None = None) -> bool:
         """Consume one slot if quota remains."""
         now = time.monotonic()

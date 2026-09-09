@@ -37,6 +37,7 @@ import asyncio
 import base64
 import logging
 import os
+from datetime import timedelta
 from pathlib import Path
 
 import httpx
@@ -44,15 +45,15 @@ import httpx
 from ..db import repo
 from ..providers import providers
 from ..providers.openai_compat import NEVER_BILLED
-from .budget import BUDGET
-from ..settings import Settings, ptext
 from ..services import UnknownAccount
+from ..settings import Settings, VisionCfg, ptext
 from ..util import defang, sysmark, why
 from .botapi import BotApi
+from .budget import BUDGET
 from .members import MEMBERS
 from .output import strip_markdown
-from .retrieval import directory
 from .ratelimit import SlidingWindow
+from .retrieval import directory
 from .segments import (
     AtRef,
     AudioRef,
@@ -116,6 +117,17 @@ _REFUSAL_MARKERS = (
 def _is_refusal(exc: Exception) -> bool:
     text = str(exc).lower()
     return any(m in text for m in _REFUSAL_MARKERS)
+
+
+def _ttl(vcfg: VisionCfg) -> timedelta | None:
+    """How current a stored description has to be for the paid path to reuse it.
+
+    None where expiry is switched off. Only the describing call asks: it is the one
+    that can afford to replace what it rejects.
+    """
+    days = vcfg.description_ttl_days
+    return timedelta(days=days) if days else None
+
 
 class MediaProcessor:
     def __init__(self) -> None:
@@ -218,6 +230,10 @@ class MediaProcessor:
         database - that is the line between the two files, and a cache lookup is on this
         side of it. It is the free half of the arrival pass, and what makes a picture
         quoted from earlier in the same group readable without spending anything.
+
+        Deliberately does not ask how old the description is. Expiry means "worth
+        paying to describe again", and nothing on this path may pay - so here an aged
+        description is served as it stands, which beats a bare marker.
         """
         return await repo.image_cache_get(ref.key) if ref.key else None
 
@@ -279,8 +295,9 @@ class MediaProcessor:
         client supplies: for a custom sticker that summary is a placeholder naming the
         category rather than saying what is drawn - and the joke in a sticker is the
         drawing. This is affordable because stickers repeat: the cache keys on emoji_id,
-        so each distinct sticker is described once and every later use is free. The
-        summary stays as the fallback for when the image cannot be fetched.
+        so each distinct sticker is described once and every later use is free until
+        that description ages out (llm.vision.description_ttl_days). The summary stays
+        as the fallback for when the image cannot be fetched.
         """
         if ref.key and (flight := self._describing.get(ref.key)) is not None:
             return await flight
@@ -304,7 +321,9 @@ class MediaProcessor:
         fallback = sysmark(f"{label}:{ref.summary}") if ref.summary else None
 
         if ref.key:
-            cached = await repo.image_cache_get(ref.key)
+            # The paid path is the one that asks for a *current* description: an
+            # aged-out one is a miss here, and this call is what pays to replace it.
+            cached = await repo.image_cache_get(ref.key, max_age=_ttl(vcfg))
             if cached:
                 return cached
 
@@ -342,7 +361,8 @@ class MediaProcessor:
                 # failures someone actually has to act on.
                 log.info("vision backend declined an image; recording it as unseen")
                 if ref.key:
-                    await repo.image_cache_put(ref.key, fallback or sysmark(label))
+                    await repo.image_cache_put(ref.key, fallback or sysmark(label),
+                                               refused=True)
                 return fallback
             log.warning("vision model call failed: %s", why(e))
             return retry_later
@@ -530,7 +550,8 @@ class MediaProcessor:
             return raw
         return await self._nested(segs, bot=bot, group_id=group_id, self_id=self_id)
 
-    async def read_forward(self, ref: ForwardRef, *, bot: BotApi, group_id: str, self_id: str) -> str | None:
+    async def read_forward(self, ref: ForwardRef, *, bot: BotApi, group_id: str,
+                           self_id: str) -> str | None:
         try:
             res = await bot.call_api("get_forward_msg", message_id=ref.ident)
         except Exception as e:

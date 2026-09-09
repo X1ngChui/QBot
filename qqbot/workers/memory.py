@@ -71,9 +71,6 @@ def transcript_legend() -> str:
     when the worker is built. The extract_legend_note paragraph is one the reply path
     does not need: these markers are annotations this system wrote, not things a
     member typed - without it the model records that the group can send pictures.
-    (tone_rules used to ride along here unlabelled; it now enters through the
-    extractor's own composition, under its heading and with the extract-side
-    consequence note.)
     """
     return ptext("legend") + "\n\n" + ptext("extract_legend_note")
 
@@ -338,7 +335,7 @@ class MemoryWorker:
     async def extract(self, group_id: int, *, force: bool = False) -> int:
         """Drain the unread transcript in gap-aligned chunks. One model call each.
 
-        The nightly single event point (schedule.extract_cron): the whole day is
+        The nightly single event point (schedule.nightly_cron): the whole day is
         read here, oldest first, each chunk cut where a conversation ended. Two
         gates per pass, in the order that costs least to check: the day's budget,
         then whether enough is unread to be worth a pass at all (DRAIN_FLOOR;
@@ -428,14 +425,14 @@ class MemoryWorker:
         nickname could reach the prompt.
 
         An account with no identity is the bot itself: every member gets an entity
-        at ingest, and nothing ever creates one for the bot. Its lines used to be
-        dropped whole, which kept the self-loop shut but fed the extractor
-        one-sided conversations - "like you said" pointed at a reply that did not
-        exist. Now they render with the self marker after the name, codeless and
-        outside the roster, and stay out of evidence by construction: their
-        SourceLine is own=True, source_of skips it, and a candidate quoting one
-        fails validation. The model reads both halves; only the members' half
-        counts.
+        at ingest, and nothing ever creates one for the bot. Its lines render with
+        the self marker after the name, codeless and outside the roster, and stay
+        out of evidence by construction: their SourceLine is own=True, source_of
+        skips it, and a candidate quoting one fails validation. Dropping them
+        instead would keep the self-loop just as firmly shut, but would feed the
+        extractor one-sided conversations in which "like you said" points at a
+        reply that does not exist. The model reads both halves; only the members'
+        half counts.
         """
         codes: dict[int, uuid.UUID] = {}
         by_account: dict[str, int] = {}

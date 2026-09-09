@@ -109,8 +109,6 @@ async def check_text() -> None:
         record(label, False, repr(e))
 
 
-
-
 async def check_vision() -> None:
     cfg = config().default.llm.vision
     label = f"vision, base64 inline ({cfg.model})"

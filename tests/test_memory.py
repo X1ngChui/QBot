@@ -42,6 +42,10 @@ from _stubs import FakeEmbedding
 fails = []
 G = 9001
 CALLS = []
+#: cfg.model of every FakeText call - what pins the extraction model override.
+SEEN_MODELS = []
+#: (model, grade, timeout) of every extraction call, from the cfg it was handed.
+SEEN_EXTRACT_CFG = []
 #: What the model was actually handed, so the test can check what it was told rather than
 #: only what came back.
 LAST_PROMPT = [""]
@@ -65,12 +69,17 @@ class FakeText(TextModel):
         return Rate("Mtoken", in_hit=0.02, in_miss=1.0, out=2.0)
 
     async def chat(self, messages, *, cfg, tools=None,
-                   max_tokens=None, timeout=None, effort=None, kind="reply", group_id=None):
+                   max_tokens=None, effort=None, kind="reply", group_id=None):
         CALLS.append(kind)
+        SEEN_MODELS.append(cfg.model)
         LAST_PROMPT.append(messages[-1]["content"])
-        # Extraction passes its own configured grade (memory.reasoning_effort); pinned
-        # because losing it is only ever noticed as a bill that grew.
-        assert kind != "extract" or effort is not None, "extract must carry its grade"
+        if kind == "extract":
+            SEEN_EXTRACT_CFG.append(
+                (cfg.model, cfg.reasoning_effort, cfg.timeout_sec))
+        # Nothing overrides the grade at the call: a use of the text model carries
+        # its settings in its own config, so a caller that needs different ones
+        # passes a different config.
+        assert effort is None, "the grade belongs to the config, not the call"
         return ChatResult(text="", model=self.MODEL, tool_calls=[
             tool("record_alias", alias="老周", account=1, kind="nickname",
                  quote="老周你那个切片做完没"),
@@ -764,6 +773,27 @@ async def main():
     check("a legacy candidate (no stored size) replays the old fixed window",
           len(legacy) == LEGACY_WINDOW and legacy[-1]["id"] == anchor,
           f"{len(legacy)} rows")
+
+    # Extraction is a use of the text model with its own model, grade and timeout,
+    # while the shared wiring (endpoint, key, backend, concurrency) stays the reply
+    # path's. The grade and timeout hold for every extraction above; the model
+    # override is probed here, last, because it adds an extract call the counting
+    # assertions above must not see.
+    _txt = config().default.llm.text
+    check("extraction carries its own grade and timeout, not the reply path's",
+          SEEN_EXTRACT_CFG
+          and all(g == _txt.extract.reasoning_effort and t == _txt.extract.timeout_sec
+                  for _m, g, t in SEEN_EXTRACT_CFG)
+          and _txt.extract.timeout_sec != _txt.timeout_sec,
+          str(SEEN_EXTRACT_CFG[:2]))
+    from qqbot.services import ExtractionInput as _EIovr, MemoryExtractor as _MEovr
+    _covr = config().default.model_copy(deep=True)
+    _covr.llm.text.extract.model = "flash-probe"
+    await _MEovr(_covr, legend="x").extract(_EIovr(
+        group_id=G, transcript="", roster="", account_codes={}, lines=()))
+    check("the extract model override moves extraction alone",
+          SEEN_MODELS[-1] == "flash-probe" and SEEN_MODELS[0] == _txt.model,
+          f"first={SEEN_MODELS[0]} last={SEEN_MODELS[-1]}")
 
     await close_pool()
     print()

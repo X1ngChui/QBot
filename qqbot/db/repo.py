@@ -7,9 +7,9 @@ extraction worker's drain queries) issue their own SQL where the query is the lo
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
-from ..util import today_local, tz_sql
+from ..util import now_local, today_local, tz_sql
 from .pool import pool
 
 # -- raw events -------------------------------------------------------------
@@ -66,6 +66,8 @@ async def ensure_schema() -> None:
                ('raw_event','plain_text'),
                ('group_state','first_seen_at'),
                ('image_cache','file_id'),
+               ('image_cache','described_at'),
+               ('image_cache','refused'),
                ('cost_ledger','day'),
                ('cost_ledger','user_id'),
                ('group_blocklist','blocked_until')
@@ -138,27 +140,53 @@ async def recent_messages(group_id: int, *, limit: int) -> list:
     return list(reversed(rows))
 
 
-async def image_cache_get(key: str) -> str | None:
+async def image_cache_get(key: str, *, max_age: timedelta | None = None) -> str | None:
     """The stored description, or None while there is none yet. A row whose upload
-    landed before its describing call holds '' - reported as a miss, not a hit."""
+    landed before its describing call holds '' - reported as a miss, not a hit.
+
+    `max_age` asks only for a description still worth trusting: an older one (or one
+    written before described_at existed) is reported as a miss so the caller pays to
+    write a fresh one. Callers that may not spend leave it unset - outside the paid
+    describing path a stale description still beats a bare marker.
+
+    The sighting counts either way: hit_count measures how often a picture comes
+    back, which is what decides whether describing it again is worth anything.
+    """
     row = await pool().fetchrow(
         """UPDATE image_cache SET hit_count = hit_count + 1, last_seen = now()
-            WHERE key=$1 RETURNING description""",
+            WHERE key=$1 RETURNING description, described_at""",
         key,
     )
-    return (row["description"] or None) if row else None
+    if not row:
+        return None
+    if max_age is not None:
+        fresh_from = now_local() - max_age
+        if row["described_at"] is None or row["described_at"] < fresh_from:
+            return None
+    return row["description"] or None
 
 
-async def image_cache_put(key: str, description: str) -> None:
-    """Store the description. Overwrites on conflict: the row may have been created by
-    the upload half with an empty description, and the same key is the same picture -
-    a fresher describing call is never worse than the placeholder it replaces."""
+async def image_cache_put(key: str, description: str, *, refused: bool = False) -> None:
+    """Store the description and stamp when it was written.
+
+    Overwrites on conflict: the row may have been created by the upload half with an
+    empty description, or hold one this call was made to replace because it had aged
+    out - the same key is the same picture, and the newer description is the one the
+    current model wrote.
+
+    `refused` marks a placeholder standing in for a picture the backend declined to
+    look at, so the two are told apart in the report. It expires like any other
+    description; a later backend may well look at it.
+    """
     await pool().execute(
-        """INSERT INTO image_cache (key, description) VALUES ($1,$2)
+        """INSERT INTO image_cache (key, description, refused, described_at)
+                VALUES ($1,$2,$3,now())
            ON CONFLICT (key) DO UPDATE
-             SET description = EXCLUDED.description, last_seen = now()""",
+             SET description = EXCLUDED.description, refused = EXCLUDED.refused,
+                 described_at = now(), last_seen = now()""",
         key,
         description,
+        refused,
     )
 
 
@@ -182,9 +210,11 @@ async def image_cache_set_file(key: str, file_id: str) -> None:
 
 async def image_cache_stats() -> dict:
     row = await pool().fetchrow(
-        "SELECT count(*) AS n, COALESCE(sum(hit_count),0) AS hits FROM image_cache"
+        """SELECT count(*) AS n, COALESCE(sum(hit_count),0) AS hits,
+                  count(*) FILTER (WHERE refused) AS refused
+             FROM image_cache"""
     )
-    return dict(row) if row else {"n": 0, "hits": 0}
+    return dict(row) if row else {"n": 0, "hits": 0, "refused": 0}
 
 
 # -- group_state (per-group switches and watermarks) ------------------------

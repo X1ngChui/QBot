@@ -211,16 +211,6 @@ TOOLS = [
     },
 ]
 
-#: How long one extraction may take. Deliberately far above the reply path's 30s: that
-#: ceiling exists because somebody is waiting in a chat window, and here nobody is. One
-#: call reads up to a window of messages (settings.EXTRACT_WINDOW, 120) and answers
-#: with a dozen tool calls, which is simply slower
-#: than answering one line - and a timeout costs the whole batch, then costs it again on
-#: the retry.
-TIMEOUT_SEC = 120.0
-
-
-
 @dataclass(frozen=True, slots=True)
 class SourceLine:
     """One line of the transcript, and the event it came from."""
@@ -297,7 +287,6 @@ class MemoryExtractor:
         Without it the model reads a picture description as something a person typed, and
         records that the group is able to send pictures.
         """
-        self._cfg = cfg
         # Composed once, at construction: the fixed half lives in the prefix cache for
         # the worker's lifetime, so a prompt override applies from the next restart
         # rather than mid-batch. tone_rules is the discernment core shared with the
@@ -306,6 +295,11 @@ class MemoryExtractor:
         base = (ptext("extract") + "\n\n【群聊语用】\n"
                 + ptext("tone_rules") + "\n\n" + ptext("tone_extract_note"))
         self._prompt = (base + "\n\n" + legend.strip()) if legend.strip() else base
+        # Extraction's own model, grade and timeout on the reply backend's wiring:
+        # same endpoint, same key, its own price tier and its own patience.
+        # Resolved once - like the prompt above, a /reload applies from the next
+        # restart, never mid-batch.
+        self._llm = cfg.llm.text.for_extract()
 
     @property
     def prompt(self) -> str:
@@ -328,14 +322,11 @@ class MemoryExtractor:
                     f"群聊记录：\n{inp.transcript}",
                 ) if p)},
             ],
-            cfg=self._cfg.llm.text,
+            # Model, grade and timeout all come from this one config: extraction is
+            # a use of the text capability with its own settings, not the reply
+            # path's settings with exceptions bolted on at the call.
+            cfg=self._llm,
             tools=TOOLS,
-            timeout=TIMEOUT_SEC,
-            # Extraction's own grade, not the reply path's: the schema and the
-            # Validator carry most of the thinking, so anything above "low" measured
-            # as waste here (~6k thought tokens a pass at the vendor default). If the
-            # rejection rate climbs at "off", the grade is the lever.
-            effort=self._cfg.memory.reasoning_effort,
             kind=Kind.EXTRACT,
             group_id=str(inp.group_id),
         )
@@ -357,14 +348,14 @@ class MemoryExtractor:
                 "record_group_term": CandidateType.GROUP_FACT,
                 "record_group_topic": CandidateType.GROUP_FACT,
                 "record_episode": CandidateType.EPISODE}.get(name)
+        if kind is None:
+            log.warning("group %s: unknown tool %r, dropped", inp.group_id, name)
+            return None
         if kind is CandidateType.GROUP_FACT:
             # Which tool it was is what tells the two group predicates apart; the payload
             # alone cannot, and the consolidator needs to know.
             args = args | {"kind": GROUP_TERM if name == "record_group_term"
                            else GROUP_TOPIC}
-        if kind is None:
-            log.warning("group %s: unknown tool %r, dropped", inp.group_id, name)
-            return None
 
         return Candidate(
             candidate_type=kind,

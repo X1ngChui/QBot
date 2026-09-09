@@ -1,11 +1,10 @@
 """L6, retrieval: episodic memory searched on demand.
 
 The past is pulled, never pushed: episodes reach a reply only through the
-recall_events tool. A per-turn pushed block, participant-filtered, used to live
-here too - it sat right next to the incoming message and once captured an
-elliptical question that referred to the conversation, so it was deleted; what
-the prompt carries uninvited is limited to what every reply needs (the roster
-and the facts, from SQL, inside the cached prefix).
+recall_events tool. A block pushed per turn would sit right next to the incoming
+message, where an elliptical question resolves against it instead of against the
+conversation. What the prompt carries uninvited stays limited to what every reply
+needs - the roster and the facts, from SQL, inside the cached prefix.
 
 Vector search runs only when the model asks (design goal 1): one embedding call
 per tool use, none per message.

@@ -138,7 +138,6 @@ class OpenAICompatChat(TextModel):
         cfg: TextCfg,
         tools: list[dict] | None = None,
         max_tokens: int | None = None,
-        timeout: float | None = None,
         effort: str | None = None,
         kind: str = "reply",
         group_id: str | None = None,
@@ -153,9 +152,8 @@ class OpenAICompatChat(TextModel):
                             messages, cfg=cfg, model=model, tools=tools,
                             max_tokens=max_tokens,
                             effort=effort if effort is not None else cfg.reasoning_effort,
-                            timeout=timeout,
                         ),
-                        timeout=timeout or cfg.timeout_sec,
+                        timeout=cfg.timeout_sec,
                     )
                 break
             except RETRYABLE as e:
@@ -210,7 +208,6 @@ class OpenAICompatChat(TextModel):
         tools: list[dict] | None,
         max_tokens: int | None,
         effort: str,
-        timeout: float | None = None,
     ) -> ChatResult:
         kwargs: dict[str, Any] = {
             "model": model,
@@ -234,14 +231,21 @@ class OpenAICompatChat(TextModel):
             base_url=cfg.base_url, api_key_env=cfg.api_key_env,
             timeout=cfg.timeout_sec, what="text",
         )
-        # Per request, not per client. The client is cached and shared, so raising its own
-        # timeout would rebuild it on every call that wants a different one - and without
-        # this the outer wait_for could never extend anything, because the SDK would have
-        # already aborted at the client's 30s. A background batch reading sixty messages
-        # needs longer than a reply somebody is waiting for.
-        if timeout:
-            kwargs["timeout"] = timeout
+        # Per request, always. The client is cached by endpoint and credential, so its
+        # own timeout is whichever config built it first - and a background batch
+        # reading a hundred messages shares that client with a reply somebody is
+        # waiting for. Without this the SDK would abort at the other use's deadline
+        # and the outer wait_for could never extend anything.
+        kwargs["timeout"] = cfg.timeout_sec
         async for chunk in await client.chat.completions.create(**kwargs):
+            # What actually served the request, which is not always what was asked
+            # for: a vendor may retire an id and route it to its successor. The
+            # ledger and the price lookup follow the served model, so a routed
+            # call bills at the rate it was really charged at - and an unpriced
+            # successor announces itself through the price table's warning
+            # instead of hiding inside a familiar name.
+            if chunk.model:
+                out.model = chunk.model
             if chunk.usage:
                 out.in_hit, out.in_miss, out.out, out.reasoning = self._usage_tokens(
                     chunk.usage.model_dump()

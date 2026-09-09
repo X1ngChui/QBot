@@ -88,10 +88,6 @@ class IdentityResolver:
             raise UnknownAccount(user_id)
         return acc
 
-    async def entity_of(self, user_id: str) -> uuid.UUID | None:
-        acc = await self._repo.account_of(PLATFORM, user_id)
-        return acc.entity_id if acc else None
-
     async def merge(self, loser_account: str, winner_account: str) -> bool:
         """Declare two accounts to be the same person. Owner-triggered only (design
         doc 55).
