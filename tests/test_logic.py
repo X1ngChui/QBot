@@ -66,11 +66,20 @@ check("the default persona is not polluted by the group's extra",
       "这个群专门聊测试" not in base_p.system_prompt)
 
 # ---- strip_markdown
+# The line is what QQ can show. Markup it does not render arrives as the characters
+# themselves and has to go; anything that survives being sent as plain text stays,
+# because a list somebody asked for reads better as a list.
 cases = [
     ("**加粗**测试", "加粗测试"),
     ("# 标题\n正文", "标题\n正文"),
     ("```python\nprint(1)\n```", "print(1)"),
-    ("- 项目一\n- 项目二", "项目一\n项目二"),
+    ("- 项目一\n- 项目二", "- 项目一\n- 项目二"),
+    ("* 项目一\n+ 项目二", "- 项目一\n- 项目二"),
+    ("- 一级\n  * 二级", "- 一级\n  - 二级"),
+    ("1. 第一步\n2. 第二步", "1. 第一步\n2. 第二步"),
+    ("- **CPU**：某型号\n- 内存：32G", "- CPU：某型号\n- 内存：32G"),
+    ("零下 -5 度", "零下 -5 度"),
+    ("---\n分割线上下", "分割线上下"),
     ("看这个[链接](https://x.com)", "看这个链接 https://x.com"),
     ("`code`和***粗斜***", "code和粗斜"),
     ("正常文本不动", "正常文本不动"),

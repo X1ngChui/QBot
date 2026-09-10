@@ -29,7 +29,10 @@ from .core.media import MEDIA
 from .db import close_pool, init_pool
 from .workers import MemoryWorker
 from .db import repo
-#: Imported for its registrations: defining the command handlers is the whole effect.
+# Imported for its registrations: defining the command handlers IS the whole effect, so
+# the name is never read below. This "unused import" is the entire ops console - drop it
+# and every command silently falls through to the reply path, with nothing in the log.
+from .plugins import commands as _commands  # noqa: F401
 from .plugins import tasks
 from .providers import build_default, providers, set_providers
 from .settings import config

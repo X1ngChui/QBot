@@ -1,7 +1,11 @@
 """What is taken back out of a reply before it is sent.
 
 Every rule here exists because the prompt already asks for it, and asking does not hold.
-QQ does not render Markdown, so `**` leaks the bot's identity straight into the chat.
+
+The line this draws is what QQ can show. Markdown is not rendered there, so `**`, `#`,
+backticks and rule lines arrive as the characters themselves and leak the bot's
+formatting into the chat. What survives being sent as plain text is left alone: a
+hyphen bullet reads as a list, and a numbered line reads as a numbered line.
 The history hands the model a number in front of every line - its own included, so that a
 quote can point at one - which is an example it can follow. And a model that wants to call
 a tool it has not been given will write the call out as text instead.
@@ -24,7 +28,12 @@ _IMG = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
 _LINK = re.compile(r"\[([^\]]+)\]\((https?://[^)]+)\)")
 _HEAD = re.compile(r"^\s{0,3}#{1,6}\s+", re.M)
 _QUOTE = re.compile(r"^\s{0,3}>\s?", re.M)
-_BULLET = re.compile(r"^(\s*)[-*+]\s+", re.M)
+#: Bullets are kept, and the two Markdown spellings are folded into the plain hyphen.
+#: A hyphen at the head of a line displays on QQ exactly as it was meant to, so a
+#: genuine list - a build sheet, a few options, the steps of something - reads better
+#: with them than without. An asterisk is the same list wearing Markdown, which is
+#: what QQ cannot show. Numbered lists need no rule: they are ordinary text already.
+_BULLET_MARK = re.compile(r"^(\s*)[*+]\s+", re.M)
 _HR = re.compile(r"^\s*(?:\*\s*){3,}$|^\s*(?:-\s*){3,}$", re.M)
 _BOLD = re.compile(r"(\*{1,3}|_{2,3})(?=\S)(.+?)(?<=\S)\1", re.S)
 _CODE = re.compile(r"`+([^`]+)`+")
@@ -84,7 +93,7 @@ def strip_markdown(text: str) -> str:
     t = _HR.sub("", t)
     t = _HEAD.sub("", t)
     t = _QUOTE.sub("", t)
-    t = _BULLET.sub(r"\1", t)
+    t = _BULLET_MARK.sub(r"\1- ", t)
     for _ in range(3):  # nested emphasis such as ***x***
         new = _BOLD.sub(r"\2", t)
         if new == t:

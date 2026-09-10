@@ -97,7 +97,7 @@ A global `max_concurrency: 3` semaphore at the provider layer; one independent r
 
 ### Output
 
-Only `clean_reply` (strips Markdown, every system marker - line numbers, timestamps, provenance, trace lines, quote pointers, name tags, in both bracket generations - and text-form tool-call markup, with a final pass replacing any leftover reserved brackets); length truncation is applied by the engine before send. There is no other exit.
+Only `clean_reply` (strips the Markdown QQ cannot render - emphasis, headings, code fences, rule lines, link syntax - while leaving what plain text carries on its own: hyphen bullets survive and asterisk ones are folded into hyphens, so a reply that is genuinely a list reads as one; every system marker - line numbers, timestamps, provenance, trace lines, quote pointers, name tags, in both bracket generations - and text-form tool-call markup, with a final pass replacing any leftover reserved brackets); length truncation is applied by the engine before send. There is no other exit.
 
 ## 3. Scope
 

@@ -199,6 +199,22 @@ CASES = [
         "checks": None,  # OBSERVE
     },
     {
+        "name": "list_shaped_answer",
+        "why": "eyeball case: an answer that really is a list should read as one - "
+               "hyphen bullets survive the stripper because QQ shows them, while "
+               "asterisks and headings would arrive as the characters themselves",
+        "window": [
+            _msg("u2", "小北", "预算五千，想自己攒台机器打游戏", 3),
+        ],
+        "trigger": _msg("u1", "阿强", "@我 帮小北开个配置单，各部件写清楚型号", 0),
+        "checks": NO_MARKERS + [
+            ("no emphasis markers survive", lambda t: "**" not in t),
+            ("no heading markers survive",
+             lambda t: not re.search(r"^\s*#{1,6}\s", t, re.M)),
+            ("no code fences survive", lambda t: "```" not in t),
+        ],
+    },
+    {
         "name": "initiative_search",
         "why": "a question the window cannot answer must be searched, not vibed: "
                "the buyer and the model number live only in the archive, and the "
@@ -345,9 +361,11 @@ async def main() -> int:
         verdict, raw = await run_case(case, cfg, persona, bot)
         if verdict.startswith("FAIL"):
             failures += 1
-        shown = (raw[:120] + "…") if len(raw) > 120 else (raw or "<沉默>")
         print(f"[{verdict:>8}] {case['name']}  ({case['why']})")
-        print(f"           {shown!r}")
+        # Printed whole, and line by line: what a reply looks like laid out is half of
+        # what an eyeball case is for, and a repr cut at 120 characters shows neither.
+        for line in (raw or "<沉默>").splitlines() or ["<空>"]:
+            print(f"           | {line}")
 
     spent = await pool().fetchval(
         "SELECT COALESCE(sum(cny),0) FROM cost_ledger WHERE group_id=$1", int(GROUP))

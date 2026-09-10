@@ -51,6 +51,26 @@ def check(name, cond, detail=""):
         fails.append(name)
 
 
+def wiring() -> None:
+    """The handlers reach NoneBot only by plugin.py importing the module they live in.
+
+    Checked in the source rather than by importing it, because importing is the one
+    thing a test cannot do here. Nothing reads the name afterwards, so it looks
+    removable to a person and to a linter alike - and removing it is silent: every
+    command falls through to the reply path, with no error anywhere.
+    """
+    import ast
+    src = (ROOT / "qqbot" / "plugin.py").read_text(encoding="utf-8")
+    imported = {
+        alias.name
+        for node in ast.walk(ast.parse(src)) if isinstance(node, ast.ImportFrom)
+        if (node.module or "").endswith("plugins") for alias in node.names
+    }
+    for mod in ("commands", "tasks"):
+        check(f"plugin.py imports plugins.{mod}, which is what registers it",
+              mod in imported, str(sorted(imported)))
+
+
 def catalogue() -> None:
     """The listing, the routing table and the permission rules. No I/O."""
     # Every documented command must be routed away from the reply pipeline, otherwise
@@ -517,6 +537,7 @@ async def directory_service() -> None:
 
 
 async def main():
+    wiring()
     catalogue()
     await init_pool()
     await reset()
