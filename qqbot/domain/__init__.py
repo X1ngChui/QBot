@@ -1,6 +1,6 @@
 """The domain model: concepts only. It knows nothing of the database or of any model API.
 
-Dependencies point one way (design doc 62):
+Dependencies point one way:
 
     domain  <-  services  <-  repositories  <-  infrastructure
 

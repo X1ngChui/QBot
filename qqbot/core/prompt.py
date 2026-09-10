@@ -1,4 +1,4 @@
-"""Prompt assembly (section 6.2).
+"""Prompt assembly.
 
 The ordering is cost discipline and must not be violated - on the configured text
 backend a prefix-cache hit is ~30x cheaper than a miss:
@@ -13,8 +13,8 @@ from the beginning: anything above a changed block is re-read as well. The const
 so that every group shares that opening span rather than each paying for its own.
 
 Nothing that changes every turn may sit before the history. History is evicted in chunks
-(EVICT_CHUNK) rather than one message per turn: every slide of the window invalidates the
-prefix once, so sliding rarely is most of what there is to win.
+rather than one message per turn: every slide of the window invalidates the prefix once,
+so sliding rarely is most of what there is to win.
 """
 
 from __future__ import annotations
@@ -25,23 +25,13 @@ from ..settings import Persona, Settings, ptext
 from ..util import defang, describe_now, now_local, sysmark
 from .state import ChatMsg, GroupState
 
-#: The history window, in messages. There is no token budget anywhere in the prompt:
-#: money bounds what a reply may spend, and every other block is rendered whole -
-#: persona and group knowledge are owner-edited, the roster and cards are written by
-#: prompts with their own length discipline, and gateway.max_msg_len bounds each
-#: transcript line. These two counts are all that is left, and they serve context
-#: and the cache rather than cost: a prefix token is ~1/30 price, so a wider window
-#: is nearly free per call and every slide is the miss that costs. Hence a chunk
-#: large relative to the window - it keeps slides rare and leaves two chunks
-#: standing after each one. Trajectories are fetched from reply_trace at assembly
-#: and do not consume the count.
-#:
-#: The window is a whole number of chunks rather than its own count, so the multiple
-#: holds by construction: two independent numbers whose ratio drifts is how a window
-#: ends up holding two and a half chunks and nobody can say what a slide leaves.
-EVICT_CHUNK = 30
-WINDOW_CHUNKS = 3
-HISTORY_MSGS = EVICT_CHUNK * WINDOW_CHUNKS
+# The history window is a message count, not a token budget: money bounds what a
+# reply may spend, and every other block is rendered whole. The count and its
+# eviction chunk are config (prompt.window_chunks, prompt.evict_chunk), and the
+# window is their product so the multiple holds by construction. They serve context
+# and the cache rather than cost - a prefix token is ~1/30 price, so a wider window
+# is nearly free per call while every slide is the miss that costs. Trajectories are
+# fetched from reply_trace at assembly and do not consume the count.
 
 #: Section headings. The blocks below answer different questions and carry different
 #: authority; without a marked boundary they read as one undifferentiated wall, and the
@@ -123,7 +113,7 @@ def _guessed_block(profiles: list[dict]) -> str:
     lines = []
     for p in profiles:
         name = defang(p.get("nickname") or p.get("user_id") or "")
-        card = defang((p.get("persona_card") or "")).strip()
+        card = defang(p.get("persona_card") or "").strip()
         if not card:
             continue
         lines.append((str(p.get("user_id") or ""), f"- {name}。{card}"))
@@ -180,7 +170,8 @@ def build_system(
     return "\n\n".join(x for x in blocks if x)
 
 
-def history_window(st: GroupState, batch: list[ChatMsg]) -> list[ChatMsg]:
+def history_window(st: GroupState, batch: list[ChatMsg],
+                   cfg: Settings) -> list[ChatMsg]:
     """The messages that will actually appear in the prompt, oldest first.
 
     Separate from rendering them because the answer is needed before the prompt is
@@ -199,8 +190,9 @@ def history_window(st: GroupState, batch: list[ChatMsg]) -> list[ChatMsg]:
     # A count, not a measurement: with no token budget there is nothing to measure, and
     # the anchor moves only when the window fills - in whole chunks, so the prefix
     # survives many turns between slides.
-    while len(hist) - start > HISTORY_MSGS:
-        start += EVICT_CHUNK
+    chunk = cfg.prompt.evict_chunk
+    while len(hist) - start > chunk * cfg.prompt.window_chunks:
+        start += chunk
 
     st.history_anchor = hist[start].msg_id if start < len(hist) else None
     return hist[start:]
@@ -243,10 +235,40 @@ def numbered(visible: list[ChatMsg]) -> tuple[dict[str, int], dict[str, str]]:
     return nums, marks
 
 
+def numbered_images(visible: list[ChatMsg]) -> tuple[dict[str, list[int]], dict[int, tuple]]:
+    """Give every picture in this prompt a number, oldest first.
+
+    The reply model reads pictures itself now, but only the newest few arrive as pixels
+    (prompt.max_images); the rest are description lines. A number is how the model names
+    one it wants opened, and it has to be a number rather than "the second picture in
+    message #12" because that is two coordinates for one thing and the model gets to
+    pick which it miscounts.
+
+    Numbered oldest first, like the line numbers, so both count the same direction.
+    Returns the numbers per message - the render puts them into the markers - and the
+    map back to (message, index into image_refs) that open_image resolves against.
+    """
+    per_msg: dict[str, list[int]] = {}
+    by_pic: dict[int, tuple] = {}
+    n = 0
+    for m in visible:
+        refs = getattr(m, "image_refs", None) or []
+        if not refs:
+            continue
+        got = []
+        for i in range(len(refs)):
+            n += 1
+            got.append(n)
+            by_pic[n] = (m, i)
+        per_msg[m.msg_id] = got
+    return per_msg, by_pic
+
+
 def render_history(window: list[ChatMsg], nums: dict[str, int],
                    marks: dict[str, str],
                    images: dict[str, list[str]] | None = None,
-                   traces: dict[str, str] | None = None) -> list[dict]:
+                   traces: dict[str, str] | None = None,
+                   pics: dict[str, list[int]] | None = None) -> list[dict]:
     """One chat message per line of transcript; a message that posted pictures carries
     their originals as file blocks right behind its text.
 
@@ -265,77 +287,81 @@ def render_history(window: list[ChatMsg], nums: dict[str, int],
     """
     images = images or {}
     traces = traces or {}
+    pics = pics or {}
     out: list[dict] = []
     for m in window:
         if m.is_bot and (t := traces.get(m.msg_id)):
             out.append({"role": "assistant", "content": t})
         # The bot's own lines never carry the quote mark. Assistant-role content
         # is the strongest imitation signal there is - "what my output looks
-        # like" - and the day these lines started opening with the mark, the
-        # model started writing it into real replies verbatim (two rounds of
-        # prompt instruction did not stop it; the output stripper catches what
-        # remains). Members' lines keep theirs: user-role content teaches reading,
-        # not writing, and the pointer is how a quote is understood at all.
+        # like" - and a mark shown there comes back in real replies verbatim, which
+        # prompt instruction does not reliably stop. Members' lines keep theirs:
+        # user-role content teaches reading, not writing, and the pointer is how a
+        # quote is understood at all.
         line = m.render(seq=nums.get(m.msg_id, 0),
-                        quote="" if m.is_bot else marks.get(m.msg_id, ""))
+                        quote="" if m.is_bot else marks.get(m.msg_id, ""),
+                        pic_nums=pics.get(m.msg_id))
         fids = images.get(m.msg_id)
         out.append({
             "role": "assistant" if m.is_bot else "user",
             "content": ([{"type": "text", "text": line}]
-                        + [{"type": "file", "file_id": f} for f in fids])
+                        + [{"type": "image", "id": f} for f in fids])
             if fids else line,
         })
     return out
 
 
-PROMPT_IMAGE_MAX_AGE = timedelta(days=7)
-
-#: Sanity rail on originals per prompt, kept newest-first. Not a layout budget: images
-#: sit inside the messages that posted them, and the window itself is the real bound -
-#: this only stops a sticker-flood day from carrying hundreds of 384-token blocks into
-#: every reply. When it binds, the oldest pictures fall back to their description
-#: lines, which also means their messages change shape and cost the cache once - the
-#: rail is set to cover "the pictures being talked about" - people discuss what was
-#: just posted - while keeping the worst case around 3k input tokens.
-MAX_PROMPT_IMAGES = 8
+#: How many original pictures a prompt carries and how old they may be is config
+#: (prompt.max_images, prompt.image_max_age_days). Not a layout budget: pictures sit
+#: inside the messages that posted them and the window is the real bound - the cap
+#: only stops a sticker-flood day from carrying hundreds of blocks into every reply,
+#: and when it binds the oldest fall back to their description lines.
 
 
 def attached_images(window: list[ChatMsg], batch: list[ChatMsg],
                     cfg: Settings) -> dict[str, list[str]]:
     """Which originals each message carries into this prompt, by message id.
 
-    Empty when the text model cannot read file blocks (llm.text.reads_images) - a
-    text-only model handed one rejects the whole request, and the description lines
-    already carry what the archive knows. Walked newest message first, so when the
-    rail binds it keeps what the conversation is most likely about - people discuss
-    the picture just posted, not yesterday's.
+    Walked newest message first, so when the rail binds it keeps what the
+    conversation is most likely about - people discuss the picture just posted, not
+    yesterday's. What it leaves out is not lost: those pictures keep their
+    description lines and their numbers, and open_image fetches any of them.
+
+    All or nothing per message. The blocks ride behind that message's own markers
+    with nothing but their order to pair them up, so a message contributing some of
+    its pictures leaves the model matching three numbered markers against two
+    pictures - and the pairing it settles on is wrong. That happens when the rail
+    runs out mid-message, and when a picture has no id at all because it was too
+    large to send or its upload failed.
     """
     keep: dict[str, list[str]] = {}
-    if not cfg.llm.text.reads_images:
-        return keep
     n = 0
-    cutoff = now_local() - PROMPT_IMAGE_MAX_AGE
+    cap = cfg.prompt.max_images
+    cutoff = now_local() - timedelta(days=cfg.prompt.image_max_age_days)
     for m in reversed(list(window) + list(batch)):
-        if n >= MAX_PROMPT_IMAGES:
-            break
         if not m.images or m.ts < cutoff:
             continue
-        take = m.images[: MAX_PROMPT_IMAGES - n]
-        keep[m.msg_id] = take
-        n += len(take)
+        refs = getattr(m, "image_refs", None) or []
+        if refs and len(m.images) != len(refs):
+            continue
+        if n + len(m.images) > cap:
+            continue
+        keep[m.msg_id] = list(m.images)
+        n += len(m.images)
     return keep
 
 
 def build_tail(*, batch: list[ChatMsg],
                nums: dict[str, int] | None = None,
-               marks: dict[str, str] | None = None) -> str:
+               marks: dict[str, str] | None = None,
+               pics: dict[str, list[int]] | None = None) -> str:
     """Everything after the cache boundary: the clock, then the current message.
 
     Nothing else is pushed here on purpose. Whatever sits in this tail is the
     nearest context the incoming message has, and an elliptical question will
-    resolve against it in preference to the transcript above - an injected
-    block of past events once hijacked exactly that way. The past is pulled
-    (recall_events), never pushed.
+    resolve against it in preference to the transcript above, so a block of past
+    events pushed here hijacks the question. The past is pulled (recall_events),
+    never pushed.
     """
     parts: list[str] = []
 
@@ -344,9 +370,11 @@ def build_tail(*, batch: list[ChatMsg],
     # Here it is already past the boundary, so it is free.
     parts.append("当前时间：" + describe_now() + "。")
 
-    nums, marks = nums or {}, marks or {}
+    nums, marks, pics = nums or {}, marks or {}, pics or {}
     now = "\n".join(
-        m.render(seq=nums.get(m.msg_id, 0), quote=marks.get(m.msg_id, "")) for m in batch
+        m.render(seq=nums.get(m.msg_id, 0), quote=marks.get(m.msg_id, ""),
+                 pic_nums=pics.get(m.msg_id))
+        for m in batch
     )
     # Each reply task carries exactly one addressed message; this header is the
     # anchor reply_final points at when naming which message to answer.
@@ -370,6 +398,7 @@ def assemble(
     window: list[ChatMsg] | None = None,
     nums: dict[str, int] | None = None,
     marks: dict[str, str] | None = None,
+    pics: dict[str, list[int]] | None = None,
 ) -> list[dict]:
     messages = [
         {
@@ -384,17 +413,19 @@ def assemble(
     # the model reads have to come from one pass, not from two passes that merely
     # happen to agree while nothing appends to the deque in between.
     if window is None:
-        window = history_window(st, batch)
+        window = history_window(st, batch, cfg)
         nums, marks = numbered(window + list(batch))
+    if pics is None:
+        pics, _ = numbered_images(window + list(batch))
     images = attached_images(window, batch, cfg)
-    messages.extend(render_history(window, nums, marks, images, traces))
-    tail = build_tail(batch=batch, nums=nums, marks=marks)
+    messages.extend(render_history(window, nums, marks, images, traces, pics))
+    tail = build_tail(batch=batch, nums=nums, marks=marks, pics=pics)
     # The batch renders inside the tail text, so its pictures attach here - behind the
     # text, like every other message's. The legend explains what a block behind a
     # picture marker is; no per-turn notice needed.
     fids = [f for m in batch for f in images.get(m.msg_id, [])]
     content = (
-        [{"type": "text", "text": tail}] + [{"type": "file", "file_id": f} for f in fids]
+        [{"type": "text", "text": tail}] + [{"type": "image", "id": f} for f in fids]
         if fids else tail
     )
     messages.append({"role": "user", "content": content})

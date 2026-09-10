@@ -1,4 +1,4 @@
-"""M0 checklist, mechanised (section 10).
+"""Launch checklist, mechanised.
 
 Run it inside the bot container after the keys are in place:
 
@@ -21,9 +21,9 @@ import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from qqbot.providers import providers  # noqa: E402
-from qqbot.settings import config  # noqa: E402
-from qqbot.util import read_api_key  # noqa: E402
+from qqbot.providers import providers
+from qqbot.settings import config
+from qqbot.util import read_api_key
 
 def test_png(side: int = 64) -> bytes:
     """A real PNG, built here so the check needs no image library and no asset on disk.
@@ -145,14 +145,10 @@ async def check_embedding() -> None:
     """Checked on its own config block, one real call: a wrong embedding endpoint
     otherwise surfaces days later as episode recall quietly degrading, never as
     a boot failure."""
-    from qqbot.providers.embedding import build as build_embedding
-
     cfg = config().default.llm.embedding
     label = f"embedding ({cfg.backend})"
     try:
-        model = build_embedding(config().default)
-        vecs = await model.embed(["预检"])
-        await model.aclose()
+        vecs = await providers().embedding.embed(["预检"], cfg=cfg)
         record(label, bool(vecs) and len(vecs[0]) == cfg.dimensions,
                f"{cfg.model}, {len(vecs[0])} dims")
     except Exception as e:

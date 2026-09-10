@@ -18,8 +18,7 @@ from typing import Self
 
 
 class EntityType(StrEnum):
-    """Only PERSON is handled properly in this version; the rest are placeholders
-    (design doc 10)."""
+    """Only PERSON is handled properly in this version; the rest are placeholders."""
 
     PERSON = "person"
     ORGANIZATION = "organization"

@@ -1,6 +1,6 @@
 -- QQ group-chat bot long-term memory: the physical model.
 --
--- Layers as in design doc section 6.1:
+-- The layers, and the tables that hold each:
 --   L0 raw_event                     raw events, append-only, never modified
 --   L1 entity / identity_account     person and account kept apart; the account is the
 --                                    strong identity
@@ -15,7 +15,7 @@
 -- receives is an @ or a quote, where the platform states the account outright, so
 -- resolution is not a judgement and a trace of it would have no reader.
 --
--- Group isolation (design goal 4): on every table that carries a group_id, the group_id
+-- Group isolation: on every table that carries a group_id, the group_id
 -- is the first column of its indexes, and no retrieval path exists that crosses groups.
 -- alias.group_id may be NULL for a global name - the one cross-group channel, and only
 -- an owner may open it by hand; everything the LLM writes carries a group id.
@@ -181,7 +181,7 @@ CREATE TABLE IF NOT EXISTS memory_fact_evidence (
 CREATE INDEX IF NOT EXISTS fact_evidence_fact ON memory_fact_evidence (fact_id);
 
 -- Everything the LLM produces lands here first, and reaches memory_fact / alias only
--- through the Validator (design doc section 6.3).
+-- through the Validator.
 CREATE TABLE IF NOT EXISTS memory_candidate (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     group_id        BIGINT,
@@ -244,7 +244,7 @@ CREATE TABLE IF NOT EXISTS episode_event (
 -- ---------------------------------------------------------------- L6
 
 -- Vectors are decoupled from the objects they project: switching embedding models
--- rebuilds this one table (design doc section 6.1).
+-- rebuilds this one table and nothing else.
 --
 -- 2048 dimensions, text-embedding-v4. Measured on Chinese, the model separates related
 -- from unrelated sentences by a cosine margin of 0.345 at 1024 dims and 0.388 at 2048;
@@ -306,8 +306,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS job_pending_once
 -- group's memory - nothing here was said in the group - so it lives beside
 -- raw_event rather than inside it, and search_history / extraction never read it.
 -- The window rebuild re-seats each entry in front of the reply it fed. Kept
--- forever like L0, by the owner's call: rows are small and disk is not the
--- constraint.
+-- forever, like L0: rows are small and disk is not the constraint.
 CREATE TABLE IF NOT EXISTS reply_trace (
     id             UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     group_id       BIGINT      NOT NULL,

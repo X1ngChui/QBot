@@ -20,19 +20,19 @@ from nonebot.plugin import PluginMetadata
 
 require("nonebot_plugin_apscheduler")
 
+# Below the require() on purpose: it has to run before anything that imports the
+# scheduler plugin, so these cannot move to the top of the file.
 from . import util
-from .core import errors, nickname  # noqa: E402
-from .core import retrieval  # noqa: E402
-from .core.pipeline import GATEWAY  # noqa: E402
-from .core.media import MEDIA  # noqa: E402
-from .db import close_pool, init_pool  # noqa: E402
-from .providers.embedding import build as build_embedding  # noqa: E402
-from .workers import MemoryWorker  # noqa: E402
-from .db import repo  # noqa: E402
-from .plugins import commands as _commands  # noqa: F401,E402
-from .plugins import tasks  # noqa: E402
-from .providers import build_default, providers, set_providers  # noqa: E402
-from .settings import config  # noqa: E402
+from .core import errors, nickname
+from .core.pipeline import GATEWAY
+from .core.media import MEDIA
+from .db import close_pool, init_pool
+from .workers import MemoryWorker
+from .db import repo
+#: Imported for its registrations: defining the command handlers is the whole effect.
+from .plugins import tasks
+from .providers import build_default, providers, set_providers
+from .settings import config
 
 __plugin_meta__ = PluginMetadata(
     name="qqbot",
@@ -61,10 +61,11 @@ async def _startup() -> None:
     await init_pool()
     await repo.ensure_schema()
 
-    # Wire the four capabilities once, here, from the backend names in config. Everything
-    # downstream asks for a capability and never learns which platform answers.
+    # Wire the five capabilities once, here, from the backend names in config.
+    # Everything downstream asks for a capability and never learns which platform
+    # answers. What was picked is logged by build() itself, so a /reload's rebuild
+    # says so too.
     set_providers(build_default())
-    log.info("capabilities wired: %s", providers().describe())
 
     nickname.initialize()
     nickname.register(bundle.default.trigger.nicknames)
@@ -75,18 +76,11 @@ async def _startup() -> None:
     tasks.register()
     global _worker_task
 
-    # The consumer end of the memory chain. Extraction and consolidation are queued, and
-    # this is what takes them off the queue - without it the inbound path keeps filing
-    # jobs nobody runs, and the queue only ever grows.
-    # One backend, wired to both ends of the vector path: the worker writes them and the
-    # reply path reads them. Neither side has a version that works without it, so a
-    # half-wired deployment cannot start.
-    # No try/except: a backend that cannot be built is a configuration error, and
-    # the place to find out is the boot log rather than three weeks later.
-    embed = build_embedding(bundle.default)
-    retrieval.set_embedding(embed)
-
-    worker = MemoryWorker(bundle.default, embed=embed)
+    # The consumer end of the memory chain. Extraction and consolidation are queued,
+    # and this is what takes them off the queue - without it the inbound path keeps
+    # filing jobs nobody runs, and the queue only ever grows. Its vector backend comes
+    # from the bundle wired above, like every other capability.
+    worker = MemoryWorker(bundle.default)
     _worker_task = asyncio.create_task(worker.run_forever())
     log.info("qqbot ready (memory worker running)")
 

@@ -18,18 +18,18 @@ os.environ.setdefault("CONFIG_DIR", str(ROOT / "tests" / "fixtures" / "config"))
 os.environ.setdefault("DATABASE_URL", "postgresql://qqbot@127.0.0.1:15432/qqbot")
 os.environ.setdefault("DATABASE_PASSWORD", "testpw")
 
-from qqbot.db import close_pool, init_pool, pool  # noqa: E402
-from qqbot.domain.identity import (  # noqa: E402
+from qqbot.db import close_pool, init_pool, pool
+from qqbot.domain.identity import (
     Alias, AliasEvidence, AliasStatus, AliasType, EvidenceType,
 )
-from qqbot.domain.memory import (  # noqa: E402
+from qqbot.domain.memory import (
     Candidate, CandidateType, Episode, EpisodeType, Fact, FactEvidence, MemoryType,
     Participant, RejectReason,
 )
-from qqbot.repositories import (  # noqa: E402
+from qqbot.repositories import (
     EpisodeRepository, IdentityRepository, JobQueue, MemoryRepository, VectorRepository,
 )
-from qqbot.repositories.job import JobType  # noqa: E402
+from qqbot.repositories.job import JobType
 
 fails = []
 GROUP_A = 111
@@ -45,7 +45,7 @@ def check(name, cond, detail=""):
 # The shared reset discovers tables from the catalog rather than keeping its own
 # list: a hand-maintained TRUNCATE list drifts against dropped or added tables
 # and the suite only passes by accident of the test database's age.
-from _db import reset  # noqa: E402
+from _db import reset
 
 
 async def an_event(group_id: int) -> uuid.UUID:
@@ -77,7 +77,8 @@ async def main() -> int:
     survived = await ids.entity(alt.entity_id)
     check("读被合并的实体会跳到存活的那个", survived and survived.id == acc.entity_id)
     both = await ids.accounts_of(acc.entity_id)
-    check("合并后两个账号都挂在同一个人名下", {a.platform_user_id for a in both} == {"1001", "1002"})
+    check("合并后两个账号都挂在同一个人名下",
+          {a.platform_user_id for a in both} == {"1001", "1002"})
     check("被合并的实体不物理删除",
           await pool().fetchval("SELECT status FROM entity WHERE id=$1", alt.entity_id)
           == "merged")
@@ -139,8 +140,8 @@ async def main() -> int:
 
     cur = await mem.current_facts(GROUP_A, [acc.entity_id])
     check("同一个谓词只有一条当前事实", len(cur) == 1 and cur[0].object_value == "鸣潮")
-    # Observed straight off the table: the invariant belongs to supersede(), and the
-    # dedicated history reader it once had shipped no consumer.
+    # Observed straight off the table: the invariant belongs to supersede(), and no
+    # production code reads fact history, so there is no reader to go through.
     hist = await pool().fetch(
         """SELECT object_value, valid_to FROM memory_fact
             WHERE group_id=$1 AND subject_entity_id=$2 AND predicate='likes'""",
@@ -236,7 +237,8 @@ async def main() -> int:
     # The retried job is currently claimed; put it back, or nothing can take it until its
     # lease expires.
     await JobQueue("worker-3").fail(retried, "boom", backoff=dt.timedelta(seconds=-1))
-    for _ in range(retried.max_retry + 3):     # Drain until empty, with a ceiling so a bug here cannot loop forever.
+    # Drain until empty, with a ceiling so a bug here cannot loop forever.
+    for _ in range(retried.max_retry + 3):
         got = await JobQueue("w").claim()
         if got is None:
             break

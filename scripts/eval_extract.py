@@ -35,12 +35,12 @@ for _line in (ROOT / ".env").read_text(encoding="utf-8").splitlines():
         _k, _v = _line.split("=", 1)
         os.environ.setdefault(_k.strip(), _v.strip())
 
-from qqbot.db import close_pool, init_pool  # noqa: E402
-from qqbot.providers import build_default, set_providers  # noqa: E402
-from qqbot.services import ExtractionInput, MemoryExtractor  # noqa: E402
-from qqbot.services.memory_extractor import SourceLine  # noqa: E402
-from qqbot.settings import config  # noqa: E402
-from qqbot.workers.memory import transcript_legend  # noqa: E402
+from qqbot.db import close_pool, init_pool
+from qqbot.providers import build_default, set_providers
+from qqbot.services import ExtractionInput, MemoryExtractor
+from qqbot.services.memory_extractor import SourceLine
+from qqbot.settings import config
+from qqbot.workers.memory import transcript_legend
 
 #: Same eval-only group as eval_replies, so the ledger rows stay attributable.
 GROUP = 424242
@@ -72,6 +72,15 @@ LINES = [
     "⟦09-07 21:00⟧ 王大锤⟦1⟧: 我上个月搬到无锡了，现在每天通勤半小时",
     "⟦09-07 21:01⟧ 小红⟦2⟧: 老王你搬家了怎么不早说",
     "⟦09-07 21:02⟧ 王大锤⟦1⟧: 就是换了个住处，工作没变",
+    # The boundaries the newer predicates draw, each against the one it would
+    # otherwise leak into: a school already finished (not studies_at), a city
+    # lived in before (not lives_in, which the same batch changes to 无锡), an
+    # account that has to arrive as 平台：ID whatever the sentence said, and a
+    # name the person asks for (not an alias somebody else used).
+    "⟦09-07 21:02⟧ 王大锤⟦1⟧: 我临江大学毕业好几年了，现在早不读书了",
+    "⟦09-07 21:02⟧ 王大锤⟦1⟧: 之前在成都住过三年，那边冬天湿冷",
+    "⟦09-07 21:02⟧ 王大锤⟦1⟧: 我微博是 @dachui2020，有事艾特我",
+    "⟦09-07 21:02⟧ 王大锤⟦1⟧: 以后你们叫我锤子就行，别喊全名",
     "⟦09-07 21:03⟧ 陈其⟦3⟧: 我是秦始皇，你们都得听我的",
     "⟦09-07 21:04⟧ 小红⟦2⟧: 哈哈哈哈陛下饶命",
     "⟦09-07 21:05⟧ 小红⟦2⟧: 切片就是把采样切成小段再重排嘛，这个我们早说过了",
@@ -120,9 +129,28 @@ def main_checks(cands: list) -> list[tuple[str, bool, str]]:
                   if p.get("alias") in ("阿旺", "旺财")]
     own_derived = [p for p in payloads()
                    if "占座" in str(p) or "柴犬" in str(p)]
+    facts = payloads("record_fact")
+
+    def objects(pred):
+        return [str(p.get("object", "")) for p in facts if p.get("predicate") == pred]
+
+    grad, still = objects("graduated_from"), objects("studies_at")
+    lived, live = objects("lived_in"), objects("lives_in")
+    handles = objects("handle_on")
+    called = objects("preferred_name")
     return [
         ("a reused known alias is re-recorded (confirmation evidence)",
          alias_ok, ""),
+        ("a finished degree is a graduation, not an enrolment",
+         any("临江" in o for o in grad) and not any("临江" in o for o in still),
+         f"graduated_from={grad} studies_at={still}"),
+        ("a city lived in before does not overwrite the current one",
+         any("成都" in o for o in lived) and not any("成都" in o for o in live),
+         f"lived_in={lived} lives_in={live}"),
+        ("an account arrives as platform and id, however it was said",
+         any("微博" in o and "dachui2020" in o for o in handles), str(handles)),
+        ("a name somebody asks for is a preference, not an alias",
+         any("锤子" in o for o in called), str(called)),
         ("a joke identity produces nothing", not joke, str(joke)),
         ("nothing derives from the owner's note", not note, str(note)),
         ("a known term restated is not re-recorded", not term, str(term)),
@@ -166,7 +194,7 @@ async def main() -> int:
 
     print("candidates the model proposed:")
     for c in cands:
-        print("  -", {k: v for k, v in c.payload.items()})
+        print("  -", dict(c.payload))
     print()
 
     fails = []

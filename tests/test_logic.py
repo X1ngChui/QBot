@@ -285,7 +285,8 @@ check("a replayed msg_id does not enter the window twice", len(_dupe.recent) == 
 # ---- prompt assembly + ordering
 st = GroupState(group_id="12345")
 for i in range(25):
-    st.add(ChatMsg(msg_id=f"m{i}", user_id="u1", nickname="阿强", text=f"第{i}条消息", ts=now_local()))
+    st.add(ChatMsg(msg_id=f"m{i}", user_id="u1", nickname="阿强",
+                   text=f"第{i}条消息", ts=now_local()))
 batch = [ChatMsg(msg_id="m99", user_id="u2", nickname="阿花", text="小X你在吗", ts=now_local())]
 st.add(batch[0])
 msgs = prompt.assemble(
@@ -339,7 +340,7 @@ check("history anchor set", st.history_anchor is not None, str(st.history_anchor
 # no ids at all every message stays a plain string.
 from datetime import timedelta as _td2
 _sti = GroupState(group_id="77")
-_old_ts = now_local() - prompt.PROMPT_IMAGE_MAX_AGE - _td2(hours=1)
+_old_ts = now_local() - _td2(days=cfg.prompt.image_max_age_days) - _td2(hours=1)
 _sti.add(ChatMsg(msg_id="i0", user_id="u", nickname="a", text="[图片:旧图]",
                  ts=_old_ts, images=["file-old"]))
 for i in range(8):
@@ -347,22 +348,77 @@ for i in range(8):
                      ts=now_local(), images=[f"file-{i}"]))
 _bi = [ChatMsg(msg_id="iq", user_id="u2", nickname="b", text="小X 看这张", ts=now_local(),
                images=["file-batch"])]
-_rail = prompt.MAX_PROMPT_IMAGES
-prompt.MAX_PROMPT_IMAGES = 99          # rail out of the way: freshness alone decides
-_att = prompt.attached_images(list(_sti.recent), _bi, cfg)
+# Rail out of the way on a copy of the config: freshness alone decides here.
+_wide = cfg.model_copy(deep=True)
+_wide.prompt.max_images = 99
+# Every picture in the prompt carries a number, and the number is what open_image
+# resolves. It has to be one coordinate rather than two ("the second picture in
+# message #12"), because two is a pair the model gets to miscount independently.
+# Numbered oldest first, like the line numbers, so both count the same direction -
+# and stickers share the run, so there is one rule rather than two.
+from qqbot.core.segments import ImageRef as _IR
+_p1 = ChatMsg(msg_id="p1", user_id="u", nickname="王大锤", text="看 ⟦图片:一只橘猫⟧",
+              ts=now_local(), image_refs=[_IR(key="a" * 32)])
+_p2 = ChatMsg(msg_id="p2", user_id="v", nickname="阿旺", text="没有图的一句",
+              ts=now_local())
+_p3 = ChatMsg(msg_id="p3", user_id="u", nickname="王大锤",
+              text="还有 ⟦图片:一条狗⟧ 和 ⟦表情:笑到打滚⟧", ts=now_local(),
+              image_refs=[_IR(key="b" * 32), _IR(key="c" * 32)])
+_per, _by = prompt.numbered_images([_p1, _p2, _p3])
+check("pictures are numbered oldest first, stickers in the same run",
+      _per == {"p1": [1], "p3": [2, 3]}, str(_per))
+check("and the number maps back to the picture it names",
+      [(m.msg_id, i) for m, i in (_by[1], _by[2], _by[3])]
+      == [("p1", 0), ("p3", 0), ("p3", 1)],
+      str([(m.msg_id, i) for m, i in _by.values()]))
+check("the number rides inside the marker, description untouched",
+      _p3.render(seq=9, pic_nums=_per["p3"]).endswith(
+          "还有 ⟦图片2:一条狗⟧ 和 ⟦表情3:笑到打滚⟧"),
+      _p3.render(seq=9, pic_nums=_per["p3"]))
+# A forwarded chat log carries its own nested picture markers, which belong to
+# messages this one does not own. Numbering them would hand the model a number that
+# opens somebody else's picture, so a count mismatch leaves the line alone.
+_pf = ChatMsg(msg_id="pf", user_id="u", nickname="小红",
+              text="⟦图片:我的图⟧ ⟦转发的聊天记录：李芳: ⟦图片⟧⟧", ts=now_local(),
+              image_refs=[_IR(key="d" * 32)])
+check("a line whose markers outnumber its pictures stays unnumbered",
+      "⟦图片1:" not in _pf.render(seq=1, pic_nums=[1]), _pf.render(seq=1, pic_nums=[1]))
+
+_att = prompt.attached_images(list(_sti.recent), _bi, _wide)
 check("every fresh picture is attached to its own message",
       all(_att.get(f"i{i+1}") == [f"file-{i}"] for i in range(8))
       and _att.get("iq") == ["file-batch"], str(_att))
 check("a picture past the freshness cutoff is left out", "i0" not in _att)
-_noimg = cfg.model_copy(deep=True)
-_noimg.llm.text.reads_images = False
-check("a text-only reply model gets no file blocks at all",
-      prompt.attached_images(list(_sti.recent), _bi, _noimg) == {})
-prompt.MAX_PROMPT_IMAGES = 3
-_att2 = prompt.attached_images(list(_sti.recent), _bi, cfg)
+_none = cfg.model_copy(deep=True)
+_none.prompt.max_images = 0
+check("a rail of zero attaches nothing, leaving every picture to open_image",
+      prompt.attached_images(list(_sti.recent), _bi, _none) == {})
+_tight = cfg.model_copy(deep=True)
+_tight.prompt.max_images = 3
+_att2 = prompt.attached_images(list(_sti.recent), _bi, _tight)
 check("when the rail binds it keeps the newest messages' pictures",
       set(_att2) == {"iq", "i8", "i7"}, str(_att2))
-prompt.MAX_PROMPT_IMAGES = _rail
+# The blocks behind a message are paired with its markers by order alone, so a
+# message that can only bring some of its pictures brings none: two blocks under
+# three numbered markers is a pairing the model gets wrong rather than a partial one.
+_part = GroupState(group_id="78")
+_part.add(ChatMsg(msg_id="pp", user_id="u", nickname="a",
+                  text="⟦图片:能传的⟧ ⟦图片:太大了⟧", ts=now_local(),
+                  images=["file-ok"],
+                  image_refs=[_IR(key="e" * 32), _IR(key="f" * 32)]))
+check("a message whose pictures did not all upload attaches none",
+      prompt.attached_images(list(_part.recent), [], _wide) == {},
+      str(prompt.attached_images(list(_part.recent), [], _wide)))
+_two = ChatMsg(msg_id="tt", user_id="u", nickname="a",
+               text="⟦图片:一⟧ ⟦图片:二⟧", ts=now_local(),
+               images=["file-1", "file-2"],
+               image_refs=[_IR(key="g" * 32), _IR(key="h" * 32)])
+_part2 = GroupState(group_id="79")
+_part2.add(_two)
+_one_slot = cfg.model_copy(deep=True)
+_one_slot.prompt.max_images = 1
+check("and a message that does not fit the rail waits rather than half-arriving",
+      prompt.attached_images(list(_part2.recent), [], _one_slot) == {})
 _mi = prompt.assemble(persona=persona, cfg=cfg, st=_sti, batch=_bi, profiles=[])
 _hist_msgs = _mi[1:-1]
 _with_files = [m for m in _hist_msgs if isinstance(m["content"], list)]
@@ -370,9 +426,9 @@ _with_files = [m for m in _hist_msgs if isinstance(m["content"], list)]
 # seven history messages carry originals, and the oldest history picture falls back
 # to its description line like any other unattached one.
 check("history messages with pictures become text-then-file blocks",
-      len(_with_files) == prompt.MAX_PROMPT_IMAGES - 1
+      len(_with_files) == cfg.prompt.max_images - 1
       and all(m["content"][0]["type"] == "text"
-              and all(b["type"] == "file" for b in m["content"][1:])
+              and all(b["type"] == "image" for b in m["content"][1:])
               for m in _with_files), str(_with_files[:1])[:120])
 check("the rail-dropped picture keeps its description line",
       any(isinstance(m["content"], str) and "第0张" in m["content"] for m in _hist_msgs))
@@ -381,7 +437,7 @@ check("the old picture's line stays a plain string",
 check("the batch picture rides the tail, text first",
       isinstance(_mi[-1]["content"], list)
       and _mi[-1]["content"][0]["type"] == "text"
-      and _mi[-1]["content"][-1] == {"type": "file", "file_id": "file-batch"},
+      and _mi[-1]["content"][-1] == {"type": "image", "id": "file-batch"},
       str(_mi[-1]["content"])[:120])
 check("the legend explains what a block behind a marker is",
       "原图" in _mi[0]["content"])
@@ -402,12 +458,17 @@ with _tf.TemporaryDirectory() as _td:
     _sh.copytree(ROOT / "config" / "prompts", _cd / "prompts")
     for _f in (_cd / "prompts").glob("*.md"):
         _f.unlink()
-    # The fixture points prompts_dir at the real texts by a relative path, which
-    # no longer resolves from the copy's location - point the copy at its own.
+    _sh.copy(ROOT / "config" / "predicates.yaml", _cd / "predicates.yaml")
+    # The fixture points prompts_dir and predicates_file at the real ones by relative
+    # path, which no longer resolves from the copy's location - point the copy at its
+    # own.
     _sy = _cd / "settings.yaml"
-    _sy.write_text(_sy.read_text(encoding="utf-8").replace(
-        "prompts_dir: ../../../config/prompts", "prompts_dir: prompts"),
-        encoding="utf-8")
+    _sy.write_text(_sy.read_text(encoding="utf-8")
+                   .replace("prompts_dir: ../../../config/prompts",
+                            "prompts_dir: prompts")
+                   .replace("predicates_file: ../../../config/predicates.yaml",
+                            "predicates_file: predicates.yaml"),
+                   encoding="utf-8")
     (_cd / "prompts" / "describe_image.txt").write_text("换一种描述方式。", encoding="utf-8")
     _bo = _lb(config_dir=_cd)
     check("editing a prompt file changes what the bundle serves",
@@ -444,9 +505,21 @@ with _tf.TemporaryDirectory() as _td:
 check("the live bundle serves the shipped texts",
       b.prompts["legend"].startswith("【系统括号原则】"))
 
+# The example config is what a new deployment starts from, and it is the one config
+# file no running system validates - a stale key in it is found by whoever copies it.
+import yaml as _yaml
+from qqbot.settings import Settings as _Settings
+try:
+    _ex = _Settings.model_validate(
+        _yaml.safe_load((ROOT / "config" / "settings.yaml.example").read_text("utf-8")))
+    check("the shipped example config still validates", True,
+          f"text model {_ex.llm.text.model}")
+except Exception as _e:
+    check("the shipped example config still validates", False, str(_e)[:200])
+
 # Config numbers with a blast radius validate at load, not at detonation time:
-# backup_keep=0 deletes the backup just written, nightly; a 4-field cron used to
-# pass /reload and fail the *next boot*, days later.
+# backup_keep=0 deletes the backup just written, nightly; a 4-field cron passes
+# /reload and then fails the next boot, days away from the edit that caused it.
 from qqbot.settings import ScheduleCfg as _SC
 for _name, _bad in (
     ("backup_keep below one", lambda: _SC(backup_keep=0)),
@@ -475,28 +548,27 @@ check("a use with no prompt tokens is omitted",
 check("no prompt tokens at all means no line", hit_split([]) == "")
 
 # The window is a message count, evicted in chunks: the anchor must survive several
-# turns so the prefix cache keeps hitting, and when it moves it moves by EVICT_CHUNK.
+# turns so the prefix cache keeps hitting, and when it moves it moves by a whole chunk.
 # There is no token budget to test - money bounds spending, and nothing trims blocks.
-_saved_win = prompt.HISTORY_MSGS, prompt.EVICT_CHUNK
-prompt.HISTORY_MSGS, prompt.EVICT_CHUNK = 20, 5
+small = cfg.model_copy(deep=True)
+small.prompt.evict_chunk, small.prompt.window_chunks = 5, 4
 st2 = GroupState(group_id="9")
 for i in range(22):
     st2.add(ChatMsg(msg_id=f"x{i}", user_id="u", nickname="a", text="消息", ts=now_local()))
-h1 = prompt.history_window(st2, [])
+h1 = prompt.history_window(st2, [], small)
 a1 = st2.history_anchor
 check("an over-full window is cut back by whole chunks",
       len(h1) == 17 and a1 == "x5", f"{len(h1)} msgs, anchor {a1}")
 anchors = []
 for i in range(22, 25):
     st2.add(ChatMsg(msg_id=f"x{i}", user_id="u", nickname="a", text="短消息", ts=now_local()))
-    prompt.history_window(st2, [])
+    prompt.history_window(st2, [], small)
     anchors.append(st2.history_anchor)
 check("history anchor is stable across turns", all(a == a1 for a in anchors), f"{a1} -> {anchors}")
 st2.add(ChatMsg(msg_id="x25", user_id="u", nickname="a", text="压过线", ts=now_local()))
-prompt.history_window(st2, [])
+prompt.history_window(st2, [], small)
 check("and moves by a whole chunk when the window fills again",
       st2.history_anchor == "x10", str(st2.history_anchor))
-prompt.HISTORY_MSGS, prompt.EVICT_CHUNK = _saved_win
 
 # ---- every source file parses, and the handler module's calls resolve
 #
@@ -599,7 +671,7 @@ check("and no function reads a name that was never bound",
 # bare strings at both ends - two lists nobody could diff - and when the per-account
 # profile rewrite became one batched call the writer's string changed while the reader's
 # did not, so /stats showed zero of them for as long as the feature existed.
-from qqbot.providers import Kind as _Kind  # noqa: E402
+from qqbot.providers import Kind as _Kind
 
 _used: set[str] = set()
 for _f in _srcs:
@@ -628,9 +700,9 @@ check("no billed kind is written as a bare string", not _bare, "; ".join(_bare))
 #
 # What this checks is the code *about* the system. What the system says to a group is
 # left alone: those strings are the product.
-import io as _io  # noqa: E402
-import re as _re  # noqa: E402
-import tokenize as _tok  # noqa: E402
+import io as _io
+import re as _re
+import tokenize as _tok
 
 _CJK = _re.compile(r"[一-鿿]")
 _cn_docs, _cn_coms, _cn_logs = [], [], []
@@ -649,9 +721,12 @@ for _f in _srcs + sorted(_pl.Path("tests").rglob("*.py")):
                 _cn_docs.append(f"{_f.name}:{getattr(_n, 'name', '<module>')}")
         # A log line is read by whoever is debugging at 3am, which is the same audience
         # as a comment.
-        if isinstance(_n, _ast.Call) and isinstance(_n.func, _ast.Attribute)                 and isinstance(_n.func.value, _ast.Name) and _n.func.value.id == "log":
+        if (isinstance(_n, _ast.Call) and isinstance(_n.func, _ast.Attribute)
+                and isinstance(_n.func.value, _ast.Name)
+                and _n.func.value.id == "log"):
             for _a in _n.args:
-                if isinstance(_a, _ast.Constant) and isinstance(_a.value, str)                         and _CJK.search(_a.value):
+                if (isinstance(_a, _ast.Constant) and isinstance(_a.value, str)
+                        and _CJK.search(_a.value)):
                     _cn_logs.append(f"{_f.name}:{_n.lineno}")
     for _t in _tok.generate_tokens(_io.StringIO(_src).readline):
         if _t.type == _tok.COMMENT and _CJK.search(_t.string):

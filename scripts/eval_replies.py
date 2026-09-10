@@ -23,7 +23,9 @@ import asyncio
 import os
 import pathlib
 import re
+import struct
 import sys
+import zlib
 from datetime import timedelta
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -41,16 +43,16 @@ for _line in (ROOT / ".env").read_text(encoding="utf-8").splitlines():
         _k, _v = _line.split("=", 1)
         os.environ.setdefault(_k.strip(), _v.strip())
 
-from qqbot.core import engine, retrieval  # noqa: E402
-from qqbot.core.output import clean_reply  # noqa: E402
-from qqbot.core.state import ChatMsg, GroupState  # noqa: E402
-from qqbot.db import close_pool, init_pool, pool  # noqa: E402
-from qqbot.gateway.ingest import ingestor  # noqa: E402
-from qqbot.gateway.onebot import GroupMessage, Sender  # noqa: E402
-from qqbot.providers import build_default, set_providers  # noqa: E402
-from qqbot.providers.embedding import build as build_embedding  # noqa: E402
-from qqbot.settings import config  # noqa: E402
-from qqbot.util import now_local  # noqa: E402
+from qqbot.core import engine
+from qqbot.core.output import clean_reply
+from qqbot.core.segments import ImageRef
+from qqbot.core.state import ChatMsg, GroupState
+from qqbot.db import close_pool, init_pool, pool
+from qqbot.gateway.ingest import ingestor
+from qqbot.gateway.onebot import GroupMessage, Sender
+from qqbot.providers import build_default, providers, set_providers
+from qqbot.settings import config
+from qqbot.util import now_local, sysmark
 
 #: A group id no real group uses, so the ledger rows are attributable to evals.
 GROUP = "424242"
@@ -176,7 +178,7 @@ CASES = [
         "name": "third_person_jab",
         "why": "eyeball case: the reply goes to the asker, so a jab aimed at a "
                "third person must name them - a 你-voiced jab reads as aimed at "
-               "the asker (a real complaint)",
+               "the asker",
         "window": [
             _msg("u2", "小北", "今天摸鱼一整天，真舒服", 4),
         ],
@@ -186,7 +188,7 @@ CASES = [
     {
         "name": "meme_vs_fact",
         "why": "eyeball case: memes about a person should be labelled, not opened "
-               "with as if they were the facts (a real reply once led with them)",
+               "with as if they were the facts",
         "window": [
             _msg("u1", "阿强", "小北身家两个亿，手握八套祖宅", 50),
             _msg("u3", "老雷", "哈哈哈哈北总", 49),
@@ -200,8 +202,7 @@ CASES = [
         "name": "initiative_search",
         "why": "a question the window cannot answer must be searched, not vibed: "
                "the buyer and the model number live only in the archive, and the "
-               "window plants a lookalike to misattribute to (a real failure "
-               "mode - the hat lands on the wrong head)",
+               "window plants a lookalike to misattribute the purchase to",
         "window": [
             # The trap: a different member talking near the topic. Answering
             # from the window pins the purchase on 小北.
@@ -247,6 +248,58 @@ CASES = [
 ]
 
 
+def _two_colour_png() -> bytes:
+    """A picture whose content nothing in the case describes: red left, blue right.
+
+    Drawn here rather than kept as a fixture, so what the model is asked about is
+    written down beside the assertion. Colour is the property to ask for because
+    nothing but the pixels can carry it - a caption, a filename or a remembered
+    description could all leak a shape or a word.
+    """
+    w = h = 64
+    red, blue = b"\xff\x00\x00", b"\x00\x00\xff"
+    row = b"\x00" + b"".join(red if x < w // 2 else blue for x in range(w))
+
+    def chunk(tag: bytes, body: bytes) -> bytes:
+        return (struct.pack(">I", len(body)) + tag + body
+                + struct.pack(">I", zlib.crc32(tag + body) & 0xFFFFFFFF))
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(row * h, 9))
+            + chunk(b"IEND", b""))
+
+
+async def picture_case(cfg) -> dict:
+    """The reply model reads the pixels, not the description line.
+
+    This is the one thing the offline suites cannot show: they prove the file block
+    reaches the request, while whether the model on the other end actually looked is
+    a property of the real backend - and it is the whole reason for going multimodal.
+    The marker in the transcript carries no description on purpose, so an answer
+    naming both colours can only have come from the picture itself.
+    """
+    data = _two_colour_png()
+    fid = await providers().text.upload(data, cfg=cfg.llm.text, mime="image/png")
+    poster = ChatMsg(
+        msg_id="pic-1", user_id="u2", nickname="小北",
+        text="看看这个 " + sysmark("图片"), ts=now_local() - timedelta(minutes=2),
+        images=[fid] if fid else [],
+        image_refs=[ImageRef(key="eval-two-colour", file_id=fid)],
+    )
+    return {
+        "name": "picture_read",
+        "why": "the reply model is multimodal: the original rides behind the message "
+               "that posted it, and only the pixels say what colour anything is",
+        "window": [poster],
+        "trigger": _msg("u1", "阿强", "@我 小北发的那张图，左右两半分别是什么颜色", 0),
+        "checks": NO_MARKERS + [
+            ("names the left half red", lambda t: "红" in t),
+            ("names the right half blue", lambda t: "蓝" in t),
+        ],
+    }
+
+
 async def run_case(case, cfg, persona, bot) -> tuple[str, str]:
     st = GroupState(group_id=GROUP)
     st.loaded = st.history_loaded = True   # nothing to load; the window is scripted
@@ -281,7 +334,6 @@ async def run_case(case, cfg, persona, bot) -> tuple[str, str]:
 
 async def main() -> int:
     set_providers(build_default())
-    retrieval.set_embedding(build_embedding(config().default))
     await init_pool()
     await pool().execute("DELETE FROM cost_ledger WHERE group_id=$1", int(GROUP))
 
@@ -289,7 +341,7 @@ async def main() -> int:
     cfg, persona = config().for_group(GROUP)
     bot = EvalBot()
     failures = 0
-    for case in CASES:
+    for case in CASES + [await picture_case(cfg)]:
         verdict, raw = await run_case(case, cfg, persona, bot)
         if verdict.startswith("FAIL"):
             failures += 1

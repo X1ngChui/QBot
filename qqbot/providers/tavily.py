@@ -1,7 +1,7 @@
 """Tavily web search backend.
 
 Not a chat protocol - a plain POST to /search - so this implements the ABC directly.
-Called on its own rather than through a model's built-in search (D5): built-in search
+Called on its own rather than through a model's built-in search: built-in search
 bills twice and splices results at a position we do not control, which would break the
 prefix cache.
 

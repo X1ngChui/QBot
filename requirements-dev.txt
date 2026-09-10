@@ -1,0 +1,8 @@
+# What the workstation needs on top of requirements.txt. Never installed into the
+# image: nothing here runs in production.
+#
+#     .venv/Scripts/python.exe -m pip install -r requirements-dev.txt
+#
+# The linter is part of the test run (tests/run_all.py); without it installed that
+# step reports as skipped rather than failing, so a bare runtime venv still passes.
+ruff==0.16.6

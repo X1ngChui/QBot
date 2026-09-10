@@ -14,10 +14,10 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("CONFIG_DIR", str(ROOT / "tests" / "fixtures" / "config"))
 
-from qqbot.domain.memory import Candidate, CandidateType, RejectReason  # noqa: E402
-from qqbot.services import Validator  # noqa: E402
-from qqbot.services.memory_extractor import (  # noqa: E402
-    PREDICATES, TOOLS, ExtractionInput, MemoryExtractor, SourceLine,
+from qqbot.domain.memory import Candidate, CandidateType, RejectReason
+from qqbot.services import Validator
+from qqbot.services.memory_extractor import (
+    ExtractionInput, MemoryExtractor, SourceLine, predicate_names, tools,
 )
 
 fails = []
@@ -51,7 +51,8 @@ check("依据原文的事实通过", v.check(ok).ok)
 
 bad_code = cand(CandidateType.FACT, account=7, predicate="plays", object="x",
                 quote="我最近在玩鸣潮")
-check("a code that is not on the roster is dropped", v.check(bad_code).reason is RejectReason.UNKNOWN_ENTITY,
+check("a code that is not on the roster is dropped",
+      v.check(bad_code).reason is RejectReason.UNKNOWN_ENTITY,
       "答不上来的模型会编一个编号")
 
 made_up = cand(CandidateType.FACT, account=1, predicate="plays", object="原神",
@@ -108,7 +109,8 @@ check("and different names are not",
       v.ambiguous_aliases([both[0]]) == set())
 
 # ---- the tool definitions -------------------------------------------------
-by_name = {t["function"]["name"]: t["function"] for t in TOOLS}
+TOOL_DEFS = tools()
+by_name = {t["function"]["name"]: t["function"] for t in TOOL_DEFS}
 check("the model is offered exactly these tools",
       set(by_name) == {"record_alias", "record_fact", "record_group_term",
                        "record_group_topic", "record_episode"},
@@ -139,41 +141,77 @@ check("record_episode names its participants by code",
 # always find one, and once written down it gets used in a reply, archived, and read back
 # by the next pass as evidence that the group still says it.
 check("and nothing offers to record a joke",
-      not any("梗" in json.dumps(t, ensure_ascii=False) for t in TOOLS))
+      not any("梗" in json.dumps(t, ensure_ascii=False) for t in TOOL_DEFS))
 pred_enum = by_name["record_fact"]["parameters"]["properties"]["predicate"]["enum"]
 check("the predicate is an enum in the tool definition itself",
-      set(pred_enum) == set(PREDICATES),
+      set(pred_enum) == set(predicate_names()),
       "the model cannot produce a value outside it, which beats checking afterwards")
 
-# ---- every predicate renders, ages, and belongs somewhere ------------------
-# These three tables live in three files, and a predicate added to one but not the
-# others fails silently: no verb renders the English name straight into the Chinese
-# prompt, and an unlisted decay class is not an error, just a default nobody chose.
-from qqbot.services.context_builder import VERB, render_fact
+# ---- the predicate table --------------------------------------------------
+# One entry defines a predicate completely - what it means, how many, how fast it is
+# forgotten, how it reads. What these check is that everything derived from an entry
+# stays derived: the enum the model is offered, the block explaining it, the decay
+# classes, the rendering.
+from qqbot.services.context_builder import render_fact
 from qqbot.services.memory_extractor import (
-    FAST_PREDICATES, MULTI_VALUED, SINGLE_VALUED, STABLE_PREDICATES,
+    decay_classes, multi_valued, opposites, rules_block, single_valued,
 )
 
-check("every predicate has a Chinese verb", set(PREDICATES) <= set(VERB),
-      str(set(PREDICATES) - set(VERB)))
-check("and renders with no English leaking through",
+PREDS = predicate_names()
+check("the table holds predicates at all", len(PREDS) > 10, str(len(PREDS)))
+_explained = rules_block()
+check("every predicate the model is offered is explained to it",
+      all(f"- {p}（" in _explained or f"- {p}：" in _explained for p in PREDS),
+      str([p for p in PREDS
+           if f"- {p}（" not in _explained and f"- {p}：" not in _explained]))
+check("every predicate renders with no English leaking through",
       all(not any(c.isascii() and c.isalpha()
                   for c in render_fact(p, "某物", "某物"))
-          for p in PREDICATES),
-      str([render_fact(p, "某物", "某物") for p in PREDICATES
+          for p in PREDS),
+      str([render_fact(p, "某物", "某物") for p in PREDS
            if any(c.isascii() and c.isalpha()
                   for c in render_fact(p, "某物", "某物"))]))
+# A predicate dropped from the table leaves its rows behind. They render as nothing
+# rather than as the bare English name, which is what the prompt would otherwise carry.
+check("a fact whose predicate is no longer configured renders as nothing",
+      render_fact("no_such_predicate", "某物") == "",
+      render_fact("no_such_predicate", "某物"))
 check("a template verb puts the object inside the phrase",
       render_fact("allergic_to", "花生", "花生") == "对花生过敏",
       render_fact("allergic_to", "花生", "花生"))
+_stable, _fast = decay_classes()
 check("decay classes only name real predicates",
-      (set(STABLE_PREDICATES) | set(FAST_PREDICATES)) <= set(PREDICATES) | {"topic"},
-      str((set(STABLE_PREDICATES) | set(FAST_PREDICATES))
-          - set(PREDICATES) - {"topic"}))
-check("no predicate is in two decay classes",
-      not set(STABLE_PREDICATES) & set(FAST_PREDICATES))
-check("single-valued and multi-valued do not overlap",
-      not set(SINGLE_VALUED) & set(MULTI_VALUED))
+      (set(_stable) | set(_fast)) <= set(PREDS) | {"topic"},
+      str((set(_stable) | set(_fast)) - set(PREDS) - {"topic"}))
+check("no predicate is in two decay classes", not set(_stable) & set(_fast))
+check("cardinality covers every predicate exactly once",
+      set(single_valued()) | set(multi_valued()) == set(PREDS)
+      and not set(single_valued()) & set(multi_valued()))
+check("opposites are mutual",
+      all(opposites().get(b) == a for a, b in opposites().items()),
+      str(opposites()))
+
+# The table is config, so the ways it can be wrong are load errors, not surprises at
+# 02:30 when the night's extraction runs.
+from qqbot.settings import PredicateTable
+_ok = {"verb": "喜欢", "cardinality": "multi", "rule": "喜欢的事物。"}
+for _name, _bad in (
+    ("a predicate with no rule", {"person": {"likes": {"verb": "喜欢",
+                                                       "cardinality": "multi"}}}),
+    ("a predicate with no verb", {"person": {"likes": {"cardinality": "multi",
+                                                      "rule": "x"}}}),
+    ("an unknown decay class", {"person": {"likes": _ok | {"decay": "slow"}}}),
+    ("a one-sided opposite", {"person": {"likes": _ok | {"opposite": "dislikes"},
+                                         "dislikes": _ok}}),
+    ("an opposite that names nothing", {"person": {"likes": _ok | {"opposite": "nope"}}}),
+    ("a predicate named like a group one", {"person": {"topic": _ok}}),
+    ("a name the database could not index", {"person": {"Likes!": _ok}}),
+):
+    try:
+        PredicateTable.model_validate(_bad)
+        check(f"{_name} is refused at load", False, "it validated")
+    except ValueError:
+        check(f"{_name} is refused at load", True)
 
 # ---- tool call -> candidate -----------------------------------------------
 BATCH = uuid.uuid4()

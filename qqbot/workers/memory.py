@@ -1,6 +1,6 @@
 """The background executor: it does what is on the queue.
 
-The asynchronous chain (design doc 53):
+The asynchronous chain:
 
     EXTRACT_MEMORY -> read a stretch of transcript, produce candidates by function call
     CONSOLIDATE    -> validate the candidates and write them into L1/L3
@@ -19,47 +19,25 @@ import uuid
 from datetime import datetime, timedelta
 
 from ..core.budget import BUDGET
+from ..providers import providers
 from ..db import pool, repo
-from ..providers.embedding import EmbeddingModel
 from ..repositories import (
     EpisodeRepository, IdentityRepository, JobQueue, MemoryRepository, VectorRepository,
 )
 from ..repositories.job import Job, JobType
 from ..services import ExtractionInput, MemoryConsolidator, MemoryExtractor
-from ..services.memory_extractor import (DEFAULT_DAYS, FAST_DAYS, FAST_PREDICATES,
-                                          STABLE_DAYS, STABLE_PREDICATES, SourceLine)
+from ..services.memory_extractor import SourceLine, decay_classes
 from ..services.context_builder import NOTE
-from ..settings import EXTRACT_WINDOW, Settings, config, ptext
+from ..settings import Settings, config, ptext
 from ..util import defang, fmt_when, now_local, sysmark, why
 
 log = logging.getLogger("qqbot.worker")
 
-#: How much transcript one extraction chunk holds at most. Enough to see whole
-#: conversations, not so much that a single call becomes expensive. The number lives
-#: in settings (the /relearn reset keeps this many unread); this is the name the
-#: worker code and the tests use.
-WINDOW = EXTRACT_WINDOW
-#: A full chunk is trimmed back to the last conversation gap of at least this long
-#: in its tail half, so batch boundaries fall where conversations end.
-BATCH_GAP = timedelta(minutes=30)
-#: Below this many unread messages a drain does not bother: a pass pays for the
-#: rules, the schemas and the known facts before reading a line, and a handful of
-#: messages simply waits for tomorrow's drain. /relearn overrides (force).
-DRAIN_FLOOR = 20
-#: Passes one drain may run - 610 to 1200 messages a night with gap-cut chunks.
-#: It CAN bind before the budget does; accepted: a group sustaining more than that
-#: every day has outgrown the memory budget itself, and the backlog carries over
-#: rather than being skipped.
-MAX_PASSES = 10
-#: What WINDOW was before the nightly redesign. Candidates staged back then carry
+#: What the extraction window was before the nightly redesign. Candidates staged back then carry
 #: no batch_size, and their batches must be replayed at the width they were made
 #: with - replaying at the new width prepends rows the model never saw, which
 #: shifts every account code and files records against the wrong people.
 LEGACY_WINDOW = 60
-#: How many already-recorded episodes the extractor is reminded of. Enough to recognise
-#: the conversation it is reading as one it has already written down, not so many that the
-#: reminder costs more than the batch.
-KNOWN_EPISODES = 8
 
 
 def transcript_legend() -> str:
@@ -77,11 +55,8 @@ def transcript_legend() -> str:
 
 #: Fact lifetimes come from the predicate class tables in memory_extractor - the kind of
 #: fact is the primary axis of forgetting, evidence a bounded multiplier on top. See
-#: MemoryRepository.decay for the reasoning and the citations.
-#: How long a name the model guessed at survives without being used again.
-ALIAS_UNUSED_DAYS = 30.0
-#: And how long one it marked as a joke does. Most are true for an afternoon.
-JOKE_UNUSED_DAYS = 7.0
+#: MemoryRepository.decay for the reasoning and the citations. How long an unused name
+#: survives is config (memory.alias_unused_days / joke_unused_days).
 
 #: Backoff after a failure. Exponential, capped at an hour - background work is not
 #: urgent, and what is urgent is not burning money on retries.
@@ -98,10 +73,11 @@ def _transcript(lines: list[SourceLine]) -> str:
 
 
 class MemoryWorker:
-    def __init__(
-        self, cfg: Settings, *, embed: EmbeddingModel, worker_id: str | None = None,
-    ) -> None:
+    def __init__(self, cfg: Settings, *, worker_id: str | None = None) -> None:
         self._cfg = cfg
+        #: The memory mechanism's own settings, read once at construction like the
+        #: extractor's prompt: /reload applies from the next restart, never mid-batch.
+        self._m = cfg.memory
         # Process-unique by default: the job queue's locked_by guards compare this
         # id, and during a deploy overlap two processes sharing a fixed name could
         # accept each other's stale fail()/done() calls. Tests pass a fixed id.
@@ -111,8 +87,10 @@ class MemoryWorker:
         self._eps = EpisodeRepository()
         self._extractor = MemoryExtractor(cfg, legend=transcript_legend())
         self._consolidator = MemoryConsolidator(self._ids, self._mem, self._eps)
-        self._embed = embed
-        self._vec = VectorRepository(embed.name)
+        # The bundle's own embedding backend: vectors are stored under the model that
+        # produced them, so the store is keyed by the backend answering right now.
+        self._embed = providers().embedding
+        self._vec = VectorRepository(self._embed.name)
 
     async def run_forever(self, *, idle: float = 5.0) -> None:
         while True:
@@ -128,11 +106,12 @@ class MemoryWorker:
     async def step(self) -> bool:
         """Do one job. Returns whether there was one to do."""
         # Half an hour, not the default ten minutes: a full drain is up to
-        # MAX_PASSES background model calls and can outlive a short lease, and a
+        # several background model calls and can outlive a short lease, and a
         # deploy overlap would then reclaim the running job and pay for the same
         # transcript twice. The cost of the longer lease is only that a crashed
         # worker's job waits this long to be retried - nobody is watching at 02:30.
-        job = await self._queue.claim(lease=timedelta(minutes=30))
+        job = await self._queue.claim(
+            lease=timedelta(minutes=self._m.job_lease_min))
         if job is None:
             return False
         try:
@@ -188,9 +167,9 @@ class MemoryWorker:
                       (SELECT last_extract_at FROM group_state WHERE group_id=$1),
                       'epoch')
                 ORDER BY created_at ASC, id ASC LIMIT $2""",
-            group_id, WINDOW,
+            group_id, self._m.extract_window,
         )
-        if len(rows) < WINDOW:
+        if len(rows) < self._m.extract_window:
             return list(rows)
         rows = self._gap_cut(list(rows))
         # A truncated chunk must never end mid-tie: the watermark is a bare
@@ -204,8 +183,7 @@ class MemoryWorker:
         trimmed = [r for r in rows if r["created_at"] != last]
         return trimmed or rows
 
-    @staticmethod
-    def _gap_cut(rows: list) -> list:
+    def _gap_cut(self, rows: list) -> list:
         """Trim a full chunk back to the last conversation gap in its tail half.
 
         Only a full chunk is cut - a partial one already ends where the group
@@ -213,8 +191,9 @@ class MemoryWorker:
         axis), so the gap is measured between created_at-consecutive rows using
         their occurred_at - identical in practice, see _next_unread.
         """
-        for i in range(len(rows) - 1, WINDOW // 2, -1):
-            if rows[i]["occurred_at"] - rows[i - 1]["occurred_at"] >= BATCH_GAP:
+        gap = timedelta(minutes=self._m.batch_gap_min)
+        for i in range(len(rows) - 1, self._m.extract_window // 2, -1):
+            if rows[i]["occurred_at"] - rows[i - 1]["occurred_at"] >= gap:
                 return rows[:i]
         return rows
 
@@ -324,12 +303,12 @@ class MemoryWorker:
         # records of the same event unless the model is told the first one exists.
         seen: list[str] = []
         for eid in dict.fromkeys(codes.values()):
-            for ep in await self._eps.involving(group_id, eid, limit=KNOWN_EPISODES):
+            for ep in await self._eps.involving(group_id, eid, limit=self._m.known_episodes):
                 if ep.summary not in seen:
                     seen.append(ep.summary)
         if seen:
             out.append("已记过的事：")
-            out += [f"- {defang(s)}" for s in seen[:KNOWN_EPISODES]]
+            out += [f"- {defang(s)}" for s in seen[:self._m.known_episodes]]
         return "\n".join(out)
 
     async def extract(self, group_id: int, *, force: bool = False) -> int:
@@ -338,13 +317,13 @@ class MemoryWorker:
         The nightly single event point (schedule.nightly_cron): the whole day is
         read here, oldest first, each chunk cut where a conversation ended. Two
         gates per pass, in the order that costs least to check: the day's budget,
-        then whether enough is unread to be worth a pass at all (DRAIN_FLOOR;
+        then whether enough is unread to be worth a pass at all (memory.drain_floor;
         `force` - /relearn - reads whatever there is). This is the only place that
         knows a model call is about to happen, so it is the only place where
         "nothing has been said since last time" can reliably stop one.
         """
         total = 0
-        for _ in range(MAX_PASSES):
+        for _ in range(self._m.max_passes):
             if await BUDGET.exceeded(self._cfg.budget.daily_cny_cap):
                 # The same cap that silences replies gates learning too: background
                 # work is the least urgent spend there is.
@@ -353,7 +332,7 @@ class MemoryWorker:
                 break
 
             unread, _newest = await repo.unread_since_extract(group_id)
-            if not unread or (unread < DRAIN_FLOOR and not force):
+            if not unread or (unread < self._m.drain_floor and not force):
                 if not total:
                     log.info("group %s: %d unread, not worth a pass", group_id, unread)
                 break
@@ -446,8 +425,8 @@ class MemoryWorker:
             # defang on render: rows archived before Sender.parse neutralized
             # names can carry anything, and the account code appended below is
             # only unforgeable if the name half cannot contain the brackets.
-            name = defang((sender.get("card") or sender.get("nickname")
-                           or uid or "")).strip()
+            name = defang(sender.get("card") or sender.get("nickname")
+                           or uid or "").strip()
             if not uid:
                 continue
             if uid not in by_account:
@@ -573,13 +552,16 @@ class MemoryWorker:
         not running it is paid on every single reply: the roster sits in the system block,
         so one stale line is re-read on every turn until somebody notices it by hand.
         """
+        stable, fast = decay_classes()
+        half = config().predicates.half_life_days
         facts = await self._mem.decay(
             group_id,
-            stable=STABLE_PREDICATES, fast=FAST_PREDICATES,
-            stable_days=STABLE_DAYS, default_days=DEFAULT_DAYS, fast_days=FAST_DAYS,
+            stable=stable, fast=fast,
+            stable_days=half.stable, default_days=half.default, fast_days=half.fast,
             keep_predicates=(NOTE,))
         names = await self._ids.decay_aliases(
-            group_id, unused_days=ALIAS_UNUSED_DAYS, joke_days=JOKE_UNUSED_DAYS)
+            group_id, unused_days=self._m.alias_unused_days,
+            joke_days=self._m.joke_unused_days)
         if facts or names:
             log.info("group %s: retired %d facts and %d unconfirmed names",
                      group_id, facts, names)
@@ -593,9 +575,13 @@ class MemoryWorker:
         todo = await self._vec.unembedded_episodes(group_id)
         if not todo:
             return 0
-        vecs = await self._embed.embed([summary for _, summary in todo],
-                                       group_id=str(group_id))
-        for (eid, _), v in zip(todo, vecs):
+        vecs = await self._embed.embed(
+            [summary for _, summary in todo], cfg=self._cfg.llm.embedding,
+            group_id=str(group_id))
+        # strict: the vectors are paired with the episodes by position, so a backend
+        # that answered with a different number of them would file each summary under
+        # somebody else's vector rather than fail.
+        for (eid, _), v in zip(todo, vecs, strict=True):
             await self._vec.put(group_id=group_id, object_type="episode",
                                 object_id=eid, embedding=v)
         log.info("group %s: embedded %d episodes", group_id, len(todo))

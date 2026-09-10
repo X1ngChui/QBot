@@ -85,7 +85,7 @@ class OpenAIClient:
 
 
 class OpenAICompatChat(TextModel):
-    """Streaming chat with tool-call accumulation. No fallback, no downgrade (D6): on
+    """Streaming chat with tool-call accumulation. No fallback, no downgrade: on
     failure this raises and the caller decides to stay silent."""
 
     name = "openai_compat"
@@ -118,10 +118,41 @@ class OpenAICompatChat(TextModel):
         backends that can be asked not to deliberate) versus default behaviour."""
         return dict(self._terse_body()) if effort == "off" else {}
 
+    def _image_part(self, image_id: str) -> dict[str, Any]:
+        """One attached picture, in this backend's own wire shape.
+
+        The layer above says {"type": "image", "id": ...} and nothing more: which
+        JSON a vendor wants for a stored picture is exactly the kind of quirk this
+        class exists to hold, and the shapes really do differ - DeepSeek takes a flat
+        file_id and rejects the nesting below, which is what OpenAI documents.
+        """
+        return {"type": "file", "file": {"file_id": image_id}}
+
+    def _wire(self, messages: list[dict]) -> list[dict]:
+        """The conversation with its neutral image markers translated for this vendor.
+
+        Copied, never mutated: the caller keeps one message list across the whole
+        tool loop and re-sends it every round, so rewriting in place would translate
+        the same part again on the next pass.
+        """
+        out = []
+        for m in messages:
+            content = m.get("content")
+            if not isinstance(content, list) or not any(
+                    isinstance(p, dict) and p.get("type") == "image" for p in content):
+                out.append(m)
+                continue
+            out.append({**m, "content": [
+                self._image_part(p["id"])
+                if isinstance(p, dict) and p.get("type") == "image" else p
+                for p in content
+            ]})
+        return out
+
     # -- driver -----------------------------------------------------------
     def _gate(self, cfg: TextCfg) -> asyncio.Semaphore:
-        # Global concurrency limit (section 2). Resizing under load would lose outstanding
-        # permits, so a changed value applies at the next start.
+        # One limit for every caller of this backend. Resizing under load would lose
+        # outstanding permits, so a changed value applies at the next start.
         if self._sem is None:
             self._sem = asyncio.Semaphore(cfg.max_concurrency)
             self._sem_size = cfg.max_concurrency
@@ -211,7 +242,7 @@ class OpenAICompatChat(TextModel):
     ) -> ChatResult:
         kwargs: dict[str, Any] = {
             "model": model,
-            "messages": messages,
+            "messages": self._wire(messages),
             "stream": True,
             "stream_options": {"include_usage": True},
         }
@@ -327,7 +358,7 @@ class OpenAICompatVision(VisionModel):
             res = await asyncio.wait_for(
                 client.chat.completions.create(**kwargs), timeout=cfg.timeout_sec
             )
-        except (asyncio.TimeoutError, openai.APITimeoutError):
+        except (TimeoutError, openai.APITimeoutError):
             # Same rule as chat and ASR: the vendor billed the image and whatever
             # was generated up to the cut, so a timeout books a leaning-high
             # estimate rather than nothing - this was the one paid capability
@@ -344,9 +375,13 @@ class OpenAICompatVision(VisionModel):
         usage = res.usage.model_dump() if res.usage else {}
         in_miss = usage.get("prompt_tokens", 0) or 0
         out = usage.get("completion_tokens", 0) or 0
+        # Billed under whatever answered, like the chat path: a vendor retiring an id
+        # answers it with the successor, and pricing the call from the retired entry
+        # bills a rate nobody charged.
+        billed = getattr(res, "model", "") or cfg.model
         await BUDGET.record(
-            kind=Kind.VISION, model=cfg.model,
-            cny=self.rate_for(cfg.model).tokens(0, in_miss, out),
+            kind=Kind.VISION, model=billed,
+            cny=self.rate_for(billed).tokens(0, in_miss, out),
             group_id=group_id, in_miss=in_miss, out=out,
         )
         return " ".join((res.choices[0].message.content or "").split())
@@ -410,7 +445,7 @@ class OpenAICompatAsr(AsrModel):
             res = await asyncio.wait_for(
                 client.chat.completions.create(**kwargs), timeout=cfg.timeout_sec
             )
-        except (asyncio.TimeoutError, openai.APITimeoutError):
+        except (TimeoutError, openai.APITimeoutError):
             # Both timeout shapes: the client carries cfg.timeout_sec too, so the
             # SDK's own APITimeoutError can fire before the outer wait_for - half
             # of all timeouts would otherwise slip through unbooked. The clip
@@ -422,9 +457,12 @@ class OpenAICompatAsr(AsrModel):
                 cny=self.rate_for(cfg.model).units(secs), group_id=group_id,
             )
             raise
+        # Under whatever answered, as on the other two paths. The timeout above has no
+        # response to read, so it books the id it asked for and can do no better.
+        billed = getattr(res, "model", "") or cfg.model
         await BUDGET.record(
-            kind=Kind.ASR, model=cfg.model,
-            cny=self.rate_for(cfg.model).units(secs), group_id=group_id,
+            kind=Kind.ASR, model=billed,
+            cny=self.rate_for(billed).units(secs), group_id=group_id,
         )
         content = res.choices[0].message.content
         if isinstance(content, list):  # some backends return the multimodal array form

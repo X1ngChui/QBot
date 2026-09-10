@@ -2,6 +2,20 @@
 # settings.yaml stays out of version control (it names real accounts); everything
 # structural about the file is documented here.
 # Per-group overrides go in config/personas/group_<gid>.yaml under `overrides`.
+# Two things this file does not say per line:
+#
+#   /reload vs restart. Most of this applies the moment /reload succeeds, because it
+#   is read at the point of use. These do not, and need a restart: every cron and
+#   misfire_grace_sec (registered with the scheduler at startup), the whole database
+#   block (the pool is built once), the whole memory block and llm.text.extract (the
+#   memory worker resolves them when it is constructed, so a reload cannot change a
+#   batch already being read), and llm.text.max_concurrency (the semaphore would lose
+#   outstanding permits if resized under load - the log says so when it notices).
+#   Editing timezone reloads fine everywhere except the already-registered crons.
+#
+#   Settings that wait on another setting are marked where they appear. A knob whose
+#   gate is shut does nothing at all - it is not doing a smaller version of its job.
+
 
 # Everyone who holds the ops console (/help lists it) and receives the daily report,
 # which arrives when the ledger day closes - see schedule.report_cron. QQ numbers, as
@@ -15,7 +29,7 @@ timezone: "Asia/Shanghai"
 
 trigger:
   # Every name people actually call the bot. Any one matching as a jieba token is a direct
-  # mention - word-level, not substring (section 4).
+  # mention - word-level, not substring.
   #
   # Note a nickname that is also an ordinary word will trip the must-answer path whenever
   # the group talks about that word. That is handled in the persona rather than in code:
@@ -26,11 +40,18 @@ trigger:
 gateway:
   dedup_ttl_sec: 300
   max_msg_len: 2000
+  # How long a reply waits for a picture or voice clip to be understood before
+  # building the prompt without it. The work is never cancelled - it lands for the
+  # next turn either way - so this only decides whether the person waits or the
+  # answer does.
+  media_wait_sec: 25
+  # How long the group's member list is reused before being fetched again.
+  member_cache_ttl_sec: 1800
   # There is no group allowlist: the account is a dedicated bot account, and a group is
   # served from its first message.
 
 # Five capabilities, each an independent provider with its own endpoint, model and
-# credential, and no automatic fallback between them (D6).
+# credential, and no automatic fallback between them.
 #
 # This block is the only place a platform is named. The code above it deals in capabilities
 # (text / vision / asr / embedding / search) and never learns who serves them, so
@@ -42,20 +63,20 @@ gateway:
 #
 # api_key_env names a credential, it does not hold one; the value comes from .env
 # (docker-compose injects it - see .env.example). text and vision share TEXT_API_KEY
-# because one account serves both; asr and embedding share MEDIA_API_KEY likewise.
-# To split any pair: new entry in .env and compose, new name here.
+# because one account serves both. Splitting them: new entry in .env and compose,
+# new name here. A backend that runs in-process (the ASR default) names no
+# credential at all.
 llm:
   text:
     backend: deepseek
     base_url: https://api.deepseek.com
     api_key_env: TEXT_API_KEY
-    model: deepseek-v4-pro
-    # Whether the reply model accepts image blocks. Off, pictures reach the prompt as
-    # descriptions only and nothing is uploaded to the Files store.
-    reads_images: false
+    model: deepseek-flash
     # "low" keeps sanity-check thinking without paying the full deliberation
-    # habit at pro output prices.
+    # habit at output prices.
     reasoning_effort: low
+    # RESTART: the semaphore is built once - resizing it under load would lose
+    # outstanding permits, so a change is logged and applied at the next start.
     max_concurrency: 3
     timeout_sec: 30
     retries: 2
@@ -65,6 +86,9 @@ llm:
     # account, and a second copy of an endpoint is how one goes stale.
     # Anything left out follows the reply settings above.
     extract:
+    # RESTART: the extractor resolves these when the worker is constructed, so a
+    # /reload never changes a batch mid-read. Any field left out inherits the reply
+    # setting above it.
       # The one place a cheaper tier can measurably do the reply model's work,
       # because extraction is schema-guarded and eval-covered. Empty = the
       # reply model. Change this or the grade below, then re-run
@@ -79,12 +103,14 @@ llm:
       # waiting at 02:30, and a timeout costs the batch twice - once now and
       # once on the retry.
       timeout_sec: 120
-  # The multimodal model's one remaining job: describing pictures for the archive.
+  # Describing pictures for the archive. May be the same model the reply path uses,
+  # but a separate capability all the same: descriptions are written at arrival for
+  # every picture, including in groups the bot never answers in.
   vision:
     backend: deepseek
     base_url: https://api.deepseek.com
     api_key_env: TEXT_API_KEY
-    model: deepseek-v4-flash-vision-exp
+    model: deepseek-flash
     # Deliberation grade for the describing call: "low" buys meme-reading
     # judgement for a fraction of the vendor default's cost; "off" disables it.
     reasoning_effort: low
@@ -97,10 +123,15 @@ llm:
     # with. 0 disables expiry.
     description_ttl_days: 15
     max_images_per_min: 6
+    # Biggest picture worth handling, in MB. Bounds both halves of picture
+    # handling: the download that feeds the description call, and the upload
+    # that puts the original in front of the reply model.
     max_image_mb: 8
     timeout_sec: 30
   asr:
-    # In-process CPU transcription, no key and no per-second bill. Needs the
+    # In-process CPU transcription. GATE: on this backend there is no endpoint and
+    # no credential, so base_url and api_key_env are absent on purpose, model is
+    # only a ledger label, and model_dir is read by sherpa alone. Needs the
     # model bundle on disk first: run scripts/fetch_asr_model.sh once on the
     # deploy host (models/ is mounted into the container read-only).
     backend: sherpa
@@ -122,6 +153,11 @@ llm:
     backend: dashscope
     base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
     api_key_env: MEDIA_API_KEY
+    # Both are load-bearing beyond this file. dimensions must match the VECTOR(n)
+    # column in sql/init.sql - a mismatch fails every insert. And vectors are stored
+    # under the model that produced them and only ever searched under the current
+    # one, so changing model hides every existing vector: recall_events comes back
+    # empty until the nightly embed pass has rebuilt them.
     model: text-embedding-v4
     dimensions: 2048
     timeout_sec: 60
@@ -142,6 +178,8 @@ llm:
 budget:
   # A real ceiling: at it the bot stops answering until the day rolls over in the
   # timezone above.
+  # Only paid backends answer to it: free ones (sherpa transcription) pass
+  # straight through, so their pace gates are the only thing holding them.
   daily_cny_cap: 3.0
   # What one reply may spend, in CNY, tool loop included. Money is the only
   # constraint: free tools run without limit, paid rounds account against this
@@ -149,6 +187,25 @@ budget:
   # wrap-up round answers from what was already fetched. Only the daily cap
   # above, checked before anything is spent, means silence.
   per_reply_cny: 0.30
+
+# What the model is shown of the conversation. Counts, not a token budget: money
+# bounds what a reply may spend, and every other block is rendered whole.
+prompt:
+  # The history window, in chunks; it holds window_chunks * evict_chunk messages.
+  # Whole chunks so the multiple holds by construction.
+  window_chunks: 3
+  # How many messages leave at once. A prefix cache matches from the start, so
+  # every slide is a miss - sliding rarely is most of what there is to win.
+  evict_chunk: 30
+  # Original pictures one prompt may carry, newest first, and how old one may be
+  # and still be shown as pixels rather than as its description line. A message
+  # brings all of its pictures or none, so the count binds at message
+  # granularity. What it leaves out is not lost: those pictures keep their
+  # description lines and their numbers, and open_image fetches any of them.
+  # The age must stay under the file retention of the backend that stores them
+  # (the text one).
+  max_images: 8
+  image_max_age_days: 7
 
 retrieval:
   # Lines of surrounding conversation around each search_history hit, each way.
@@ -159,8 +216,50 @@ retrieval:
   # after each recalled one. An episode covers a whole stretch of conversation,
   # so a couple either side frames the story. 0 = bare recall.
   episode_context: 2
+  # How many archive hits one search returns, and how many terms one search
+  # expression may carry. Nothing is paginated: a model that wants more searches
+  # again with better words.
+  history_hits: 8
+  max_query_terms: 8
+  # How much of one page read_url hands the model. The one input with no bound of
+  # its own - past the model's context the request fails outright - and a cut page
+  # is told it was cut.
+  url_content_chars: 8000
+  # Entries of a merged forward that get rendered. Entries, not characters: what
+  # each one says is shown whole.
+  forward_nodes: 6
+
+# How much the memory pipeline reads, and how fast it lets go. The model that runs
+# extraction is not here - it belongs to the capability doing the work
+# (llm.text.extract); this is the machinery around it.
+memory:
+  # RESTART: the memory worker resolves this whole block when it is constructed, so
+  # a /reload cannot change a batch already being read. Edits apply at the next start.
+  # Messages one extraction chunk holds at most. /relearn's watermark reset keeps
+  # exactly this many unread, so the two move together.
+  extract_window: 120
+  # A full chunk is trimmed back to the last conversation gap of at least this many
+  # minutes in its tail half, so batches end where conversations do.
+  batch_gap_min: 30
+  # Below this many unread messages a drain does not bother - a pass pays for the
+  # rules and the schemas before reading a line. /relearn forces past it.
+  drain_floor: 20
+  # Passes one nightly drain may run, and how many recorded episodes the extractor
+  # is reminded of so it recognises what it already wrote down.
+  max_passes: 10
+  known_episodes: 8
+  # How long an unused name survives: one the model merely guessed at, and one it
+  # marked as a joke. Most jokes are true for an afternoon.
+  alias_unused_days: 30
+  joke_unused_days: 7
+  # How long a claimed memory job stays claimed. A full drain is several model calls
+  # and can outlive a short lease; a deploy overlap would then pay twice.
+  job_lease_min: 30
 
 schedule:
+  # RESTART: both crons and misfire_grace_sec are handed to the scheduler at startup.
+  # /reload validates them and accepts the file, but the jobs keep their old triggers
+  # until the next start. Everything else in this block is read when the night runs.
   # The whole night is one pipeline in dependency order - extraction drain,
   # decay, pg_dump, napcat cache sweep - with a queue-drain wait between
   # stages (tasks.nightly). The report fires the moment the ledger day
@@ -169,6 +268,26 @@ schedule:
   report_cron:  "0 0 * * *"
   backup_keep: 14
   napcat_cache_days: 7
+  # How long the nightly pipeline waits for each stage's jobs to drain before moving
+  # on anyway, and how often it checks. Moving on late beats a night with no backup.
+  extract_drain_hours: 3
+  decay_drain_min: 30
+  drain_poll_sec: 30
+  # How late a missed trigger may still fire. APScheduler's default is seconds, so a
+  # loop busy at the trigger moment would silently skip that night.
+  misfire_grace_sec: 3600
+  # How old the newest dump may be before the daily report calls it out.
+  backup_stale_hours: 26
+
+# The connection pool. Small on purpose: one bot on one machine, and a pool larger
+# than the work only moves contention into postgres.
+database:
+  # RESTART: the pool is built once at startup and never resized.
+  pool_min: 2
+  pool_max: 8
+  # Ceiling on any single statement, so a query that will never finish fails instead
+  # of holding a connection for the life of the process.
+  command_timeout_sec: 20
 
 # -- files --------------------------------------------------------------------
 # Paths are relative to this config directory (absolute allowed).
@@ -184,6 +303,9 @@ personas_dir: personas
 agreement:
   version: 1
   file: agreement.txt
+  # How often one member is re-shown the pointer at /terms. The full text re-sent
+  # every time reads as spam.
+  prompt_every_sec: 600
 
 # The prompt texts the model reads, one <key>.txt per key in the code's manifest
 # (settings.PROMPT_KEYS); ls this directory to see the set. A file missing or

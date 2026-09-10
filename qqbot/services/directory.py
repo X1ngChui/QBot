@@ -17,7 +17,7 @@ import logging
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 
 from ..domain.identity import Alias, AliasEvidence, AliasType, EvidenceType, normalize
 from ..domain.memory import Fact, MemoryType
@@ -26,7 +26,7 @@ from ..repositories import (
 )
 from ..db import repo as db_repo
 from ..repositories.job import JobType
-from ..settings import EXTRACT_WINDOW
+from ..settings import config
 from ..util import now_local
 from .context_builder import NOTE, render_fact
 from .identity_resolver import IdentityResolver, UnknownAccount
@@ -185,7 +185,7 @@ def _current_platform_name(aliases) -> str:
                 if a.alias_type in (AliasType.GROUP_CARD, AliasType.QQ_NICKNAME)]
     if not platform:
         return ""
-    epoch = datetime.min.replace(tzinfo=timezone.utc)
+    epoch = datetime.min.replace(tzinfo=UTC)
     newest = max(platform,
                  key=lambda a: (a.last_used_at or a.valid_from or epoch, a.confidence))
     return newest.alias_text
@@ -415,8 +415,8 @@ class Directory:
         waiting for a second sighting.
 
         `globally` is the only way an alias ever crosses groups, and it is owner-only for
-        that reason (design goal 4): a name that resolves everywhere carries what one
-        group knows into another.
+        that reason: a name that resolves everywhere carries what one group knows into
+        another.
 
         Raises NameTaken if somebody else here already answers to it. A name belongs to
         one person - the same rule under which the validator refuses a batch pointing one
@@ -485,7 +485,7 @@ class Directory:
 
         Retired, not deleted: messages already in the archive still need it to be
         resolvable, and dropping the row would make them unreadable in a way nothing
-        could reconstruct (design doc 18).
+        could reconstruct.
         """
         entity_id = await self._entity(user_id)
         wanted = normalize(text)
@@ -572,7 +572,8 @@ class Directory:
         """
         # Pull back exactly one window, and force past the drain floor: an owner
         # asking for a re-read gets one however few messages there are.
-        await db_repo.reset_extract_watermark(group_id, keep=EXTRACT_WINDOW)
+        await db_repo.reset_extract_watermark(
+            group_id, keep=config().default.memory.extract_window)
         jid = await self._jobs.submit(
             JobType.EXTRACT_MEMORY, {"group_id": group_id, "force": True}, priority=2
         )

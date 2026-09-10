@@ -46,7 +46,7 @@ from ..db import repo
 from ..providers import providers
 from ..providers.openai_compat import NEVER_BILLED
 from ..services import UnknownAccount
-from ..settings import Settings, VisionCfg, ptext
+from ..settings import Settings, VisionCfg, config, ptext
 from ..util import defang, sysmark, why
 from .botapi import BotApi
 from .budget import BUDGET
@@ -64,10 +64,6 @@ from .segments import (
     parse_segments,
     segments_of,
 )
-
-#: How many entries of a merged forward to render, and how much of each.
-FORWARD_NODES = 6
-FORWARD_CHARS = 40
 
 log = logging.getLogger("qqbot.media")
 
@@ -239,7 +235,7 @@ class MediaProcessor:
 
     async def ensure_uploaded(self, ref: ImageRef, *, bot: BotApi, group_id: str,
                               cfg: Settings) -> str | None:
-        """File this picture with the vision backend, once, and remember where.
+        """File this picture with the reply model's backend, once, and remember where.
 
         The upload itself is free and the id is what lets a reply prompt carry the
         original pixels instead of a one-line description. Runs on arrival, while the
@@ -248,10 +244,6 @@ class MediaProcessor:
         the window). A backend that keeps no files answers None once and this feature
         simply stays off.
         """
-        if not cfg.llm.text.reads_images:
-            # Nothing would ever reference the id: the reply model cannot read file
-            # blocks, and the archive runs on descriptions.
-            return None
         if ref.file_id:
             return ref.file_id
         if not ref.key:
@@ -272,7 +264,9 @@ class MediaProcessor:
         suffix = Path(ref.file or "").suffix.lower().lstrip(".")
         mime = f"image/{'jpeg' if suffix in ('', 'jpg') else suffix}"
         try:
-            fid = await providers().vision.upload(data, cfg=vcfg, mime=mime)
+            # Through the text capability: it is the model that will be handed the
+            # file block, so it is the one that has to resolve the id.
+            fid = await providers().text.upload(data, cfg=cfg.llm.text, mime=mime)
         except Exception as e:
             log.warning("image upload failed: %s", why(e))
             return None
@@ -378,31 +372,6 @@ class MediaProcessor:
             await repo.image_cache_put(ref.key, desc)
         return desc
 
-    async def inspect(self, ref: ImageRef, *, question: str, bot: BotApi,
-                      group_id: str, cfg: Settings) -> str | None:
-        """Look at one picture again, with a specific question.
-
-        The archival describe is a single sentence; when someone asks for a detail
-        beyond it ("what does the third line say"), this is the reply loop's paid
-        way to reopen its eyes. Uncached on purpose - the answer is question-shaped,
-        not picture-shaped - and unwindowed: what bounds it is the per-reply budget
-        the tool loop already runs inside (the describe call books itself into the
-        ambient scope), plus the engine's duplicate-call suppression.
-        """
-        vcfg = cfg.llm.vision
-        data = await self._bytes(ref, bot=bot,
-                                 max_bytes=int(vcfg.max_image_mb * 1024 * 1024))
-        if not data:
-            return None
-        try:
-            answer = await providers().vision.describe(
-                data, cfg=vcfg, prompt=ptext("inspect_image") + "\n" + question.strip(),
-                group_id=group_id)
-        except Exception as e:
-            log.warning("inspect_image call failed: %s", why(e))
-            return None
-        return " ".join(strip_markdown(answer).split()) or None
-
     async def transcribe(self, ref: AudioRef, *, bot: BotApi, group_id: str,
                          cfg: Settings) -> str | None:
         """Single-flight per clip, like describe_image per picture: with pending
@@ -491,7 +460,7 @@ class MediaProcessor:
         """A bare QQ number tells the model nothing about who was addressed.
 
         The protocol side already knows every member's group card, so ask it for the whole
-        group at once rather than keeping a name cache of our own. It also answers for
+        group at once rather than keeping a second name cache here. It also answers for
         people who have never spoken, which user_profiles cannot.
         """
         qq = ref.ident or ""
@@ -541,7 +510,8 @@ class MediaProcessor:
             return None
 
         outs = await asyncio.gather(*(free(r) for r in pm.refs), return_exceptions=True)
-        return {r.slot: o for r, o in zip(pm.refs, outs) if isinstance(o, str) and o}
+        return {r.slot: o for r, o in zip(pm.refs, outs, strict=True)
+                if isinstance(o, str) and o}
 
     async def _body_of(self, msg: dict, *, bot: BotApi, group_id: str, self_id: str) -> str:
         """One forward node's text, on the free budget."""
@@ -560,23 +530,22 @@ class MediaProcessor:
             return None
         nodes = res.get("messages") or res.get("message") or []
         lines = []
-        for node in nodes[:FORWARD_NODES]:
+        limit = config().default.retrieval.forward_nodes
+        for node in nodes[:limit]:
             data = node.get("data") if node.get("type") == "node" else node
             data = data or {}
             sender = data.get("sender") or {}
-            who = defang((
+            who = defang(
                 sender.get("card") or sender.get("nickname")
                 or data.get("nickname") or ""
-            )).strip()
+            ).strip()
             body = await self._body_of(data, bot=bot, group_id=group_id, self_id=self_id)
             if not body:
                 continue
-            if len(body) > FORWARD_CHARS:
-                body = body[:FORWARD_CHARS] + "…"
             lines.append(f"{who}: {body}" if who else body)
         if not lines:
             return None
-        more = "" if len(nodes) <= FORWARD_NODES else f" 等{len(nodes)}条"
+        more = "" if len(nodes) <= limit else f" 等{len(nodes)}条"
         # The nested bodies came through parse_segments and are already defanged;
         # their own media markers keep the system brackets - a nested description
         # is system writing even inside a forward.
@@ -622,7 +591,7 @@ class MediaProcessor:
 
         results = await asyncio.gather(*(one(r) for r in pm.refs), return_exceptions=True)
         out: dict[int, str] = {}
-        for ref, res in zip(pm.refs, results):
+        for ref, res in zip(pm.refs, results, strict=True):
             if isinstance(res, Exception):
                 log.warning("resolving %s failed: %s", type(ref).__name__, res)
             elif res:

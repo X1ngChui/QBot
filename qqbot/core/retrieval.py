@@ -1,9 +1,9 @@
 """The long-term memory the reply path uses: the whole roster, in a fixed order.
 
-Why the whole roster rather than a retrieval (design goal 1): this block sits in the
+Why the whole roster rather than a retrieval: this block sits in the
 system prompt, ahead of the history, and prefix caching only matches forward from the
 start - rebuilding the roster around whoever is speaking invalidates everything after it
-(measured, and rejected on the measurement). Held whole and rendered in a fixed order, it
+- measured, and rejected on the measurement. Held whole and rendered in a fixed order, it
 is identical word for word between turns. A real group of thirty accounts renders to
 about two thousand characters; while it fits, there is nothing to rank and nothing to
 leave out.
@@ -28,6 +28,7 @@ from ..repositories import (
     EpisodeRepository, EventRepository, IdentityRepository, JobQueue,
     MemoryRepository, VectorRepository,
 )
+from ..providers import providers
 from ..services import Directory, IdentityResolver, Retriever
 from ..services.memory_extractor import GROUP_TERM, GROUP_TOPIC
 from .members import MEMBERS
@@ -165,21 +166,21 @@ async def gather(*, group_id: str, bot=None) -> list[dict]:
     return out
 
 
-_RETRIEVER: Retriever | None = None
+#: Built on first use rather than injected at startup: the embedding backend arrives
+#: with the rest of the bundle now, so there is nothing left for a wiring step to do
+#: and nothing to forget to call. Keyed by backend name because vectors are stored
+#: under the model that produced them.
+_RETRIEVERS: dict[str, Retriever] = {}
 
 
-def set_embedding(embed) -> None:
-    """Give the reply path its vector backend. Called once, at startup.
-
-    There is no instance until this runs, and deliberately no default that quietly ranks
-    by something else: asking for episodes before this is wired is an error rather than
-    a worse answer.
-    """
-    global _RETRIEVER
-    _RETRIEVER = Retriever(
-        _IDS, MemoryRepository(), EpisodeRepository(),
-        vec=VectorRepository(embed.name), embed=embed,
-    )
+def _retriever() -> Retriever:
+    embed = providers().embedding
+    got = _RETRIEVERS.get(embed.name)
+    if got is None:
+        got = Retriever(_IDS, MemoryRepository(), EpisodeRepository(),
+                        vec=VectorRepository(embed.name), embed=embed)
+        _RETRIEVERS[embed.name] = got
+    return got
 
 
 async def episode_lookup(group_id: str, question: str) -> str:
@@ -198,9 +199,7 @@ async def episode_lookup(group_id: str, question: str) -> str:
     stretch. Touching windows merge into one block, blocks are separated by an
     ellipsis line, and an undated episode stands alone.
     """
-    if _RETRIEVER is None:
-        raise RuntimeError("retrieval.set_embedding has not been called")
-    eps = await _RETRIEVER.search_episodes(int(group_id), question)
+    eps = await _retriever().search_episodes(int(group_id), question)
     if not eps:
         return ""
 
@@ -262,5 +261,4 @@ async def group_knowledge(group_id: str) -> list[str]:
     return out
 
 
-__all__ = ["gather", "group_knowledge", "episode_lookup", "directory",
-           "set_embedding"]
+__all__ = ["gather", "group_knowledge", "episode_lookup", "directory"]

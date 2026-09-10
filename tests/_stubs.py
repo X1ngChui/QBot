@@ -6,8 +6,7 @@ every suite has to supply now that the reply path will not start without it.
 
 import hashlib
 
-from qqbot.providers.base import Rate
-from qqbot.providers.embedding import EmbeddingModel
+from qqbot.providers.base import EmbeddingModel, Rate
 
 
 class FakeEmbedding(EmbeddingModel):
@@ -31,7 +30,7 @@ class FakeEmbedding(EmbeddingModel):
     def rate_for(self, model):
         return Rate("Mtoken", in_miss=0.5)
 
-    async def embed(self, texts, *, group_id=None):
+    async def embed(self, texts, *, cfg=None, group_id=None):
         type(self).EMBED_CALLS += len(texts)
         # Deterministic across processes, which the first version was not: it used the
         # built-in hash(), which is salted per process, so the vector geometry changed

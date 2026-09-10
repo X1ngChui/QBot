@@ -9,45 +9,24 @@ a phrase.
 
 from __future__ import annotations
 
+from ..settings import config
+
 #: The predicate a hand-written note is filed under. It renders as itself, with no verb
 #: in front: an owner who types a note has already written the sentence they want.
 NOTE = "note"
 
-#: How each predicate reads in Chinese. Prompt-facing text, so it is written the way the
-#: group talks rather than the way the schema does.
-VERB: dict[str, str] = {
-    # who they are, where they are, what they do
-    "lives_in": "住在",
-    "from_place": "来自",
-    "works_as": "做",
-    "works_at": "就职于",
-    "studies_at": "就读于",
-    "majors_in": "主修",
-    "birthday": "生日",
-    # what they think of things
-    "likes": "喜欢",
-    "dislikes": "不喜欢",
-    "avoids": "回避",
-    "wants": "想要",
-    "fears": "害怕",
-    # what they do and have
-    "plays": "在玩",
-    "watches": "在追",
-    "listens_to": "在听",
-    "reads": "在读",
-    "uses": "在用",
-    "owns": "有",
-    "collects": "收集",
-    "has_pet": "养着",
-    "visited": "去过",
-    # what they can do, who they are with, and what their body says no to.
-    # A value containing {} is a template the object drops into; everything else is a
-    # verb the object follows - an allergy reads object-first in Chinese.
-    "good_at": "擅长",
-    "speaks": "会说",
-    "member_of": "属于",
-    "allergic_to": "对{}过敏",
-}
+
+def verb_of(predicate: str) -> str:
+    """How this predicate reads in Chinese, or "" if it is not a configured one.
+
+    Prompt-facing text, so it is written the way the group talks rather than the way
+    the schema does, and it lives with the rest of the predicate's definition in
+    predicates.yaml. Empty for anything the table does not name: a predicate that was
+    removed leaves rows behind, and the bare English name is not something to put in
+    front of the model.
+    """
+    entry = config().predicates.person.get(predicate)
+    return entry.verb if entry else ""
 
 
 def render_fact(predicate: str, object_value, object_key: str | None = None) -> str:
@@ -68,7 +47,9 @@ def render_fact(predicate: str, object_value, object_key: str | None = None) -> 
         return f"{object_key}：{obj}"
     if predicate == "topic":
         return obj
-    verb = VERB.get(predicate, predicate)
+    verb = verb_of(predicate)
+    if not verb:
+        return ""
     return verb.format(obj) if "{}" in verb else f"{verb}{obj}"
 
 

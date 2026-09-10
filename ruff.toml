@@ -1,0 +1,26 @@
+# Lint settings. Run it from the repo root:
+#
+#     .venv/Scripts/python.exe -m ruff check .
+#
+# The rule set is picked to catch mistakes, not to impose a house style the code does
+# not already follow: correctness and dead code first, plus the modernisations that are
+# unambiguous. Import sorting (I) is deliberately off - the import blocks here are
+# grouped by meaning, and re-sorting them would churn every file to say nothing.
+line-length = 100
+target-version = "py312"
+
+[lint]
+select = ["E", "F", "W", "B", "UP", "C4", "SIM"]
+ignore = [
+    # A bare `except Exception: pass` around a best-effort call is deliberate in the
+    # places it appears, and contextlib.suppress reads no better there.
+    "SIM105",
+]
+
+[lint.per-file-ignores]
+# These files set sys.path and read .env before importing the package, so their imports
+# cannot come first. Same for plugin.py, which must call NoneBot's require() before
+# importing anything that uses the scheduler plugin.
+"tests/*" = ["E402"]
+"scripts/*" = ["E402"]
+"qqbot/plugin.py" = ["E402"]

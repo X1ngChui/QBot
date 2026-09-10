@@ -10,11 +10,11 @@ import uuid
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from qqbot.domain.identity import (  # noqa: E402
+from qqbot.domain.identity import (
     Alias, AliasEvidence, AliasStatus, AliasType, Entity, EvidenceType,
     IdentityAccount, normalize,
 )
-from qqbot.domain.memory import (  # noqa: E402
+from qqbot.domain.memory import (
     Candidate, CandidateType, Episode, EpisodeType, Fact, Participant,
     RejectReason,
 )

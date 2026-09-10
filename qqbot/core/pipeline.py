@@ -1,4 +1,4 @@
-"""The message pipeline (section 2): what happens to a message between arriving and
+"""The message pipeline: what happens to a message between arriving and
 being answered. (`gateway/` is the protocol layer - OneBot in, typed events out.)
 
   arrive -> dedup -> ingest -> free media lookups -> trigger
@@ -41,14 +41,6 @@ from .segments import ImageRef, ParsedMessage, parse_segments
 from .state import REGISTRY, ChatMsg
 
 log = logging.getLogger("qqbot.pipeline")
-
-#: How long a reply waits for media (the settle and the backlog). A deliberating
-#: describe measures 10-20s; the person is already waiting for an answer about the
-#: picture, so waiting beats answering that it could not be seen. Timing out is
-#: still safe either way - the work completes and lands for the next turn. Only a
-#: replying message waits at all: the media tasks persist their own results, so a
-#: message that draws no reply costs nothing here.
-MEDIA_WAIT_PAID_SEC = 25.0
 
 
 async def note_console_reply(*, group_id: str | int, self_id: str, text: str,
@@ -158,7 +150,7 @@ class Gateway:
         parsed = parse_segments(segments, str(bot.self_id))
 
         # The adapter pops a leading or trailing @me segment off the message and reports it
-        # as event.to_me, so the segments alone cannot tell us we were addressed - the one
+        # as event.to_me, so the segments alone cannot show the bot was addressed - the one
         # path that must always answer would never fire. Trust to_me, and put the marker
         # back so the prompt still shows the bot was spoken to.
         if getattr(event, "to_me", False) and not parsed.at_bot:
@@ -183,8 +175,8 @@ class Gateway:
         sender = event.sender
         # The reply path reads the live event, not gateway.Sender - so it defangs
         # here, in step with Sender.parse doing the same for the archived copy.
-        nickname = defang((getattr(sender, "card", "")
-                           or getattr(sender, "nickname", "") or user_id)).strip()
+        nickname = defang(getattr(sender, "card", "")
+                           or getattr(sender, "nickname", "") or user_id).strip()
 
         # The event's own timestamp when it carries one, so the line's [MM-dd HH:mm]
         # stamp and the archive's occurred_at agree - late-delivered messages after
@@ -201,7 +193,7 @@ class Gateway:
             mentions=list(parsed.mentions),
             reply_to=parsed.reply_to,
             # Kept beyond the describe: pending is unpaid work and gets cleared,
-            # but the references stay for the window's lifetime so inspect_image
+            # but the references stay for the window's lifetime so open_image
             # can reopen a picture whose one-line description is already in.
             image_refs=[x for x in parsed.refs if isinstance(x, ImageRef)],
         )
@@ -267,7 +259,7 @@ class Gateway:
         # no await sits between st.add above and this line, so the slice ends
         # exactly at the message being answered, and whatever arrives while the
         # task is generating can neither leak in nor steal the reply's target.
-        window = prompt.history_window(st, [msg])
+        window = prompt.history_window(st, [msg], cfg)
         task = asyncio.create_task(self._reply(bot, group_id, item, decision, window))
         self._replies.add(task)
         task.add_done_callback(self._replies.discard)
@@ -491,7 +483,7 @@ class Gateway:
         one that has already fallen out of the window would be paid for and never seen.
         """
         stale = [
-            m for m in prompt.history_window(st, batch)
+            m for m in prompt.history_window(st, batch, cfg)
             if m.pending is not None and not m.is_bot
         ]
         # Each attempt owns its own persistence and survives this wait; `pending`
@@ -509,7 +501,7 @@ class Gateway:
             for msg in stale
         ]
         if tasks:
-            await asyncio.wait(tasks, timeout=MEDIA_WAIT_PAID_SEC)
+            await asyncio.wait(tasks, timeout=cfg.gateway.media_wait_sec)
 
     async def _resolve_and_patch(
         self, pm, msg: ChatMsg, *, bot: BotApi, group_id: str, cfg: Settings,
@@ -596,7 +588,7 @@ class Gateway:
         tasks = [i.media_task for i in batch if i.media_task is not None]
         if not tasks:
             return
-        await asyncio.wait(tasks, timeout=MEDIA_WAIT_PAID_SEC)
+        await asyncio.wait(tasks, timeout=cfg.gateway.media_wait_sec)
         for item in batch:
             if item.media_task is not None and item.media_task.done():
                 item.media_task = None

@@ -35,9 +35,15 @@ from qqbot.util import now_local
 from qqbot.repositories import (
     IdentityRepository as ids_probe, MemoryRepository as mem_probe,
 )
-from qqbot.workers.memory import WINDOW, MemoryWorker
+from qqbot.workers.memory import MemoryWorker
+
+#: The extraction chunk width, from config - the tests build batches around it.
+WINDOW = config().default.memory.extract_window
 from _db import reset
 from _stubs import FakeEmbedding
+
+#: One stub for every bundle in this suite.
+_EMBED = FakeEmbedding()
 
 fails = []
 G = 9001
@@ -128,7 +134,7 @@ async def say(uid, name, text, mid, gid=G):
 
 async def main():
     set_providers(Providers(text=FakeText(), vision=Unused(), asr=Unused(),
-                            search=Unused()))
+                            embedding=_EMBED, search=Unused()))
     await init_pool()
     await reset()
 
@@ -137,9 +143,7 @@ async def main():
     await say("u1", "董自豪", "切片就是把采样切成小段再重排", "e3")
     await say("u2", "小北", "这个群是做音乐的", "e4")
 
-    embed = FakeEmbedding()
-    retrieval.set_embedding(embed)
-    w = MemoryWorker(config().default, embed=embed, worker_id="e2e")
+    w = MemoryWorker(config().default, worker_id="e2e")
     # The drain floor would skip these four messages (a handful is not worth a
     # pass); the tests force past it the way /relearn does.
     check("under the drain floor nothing is paid for",
@@ -487,7 +491,7 @@ async def main():
             return await orig(self, *a, **k)
         return f
 
-    for _name, _o in zip(("fetch", "fetchrow", "fetchval"), _orig):
+    for _name, _o in zip(("fetch", "fetchrow", "fetchval"), _orig, strict=True):
         setattr(type(pool()), _name, _counting(_o))
     try:
         await retrieval.gather(group_id=str(G))
@@ -504,7 +508,7 @@ async def main():
         await retrieval.gather(group_id=str(G))
         after = calls["n"]
     finally:
-        for _name, _o in zip(("fetch", "fetchrow", "fetchval"), _orig):
+        for _name, _o in zip(("fetch", "fetchrow", "fetchval"), _orig, strict=True):
             setattr(type(pool()), _name, _o)
     check("an unchanged roster is not rebuilt", warm <= 3, f"{warm} queries")
     check("but a new fact rebuilds it", after > warm, f"{after} queries")
@@ -581,13 +585,13 @@ async def main():
     # that is right and is what makes a move expressible. For "likes" it was a bug: a
     # second thing somebody liked silently overturned the first, and with eighteen
     # predicates that would have been most of them.
-    from qqbot.services.memory_extractor import MULTI_VALUED
+    from qqbot.services.memory_extractor import multi_valued
     person = (await ids_probe().account_of("qq", "u1")).entity_id
 
     async def record(pred, obj):
         await mem_probe().supersede(
             Fact(subject_entity_id=person, predicate=pred,
-                 object_key=obj if pred in MULTI_VALUED else None,
+                 object_key=obj if pred in multi_valued() else None,
                  object_value=obj, group_id=G, memory_type=MemoryType.PREFERENCE,
                  confidence=0.5),
             [], when=now_local())
@@ -679,7 +683,7 @@ async def main():
     await say("u2", "小北", "这两条必须还能被重读", "wm2")
     before, _ = await _dbrepo.unread_since_extract(G)
     set_providers(Providers(text=FailingText(), vision=Unused(), asr=Unused(),
-                            search=Unused()))
+                            embedding=_EMBED, search=Unused()))
     try:
         await w.extract(G, force=True)
         crashed = False
@@ -690,7 +694,7 @@ async def main():
     check("and leaves the batch unread for the retry",
           before > 0 and unread == before, f"{unread}/{before}")
     set_providers(Providers(text=FakeText(), vision=Unused(), asr=Unused(),
-                            search=Unused()))
+                            embedding=_EMBED, search=Unused()))
     n_retry = await w.extract(G, force=True)
     unread, _ = await _dbrepo.unread_since_extract(G)
     check("the retry reads the same batch and the mark then moves",
@@ -700,7 +704,8 @@ async def main():
     # These branches only ever run on a full chunk at the nightly drain, which is
     # exactly when nobody is watching - so they are exercised here or never.
     from datetime import timedelta as _td
-    from qqbot.workers.memory import BATCH_GAP, LEGACY_WINDOW
+    from qqbot.workers.memory import LEGACY_WINDOW
+    BATCH_GAP = _td(minutes=config().default.memory.batch_gap_min)
 
     base = now_local()
     flat = [{"occurred_at": base + _td(seconds=i)} for i in range(WINDOW)]

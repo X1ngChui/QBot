@@ -23,14 +23,11 @@ import logging
 import time
 
 from ..db import repo
+from ..settings import config
 from ..util import defang, sysmark, why
 from .botapi import BotApi
 
 log = logging.getLogger("qqbot.members")
-
-#: How long a fetched roster is reused. Group cards change rarely; this is about call
-#: volume, not freshness.
-TTL_SEC = 1800
 
 
 class MemberDirectory:
@@ -45,7 +42,8 @@ class MemberDirectory:
         self._locks: dict[str, asyncio.Lock] = {}
 
     def _fresh(self, group_id: str) -> bool:
-        return time.monotonic() - self._fetched.get(group_id, 0.0) < TTL_SEC
+        ttl = config().default.gateway.member_cache_ttl_sec
+        return time.monotonic() - self._fetched.get(group_id, 0.0) < ttl
 
     async def _fetch(self, bot: BotApi, group_id: str) -> None:
         lock = self._locks.setdefault(group_id, asyncio.Lock())
@@ -72,7 +70,7 @@ class MemberDirectory:
                 # defang at the fetch: these names flow to transcripts, notice
                 # lines and @-resolution, and the namesake tag appended below is
                 # only unforgeable if the name half cannot carry system brackets.
-                name = defang((r.get("card") or r.get("nickname") or "")).strip()
+                name = defang(r.get("card") or r.get("nickname") or "").strip()
                 if qq and name:
                     table[qq] = name
             self._raw_by_group[group_id] = dict(table)

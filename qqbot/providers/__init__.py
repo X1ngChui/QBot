@@ -14,6 +14,7 @@ from __future__ import annotations
 from .base import (
     AsrModel,
     Capability,
+    EmbeddingModel,
     ChatResult,
     Kind,
     Providers,
@@ -30,6 +31,7 @@ __all__ = [
     "TextModel",
     "VisionModel",
     "AsrModel",
+    "EmbeddingModel",
     "SearchEngine",
     "providers",
     "set_providers",

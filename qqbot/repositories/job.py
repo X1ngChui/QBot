@@ -1,6 +1,6 @@
 """The background job queue.
 
-No Kafka (design doc 48): PostgreSQL's `FOR UPDATE SKIP LOCKED` is already enough for
+No message broker: PostgreSQL's `FOR UPDATE SKIP LOCKED` is already enough for
 several workers to contend for one table safely, and one fewer piece of middleware is one
 fewer thing to operate.
 

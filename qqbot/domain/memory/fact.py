@@ -1,6 +1,6 @@
 """L3, semantic facts.
 
-A fact is not a boolean (design doc 32). That somebody likes a game is true with a time
+A fact is not a boolean. That somebody likes a game is true with a time
 attached: they say so in August and quit the following year, and the old row should not
 be deleted but closed with a valid_to. Deleting it makes "did they use to play it"
 unanswerable forever, and makes the same sentence get learned over and over.
@@ -55,12 +55,12 @@ class MemoryType(StrEnum):
     #: Relations: who somebody is to somebody else.
     RELATION = "relation"
     #: Something true of the group rather than of any person: what it is for, what its
-    #: jargon means (design doc 57). The subject of such a fact is the group's own entity.
+    #: jargon means. The subject of such a fact is the group's own entity.
     #:
     #: Deliberately no category for in-jokes: unfalsifiable, the model will always find
     #: one, and once written down it gets used, quoted back into the archive, and
-    #: re-confirmed forever. What is stored is the useful half - the words you have to
-    #: know to follow the conversation.
+    #: re-confirmed forever. What is stored is the useful half - the words a reader
+    #: needs in order to follow the conversation.
     GROUP = "group"
 
 

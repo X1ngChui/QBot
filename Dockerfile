@@ -9,7 +9,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# pg_dump for the daily backup job (section 7.4). The client major version must be >= the
+# pg_dump for the daily backup job. The client major version must be >= the
 # server's 17, and the trixie base ships exactly 17 - so no third-party repo, no key
 # fetching, and one less host the build has to reach.
 RUN set -eux; \

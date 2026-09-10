@@ -79,7 +79,7 @@ class IdentityRepository:
     ) -> IdentityAccount:
         """Seeing an account guarantees it has an owner.
 
-        The first sighting creates the person along with the account (design doc 12): an
+        The first sighting creates the person along with the account: an
         account always belongs to somebody, even when that somebody currently consists of
         this one account. Leaving an ownerless account behind defers the question of who
         they are to a moment with no context left to answer it.
@@ -191,7 +191,7 @@ class IdentityRepository:
         return _entity(row) if row else None
 
     async def merge(self, loser: uuid.UUID, winner: uuid.UUID) -> None:
-        """Fold loser into winner. Owner-triggered only (design doc 55).
+        """Fold loser into winner. Owner-triggered only.
 
         The accounts change hands and the entity is marked merged. Facts and aliases are
         left alone: the ids they point at still resolve, because reads follow the pointer.
@@ -572,7 +572,7 @@ class IdentityRepository:
 
     async def retire_alias(self, alias_id: uuid.UUID) -> None:
         """No longer holds. Not deleted: messages already archived still need it to be
-        readable (design doc 18).
+        readable.
 
         The zero-weight MANUAL row is the pin that makes retirement stick: the platform
         re-reports the name on the very next message, and without the pin that rescore

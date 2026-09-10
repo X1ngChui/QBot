@@ -1,6 +1,6 @@
 """L1, the identity layer: people, accounts, names.
 
-Keeping the three apart is the foundation of the whole design (design doc 9-20):
+Keeping the three apart is the foundation of the whole design:
 
     Entity (a person)
        +-- IdentityAccount (a QQ account: strong identity)

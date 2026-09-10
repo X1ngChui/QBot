@@ -4,8 +4,8 @@ Four things differ from a plain OpenAI-compatible endpoint, and they all live he
 
 1. Prompt-cache accounting is reported as `prompt_cache_hit_tokens` /
    `prompt_cache_miss_tokens`. A hit is ~30x cheaper than a miss, which is what the
-   prompt ordering discipline in section 6.2 exists to earn - so the split has to be
-   read, not assumed.
+   prompt's stable-first ordering exists to earn - so the split has to be read from
+   the response, not assumed.
 2. These models deliberate before answering, and the deliberation bills as output. It
    arrives as `reasoning_content` and is reported under
    `completion_tokens_details.reasoning_tokens`.
@@ -24,9 +24,9 @@ from zoneinfo import ZoneInfo
 
 import httpx
 
-from ..settings import VisionCfg
+from ..settings import TextCfg
 from ..util import read_api_key
-from .base import Rate
+from .base import Rate, retire
 from .openai_compat import OpenAICompatChat, OpenAICompatVision
 
 log = logging.getLogger("qqbot.deepseek")
@@ -49,17 +49,17 @@ _PRICES_20260817 = {
     "deepseek-v4-flash-vision-exp": Rate("Mtoken", in_hit=0.05, in_miss=1.5, out=4.5,
                                          source="deepseek vision launch note: priced as V4-Flash"),
     "deepseek-v4-pro": Rate("Mtoken", in_hit=0.15, in_miss=4.5, out=13.5,
-                            source="deepseek repricing eff. 2026-08-17"),
-    # V4.1-Flash, announced to bill exactly like V4-Flash. Both the timed beta
-    # id and the expected release id are listed: an unpriced model falls to the
-    # pessimistic tier, whose cache-hit rate is 30x pro's, and every reply it
-    # serves is then overbilled into the daily cap.
-    "deepseek-v4.1-flash-expires-on-0910": Rate(
-        "Mtoken", in_hit=0.05, in_miss=1.5, out=4.5,
-        source="deepseek beta notice: priced as V4-Flash"),
-    "deepseek-v4.1-flash": Rate(
-        "Mtoken", in_hit=0.05, in_miss=1.5, out=4.5,
-        source="deepseek beta notice: priced as V4-Flash; confirm at release"),
+                            source="deepseek pricing page, verified 2026-09-10"),
+    # V4.1-Flash, released 2026-09-10 under this id and cheaper than the V4-Flash it
+    # replaces. It is what actually answers the two ids above: both are routed here
+    # now, so a call naming either bills at these rates once the response's own model
+    # is read back - which is why the ledger books what served a call, not what asked.
+    #
+    # From 2026-09-14 12:00 Beijing, deepseek-v4-pro routes here too, until a V4.1 Pro
+    # ships. Nothing in config has to change on that day: the id keeps working and the
+    # ledger follows the answer.
+    "deepseek-flash": Rate("Mtoken", in_hit=0.02, in_miss=1.0, out=4.0,
+                           source="deepseek pricing page, verified 2026-09-10"),
 }
 # An unlisted model bills at the most expensive tier known, so a rename cannot quietly
 # make spending look smaller than it is.
@@ -145,6 +145,21 @@ def _at_peak(now: datetime | None = None) -> bool:
 class DeepSeekChat(OpenAICompatChat):
     name = "deepseek"
 
+    def __init__(self) -> None:
+        super().__init__()
+        #: Its own client: the Files endpoint is plain multipart, not the chat
+        #: protocol the SDK speaks. Rebuilt when the timeout it was built for
+        #: changes, so a reload reaches it like every other client here.
+        self._files: httpx.AsyncClient | None = None
+        self._files_timeout = 0.0
+
+    async def aclose(self) -> None:
+        await super().aclose()
+        if self._files is not None:
+            await self._files.aclose()
+            self._files = None
+            self._files_timeout = 0.0
+
     def rate_for(self, model: str) -> Rate:
         """What this model costs to call right now.
 
@@ -175,58 +190,34 @@ class DeepSeekChat(OpenAICompatChat):
             details.get("reasoning_tokens") or 0,
         )
 
-    def _extra_body(self, *, cfg, effort: str) -> dict[str, Any]:
-        """The resolved deliberation grade as this vendor's request fields: "off"
-        disables thinking, low/high/max enable it at that reasoning_effort (the
-        vendor's own grades; its default is high, medium/xhigh alias to high)."""
-        if effort == "off":
-            return {"thinking": {"type": "disabled"}}
-        return {"thinking": {"type": "enabled"}, "reasoning_effort": effort}
-
-
-class DeepSeekVision(OpenAICompatVision):
-    """Vision over the same account and price table as the chat backend.
-
-    Two things beyond the generic class. Rates come from the era-and-peak function
-    above, so a describe bills like the chat call it technically is. And this backend
-    keeps files: upload() stores an image once with the vendor and returns a file_id
-    that any later chat message can reference - which is what lets the reply path show
-    the model an original picture instead of a one-line description of it.
-    """
-
-    name = "deepseek"
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._files: httpx.AsyncClient | None = None
-
-    def rate_for(self, model: str) -> Rate:
-        return _rate_at(model, datetime.now(_BILLING_TZ))
-
-    def _extra_body(self, cfg) -> dict:
-        # The describing call's grade comes from vision config: "off" for the old
-        # no-thinking behaviour, "low" for sanity-check thinking at a fraction of the
-        # ~800 thought tokens a picture that the vendor default measured at.
-        if cfg.reasoning_effort == "off":
-            return {"thinking": {"type": "disabled"}}
-        return {"thinking": {"type": "enabled"}, "reasoning_effort": cfg.reasoning_effort}
+    def _image_part(self, image_id: str) -> dict[str, Any]:
+        """Flat, not nested. The vendor rejects OpenAI's {"file": {"file_id": ...}}
+        with "file must have a file_id or file_data"; it takes an image_url data URI
+        too, but that re-sends the bytes on every round of every reply, and a picture
+        in the window is re-sent on all of them."""
+        return {"type": "file", "file_id": image_id}
 
     #: Uploaded files expire at the vendor after this long, which is what keeps the
-    #: account's 10k-file store from silting up with no cleanup job to run or forget.
-    #: Comfortably past prompt.PROMPT_IMAGE_MAX_AGE, the age at which the reply prompt
-    #: stops attaching a picture at all: expiring first would leave the prompt holding
-    #: file ids the vendor has already dropped.
+    #: account's file store from silting up with no cleanup job to run or forget.
+    #: It must stay comfortably above prompt.image_max_age_days, the age past which
+    #: the reply prompt stops attaching a picture: expiring first would leave the
+    #: prompt carrying file ids the vendor has already dropped.
     FILE_TTL_SEC = 30 * 24 * 3600
 
     async def upload(
-        self, data: bytes, *, cfg: VisionCfg, mime: str = "image/jpeg",
+        self, data: bytes, *, cfg: TextCfg, mime: str = "image/jpeg",
     ) -> str | None:
         key = read_api_key(cfg.api_key_env)
         if not key:
-            raise RuntimeError(f"no vision API key: {cfg.api_key_env} resolved to nothing")
-        if self._files is None:
+            raise RuntimeError(f"no text API key: {cfg.api_key_env} resolved to nothing")
+        if self._files is None or self._files_timeout != cfg.timeout_sec:
+            if self._files is not None:
+                retire(self._files.aclose())
             self._files = httpx.AsyncClient(timeout=cfg.timeout_sec)
-        ext = (mime.split("/", 1) + ["bin"])[1]
+            self._files_timeout = cfg.timeout_sec
+        # The vendor takes the format from the filename, so give it the one the
+        # mime type names.
+        ext = mime.partition("/")[2] or "bin"
         r = await self._files.post(
             f"{cfg.base_url.rstrip('/')}/files",
             headers={"Authorization": f"Bearer {key}"},
@@ -241,8 +232,34 @@ class DeepSeekVision(OpenAICompatVision):
         fid = (r.json() or {}).get("id") or ""
         return fid or None
 
-    async def aclose(self) -> None:
-        await super().aclose()
-        if self._files is not None:
-            await self._files.aclose()
-            self._files = None
+    def _extra_body(self, *, cfg, effort: str) -> dict[str, Any]:
+        """The resolved deliberation grade as this vendor's request fields: "off"
+        disables thinking, low/high/max enable it at that reasoning_effort (the
+        vendor's own grades; its default is high, medium/xhigh alias to high)."""
+        if effort == "off":
+            return {"thinking": {"type": "disabled"}}
+        return {"thinking": {"type": "enabled"}, "reasoning_effort": effort}
+
+
+class DeepSeekVision(OpenAICompatVision):
+    """Vision over the same account and price table as the chat backend.
+
+    One thing beyond the generic class: rates come from the era-and-peak function
+    above, so a describe bills like the chat call it technically is. Keeping files
+    belongs to the chat backend, because the model that reads a file block is the one
+    that has to resolve its id.
+    """
+
+    name = "deepseek"
+
+    def rate_for(self, model: str) -> Rate:
+        return _rate_at(model, datetime.now(_BILLING_TZ))
+
+    def _extra_body(self, cfg) -> dict:
+        # The describing call's grade comes from vision config: "off" for the old
+        # no-thinking behaviour, "low" for sanity-check thinking at a fraction of the
+        # ~800 thought tokens a picture that the vendor default measured at.
+        if cfg.reasoning_effort == "off":
+            return {"thinking": {"type": "disabled"}}
+        return {"thinking": {"type": "enabled"}, "reasoning_effort": cfg.reasoning_effort}
+

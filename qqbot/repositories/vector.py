@@ -1,6 +1,6 @@
 """L6, the vector projection.
 
-Vectors are decoupled from the things they project (design doc 47): changing embedding
+Vectors are decoupled from the things they project: changing embedding
 model rebuilds this one table and leaves fact and episode alone. The model and version
 are part of the unique key, so two sets of vectors can coexist and a switchover needs no
 downtime to recompute.

@@ -43,7 +43,7 @@ from ..util import now_local, read_secret, tz
 log = logging.getLogger("qqbot.tasks")
 
 
-def _trigger(expr: str) -> "CronTrigger":
+def _trigger(expr: str) -> CronTrigger:
     """One parser for registration and validation alike: settings validates these
     expressions with from_crontab, so registering through anything else invites
     the day-of-week trap (crontab counts 0=Sunday, APScheduler kwargs 0=Monday -
@@ -54,16 +54,6 @@ def _trigger(expr: str) -> "CronTrigger":
 
 
 # -- the nightly pipeline ----------------------------------------------------
-
-#: How long each drain-wait may take before the pipeline moves on anyway.
-#: Extraction's worst honest night is MAX_PASSES model calls per group plus
-#: retry backoff capped at an hour; three hours covers that, and moving on
-#: late beats a night with no backup. Decay is one UPDATE per group.
-EXTRACT_DRAIN_DEADLINE = timedelta(hours=3)
-DECAY_DRAIN_DEADLINE = timedelta(minutes=30)
-#: Queue poll cadence during a drain-wait. Nobody is waiting at 03:00.
-DRAIN_POLL_SEC = 30.0
-
 
 async def _queue_groups() -> list[str]:
     scopes = ({str(g) for g in await repo.groups_with_state()}
@@ -85,7 +75,7 @@ async def _drain_wait(queue: JobQueue, deadline: timedelta, stage: str) -> None:
         depth = await queue.depth()
         if not any(depth.get(k) for k in ("pending", "running")):
             return
-        await asyncio.sleep(DRAIN_POLL_SEC)
+        await asyncio.sleep(config().default.schedule.drain_poll_sec)
     log.error("nightly: %s stage still has live jobs after %s, moving on",
               stage, deadline)
 
@@ -118,7 +108,9 @@ async def nightly() -> None:
                                priority=1)
         except Exception:
             log.exception("could not queue extraction for group %s", gid)
-    await _drain_wait(queue, EXTRACT_DRAIN_DEADLINE, "extraction")
+    sched = config().default.schedule
+    await _drain_wait(
+        queue, timedelta(hours=sched.extract_drain_hours), "extraction")
 
     for gid in await _queue_groups():
         try:
@@ -130,7 +122,8 @@ async def nightly() -> None:
             log.info("purged %d finished jobs older than 30 days", n)
     except Exception:
         log.exception("job purge failed")
-    await _drain_wait(queue, DECAY_DRAIN_DEADLINE, "decay")
+    await _drain_wait(
+        queue, timedelta(minutes=sched.decay_drain_min), "decay")
 
     # The paid and destructive stages are behind the waits; these two are
     # plain local work and each guards itself.
@@ -242,7 +235,8 @@ async def daily_report() -> None:
     rows = await repo.day_breakdown(yesterday)
     total = sum(float(r["cny"]) for r in rows)
 
-    lines = [f"[{yesterday}] 昨日小结", f"总花费 ¥{total:.3f} / 上限 ¥{cfg.budget.daily_cny_cap:.2f}"]
+    lines = [f"[{yesterday}] 昨日小结",
+             f"总花费 ¥{total:.3f} / 上限 ¥{cfg.budget.daily_cny_cap:.2f}"]
     for r in rows:
         lines.append(
             f"  {r['kind']:<8}{r['model']:<18} {int(r['calls'])} 次  ¥{float(r['cny']):.3f}"
@@ -284,7 +278,7 @@ async def daily_report() -> None:
     else:
         age_h = (time.time() - dumps[0].stat().st_mtime) / 3600
         note = f"备份 {dumps[0].name}（{dumps[0].stat().st_size / 1e6:.1f} MB）"
-        lines.append(note if age_h < 26
+        lines.append(note if age_h < cfg.schedule.backup_stale_hours
                      else f"{note}——已 {age_h / 24:.1f} 天未更新！")
 
     # Every stripper hit is a near-miss leak: the model wrote a system marker and
@@ -331,7 +325,8 @@ def register() -> None:
     # misfire_grace_time: APScheduler's default is seconds - a loop busy at the
     # trigger moment would silently skip that night. An hour of grace runs it
     # late instead; coalesce folds a pile-up into one run.
-    common = {"replace_existing": True, "misfire_grace_time": 3600, "coalesce": True}
+    common = {"replace_existing": True, "coalesce": True,
+              "misfire_grace_time": s.misfire_grace_sec}
     scheduler.add_job(nightly, _trigger(s.nightly_cron), id="nightly", **common)
     scheduler.add_job(daily_report, _trigger(s.report_cron), id="report", **common)
     log.info("scheduled jobs registered")

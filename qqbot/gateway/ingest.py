@@ -10,7 +10,7 @@ are left alone, because deciding whether a name in a sentence means a member or
 somebody's colleague is interpretation, and this layer reproduces the conversation
 rather than interpreting it.
 
-The chain does only free work (design doc 52): write, look up, resolve. Paid extraction
+The chain does only free work: write, look up, resolve. Paid extraction
 does not happen here at all - the nightly drain (schedule.nightly_cron) reads the day's
 transcript in one sitting, through the job queue so half-learned work survives the
 process stopping.

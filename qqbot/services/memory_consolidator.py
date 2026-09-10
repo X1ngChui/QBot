@@ -1,6 +1,6 @@
 """Validate candidates, then write them down.
 
-Where the line from design doc 63 is enforced: the model may only produce candidates, and
+Where the line is enforced: the model may only produce candidates, and
 this is what writes long-term memory.
 
 Validation is a pure function (`Validator.check`) that touches no database, so every rule
@@ -21,21 +21,17 @@ from ..domain.memory import (
     RejectReason,
 )
 from ..repositories import EpisodeRepository, IdentityRepository, MemoryRepository
+from ..settings import config
 from .memory_extractor import (
-    ALIAS_KINDS, GROUP_TERM, GROUP_TOPIC, MULTI_VALUED, OPPOSITES, PREDICATES,
+    ALIAS_KINDS, GROUP_TERM, GROUP_TOPIC, multi_valued, opposites, predicate_names,
 )
 
 log = logging.getLogger("qqbot.consolidate")
 
-#: Predicate to memory type. This is what decides how a fact ages.
-FACT_KIND = {
-    "likes": MemoryType.PREFERENCE, "dislikes": MemoryType.PREFERENCE,
-    "avoids": MemoryType.PREFERENCE, "wants": MemoryType.PREFERENCE,
-    "plays": MemoryType.PREFERENCE, "watches": MemoryType.PREFERENCE,
-    "listens_to": MemoryType.PREFERENCE, "reads": MemoryType.PREFERENCE,
-    "uses": MemoryType.PREFERENCE, "fears": MemoryType.PREFERENCE,
-    "member_of": MemoryType.RELATION,
-}
+def _fact_kind(pred: str) -> MemoryType:
+    """How a fact is classified once stored, from the predicate table."""
+    entry = config().predicates.person.get(pred)
+    return MemoryType(entry.kind) if entry else MemoryType.ATTRIBUTE
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,7 +42,7 @@ class Verdict:
     reason: RejectReason | None = None
 
     @classmethod
-    def no(cls, reason: RejectReason) -> "Verdict":
+    def no(cls, reason: RejectReason) -> Verdict:
         return cls(False, reason)
 
 
@@ -120,7 +116,7 @@ class Validator:
         return PASS
 
     def _check_fact(self, p: dict) -> Verdict:
-        if p.get("predicate") not in PREDICATES:
+        if p.get("predicate") not in predicate_names():
             return Verdict.no(RejectReason.MALFORMED)
         if not (p.get("object") or "").strip():
             return Verdict.no(RejectReason.EMPTY)
@@ -307,7 +303,7 @@ class MemoryConsolidator:
         # Saying somebody has gone off a thing retracts their liking it. The two are
         # separate rows about the same object, so nothing else would ever reconcile them
         # and both would end up in the prompt.
-        if (opposite := OPPOSITES.get(pred)) is not None:
+        if (opposite := opposites().get(pred)) is not None:
             for f in await self._mem.current_facts(group_id, [entity_id]):
                 if f.predicate == opposite and f.object_key == obj:
                     await self._mem.retract(f.id)
@@ -319,10 +315,10 @@ class MemoryConsolidator:
                 # The key is what makes a multi-valued predicate multi-valued: each
                 # object is its own row under the one-current-fact index. Single-valued
                 # predicates leave it empty, so a new value supersedes the old.
-                object_key=obj if pred in MULTI_VALUED else None,
+                object_key=obj if pred in multi_valued() else None,
                 object_value=obj,
                 group_id=group_id,
-                memory_type=FACT_KIND.get(pred, MemoryType.ATTRIBUTE),
+                memory_type=_fact_kind(pred),
                 confidence=earned_confidence(1),
             ),
             [FactEvidence(c.source_event_id)] if c.source_event_id else [],

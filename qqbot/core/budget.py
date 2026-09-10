@@ -1,4 +1,4 @@
-"""The budget: the one limit this system has (section 5.4).
+"""The budget: the one limit this system has.
 
 Money is the only constraint. Anything free runs as often as it likes; anything paid
 answers to money at two levels, both of which live here:
@@ -20,7 +20,7 @@ import asyncio
 import logging
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Iterator
+from collections.abc import Iterator
 
 from ..db import repo
 from ..providers.base import Kind

@@ -1,7 +1,7 @@
 """API key resolution.
 
-Vision and ASR share one bailian key today, but each capability names its own key, so a
-split must be reachable from YAML alone. Also pins the resolution order, since a silent
+Capabilities may share a credential today, but each names its own, so splitting them
+must be reachable from YAML alone. Also pins the resolution order, since a silent
 fallback to the wrong credential is the kind of thing that only shows up as a 401 in
 production.
 """
@@ -65,7 +65,7 @@ def main() -> int:
     check("empty name is empty", util.read_api_key("  ") == "")
 
     # 6. a BOM from a Windows editor must not ride along into the auth header
-    (fake_secrets / "bom_api_key").write_bytes("﻿bom-key\r\n".encode("utf-8"))
+    (fake_secrets / "bom_api_key").write_bytes("﻿bom-key\r\n".encode())
     check("BOM and CRLF stripped from key files",
           util.read_api_key("BOM_API_KEY") == "bom-key",
           repr(util.read_api_key("BOM_API_KEY")))

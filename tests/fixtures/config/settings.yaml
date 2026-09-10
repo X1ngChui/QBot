@@ -21,7 +21,6 @@ llm:
     base_url: https://example.invalid/v1
     api_key_env: TEXT_API_KEY
     model: test-light
-    reads_images: true
     max_concurrency: 3
     timeout_sec: 30
     retries: 2
@@ -75,3 +74,6 @@ agreement:
 # Borrow the real prompt texts instead of copying every file into fixtures;
 # the path is relative to this fixture config directory.
 prompts_dir: ../../../config/prompts
+# Same reason as the prompts: the predicate table is the shipped one, so a test
+# reads what production reads instead of a copy that drifts from it.
+predicates_file: ../../../config/predicates.yaml

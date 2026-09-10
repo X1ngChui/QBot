@@ -1,6 +1,6 @@
 """What the model produced, before anything has checked it.
 
-The line design doc 63 draws: the model may propose candidates and may not write
+The line this package draws: the model may propose candidates and may not write
 long-term facts.
 
     LLM -> Candidate -> Validator -> Consolidator -> Repository
@@ -66,10 +66,10 @@ class Candidate:
     id: uuid.UUID = field(default_factory=uuid.uuid4)
     created_at: datetime | None = None
 
-    def rejected(self, why: str) -> "Candidate":
+    def rejected(self, why: str) -> Candidate:
         return replace(self, status=CandidateStatus.REJECTED, reject_reason=why)
 
-    def accepted(self) -> "Candidate":
+    def accepted(self) -> Candidate:
         return replace(self, status=CandidateStatus.ACCEPTED, reject_reason=None)
 
 

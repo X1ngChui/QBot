@@ -330,7 +330,7 @@ async def directory_service() -> None:
                                 AND alias_text='要撤的名片')""", GROUP)
     await say(GROUP, "m9", "要撤的名片", "再说一句")
     check("a card worn into a second day is a confirmed name",
-          "要撤的名片" == (await d.person(GROUP, "m9")).display
+          (await d.person(GROUP, "m9")).display == "要撤的名片"
           and any(n.text == "要撤的名片" for n in (await d.person(GROUP, "m9")).names))
     check("retiring it reports success", await d.unname(GROUP, "m9", "要撤的名片"))
     await say(GROUP, "m9", "要撤的名片", "又说一句")

@@ -13,7 +13,7 @@ Apply with:
 docker exec qbot-postgres-1 psql -U qqbot -d qqbot -c "<statement>"
 ```
 
-## 2026-09-10 — image descriptions expire
+## 2026-09-09 — image descriptions expire
 
 ```sql
 ALTER TABLE image_cache ADD COLUMN IF NOT EXISTS described_at TIMESTAMPTZ;

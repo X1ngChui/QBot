@@ -37,7 +37,7 @@ class Role(StrEnum):
     MEMBER = "member"
 
     @classmethod
-    def parse(cls, raw: Any) -> "Role":
+    def parse(cls, raw: Any) -> Role:
         # Sender.role is declared optional: the attribute always exists but may be None,
         # so a getattr default can never fire. Reading None as member is the safe way to
         # be wrong.

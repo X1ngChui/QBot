@@ -20,6 +20,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ..domain.identity.alias import CONFIRM_THRESHOLD
+
 
 @dataclass(frozen=True)
 class Command:
@@ -92,12 +94,12 @@ CATALOG: tuple[Command, ...] = (
     # Names a group says out loud but never types at anyone. The extractor only ever
     # sees what was written down, so a name that lives entirely in speech cannot be
     # learned unless somebody happens to write the sentence that coins it.
-    Command("/alias", "登记、撤销或调整称呼", """/alias @某人　　　　　列出该成员的全部称呼及置信度
+    Command("/alias", "登记、撤销或调整称呼", f"""/alias @某人　　　　　列出该成员的全部称呼及置信度
 /alias @某人 称呼　　　登记一个称呼（置信度 1.0）
 /alias @某人 称呼=0.6　设置该称呼的置信度，0 到 1
 /alias @某人 -称呼　　 撤销一个称呼
 
-置信度达到 0.75 才会启用该称呼。手动设置的数值为最终决定，
+置信度达到 {CONFIRM_THRESHOLD} 才会启用该称呼。手动设置的数值为最终决定，
 后续自动观察不会覆盖它。撤销仅标记为不再使用，历史消息仍可识别。
 
 普通成员也可使用，但只能 @自己：登记、撤销自己的称呼，效力与拥有者录入的相同。

@@ -1,4 +1,4 @@
-"""The conversation engine: retrieve -> assemble -> call -> strip -> send (section 2).
+"""The conversation engine: retrieve -> assemble -> call -> strip -> send.
 
 There is no fallback and no downgrade, so any failure means the bot says nothing.
 
@@ -44,14 +44,21 @@ WRAP_UP_NOTE = ("（本次回复的额度已用完，不能再执行任何检索
 #: Caps on the provenance marker appended to the bot's own archived line: how many
 #: tool uses it names, and how much of each query survives. A record, not a transcript
 #: - enough for a later turn to see what that answer rested on, not to replay it.
+#: The query has to survive whole to be a record at all: a boolean search expression
+#: cut in half reads as a different search than the one that ran.
 PROV_ITEMS = 4
-PROV_QUERY_CHARS = 20
+PROV_QUERY_CHARS = 80
 
 #: Caps on the trajectory entry kept in the conversation window: how much of each
 #: tool result survives, and how large the whole entry may grow. A digest for
 #: follow-ups on the same topic - the tools are still there when more is needed.
-TRACE_RESULT_CHARS = 200
-TRACE_TOTAL_CHARS = 900
+#:
+#: Sized so the digest actually reaches the answer. A search result opens with the
+#: conversation around its first hit (retrieval.history_context), so a couple of
+#: hundred characters recorded nothing but the chatter leading up to what was found
+#: - the one thing this entry exists to carry.
+TRACE_RESULT_CHARS = 1200
+TRACE_TOTAL_CHARS = 4000
 
 #: How each query tool reads in the provenance marker and the trace. One dict for
 #: both, or a renamed tool would let the marker and the trace quietly diverge.
@@ -101,13 +108,12 @@ def _provenance(executed: list[tuple[str, dict, str]]) -> str:
             continue
         if name == "read_url":
             parts.append("读了网页")
-        elif name == "inspect_image":
-            # Never the line number: numbering is per-render and shifts on every
-            # eviction, while this marker is frozen into the archive - a stale #N
-            # would point at whatever message sits there next week. The question
-            # is the stable half of the call.
-            q = str(args.get("question") or "").strip()
-            parts.append(f"看图查证“{q[:PROV_QUERY_CHARS]}”")
+        elif name == "open_image":
+            # No number: numbering is per-render and shifts on every eviction, while
+            # this marker is frozen into the archive - a stale one would point at
+            # whatever picture sits there next week. That a picture was looked at is
+            # the part that stays true.
+            parts.append("看了图")
         elif name in TOOL_VERB:
             q = str(args.get("query") or args.get("question") or "").strip()
             parts.append(f"{TOOL_VERB[name]}“{q[:PROV_QUERY_CHARS]}”")
@@ -122,13 +128,12 @@ def _provenance(executed: list[tuple[str, dict, str]]) -> str:
 def _label(name: str, args: dict) -> str:
     """One tool use as the trace names it - the provenance vocabulary, reused.
 
-    No line numbers anywhere in here: a number is a position in one render, and
-    this text is frozen into reply_trace forever - the question asked of a picture
-    is the reference that stays true."""
+    No numbers anywhere in here: a number is a position in one render, and this
+    text is frozen into reply_trace forever."""
     if name == "read_url":
         return f"读网页 {str(args.get('url') or '')[:60]}"
-    if name == "inspect_image":
-        return f"看图查证“{str(args.get('question') or '').strip()}”"
+    if name == "open_image":
+        return "看了图"
     q = str(args.get("query") or args.get("question") or "").strip()
     return f"{TOOL_VERB.get(name, name)}“{q}”"
 
@@ -186,17 +191,17 @@ async def generate(
     # of against the conversation. The model pulls with recall_events instead.
     #
     # Window and numbering are computed once and handed to both the tool context and
-    # assemble: the seq->message map inspect_image resolves against and the numbers
+    # assemble: the picture numbers open_image resolves against and the numbers
     # the model reads must come from the same pass. The caller normally passes the
     # window in, cut when the message arrived, so later arrivals cannot shift what
     # this reply is looking at. Trajectories are fetched from reply_trace by id - the
     # deque holds only conversation - and render_history seats each before the reply
     # it fed, so eviction needs no bookkeeping.
     if window is None:
-        window = prompt.history_window(st, batch)
+        window = prompt.history_window(st, batch, cfg)
     nums, marks = prompt.numbered(window + list(batch))
-    ctx = tools.ToolCtx(bot=bot,
-                        by_seq={nums[m.msg_id]: m for m in window + list(batch)})
+    pics, by_pic = prompt.numbered_images(window + list(batch))
+    ctx = tools.ToolCtx(bot=bot, by_pic=by_pic)
     traces = await repo.traces_for(
         int(st.group_id), [m.msg_id for m in window if m.is_bot])
     messages = prompt.assemble(
@@ -207,7 +212,7 @@ async def generate(
         profiles=profiles,
         group_facts=await retrieval.group_knowledge(st.group_id),
         traces=traces,
-        window=window, nums=nums, marks=marks,
+        window=window, nums=nums, marks=marks, pics=pics,
     )
 
     # Web for what the model cannot know; the archive for what the group said outside
@@ -250,7 +255,8 @@ async def generate(
                 return await _wrap_up(messages, cfg=cfg, st=st,
                                       executed=executed, round_no=round_no + 1)
 
-            # Tool results stay at the very tail, after the cache boundary (section 6.2).
+            # Tool results stay at the very tail, after the cache boundary: they
+            # differ every round, and anything above them would be re-read with them.
             messages.append(
                 {"role": "assistant", "content": res.text or None,
                  "tool_calls": res.tool_calls}
@@ -277,9 +283,9 @@ async def generate(
                     except json.JSONDecodeError:
                         _args = {}
                     try:
-                        # The retrieval tools are free per call; inspect_image is the
-                        # one paid tool, and its vision call books itself into this
-                        # reply's scope like any other spend.
+                        # Every tool here is free per call - a SQL query, an HTTP
+                        # fetch, a file upload. What money bounds is the rounds that
+                        # carry them, each a paid model call.
                         out = await tools.execute(call, cfg=cfg, group_id=st.group_id,
                                                   ctx=ctx)
                     except QuotaExhausted as e:
@@ -290,14 +296,13 @@ async def generate(
                     else:
                         executed.append(
                             (key[0], _args if isinstance(_args, dict) else {}, out))
-                    # A round carrying several inspect_image calls can overshoot
-                    # the scope by their sum before the next gate reads it - a
-                    # known, bounded slack (vision runs at flash rates; one
-                    # round's worth is well under the cap), accepted over a
-                    # per-call gate that would complicate every free tool's path.
-                messages.append(
-                    {"role": "tool", "tool_call_id": call.get("id", ""), "content": out}
-                )
+                # A picture answers as a content array carrying the file block; the
+                # vendor takes one on a tool message, so what was asked for arrives
+                # as the answer to the call rather than as a turn appended behind it.
+                messages.append({
+                    "role": "tool", "tool_call_id": call.get("id", ""),
+                    "content": out.content() if isinstance(out, tools.Attachment) else out,
+                })
             if quota_hit:
                 return await _wrap_up(messages, cfg=cfg, st=st,
                                       executed=executed, round_no=round_no + 1)
@@ -412,6 +417,6 @@ async def respond(
             reply_to=reply_to,
         )
     except Exception:
-        log.exception("failed to archive our own reply in group %s", st.group_id)
+        log.exception("failed to archive the bot's own reply in group %s", st.group_id)
     log.info("group %s: replied (%d chars)", st.group_id, len(text))
     return True

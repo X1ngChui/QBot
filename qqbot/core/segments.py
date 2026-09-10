@@ -86,9 +86,9 @@ class ImageRef(Ref):
     file: str | None = None
     path: str | None = None      # napcat's own path, usable through the shared mount
     summary: str | None = None
-    #: Where the vision backend filed this picture, once ensure_uploaded has run. What
-    #: a chat message's file block carries; None until then, or when the backend keeps
-    #: no files.
+    #: Where the reply model filed this picture, once ensure_uploaded has run - the
+    #: model that reads it is the one that holds it. What a chat message's file block
+    #: carries; None until then, or when the backend keeps no files.
     file_id: str | None = None
     size: int | None = None
 
@@ -234,9 +234,11 @@ def _card_text(raw: str) -> str:
         title = defang((entry.get("title") or entry.get("tag") or "").strip())
         desc = defang((entry.get("desc") or entry.get("summary") or "").strip())
         if title or desc:
+            # Whole: a card is a headline and a blurb, and the rendered line answers
+            # to gateway.max_msg_len like any other message.
             body = f"{title}：{desc}" if title and desc else (title or desc)
-            return sysmark(f"分享:{body[:80]}")
-    return sysmark(f"分享:{prompt[:80]}") if prompt else sysmark("卡片消息")
+            return sysmark(f"分享:{body}")
+    return sysmark(f"分享:{prompt.strip()}") if prompt else sysmark("卡片消息")
 
 
 def parse_segments(segments: list[dict], self_id: str) -> ParsedMessage:
@@ -259,7 +261,7 @@ def parse_segments(segments: list[dict], self_id: str) -> ParsedMessage:
             # defang before anything else: member-typed text is the one string an
             # adversary fully controls, and stripping the system brackets here is
             # what makes every marker downstream trustworthy by construction.
-            txt = defang((data.get("text") or "")).strip()
+            txt = defang(data.get("text") or "").strip()
             if txt:
                 pm.parts.append(txt)
         elif stype == "at":
@@ -281,7 +283,7 @@ def parse_segments(segments: list[dict], self_id: str) -> ParsedMessage:
                     add_ref(AtRef, ident=qq)
         elif stype == "face":
             raw = data.get("raw") if isinstance(data.get("raw"), dict) else {}
-            name = defang((raw.get("faceText") or "")).strip().lstrip("/")
+            name = defang(raw.get("faceText") or "").strip().lstrip("/")
             name = name or FACE_NAMES.get(str(data.get("id") or ""), "")
             pm.parts.append(sysmark(f"表情:{name}") if name else sysmark("表情"))
         elif stype == "mface":
@@ -290,7 +292,7 @@ def parse_segments(segments: list[dict], self_id: str) -> ParsedMessage:
                 sticker=True,
                 key=str(data.get("emoji_id") or "") or None,
                 url=data.get("url"),
-                summary=defang((data.get("summary") or "")).strip("[]") or None,
+                summary=defang(data.get("summary") or "").strip("[]") or None,
             )
         elif stype == "image":
             file_field = str(data.get("file") or "")
@@ -302,7 +304,7 @@ def parse_segments(segments: list[dict], self_id: str) -> ParsedMessage:
                 file=file_field or None,
                 path=data.get("path"),
                 size=int(data.get("file_size") or 0) or None,
-                summary=defang((data.get("summary") or "")).strip("[]") or None,
+                summary=defang(data.get("summary") or "").strip("[]") or None,
             )
         elif stype == "record":
             add_ref(
@@ -330,14 +332,14 @@ def parse_segments(segments: list[dict], self_id: str) -> ParsedMessage:
         elif stype == "video":
             pm.parts.append(sysmark("视频"))
         elif stype == "file":
-            name = defang((data.get("file") or data.get("name") or "")).strip()
+            name = defang(data.get("file") or data.get("name") or "").strip()
             pm.parts.append(sysmark(f"文件:{name}") if name else sysmark("文件"))
         elif stype == "poke":
             pm.parts.append(sysmark("戳一戳"))
         elif stype == "markdown":
             # Bots on QQ send their output as markdown, and the segment carries the
             # whole body, not a decoration on it - dropping it drops the entire message.
-            body = _markdown_text(str((data.get("content") or data.get("data") or "")))
+            body = _markdown_text(str(data.get("content") or data.get("data") or ""))
             if body:
                 pm.parts.append(body)
         elif stype == "dice":

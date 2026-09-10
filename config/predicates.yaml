@@ -1,0 +1,232 @@
+# What may be recorded about a person, and how each entry reads.
+#
+# This file is the whole definition of a predicate. Adding one is an edit here and
+# nothing else: the extraction model is offered exactly these names, the validator
+# accepts exactly these names, and the roster the reply model reads is rendered with
+# the verbs below. `rule` is shown to the extraction model, so a predicate cannot
+# enter the system without saying what it means and where its boundary runs.
+#
+# Fields
+#   verb         how the fact reads in Chinese. `{}` marks where the object goes for
+#                anything that does not read verb-first; without it the object simply
+#                follows the verb.
+#   cardinality  single - one at a time, a new value closes the old one (so "he moved"
+#                is expressible). multi - they stand side by side, each ageing on its
+#                own evidence.
+#   decay        which half-life below it is forgotten on.
+#   kind         attribute (stable properties), preference (what they think of things),
+#                relation (who they are with).
+#   opposite     recording this retracts the named one about the same object. Mutual.
+#   rule         the line the extraction model reads. One sentence of meaning, then the
+#                boundary against whichever predicate it would otherwise leak into.
+#
+# What a predicate has to be, before it earns a place here:
+#   - checkable: somebody said it, in a sentence that can be quoted verbatim. Not
+#     something read out of the mood of a conversation.
+#   - still true next week. The half-life is a backstop, not a licence to store
+#     what changes daily.
+#   - orthogonal: where two predicates could hold the same fact, the vaguer one
+#     collects everything and neither is worth reading.
+#   - worth reading: the reply is different for having it.
+#
+# Deliberately absent, and to stay absent: in-jokes and catchphrases (nothing can
+# check them, and once written down the bot uses them, which archives them, which
+# re-confirms them); anything inferred rather than said - age, occupation, identity;
+# personality labels; political, religious, medical or financial facts about a person.
+# `note` is not here either: that is what an owner typed by hand, and the model must
+# have no way to write over it.
+
+# How fast a fact is forgotten when nothing confirms it again, by class, in days.
+half_life_days:
+  stable: 90
+  default: 30
+  fast: 14
+
+person:
+  # -- who they are, where they are, what they do ----------------------------
+  lives_in:
+    verb: 住在
+    cardinality: single
+    decay: stable
+    kind: attribute
+    rule: 现在长期居住的城市或地区。短期旅行、出差用 visited；籍贯用 from_place。
+  lived_in:
+    verb: 曾住
+    cardinality: multi
+    decay: stable
+    kind: attribute
+    rule: 曾经长期居住过的城市或地区。籍贯或长大的地方用 from_place，现在住地用 lives_in，短期旅行或出差用 visited。
+  from_place:
+    verb: 来自
+    cardinality: single
+    decay: stable
+    kind: attribute
+    rule: 籍贯或长大的地方，不是现在住的地方。
+  works_as:
+    verb: 做
+    cardinality: single
+    decay: stable
+    kind: attribute
+    rule: 职位或身份本身（实习生、程序员、学生），不含单位名。
+  works_at:
+    verb: 就职于
+    cardinality: single
+    decay: stable
+    kind: attribute
+    rule: 单位名称，不含职位。
+  studies_at:
+    verb: 就读于
+    cardinality: single
+    decay: stable
+    kind: attribute
+    rule: 现在在读的学校名称。已毕业的学校用 graduated_from；说不出校名就不要记（「QS 前二十的学校」不算校名）。
+  graduated_from:
+    verb: 毕业于
+    cardinality: multi
+    decay: stable
+    kind: attribute
+    rule: 已经毕业的学校名称。现在在读用 studies_at；只说学历层次、学校排名而不出校名的不记。
+  majors_in:
+    verb: 主修
+    cardinality: single
+    decay: stable
+    kind: attribute
+    rule: 专业名称，不含学校名。
+  birthday:
+    verb: 生日
+    cardinality: single
+    decay: stable
+    kind: attribute
+    rule: 本人说明的出生日期。不记年龄，也不由年龄反推。
+
+  # -- what they think of things ---------------------------------------------
+  likes:
+    verb: 喜欢
+    cardinality: multi
+    decay: default
+    kind: preference
+    opposite: dislikes
+    rule: 喜欢的事物。确实擅长的事用 good_at。
+  dislikes:
+    verb: 不喜欢
+    cardinality: multi
+    decay: default
+    kind: preference
+    opposite: likes
+    rule: 只表示不喜欢的评价。明确说行为上不碰、不吃的用 avoids。
+  avoids:
+    verb: 回避
+    cardinality: multi
+    decay: default
+    kind: preference
+    rule: 行为上不碰的东西（不吃香菜）。只是不喜欢而没有行为回避的用 dislikes；心理上害怕的用 fears；过敏用 allergic_to。
+  wants:
+    verb: 想要
+    cardinality: multi
+    decay: fast
+    kind: preference
+    rule: 明确说过想要或想做的事。已经在做的不算。
+  fears:
+    verb: 害怕
+    cardinality: multi
+    decay: stable
+    kind: preference
+    rule: 心理上害怕的东西，宾语写对象本身（怕蜘蛛写「蜘蛛」）。
+
+  # -- what they do and have -------------------------------------------------
+  plays:
+    verb: 在玩
+    cardinality: multi
+    decay: fast
+    kind: preference
+    rule: 在玩的游戏。
+  watches:
+    verb: 在追
+    cardinality: multi
+    decay: fast
+    kind: preference
+    rule: 在追的剧或番。
+  listens_to:
+    verb: 在听
+    cardinality: multi
+    decay: default
+    kind: preference
+    rule: 在听的音乐、乐队或播客。
+  reads:
+    verb: 在读
+    cardinality: multi
+    decay: default
+    kind: preference
+    rule: 在读的书。
+  uses:
+    verb: 在用
+    cardinality: multi
+    decay: fast
+    kind: preference
+    rule: 在用的工具、软件或设备型号。拥有但不常用的用 owns。
+  owns:
+    verb: 有
+    cardinality: multi
+    decay: stable
+    kind: attribute
+    rule: 持有的东西。宠物用 has_pet，成系列收集用 collects，正在日常使用的工具、软件、设备用 uses。
+  collects:
+    verb: 收集
+    cardinality: multi
+    decay: default
+    kind: attribute
+    rule: 成系列收集的东西，不是买过一件。
+  has_pet:
+    verb: 养着
+    cardinality: multi
+    decay: stable
+    kind: attribute
+    rule: 养的宠物，写种类或名字。
+  visited:
+    verb: 去过
+    cardinality: multi
+    decay: stable
+    kind: attribute
+    rule: 去过的地方。现在住地用 lives_in；曾长期居住用 lived_in；短期旅行或出差仍用 visited。
+
+  # -- how to reach them, and what to call them -------------------------------
+  handle_on:
+    # The object carries both halves, so it is the whole phrase and there is no verb
+    # in front of it: it renders as "微博：@wang" rather than as a sentence about it.
+    verb: "{}"
+    cardinality: multi
+    decay: stable
+    kind: attribute
+    rule: 社交平台及账号。宾语统一写「平台：ID」，例如「微博：@wang」；只记本人明确给出的公开账号；同一平台多个账号分条记。不记手机号、邮箱、住址。
+  preferred_name:
+    verb: 希望被叫
+    cardinality: single
+    decay: stable
+    kind: attribute
+    rule: 本人明确表示希望被使用的称呼。只是他人使用某称呼不算；本人自称作为使用证据仍走 record_alias。
+
+  # -- what they can do, and who they are with -------------------------------
+  good_at:
+    verb: 擅长
+    cardinality: multi
+    decay: default
+    kind: attribute
+    rule: 确实擅长的事。只是喜欢的用 likes。
+  speaks:
+    verb: 会说
+    cardinality: multi
+    decay: stable
+    kind: attribute
+    rule: 会说的语言。
+  member_of:
+    verb: 属于
+    cardinality: multi
+    decay: stable
+    kind: relation
+    rule: 所属的组织、社团或战队。就职单位用 works_at，学校用 studies_at。
+  allergic_to:
+    verb: 对{}过敏
+    cardinality: multi
+    decay: stable
+    kind: attribute
+    rule: 过敏源。只是不爱吃的用 avoids。

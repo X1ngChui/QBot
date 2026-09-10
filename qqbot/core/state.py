@@ -1,6 +1,6 @@
 """Per-group runtime state.
 
-In memory: the recent messages (section 6.1, immediate context). What has and has not
+In memory: the recent messages, the immediate context a reply reads. What has and has not
 been read into long-term memory is tracked in SQL instead - a restart should not send a
 nearly-full batch back to zero. Persisted in group_state: the mute switch and the
 blocklist, so a restart does not lose them.
@@ -9,13 +9,14 @@ blocklist, so a restart does not lose them.
 from __future__ import annotations
 
 import logging
+import re
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 
 from ..db import repo
 from ..settings import config
-from ..util import defang, fmt_when, now_local, sysmark, why
+from ..util import SYS_L, SYS_R, defang, fmt_when, now_local, sysmark, why
 from .segments import ImageRef, parse_segments
 
 log = logging.getLogger("qqbot.state")
@@ -23,6 +24,10 @@ log = logging.getLogger("qqbot.state")
 #: Worn in the system brackets so no display name can imitate it: defang()
 #: neutralizes the pair in every member-controlled string before it renders.
 OWNER_TAG = sysmark("拥有者")
+
+#: A picture marker in a rendered line, either kind. The number the prompt gives
+#: it is inserted right after the label, so the description stays where it was.
+_PIC_MARK = re.compile(rf"{SYS_L}(图片|表情)(:[^{SYS_R}]*)?{SYS_R}")
 
 
 @dataclass
@@ -54,13 +59,34 @@ class ChatMsg:
     images: list[str] = field(default_factory=list)
     #: The message's picture references (segments.ImageRef), kept for as long as the
     #: message is in the window - unlike `pending`, which is unpaid *work* and is
-    #: cleared once settled. This is what lets the inspect_image tool reopen its eyes
-    #: on a picture whose one-line description has already been bought: QQ's file id
+    #: cleared once settled. This is what lets the open_image tool hand the model a
+    #: picture the prompt did not attach: QQ's file id
     #: trades for a fresh link at any time (see media._bytes). Typed loosely for the
     #: same reason `pending` is.
     image_refs: list = field(default_factory=list)
 
-    def render(self, *, seq: int = 0, quote: str = "") -> str:
+    def numbered_text(self, pic_nums: list[int] | None) -> str:
+        """This message's text with its picture markers carrying their prompt numbers.
+
+        The number is how the model names a picture to open_image, and it is a position
+        in one render - so it is applied here rather than stored, exactly like the line
+        number. Markers are matched in order against image_refs; if the two counts
+        disagree the message is left unnumbered rather than numbered wrong. They
+        disagree when a forwarded chat log carries its own nested picture markers,
+        which belong to messages this one does not own, and a number that opened
+        somebody else's picture would be worse than no number at all.
+        """
+        if not pic_nums:
+            return self.text
+        marks = _PIC_MARK.findall(self.text)
+        if len(marks) != len(pic_nums):
+            return self.text
+        it = iter(pic_nums)
+        return _PIC_MARK.sub(
+            lambda m: sysmark(f"{m.group(1)}{next(it)}{m.group(2) or ''}"), self.text)
+
+    def render(self, *, seq: int = 0, quote: str = "",
+               pic_nums: list[int] | None = None) -> str:
         """One line of transcript, as the model will read it.
 
         The prompt only ever sees a display name, never a QQ id, so without the owner tag
@@ -77,7 +103,8 @@ class ChatMsg:
         history stays cache-safe - unlike any relative form ("5 minutes ago"), which
         would invalidate the prefix on every reply.
         """
-        body = f"{quote} {self.text}".strip() if quote else self.text
+        text = self.numbered_text(pic_nums)
+        body = f"{quote} {text}".strip() if quote else text
         head = f"#{seq} " if seq else ""
         when = sysmark(fmt_when(self.ts)) + " "
         if self.is_bot:
@@ -89,10 +116,13 @@ class ChatMsg:
 @dataclass
 class GroupState:
     group_id: str
-    #: Must exceed prompt.HISTORY_MSGS, so the window - with its chunked, cache-stable
-    #: eviction - always binds before the deque does. A deque-bound window slides one
-    #: message per turn and invalidates the prefix on every reply.
-    recent: deque[ChatMsg] = field(default_factory=lambda: deque(maxlen=200))
+    #: Sized in __post_init__ from this group's prompt settings, never by hand: it has
+    #: to exceed the window so the window - with its chunked, cache-stable eviction -
+    #: always binds first. A deque-bound window slides one message per turn and
+    #: invalidates the prefix on every reply, which is the opposite of what the
+    #: chunking is for. Derived rather than checked, so raising window_chunks cannot
+    #: quietly cross it.
+    recent: deque[ChatMsg] = field(default_factory=deque)
     history_anchor: str | None = None
     muted: bool = False
     #: Accounts this group's owner has told the bot not to answer: their messages
@@ -105,6 +135,14 @@ class GroupState:
     blocked: dict[str, datetime | None] = field(default_factory=dict)
     loaded: bool = False
     history_loaded: bool = False
+
+    def __post_init__(self) -> None:
+        # Two chunks of headroom past the window: the anchor walks forward a chunk at
+        # a time, so the deque has to hold a full window plus what has not been
+        # evicted from in front of it yet.
+        p = config().for_group(self.group_id)[0].prompt
+        self.recent = deque(
+            self.recent, maxlen=p.evict_chunk * (p.window_chunks + 2))
 
     def add(self, msg: ChatMsg) -> None:
         # The pipeline's dedup set dies with the process, so a message the adapter
@@ -188,7 +226,7 @@ class GroupState:
                 continue
             sender = payload.get("sender") or {}
             # The payload keeps the segments verbatim, so picture references survive
-            # a restart: re-parsed here, they are what lets inspect_image reopen a
+            # a restart: re-parsed here, they are what lets open_image hand over a
             # picture posted before the deploy. Parsing is pure and costs nothing.
             segs = payload.get("segments") or []
             refs = ([x for x in parse_segments(segs, self_id).refs
@@ -196,8 +234,8 @@ class GroupState:
             msgs.append(ChatMsg(
                 msg_id=str(r["platform_event_id"] or r["id"]),
                 user_id=uid,
-                nickname=defang((sender.get("card") or sender.get("nickname")
-                                 or uid)).strip(),
+                nickname=defang(sender.get("card") or sender.get("nickname")
+                                 or uid).strip(),
                 text=text,
                 ts=r["occurred_at"],
                 is_bot=uid == self_id,

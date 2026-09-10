@@ -6,8 +6,8 @@ message, where an elliptical question resolves against it instead of against the
 conversation. What the prompt carries uninvited stays limited to what every reply
 needs - the roster and the facts, from SQL, inside the cached prefix.
 
-Vector search runs only when the model asks (design goal 1): one embedding call
-per tool use, none per message.
+Vector search runs only when the model asks: one embedding call per tool use,
+none per message.
 """
 
 from __future__ import annotations
@@ -15,7 +15,8 @@ from __future__ import annotations
 import logging
 
 from ..domain.memory import Episode
-from ..providers.embedding import EmbeddingModel
+from ..providers.base import EmbeddingModel
+from ..settings import config
 from ..repositories import (
     EpisodeRepository, IdentityRepository, MemoryRepository, VectorRepository,
 )
@@ -51,7 +52,8 @@ class Retriever:
         holds twice over: the vector search is group-scoped, and by_ids checks
         again.
         """
-        [qv] = await self._embed.embed([question], group_id=str(group_id))
+        [qv] = await self._embed.embed(
+            [question], cfg=config().default.llm.embedding, group_id=str(group_id))
         near = await self._vec.search(
             group_id=group_id, object_type="episode", embedding=qv, limit=limit,
         )

@@ -18,7 +18,8 @@ from qqbot.providers import base
 from qqbot.providers.dashscope import DashScopeAsr
 from qqbot.providers.deepseek import DeepSeekChat
 from qqbot.providers.openai_compat import OpenAICompatAsr, OpenAICompatChat
-from qqbot.providers.registry import (ASR_BACKENDS, SEARCH_BACKENDS, TEXT_BACKENDS,
+from qqbot.providers.registry import (ASR_BACKENDS, EMBEDDING_BACKENDS,
+                                      SEARCH_BACKENDS, TEXT_BACKENDS,
                                       VISION_BACKENDS, build)
 from qqbot.providers.tavily import TavilySearch
 from qqbot.settings import load_bundle
@@ -42,6 +43,7 @@ def main() -> int:
     _cfg_names = (f"text={settings.llm.text.backend}"
                   f" vision={settings.llm.vision.backend}"
                   f" asr={settings.llm.asr.backend}"
+                  f" embedding={settings.llm.embedding.backend}"
                   f" search={settings.llm.search.backend}")
     check("shipped config wires the expected backends",
           bundle.describe() == _cfg_names, bundle.describe())
@@ -60,6 +62,7 @@ def main() -> int:
         (TEXT_BACKENDS, base.TextModel, "text"),
         (VISION_BACKENDS, base.VisionModel, "vision"),
         (ASR_BACKENDS, base.AsrModel, "asr"),
+        (EMBEDDING_BACKENDS, base.EmbeddingModel, "embedding"),
         (SEARCH_BACKENDS, base.SearchEngine, "search"),
     ):
         bad = [n for n, c in table.items() if not issubclass(c, abc_cls)]
@@ -117,7 +120,8 @@ def main() -> int:
     check("dashscope audio URI carries no media type",
           da._audio_uri("QUJD", "wav") == "data:;base64,QUJD", da._audio_uri("QUJD", "wav"))
     check("generic audio URI carries one",
-          ga._audio_uri("QUJD", "wav") == "data:audio/wav;base64,QUJD", ga._audio_uri("QUJD", "wav"))
+          ga._audio_uri("QUJD", "wav") == "data:audio/wav;base64,QUJD",
+          ga._audio_uri("QUJD", "wav"))
     check("dashscope enables language id and inverse text normalisation",
           da._extra_body() == {"asr_options": {"enable_lid": True, "enable_itn": True}},
           str(da._extra_body()))
@@ -149,19 +153,64 @@ def main() -> int:
           and _DV()._extra_body(_vlow)
           == {"thinking": {"type": "enabled"}, "reasoning_effort": "low"})
 
-    # -- embedding wires from its own block, never vision's ------------------
-    # It borrowed vision's endpoint once, and followed it to a platform with no
-    # /embeddings when vision moved - every reply needing recall died on a 404.
-    from qqbot.providers.embedding import build as build_embedding
+    # -- embedding is a capability like the other four -----------------------
+    # It was wired on its own path for a while - its own table, its own injection,
+    # its own construction convention - and the capability nothing bundled was the
+    # one nothing closed at shutdown.
     emb_cfg = load_bundle().default
-    emb = build_embedding(emb_cfg)
-    check("embedding uses its own endpoint",
-          emb._base == emb_cfg.llm.embedding.base_url.rstrip("/"), emb._base)
-    emb_cfg.llm.vision.base_url = "https://moved.example/v1"
-    check("and does not follow vision when vision moves",
-          build_embedding(emb_cfg)._base == emb_cfg.llm.embedding.base_url.rstrip("/"))
-    check("embedding dimensions come from config",
-          emb.dimensions == emb_cfg.llm.embedding.dimensions)
+    _b5 = build(emb_cfg)
+    check("the bundle carries five capabilities, embedding among them",
+          isinstance(_b5.embedding, base.EmbeddingModel), type(_b5.embedding).__name__)
+
+    class _Counting(base.EmbeddingModel):
+        name = "counting"
+        closed = 0
+
+        def rate_for(self, model):
+            return base.Rate("Mtoken")
+
+        async def embed(self, texts, *, cfg, group_id=None):
+            return []
+
+        async def aclose(self):
+            type(self).closed += 1
+
+    _probe = base.Providers(text=_b5.text, vision=_b5.vision, asr=_b5.asr,
+                            embedding=_Counting(), search=_b5.search)
+    asyncio.run(_probe.aclose())
+    check("closing the bundle closes the embedding client too",
+          _Counting.closed == 1, str(_Counting.closed))
+    # Its endpoint is its own, and it comes from the config handed to the call:
+    # the client was built once at startup for a while, so a /reload that moved
+    # the endpoint kept posting to the old one.
+    from qqbot.providers.embedding import DashScopeEmbedding
+    from qqbot.settings import EmbeddingCfg
+
+    posted: list[str] = []
+
+    class _Stop(Exception):
+        pass
+
+    class _RecordingClient:
+        async def post(self, url, **kw):
+            posted.append(url)
+            raise _Stop
+
+    _emb = DashScopeEmbedding()
+    _emb._client = lambda cfg: _RecordingClient()
+
+    def _ecfg(base_url):
+        return EmbeddingCfg.model_validate(
+            {"base_url": base_url, "model": "m", "api_key_env": "PATH"})
+
+    for _url in ("https://first.example/v1", "https://second.example/v1/"):
+        try:
+            asyncio.run(_emb.embed(["x"], cfg=_ecfg(_url)))
+        except _Stop:
+            pass
+    check("embedding posts to the endpoint its own config names, per call",
+          posted == ["https://first.example/v1/embeddings",
+                     "https://second.example/v1/embeddings"], str(posted))
 
     # -- pricing belongs to the backend that charges it ---------------------
     bundle2 = build(settings)
@@ -244,6 +293,16 @@ def main() -> int:
           rate_at("deepseek-v4-pro", 2026, 8, 17, 21).out == 13.5)
     check("an unknown model still bills at the priciest new tier",
           rate_at("no-such-model", 2026, 8, 17, 21).out == 13.5)
+    # V4.1-Flash, the id the vendor answers with after retiring the V4 flash ids and,
+    # from 2026-09-14, deepseek-v4-pro as well. Pinned because a call is billed under
+    # whatever answered it, so this entry is what the ledger reaches for once the
+    # routing starts - and a missing one falls to the pessimistic tier, 30x on hits.
+    _f = rate_at("deepseek-flash", 2026, 9, 10, 21)
+    check("V4.1-Flash bills at the published off-peak rate",
+          (_f.in_hit, _f.in_miss, _f.out) == (0.02, 1.0, 4.0), str(_f))
+    _fp = rate_at("deepseek-flash", 2026, 9, 10, 10)
+    check("and doubles in the peak window like everything else",
+          (_fp.in_hit, _fp.in_miss, _fp.out) == (0.04, 2.0, 8.0), str(_fp))
 
     check("token arithmetic",
           abs(base.Rate("Mtoken", in_hit=0.02).tokens(1_000_000, 0, 0) - 0.02) < 1e-9)

@@ -1,4 +1,4 @@
-"""asyncpg connection pool (section 2: pool size 2-8)."""
+"""asyncpg connection pool."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ from urllib.parse import quote
 
 import asyncpg
 
+from ..settings import config
 from ..util import read_secret
 
 log = logging.getLogger("qqbot.db")
@@ -39,9 +40,11 @@ async def _init_conn(conn: asyncpg.Connection) -> None:
 
 async def init_pool() -> asyncpg.Pool:
     global _pool
+    db = config().default.database
     if _pool is None:
         _pool = await asyncpg.create_pool(
-            dsn(), min_size=2, max_size=8, init=_init_conn, command_timeout=20
+            dsn(), min_size=db.pool_min, max_size=db.pool_max,
+            init=_init_conn, command_timeout=db.command_timeout_sec
         )
         log.info("postgres pool ready")
     return _pool

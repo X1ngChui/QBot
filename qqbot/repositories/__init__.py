@@ -1,6 +1,6 @@
 """The repository layer: how domain objects reach PostgreSQL.
 
-Services write no SQL and do not know table names (design doc 60). What that boundary
+Services write no SQL and do not know table names. What that boundary
 buys: a schema change reaches one layer only, and group isolation can be guaranteed in
 one place - every method that takes a group_id takes it as a required parameter, so
 forgetting it is a TypeError rather than a silent cross-group read. (The boundary is

@@ -192,7 +192,8 @@ async def main():
     # The reset pulls back exactly one window and no further - extraction drains
     # oldest-first from the watermark now, and a bare NULL would send the next
     # drain through the entire archive at model prices.
-    from qqbot.settings import EXTRACT_WINDOW as _EW
+    from qqbot.settings import config as _cfgw
+    _EW = _cfgw().default.memory.extract_window
     await repo.reset_extract_watermark(G3, keep=_EW)
     n5, _ = await repo.unread_since_extract(G3)
     check("a reset makes the window count as unread again", n5 == 4, str(n5))
@@ -302,7 +303,7 @@ async def main():
 
     class TimingOut(OpenAICompatChat):
         async def _stream_once(self, *a, **kw):
-            raise asyncio.TimeoutError
+            raise TimeoutError
 
     tcfg = _config().default.llm.text.model_copy(deep=True)
     tcfg.retries = 0
@@ -312,7 +313,7 @@ async def main():
                                cfg=tcfg, max_tokens=100, kind="reply",
                                group_id=str(G1))
         check("a timed-out chat still raises", False, "it returned")
-    except asyncio.TimeoutError:
+    except TimeoutError:
         check("a timed-out chat still raises", True)
     after_to = await repo.day_cost(day)
     check("and its estimated spend reaches the ledger", after_to > before_to,
@@ -446,6 +447,17 @@ async def main():
     b3 = await search_history(G1, '"新喷头 效果"')
     check("a quoted phrase matches whole, space included",
           "喷头" in b3 and "到货" not in b3, b3)
+    # A hit comes back whole, and so does the result. The long messages are the
+    # substantial ones - a summary, an argument, a piece of writing - and a fixed
+    # width cut exactly the part worth searching for, silently and mid-word. There
+    # is no length quota in its place either: money already bounds what a reply may
+    # spend, and a character budget would be a second, blinder bound on the same thing.
+    _long = "螺丝刀的来历要从头说起，" + "这段话很长很长，".join(str(i) for i in range(60))
+    await say(G1, "u1", "阿强", _long)
+    _wide = await search_history(G1, "螺丝刀的来历")
+    _widest = max(len(line) for line in _wide.splitlines())
+    check("a long message comes back whole, not cut mid-word",
+          _long in _wide, f"{len(_long)} chars in, longest line {_widest}")
     check("a broken expression is answered in words, not raised",
           "检索式有误" in await search_history(G1, "(("))
     check("lucene features outside the boolean subset are refused in words",

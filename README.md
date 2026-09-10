@@ -12,8 +12,8 @@ QQ <-> napcat <-OneBot v11 reverse WS-> bot <-asyncpg-> postgres
 Everything about behaviour lives in `config/`; credentials live in `.env`; runtime
 state lives in the DB.
 
-The code knows four capabilities - text, vision, ASR, search - and reaches them
-through `providers()`. Which platform serves each one, on which endpoint, with
+The code knows five capabilities - text, vision, ASR, embedding, search - and reaches
+them through `providers()`. Which platform serves each one, on which endpoint, with
 which model and credential, is stated only in `config/settings.yaml`.
 
 Each backend is its own subclass of the ABC in `qqbot/providers/base.py`, because platforms
@@ -74,6 +74,16 @@ rather than accumulate as flags. Adding one is: write the subclass, add a line t
   propose. A wrong entry is deleted by number (`/forget`), and everything
   expires: a fact survives one half-life per supporting event, so what a group
   repeats stays and a passing remark fades in a fortnight.
+- **Pictures and voice are understood when they arrive**, not when somebody asks
+  about them: the download link is freshest then, and a group the bot never
+  answers in still gets a readable archive. Every picture is described in one
+  line, cached by image content so a repost costs nothing, and the description
+  expires by age so a better model gets to look again. The reply model is
+  multimodal, so the newest few originals ride behind the messages that posted
+  them and it reads the pixels; the rest carry their description line and a
+  number, and the `open_image` tool fetches any of them by number. Voice clips
+  are transcribed into the same archive the text goes to.
+
 - **Money is the only limit.** The daily cap, checked before anything is spent,
   means silence when hit. What costs nothing is not gated by it: voice
   transcription runs in-process (sherpa-onnx + SenseVoice on CPU, zero rates,
@@ -216,8 +226,15 @@ protocol side:
 
 ```bash
 python -m venv .venv && .venv/bin/pip install pydantic pyyaml jieba asyncpg openai httpx luqum
+.venv/bin/pip install -r requirements-dev.txt      # the linter, workstation only
 docker run -d --name qbot-pgtest -e POSTGRES_DB=qqbot -e POSTGRES_USER=qqbot \
   -e POSTGRES_PASSWORD=testpw -p 15432:5432 \
   -v "$PWD/sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro" \
   pgvector/pgvector:0.8.5-pg17
+
+.venv/bin/python tests/run_all.py                  # every suite, then ruff
 ```
+
+The suites need that database up. `run_all.py` finishes with `ruff check` over the
+whole tree (settings in [ruff.toml](ruff.toml)); with ruff not installed that step
+reports as skipped, so a bare runtime venv still passes.

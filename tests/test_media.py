@@ -14,6 +14,10 @@ import asyncio
 from qqbot.db import init_pool, close_pool, pool, repo
 from qqbot.settings import config
 from _db import reset
+from _stubs import FakeEmbedding
+
+#: One stub for every bundle in this suite.
+_EMBED = FakeEmbedding()
 from qqbot.core.media import MEDIA
 from qqbot.core.segments import (AudioRef, ImageRef, ParsedMessage as _PMcls,
                                  parse_segments)
@@ -54,7 +58,8 @@ class FakeVision(VisionModel):
 
 
 _real = build_default()
-set_providers(Providers(text=_real.text, vision=FakeVision(), asr=_real.asr, search=_real.search))
+set_providers(Providers(text=_real.text, vision=FakeVision(), asr=_real.asr,
+                        embedding=_EMBED, search=_real.search))
 
 
 class FakeBot:
@@ -118,7 +123,6 @@ async def main():
     # Every segment type QQ actually sends has to come out as text. markdown was the one
     # that proved this matters: bots post their whole output that way - game results,
     # divination - and with no branch for it the message reached the model empty.
-    from qqbot.core.segments import parse_segments
     md = "\n".join([
         "[](%7B%22version%22%3A2%7D)",
         "[@某人](mqqapi://markdown/mention?at_type=1&at_tinyid=1)",
@@ -180,7 +184,7 @@ async def main():
 
     _ok = providers().vision
     set_providers(Providers(text=_real.text, vision=Refusing(),
-                            asr=_real.asr, search=_real.search))
+                            asr=_real.asr, embedding=_EMBED, search=_real.search))
     ref_no = ImageRef(slot=0, key="c" * 32, url="http://example/nope.jpg")
     before = len(VISION_CALLS)
     out = await MEDIA.describe_image(ref_no, bot=bot, group_id="g", cfg=cfg)
@@ -191,7 +195,8 @@ async def main():
           str(VISION_CALLS))
     check("the cached outcome still reads as not received",
           out == "⟦图片⟧", str(out))
-    set_providers(Providers(text=_real.text, vision=_ok, asr=_real.asr, search=_real.search))
+    set_providers(Providers(text=_real.text, vision=_ok, asr=_real.asr,
+                            embedding=_EMBED, search=_real.search))
 
     # A received link carries an rkey that expires in about two hours, but the file id
     # does not - get_image trades it for a fresh one, which is why the QQ client still
@@ -211,7 +216,7 @@ async def main():
             return {"message_id": "0"}
 
     set_providers(Providers(text=_real.text, vision=FakeVision(),
-                            asr=_real.asr, search=_real.search))
+                            asr=_real.asr, embedding=_EMBED, search=_real.search))
     _fetch3 = MEDIA._fetch
 
     async def only_fresh(url, max_bytes):
@@ -274,7 +279,7 @@ async def main():
     MEDIA._local = staticmethod(lambda p, m: _SILK)   # the trap, armed
     _prev_asr = providers().asr
     set_providers(Providers(text=_real.text, vision=FakeVision(),
-                            asr=CapturingAsr(), search=_real.search))
+                            asr=CapturingAsr(), embedding=_EMBED, search=_real.search))
     _vref = _AR(slot=0, file="v.amr",
                 path="/app/.config/QQ/nt/Ptt/v.amr", url="http://cdn/v.amr")
     _vout = await MEDIA.transcribe(_vref, bot=VoiceBot(), group_id="g9", cfg=cfg)
@@ -316,14 +321,14 @@ async def main():
     check("a free ASR backend transcribes straight through an exhausted budget",
           _vout == "⟦语音:明天一起去吃饭⟧", repr(_vout))
     set_providers(Providers(text=_real.text, vision=FakeVision(),
-                            asr=PricedAsr(), search=_real.search))
+                            asr=PricedAsr(), embedding=_EMBED, search=_real.search))
     _vout = await MEDIA.transcribe(_AR(slot=0, file="paid.amr"), bot=VoiceBot(),
                                    group_id="g10", cfg=cfg)
     check("a priced ASR backend still defers on an exhausted budget",
           _vout is None, repr(_vout))
     _media_mod.BUDGET.exceeded = _budget_saved
     set_providers(Providers(text=_real.text, vision=FakeVision(),
-                            asr=_prev_asr, search=_real.search))
+                            asr=_prev_asr, embedding=_EMBED, search=_real.search))
 
     # The sherpa backend's model-free surface: WAV parsing and the format guard.
     # Real decoding needs the wheel and the weights, which belong to the

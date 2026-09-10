@@ -35,9 +35,9 @@ PROMPT_KEYS = frozenset({
     # the rest of the extraction rulebook
     "extract",
     # media and tools
-    "describe_image", "inspect_image",
+    "describe_image",
     "tool_web_search", "tool_search_history", "tool_recall_events",
-    "tool_read_url", "tool_inspect_image",
+    "tool_read_url", "tool_open_image",
 })
 
 CONFIG_DIR = Path(os.getenv("CONFIG_DIR", "/app/config"))
@@ -57,6 +57,38 @@ Effort = Literal["off", "low", "high", "max"]
 class GatewayCfg(_M):
     dedup_ttl_sec: int = 300
     max_msg_len: int = 2000
+    #: How long a reply waits for a picture or a voice clip to be understood before
+    #: building the prompt without it. The work is never cancelled - it lands for the
+    #: next turn either way - so this only decides whether the person waits or the
+    #: answer does.
+    media_wait_sec: float = 25.0
+    #: How long the group's member list is reused before being fetched again. Names
+    #: are read on every message, and the platform call is the expensive part.
+    member_cache_ttl_sec: int = 1800
+
+
+class PromptCfg(_M):
+    """What the model is shown of the conversation.
+
+    A count, not a token budget: money bounds what a reply may spend, and every
+    other block is rendered whole. These decide context and prefix-cache behaviour.
+    """
+
+    #: The history window, in chunks. Whole chunks rather than its own count, so the
+    #: multiple holds by construction - two numbers whose ratio drifts is how a window
+    #: ends up holding two and a half chunks and nobody can say what a slide leaves.
+    window_chunks: int = Field(3, ge=1)
+    #: How many messages leave the window at once. A prefix cache matches from the
+    #: start, so every slide is a miss: sliding rarely is most of what there is to
+    #: win, and one message per turn would miss on every reply.
+    evict_chunk: int = Field(30, ge=1)
+    #: A sanity rail on original pictures per prompt, newest first - when it binds the
+    #: oldest keep their description lines and their numbers, and open_image fetches
+    #: any of them - and how old one may still be shown as pixels. The age must stay
+    #: under the vision backend's own file retention, or the prompt would cite ids the
+    #: vendor has already dropped.
+    max_images: int = Field(8, ge=0)
+    image_max_age_days: int = Field(7, ge=0)
 
 
 class TriggerCfg(_M):
@@ -70,7 +102,7 @@ class TriggerCfg(_M):
 
 
 # One section per capability, each carrying its own endpoint, model and credential name
-# so it can be moved independently: four providers, each swappable, and no automatic
+# so it can be moved independently: five capabilities, each swappable, and no automatic
 # fallback between them.
 #
 # Defaults name capabilities, never vendors: which platform serves a capability is a
@@ -101,13 +133,12 @@ class TextCfg(_M):
     base_url: str
     api_key_env: str = "TEXT_API_KEY"
     model: str
-    #: Whether this model accepts image file blocks in messages. Off, the prompt
-    #: carries descriptions only and pictures are not uploaded to the Files store;
-    #: a text-only model sent a file block rejects the whole request.
-    reads_images: bool = False
     #: How hard replies may think. Other uses of this model carry their own grade:
     #: extraction below, describing in llm.vision.
     reasoning_effort: Effort = "off"
+    #: Applied at startup only: the semaphore is built once, and resizing it under
+    #: load would lose the permits already handed out. A change is logged and takes
+    #: effect at the next start.
     max_concurrency: int = 3
     timeout_sec: float = 30.0
     retries: int = 2
@@ -118,12 +149,12 @@ class TextCfg(_M):
     #: timeout the reply path would never grant.
     extract: TextUseCfg = Field(default_factory=TextUseCfg)
 
-    def for_extract(self) -> "TextCfg":
+    def for_extract(self) -> TextCfg:
         """This config as the extraction call should see it.
 
-        One override point instead of three: before this, extraction patched the
-        model onto a copy, passed its grade as a call argument, and kept its
-        timeout as a constant in Python because config had nowhere to put it.
+        One override point rather than three: everything the extraction call needs
+        to differ in is named here, so no caller has to patch a copy or pass a
+        setting as an argument.
         """
         use = self.extract
         return self.model_copy(update={
@@ -152,6 +183,9 @@ class VisionCfg(_M):
     #: they were written with; this decides what the *next* sighting reads.
     description_ttl_days: int = Field(15, ge=0)
     max_images_per_min: int = 6
+    #: Bounds both halves of picture handling: the download that feeds the
+    #: description call, and the upload that puts the original in front of the
+    #: reply model.
     max_image_mb: float = 8.0
     timeout_sec: float = 30.0
 
@@ -198,6 +232,11 @@ class EmbeddingCfg(_M):
     backend: str = "dashscope"
     base_url: str
     api_key_env: str = "MEDIA_API_KEY"
+    #: Both reach past this file. `dimensions` must equal the VECTOR(n) column in
+    #: sql/init.sql or every insert fails, and vectors are stored under the model
+    #: that produced them and searched under the current one - so changing `model`
+    #: hides every stored vector until the nightly embed pass rebuilds them, with
+    #: recall answering "nothing found" in the meantime.
     model: str
     dimensions: int = 2048
     timeout_sec: float = 60.0
@@ -228,13 +267,6 @@ class BudgetCfg(_M):
     per_reply_cny: float = 0.30
 
 
-#: How much transcript one extraction chunk holds at most. The worker owns the
-#: behaviour (workers.memory re-exports this as WINDOW, and cuts chunks shorter at
-#: conversation gaps); the number lives here because /relearn's watermark reset
-#: keeps exactly this many messages unread, and services may not import workers.
-EXTRACT_WINDOW = 120
-
-
 class RetrievalCfg(_M):
     #: Lines of surrounding conversation each search_history hit carries - this
     #: many before and this many after, windows merged into one block when hits
@@ -250,9 +282,66 @@ class RetrievalCfg(_M):
     #: story ("what led to this, what came of it"); undated episodes stand
     #: alone. 0 restores bare recall.
     episode_context: int = 2
+    #: How many archive hits one search returns. A model that wants more searches
+    #: again with better words; nothing here is paginated.
+    history_hits: int = Field(8, ge=1)
+    #: Terms one search expression may carry. Past this the question wants splitting
+    #: into two searches - a query is a filter, not a program.
+    max_query_terms: int = Field(8, ge=1)
+    #: How much of one page read_url hands the model. The one input with no bound of
+    #: its own: a web page can be any size, and past the model's context the request
+    #: fails outright rather than degrading. A cut page is told it was cut.
+    url_content_chars: int = Field(8000, ge=500)
+    #: Entries of a merged forward that get rendered. Entries, not characters - what
+    #: each one says is shown whole.
+    forward_nodes: int = Field(6, ge=1)
+
+
+class MemoryCfg(_M):
+    """How much the memory pipeline reads, and how fast it lets go.
+
+    Model settings for the extraction call are not here - they belong to the text
+    capability that runs it (llm.text.extract). This is the machinery around it.
+
+    Read once, when the worker is constructed: a /reload cannot change a batch that
+    is already being read, so edits here apply at the next restart.
+    """
+
+    #: Messages one extraction chunk holds at most. /relearn's watermark reset keeps
+    #: exactly this many unread, so the two move together.
+    extract_window: int = Field(120, ge=10)
+    #: A full chunk is trimmed back to the last conversation gap of at least this
+    #: long in its tail half, so batch boundaries fall where conversations end
+    #: rather than mid-topic - which is what keeps one episode from becoming two
+    #: half-known ones.
+    batch_gap_min: int = Field(30, ge=1)
+    #: Below this many unread messages a drain does not bother: a pass pays for the
+    #: rules, the schemas and the known facts before reading a line. /relearn forces
+    #: past it.
+    drain_floor: int = Field(20, ge=0)
+    #: Passes one nightly drain may run. It can bind before the budget does; a group
+    #: sustaining more than this every day has outgrown the memory budget itself, and
+    #: the backlog carries over rather than being skipped.
+    max_passes: int = Field(10, ge=1)
+    #: How many already-recorded episodes the extractor is reminded of, so it
+    #: recognises a conversation it has already written down.
+    known_episodes: int = Field(8, ge=0)
+    #: How long a name the model merely guessed at survives without being used again,
+    #: and how long one it marked as a joke does. Most jokes are true for an afternoon.
+    alias_unused_days: float = Field(30.0, gt=0)
+    joke_unused_days: float = Field(7.0, gt=0)
+    #: How long a claimed memory job stays claimed. A full drain is several model
+    #: calls and can outlive a short lease, and a deploy overlap would then pay for
+    #: the same transcript twice.
+    job_lease_min: int = Field(30, ge=1)
 
 
 class ScheduleCfg(_M):
+    #: The two crons and misfire_grace_sec below are handed to the scheduler at
+    #: startup: /reload validates them and accepts the file, but the registered jobs
+    #: keep their old triggers (and their old timezone) until the next restart. The
+    #: rest of this class is read when the night actually runs.
+    #:
     #: The nightly pipeline: extraction drain, then decay, then backup, then the
     #: NapCat cache sweep - one trigger, stages run in order (tasks.nightly). One
     #: trigger rather than four, because extraction drains through the job queue
@@ -271,6 +360,20 @@ class ScheduleCfg(_M):
     #: "no pruning" while actually deleting the backup just written, every night.
     backup_keep: int = Field(14, ge=1)
     napcat_cache_days: int = 7
+    #: How long the pipeline waits for each stage's jobs to drain before moving on
+    #: anyway. Extraction's worst honest night is max_passes model calls per group
+    #: plus retry backoff; decay is one UPDATE per group. Moving on late beats a
+    #: night with no backup.
+    extract_drain_hours: float = Field(3.0, gt=0)
+    decay_drain_min: float = Field(30.0, gt=0)
+    #: How often a drain-wait checks the queue. Nobody is waiting at 03:00.
+    drain_poll_sec: float = Field(30.0, gt=0)
+    #: How late a missed trigger may still fire. APScheduler's default is seconds, so
+    #: a loop busy at the trigger moment would silently skip that night.
+    misfire_grace_sec: int = Field(3600, ge=0)
+    #: How old the newest dump may be before the daily report calls it out. Just over
+    #: a day, so an ordinary night's backup never trips it.
+    backup_stale_hours: float = Field(26.0, gt=0)
 
     @field_validator("nightly_cron", "report_cron")
     @classmethod
@@ -292,6 +395,89 @@ class ScheduleCfg(_M):
         return v
 
 
+class PredicateCfg(_M):
+    """One thing that may be recorded about a person.
+
+    Everything a predicate is lives in this one entry: what the extraction model may
+    offer, how many of them a person may hold at once, how fast it is forgotten, and
+    the words it renders as in the prompt. Split across code the way it used to be,
+    adding a predicate meant five edits in three files, and each omission failed
+    quietly - a missing verb put the bare English predicate in front of the model.
+    """
+
+    #: How the fact reads in Chinese. `{}` marks where the object goes for a
+    #: predicate that does not read verb-first, the way an allergy does; without it
+    #: the object simply follows the verb.
+    verb: str = Field(min_length=1)
+    #: single: a person holds one at a time, and a new value closes the old one
+    #: (which is what makes "he moved" expressible). multi: they sit side by side,
+    #: each ageing on its own evidence.
+    cardinality: Literal["single", "multi"]
+    #: Which half-life this predicate is forgotten on. Where somebody lives changes
+    #: over years, what they are playing over weeks; one clock for both is wrong for
+    #: both.
+    decay: Literal["stable", "default", "fast"] = "default"
+    #: How the fact is classified once stored.
+    kind: Literal["attribute", "preference", "relation"] = "attribute"
+    #: Recording this retracts the named predicate about the same object: somebody
+    #: who has gone off a thing is not also somebody who likes it. Must be mutual.
+    opposite: str | None = None
+    #: The line the extraction model is shown for this predicate: what it means and
+    #: where its boundary with the neighbouring predicates runs. Rendered into the
+    #: extraction prompt, so a predicate cannot be added without saying what it is.
+    rule: str = Field(min_length=1)
+
+
+class HalfLifeCfg(_M):
+    """Base half-lives in days, one per decay class. A fact loses confidence on this
+    clock unless its evidence is renewed."""
+
+    stable: float = Field(90.0, gt=0)
+    default: float = Field(30.0, gt=0)
+    fast: float = Field(14.0, gt=0)
+
+
+class PredicateTable(_M):
+    """The whole of predicates.yaml: the clocks, and the predicates themselves."""
+
+    half_life_days: HalfLifeCfg = Field(default_factory=HalfLifeCfg)
+    person: dict[str, PredicateCfg]
+
+    @field_validator("person")
+    @classmethod
+    def _coherent(cls, table: dict[str, PredicateCfg]) -> dict[str, PredicateCfg]:
+        # The name goes into a JSON-schema enum, a database column and an index, so
+        # it has to be plain. Checked here rather than trusted, because a predicate
+        # that differs from another by a space is two predicates nothing reconciles.
+        for name, p in table.items():
+            if not name.replace("_", "").isalnum() or not name.islower():
+                raise ValueError(
+                    f"predicate name must be lower-case letters, digits and _: {name!r}")
+            if name in RESERVED_PREDICATES:
+                raise ValueError(
+                    f"{name!r} is reserved: it has its own tool and its own shape")
+            if p.opposite is None:
+                continue
+            other = table.get(p.opposite)
+            if other is None:
+                raise ValueError(f"{name}: opposite names no predicate: {p.opposite!r}")
+            if other.opposite != name:
+                raise ValueError(
+                    f"{name} and {p.opposite} disagree about being opposites")
+        return table
+
+
+#: Where the rendered predicate table is dropped into the extraction prompt. A plain
+#: token rather than a format field: the prompt is Chinese prose full of braces-free
+#: punctuation, and str.format would trip over any brace somebody typed.
+PREDICATE_SLOT = "{{谓词表}}"
+
+#: Names the person table may not use. `note` is what an owner typed by hand, and the
+#: model must have no way to write over it; `topic` and `term` are about the group
+#: rather than about a person, and reach memory through their own tools.
+RESERVED_PREDICATES = frozenset({"note", "topic", "term"})
+
+
 class AgreementCfg(_M):
     """The user agreement. The version is a number the owner sets - bumping it
     voids every older acceptance - and the text lives in its own file, named
@@ -305,6 +491,24 @@ class AgreementCfg(_M):
     #: config directory (absolute allowed). The accept instruction is appended
     #: in code, so an edited body can never lose it.
     file: str
+    #: How often one member is re-shown the pointer at /terms. The full text re-sent
+    #: every time reads as spam, and a member who has not accepted still costs
+    #: nothing - the pointer is sent instead of a reply, not as well as one.
+    prompt_every_sec: float = Field(600.0, gt=0)
+
+
+class DatabaseCfg(_M):
+    """The connection pool. Small on purpose: this is one bot on one machine, and
+    a pool larger than the work only moves contention into postgres.
+
+    Built once at startup and never resized, so edits apply at the next restart.
+    """
+
+    pool_min: int = Field(2, ge=1)
+    pool_max: int = Field(8, ge=1)
+    #: Ceiling on any single statement, so a query that will never finish fails
+    #: instead of holding a connection for the life of the process.
+    command_timeout_sec: float = Field(20.0, gt=0)
 
 
 class Settings(_M):
@@ -323,14 +527,19 @@ class Settings(_M):
     gateway: GatewayCfg = Field(default_factory=GatewayCfg)
     llm: LlmCfg
     budget: BudgetCfg = Field(default_factory=BudgetCfg)
+    prompt: PromptCfg = Field(default_factory=PromptCfg)
     retrieval: RetrievalCfg = Field(default_factory=RetrievalCfg)
+    memory: MemoryCfg = Field(default_factory=MemoryCfg)
     schedule: ScheduleCfg = Field(default_factory=ScheduleCfg)
+    database: DatabaseCfg = Field(default_factory=DatabaseCfg)
 
     # -- files: paths relative to the config directory (absolute allowed) ----
     personas_dir: str = "personas"
     agreement: AgreementCfg
     #: Where the prompt texts live, one `<key>.txt` per entry in PROMPT_KEYS.
     prompts_dir: str = "prompts"
+    #: What may be recorded about a person, one entry per predicate.
+    predicates_file: str = "predicates.yaml"
 
 
 class Persona(_M):
@@ -406,10 +615,14 @@ class ConfigBundle:
 
     def __init__(self, raw_settings: dict, personas: dict[str, Persona],
                  prompts: dict[str, str] | None = None,
-                 agreement_text: str = ""):
+                 agreement_text: str = "",
+                 predicates: PredicateTable | None = None):
         self._raw = raw_settings
         self.default = Settings.model_validate(raw_settings)
         self.personas = personas
+        #: What may be recorded about a person, from predicates_file. Read through
+        #: `predicates()`; empty only for a bundle built outside load_bundle.
+        self.predicates: PredicateTable = predicates or PredicateTable(person={})
         #: Model-facing text by key, loaded from the prompt files. Read through
         #: ptext(); empty only for a bundle built outside load_bundle.
         self.prompts: dict[str, str] = prompts or {}
@@ -477,6 +690,22 @@ def load_bundle(config_dir: Path | None = None) -> ConfigBundle:
             raise ValueError(f"prompt file is empty: {key}: {ppath}")
         prompts[key] = body
 
+    # The predicate table is mandatory too: without it the extractor would offer
+    # the model an empty enum and every fact would be rejected, silently and all
+    # night. The prompt has to carry the block that explains it, or the model gets
+    # an enum with no meanings attached.
+    ppath = _resolve(root, settings.predicates_file)
+    try:
+        predicates = PredicateTable.model_validate(_read_yaml(ppath))
+    except OSError as e:
+        raise ValueError(f"predicate file unreadable: {ppath}: {e}") from None
+    if not predicates.person:
+        raise ValueError(f"predicate file lists no predicates: {ppath}")
+    if PREDICATE_SLOT not in prompts["extract"]:
+        raise ValueError(
+            f"the extract prompt must carry {PREDICATE_SLOT}, "
+            "where the predicate table is rendered")
+
     # The agreement text follows its configured path, loaded with everything
     # else so /reload swaps text and version together. Mandatory like the
     # prompts: a missing or empty file fails the load, never a placeholder.
@@ -488,11 +717,11 @@ def load_bundle(config_dir: Path | None = None) -> ConfigBundle:
     if not agreement_text:
         raise ValueError(f"agreement file is empty: {apath}")
 
-    bundle = ConfigBundle(raw, personas, prompts, agreement_text)
+    bundle = ConfigBundle(raw, personas, prompts, agreement_text, predicates)
     # Validate eagerly: a bad config should blow up at startup / reload, not on the
-    # first incoming message. Every group's merged overrides included - for_group
-    # merges lazily, and before this a typo in one group's overrides sailed through
-    # /reload and then failed on that group's every message (no reply, no archive)
+    # first incoming message. Every group's merged overrides included, because
+    # for_group merges lazily: a typo in one group's overrides would otherwise pass
+    # /reload and then fail on that group's every message - no reply, no archive -
     # until the file was fixed. Warming the merge cache here is a free side effect.
     _ = bundle.default
     for gid in personas:

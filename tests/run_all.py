@@ -21,6 +21,23 @@ SCRIPTS = [
 ]
 
 
+def lint() -> bool:
+    """ruff over the whole tree, if it is installed. True when it is clean.
+
+    Run here rather than only by hand, because a linter nobody runs is a linter
+    nobody obeys. Skipped rather than failed when ruff is absent: the suites are
+    meant to run in a bare venv with the runtime dependencies alone.
+    """
+    print(f"\n{'=' * 70}\nruff\n{'=' * 70}")
+    try:
+        import ruff  # noqa: F401  (imported to find out whether it is installed)
+    except ImportError:
+        print("ruff is not installed - skipping (pip install ruff)")
+        return True
+    return subprocess.call([sys.executable, "-m", "ruff", "check",
+                            str(HERE.parent)]) == 0
+
+
 def main() -> int:
     failed = []
     for name in SCRIPTS:
@@ -28,12 +45,14 @@ def main() -> int:
         rc = subprocess.call([sys.executable, str(HERE / name)])
         if rc != 0:
             failed.append(name)
+    if not lint():
+        failed.append("ruff")
 
     print(f"\n{'=' * 70}")
     if failed:
         print(f"FAILED: {', '.join(failed)}")
         return 1
-    print(f"all {len(SCRIPTS)} suites passed")
+    print(f"all {len(SCRIPTS)} suites passed, lint clean")
     return 0
 
 

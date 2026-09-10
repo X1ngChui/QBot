@@ -1,4 +1,4 @@
-"""Tool definitions for the tool loop: web search (D5), and the group's own archive.
+"""Tool definitions for the tool loop: web search, and the group's own archive.
 
 The archive tool is the cheap one: the bot sits on a complete L0 record of everything
 said in the group - pictures described, voice transcribed - and anything outside the
@@ -32,18 +32,19 @@ log = logging.getLogger("qqbot.tools")
 @dataclass
 class ToolCtx:
     """What tool execution may reach beyond the database: the live protocol side,
-    and the map from the prompt's line numbers to the messages they name. Only
-    inspect_image needs either; the retrieval tools stay context-free."""
+    and the map from the numbers the prompt shows to what they name. Only
+    open_image needs either; the retrieval tools stay context-free."""
 
     bot: object = None
-    by_seq: dict[int, object] = field(default_factory=dict)  # seq -> ChatMsg
+    #: Picture number -> (the message that posted it, its index in image_refs).
+    by_pic: dict[int, tuple] = field(default_factory=dict)
 
 
 def tool_defs() -> list[dict]:
     """The tool definitions, built fresh so a /reload'ed description applies.
 
-    The schemas are code (design goal 7 - structure is the contract the executor
-    matches on); only the descriptions, which are prompts, come from the registry.
+    The schemas stay in code - they are the contract the executor matches on -
+    while the descriptions, which are prompts, come from the registry.
     """
     return [
         {
@@ -110,25 +111,17 @@ def tool_defs() -> list[dict]:
         {
             "type": "function",
             "function": {
-                "name": "inspect_image",
-                "description": ptext("tool_inspect_image"),
+                "name": "open_image",
+                "description": ptext("tool_open_image"),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "seq": {
+                        "n": {
                             "type": "integer",
-                            "description": "图片所在消息的编号（#后面的数字）",
-                        },
-                        "question": {
-                            "type": "string",
-                            "description": "要对这张图问的具体问题",
-                        },
-                        "which": {
-                            "type": "integer",
-                            "description": "该消息里的第几张图，从 1 数起；不填为第 1 张",
+                            "description": "图片编号，取自转写里 ⟦图片N:…⟧ 或 ⟦表情N:…⟧ 的 N",
                         },
                     },
-                    "required": ["seq", "question"],
+                    "required": ["n"],
                 },
             },
         },
@@ -150,14 +143,6 @@ def tool_defs() -> list[dict]:
             },
         },
     ]
-
-#: How many archive hits one call returns. Enough to answer "when did we discuss this";
-#: a model that wants more can search again with better words.
-HISTORY_HITS = 8
-#: And how much of each message. A link survives this; a wall of text is cut where the
-#: model has seen enough to decide whether to search again.
-HISTORY_SNIPPET = 200
-
 
 #: The namesake form current names render as: the name plus the reserved
 #: namesake tag carrying the permanent serial. A speaker argument in this shape
@@ -195,10 +180,6 @@ def _like(word: str) -> str:
 # parameterized ILIKE expression - member text reaches SQL only as ILIKE
 # parameters, never as SQL text.
 
-#: Complexity cap: a query is a filter, not a program. Terms beyond the cap
-#: mean the question should be split into two searches.
-MAX_QUERY_TERMS = 8
-
 _QUERY_NORMALIZE = str.maketrans({"（": "(", "）": ")", "“": '"', "”": '"',
                                   "「": '"', "」": '"', "'": '"'})
 
@@ -222,8 +203,9 @@ def _parse_query(q: str):
         ast = _luqum_parser.parse(q)
     except _LuqumParseError as e:
         raise QueryError(f"无法解析（{e}）") from None
-    if _terms_of(ast) > MAX_QUERY_TERMS:
-        raise QueryError(f"关键词太多（最多 {MAX_QUERY_TERMS} 个），请拆成两次检索")
+    cap = config().default.retrieval.max_query_terms
+    if _terms_of(ast) > cap:
+        raise QueryError(f"关键词太多（最多 {cap} 个），请拆成两次检索")
     return ast
 
 
@@ -283,7 +265,18 @@ async def search_history(group_id: int, query: str, *, speaker: str | None = Non
     actually surrounds them - group notices included, since a recall or a mute is
     often the very thing a line responds to. Windows that touch merge into one
     block; blocks are separated by an ellipsis line.
+
+    Every matched message is returned whole, and the result carries no length quota
+    of its own. What it holds is already settled by retrieval.history_hits hits, each
+    with its context lines, each line a message bounded by gateway.max_msg_len - and
+    past that by money, the only limit this system has. A character budget on top
+    would be a second bound on the same thing and the cruder one: it cannot tell a
+    result worth its size from one that is not, while money can.
     """
+    # One read of the retrieval settings for the whole call, so how many hits are
+    # fetched and how much context is rendered cannot come from two different
+    # configs if /reload lands in between.
+    rcfg = config().default.retrieval
     # Parse and compile under one roof: the subset check lives in the compile
     # walk, and a rejected feature must answer in words exactly like a syntax
     # error does.
@@ -318,7 +311,7 @@ async def search_history(group_id: int, query: str, *, speaker: str | None = Non
                    OR occurred_at >= NOW() - make_interval(days => $4))
               AND ($5::text IS NULL OR platform_user_id = $5)
             ORDER BY occurred_at DESC, id DESC LIMIT $2""",
-        group_id, HISTORY_HITS,
+        group_id, rcfg.history_hits,
         _like(sp) if sp and uid is None else None,
         days if days and days > 0 else None,
         uid,
@@ -326,7 +319,7 @@ async def search_history(group_id: int, query: str, *, speaker: str | None = Non
     )
     if not rows:
         return "（存档里没有搜到）"
-    ctx = max(0, config().default.retrieval.history_context)
+    ctx = max(0, rcfg.history_context)
     if not ctx:
         return "\n".join(_history_line(r) for r in reversed(rows))
     return await _with_context(group_id, [r["id"] for r in rows], ctx)
@@ -338,8 +331,10 @@ def _history_line(r) -> str:
     # defang the name on render: rows filed before Sender.parse neutralized
     # names can carry anything. The text is left as stored - its markers are
     # system writing, and defanging would destroy them.
-    who = defang((sender.get("card") or sender.get("nickname") or "?")).strip()
-    text = (r["plain_text"] or "").strip()[:HISTORY_SNIPPET]
+    who = defang(sender.get("card") or sender.get("nickname") or "?").strip()
+    # The message whole. What a search is for is the substance of what was said, and
+    # the archive's long messages are where that lives.
+    text = (r["plain_text"] or "").strip()
     # fmt_when, not strftime on the raw value: asyncpg returns timestamptz in UTC,
     # and a UTC wall time here would disagree with every stamp in the history window.
     return f"{sysmark(fmt_when(r['occurred_at']))} {who}: {text}"
@@ -353,7 +348,8 @@ async def _with_context(group_id: int, hit_ids: list, ctx: int) -> str:
     ties without meaning anything). A window is contiguous by construction, so
     two windows overlap exactly when they share a row: overlapping windows are
     merged into one block, and blocks render oldest first with an ellipsis line
-    between them. Worst case is HISTORY_HITS disjoint blocks of 2*ctx+1 lines.
+    between them. Worst case is retrieval.history_hits disjoint blocks of 2*ctx+1
+    lines.
     """
     nrows = await pool().fetch(
         """SELECT h.id AS hit, n.id, n.occurred_at, n.payload, n.plain_text
@@ -378,7 +374,9 @@ async def _with_context(group_id: int, hit_ids: list, ctx: int) -> str:
         by_id[r["id"]] = r
         windows.setdefault(r["hit"], set()).add(r["id"])
     blocks = merge_overlapping(list(windows.values()))
-    order = lambda rid: (by_id[rid]["occurred_at"], by_id[rid]["id"])  # noqa: E731
+    def order(rid):
+        return by_id[rid]["occurred_at"], by_id[rid]["id"]
+
     lines: list[str] = []
     for b in sorted(blocks, key=lambda b: min(order(rid) for rid in b)):
         if lines:
@@ -395,13 +393,6 @@ def render_results(items: list[dict]) -> str:
     )
 
 
-#: How much of one page read_url hands the model. Pages are unbounded; the reply is
-#: not - this is enough for an article's substance, and the model can say what the
-#: page is rather than drown in it. Page text is untrusted input like search
-#: snippets; the standing rules (private_rules) already cover text that tries to
-#: read as instructions.
-URL_CONTENT_CHARS = 3000
-
 
 class Failure(str):
     """A tool answer that obtained nothing - a transport failure, a bad argument,
@@ -412,6 +403,28 @@ class Failure(str):
     is NOT a Failure on purpose - searching and finding nothing is verification
     work, and the provenance marker may certify it."""
     __slots__ = ()
+
+
+class Attachment(str):
+    """A tool answer that hands the model a picture rather than describing one.
+
+    Still a string - what it says is what everything downstream reads, so the
+    provenance marker and the trajectory digest need no special case - but it
+    carries the file blocks that go into the tool message beside that text. The
+    vendor accepts a content array on a tool message, so the picture arrives as
+    the answer to the call rather than as a separate turn appended behind it.
+    """
+
+    __slots__ = ("blocks",)
+
+    def __new__(cls, text: str, blocks: list[dict]):
+        s = super().__new__(cls, text)
+        s.blocks = blocks
+        return s
+
+    def content(self) -> list[dict]:
+        """This answer as the tool message's content."""
+        return [*self.blocks, {"type": "text", "text": str(self)}]
 
 
 def verified(out: str) -> bool:
@@ -436,28 +449,25 @@ async def execute(call: dict, *, cfg: Settings, group_id: str,
     if not isinstance(args, dict):
         return Failure("（工具参数解析失败）")
 
-    if name == "inspect_image":
-        # The one paid tool: a vision call billed into the reply's ambient budget
-        # scope. Everything else about the loop still holds - duplicate calls are
-        # answered in words, and the per-reply cap is what bounds repetition.
-        seq = args.get("seq")
-        question = (args.get("question") or "").strip()
-        if not isinstance(seq, int) or not question:
-            return Failure("（需要消息编号和一个具体问题）")
-        msg = (ctx.by_seq if ctx else {}).get(seq)
-        if msg is None:
-            return Failure(f"（上文里没有编号为 #{seq} 的消息）")
+    if name == "open_image":
+        # Free: bytes and an upload, no model call. The reply model reads pictures
+        # itself, so this hands it one rather than asking another model to look -
+        # which could only ever answer the single question it was given.
+        n = args.get("n")
+        if not isinstance(n, int):
+            return Failure("（需要一个图片编号）")
+        found = (ctx.by_pic if ctx else {}).get(n)
+        if found is None:
+            return Failure(f"（上文里没有编号为 {n} 的图片）")
+        msg, idx = found
         refs = getattr(msg, "image_refs", None) or []
-        if not refs:
-            return Failure(f"（#{seq} 这条消息里没有图片）")
-        which = args.get("which")
-        idx = (which - 1) if isinstance(which, int) and which >= 1 else 0
         if idx >= len(refs):
-            return Failure(f"（#{seq} 只有 {len(refs)} 张图）")
-        answer = await MEDIA.inspect(refs[idx], question=question,
-                                     bot=ctx.bot if ctx else None,
-                                     group_id=group_id, cfg=cfg)
-        return answer or Failure("（这张图已经取不回来了，以文字描述为准）")
+            return Failure(f"（图片 {n} 已经取不回来了，以文字描述为准）")
+        fid = await MEDIA.ensure_uploaded(refs[idx], bot=ctx.bot if ctx else None,
+                                          group_id=group_id, cfg=cfg)
+        if not fid:
+            return Failure(f"（图片 {n} 已经取不回来了，以文字描述为准）")
+        return Attachment(f"（这是图片 {n} 的原图。）", [{"type": "image", "id": fid}])
 
     if name == "read_url":
         url = (args.get("url") or "").strip()
@@ -477,7 +487,15 @@ async def execute(call: dict, *, cfg: Settings, group_id: str,
             return Failure("（这个网页没有可读的正文）")
         # Outside text: a page carrying the system brackets must not read as
         # system markup to the model, here or later in the frozen trace digest.
-        return defang(text)[:URL_CONTENT_CHARS]
+        body = defang(text)
+        # A web page is the one input with no bound of its own; past the model's
+        # context the request fails outright rather than degrading. A cut page is
+        # told it was cut, or a sentence stopping mid-thought reads as the end of
+        # the article.
+        cap = cfg.retrieval.url_content_chars
+        if len(body) > cap:
+            return body[:cap] + "\n（网页正文过长，后面的没有读到）"
+        return body
 
     if name == "recall_events":
         question = (args.get("question") or args.get("query") or "").strip()

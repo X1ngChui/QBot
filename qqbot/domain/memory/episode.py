@@ -1,6 +1,6 @@
 """L4, episodic memory: one thing that happened in a group, with a beginning and an end.
 
-The division of labour against facts (design doc 36-40): a fact answers what somebody is
+The division of labour against facts: a fact answers what somebody is
 like, an episode answers what actually happened that time. The first is rewritten
 repeatedly; the second is fixed once it is written.
 
@@ -44,9 +44,8 @@ class Episode:
     started_at: datetime | None = None
     ended_at: datetime | None = None
     #: Whether this is worth bringing back up later. Recorded, not yet acted on:
-    #: episodes have no decay path today (design doc 58 promises aging by
-    #: importance; deliberately unbuilt until episode volume makes it worth a pass),
-    #: so nothing currently reads this.
+    #: episodes have no decay path today (aging by importance is the intended one,
+    #: left unbuilt until episode volume makes it worth a pass), so nothing reads this.
     importance: float = 0.0
     confidence: float = 0.0
     status: str = "active"

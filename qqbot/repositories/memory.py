@@ -345,7 +345,7 @@ class EpisodeRepository:
     ) -> list[Episode]:
         """Episodes somebody took part in. Filter by participant first, then talk about
         similarity: whether it is the right person matters more than whether the text
-        looks alike (design doc 46)."""
+        looks alike."""
         rows = await pool().fetch(
             """SELECT e.* FROM episode e
                  JOIN episode_participant p ON p.episode_id = e.id

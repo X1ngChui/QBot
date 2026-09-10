@@ -1,6 +1,6 @@
 """Pulling candidates out of a stretch of group chat: names and facts.
 
-By function call rather than by asking the model for JSON (design goal 7). The
+By function call rather than by asking the model for JSON. The
 difference is not the format - it is that the shape of each argument is defined here and
 enforced by the backend: the predicate is an enum, the subject can only be a code from
 the roster it was given, and every record has to carry a verbatim quote. A field the
@@ -23,42 +23,62 @@ from dataclasses import dataclass
 from ..domain.identity import AliasType
 from ..domain.memory import Candidate, CandidateType
 from ..providers import Kind, providers
-from ..settings import Settings, ptext
+from ..settings import PREDICATE_SLOT, Settings, config, ptext
 
 log = logging.getLogger("qqbot.extract")
 
-#: Predicates a person can only have one of at a time. A new answer overturns the old
-#: one, which is what makes "he moved" expressible: the previous city gets a valid_to
-#: rather than sitting alongside the new one.
-SINGLE_VALUED = (
-    "lives_in", "from_place", "works_as", "works_at", "studies_at",
-    "majors_in", "birthday",
-)
 
-#: Predicates a person can have many of at once. Each object is stored as its own row -
-#: the object doubles as the row's object_key under the one-current-fact index - so a
-#: second thing somebody likes sits beside the first, and each ages on its own evidence:
-#: a game mentioned once falls away while the one they talk about weekly stays.
-MULTI_VALUED = (
-    "likes", "dislikes", "avoids", "wants",
-    "plays", "watches", "listens_to", "reads", "uses", "owns", "collects", "has_pet",
-    "good_at", "speaks", "member_of",
-    "visited", "fears", "allergic_to",
-)
-
-#: The closed set the tool schema offers. An open string would let one fact be written as
-#: likes / like / liked on three rows that nothing could reconcile, so adding one means
-#: editing a tuple above - a deliberate decision rather than something the model can do.
-#: Predicates that overlap an existing one - known_for against good_at, plans_to against
-#: wants, and their kin - are deliberately excluded (orthogonality rule): where two
-#: predicates could hold the same fact, the vaguer one collects everything.
-PREDICATES = SINGLE_VALUED + MULTI_VALUED
+def _table() -> dict:
+    """The predicate table as configured. Read at use time, so /reload applies."""
+    return config().predicates.person
 
 
-#: Recording one retracts the other about the same object: somebody who says they have
-#: gone off something is not simultaneously a person who likes it. Without this the two
-#: sit side by side and both go into the prompt.
-OPPOSITES = {"likes": "dislikes", "dislikes": "likes"}
+def predicate_names() -> tuple[str, ...]:
+    """The closed set the tool schema offers.
+
+    Closed because an open string would let one fact be written as likes / like /
+    liked on three rows nothing could reconcile. Adding one is an edit to
+    predicates.yaml - a deliberate decision, and not one the model can take.
+    """
+    return tuple(_table())
+
+
+def single_valued() -> tuple[str, ...]:
+    """Predicates a person can only have one of at a time. A new answer overturns the
+    old one, which is what makes "he moved" expressible: the previous city gets a
+    valid_to rather than sitting alongside the new one."""
+    return tuple(n for n, p in _table().items() if p.cardinality == "single")
+
+
+def multi_valued() -> tuple[str, ...]:
+    """Predicates a person can hold many of at once. Each object is stored as its own
+    row - the object doubles as the row's object_key - so a second thing somebody
+    likes sits beside the first, and each ages on its own evidence."""
+    return tuple(n for n, p in _table().items() if p.cardinality == "multi")
+
+
+def opposites() -> dict[str, str]:
+    """Recording one retracts the other about the same object: somebody who says they
+    have gone off something is not simultaneously a person who likes it. Without this
+    the two sit side by side and both reach the prompt."""
+    return {n: p.opposite for n, p in _table().items() if p.opposite}
+
+
+def rules_block() -> str:
+    """The predicate table as the extraction model reads it.
+
+    Rendered from the same entries the schema is built from, so a predicate the model
+    is offered always arrives with its meaning attached. Stable between runs, which is
+    what keeps it inside the prefix cache.
+    """
+    lines = []
+    for n, p in _table().items():
+        # A verb that is nothing but the placeholder means the object is the whole
+        # phrase, so there is no reading to show alongside the name.
+        head = n if p.verb == "{}" else f"{n}（{p.verb.replace('{}', '…')}）"
+        lines.append(f"- {head}：{p.rule}")
+    return "\n".join(lines)
+
 
 #: Deliberately without `note`: that predicate belongs to what an owner typed, and the
 #: model must have no way to write over it.
@@ -77,139 +97,155 @@ ALIAS_KINDS = tuple(t.value for t in (
 #: alive.
 #:
 #: What is left is what the model cannot work out from the transcript in front of it: what
-#: this group is for, and what its words mean.
+#: this group is for, and what its words mean. These two are not in predicates.yaml
+#: because they are not properties of a person: each has its own tool, its own subject
+#: (the group's own entity) and its own rendering.
 GROUP_TOPIC = "topic"
 #: A term row's object_key is the word being defined, so redefining supersedes rather
 #: than accumulating, and each word is one row that ages on its own evidence.
 GROUP_TERM = "term"
 
-#: How fast each kind of fact goes stale, as a base half-life in days. The class, not the
-#: repetition count, is the primary axis of forgetting: where somebody lives changes on
-#: the scale of years, what they are currently playing on the scale of weeks, and a decay
-#: clock that ignores the difference discounts both wrongly. Defined here because it is
-#: predicate metadata, exactly like cardinality above; the repository receives the lists
-#: and knows nothing about what predicates mean.
-STABLE_PREDICATES = ("lives_in", "from_place", "works_as", "works_at", "studies_at",
-                     "majors_in", "birthday", "member_of", "speaks", "has_pet", "owns",
-                     "visited", "fears", "allergic_to", GROUP_TOPIC)
-FAST_PREDICATES = ("plays", "watches", "uses", "wants")
-#: Everything else - preferences, skills, group terms - sits in the middle.
-STABLE_DAYS, DEFAULT_DAYS, FAST_DAYS = 90.0, 30.0, 14.0
 
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "record_alias",
-            "description": "记录一个称呼：群里用某个名字指代某个账号。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "alias": {"type": "string", "description": "被使用的称呼原文"},
-                    "account": {
-                        "type": "integer",
-                        "description": "被指代账号的编号，取自「本群账号」列表",
+def decay_classes() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """(stable, fast) predicate names. Everything else takes the middle clock.
+
+    The class, not the repetition count, is the primary axis of forgetting: where
+    somebody lives changes on the scale of years, what they are currently playing on
+    the scale of weeks, and one clock for both is wrong for both. The group's topic
+    rides with the stable ones - what a group is for outlasts what anybody in it is
+    playing.
+    """
+    table = _table()
+    stable = tuple(n for n, p in table.items() if p.decay == "stable") + (GROUP_TOPIC,)
+    return stable, tuple(n for n, p in table.items() if p.decay == "fast")
+
+
+def tools() -> list[dict]:
+    """The tool definitions, built fresh so an edited predicate table applies.
+
+    The predicate enum comes from the same entries the prompt block is rendered
+    from: the model cannot be offered a name it was given no meaning for.
+    """
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "record_alias",
+                "description": "记录一个称呼：群里用某个名字指代某个账号。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "alias": {"type": "string", "description": "被使用的称呼原文"},
+                        "account": {
+                            "type": "integer",
+                            "description": "被指代账号的编号，取自「本群账号」列表",
+                        },
+                        "kind": {
+                            "type": "string",
+                            "enum": list(ALIAS_KINDS),
+                            "description": "nickname 常用称呼；short_name 由昵称简化而来；"
+                                           "joke_name 玩笑性质的称呼；title 头衔或职务；"
+                                           "relationship_name 按关系叫的（如「师兄」）",
+                        },
+                        "quote": {"type": "string",
+                                  "description": "记录中逐字存在的一句，作为依据"},
                     },
-                    "kind": {
-                        "type": "string",
-                        "enum": list(ALIAS_KINDS),
-                        "description": "nickname 常用称呼；short_name 由昵称简化而来；"
-                                       "joke_name 玩笑性质的称呼；title 头衔或职务；"
-                                       "relationship_name 按关系叫的（如「师兄」）",
-                    },
-                    "quote": {"type": "string", "description": "记录中逐字存在的一句，作为依据"},
+                    "required": ["alias", "account", "kind", "quote"],
                 },
-                "required": ["alias", "account", "kind", "quote"],
             },
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "record_fact",
-            "description": "记录一条关于某个账号的稳定事实。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "account": {
-                        "type": "integer",
-                        "description": "主语账号的编号，取自「本群账号」列表",
+        {
+            "type": "function",
+            "function": {
+                "name": "record_fact",
+                "description": "记录一条关于某个账号的稳定事实。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "account": {
+                            "type": "integer",
+                            "description": "主语账号的编号，取自「本群账号」列表",
+                        },
+                        "predicate": {"type": "string", "enum": list(predicate_names())},
+                        "object": {
+                            "type": "string",
+                            "description": "宾语，只写值本身。举例：lives_in 写「杭州」，"
+                                           "works_as 写「实习生」，works_at 写「某某券商」。"
+                                           "不加括号注解、补充说明或时间限定，"
+                                           "也不要把职位和单位写进同一个值",
+                        },
+                        "quote": {"type": "string",
+                                  "description": "记录中逐字存在的一句，作为依据"},
                     },
-                    "predicate": {"type": "string", "enum": list(PREDICATES)},
-                    "object": {
-                        "type": "string",
-                        "description": "宾语，只写值本身。举例：lives_in 写「杭州」，"
-                                       "works_as 写「实习生」，works_at 写「某某券商」。"
-                                       "不加括号注解、补充说明或时间限定，"
-                                       "也不要把职位和单位写进同一个值",
-                    },
-                    "quote": {"type": "string", "description": "记录中逐字存在的一句，作为依据"},
+                    "required": ["account", "predicate", "object", "quote"],
                 },
-                "required": ["account", "predicate", "object", "quote"],
             },
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "record_group_term",
-            "description": "记录本群一个术语、缩写或行话的含义。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "term": {"type": "string", "description": "这个词本身，原文照抄"},
-                    "meaning": {
-                        "type": "string",
-                        "description": "它在本群指什么，一句话说清",
+        {
+            "type": "function",
+            "function": {
+                "name": "record_group_term",
+                "description": "记录本群一个术语、缩写或行话的含义。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "term": {"type": "string", "description": "这个词本身，原文照抄"},
+                        "meaning": {
+                            "type": "string",
+                            "description": "它在本群指什么，一句话说清",
+                        },
+                        "quote": {"type": "string",
+                                  "description": "记录中逐字存在的一句，作为依据"},
                     },
-                    "quote": {"type": "string", "description": "记录中逐字存在的一句，作为依据"},
+                    "required": ["term", "meaning", "quote"],
                 },
-                "required": ["term", "meaning", "quote"],
             },
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "record_group_topic",
-            "description": "记录本群是干什么的。一个群只有一条。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "topic": {"type": "string", "description": "本群的性质与主题，一句话"},
-                    "quote": {"type": "string", "description": "记录中逐字存在的一句，作为依据"},
+        {
+            "type": "function",
+            "function": {
+                "name": "record_group_topic",
+                "description": "记录本群是干什么的。一个群只有一条。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "topic": {"type": "string", "description": "本群的性质与主题，一句话"},
+                        "quote": {"type": "string",
+                                  "description": "记录中逐字存在的一句，作为依据"},
+                    },
+                    "required": ["topic", "quote"],
                 },
-                "required": ["topic", "quote"],
             },
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "record_episode",
-            "description": "记录一件本群发生过的、以后可能被提起的事。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "summary": {
-                        "type": "string",
-                        "description": "这件事是什么，一到两句话，写清谁做了什么；"
-                                       "只写记录里有的，不要补充没提到的细节",
+        {
+            "type": "function",
+            "function": {
+                "name": "record_episode",
+                "description": "记录一件本群发生过的、以后可能被提起的事。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "summary": {
+                            "type": "string",
+                            "description": "这件事是什么，一到两句话，写清谁做了什么；"
+                                           "只写记录里有的，不要补充没提到的细节",
+                        },
+                        "participants": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                            "description": "参与者的账号编号，取自「本群账号」列表；"
+                                           "只填能确认的人，指不准的宁可不填；"
+                                           "一个都指不出就不要调用",
+                        },
+                        "quote": {"type": "string",
+                                  "description": "记录中逐字存在的一句，作为依据"},
                     },
-                    "participants": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "参与者的账号编号，取自「本群账号」列表；"
-                                       "只填能确认的人，指不准的宁可不填；"
-                                       "一个都指不出就不要调用",
-                    },
-                    "quote": {"type": "string", "description": "记录中逐字存在的一句，作为依据"},
+                    "required": ["summary", "participants", "quote"],
                 },
-                "required": ["summary", "participants", "quote"],
             },
         },
-    },
-]
+    ]
+
 
 @dataclass(frozen=True, slots=True)
 class SourceLine:
@@ -292,7 +328,8 @@ class MemoryExtractor:
         # rather than mid-batch. tone_rules is the discernment core shared with the
         # reply path - what counts as said-in-earnest is one judgment, stated once -
         # followed by this path's consequence note (what not to record).
-        base = (ptext("extract") + "\n\n【群聊语用】\n"
+        base = (ptext("extract").replace(PREDICATE_SLOT, rules_block())
+                + "\n\n【群聊语用】\n"
                 + ptext("tone_rules") + "\n\n" + ptext("tone_extract_note"))
         self._prompt = (base + "\n\n" + legend.strip()) if legend.strip() else base
         # Extraction's own model, grade and timeout on the reply backend's wiring:
@@ -326,7 +363,7 @@ class MemoryExtractor:
             # a use of the text capability with its own settings, not the reply
             # path's settings with exceptions bolted on at the call.
             cfg=self._llm,
-            tools=TOOLS,
+            tools=tools(),
             kind=Kind.EXTRACT,
             group_id=str(inp.group_id),
         )

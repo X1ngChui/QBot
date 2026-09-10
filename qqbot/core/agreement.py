@@ -30,7 +30,6 @@ _AGREED: set[tuple[str, str, int]] = set()
 #: seconds). A member who keeps addressing the bot sees the pointer once per
 #: window, not once per message - the gate must not become spam.
 _PROMPTED: dict[tuple[str, str], float] = {}
-PROMPT_EVERY_SEC = 600.0
 
 #: What an unconsenting member is told instead of a reply - one line, because
 #: the full agreement re-sent on every cooldown reads as spam. /terms serves
@@ -80,7 +79,7 @@ def should_prompt(group_id: str, user_id: str) -> bool:
     key = (str(group_id), user_id)
     now = time.monotonic()
     last = _PROMPTED.get(key)
-    if last is not None and now - last < PROMPT_EVERY_SEC:
+    if last is not None and now - last < config().default.agreement.prompt_every_sec:
         return False
     _PROMPTED[key] = now
     return True

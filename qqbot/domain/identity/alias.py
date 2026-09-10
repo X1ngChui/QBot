@@ -1,6 +1,6 @@
 """Names.
 
-A name is not a string field. It has three dimensions (design doc 13-19):
+A name is not a string field. It has three dimensions:
 
     who it points at   target_entity_id
     where it holds     group_id (null = everywhere, and only a human may establish that)
@@ -23,7 +23,7 @@ from enum import StrEnum
 
 
 class AliasType(StrEnum):
-    """Where a name came from (design doc 16).
+    """Where a name came from.
 
     The type is itself part of how strong the evidence is: a group card is a fact the
     platform reports, while a joke name rarely outlives the week.
@@ -39,7 +39,7 @@ class AliasType(StrEnum):
 
 
 class AliasStatus(StrEnum):
-    """candidate -> confirmed -> inactive (design doc 18).
+    """candidate -> confirmed -> inactive.
 
     There is no `rejected`. Messages already archived may still depend on a name that
     later fell out of use, and deleting it would make them unreadable again. A name that
@@ -52,7 +52,7 @@ class AliasStatus(StrEnum):
 
 
 class EvidenceType(StrEnum):
-    """What makes us think this name points at this person (design doc 17)."""
+    """The grounds for believing this name points at this person."""
 
     PLATFORM_IDENTITY = "platform_identity"
     EXPLICIT_AT = "explicit_at"
@@ -108,7 +108,7 @@ CHANNELS: dict[EvidenceType, str] = {
 }
 
 
-def fused_confidence(evidence: list["AliasEvidence"]) -> float:
+def fused_confidence(evidence: list[AliasEvidence]) -> float:
     """Two-level fusion: maximum within a channel, noisy-OR across channels.
 
     The shape follows the correlation structure rather than a single rule: repeats of the
@@ -228,7 +228,7 @@ class Alias:
     @property
     def is_global(self) -> bool:
         """Holds across groups. The only channel that crosses them, and one no automatic
-        path may open - it is established by hand (design goal 4)."""
+        path may open: group isolation is the default, and only a person can waive it."""
         return self.group_id is None
 
     @property
@@ -237,7 +237,7 @@ class Alias:
         candidate is precisely what "not yet certain" means."""
         return self.status is AliasStatus.CONFIRMED and self.valid_to is None
 
-    def scored(self, evidence: list[AliasEvidence]) -> "Alias":
+    def scored(self, evidence: list[AliasEvidence]) -> Alias:
         """Recompute confidence from the evidence, promoting to confirmed if it earns it.
 
         Fusion is channelled - see fused_confidence. Within a channel repetition buys
@@ -269,7 +269,7 @@ class Alias:
             conf = max(conf, self.confidence)
         return self._with(conf, status)
 
-    def _with(self, conf: float, status: AliasStatus) -> "Alias":
+    def _with(self, conf: float, status: AliasStatus) -> Alias:
         return type(self)(
             alias_text=self.alias_text,
             target_entity_id=self.target_entity_id,

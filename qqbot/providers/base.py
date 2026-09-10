@@ -8,19 +8,23 @@ and every one of those differences should be forced into a named subclass instea
 accumulating as flags in shared code. Subclassing makes the contract explicit, and an
 incomplete backend fails at construction rather than at the first live call.
 
-Section 5.1 splits providers by capability so each can move independently; D6 rules out
-automatic fallback between them.
+One capability may be repointed at another platform without touching the others.
+There is no automatic fallback between backends: a silent downgrade would answer
+from a model nobody chose, at a price nobody budgeted.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from ..settings import AsrCfg, SearchCfg, TextCfg, VisionCfg
+from ..settings import AsrCfg, EmbeddingCfg, SearchCfg, TextCfg, VisionCfg
+
+log = logging.getLogger("qqbot.providers")
 
 
 class Kind(StrEnum):
@@ -177,10 +181,27 @@ class TextModel(Capability):
         may depend on it for correctness - only for cost, latency and depth.
         """
 
+    async def upload(
+        self, data: bytes, *, cfg: TextCfg, mime: str = "image/jpeg",
+    ) -> str | None:
+        """Store a picture with this backend and return an id its messages can carry.
+
+        On the text capability rather than on vision, because the model that reads the
+        file block is the one that has to be able to resolve the id. Filed through
+        vision, the two would have to share an account for a picture to arrive at
+        all - and config invites splitting them, giving each capability its own
+        endpoint and credential.
+
+        Not abstract: keeping files is a backend feature, not part of the contract.
+        None means this backend keeps none, and the caller then leaves originals out
+        of the prompt and lets the description line stand alone.
+        """
+        return None
+
 
 class VisionModel(Capability):
     """Image understanding. Implementations must accept the bytes inline: media never
-    touches disk (5.3), so a backend that only takes a public URL cannot satisfy this."""
+    touches disk, so a backend that only takes a public URL cannot satisfy this."""
 
     @abstractmethod
     async def describe(
@@ -200,19 +221,6 @@ class VisionModel(Capability):
         """
 
 
-    async def upload(
-        self, data: bytes, *, cfg: VisionCfg, mime: str = "image/jpeg",
-    ) -> str | None:
-        """Store the image with the backend and return an id a chat message can carry.
-
-        Not abstract: keeping files is a backend feature, not part of the contract.
-        None means this backend keeps none - the caller then leaves raw images out of
-        the prompt and the text description stands alone, which is the pre-vision
-        behaviour and always correct.
-        """
-        return None
-
-
 class AsrModel(Capability):
     """Speech to text. Inline bytes, for the same reason as VisionModel."""
 
@@ -229,8 +237,21 @@ class AsrModel(Capability):
         """Return the transcript, or "" if nothing was said."""
 
 
+class EmbeddingModel(Capability):
+    """Text in, vectors out.
+
+    Batching is the implementation's business: endpoints cap how many inputs one
+    request may carry, and a caller that had to know would be knowing a vendor.
+    """
+
+    @abstractmethod
+    async def embed(self, texts, *, cfg: EmbeddingCfg,
+                    group_id: str | None = None) -> list[list[float]]:
+        """Vectors for these texts, in the order they were given."""
+
+
 class SearchEngine(Capability):
-    """Web search, called directly rather than through a model's built-in search (D5)."""
+    """Web search, called directly rather than through a model's built-in search."""
 
     @abstractmethod
     async def search(
@@ -251,25 +272,34 @@ class SearchEngine(Capability):
 
 @dataclass
 class Providers:
-    """The four capabilities, injected as one bundle.
+    """The five capabilities, injected as one bundle.
 
     Tests hand over fakes; a different backend is a different object here. Neither case
-    touches the code that uses them.
+    touches the code that uses them. Every capability belongs in the bundle: one wired
+    separately is one that shutdown, /reload and the startup log all have to be told
+    about by hand, and each of those is a place to forget it.
     """
 
     text: TextModel
     vision: VisionModel
     asr: AsrModel
+    embedding: EmbeddingModel
     search: SearchEngine
 
     async def aclose(self) -> None:
-        for cap in (self.text, self.vision, self.asr, self.search):
-            await cap.aclose()
+        """Close all five, even if one refuses: a backend that raises on the way out
+        must not leave the others holding their connections."""
+        for cap in (self.text, self.vision, self.asr, self.embedding, self.search):
+            try:
+                await cap.aclose()
+            except Exception:
+                log.warning("closing %s failed", type(cap).__name__, exc_info=True)
 
     def describe(self) -> str:
         return (
             f"text={self.text.name or type(self.text).__name__} "
             f"vision={self.vision.name or type(self.vision).__name__} "
             f"asr={self.asr.name or type(self.asr).__name__} "
+            f"embedding={self.embedding.name or type(self.embedding).__name__} "
             f"search={self.search.name or type(self.search).__name__}"
         )

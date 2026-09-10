@@ -36,6 +36,7 @@ from ..core.nickname import register as register_nicknames
 from ..core.retrieval import directory
 from ..core.state import REGISTRY
 from ..db import repo
+from ..domain.identity.alias import CONFIRM_THRESHOLD
 from ..providers import Kind, providers
 from ..services import NameTaken, PersonCard, UnknownAccount
 from ..settings import config, reload_config
@@ -103,7 +104,10 @@ async def _gate(matcher: Matcher, event: GroupMessageEvent,
               else config().for_group(str(event.group_id))[0].owners)
     if perms.is_owner(str(event.user_id), owners):
         return True
-    if (self_serve or open_to_members) and not global_only:
+    if (self_serve or open_to_members) and not global_only:  # noqa: SIM102
+        # Kept nested: folded into one condition the test below would be a
+        # four-term boolean, and the note explaining it would no longer sit
+        # against the clause it explains.
         # The member surface opens only past the user agreement; before it the
         # only commands that exist are /agree and /terms (their handlers set
         # pre_agreement - consenting needs both the pen and the document).
@@ -351,7 +355,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     accounts = await directory().accounts_of_person(target)
     if any(perms.is_owner(a, cfg.owners) for a in accounts):
         await _finish(matcher, "不能屏蔽拥有者。")
-    st.blocked.update({a: until for a in accounts})
+    st.blocked.update(dict.fromkeys(accounts, until))
     await repo.block(int(gid), accounts, until=until)
     log.info("group %s: person %s blocked by owner (%d account(s)%s)",
              gid, target, len(accounts),
@@ -575,7 +579,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
                                   gid=str(gid)))
 
     if wanted := _strip_cmd(event.get_plaintext(), "who"):
-        await _finish(matcher, 
+        await _finish(matcher,
             f"要查「{wanted}」请用 /who @{wanted}，直接 @ 他。\n"
             "名字会重复、会改，@ 带的是账号，指到的一定是那个人。"
         )
@@ -617,7 +621,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
 
     if not text:
         if not card.note:
-            await _finish(matcher, 
+            await _finish(matcher,
                 f"{card.display} 目前没有备注。\n"
                 "用法：/note @某人 内容　写入；内容写 - 清除"
             )
@@ -694,17 +698,18 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
         try:
             n = await directory().set_confidence(gid, target, name, conf)
         except NameTaken as e:
-            await _finish(matcher, 
+            await _finish(matcher,
                 f"「{e.text}」在本群已经指向 {e.holder}，一个称呼只能指一个人。")
             return
-        state = "可以使用" if n.confidence >= 0.75 else "已保留记录，暂不使用"
-        await _finish(matcher, 
+        state = ("可以使用" if n.confidence >= CONFIRM_THRESHOLD
+                 else "已保留记录，暂不使用")
+        await _finish(matcher,
             f"已设置：{card.display} 的「{n.text}」置信度 {n.confidence:.2f}（{state}）。")
 
     try:
         await directory().name(gid, target, arg)
     except NameTaken as e:
-        await _finish(matcher, 
+        await _finish(matcher,
             f"「{e.text}」在本群已经指向 {e.holder}，一个称呼只能指一个人。\n"
             f"要改的话，先在他名下撤销：/alias @他 -{e.text}")
         return
@@ -741,7 +746,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     dropped = (await directory().forget(gid, at[0], int(digits)) if at
                else await directory().forget_group_fact(gid, int(digits)))
     if dropped is None:
-        await _finish(matcher, 
+        await _finish(matcher,
             f"没有编号 {digits} 这一条。用 /who @某人 或 /card 看当前的编号。")
     await _finish(matcher, f"已删除：{dropped.text}")
 
@@ -785,7 +790,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
         spread = await directory().blocks_after_merge(winner, shielded=shielded)
     for gid, until in spread:
         if (st := REGISTRY.loaded(str(gid))) is not None:
-            st.blocked.update({a: until for a in accounts})
+            st.blocked.update(dict.fromkeys(accounts, until))
     tail = f"两者在 {len(spread)} 个群的屏蔽状态已统一。" if spread else ""
     if not changed:
         await _finish(matcher, "这两个账号本来就属于同一个人。" + tail)

@@ -1,9 +1,8 @@
-"""The embedding capability.
+"""Bailian (DashScope) embedding backend.
 
-The choice was measured rather than assumed (design goal 2): DashScope's
-text-embedding-v4 at 2048 dimensions. Over the same set of Chinese probes, the separation
-between related and unrelated sentences was 0.345 at 1024 dimensions and 0.388 at 2048.
-The larger one wins.
+The choice was measured rather than assumed: text-embedding-v4 at 2048
+dimensions. Over the same set of Chinese probes, the separation between related and
+unrelated sentences was 0.345 at 1024 dimensions and 0.388 at 2048. The larger one wins.
 
 The cost is that pgvector's hnsw cannot index 2048 dimensions. That trade is deliberate:
 retrieval always filters by group first, which leaves a few hundred rows, and an exact
@@ -11,8 +10,8 @@ scan over those is both more accurate than an approximate one and fast enough th
 difference is not visible.
 
 The endpoint accepts at most BATCH inputs per request and answers anything larger with a
-400 whose text does not say so. Batching therefore happens in this layer, and no caller
-has to know it exists.
+400 whose text does not say so. Batching therefore happens here, and no caller has to
+know it exists.
 """
 
 from __future__ import annotations
@@ -23,8 +22,9 @@ from collections.abc import Sequence
 import httpx
 
 from ..core.budget import BUDGET
+from ..settings import EmbeddingCfg
 from ..util import read_api_key
-from .base import Capability, Kind, Rate
+from .base import EmbeddingModel, Kind, Rate, retire
 
 log = logging.getLogger("qqbot.embed")
 
@@ -33,77 +33,45 @@ log = logging.getLogger("qqbot.embed")
 BATCH = 10
 
 
-class EmbeddingModel(Capability):
-    """Text in, vectors out. An implementation is responsible for its own batching."""
-
-    async def embed(self, texts: Sequence[str], *, group_id: str | None = None
-                    ) -> list[list[float]]:
-        raise NotImplementedError
-
-    @property
-    def dimensions(self) -> int:
-        raise NotImplementedError
-
-
-def build(settings) -> EmbeddingModel:
-    """The embedding backend, from its own config block.
-
-    Its own block, never borrowed from another capability's: a capability that
-    can move platforms independently needs wiring that names it, or retargeting
-    the other capability silently drags embedding onto an endpoint that does not
-    serve it and every reply needing recall dies on a 404.
-    """
-    e = settings.llm.embedding
-    table = {"dashscope": DashScopeEmbedding}
-    try:
-        cls = table[e.backend]
-    except KeyError:
-        raise RuntimeError(
-            f"unknown embedding backend {e.backend!r}; available: "
-            + ", ".join(sorted(table))) from None
-    return cls(base_url=e.base_url, api_key_env=e.api_key_env,
-               model=e.model, dimensions=e.dimensions, timeout=e.timeout_sec)
-
-
 class DashScopeEmbedding(EmbeddingModel):
     name = "dashscope"
 
-    def __init__(self, *, base_url: str, api_key_env: str, model: str,
-                 dimensions: int = 2048, timeout: float = 60.0) -> None:
-        self._base = base_url.rstrip("/")
-        self._key_env = api_key_env
-        self._model = model
-        self._dims = dimensions
-        self._timeout = timeout
+    def __init__(self) -> None:
         self._http: httpx.AsyncClient | None = None
-
-    @property
-    def dimensions(self) -> int:
-        return self._dims
+        #: What the cached client was built for, so a /reload that moves the endpoint
+        #: or the timeout rebuilds it - the same rule the chat clients follow.
+        self._id: tuple = ()
 
     def rate_for(self, model: str) -> Rate:
         # Bailian price list: text-embedding-v4 is CNY 0.5 per million tokens, input
         # only.
-        return Rate("Mtoken", in_miss=0.5, source="bailian price list, rechecked 2026-08-27")
+        return Rate("Mtoken", in_miss=0.5,
+                    source="bailian price list, rechecked 2026-08-27")
 
-    def _client(self) -> httpx.AsyncClient:
-        if self._http is None:
-            self._http = httpx.AsyncClient(timeout=self._timeout)
+    def _client(self, cfg: EmbeddingCfg) -> httpx.AsyncClient:
+        ident = (cfg.base_url, cfg.timeout_sec)
+        if self._http is None or self._id != ident:
+            if self._http is not None:
+                retire(self._http.aclose())
+            self._http = httpx.AsyncClient(timeout=cfg.timeout_sec)
+            self._id = ident
         return self._http
 
-    async def embed(self, texts: Sequence[str], *, group_id: str | None = None
-                    ) -> list[list[float]]:
+    async def embed(self, texts: Sequence[str], *, cfg: EmbeddingCfg,
+                    group_id: str | None = None) -> list[list[float]]:
         out: list[list[float]] = []
-        key = read_api_key(self._key_env)
+        key = read_api_key(cfg.api_key_env)
         if not key:
             raise RuntimeError(
-                f"no embedding API key: {self._key_env} resolved to nothing")
+                f"no embedding API key: {cfg.api_key_env} resolved to nothing")
+        base = cfg.base_url.rstrip("/")
         for i in range(0, len(texts), BATCH):
             chunk = list(texts[i:i + BATCH])
-            r = await self._client().post(
-                f"{self._base}/embeddings",
+            r = await self._client(cfg).post(
+                f"{base}/embeddings",
                 headers={"Authorization": f"Bearer {key}"},
-                json={"model": self._model, "input": chunk, "dimensions": self._dims},
+                json={"model": cfg.model, "input": chunk,
+                      "dimensions": cfg.dimensions},
             )
             r.raise_for_status()
             body = r.json()
@@ -115,8 +83,8 @@ class DashScopeEmbedding(EmbeddingModel):
             tokens = int(usage.get("total_tokens") or usage.get("prompt_tokens")
                          or sum(len(t) for t in chunk))
             await BUDGET.record(
-                kind=Kind.EMBED, model=self._model,
-                cny=self.rate_for(self._model).tokens(0, tokens, 0),
+                kind=Kind.EMBED, model=cfg.model,
+                cny=self.rate_for(cfg.model).tokens(0, tokens, 0),
                 group_id=group_id, in_miss=tokens,
             )
             data = sorted(body["data"], key=lambda d: d.get("index", 0))
@@ -127,3 +95,4 @@ class DashScopeEmbedding(EmbeddingModel):
         if self._http is not None:
             await self._http.aclose()
             self._http = None
+            self._id = ()

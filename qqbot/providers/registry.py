@@ -14,9 +14,12 @@ from __future__ import annotations
 import logging
 
 from ..settings import Settings
-from .base import AsrModel, Providers, SearchEngine, TextModel, VisionModel
+from .base import (
+    AsrModel, EmbeddingModel, Providers, SearchEngine, TextModel, VisionModel,
+)
 from .dashscope import DashScopeAsr
 from .deepseek import DeepSeekChat, DeepSeekVision
+from .embedding import DashScopeEmbedding
 from .local import LocalChat
 from .openai_compat import OpenAICompatAsr, OpenAICompatChat, OpenAICompatVision
 from .sherpa import SherpaAsr
@@ -43,6 +46,14 @@ ASR_BACKENDS: dict[str, type[AsrModel]] = {
     "sherpa": SherpaAsr,
 }
 
+#: Its own block, never borrowed from another capability's: a capability that can move
+#: platforms independently needs wiring that names it. Sharing one silently drags
+#: embedding onto whatever endpoint the other capability moves to, and every reply
+#: needing recall dies there on a 404.
+EMBEDDING_BACKENDS: dict[str, type[EmbeddingModel]] = {
+    "dashscope": DashScopeEmbedding,
+}
+
 SEARCH_BACKENDS: dict[str, type[SearchEngine]] = {
     "tavily": TavilySearch,
 }
@@ -64,6 +75,7 @@ def build(settings: Settings) -> Providers:
         text=_pick(TEXT_BACKENDS, llm.text.backend, "text"),
         vision=_pick(VISION_BACKENDS, llm.vision.backend, "vision"),
         asr=_pick(ASR_BACKENDS, llm.asr.backend, "asr"),
+        embedding=_pick(EMBEDDING_BACKENDS, llm.embedding.backend, "embedding"),
         search=_pick(SEARCH_BACKENDS, llm.search.backend, "search"),
     )
     log.info("providers: %s", bundle.describe())

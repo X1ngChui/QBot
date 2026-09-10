@@ -191,9 +191,10 @@ async def image_cache_put(key: str, description: str, *, refused: bool = False) 
 
 
 async def image_cache_file(key: str) -> str | None:
-    """Where the vision backend filed this picture, if it was ever uploaded. A hint:
-    the backend expires files, and a dead id can fail the request it rides in - which
-    is why the prompt only ever attaches ids from recent messages."""
+    """Where this picture was filed with the model that reads it, if it was ever
+    uploaded. A hint, not a guarantee: the backend expires files, and a dead id can
+    fail the request it rides in - which is why the prompt only ever attaches ids
+    from recent messages."""
     return await pool().fetchval(
         "SELECT file_id FROM image_cache WHERE key=$1", key)
 

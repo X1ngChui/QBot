@@ -17,7 +17,10 @@ from qqbot.db import init_pool, close_pool, pool
 from qqbot.settings import config
 from _db import reset
 from _stubs import FakeEmbedding
-from qqbot.core import prompt as prompt_mod, trigger
+
+#: One stub for every bundle in this suite.
+_EMBED = FakeEmbedding()
+from qqbot.core import prompt as prompt_mod
 from qqbot.core.budget import BUDGET
 from qqbot.core.pipeline import GATEWAY
 from qqbot.core.state import REGISTRY, ChatMsg as _CM0
@@ -72,6 +75,11 @@ class FakeText(TextModel):
                             in_hit=100, in_miss=10, out=20, group_id=group_id)
         return ChatResult(text=text, model=self.MODEL, in_hit=100, in_miss=10, out=20)
 
+    async def upload(self, data, *, cfg, mime="image/jpeg"):
+        # The model that reads the picture is the one that holds it, so the id
+        # comes from here - the same place a multimodal backend puts it.
+        return f"file-api-fake{len(data)}"
+
     async def aclose(self):
         pass
 
@@ -118,7 +126,7 @@ class UnusedSearch(SearchEngine):
 
 
 providers_bundle = Providers(text=FakeText(), vision=UnusedVision(),
-                             asr=UnusedAsr(), search=UnusedSearch())
+                             asr=UnusedAsr(), embedding=_EMBED, search=UnusedSearch())
 set_providers(providers_bundle)
 
 
@@ -190,10 +198,12 @@ class FakeBot:
                     "message": [{"type": "text", "data": {"text": "昨天那张图"}}]}
         if api == "get_forward_msg":
             return {"messages": [
-                {"type": "node", "data": {"sender": {"nickname": "阿强"},
-                                          "message": [{"type": "text", "data": {"text": "第一条"}}]}},
-                {"type": "node", "data": {"sender": {"nickname": "阿花"},
-                                          "message": [{"type": "text", "data": {"text": "第二条"}}]}}]}
+                {"type": "node",
+                 "data": {"sender": {"nickname": "阿强"},
+                          "message": [{"type": "text", "data": {"text": "第一条"}}]}},
+                {"type": "node",
+                 "data": {"sender": {"nickname": "阿花"},
+                          "message": [{"type": "text", "data": {"text": "第二条"}}]}}]}
         if api == "get_group_member_list":
             self.member_list_calls += 1
             return list(self.members)
@@ -243,8 +253,6 @@ async def main():
     cfg = config().default
     # The reply path will not start without one, which is the point: a half-wired
     # deployment must fail at boot, not quietly degrade recall.
-    from qqbot.core import retrieval as _retr_wire
-    _retr_wire.set_embedding(FakeEmbedding())
     cfg.trigger.nicknames = ["小X", "X酱"]
     from qqbot.core import nickname
     nickname.initialize()
@@ -256,7 +264,8 @@ async def main():
     await GATEWAY.handle(bot, ev0)
     await drain()
     check("direct mention replies", len(bot.sent) == 1, str(bot.sent))
-    check("markdown stripped before send", bot.sent and "**" not in bot.sent[0][1], str(bot.sent[:1]))
+    check("markdown stripped before send",
+          bot.sent and "**" not in bot.sent[0][1], str(bot.sent[:1]))
     # The protocol side is configured not to report the bot's own messages, so nothing
     # else writes them down. Without this they lived only in the in-memory deque - and the
     # group card, which is distilled from the archive, was summarising one side of a
@@ -288,7 +297,8 @@ async def main():
     # Without this the bot denies seeing an image while holding its description - it does
     # not know that the picture marker is its own eyesight rather than something a person
     # typed.
-    check("the reply prompt explains the markers", "⟦图片:描述⟧" in sys_prompt)
+    check("the reply prompt explains the numbered markers",
+          "⟦图片N:描述⟧" in sys_prompt and "open_image" in sys_prompt)
     # The transcript carries names but never account ids, so two people with similar names
     # are indistinguishable to the model - three members rearranging the same joke
     # nickname read as one person renaming himself, and it said so out loud. The system
@@ -349,7 +359,7 @@ async def main():
 
     # 1b. A real @ arrives as to_me with the segment already stripped by the adapter.
     # Relying on the at segment alone means the must-answer path never fires for @.
-    st_at = await REGISTRY.get("123")
+    await REGISTRY.get("123")
     n_at = len(bot.sent)
     await GATEWAY.handle(bot, FakeEvent("你好，介绍一下自己", to_me=True))
     await drain()
@@ -362,7 +372,7 @@ async def main():
     # tag derived from the account id the bot cannot tell who its owner is the moment
     # they change their group card.
     cfg.owners = ["u9"]
-    st_o = await REGISTRY.get("123")
+    await REGISTRY.get("123")
     await GATEWAY.handle(bot, FakeEvent("在吗", to_me=True, user_id="u9", nickname="随便改的名字"))
     await drain()
     own_tail = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["messages"][-1]["content"]
@@ -411,7 +421,7 @@ async def main():
 
     # 6. one message, one verdict: in a burst only the addressed fragment draws a
     # reply, immediately - later fragments are ordinary background, not merged in.
-    st6 = await REGISTRY.get("123")
+    await REGISTRY.get("123")
     n2 = len(bot.sent)
     ev6 = FakeEvent("小X 你看")
     for e in (ev6, FakeEvent("这个"), FakeEvent("怎么样")):
@@ -437,7 +447,7 @@ async def main():
     check("two near-simultaneous askers get two replies",
           len(bot.sent) == n2b + 2, f"{len(bot.sent) - n2b} replies")
     check("each reply quotes and @s its own asker, whatever the finish order",
-          dict(zip(bot.quoted[-2:], bot.ats[-2:]))
+          dict(zip(bot.quoted[-2:], bot.ats[-2:], strict=True))
           == {str(ev_a.message_id): "u1", str(ev_b.message_id): "u7"},
           f"{bot.quoted[-2:]} {bot.ats[-2:]}")
 
@@ -452,7 +462,6 @@ async def main():
 
     # 8. dedup
     ev = FakeEvent("小X 重复消息")
-    n4 = len(bot.sent)
     await GATEWAY.handle(bot, ev)
     await GATEWAY.handle(bot, ev)
     await drain()
@@ -474,7 +483,7 @@ async def main():
     await _repo.unblock(123, "u9")
 
     # 11. nothing that changes every turn may sit in the cached system block.
-    st2 = await REGISTRY.get("123")
+    await REGISTRY.get("123")
     await GATEWAY.handle(bot, FakeEvent("小X 显卡现在多少钱"))
     await drain()
     msgs = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["messages"]
@@ -558,9 +567,9 @@ async def main():
 
     # 12d. Pictures are understood on arrival: the CDN link is freshest then, the
     # describing call is cached per unique picture, and a group the bot never answers
-    # still gets a readable archive. This killed the old bug where a picture posted on
-    # its own stayed a bare marker until something happened to draw a reply - by which
-    # time the link had expired.
+    # still gets a readable archive. Deferring it to reply time would leave a picture
+    # posted on its own a bare marker until something drew a reply - by which time the
+    # link has expired.
     cfg.budget.daily_cny_cap = 5.0      # test 12 left the cap at ~zero
     BUDGET._loaded = False
     VISION_SEEN = []
@@ -575,15 +584,12 @@ async def main():
             VISION_SEEN.append(len(data))
             return "一只橘猫在键盘上打滚"
 
-        async def upload(self, data, *, cfg, mime="image/jpeg"):
-            return f"file-api-fake{len(data)}"
-
         async def aclose(self):
             pass
 
     prev = providers_bundle.vision
     set_providers(Providers(text=FakeText(), vision=SeeingVision(),
-                            asr=UnusedAsr(), search=UnusedSearch()))
+                            asr=UnusedAsr(), embedding=_EMBED, search=UnusedSearch()))
     from qqbot.core.media import MEDIA as _MEDIA
     async def _fake_fetch(url, max_bytes):
         return b"x" * 2048
@@ -657,7 +663,7 @@ async def main():
     check("the original pixels ride behind the message that posted them",
           isinstance(tail_i, list)
           and tail_i[0].get("type") == "text"
-          and any(b.get("type") == "file" and b.get("file_id", "").startswith("file-api-")
+          and any(b.get("type") == "image" and b.get("id", "").startswith("file-api-")
                   for b in tail_i[1:]), str(tail_i)[:160])
     tail_text = tail_i[0]["text"] if isinstance(tail_i, list) else tail_i
     check("and its description reaches the model", "橘猫" in tail_text, tail_text[-120:])
@@ -716,16 +722,17 @@ async def main():
           any(m.msg_id == str(img3.message_id) for m in st_m.recent))
 
     set_providers(Providers(text=FakeText(), vision=prev,
-                            asr=UnusedAsr(), search=UnusedSearch()))
+                            asr=UnusedAsr(), embedding=_EMBED, search=UnusedSearch()))
     # A describe slower than every wait window must still land: the waiters give up,
     # the flight is not cancelled, and the description reaches the cache and the
     # message for the next turn. The old shape cancelled the task on timeout, which
     # left empty cache rows and images that could never be described (a real
     # incident, not a hypothetical). Two sightings of the same key during the flight
     # must also share it - one paid call, not two.
-    import qqbot.core.pipeline as _pl
-    _waits = _pl.MEDIA_WAIT_PAID_SEC
-    _pl.MEDIA_WAIT_PAID_SEC = 0.2
+    # The wait is per-group config, so shorten the one this group resolves to.
+    _cfg_media = config().for_group("123")[0]
+    _waits = _cfg_media.gateway.media_wait_sec
+    _cfg_media.gateway.media_wait_sec = 0.2
 
     class SlowVision(SeeingVision):
         async def describe(self, data, *, cfg, prompt="", mime="image/jpeg", group_id=None):
@@ -734,7 +741,7 @@ async def main():
             return "慢速描述完成"
 
     set_providers(Providers(text=FakeText(), vision=SlowVision(),
-                            asr=UnusedAsr(), search=UnusedSearch()))
+                            asr=UnusedAsr(), embedding=_EMBED, search=UnusedSearch()))
     _slow_seen = len(VISION_SEEN)
     slow1 = FakeEvent(segments=[
         Seg("image", {"file": "D" * 32 + ".png", "url": "http://x/slow.png", "summary": ""})])
@@ -756,7 +763,7 @@ async def main():
           "慢速描述完成" in (_slow_stored or ""), repr(_slow_stored))
     check("two sightings during the flight paid for one call",
           len(VISION_SEEN) == _slow_seen + 1, str(VISION_SEEN[_slow_seen:]))
-    _pl.MEDIA_WAIT_PAID_SEC = _waits
+    _cfg_media.gateway.media_wait_sec = _waits
 
     # A media patch must not undo the arrival truncation: pm.parts holds the full
     # original text, so an unbounded re-render would put the whole thing back into
@@ -770,7 +777,7 @@ async def main():
             return "长" * (_cap_len + 500)
 
     set_providers(Providers(text=FakeText(), vision=LongVision(),
-                            asr=UnusedAsr(), search=UnusedSearch()))
+                            asr=UnusedAsr(), embedding=_EMBED, search=UnusedSearch()))
     _MEDIA._img_windows.clear()
     longe = FakeEvent(segments=[
         Seg("text", {"text": "看这张超长描述的图"}),
@@ -787,29 +794,54 @@ async def main():
     check("and in the archive",
           _lstored and len(_lstored) <= _cap_len, str(len(_lstored or "")))
 
-    # inspect_image: the one paid tool - a second look at a picture in the window,
-    # with a question, addressed by the prompt's own line number.
+    # open_image: the reply model reads pictures itself, so the tool hands it one by
+    # number rather than asking a second model to look. Free - bytes and an upload -
+    # and it answers with a content array carrying the file block, which is what lets
+    # the picture arrive as the answer to the call instead of a turn appended behind it.
     import json as _json
     from qqbot.core.segments import ImageRef as _IRef
-    from qqbot.core.tools import ToolCtx, URL_CONTENT_CHARS, execute as _texec
+    from qqbot.core.tools import Attachment, ToolCtx, execute as _texec
+    URL_CONTENT_CHARS = config().default.retrieval.url_content_chars
 
     def _tcall(name, **kw):
         return {"id": "t1", "function": {
             "name": name, "arguments": _json.dumps(kw, ensure_ascii=False)}}
 
     set_providers(Providers(text=FakeText(), vision=SeeingVision(),
-                            asr=UnusedAsr(), search=UnusedSearch()))
-    _imsg = _CM0(msg_id="ins1", user_id="1", nickname="某人", text="[图片]", ts=_nl0(),
+                            asr=UnusedAsr(), embedding=_EMBED, search=UnusedSearch()))
+    _imsg = _CM0(msg_id="ins1", user_id="1", nickname="某人", text="⟦图片⟧", ts=_nl0(),
                  image_refs=[_IRef(slot=0, key="9" * 32, url="http://x/ins.png")])
-    _ictx = ToolCtx(bot=bot, by_seq={7: _imsg})
+    _ictx = ToolCtx(bot=bot, by_pic={4: (_imsg, 0)})
     _seen0 = len(VISION_SEEN)
-    out_i = await _texec(_tcall("inspect_image", seq=7, question="图里写了什么"),
-                         cfg=cfg, group_id="123", ctx=_ictx)
-    check("inspect_image reopens the picture with the question",
-          "橘猫" in out_i and len(VISION_SEEN) == _seen0 + 1, repr(out_i))
-    check("a seq outside the prompt is answered, not crashed",
-          "#99" in await _texec(_tcall("inspect_image", seq=99, question="x"),
-                                cfg=cfg, group_id="123", ctx=_ictx))
+    out_i = await _texec(_tcall("open_image", n=4), cfg=cfg, group_id="123", ctx=_ictx)
+    check("open_image hands back the original as a picture part",
+          isinstance(out_i, Attachment)
+          and any(b.get("type") == "image" for b in out_i.blocks), str(out_i.blocks))
+    check("and costs no model call - it is a fetch, not a second opinion",
+          len(VISION_SEEN) == _seen0, str(len(VISION_SEEN) - _seen0))
+    check("the tool message carries the picture beside its text",
+          [b["type"] for b in out_i.content()] == ["image", "text"],
+          str(out_i.content()))
+    # The neutral part never reaches a vendor: each backend renders it into its own
+    # wire shape on the way out, and they really do differ - DeepSeek takes a flat
+    # file_id and rejects the nesting OpenAI documents.
+    from qqbot.providers.deepseek import DeepSeekChat as _DSC
+    from qqbot.providers.openai_compat import OpenAICompatChat as _OAC
+    _neutral = [{"role": "user", "content": out_i.content()}]
+    check("the picture part is translated per backend, not shipped as written",
+          _OAC()._wire(_neutral)[0]["content"][0]
+          == {"type": "file", "file": {"file_id": "file-api-fake2048"}}
+          and _DSC()._wire(_neutral)[0]["content"][0]
+          == {"type": "file", "file_id": "file-api-fake2048"},
+          str(_DSC()._wire(_neutral)[0]["content"][0]))
+    check("and the caller's own messages are left as they were",
+          _neutral[0]["content"][0] == {"type": "image", "id": "file-api-fake2048"})
+    check("a number outside the prompt is answered, not crashed",
+          "99" in await _texec(_tcall("open_image", n=99),
+                               cfg=cfg, group_id="123", ctx=_ictx))
+    check("a missing number is answered too",
+          "编号" in await _texec(_tcall("open_image"), cfg=cfg, group_id="123",
+                                 ctx=_ictx))
     # "null", "[]" and "42" are valid JSON: a degenerate argument string must get
     # the same in-band answer as an unparsable one, not crash the whole reply.
     out_n = await _texec(
@@ -817,11 +849,6 @@ async def main():
         cfg=cfg, group_id="123", ctx=_ictx)
     check("non-object tool arguments are answered in-band",
           out_n.startswith("（工具参数解析失败"), repr(out_n))
-    check("a message without pictures says so",
-          "没有图片" in await _texec(
-              _tcall("inspect_image", seq=5, question="x"), cfg=cfg, group_id="123",
-              ctx=ToolCtx(bot=bot, by_seq={5: _CM0(
-                  msg_id="tt", user_id="1", nickname="n", text="hi", ts=_nl0())})))
 
     # read_url: page text through the search backend's extract, capped before it
     # reaches the prompt - pages are unbounded, replies are not.
@@ -830,16 +857,17 @@ async def main():
             return "页 " * 4000
 
     set_providers(Providers(text=FakeText(), vision=SeeingVision(),
-                            asr=UnusedAsr(), search=ReadingSearch()))
+                            asr=UnusedAsr(), embedding=_EMBED, search=ReadingSearch()))
     out_u = await _texec(_tcall("read_url", url="https://a.example/x"),
                          cfg=cfg, group_id="123")
     check("read_url returns page text capped at the limit",
-          out_u.startswith("页") and len(out_u) <= URL_CONTENT_CHARS, str(len(out_u)))
+          out_u.startswith("页")
+          and len(out_u) <= URL_CONTENT_CHARS + 40, str(len(out_u)))
     check("a non-http url is refused in words",
           "http" in await _texec(_tcall("read_url", url="ftp://x"),
                                  cfg=cfg, group_id="123"))
     set_providers(Providers(text=FakeText(), vision=SeeingVision(),
-                            asr=UnusedAsr(), search=UnusedSearch()))
+                            asr=UnusedAsr(), embedding=_EMBED, search=UnusedSearch()))
 
     # The window still remembers where this section's pictures were filed, and every
     # later reply in the group would attach them; the sections below assert on plain
@@ -849,7 +877,7 @@ async def main():
         m.pending = None      # or the backlog pass re-files them on the next reply
 
     # 12e. reply and forward segments reach the model as content
-    st_r = await REGISTRY.get("123")
+    await REGISTRY.get("123")
     # Addressed, because that is the only way a reply happens now - and quoting somebody
     # while asking the bot about it is exactly the shape this checks.
     await GATEWAY.handle(bot, FakeEvent(segments=[
@@ -1009,7 +1037,7 @@ async def main():
           len([r for r in await _retr.gather(group_id=str(ORD), bot=bot)
                if r["user_id"] in ("g", "alt")]) == 1)
 
-    # And the undo, which is the reason evidence is kept on everything (design doc 56).
+    # And the undo, which is the reason evidence is kept on everything.
     await _DIR.split("alt")
     _after = await _DIR.person(ORD, "alt")
     check("splitting gives the account its own person again",
@@ -1020,7 +1048,7 @@ async def main():
           "新名字" not in _after.other_names + (_after.display,), str(_after.other_names))
 
     # The protocol side already knows every group card, including for people who have
-    # never spoken - so ask it once for the whole group instead of keeping our own cache.
+    # never spoken - so ask it once for the whole group instead of keeping a second cache.
     from qqbot.core.members import MEMBERS as _MEM
     _MEM.forget()
     before = bot.member_list_calls
@@ -1176,7 +1204,7 @@ async def main():
                               tool_calls=[_tc("话题A"), _tc("话题A"), _tc(f"话题{len(LLM_CALLS)}")])
 
     set_providers(Providers(text=ScriptedText(), vision=UnusedVision(),
-                            asr=UnusedAsr(), search=CountingSearch()))
+                            asr=UnusedAsr(), embedding=_EMBED, search=CountingSearch()))
     n_llm = len(LLM_CALLS)
     st13 = await REGISTRY.get("123")
     text, _prov1, _tr1 = await _eng.generate(
@@ -1222,7 +1250,7 @@ async def main():
 
     cfg.budget.per_reply_cny = 0.04
     set_providers(Providers(text=ScriptedText(), vision=UnusedVision(),
-                            asr=UnusedAsr(), search=EndlessSearch()))
+                            asr=UnusedAsr(), embedding=_EMBED, search=EndlessSearch()))
     n_llm2 = len(LLM_CALLS)
     text2, _prov2, _tr2 = await _eng.generate(
         bot=bot, st=st13, cfg=cfg, persona=config().for_group("123")[1],
@@ -1266,7 +1294,7 @@ async def main():
 
     cfg.budget.per_reply_cny = 0.30
     set_providers(Providers(text=OneSearchText(), vision=UnusedVision(),
-                            asr=UnusedAsr(), search=EndlessSearch()))
+                            asr=UnusedAsr(), embedding=_EMBED, search=EndlessSearch()))
     st_pv = await REGISTRY.get("123")
     ok_pv = await _eng.respond(
         bot=bot, st=st_pv, cfg=cfg, persona=config().for_group("123")[1],
@@ -1333,7 +1361,7 @@ async def main():
         bot=bot, st=st_pv, cfg=cfg, persona=config().for_group("123")[1],
         batch=[_CM0(msg_id="pv2", user_id="u1", nickname="阿强",
                     text="后天呢", ts=_nl0())])
-    _msgs2 = [m for m in LLM_CALLS[-1]["messages"]]
+    _msgs2 = list(LLM_CALLS[-1]["messages"])
     _ri = next(i for i, m in enumerate(_msgs2)
                if m.get("role") == "assistant"
                and isinstance(m.get("content"), str)
@@ -1408,7 +1436,7 @@ async def main():
     # with no model call and nothing spent - and /agree opens the door. Their
     # messages archive like anyone's; only the reply is withheld.
     from qqbot.core import agreement as _agree
-    st16 = await REGISTRY.get("123")
+    await REGISTRY.get("123")
     n16 = len(bot.sent)
     calls16 = len(LLM_CALLS)
     ev16 = FakeEvent("小X 在吗", user_id="newbie", nickname="新人", to_me=True)

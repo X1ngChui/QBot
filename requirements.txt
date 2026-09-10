@@ -1,5 +1,5 @@
-# Pinned to the exact versions production runs (captured from the live container,
-# 2026-09-04). A rebuild must not change behavior by itself: ranges let any
+# Pinned to the exact versions production runs. 
+# A rebuild must not change behavior by itself: ranges let any
 # cache-busting build resolve a fresh minor release between two deploys that
 # "changed nothing". Bump these on purpose, one at a time, and redeploy.
 nonebot2[fastapi]==2.5.0
@@ -16,8 +16,7 @@ asyncpg==0.31.0
 pydantic==2.13.5
 PyYAML==6.0.3
 jieba==0.42.1
-# Lucene-syntax parser behind search_history's boolean queries (the owner's
-# call: lean on the ecosystem rather than hand-roll a grammar). Only the
+# Lucene-syntax parser behind search_history's boolean queries. Only the
 # operator subset is accepted; core/tools.py rejects fields, ranges and the
 # rest at the AST.
 luqum==1.0.0
