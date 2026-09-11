@@ -120,7 +120,8 @@ def tool_defs() -> list[dict]:
                             "type": "array",
                             "items": {"type": "integer"},
                             "description": "要查看的图片编号列表，取自转写里 ⟦图片N:…⟧、"
-                                           "⟦表情N:…⟧ 或 ⟦图片N⟧ 的 N；一次最多 6 张",
+                                           "⟦表情N:…⟧ 或 ⟦图片N⟧ 的 N；一次最多 "
+                                           f"{config().default.retrieval.open_image_max} 张",
                         },
                     },
                     "required": ["ns"],
@@ -432,11 +433,6 @@ class Attachment(str):
         return [*self.parts, {"type": "text", "text": str(self)}]
 
 
-#: How many pictures one open_image call may fetch. Each is a file block in the
-#: next request, and a model asking for the whole window's pictures at once is
-#: better answered with a first batch than with a request that fails on size.
-OPEN_IMAGE_MAX = 6
-
 
 def verified(out: str) -> bool:
     """Whether a tool answer represents work that actually obtained something.
@@ -473,7 +469,7 @@ async def execute(call: dict, *, cfg: Settings, group_id: str,
         if (not isinstance(ns, list) or not ns
                 or not all(isinstance(x, int) and not isinstance(x, bool) for x in ns)):
             return Failure("（需要图片编号列表。）")
-        wanted = list(dict.fromkeys(ns))[:OPEN_IMAGE_MAX]
+        wanted = list(dict.fromkeys(ns))[:cfg.retrieval.open_image_max]
         parts: list[dict] = []
         shown: list[int] = []
         unknown: list[int] = []

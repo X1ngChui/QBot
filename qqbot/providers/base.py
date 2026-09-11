@@ -27,7 +27,7 @@ from enum import StrEnum
 
 import httpx
 
-from ..settings import AsrCfg, EmbeddingCfg, SearchCfg, TextCfg, VisionCfg
+from ..settings import AsrCfg, EmbeddingCfg, SearchCfg, TextCfg, VisionCfg, config
 from ..util import why
 
 log = logging.getLogger("qqbot.providers")
@@ -81,14 +81,6 @@ def retire(closing: Coroutine) -> None:
 
 # -- retrying ---------------------------------------------------------------
 
-#: The longest a Retry-After header may hold a call. A vendor asking for minutes is
-#: asking the wrong client: a reply somebody is waiting for fails and is retried by
-#: the person, and a background batch is rescheduled by its queue.
-RETRY_AFTER_CAP = 30.0
-
-#: Retries for the plain-HTTP backends, which carry no `retries` setting of their own.
-#: Same count the text config defaults to.
-HTTP_RETRIES = 2
 
 
 def retry_after_seconds(headers: Mapping[str, str]) -> float | None:
@@ -112,7 +104,7 @@ def retry_after_seconds(headers: Mapping[str, str]) -> float | None:
 
 
 def backoff_delay(attempt: int, *, retry_after: float | None = None,
-                  cap: float = RETRY_AFTER_CAP) -> float:
+                  cap: float | None = None) -> float:
     """How long to sleep before retry number `attempt` (1-based).
 
     The base schedule is short and doubling (0.5 s, 1 s, 2 s ...): a connection
@@ -124,7 +116,7 @@ def backoff_delay(attempt: int, *, retry_after: float | None = None,
     delay = 0.5 * 2 ** (attempt - 1)
     if retry_after is not None:
         delay = max(delay, retry_after)
-    delay = min(delay, cap)
+    delay = min(delay, cap if cap is not None else config().default.llm.retry_after_cap_sec)
     return delay + random.uniform(0.0, 0.25 * delay)
 
 
@@ -142,7 +134,7 @@ def _http_retryable(e: Exception) -> bool:
 
 async def with_retry[T](
     fn: Callable[[], Awaitable[T]], *, what: str,
-    retries: int = HTTP_RETRIES, retry_after_cap: float = RETRY_AFTER_CAP,
+    retries: int | None = None, retry_after_cap: float | None = None,
 ) -> T:
     """Run `fn` again on a transport error, a 429 or a 5xx, up to `retries` times.
 
@@ -151,6 +143,8 @@ async def with_retry[T](
     call. `fn` must raise httpx.HTTPStatusError itself (raise_for_status) for the
     status rule to see it. Anything else propagates on the first attempt.
     """
+    if retries is None:
+        retries = config().default.llm.http_retries
     attempt = 0
     while True:
         try:

@@ -121,7 +121,8 @@ class Gateway:
         # The loose tasks are not cancelled - they are writes that should land -
         # only waited for, briefly: a hung one must not hold the whole shutdown.
         if self._loose:
-            await asyncio.wait(self._loose, timeout=5)
+            await asyncio.wait(self._loose,
+                               timeout=config().default.gateway.shutdown_wait_sec)
         self._replies.clear()
 
     # -- producer ---------------------------------------------------------

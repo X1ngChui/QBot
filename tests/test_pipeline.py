@@ -1309,7 +1309,7 @@ async def main():
           _pvfn([("web_search", {"query": "明天 天气"}, "1. T C")]))
     check("no tools means no marker", _pvfn([]) == "")
     from qqbot.core.engine import _trace as _trfn
-    check("no tools means no trace either", _trfn([]) == "")
+    check("no tools means no trace either", _trfn([], cfg) == "")
 
     class OneSearchText(FakeText):
         _asked = False

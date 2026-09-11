@@ -47,6 +47,16 @@ gateway:
   media_wait_sec: 25
   # How long the group's member list is reused before being fetched again.
   member_cache_ttl_sec: 1800
+  # Deadline for the protocol side's media calls (get_image, get_record,
+  # get_forward_msg), under its own half-minute default: a file the platform can
+  # no longer serve does not fail there, it hangs.
+  protocol_call_timeout_sec: 10
+  # Deadline for downloading a picture or a clip from a link.
+  media_http_timeout_sec: 20
+  # How long a picture no route could read is left alone before another attempt.
+  unreadable_retry_sec: 600
+  # How long shutdown waits for in-flight archive writes and media patches.
+  shutdown_wait_sec: 5
   # There is no group allowlist: the account is a dedicated bot account, and a group is
   # served from its first message.
 
@@ -67,6 +77,11 @@ gateway:
 # new name here. A backend that runs in-process (the ASR default) names no
 # credential at all.
 llm:
+  # Retries for the plain-HTTP backends (embedding, search, file upload); the chat
+  # backends use text.retries. And the longest a vendor's Retry-After may hold any
+  # call - a vendor asking for minutes is asking the wrong client.
+  http_retries: 2
+  retry_after_cap_sec: 30
   text:
     backend: deepseek
     base_url: https://api.deepseek.com
@@ -210,6 +225,10 @@ prompt:
   forward_lines: 20
   forward_depth: 3
   forward_chars: 1500
+  # How much of the trajectory entry kept beside each of the bot's own replies
+  # survives: characters of each tool result, and of the whole entry.
+  trace_result_chars: 1200
+  trace_total_chars: 4000
 
 retrieval:
   # Lines of surrounding conversation around each search_history hit, each way.
@@ -229,6 +248,10 @@ retrieval:
   # its own - past the model's context the request fails outright - and a cut page
   # is told it was cut.
   url_content_chars: 8000
+  # How many tool calls one round of the reply loop may carry - each result is
+  # appended to the prompt - and how many pictures one open_image call may fetch.
+  max_tool_calls_per_round: 8
+  open_image_max: 6
 
 # How much the memory pipeline reads, and how fast it lets go. The model that runs
 # extraction is not here - it belongs to the capability doing the work

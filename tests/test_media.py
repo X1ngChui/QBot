@@ -252,9 +252,8 @@ async def main():
     # A picture the platform can no longer serve does not fail get_image, it hangs;
     # the fetch has its own short deadline, and the picture is then remembered as
     # unreadable so the next reply looking at it does not wait it out again.
-    from qqbot.core import media as _media_mod
-    _saved_to = _media_mod._GET_IMAGE_TIMEOUT_SEC
-    _media_mod._GET_IMAGE_TIMEOUT_SEC = 0.2
+    _gw = config().default.gateway
+    _saved_to, _gw.protocol_call_timeout_sec = _gw.protocol_call_timeout_sec, 0.2
 
     class HangingBot:
         self_id = "999"
@@ -279,7 +278,7 @@ async def main():
           str(HangingBot.calls))
     MEDIA._unreadable.clear()
     MEDIA._fetch = _fetch3
-    _media_mod._GET_IMAGE_TIMEOUT_SEC = _saved_to
+    _gw.protocol_call_timeout_sec = _saved_to
 
     # Voice never takes the shortcut pictures take. The stored file (and the CDN
     # original) is SILK v3 wearing an .amr suffix, and SILK sent raw draws a

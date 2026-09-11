@@ -49,6 +49,7 @@ import httpx
 
 from ..db import repo
 from ..providers import providers
+from ..providers.base import retire
 from ..providers.openai_compat import NEVER_BILLED
 from ..services import UnknownAccount
 from ..settings import Settings, VisionCfg, config, ptext
@@ -79,15 +80,6 @@ NAPCAT_DATA_DIR = os.getenv("NAPCAT_DATA_DIR", "/app/napcat_data")
 #: but that never reaches the ASR backend - see transcribe.
 _WAV_BYTES_PER_SEC = 32000
 
-
-#: How long get_image may take before the fetch is given up. The protocol side's
-#: own deadline is half a minute, and a picture the platform can no longer serve
-#: spends all of it.
-_GET_IMAGE_TIMEOUT_SEC = 10.0
-
-#: How long a picture found unreadable by every route stays that way before
-#: another attempt is made.
-_UNREADABLE_TTL_SEC = 600
 
 #: The marketplace-sticker CDN: a directory link per sticker.
 _STICKER_CDN = re.compile(r"^https?://gxh\.vip\.qq\.com/club/item/parcel/item/")
@@ -145,6 +137,7 @@ def _ttl(vcfg: VisionCfg) -> timedelta | None:
 class MediaProcessor:
     def __init__(self) -> None:
         self._http: httpx.AsyncClient | None = None
+        self._http_timeout: float | None = None
         self._img_windows: dict[str, SlidingWindow] = {}
         self._asr_windows: dict[str, SlidingWindow] = {}
         #: Describe calls in the air, by image key - the single-flight registry.
@@ -158,9 +151,26 @@ class MediaProcessor:
         self._unreadable: dict[str, float] = {}
 
     def _client(self) -> httpx.AsyncClient:
-        if self._http is None:
-            self._http = httpx.AsyncClient(timeout=20.0, follow_redirects=True)
+        # Rebuilt when the deadline changes, so a /reload applies without a restart.
+        timeout = config().default.gateway.media_http_timeout_sec
+        if self._http is None or self._http_timeout != timeout:
+            if self._http is not None:
+                retire(self._http.aclose())
+            self._http = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
+            self._http_timeout = timeout
         return self._http
+
+    @staticmethod
+    async def _call(bot: BotApi, api: str, **params):
+        """One protocol-side media call under gateway.protocol_call_timeout_sec.
+
+        The protocol side's own deadline is half a minute, and a file the platform
+        can no longer serve does not fail there, it hangs - a reply would stand
+        still for the whole of it.
+        """
+        return await asyncio.wait_for(
+            bot.call_api(api, **params),
+            timeout=config().default.gateway.protocol_call_timeout_sec)
 
     async def close(self) -> None:
         if self._http is not None:
@@ -253,8 +263,9 @@ class MediaProcessor:
         looked at the same picture would otherwise wait it out anew.
         """
         key = ref.key or ref.file or ref.url or ""
+        hold = config().default.gateway.unreadable_retry_sec
         failed_at = self._unreadable.get(key) if key else None
-        if failed_at is not None and time.monotonic() - failed_at < _UNREADABLE_TTL_SEC:
+        if failed_at is not None and time.monotonic() - failed_at < hold:
             log.debug("picture %s recently unreadable, not retried", key[:40])
             return None
         data = None
@@ -264,11 +275,7 @@ class MediaProcessor:
                 break
         if data is None and ref.file:
             try:
-                # Its own deadline, well under the protocol side's: a fetch the
-                # platform cannot complete times out there, and half a minute per
-                # attempt is what a reply would otherwise stand still for.
-                info = await asyncio.wait_for(bot.call_api("get_image", file=ref.file),
-                                              timeout=_GET_IMAGE_TIMEOUT_SEC)
+                info = await self._call(bot, "get_image", file=ref.file)
                 data = self._local(info.get("file"), max_bytes)
                 if data is None and info.get("url"):
                     data = await self._fetch(info["url"], max_bytes)
@@ -278,8 +285,7 @@ class MediaProcessor:
             if key:
                 self._unreadable[key] = time.monotonic()
             log.warning("picture unreadable by every route (link=%s file=%s), "
-                        "not retried for %ds", bool(ref.url), bool(ref.file),
-                        _UNREADABLE_TTL_SEC)
+                        "not retried for %ds", bool(ref.url), bool(ref.file), hold)
         return data
 
     @staticmethod
@@ -488,7 +494,7 @@ class MediaProcessor:
         # transcodes to 16 kHz mono WAV, and the cap is computed for WAV (~20x denser).
         wav_cap = _byte_cap(acfg.max_audio_sec)
         try:
-            info = await bot.call_api("get_record", file=ref.file or "", out_format="wav")
+            info = await self._call(bot, "get_record", file=ref.file or "", out_format="wav")
         except Exception as e:
             log.warning("get_record failed: %s", why(e))
             info = {}
@@ -561,7 +567,7 @@ class MediaProcessor:
         the message was numbered when it arrived, before this fetch answered.
         """
         try:
-            res = await bot.call_api("get_forward_msg", message_id=ref.ident)
+            res = await self._call(bot, "get_forward_msg", message_id=ref.ident)
         except Exception as e:
             # Forward ids expire, and re-reading one can invalidate it.
             log.info("get_forward_msg failed for %s: %s", ref.ident, why(e))

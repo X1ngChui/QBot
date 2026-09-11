@@ -45,13 +45,6 @@ REPEAT_NOTE = "（这个查询刚执行过，结果就在上面。换个关键�
 WRAP_UP_NOTE = ("（本次回复的额度已用完，不能再执行任何检索或查看；"
                 "请只依据上文已有的材料直接作答，不要提及额度或系统限制。）")
 
-#: How many tool calls one round may carry. Each call is free, but each result is
-#: appended to the prompt, and a round asking for thirty pages at once would grow
-#: the next request past the model's context before money had a chance to bind -
-#: which ends in a failed call and silence, not a budget stop. The rest of the
-#: round is answered with a note; a model that still wants them asks next round.
-MAX_CALLS_PER_ROUND = 8
-
 #: Caps on the provenance marker appended to the bot's own archived line: how many
 #: tool uses it names, and how much of each query survives. A record, not a transcript
 #: - enough for a later turn to see what that answer rested on, not to replay it.
@@ -59,17 +52,6 @@ MAX_CALLS_PER_ROUND = 8
 #: cut in half reads as a different search than the one that ran.
 PROV_ITEMS = 4
 PROV_QUERY_CHARS = 80
-
-#: Caps on the trajectory entry kept in the conversation window: how much of each
-#: tool result survives, and how large the whole entry may grow. A digest for
-#: follow-ups on the same topic - the tools are still there when more is needed.
-#:
-#: Sized so the digest actually reaches the answer. A search result opens with the
-#: conversation around its first hit (retrieval.history_context), so a couple of
-#: hundred characters recorded nothing but the chatter leading up to what was found
-#: - the one thing this entry exists to carry.
-TRACE_RESULT_CHARS = 1200
-TRACE_TOTAL_CHARS = 4000
 
 #: How each query tool reads in the provenance marker and the trace. One dict for
 #: both, or a renamed tool would let the marker and the trace quietly diverge.
@@ -95,7 +77,7 @@ async def _wrap_up(messages: list, *, cfg: Settings, st: GroupState,
                     st.group_id, why(e))
         return None, "", ""
     debug.capture(st.group_id, round_no, messages, res)
-    return res.text or None, _provenance(executed), _trace(executed)
+    return res.text or None, _provenance(executed), _trace(executed, cfg)
 
 
 def _provenance(executed: list[tuple[str, dict, str]]) -> str:
@@ -149,13 +131,14 @@ def _label(name: str, args: dict) -> str:
     return f"{TOOL_VERB.get(name, name)}“{q}”"
 
 
-def _trace(executed: list[tuple[str, dict, str]]) -> str:
+def _trace(executed: list[tuple[str, dict, str]], cfg: Settings) -> str:
     """The trajectory entry kept in the conversation window beside the reply it fed.
 
     The reply is the model's synthesis for the question that was asked; a follow-up
     on the same topic often needs a different slice of the same results, and without
     this it either re-searches what was just searched or leans on its own summary.
-    Digested per call and capped as a whole - a record for reuse, not a replay.
+    Digested per call and capped as a whole (prompt.trace_result_chars and
+    prompt.trace_total_chars) - a record for reuse, not a replay.
     Persisted in reply_trace and nowhere else: tool output is not something said
     in the group, so it never enters the archive and search_history must not start
     returning the bot's own search results. Prompt assembly queries the table for
@@ -169,9 +152,9 @@ def _trace(executed: list[tuple[str, dict, str]]) -> str:
     for name, args, out in executed:
         # Web pages and search results are outside text; a page carrying the
         # system brackets must not smuggle markup into the frozen trace.
-        digest = defang(" ".join((out or "").split()))[:TRACE_RESULT_CHARS]
+        digest = defang(" ".join((out or "").split()))[:cfg.prompt.trace_result_chars]
         line = f"{_label(name, args)}：{digest}"
-        if used + len(line) > TRACE_TOTAL_CHARS:
+        if used + len(line) > cfg.prompt.trace_total_chars:
             lines.append("（其余从略）")
             break
         lines.append(line)
@@ -249,7 +232,7 @@ async def generate(
             )
             debug.capture(st.group_id, round_no, messages, res)
             if not res.tool_calls:
-                return res.text or None, _provenance(executed), _trace(executed)
+                return res.text or None, _provenance(executed), _trace(executed, cfg)
 
             # The gate sits between the request for tools and their execution:
             # tools whose results no further round could read would burn search
@@ -302,8 +285,12 @@ async def _run_round(
     the same bytes, and a model repeating itself is a model stuck - handing it
     identical results once more is how a bounded loop spends its whole bound
     standing still), anything past the per-round cap, and everything after the
-    allowance died mid-round.
+    allowance died mid-round. The cap is retrieval.max_tool_calls_per_round:
+    each result is appended to the prompt, and a round asking for thirty pages at
+    once would grow the next request past the model's context before money had a
+    chance to bind - a failed call and silence, not a budget stop.
     """
+    cap = cfg.retrieval.max_tool_calls_per_round
     answers: list[dict] = []
     quota_hit = False
     for n, call in enumerate(calls):
@@ -321,7 +308,7 @@ async def _run_round(
                if isinstance(args, dict) else raw)
         if quota_hit:
             out = QUOTA_NOTE
-        elif n >= MAX_CALLS_PER_ROUND:
+        elif n >= cap:
             out = OVERFLOW_NOTE
         elif key in seen_calls:
             out = REPEAT_NOTE
@@ -343,9 +330,9 @@ async def _run_round(
             "role": "tool", "tool_call_id": call.get("id", ""),
             "content": out.content() if isinstance(out, tools.Attachment) else out,
         })
-    if len(calls) > MAX_CALLS_PER_ROUND:
+    if len(calls) > cap:
         log.info("group %s: %d tool calls in one round, %d past the cap left unexecuted",
-                 st.group_id, len(calls), len(calls) - MAX_CALLS_PER_ROUND)
+                 st.group_id, len(calls), len(calls) - cap)
     return answers, quota_hit
 
 

@@ -71,6 +71,19 @@ class GatewayCfg(_M):
     #: How long the group's member list is reused before being fetched again. Names
     #: are read on every message, and the platform call is the expensive part.
     member_cache_ttl_sec: int = 1800
+    #: Deadline for the protocol side's media calls (get_image, get_record,
+    #: get_forward_msg), under its own half-minute default. A picture the platform
+    #: can no longer serve does not fail there, it hangs - and a reply would stand
+    #: still for the whole of it.
+    protocol_call_timeout_sec: float = Field(10.0, gt=0)
+    #: Deadline for downloading a picture or a clip from a link.
+    media_http_timeout_sec: float = Field(20.0, gt=0)
+    #: How long a picture no route could read is left alone before another attempt:
+    #: one dead picture must not cost every reply that looks at it a full timeout.
+    unreadable_retry_sec: int = Field(600, ge=0)
+    #: How long shutdown waits for in-flight archive writes and media patches. They
+    #: are never cancelled, only waited for; a hung one must not hold a deploy.
+    shutdown_wait_sec: float = Field(5.0, ge=0)
 
 
 class PromptCfg(_M):
@@ -98,6 +111,14 @@ class PromptCfg(_M):
     forward_lines: int = Field(20, ge=1)
     forward_depth: int = Field(3, ge=1)
     forward_chars: int = Field(1500, ge=100)
+    #: How much of the trajectory entry kept beside each of the bot's own replies
+    #: survives: characters of each tool result, and of the whole entry. A digest
+    #: for follow-ups on the same topic, not a replay - the tools are still there
+    #: when more is needed. Sized so the digest reaches the answer: a search result
+    #: opens with the conversation around its first hit, and a couple of hundred
+    #: characters recorded only the chatter leading up to what was found.
+    trace_result_chars: int = Field(1200, ge=100)
+    trace_total_chars: int = Field(4000, ge=500)
 
 
 class TriggerCfg(_M):
@@ -295,6 +316,13 @@ class LlmCfg(_M):
     asr: AsrCfg
     embedding: EmbeddingCfg
     search: SearchCfg
+    #: Retries for the plain-HTTP backends (embedding, search, file upload), which
+    #: carry no retries setting of their own; the chat backends use text.retries.
+    http_retries: int = Field(2, ge=0)
+    #: The longest a vendor's Retry-After may hold any call. A vendor asking for
+    #: minutes is asking the wrong client: a reply somebody is waiting for fails and
+    #: is retried by the person, and a background batch is rescheduled by its queue.
+    retry_after_cap_sec: float = Field(30.0, gt=0)
 
 
 class BudgetCfg(_M):
@@ -339,6 +367,14 @@ class RetrievalCfg(_M):
     #: its own: a web page can be any size, and past the model's context the request
     #: fails outright rather than degrading. A cut page is told it was cut.
     url_content_chars: int = Field(8000, ge=500)
+    #: How many tool calls one round of the reply loop may carry. Each result is
+    #: appended to the prompt, and a round asking for thirty pages at once would
+    #: grow the next request past the model's context before money had a chance to
+    #: bind. The rest of the round is answered with a note.
+    max_tool_calls_per_round: int = Field(8, ge=1)
+    #: How many pictures one open_image call may fetch; each is a file block in the
+    #: next request.
+    open_image_max: int = Field(6, ge=1)
 
 
 class MemoryCfg(_M):
