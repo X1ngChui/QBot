@@ -90,20 +90,31 @@ def registrations() -> None:
     """
     import ast
     tree = _commands_source()
-    shared = next((ast.literal_eval(node.value) for node in ast.walk(tree)
+    shared = next((node.value for node in ast.walk(tree)
                    if isinstance(node, ast.Assign)
                    and any(isinstance(t, ast.Name) and t.id == "_CMD" for t in node.targets)),
-                  {})
+                  None)
     calls = [node for node in ast.walk(tree)
              if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
              and node.func.id == "on_command"]
 
+    def shared_break() -> bool:
+        # The shared options carry the word-break rule: rule=Rule(_whole_name),
+        # whose decision is command_catalog.name_is_whole (tested in test_logic).
+        if not isinstance(shared, ast.Dict):
+            return False
+        for k, v in zip(shared.keys, shared.values, strict=True):
+            if isinstance(k, ast.Constant) and k.value == "rule":
+                return (isinstance(v, ast.Call) and isinstance(v.func, ast.Name)
+                        and v.func.id == "Rule"
+                        and any(isinstance(a, ast.Name) and a.id == "_whole_name"
+                                for a in v.args))
+        return False
+
     def demands_break(call) -> bool:
         for kw in call.keywords:
-            if kw.arg == "force_whitespace":
-                return isinstance(kw.value, ast.Constant) and kw.value.value is True
             if kw.arg is None and isinstance(kw.value, ast.Name) and kw.value.id == "_CMD":
-                return shared.get("force_whitespace") is True
+                return shared_break()
         return False
 
     names = {"/" + c.args[0].value for c in calls

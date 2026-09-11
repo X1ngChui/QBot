@@ -715,6 +715,24 @@ check("and every module attribute the handlers reach for exists",
       not _missing, "; ".join(_missing))
 _tree = _ast.parse(_pl.Path("qqbot/plugins/commands.py").read_text(encoding="utf-8"))
 
+# Where a command name may end: whitespace, the end of the message, or the end of
+# the text segment - an @ typed straight after the name is still that command.
+from qqbot.core.command_catalog import name_is_whole as _whole
+
+
+class _Seg:
+    def __init__(self, text):
+        self._t = text
+
+    def is_text(self):
+        return self._t
+
+
+check("a bare command is whole", _whole([], None))
+check("a command with a spaced argument is whole", _whole([_Seg(True)], " "))
+check("a command straight before an @ is whole", _whole([_Seg(False)], None))
+check("a longer word is not the command it starts with", not _whole([_Seg(True)], None))
+
 # The gate's decision table, as the pure function the handlers call.
 from qqbot.core.perms import Verdict as _V, decide as _decide
 _own, _glob = ["10001", "20001"], ["10001"]

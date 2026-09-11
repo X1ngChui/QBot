@@ -180,7 +180,9 @@ class Gateway:
 
         text = parsed.render()
         # Routed to the command matchers instead. Whole word: the matchers require
-        # whitespace after the name, so "/topology" is chat, not "/top".
+        # a word break after the name (command_catalog.name_is_whole), so
+        # "/topology" is chat, not "/top"; the render puts a space before an @,
+        # so "/forget@somebody" splits the same way here.
         if text.strip() and text.split(maxsplit=1)[0] in COMMANDS:
             return
         if not text and not parsed.refs:

@@ -27,7 +27,10 @@ from pathlib import Path
 
 from nonebot import on_command
 from nonebot.adapters.onebot.v11 import GroupMessageEvent
+from nonebot.consts import CMD_ARG_KEY, CMD_WHITESPACE_KEY, PREFIX_KEY
 from nonebot.matcher import Matcher, current_bot, current_event
+from nonebot.rule import Rule
+from nonebot.typing import T_State
 from pydantic import ValidationError
 
 from ..core import agreement, command_catalog, debug, errors, perms
@@ -157,13 +160,22 @@ async def _finish(matcher: Matcher, message: str) -> None:
     await matcher.finish()
 
 
-# Every name is registered in its own right, and every registration demands a break
-# after the name. NoneBot resolves a message against the longest registered prefix,
-# so a name nobody registered would otherwise arrive as the shorter command it
-# starts with, carrying the rest as its argument - /topology as /top, /cards as
-# /card, /whoami as /who - and block=True would keep it from the chat path as well.
-# With force_whitespace such a message matches no command at all.
-_CMD = {"block": True, "priority": 1, "force_whitespace": True}
+async def _whole_name(state: T_State) -> bool:
+    """The command name must end at a word break (command_catalog.name_is_whole).
+
+    NoneBot's own force_whitespace demands whitespace inside the text segment,
+    which refuses a command typed straight before an @: the platform puts no
+    space between "/forget" and the @ segment that follows it.
+    """
+    prefix = state[PREFIX_KEY]
+    return command_catalog.name_is_whole(prefix[CMD_ARG_KEY] or [],
+                                         prefix[CMD_WHITESPACE_KEY])
+
+
+# Every name is registered in its own right, and every registration demands a
+# break after the name - see _whole_name. block=True keeps a matched command from
+# the chat path as well.
+_CMD = {"block": True, "priority": 1, "rule": Rule(_whole_name)}
 
 agree_cmd = on_command("agree", **_CMD)
 terms_cmd = on_command("terms", **_CMD)

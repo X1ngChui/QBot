@@ -18,6 +18,7 @@ the boundary.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from ..domain.identity.alias import CONFIRM_THRESHOLD
@@ -209,6 +210,23 @@ CATALOG: tuple[Command, ...] = (
 
 #: What the gateway routes away from the reply pipeline.
 PREFIXES: tuple[str, ...] = tuple(c.name for c in CATALOG)
+
+
+def name_is_whole(arg: Sequence, whitespace: str | None) -> bool:
+    """Whether a matched command name ends at a word break.
+
+    NoneBot resolves a message against the longest registered prefix, so a name
+    nobody registered would otherwise arrive as the shorter command it starts
+    with, carrying the rest as its argument - /topology as /top, /whoami as /who.
+    A break is whitespace after the name, or the end of the text segment: a
+    command typed straight before an @ ("/forget@somebody") is still that
+    command, and the platform puts no space between the two. `arg` is the
+    remainder as segments, `whitespace` what separated it from the name, if any.
+    """
+    if not arg or whitespace is not None:
+        return True
+    first = arg[0]
+    return not first.is_text()
 
 _BY_NAME = {c.name.lstrip("/"): c for c in CATALOG}
 
