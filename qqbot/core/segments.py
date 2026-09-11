@@ -130,20 +130,6 @@ class AudioRef(Ref):
 
 
 @dataclass
-class ForwardRef(Ref):
-    """A merged-forward bundle, whose contents live behind one more API call."""
-
-    ident: str = ""
-
-    def placeholder(self) -> str:
-        return sysmark("转发的聊天记录")
-
-    async def resolve(self, proc: MediaProcessor, *, bot: BotApi, group_id: str,
-                      cfg: Settings, self_id: str) -> str | None:
-        return await proc.read_forward(self, bot=bot, group_id=group_id, self_id=self_id)
-
-
-@dataclass
 class ParsedMessage:
     parts: list = field(default_factory=list)     # str | Ref
     refs: list[Ref] = field(default_factory=list)
@@ -456,16 +442,12 @@ class _Walk:
                 if not nested:
                     pm.reply_to = str(data.get("id") or "") or None
             elif stype == "forward":
+                # The protocol side delivers the record inline, nested records
+                # included, so it is read here without a call. A segment without
+                # one has nothing to read.
                 content = data.get("content")
-                fid = str(data.get("id") or "")
                 if isinstance(content, list) and content:
-                    # The protocol side delivers the record inline, nested records
-                    # included, so it is read here without a call.
                     parts.append(self.block(content, depth=depth + 1))
-                elif fid and not nested:
-                    # Only an id: fetched later by read_forward, which renders the
-                    # answer through the same block.
-                    self.add_ref(parts, ForwardRef, ident=fid)
                 else:
                     parts.append(sysmark("转发的聊天记录"))
             elif stype == "json":
@@ -517,11 +499,7 @@ class _Walk:
             if self.lines_left <= 0 or self.chars_left <= 0:
                 block.omitted = len(nodes) - i
                 break
-            if not isinstance(node, dict):
-                continue
-            # Two shapes: an entry delivered inline is the node itself; one fetched
-            # through the API is wrapped as {"type": "node", "data": {...}}.
-            data = node.get("data") if node.get("type") == "node" else node
+            data = node
             if not isinstance(data, dict):
                 continue
             sender = data.get("sender") if isinstance(data.get("sender"), dict) else {}
@@ -552,18 +530,6 @@ def parse_segments(segments: list[dict], self_id: str,
     pm = ParsedMessage()
     _Walk(pm, self_id, limits or config().default.prompt).parse(segments, pm.parts, depth=0)
     return pm
-
-
-def parse_forward(nodes: list, self_id: str,
-                  limits: PromptCfg | None = None) -> tuple[ForwardBlock, ParsedMessage]:
-    """A record fetched through the API, as a block plus the refs it registered -
-    for the id-only forward segment that older protocol sides send. The refs
-    belong to a throwaway message here: the block is rendered by whoever fetched
-    it and folded into the carrying message as text, so its pictures do not join
-    that message's numbering."""
-    pm = ParsedMessage()
-    block = _Walk(pm, self_id, limits or config().default.prompt).block(nodes, depth=1)
-    return block, pm
 
 
 def segments_of(msg: dict) -> tuple[list | None, str]:

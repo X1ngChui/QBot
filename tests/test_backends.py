@@ -272,26 +272,22 @@ def main() -> int:
     check("the window is Beijing time, not the caller's",
           ds._at_peak(datetime(2026, 8, 11, 2, 30, tzinfo=ZoneInfo("Europe/London"))))
 
-    # The vendor repriced effective 2026-08-17 00:00 Beijing. Both eras stay encoded and
-    # the switch is a pure function of the clock, so both sides of the boundary are
-    # pinned - a wrong era misbills every call silently.
+    # The rate is a pure function of the clock, so the peak boundary is pinned - a
+    # wrong rate misbills every call silently.
     def rate_at(model, y, mo, d, h):
         return ds._rate_at(model, datetime(y, mo, d, h, 30, tzinfo=BJ))
 
-    check("the day before the repricing bills at the old table",
-          rate_at("deepseek-v4-flash", 2026, 8, 16, 21).out == 2.0,
-          str(rate_at("deepseek-v4-flash", 2026, 8, 16, 21)))
-    check("the day after bills at the new one",
+    check("V4-Flash bills at the published off-peak rate",
           rate_at("deepseek-v4-flash", 2026, 8, 17, 21).out == 4.5,
           str(rate_at("deepseek-v4-flash", 2026, 8, 17, 21)))
-    # 2026-08-17 is a Monday: peak doubling applies on top of the new table.
+    # 2026-08-17 is a Monday: peak doubling applies on top of the table.
     peak_new = rate_at("deepseek-v4-flash", 2026, 8, 17, 10)
-    check("new-era peak doubles the new off-peak",
+    check("peak doubles the off-peak rate",
           (peak_new.in_hit, peak_new.in_miss, peak_new.out) == (0.10, 3.0, 9.0),
           str(peak_new))
-    check("pro's new off-peak output is 13.5",
+    check("pro's off-peak output is 13.5",
           rate_at("deepseek-v4-pro", 2026, 8, 17, 21).out == 13.5)
-    check("an unknown model still bills at the priciest new tier",
+    check("an unknown model bills at the priciest tier",
           rate_at("no-such-model", 2026, 8, 17, 21).out == 13.5)
     # V4.1-Flash, the id the vendor answers with after retiring the V4 flash ids and,
     # from 2026-09-14, deepseek-v4-pro as well. Pinned because a call is billed under

@@ -56,9 +56,8 @@ class Candidate:
     #: And how many rows that batch held. Batches are cut at conversation gaps, so
     #: their length varies; without the count, replay could only guess a fixed
     #: window ending at the anchor - a superset that would shift every account code
-    #: and misattribute records. None on rows staged before the column existed;
-    #: replay then falls back to the fixed-window guess those batches were made with.
-    batch_size: int | None = None
+    #: and misattribute records.
+    batch_size: int = 0
     confidence: float | None = None
     status: CandidateStatus = CandidateStatus.PENDING
     reject_reason: str | None = None

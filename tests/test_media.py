@@ -520,10 +520,14 @@ async def main():
     # Only the stamp is stripped in the bare form: a speaker after it could be the
     # reply's own words, and where the readings collide the guard declines.
     check("a copied stamp goes with the number and speaker",
-          clean_reply("#7 [08-30 14:03] 小X: 那我就不抢了") == "那我就不抢了",
-          repr(clean_reply("#7 [08-30 14:03] 小X: 那我就不抢了")))
+          clean_reply("#7 ⟦08-30 14:03⟧ 小X: 那我就不抢了") == "那我就不抢了",
+          repr(clean_reply("#7 ⟦08-30 14:03⟧ 小X: 那我就不抢了")))
     check("a bare copied stamp is removed",
-          clean_reply("[08-30 14:03] 那我就不抢了") == "那我就不抢了",
+          clean_reply("⟦08-30 14:03⟧ 那我就不抢了") == "那我就不抢了",
+          repr(clean_reply("⟦08-30 14:03⟧ 那我就不抢了")))
+    # The square form is a member's own imitation after defang; quoting it is content.
+    check("a square-bracket stamp is text and stays",
+          clean_reply("[08-30 14:03] 那我就不抢了") == "[08-30 14:03] 那我就不抢了",
           repr(clean_reply("[08-30 14:03] 那我就不抢了")))
 
     # A model that wants a tool it has not been given writes the call out as text. The

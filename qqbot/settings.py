@@ -71,8 +71,8 @@ class GatewayCfg(_M):
     #: How long the group's member list is reused before being fetched again. Names
     #: are read on every message, and the platform call is the expensive part.
     member_cache_ttl_sec: int = 1800
-    #: Deadline for the protocol side's media calls (get_image, get_record,
-    #: get_forward_msg), under its own half-minute default. A picture the platform
+    #: Deadline for the protocol side's media calls (get_image, get_record),
+    #: under its own half-minute default. A picture the platform
     #: can no longer serve does not fail there, it hangs - and a reply would stand
     #: still for the whole of it.
     protocol_call_timeout_sec: float = Field(10.0, gt=0)
@@ -480,9 +480,10 @@ class PredicateCfg(_M):
 
     Everything a predicate is lives in this one entry: what the extraction model may
     offer, how many of them a person may hold at once, how fast it is forgotten, and
-    the words it renders as in the prompt. Split across code the way it used to be,
-    adding a predicate meant five edits in three files, and each omission failed
-    quietly - a missing verb put the bare English predicate in front of the model.
+    the words it renders as in the prompt. One entry rather than a table per aspect
+    spread across code: split up, adding a predicate means several edits in several
+    files, and each omission fails quietly - a missing verb puts the bare English
+    predicate in front of the model.
     """
 
     #: How the fact reads in Chinese. `{}` marks where the object goes for a

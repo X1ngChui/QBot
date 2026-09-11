@@ -166,10 +166,10 @@ async def image_cache_get(key: str, *, max_age: timedelta | None = None) -> str 
     """The stored description, or None while there is none yet. A row whose upload
     landed before its describing call holds '' - reported as a miss, not a hit.
 
-    `max_age` asks only for a description still worth trusting: an older one (or one
-    written before described_at existed) is reported as a miss so the caller pays to
-    write a fresh one. Callers that may not spend leave it unset - outside the paid
-    describing path a stale description still beats a bare marker.
+    `max_age` asks only for a description still worth trusting: an older one is
+    reported as a miss so the caller pays to write a fresh one. Callers that may not
+    spend leave it unset - outside the paid describing path a stale description
+    still beats a bare marker.
 
     The sighting counts either way: hit_count measures how often a picture comes
     back, which is what decides whether describing it again is worth anything.
@@ -179,13 +179,11 @@ async def image_cache_get(key: str, *, max_age: timedelta | None = None) -> str 
             WHERE key=$1 RETURNING description, described_at""",
         key,
     )
-    if not row:
+    if not row or not row["description"]:
         return None
-    if max_age is not None:
-        fresh_from = now_local() - max_age
-        if row["described_at"] is None or row["described_at"] < fresh_from:
-            return None
-    return row["description"] or None
+    if max_age is not None and row["described_at"] < now_local() - max_age:
+        return None
+    return row["description"]
 
 
 async def image_cache_put(key: str, description: str, *, refused: bool = False) -> None:
@@ -350,20 +348,6 @@ async def unblock_expired(group_id: int) -> None:
             WHERE group_id=$1 AND blocked_until IS NOT NULL AND blocked_until <= NOW()""",
         group_id,
     )
-
-
-async def unread_since_extract(group_id: int) -> tuple[int, object]:
-    """How many messages this group has that no extraction has read, and the newest one's
-    arrival time. See EventRepository.unread_since_extract, which owns the predicate.
-
-    Kept here for the ops console, which reports the count beside the other
-    group_state switches and does not otherwise touch the repositories. Imported
-    inside the function: the repositories build on this package, not the other way
-    round, and a module-level import here would make the two load each other.
-    """
-    from ..repositories.event import EventRepository
-
-    return await EventRepository().unread_since_extract(group_id)
 
 
 async def mark_extracted(group_id: int, upto) -> None:

@@ -429,5 +429,5 @@ class MemoryExtractor:
             group_id=inp.group_id,
             source_event_id=inp.source_of(args.get("quote", "")),
             batch_event_id=inp.source_event_id,
-            batch_size=inp.batch_size or None,
+            batch_size=inp.batch_size,
         )

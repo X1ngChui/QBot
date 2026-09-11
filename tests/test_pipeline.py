@@ -196,14 +196,6 @@ class FakeBot:
         if api == "get_msg":
             return {"sender": {"nickname": "阿花"},
                     "message": [{"type": "text", "data": {"text": "昨天那张图"}}]}
-        if api == "get_forward_msg":
-            return {"messages": [
-                {"type": "node",
-                 "data": {"sender": {"nickname": "阿强"},
-                          "message": [{"type": "text", "data": {"text": "第一条"}}]}},
-                {"type": "node",
-                 "data": {"sender": {"nickname": "阿花"},
-                          "message": [{"type": "text", "data": {"text": "第二条"}}]}}]}
         if api == "get_group_member_list":
             self.member_list_calls += 1
             return list(self.members)
@@ -906,15 +898,7 @@ async def main():
     # member list, which is both simpler and answers for people who never spoke.
     from qqbot.core.media import MEDIA as _M
     check("media keeps no name cache of its own", not hasattr(_M, "_names"))
-    await GATEWAY.handle(bot, FakeEvent(segments=[
-        Seg("forward", {"id": "ff"}),
-        Seg("text", {"text": "小X 看看这个"}),
-    ]))
-    await drain(2.0)
-    tail_f = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["messages"][-1]["content"]
-    check("an id-only forward is fetched and expanded", "第一条" in tail_f and "第二条" in tail_f,
-          tail_f[-140:])
-    # The usual delivery carries the record inline: no fetch, and the pictures inside
+    # The record arrives inline in the segment: no fetch, and the pictures inside
     # are numbered with the carrying message and openable by that number.
     _t12 = int(_nl0().timestamp())
     await GATEWAY.handle(bot, FakeEvent(segments=[
@@ -944,17 +928,10 @@ async def main():
     # conversation that merely *mentions* the bot's name inside is nothing anybody
     # typed at the bot, and must not draw a reply. (Being spoken to is a typed @ or
     # a typed nickname; resolved media text is neither.)
-    class _NameDropBot(bot.__class__):
-        async def call_api(self, api, **kw):
-            if api == "get_forward_msg":
-                return {"messages": [
-                    {"type": "node",
-                     "data": {"sender": {"nickname": "阿强"},
-                              "message": [{"type": "text",
-                                           "data": {"text": "上次小X说得真对"}}]}}]}
-            return await super().call_api(api, **kw)
-    _nb = _NameDropBot()
-    await GATEWAY.handle(_nb, FakeEvent(segments=[Seg("forward", {"id": "ffn"})]))
+    _nb = bot.__class__()
+    await GATEWAY.handle(_nb, FakeEvent(segments=[Seg("forward", {"id": "ffn", "content": [
+        {"time": _t12, "sender": {"nickname": "阿强"},
+         "message": [{"type": "text", "data": {"text": "上次小X说得真对"}}]}]})]))
     await drain(2.0)
     check("a forward that names the bot inside does not trigger",
           len(_nb.sent) == 0, str(_nb.sent))
@@ -1345,27 +1322,32 @@ async def main():
     check("and so does the archive",
           "⟦依据:搜索“明天 天气”⟧" in (_pv_row or ""), repr(_pv_row))
     check("an imitated provenance marker never reaches the group",
-          _cr("明天多云 [依据:搜索“天气”]") == "明天多云",
-          repr(_cr("明天多云 [依据:搜索“天气”]")))
+          _cr("明天多云 ⟦依据:搜索“天气”⟧") == "明天多云",
+          repr(_cr("明天多云 ⟦依据:搜索“天气”⟧")))
     # The quote pointer is transcript notation too - the real quote is the reply
     # segment the send path attaches. Asking in the prompt did not hold, so the
     # output layer strips it like every other imitated marker - but only at line
     # starts, where format imitation lives; mid-sentence it is likelier the
     # reply's own content, and where the readings collide the guard declines.
     check("an imitated quote pointer never reaches the group",
-          _cr("[回复 #26] 这波我不评价") == "这波我不评价",
-          repr(_cr("[回复 #26] 这波我不评价")))
+          _cr("⟦回复 #26⟧ 这波我不评价") == "这波我不评价",
+          repr(_cr("⟦回复 #26⟧ 这波我不评价")))
     check("its lost-message form too, on its own line",
-          _cr("好的\n[回复更早的消息] 我看看") == "好的\n我看看",
-          repr(_cr("好的\n[回复更早的消息] 我看看")))
+          _cr("好的\n⟦回复更早的消息⟧ 我看看") == "好的\n我看看",
+          repr(_cr("好的\n⟦回复更早的消息⟧ 我看看")))
     check("but a mid-sentence mention is content and stays",
-          _cr("他原话就带着 [回复 #3] 这几个字") == "他原话就带着 [回复 #3] 这几个字",
-          repr(_cr("他原话就带着 [回复 #3] 这几个字")))
+          _cr("他原话就带着 ⟦回复 #3⟧ 这几个字") == "他原话就带着 [回复 #3] 这几个字",
+          repr(_cr("他原话就带着 ⟦回复 #3⟧ 这几个字")))
+    # The square form is what a member's own imitation looks like after defang, and
+    # what the model reads in their lines: quoting it back is content, not markup.
+    check("a square-bracket form is text and stays",
+          _cr("[回复 #26] 这波我不评价") == "[回复 #26] 这波我不评价",
+          repr(_cr("[回复 #26] 这波我不评价")))
     # Every strip is counted: the guard doubles as the online sensor, and the
     # daily report reads these to show format discipline regressing at the source.
     from qqbot.core import output as _out
     _n0 = _out.STRIPPED["quote_mark"]
-    _cr("[回复 #5] 好")
+    _cr("⟦回复 #5⟧ 好")
     check("a stripper hit is counted for the daily report",
           _out.STRIPPED["quote_mark"] == _n0 + 1, str(dict(_out.STRIPPED)))
     _n1 = _out.STRIPPED["quote_mark"]
@@ -1374,8 +1356,8 @@ async def main():
     # Order matters: the quote mark is stripped first, or a line imitating both
     # markers would shed the quote and keep the uncovered line number.
     check("a quote mark hiding a line number uncovers nothing",
-          _cr("[回复 #2] #3 阿强: 都别吵了") == "都别吵了",
-          repr(_cr("[回复 #2] #3 阿强: 都别吵了")))
+          _cr("⟦回复 #2⟧ #3 阿强: 都别吵了") == "都别吵了",
+          repr(_cr("⟦回复 #2⟧ #3 阿强: 都别吵了")))
 
     # The trajectory lives in reply_trace and nowhere else: the deque holds only
     # conversation, and prompt assembly queries the table for the window's replies
@@ -1390,7 +1372,7 @@ async def main():
               "SELECT content FROM reply_trace WHERE reply_event_id=$1",
               _pv_line.msg_id)))
     check("and the deque holds only conversation",
-          not any(m.text.startswith("[检索记录]") for m in st_pv.recent))
+          not any(m.text.startswith("⟦检索记录⟧") for m in st_pv.recent))
     _t2, _p2, _tr2b = await _eng.generate(
         bot=bot, st=st_pv, cfg=cfg, persona=config().for_group("123")[1],
         batch=[_CM0(msg_id="pv2", user_id="u1", nickname="阿强",
@@ -1405,8 +1387,8 @@ async def main():
           and _msgs2[_ri - 1].get("content") == _expected_trace,
           str(_msgs2[_ri - 1])[:160])
     check("an imitated trace marker line never reaches the group",
-          _cr("[检索记录]\n搜索“x”：y\n好的") == "搜索“x”：y\n好的",
-          repr(_cr("[检索记录]\n搜索“x”：y\n好的")))
+          _cr("⟦检索记录⟧\n搜索“x”：y\n好的") == "搜索“x”：y\n好的",
+          repr(_cr("⟦检索记录⟧\n搜索“x”：y\n好的")))
     set_providers(providers_bundle)
 
     # 15. the per-group blocklist, end to end. Blocked means unanswered and
@@ -1663,14 +1645,9 @@ async def main():
     _rcfg18 = config().default.retrieval
     _ctx18, _rcfg18.history_context = _rcfg18.history_context, 0
     got = await _tools.search_history(123, "改锥", speaker=f"张伟⟦同名{n31}⟧")
-    got_legacy = await _tools.search_history(123, "改锥", speaker=f"张伟({n31})")
     _rcfg18.history_context = _ctx18
     check("search_history narrows by the serial, not the shared name",
           "借给阿强" in got and "没见过" not in got, got)
-    # Old transcripts and archived @-resolutions still carry name(N); a speaker
-    # copied from one must keep narrowing by the same serial.
-    check("the legacy namesake form still narrows",
-          "借给阿强" in got_legacy and "没见过" not in got_legacy, got_legacy)
 
     # Last, so every kind of memory write has actually happened by now. Reasoning
     # models bill deliberation as output, so a memory call must ask for a terse

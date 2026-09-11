@@ -60,15 +60,7 @@ from .members import MEMBERS
 from .output import strip_markdown
 from .ratelimit import SlidingWindow
 from .retrieval import directory
-from .segments import (
-    AtRef,
-    AudioRef,
-    ForwardRef,
-    ImageRef,
-    ParsedMessage,
-    Ref,
-    parse_forward,
-)
+from .segments import AtRef, AudioRef, ImageRef, ParsedMessage, Ref
 
 log = logging.getLogger("qqbot.media")
 
@@ -554,42 +546,6 @@ class MediaProcessor:
             except (UnknownAccount, ValueError):
                 name = ""
         return f"@{name}" if name else None
-
-    async def read_forward(self, ref: ForwardRef, *, bot: BotApi, group_id: str,
-                           self_id: str) -> str | None:
-        """A record the protocol side sent by id alone, fetched and rendered.
-
-        The usual delivery carries the record inline and never reaches here; this
-        is the older shape. The fetched entries go through the same parser and
-        block as an inline record, on the free budget: names for mentions, and
-        descriptions already paid for. The pictures inside are filed so a later
-        look is possible, but they do not join the carrying message's numbering -
-        the message was numbered when it arrived, before this fetch answered.
-        """
-        try:
-            res = await self._call(bot, "get_forward_msg", message_id=ref.ident)
-        except Exception as e:
-            # Forward ids expire, and re-reading one can invalidate it.
-            log.info("get_forward_msg failed for %s: %s", ref.ident, why(e))
-            return None
-        nodes = res.get("messages") or res.get("message") or []
-        if not nodes:
-            return None
-        block, pm = parse_forward(nodes, self_id)
-
-        async def free(r: Ref):
-            if isinstance(r, AtRef):
-                return await self.name_for(r, bot=bot, group_id=group_id)
-            if isinstance(r, ImageRef):
-                await self.ensure_uploaded(r, bot=bot, group_id=group_id,
-                                           cfg=config().for_group(group_id)[0])
-                return await self.cached(r)
-            return None
-
-        outs = await asyncio.gather(*(free(r) for r in pm.refs), return_exceptions=True)
-        resolved = {r.slot: o for r, o in zip(pm.refs, outs, strict=True)
-                    if isinstance(o, str) and o}
-        return block.render(resolved, depth=1)
 
     async def resolve(
         self,

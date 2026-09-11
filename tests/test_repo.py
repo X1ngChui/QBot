@@ -24,6 +24,7 @@ import itertools
 from qqbot.db import init_pool, close_pool, pool
 from qqbot.db import repo
 from qqbot.gateway.ingest import ingestor
+from qqbot.repositories.event import EventRepository
 from qqbot.gateway.onebot import GroupMessage, Sender
 from qqbot.util import now_local, today_local
 from _db import reset
@@ -103,12 +104,13 @@ async def main():
           await repo.image_cache_get("k1", max_age=_td(days=15)) is None)
     check("but the free path still serves it",
           await repo.image_cache_get("k1") == "[表情:开心]")
-    # Rows written before described_at existed have descriptions of unknown age and
-    # count as expired - each is rewritten the next time that picture is posted.
-    await pool().execute("UPDATE image_cache SET described_at = NULL WHERE key='k1'")
-    check("an undated description counts as expired",
-          await repo.image_cache_get("k1", max_age=_td(days=15)) is None
-          and await repo.image_cache_get("k1") == "[表情:开心]")
+    # A description always carries its time: the schema refuses one without it.
+    try:
+        await pool().execute("UPDATE image_cache SET described_at = NULL WHERE key='k1'")
+        check("a description without a time is refused by the schema", False, "accepted")
+    except Exception as e:
+        check("a description without a time is refused by the schema",
+              "image_cache_described_stamped" in str(e), str(e)[:80])
     # Re-describing stamps the row afresh, which is what ends the expiry.
     await repo.image_cache_put("k1", "[表情:开心，重描]")
     check("a rewrite is current again",
@@ -189,25 +191,25 @@ async def main():
     from qqbot.repositories.job import JobType as _JT
 
     G3 = 7003
-    n0, _ = await repo.unread_since_extract(G3)
+    n0, _ = await EventRepository().unread_since_extract(G3)
     check("a group nobody has read has nothing unread", n0 == 0, str(n0))
     for i in range(4):
         await say(G3, "u1", "阿强", f"第 {i} 句")
-    n1, newest = await repo.unread_since_extract(G3)
+    n1, newest = await EventRepository().unread_since_extract(G3)
     check("messages arrive unread", n1 == 4 and newest is not None, str(n1))
 
     await _JQ("t").submit(_JT.EXTRACT_MEMORY, {"group_id": G3}, priority=1)
-    n2, _ = await repo.unread_since_extract(G3)
+    n2, _ = await EventRepository().unread_since_extract(G3)
     check("queueing a pass reads nothing, so the count does not move", n2 == 4, str(n2))
 
     await repo.mark_extracted(G3, newest)
-    n3, _ = await repo.unread_since_extract(G3)
+    n3, _ = await EventRepository().unread_since_extract(G3)
     check("marking what was read is what clears them", n3 == 0, str(n3))
 
     # A watermark never goes backwards: two passes can overlap, and the one that finishes
     # later must not reopen what the other already read.
     await repo.mark_extracted(G3, newest - _td(hours=1))
-    n4, _ = await repo.unread_since_extract(G3)
+    n4, _ = await EventRepository().unread_since_extract(G3)
     check("and it never moves backwards", n4 == 0, str(n4))
 
     # ...except for the one sanctioned reset: /relearn means "read it again", and the
@@ -218,7 +220,7 @@ async def main():
     from qqbot.settings import config as _cfgw
     _EW = _cfgw().default.memory.extract_window
     await repo.reset_extract_watermark(G3, keep=_EW)
-    n5, _ = await repo.unread_since_extract(G3)
+    n5, _ = await EventRepository().unread_since_extract(G3)
     check("a reset makes the window count as unread again", n5 == 4, str(n5))
     await repo.mark_extracted(G3, newest)
 

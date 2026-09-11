@@ -64,10 +64,8 @@ class ChatMsg:
         The number is how the model names a picture to open_image, and it is a position
         in one render - so it is applied here rather than stored, exactly like the line
         number. Markers are matched in order against image_refs; if the two counts
-        disagree the message is left unnumbered rather than numbered wrong. They
-        disagree for a line whose text was archived under an older rendering, or a
-        forwarded record fetched by id after the message was numbered - either
-        way a number that opened the wrong picture would be worse than none.
+        disagree the message is left unnumbered rather than numbered wrong - a
+        number that opened the wrong picture would be worse than none.
         """
         if not pic_nums:
             return self.text

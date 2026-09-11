@@ -56,9 +56,6 @@ def tz_sql() -> str:
     return f"UTC{sign}{total // 3600:02d}:{total % 3600 // 60:02d}"
 
 
-DOCKER_SECRETS_DIR = Path("/run/secrets")
-
-
 def _read_key_file(path: Path) -> str:
     """utf-8-sig, because a secret written by a Windows editor carries a BOM that strip()
     will not remove (U+FEFF is not whitespace) - it would ride along into the auth header
@@ -88,21 +85,14 @@ def read_api_key(name: str) -> str:
         MEDIA_API_KEY_FILE -> the file it points at   (a mounted secret file)
         MEDIA_API_KEY                                 (plain env var - the deployed form:
                                                        compose injects it from .env)
-        /run/secrets/media_api_key                    (legacy docker-secret mount)
 
-    The file forms stay supported so a deployment that prefers mounted secrets only has
-    to set the variables; the shipped compose file uses plain env from .env.
+    The file form stays supported so a deployment that prefers mounted secrets only
+    has to set the variable; the shipped compose file uses plain env from .env.
     """
     name = name.strip()
     if not name:
         return ""
-    direct = read_secret(f"{name}_FILE", name)
-    if direct:
-        return direct
-    conventional = DOCKER_SECRETS_DIR / name.lower()
-    if conventional.is_file():
-        return _read_key_file(conventional)
-    return ""
+    return read_secret(f"{name}_FILE", name)
 
 
 def require_key(name: str, what: str) -> str:

@@ -80,8 +80,8 @@ def _known_block(profiles: list[dict]) -> str:
     """
     lines = []
     for p in profiles:
-        # defang on render, not only at ingest: rows filed before the reserved
-        # grammar existed can still carry anything.
+        # defang on render as well as at ingest: names are stored as the platform
+        # reported them, and the render is where the grammar must hold.
         name = defang(p.get("nickname") or "")
         bits = []
         if former := [defang(n) for n in (p.get("former_names") or [])

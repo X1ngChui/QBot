@@ -14,6 +14,37 @@ Apply with:
 docker exec qbot-postgres-1 psql -U qqbot -d qqbot -c "<statement>"
 ```
 
+## 2026-09-11 — one shape per thing
+
+Every batch records its width, every description carries its time, and the
+archive holds one marker grammar and one namesake form. The code that read the
+older shapes is gone, so the data has to match before the code is deployed.
+
+```sql
+-- Candidates staged before batches recorded their width were cut at a fixed
+-- sixty rows; say so, then require it.
+UPDATE memory_candidate SET batch_size = 60 WHERE batch_size IS NULL;
+ALTER TABLE memory_candidate ALTER COLUMN batch_size SET NOT NULL;
+
+-- Descriptions written before described_at existed are of unknown age: stamp
+-- them as expired (any date before the first deployment), then require a stamp
+-- wherever there is a description.
+UPDATE image_cache SET described_at = TIMESTAMPTZ '2026-07-31 00:00+08'
+ WHERE description <> '' AND described_at IS NULL;
+ALTER TABLE image_cache ADD CONSTRAINT image_cache_described_stamped
+    CHECK (description = '' OR described_at IS NOT NULL);
+
+-- The archive's last lines in the older forms: an @-resolution rendered with the
+-- parenthesised namesake serial, and a forwarded entry's picture description in
+-- square brackets. Both rewritten by id after reading them.
+UPDATE raw_event SET plain_text = replace(replace(plain_text,
+           '@<name>(3)', '@<name>⟦同名3⟧'), '@<name>(4)', '@<name>⟦同名4⟧')
+ WHERE id IN ('<id>', '<id>');
+UPDATE raw_event SET plain_text = regexp_replace(plain_text,
+           '\[图片:([^\]]*)\]', '⟦图片:⟧', 'g')
+ WHERE id = '<id>';
+```
+
 ## 2026-09-11 — uploaded originals carry their upload time
 
 ```sql
@@ -63,12 +94,8 @@ indistinguishable from real descriptions in the data, and they expire anyway.
 -- bracket pair that is stripped from every string a member can type, so a
 -- marker in a transcript can only have been written by this system; the
 -- stored derived readings in raw_event.plain_text and image_cache.description
--- were rewritten
--- once by scripts/migrate_markers.py (best-effort pattern rules documented in
--- the script). Run it inside the bot container while the bot is stopped or
--- idle, and only with memory_candidate empty of pending rows - consolidation
--- validates quotes against a re-rendered transcript:
---   docker compose run --rm bot python scripts/migrate_markers.py
+-- were rewritten once by a script since removed; the handful of lines it
+-- missed were fixed by hand on 2026-09-11 (see that entry).
 ```
 
 ## 2026-09-07 — namesake serials

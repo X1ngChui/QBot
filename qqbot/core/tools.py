@@ -147,14 +147,11 @@ def tool_defs() -> list[dict]:
         },
     ]
 
-#: The namesake form current names render as: the name plus the reserved
-#: namesake tag carrying the permanent serial. A speaker argument in this shape
-#: narrows by the serial's account, never by the name half - the name is exactly
-#: what the two people share. The legacy parenthesised form (name(N)) is still
-#: accepted: old transcripts and archived @-resolutions carry it, and the model
-#: copies speaker names verbatim from whatever line it read.
+#: The namesake form names render as: the name plus the reserved namesake tag
+#: carrying the permanent serial. A speaker argument in this shape narrows by the
+#: serial's account, never by the name half - the name is exactly what the two
+#: people share.
 _SEQ_NAME = re.compile(rf"^(.+){SYS_L}同名(\d{{1,9}}){SYS_R}$")
-_SEQ_NAME_LEGACY = re.compile(r"^(.+)\((\d{1,9})\)$")
 
 
 async def _carried_name(group_id: int, uid: str, name: str) -> bool:
@@ -291,7 +288,7 @@ async def search_history(group_id: int, query: str, *, speaker: str | None = Non
         return Failure(f"（检索式有误：{e}）")
     sp = (speaker or "").strip()
     uid: str | None = None
-    if m := (_SEQ_NAME.fullmatch(sp) or _SEQ_NAME_LEGACY.fullmatch(sp)):
+    if m := _SEQ_NAME.fullmatch(sp):
         uid = await repo.member_of_seq(group_id, int(m.group(2)))
         if uid is not None and not await _carried_name(group_id, uid,
                                                        m.group(1).strip()):

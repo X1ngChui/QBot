@@ -139,9 +139,9 @@ CREATE TABLE IF NOT EXISTS memory_fact (
     subject_entity_id UUID         NOT NULL REFERENCES entity(id),
     predicate         VARCHAR(128) NOT NULL,
     -- What distinguishes rows of a multi-valued predicate (likes, by the thing liked;
-    -- term, by the word defined). NULL for single-valued predicates. This used to be
-    -- folded into the predicate itself ("likes:<object>") - two values in one column, which
-    -- first normal form forbids.
+    -- term, by the word defined). NULL for single-valued predicates. Its own column
+    -- rather than a suffix on the predicate: two values in one column is what first
+    -- normal form forbids, and the key is what supersede matches on.
     object_key        TEXT,
     object_entity_id  UUID         REFERENCES entity(id),
     object_value      JSONB,
@@ -194,7 +194,7 @@ CREATE TABLE IF NOT EXISTS memory_candidate (
     -- correctly-quoted records as if invented. Anchor plus size name the exact set;
     -- batches are cut at conversation gaps, so their length varies.
     batch_event_id  UUID        REFERENCES raw_event(id),
-    batch_size      INT,
+    batch_size      INT          NOT NULL,
     candidate_type  VARCHAR(64) NOT NULL,
     payload         JSONB       NOT NULL,
     confidence      REAL,
@@ -414,9 +414,9 @@ CREATE TABLE IF NOT EXISTS image_cache (
     -- The describing path treats one older than llm.vision.description_ttl_days as
     -- a miss and pays to write a fresh one: models improve, and a vendor can put a
     -- better model behind an unchanged id, so age is the only thing that tracks
-    -- description quality from here. NULL means "written before this column
-    -- existed" and counts as expired. Free paths ignore it - a stale description
-    -- still beats a bare marker when nothing may be spent.
+    -- description quality from here. NULL only while there is no description (the
+    -- constraint below); free paths ignore the age - a stale description still
+    -- beats a bare marker when nothing may be spent.
     described_at TIMESTAMPTZ,
     -- The description is a placeholder standing in for a picture the backend's
     -- content filter declined to look at, not something it saw. Expires on the same
@@ -424,5 +424,7 @@ CREATE TABLE IF NOT EXISTS image_cache (
     -- different rules, may well look at it.
     refused     BOOLEAN     NOT NULL DEFAULT FALSE,
     hit_count   BIGINT      NOT NULL DEFAULT 0,
-    last_seen   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    last_seen   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT image_cache_described_stamped
+        CHECK (description = '' OR described_at IS NOT NULL)
 );

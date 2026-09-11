@@ -32,20 +32,15 @@ from .openai_compat import OpenAICompatChat, OpenAICompatVision
 log = logging.getLogger("qqbot.deepseek")
 
 
-# CNY per 1M tokens, off-peak figures; peak doubles them - see _at_peak. Two eras,
-# because the vendor repriced effective 2026-08-17 00:00 Beijing time. Off-peak stays
-# half of peak in both schemes, so the table-plus-multiplier structure holds and only
-# the numbers change. Figures re-verified against the official pricing page 2026-09-09.
-_PRICES_LEGACY = {
-    "deepseek-v4-flash": Rate("Mtoken", in_hit=0.02, in_miss=1.0, out=2.0, source="deepseek docs"),
-    "deepseek-v4-pro": Rate("Mtoken", in_hit=0.025, in_miss=3.0, out=6.0, source="deepseek docs"),
-}
-_PRICES_20260817 = {
+# CNY per 1M tokens, off-peak figures; peak doubles them - see _at_peak. The
+# vendor's pricing as of 2026-08-17; figures re-verified against the official pricing
+# page 2026-09-09. When the vendor reprices, the table changes with it: the ledger
+# books at the rate in force when a call is made, so no older table is kept.
+_PRICES = {
     "deepseek-v4-flash": Rate("Mtoken", in_hit=0.05, in_miss=1.5, out=4.5,
                               source="deepseek repricing eff. 2026-08-17"),
     # Image tokens are input tokens: a picture scales to at most 384 of them and then
-    # bills like any other prompt content, per the launch note (2026-08-21). The model
-    # postdates the repricing, so only this era lists it.
+    # bills like any other prompt content, per the launch note (2026-08-21).
     "deepseek-v4-flash-vision-exp": Rate("Mtoken", in_hit=0.05, in_miss=1.5, out=4.5,
                                          source="deepseek vision launch note: priced as V4-Flash"),
     "deepseek-v4-pro": Rate("Mtoken", in_hit=0.15, in_miss=4.5, out=13.5,
@@ -63,8 +58,7 @@ _PRICES_20260817 = {
 }
 # An unlisted model bills at the most expensive tier known, so a rename cannot quietly
 # make spending look smaller than it is.
-_UNKNOWN_LEGACY = Rate("Mtoken", in_hit=3.0, in_miss=3.0, out=6.0, source="pessimistic guess")
-_UNKNOWN_20260817 = Rate("Mtoken", in_hit=4.5, in_miss=4.5, out=13.5, source="pessimistic guess")
+_UNKNOWN = Rate("Mtoken", in_hit=4.5, in_miss=4.5, out=13.5, source="pessimistic guess")
 
 #: Time-of-day billing, announced 2026-06-29 and in force since mid-July. Every component
 #: doubles during peak - a cache hit as much as an output token.
@@ -82,27 +76,18 @@ _PEAK_HOURS = frozenset(range(9, 12)) | frozenset(range(14, 18))
 #: only by the coincidence of it being the same one.
 _BILLING_TZ = ZoneInfo("Asia/Shanghai")
 
-#: When the 2026-08-17 price table takes over, midnight Beijing time. Encoded as a switch
-#: rather than edited in place on the day: a deploy is not going to happen at midnight,
-#: and either constant alone would misbill for however long the gap lasted.
-_REPRICE_AT = datetime(2026, 8, 17, tzinfo=_BILLING_TZ)
-
 #: Models already reported as unpriced, so the warning below fires once each.
 _WARNED_UNKNOWN: set[str] = set()
 
 
 def _rate_at(model: str, now: datetime) -> Rate:
-    """The rate for one model at one moment: era table, then peak doubling.
+    """The rate for one model at one moment: the table, then peak doubling.
 
-    A pure function of the clock so the two boundaries that decide real money - the
-    repricing date and the peak window - can be pinned by tests instead of trusted to
-    comments.
+    A pure function of the clock so the boundary that decides real money - the
+    peak window - can be pinned by tests instead of trusted to comments.
     """
     now = now.astimezone(_BILLING_TZ)
-    table, unknown = ((_PRICES_20260817, _UNKNOWN_20260817)
-                      if now >= _REPRICE_AT
-                      else (_PRICES_LEGACY, _UNKNOWN_LEGACY))
-    rate = table.get(model)
+    rate = _PRICES.get(model)
     if rate is None:
         # Loudly, once per model. The pessimistic tier keeps the daily cap safe
         # by overbilling, which also means an unpriced model burns its reply
@@ -113,7 +98,7 @@ def _rate_at(model: str, now: datetime) -> Rate:
             log.warning("no price entry for model %r: billing at the priciest "
                         "tier, so this model overspends its per-reply scope and "
                         "the daily cap. Add it to the table.", model)
-        rate = unknown
+        rate = _UNKNOWN
     if not _at_peak(now):
         return rate
     return replace(

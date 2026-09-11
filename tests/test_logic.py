@@ -16,7 +16,7 @@ from qqbot.core import nickname, prompt, trigger
 from qqbot.core.state import ChatMsg, GroupState
 import json
 
-from qqbot.core.segments import AtRef, AudioRef, ForwardRef, parse_segments
+from qqbot.core.segments import AtRef, AudioRef, parse_segments
 from qqbot.util import now_local
 
 fails = []
@@ -249,7 +249,8 @@ check("and adds nothing to the text", quoted.render() == "这个", repr(quoted.r
 check("and asks for no lookup", not quoted.refs, str(quoted.refs))
 
 fwd = parse_segments([{"type": "forward", "data": {"id": "abc"}}], "999")
-check("forward becomes a ref", isinstance(fwd.refs[0], ForwardRef) and fwd.refs[0].ident == "abc")
+check("a forward without its content is a bare marker, not a fetch",
+      fwd.render() == "⟦转发的聊天记录⟧" and not fwd.refs, fwd.render())
 
 at_other = parse_segments([{"type": "at", "data": {"qq": "12345"}}], "999")
 check("a bare @qq becomes a ref to resolve", isinstance(at_other.refs[0], AtRef))
@@ -532,9 +533,6 @@ _onlyfirst = cfg.prompt.model_copy(update={"forward_lines": 1})
 _fw5 = parse_segments(_outer, "999", limits=_onlyfirst)
 check("a picture in an unrendered entry is not registered",
       _fw5.pictures == [] and "⟦图片⟧" not in _fw5.render(), _fw5.render())
-check("an id-only forward stays a fetchable ref",
-      isinstance(parse_segments([{"type": "forward", "data": {"id": "abc"}}], "999").refs[0],
-                 ForwardRef))
 
 # Prompts are data: <prompts_dir>/<key>.txt is the source of truth and the manifest in
 # settings.py is the only list of keys. The filename IS the key, so there is no mapping

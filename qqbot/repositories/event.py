@@ -109,22 +109,3 @@ class EventRepository:
                  ORDER BY created_at DESC, id DESC LIMIT $2""",
             group_id, size, anchor,
         )))
-
-    async def batch_ending_at_by_time(
-        self, group_id: int, *, anchor: uuid.UUID | None, size: int,
-    ) -> list:
-        """The `size` messages sent up to and including `anchor`, oldest first.
-
-        Like batch_ending_at, but on the conversation axis (occurred_at). Only for
-        batches made before the ingest-order watermark existed; new batches are
-        always replayed on the axis they were cut on.
-        """
-        return list(reversed(await pool().fetch(
-            f"""SELECT {_MESSAGE_COLS} FROM raw_event
-                 WHERE group_id=$1 AND event_type='message'
-                   AND ($3::uuid IS NULL
-                        OR (occurred_at, id)
-                            <= (SELECT occurred_at, id FROM raw_event WHERE id=$3))
-                 ORDER BY occurred_at DESC, id DESC LIMIT $2""",
-            group_id, size, anchor,
-        )))

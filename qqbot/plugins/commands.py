@@ -39,6 +39,7 @@ from ..core.state import REGISTRY
 from ..db import repo
 from ..domain.identity.alias import CONFIRM_THRESHOLD
 from ..providers import Kind, providers
+from ..repositories.event import EventRepository
 from ..services import NameTaken, NotMerged, PersonCard, UnknownAccount
 from ..settings import config, reload_config
 from ..util import fmt_when, now_local, parse_duration, today_local, why
@@ -468,7 +469,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     # is stuck (the daily report watches the queue side of that).
     backlog = 0
     for g in await repo.groups_with_state():
-        n, _newest = await repo.unread_since_extract(int(g))
+        n, _newest = await EventRepository().unread_since_extract(int(g))
         backlog += n
     lines = [
         "全局用量（所有群合计）",
@@ -525,7 +526,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     rows = await repo.day_breakdown(day, gid)
     spent = sum(float(r["cny"]) for r in rows)
 
-    unread, _newest = await repo.unread_since_extract(int(gid))
+    unread, _newest = await EventRepository().unread_since_extract(int(gid))
     lines = [
         f"本群用量（{gid}）",
         f"人设　　{persona.name}",

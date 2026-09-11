@@ -52,7 +52,7 @@ _MULTI_NL = re.compile(r"\n{3,}")
 #: collide, the guard declines. The character class is the short list of classifiers a
 #: number can take.
 _LINE_NO = re.compile(
-    r"^\s*#\d{1,4}(?:\s+[\[⟦]\d{2}-\d{2} \d{2}:\d{2}[\]⟧])?(?:\s+[^\s:：]{1,20}[:：])?"
+    r"^\s*#\d{1,4}(?:\s+⟦\d{2}-\d{2} \d{2}:\d{2}⟧)?(?:\s+[^\s:：]{1,20}[:：])?"
     r"\s*+(?![号位名楼队班组层期版区])",
     re.M,  # every line: a multi-line reply imitates the numbered format on each one
 )
@@ -60,19 +60,19 @@ _LINE_NO = re.compile(
 #: A time stamp copied back out of the history without its line number. Only the stamp
 #: is eaten, never a speaker after it: a bracketed date-time opening a line is format
 #: imitation, but "X：" after one could be the reply's own words - where the readings
-#: collide, the guard declines, same as _LINE_NO. Both bracket generations are
-#: matched: the reserved pair is what the history teaches now, the square pair is
-#: what old archive lines surfaced by search_history still carry.
-_TS_ONLY = re.compile(r"^\s*[\[⟦]\d{2}-\d{2} \d{2}:\d{2}[\]⟧]\s*", re.M)
+#: collide, the guard declines, same as _LINE_NO. Only the reserved pair: a square
+#: form is what a member's imitation looks like after defang, and quoting a
+#: member is content.
+_TS_ONLY = re.compile(r"^\s*⟦\d{2}-\d{2} \d{2}:\d{2}⟧\s*", re.M)
 #: The provenance marker the engine appends to the bot's own archived lines. The
 #: history is an example the model may follow, and a reply that imitates it would
 #: leak a system annotation into the group. Nobody writes the bracketed form by
 #: hand, so this one is stripped wherever it appears.
-_PROV = re.compile(r"\s*[\[⟦]依据[:：][^\]⟧]*[\]⟧]")
+_PROV = re.compile(r"\s*⟦依据[:：][^⟧]*⟧")
 #: A line imitating the trajectory-entry marker. Whole lines carrying it are
 #: dropped: the marker is system-written and must never reach the group, while the
 #: digest lines that follow one read as ordinary speech and are left to stand.
-_TRACE_LINE = re.compile(r"^.*[\[⟦]检索记录[\]⟧].*$\n?", re.M)
+_TRACE_LINE = re.compile(r"^.*⟦检索记录⟧.*$\n?", re.M)
 #: The quote pointer copied back out of the history. The real quote is the reply
 #: segment the send path attaches; the bracketed form is transcript notation, and
 #: the prompt instruction not to reproduce it is not reliable on its own - replies
@@ -81,7 +81,7 @@ _TRACE_LINE = re.compile(r"^.*[\[⟦]检索记录[\]⟧].*$\n?", re.M)
 #: while one sitting mid-sentence is likelier the reply's own content (somebody's
 #: words restated, or the notation being talked about) - where the readings
 #: collide, the guard declines.
-_REPLY_MARK = re.compile(r"^\s*[\[⟦]回复\s*(?:#\d{1,4}|更早的消息)[\]⟧]\s*", re.M)
+_REPLY_MARK = re.compile(r"^\s*⟦回复\s*(?:#\d{1,4}|更早的消息)⟧\s*", re.M)
 #: Speaker tags copied out of the history: the owner/self/namesake annotations
 #: that ride behind names in transcripts. Dropped whole wherever they appear -
 #: they are annotations about a line, never words anyone says.

@@ -47,9 +47,9 @@ gateway:
   media_wait_sec: 25
   # How long the group's member list is reused before being fetched again.
   member_cache_ttl_sec: 1800
-  # Deadline for the protocol side's media calls (get_image, get_record,
-  # get_forward_msg), under its own half-minute default: a file the platform can
-  # no longer serve does not fail there, it hangs.
+  # Deadline for the protocol side's media calls (get_image, get_record), under
+  # its own half-minute default: a file the platform can no longer serve does not
+  # fail there, it hangs.
   protocol_call_timeout_sec: 10
   # Deadline for downloading a picture or a clip from a link.
   media_http_timeout_sec: 20

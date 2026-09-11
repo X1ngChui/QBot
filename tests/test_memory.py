@@ -26,6 +26,7 @@ import json
 from qqbot.core import retrieval
 from qqbot.db import close_pool, init_pool, pool
 from qqbot.gateway.ingest import ingestor
+from qqbot.repositories.event import EventRepository
 from qqbot.gateway.onebot import GroupMessage, Sender
 from qqbot.providers import (AsrModel, ChatResult, Providers, SearchEngine, TextModel,
                              VisionModel, set_providers)
@@ -698,7 +699,7 @@ async def main():
 
     await say("u1", "董自豪", "水位线在失败后不能动", "wm1")
     await say("u2", "小北", "这两条必须还能被重读", "wm2")
-    before, _ = await _dbrepo.unread_since_extract(G)
+    before, _ = await EventRepository().unread_since_extract(G)
     set_providers(Providers(text=FailingText(), vision=Unused(), asr=Unused(),
                             embedding=_EMBED, search=Unused()))
     try:
@@ -706,14 +707,14 @@ async def main():
         crashed = False
     except RuntimeError:
         crashed = True
-    unread, _ = await _dbrepo.unread_since_extract(G)
+    unread, _ = await EventRepository().unread_since_extract(G)
     check("a failed extraction propagates to the job layer", crashed)
     check("and leaves the batch unread for the retry",
           before > 0 and unread == before, f"{unread}/{before}")
     set_providers(Providers(text=FakeText(), vision=Unused(), asr=Unused(),
                             embedding=_EMBED, search=Unused()))
     n_retry = await w.extract(G, force=True)
-    unread, _ = await _dbrepo.unread_since_extract(G)
+    unread, _ = await EventRepository().unread_since_extract(G)
     check("the retry reads the same batch and the mark then moves",
           n_retry > 0 and unread == 0, f"{n_retry} cands, {unread} unread")
 
@@ -721,7 +722,6 @@ async def main():
     # These branches only ever run on a full chunk at the nightly drain, which is
     # exactly when nobody is watching - so they are exercised here or never.
     from datetime import timedelta as _td
-    from qqbot.workers.memory import LEGACY_WINDOW
     BATCH_GAP = _td(minutes=config().default.memory.batch_gap_min)
 
     base = now_local()
@@ -765,7 +765,7 @@ async def main():
           len(await w._next_unread(G2)) == WINDOW)
     _calls_t = CALLS.count("extract")
     await w.extract(G2, force=True)
-    unread_t, _ = await _dbrepo.unread_since_extract(G2)
+    unread_t, _ = await EventRepository().unread_since_extract(G2)
     check("and it drains in a single pass with nothing left behind",
           CALLS.count("extract") == _calls_t + 1 and unread_t == 0,
           f"{CALLS.count('extract') - _calls_t} call(s), {unread_t} unread")
@@ -776,14 +776,13 @@ async def main():
         await say("t2", "阿强", f"第二天的第 {i} 句", f"d2-{i}", gid=G2)
     _calls_d = CALLS.count("extract")
     await w.extract(G2, force=True)
-    unread_d, _ = await _dbrepo.unread_since_extract(G2)
+    unread_d, _ = await EventRepository().unread_since_extract(G2)
     check("a backlog wider than one window drains in exactly two passes",
           CALLS.count("extract") == _calls_d + 2 and unread_d == 0,
           f"{CALLS.count('extract') - _calls_d} call(s), {unread_d} unread")
 
-    # Replay, both widths: a candidate that stored its batch size gets back
-    # precisely the rows its extraction read; one from before the column existed
-    # replays the fixed occurred_at window its batch was made with.
+    # Replay: a candidate's stored batch size gets back precisely the rows its
+    # extraction read.
     all_rows = await pool().fetch(
         "SELECT id FROM raw_event WHERE group_id=$1 ORDER BY created_at, id", G2)
     anchor = all_rows[-1]["id"]
@@ -791,10 +790,6 @@ async def main():
     check("an exact replay returns precisely the stored batch",
           [r["id"] for r in exact] == [r["id"] for r in all_rows[-5:]],
           f"{len(exact)} rows")
-    legacy = await w._replay(G2, ending_at=anchor, size=None)
-    check("a legacy candidate (no stored size) replays the old fixed window",
-          len(legacy) == LEGACY_WINDOW and legacy[-1]["id"] == anchor,
-          f"{len(legacy)} rows")
 
     # Extraction is a use of the text model with its own model, grade and timeout,
     # while the shared wiring (endpoint, key, backend, concurrency) stays the reply

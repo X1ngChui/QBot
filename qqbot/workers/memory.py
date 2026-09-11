@@ -37,13 +37,6 @@ from ..util import defang, fmt_when, now_local, sysmark, why
 
 log = logging.getLogger("qqbot.worker")
 
-#: The width of an extraction batch from before batches recorded their own size.
-#: Candidates staged by such a batch carry no batch_size, and must be replayed at
-#: the width they were made with - replaying at the current width prepends rows
-#: the model never saw, which shifts every account code and files records against
-#: the wrong people.
-LEGACY_WINDOW = 60
-
 #: How many rounds of pending candidates one consolidation job settles before
 #: handing back. Each round settles everything it fetched, so the loop ends when
 #: the queue is empty; the cap only bounds a job whose candidates keep arriving.
@@ -202,7 +195,7 @@ class MemoryWorker:
         return rows
 
     async def _replay(self, group_id: int, *, ending_at: uuid.UUID | None,
-                      size: int | None) -> list:
+                      size: int) -> list:
         """Reproduce exactly the batch some earlier extraction read.
 
         Validation runs later, as its own job, and re-fetching "the unread
@@ -210,15 +203,8 @@ class MemoryWorker:
         already-read rows could no longer be found, so records that were correctly
         quoted would come back rejected as if the model had invented them. The
         anchor (the batch's last row) plus the stored batch size name the exact
-        set; a candidate from before the size column was added falls back to the
-        fixed window its batch was made with.
+        set.
         """
-        if size is None:
-            # Legacy batches were the newest LEGACY_WINDOW by occurred_at ending at
-            # the anchor; reproduce them the way they were made, at the width they
-            # were made with.
-            return await self._events.batch_ending_at_by_time(
-                group_id, anchor=ending_at, size=LEGACY_WINDOW)
         return await self._events.batch_ending_at(group_id, anchor=ending_at, size=size)
 
     async def _known(self, group_id: int, codes: dict[int, uuid.UUID]) -> str:
