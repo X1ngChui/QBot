@@ -41,7 +41,7 @@ UPDATE raw_event SET plain_text = replace(replace(plain_text,
            '@<name>(3)', '@<name>⟦同名3⟧'), '@<name>(4)', '@<name>⟦同名4⟧')
  WHERE id IN ('<id>', '<id>');
 UPDATE raw_event SET plain_text = regexp_replace(plain_text,
-           '\[图片:([^\]]*)\]', '⟦图片:⟧', 'g')
+           '\[图片:([^\]]*)\]', '⟦图片:\1⟧', 'g')
  WHERE id = '<id>';
 ```
 
