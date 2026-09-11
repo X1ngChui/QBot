@@ -88,13 +88,16 @@ class PromptCfg(_M):
     #: start, so every slide is a miss: sliding rarely is most of what there is to
     #: win, and one message per turn would miss on every reply.
     evict_chunk: int = Field(30, ge=1)
-    #: A sanity rail on original pictures per prompt, newest first - when it binds the
-    #: oldest keep their description lines and their numbers, and open_image fetches
-    #: any of them - and how old one may still be shown as pixels. The age must stay
-    #: under the vision backend's own file retention, or the prompt would cite ids the
-    #: vendor has already dropped.
-    max_images: int = Field(8, ge=0)
-    image_max_age_days: int = Field(7, ge=0)
+    #: How much of a forwarded chat record is rendered into the message that carries
+    #: it: lines in all (nested records count towards the same total), how deep a
+    #: record inside a record is still expanded, and the characters the whole block
+    #: may take. Past any of them the rest is summarised as a count. The character
+    #: bound must sit under gateway.max_msg_len, or the message's own cut would take
+    #: the block's tail - and with it picture markers whose numbers were already
+    #: handed out.
+    forward_lines: int = Field(20, ge=1)
+    forward_depth: int = Field(3, ge=1)
+    forward_chars: int = Field(1500, ge=100)
 
 
 class TriggerCfg(_M):
@@ -215,6 +218,12 @@ class VisionCfg(_BackendCfg):
     #: its description gets. Already-archived transcript lines keep the wording
     #: they were written with; this decides what the *next* sighting reads.
     description_ttl_days: int = Field(15, ge=0)
+    #: How long a stored file id - where the original was filed with the reply
+    #: model's backend - is trusted to still exist there. Past it, open_image
+    #: re-uploads instead of handing the model an id the vendor may have dropped,
+    #: which would fail the whole request the id rides in. Must stay under the
+    #: backend's own retention (the DeepSeek client sets 30 days).
+    file_max_age_days: int = Field(20, ge=1)
     max_images_per_min: int = 6
     #: Bounds both halves of picture handling: the download that feeds the
     #: description call, and the upload that puts the original in front of the
@@ -330,9 +339,6 @@ class RetrievalCfg(_M):
     #: its own: a web page can be any size, and past the model's context the request
     #: fails outright rather than degrading. A cut page is told it was cut.
     url_content_chars: int = Field(8000, ge=500)
-    #: Entries of a merged forward that get rendered. Entries, not characters - what
-    #: each one says is shown whole.
-    forward_nodes: int = Field(6, ge=1)
 
 
 class MemoryCfg(_M):

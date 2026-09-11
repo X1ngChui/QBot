@@ -17,7 +17,7 @@ from datetime import datetime
 from ..db import repo
 from ..settings import config
 from ..util import SYS_L, SYS_R, defang, fmt_when, now_local, sysmark, why
-from .segments import ImageRef, parse_segments
+from .segments import parse_segments
 
 log = logging.getLogger("qqbot.state")
 
@@ -50,16 +50,12 @@ class ChatMsg:
     #: Typed loosely because media imports nothing from here and this module must not
     #: import media back.
     pending: object | None = None
-    #: Where the vision backend filed this message's pictures, in segment order. The
-    #: prompt attaches the newest few of these to the reply so the model reads the
-    #: original pixels, not only the one-line description in the text.
-    images: list[str] = field(default_factory=list)
-    #: The message's picture references (segments.ImageRef), kept for as long as the
-    #: message is in the window - unlike `pending`, which is unpaid *work* and is
-    #: cleared once settled. This is what lets the open_image tool hand the model a
-    #: picture the prompt did not attach: QQ's file id
-    #: trades for a fresh link at any time (see media._bytes). Typed loosely for the
-    #: same reason `pending` is.
+    #: The message's picture references (segments.ImageRef), forwarded ones
+    #: included, in the order their markers render - kept for as long as the
+    #: message is in the window, unlike `pending`, which is unpaid *work* and is
+    #: cleared once settled. This is what lets the open_image tool hand the model
+    #: any picture by number: QQ's file id trades for a fresh link at any time (see
+    #: media._bytes). Typed loosely for the same reason `pending` is.
     image_refs: list = field(default_factory=list)
 
     def numbered_text(self, pic_nums: list[int] | None) -> str:
@@ -69,9 +65,9 @@ class ChatMsg:
         in one render - so it is applied here rather than stored, exactly like the line
         number. Markers are matched in order against image_refs; if the two counts
         disagree the message is left unnumbered rather than numbered wrong. They
-        disagree when a forwarded chat log carries its own nested picture markers,
-        which belong to messages this one does not own, and a number that opened
-        somebody else's picture would be worse than no number at all.
+        disagree for a line whose text was archived under an older rendering, or a
+        forwarded record fetched by id after the message was numbered - either
+        way a number that opened the wrong picture would be worse than none.
         """
         if not pic_nums:
             return self.text
@@ -233,8 +229,7 @@ class GroupState:
             # a restart: re-parsed here, they are what lets open_image hand over a
             # picture posted before the deploy. Parsing is pure and costs nothing.
             segs = payload.get("segments") or []
-            refs = ([x for x in parse_segments(segs, self_id).refs
-                     if isinstance(x, ImageRef)] if segs else [])
+            refs = parse_segments(segs, self_id).pictures if segs else []
             msgs.append(ChatMsg(
                 msg_id=str(r["platform_event_id"] or r["id"]),
                 user_id=uid,

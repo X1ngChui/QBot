@@ -16,10 +16,11 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import TYPE_CHECKING
 
-from ..settings import Settings
-from ..util import defang, sysmark
+from ..settings import PromptCfg, Settings, config
+from ..util import defang, fmt_when, sysmark, tz
 from .botapi import BotApi
 
 if TYPE_CHECKING:                       # resolve() delegates to it; importing it here
@@ -91,16 +92,24 @@ class ImageRef(Ref):
     #: carries; None until then, or when the backend keeps no files.
     file_id: str | None = None
     size: int | None = None
+    #: Inside a forwarded chat record rather than posted here. Such a picture is
+    #: filed (free) so open_image can show it, and reuses a description already
+    #: paid for, but is never described on its own account: one forwarded album
+    #: would otherwise fan out into a vision call per picture. `free` is set to
+    #: match, so the message never waits on it as unpaid work.
+    nested: bool = False
 
     def placeholder(self) -> str:
         return sysmark("图片")
 
     async def resolve(self, proc: MediaProcessor, *, bot: BotApi, group_id: str,
                       cfg: Settings, self_id: str) -> str | None:
-        # Filing comes first and is free: the download link is freshest now, and the id
-        # must exist for the prompt to attach the original. Describing follows, with
-        # its own cache, rate limit and budget gate.
+        # Filing comes first and is free: the download link is freshest now, and the
+        # id is what open_image hands the model. Describing follows, with its own
+        # cache, rate limit and budget gate - unless the picture is only forwarded.
         await proc.ensure_uploaded(self, bot=bot, group_id=group_id, cfg=cfg)
+        if self.nested:
+            return await proc.cached(self)
         return await proc.describe_image(self, bot=bot, group_id=group_id, cfg=cfg)
 
 
@@ -155,16 +164,87 @@ class ParsedMessage:
         return " ".join(self.typed)
 
     def render(self, resolved: dict[int, str] | None = None) -> str:
-        resolved = resolved or {}
-        out = []
-        for p in self.parts:
-            out.append(resolved.get(p.slot) or p.placeholder() if isinstance(p, Ref) else p)
-        return " ".join(x for x in (s.strip() for s in out) if x)
+        return _join(self.parts, resolved or {}, depth=0)
+
+    @property
+    def pictures(self) -> list[ImageRef]:
+        """Every picture this message shows, in the order its markers render -
+        those posted here and those inside a forwarded record alike. The prompt
+        numbers markers in text order and open_image resolves a number back
+        through this list, so the two orders must be the same one."""
+        return [r for r in self.refs if isinstance(r, ImageRef)]
 
     @property
     def needs_model(self) -> bool:
         """Whether resolving this costs an API call, as opposed to a lookup."""
         return any(not r.free for r in self.refs)
+
+
+@dataclass
+class ForwardLine:
+    """One entry of a forwarded chat record: who said it, when, and what."""
+
+    when: str                 # the rendered time stamp, or "" when the node had none
+    who: str
+    parts: list = field(default_factory=list)   # str | Ref | ForwardBlock
+
+
+@dataclass
+class ForwardBlock:
+    """A forwarded chat record, rendered as an indented block under the message
+    that carries it.
+
+    The transcript's grammar is one message per line, with any further line
+    belonging to the message above it, so a record fits as continuation lines:
+    each entry is stamped and named like a message of its own, indented one
+    level per nesting. The pictures inside are ordinary refs on the carrying
+    message - numbered with its own, opened by number - and a record inside a
+    record renders the same way, one level deeper, until the depth bound.
+
+    `lines` is what survived the bounds (prompt.forward_lines / forward_depth /
+    forward_chars); `omitted` is how many entries did not, said as a count so
+    the model knows the record was longer. A block past the depth bound has no
+    lines and is not `expanded`: its header alone says a record was there.
+    """
+
+    total: int
+    lines: list[ForwardLine] = field(default_factory=list)
+    omitted: int = 0
+    expanded: bool = True
+
+    def render(self, resolved: dict[int, str], *, depth: int) -> str:
+        head = sysmark(f"转发的聊天记录 {self.total}条")
+        if not self.expanded:
+            return head
+        pad = "  " * depth
+        out = [head]
+        for ln in self.lines:
+            out.append(f"{pad}{ln.when}{ln.who}: {_join(ln.parts, resolved, depth=depth)}")
+        if self.omitted:
+            out.append(pad + sysmark(f"其余{self.omitted}条未显示"))
+        return "\n".join(out)
+
+
+def _join(parts: list, resolved: dict[int, str], *, depth: int) -> str:
+    """Parts into text: strings as they are, refs by their resolved text or
+    placeholder, blocks rendered one level deeper. A block ends with its own last
+    line, so whatever follows it starts a new line rather than trailing it."""
+    out = ""
+    after_block = False
+    for p in parts:
+        if isinstance(p, ForwardBlock):
+            text = p.render(resolved, depth=depth + 1)
+        elif isinstance(p, Ref):
+            text = (resolved.get(p.slot) or p.placeholder()).strip()
+        else:
+            text = p.strip()
+        if not text:
+            continue
+        if out:
+            out += "\n" if after_block else " "
+        out += text
+        after_block = isinstance(p, ForwardBlock)
+    return out
 
 
 #: Classic QQ emoticons carry only a numeric id; the newer ones carry a name in
@@ -264,127 +344,230 @@ def _card_text(raw: str) -> str:
     return sysmark(f"分享:{prompt.strip()}") if prompt else sysmark("卡片消息")
 
 
-def parse_segments(segments: list[dict], self_id: str) -> ParsedMessage:
-    """Synchronous, allocation-only. Anything needing an API call becomes a Ref."""
-    pm = ParsedMessage()
-    slot = 0
+class _Walk:
+    """One parse of a message and every forwarded record nested in it.
 
-    def add_ref(cls, **kw) -> None:
-        nonlocal slot
-        ref = cls(slot=slot, **kw)
-        pm.parts.append(ref)
-        pm.refs.append(ref)
-        slot += 1
+    Refs and their slots belong to the message whatever depth they sit at, so the
+    walk owns the slot counter; the forward bounds are drawn down across the whole
+    tree, so it owns those too. `depth` is 0 for the message itself and one more
+    for each record inside a record.
+    """
 
-    for seg in segments:
-        stype = seg.get("type")
-        data = seg.get("data")
-        if not isinstance(data, dict):
-            data = {}
+    def __init__(self, pm: ParsedMessage, self_id: str, limits: PromptCfg) -> None:
+        self.pm = pm
+        self.self_id = self_id
+        self.limits = limits
+        self.slot = 0
+        self.lines_left = limits.forward_lines
+        self.chars_left = limits.forward_chars
 
-        if stype == "text":
-            # defang before anything else: member-typed text is the one string an
-            # adversary fully controls, and stripping the system brackets here is
-            # what makes every marker downstream trustworthy by construction.
-            txt = defang(str(data.get("text") or "")).strip()
-            if txt:
-                pm.parts.append(txt)
-                pm.typed.append(txt)
-        elif stype == "at":
-            qq = str(data.get("qq") or "")
-            if qq == self_id:
-                pm.at_bot = True
-                pm.parts.append("@我")
-            elif qq == "all":
-                pm.parts.append("@全体成员")
-            else:
-                # Recorded whether or not the name came with it: being addressed is what
-                # makes someone part of this exchange, and their profile is worth loading
-                # even though they have not spoken.
-                pm.mentions.append(qq)
-                if data.get("name"):
-                    pm.parts.append(f"@{defang(str(data['name']))}")
+    def add_ref(self, parts: list, cls, **kw) -> None:
+        ref = cls(slot=self.slot, **kw)
+        parts.append(ref)
+        self.pm.refs.append(ref)
+        self.slot += 1
+
+    def parse(self, segments: list[dict], parts: list, *, depth: int) -> None:
+        pm, nested = self.pm, depth > 0
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            stype = seg.get("type")
+            data = seg.get("data")
+            if not isinstance(data, dict):
+                data = {}
+
+            if stype == "text":
+                # defang before anything else: member-typed text is the one string an
+                # adversary fully controls, and stripping the system brackets here is
+                # what makes every marker downstream trustworthy by construction.
+                txt = defang(str(data.get("text") or "")).strip()
+                if txt:
+                    parts.append(txt)
+                    if not nested:
+                        pm.typed.append(txt)
+            elif stype == "at":
+                qq = str(data.get("qq") or "")
+                if qq == "all":
+                    parts.append("@全体成员")
+                elif qq == self.self_id and not nested:
+                    pm.at_bot = True
+                    parts.append("@我")
+                elif nested:
+                    # Somebody @-ed inside a forwarded conversation: named for
+                    # readability, but neither an address to the bot nor a person
+                    # this message brought into the group's identity records.
+                    if data.get("name"):
+                        parts.append(f"@{defang(str(data['name']))}")
+                    elif qq:
+                        self.add_ref(parts, AtRef, ident=qq)
                 else:
-                    # Only the number is given, which is meaningless to the model.
-                    add_ref(AtRef, ident=qq)
-        elif stype == "face":
-            raw = data.get("raw") if isinstance(data.get("raw"), dict) else {}
-            name = defang(raw.get("faceText") or "").strip().lstrip("/")
-            name = name or FACE_NAMES.get(str(data.get("id") or ""), "")
-            pm.parts.append(sysmark(f"表情:{name}") if name else sysmark("表情"))
-        elif stype == "mface":
-            add_ref(
-                ImageRef,
-                sticker=True,
-                key=str(data.get("emoji_id") or "") or None,
-                url=data.get("url"),
-                summary=defang(str(data.get("summary") or "")).strip("[]") or None,
-            )
-        elif stype == "image":
-            file_field = str(data.get("file") or "")
-            m = _MD5.search(file_field) or _MD5.search(str(data.get("file_id") or ""))
-            add_ref(
-                ImageRef,
-                key=(m.group(1).lower() if m else None),
-                url=data.get("url"),
-                file=file_field or None,
-                path=data.get("path"),
-                size=_int_or_none(data.get("file_size")),
-                summary=defang(str(data.get("summary") or "")).strip("[]") or None,
-            )
-        elif stype == "record":
-            add_ref(
-                AudioRef,
-                url=data.get("url"),
-                file=str(data.get("file") or "") or None,
-                path=data.get("path"),
-                size=_int_or_none(data.get("file_size")),
-            )
-        elif stype == "reply":
-            # Recorded, not rendered. The quoted message is almost always one the bot is
-            # already being shown, so the prompt points at it by number instead of pasting
-            # an excerpt in - an excerpt says what was said but not which line said it,
-            # and two people saying the same thing is ordinary in a group. See
-            # prompt.numbered.
-            pm.reply_to = str(data.get("id") or "") or None
-        elif stype == "forward":
-            fid = str(data.get("id") or "")
-            if fid:
-                add_ref(ForwardRef, ident=fid)
+                    # Recorded whether or not the name came with it: being addressed
+                    # is what makes someone part of this exchange, and their profile
+                    # is worth loading even though they have not spoken.
+                    pm.mentions.append(qq)
+                    if data.get("name"):
+                        parts.append(f"@{defang(str(data['name']))}")
+                    else:
+                        # Only the number is given, which is meaningless to the model.
+                        self.add_ref(parts, AtRef, ident=qq)
+            elif stype == "face":
+                raw = data.get("raw") if isinstance(data.get("raw"), dict) else {}
+                name = defang(raw.get("faceText") or "").strip().lstrip("/")
+                name = name or FACE_NAMES.get(str(data.get("id") or ""), "")
+                parts.append(sysmark(f"表情:{name}") if name else sysmark("表情"))
+            elif stype == "mface":
+                self.add_ref(
+                    parts, ImageRef,
+                    sticker=True, nested=nested, free=nested,
+                    key=str(data.get("emoji_id") or "") or None,
+                    url=data.get("url"),
+                    summary=defang(str(data.get("summary") or "")).strip("[]") or None,
+                )
+            elif stype == "image":
+                file_field = str(data.get("file") or "")
+                m = _MD5.search(file_field) or _MD5.search(str(data.get("file_id") or ""))
+                self.add_ref(
+                    parts, ImageRef,
+                    nested=nested, free=nested,
+                    key=(m.group(1).lower() if m else None),
+                    url=data.get("url"),
+                    file=file_field or None,
+                    path=data.get("path"),
+                    size=_int_or_none(data.get("file_size")),
+                    summary=defang(str(data.get("summary") or "")).strip("[]") or None,
+                )
+            elif stype == "record":
+                if nested:
+                    # Never transcribed: a clip inside a forward is paid content the
+                    # forwarder did not post, and voice has no cache to reuse.
+                    parts.append(sysmark("语音"))
+                else:
+                    self.add_ref(
+                        parts, AudioRef,
+                        url=data.get("url"),
+                        file=str(data.get("file") or "") or None,
+                        path=data.get("path"),
+                        size=_int_or_none(data.get("file_size")),
+                    )
+            elif stype == "reply":
+                # Recorded, not rendered. The quoted message is almost always one the
+                # bot is already being shown, so the prompt points at it by number
+                # instead of pasting an excerpt in - an excerpt says what was said but
+                # not which line said it, and two people saying the same thing is
+                # ordinary in a group. See prompt.numbered. Inside a forward the
+                # quoted line is not on screen at all, so the pointer is dropped.
+                if not nested:
+                    pm.reply_to = str(data.get("id") or "") or None
+            elif stype == "forward":
+                content = data.get("content")
+                fid = str(data.get("id") or "")
+                if isinstance(content, list) and content:
+                    # The protocol side delivers the record inline, nested records
+                    # included, so it is read here without a call.
+                    parts.append(self.block(content, depth=depth + 1))
+                elif fid and not nested:
+                    # Only an id: fetched later by read_forward, which renders the
+                    # answer through the same block.
+                    self.add_ref(parts, ForwardRef, ident=fid)
+                else:
+                    parts.append(sysmark("转发的聊天记录"))
+            elif stype == "json":
+                parts.append(_card_text(data.get("data") or ""))
+            elif stype == "xml":
+                parts.append(sysmark("卡片消息"))
+            elif stype == "video":
+                parts.append(sysmark("视频"))
+            elif stype == "file":
+                name = defang(str(data.get("file") or data.get("name") or "")).strip()
+                parts.append(sysmark(f"文件:{name}") if name else sysmark("文件"))
+            elif stype == "poke":
+                parts.append(sysmark("戳一戳"))
+            elif stype == "markdown":
+                # Bots on QQ send their output as markdown, and the segment carries
+                # the whole body, not a decoration on it - dropping it drops the
+                # entire message.
+                body = _markdown_text(str(data.get("content") or data.get("data") or ""))
+                if body:
+                    parts.append(body)
+            elif stype == "dice":
+                parts.append(sysmark(f"骰子:{data.get('result')}点")
+                             if data.get("result") else sysmark("骰子"))
+            elif stype == "rps":
+                name = RPS_NAMES.get(str(data.get("result") or ""))
+                parts.append(sysmark(f"猜拳:{name}") if name else sysmark("猜拳"))
+            elif stype:
+                # A type nobody has taught this function about. Say something rather
+                # than drop the message on the floor, and log it once so it can be
+                # added - QQ keeps inventing these, and a silent drop is invisible
+                # from outside.
+                if stype not in _SEEN_UNKNOWN:
+                    _SEEN_UNKNOWN.add(stype)
+                    log.info("unhandled message segment type %r: %s", stype, list(data)[:8])
+                parts.append(sysmark(defang(str(stype))))
+
+    def block(self, nodes: list, *, depth: int) -> ForwardBlock:
+        """A forwarded record's entries as a block, drawing on the shared bounds.
+
+        Bounded here, at parse, rather than at render: a picture inside an entry
+        that is never rendered must never be registered, or the message would
+        carry a numbered reference to a marker the model cannot see.
+        """
+        block = ForwardBlock(total=len(nodes))
+        if depth > self.limits.forward_depth:
+            block.expanded = False
+            return block
+        for i, node in enumerate(nodes):
+            if self.lines_left <= 0 or self.chars_left <= 0:
+                block.omitted = len(nodes) - i
+                break
+            if not isinstance(node, dict):
+                continue
+            # Two shapes: an entry delivered inline is the node itself; one fetched
+            # through the API is wrapped as {"type": "node", "data": {...}}.
+            data = node.get("data") if node.get("type") == "node" else node
+            if not isinstance(data, dict):
+                continue
+            sender = data.get("sender") if isinstance(data.get("sender"), dict) else {}
+            who = defang(str(sender.get("card") or sender.get("nickname")
+                             or data.get("nickname") or "")).strip() or "成员"
+            stamp = _int_or_none(data.get("time"))
+            when = sysmark(fmt_when(datetime.fromtimestamp(stamp, tz()))) + " " if stamp else ""
+            line = ForwardLine(when=when, who=who)
+            segs, raw = segments_of(data)
+            if segs is None:
+                text = defang(raw).strip()
+                if text:
+                    line.parts.append(text)
             else:
-                pm.parts.append(sysmark("转发的聊天记录"))
-        elif stype == "json":
-            pm.parts.append(_card_text(data.get("data") or ""))
-        elif stype == "xml":
-            pm.parts.append(sysmark("卡片消息"))
-        elif stype == "video":
-            pm.parts.append(sysmark("视频"))
-        elif stype == "file":
-            name = defang(data.get("file") or data.get("name") or "").strip()
-            pm.parts.append(sysmark(f"文件:{name}") if name else sysmark("文件"))
-        elif stype == "poke":
-            pm.parts.append(sysmark("戳一戳"))
-        elif stype == "markdown":
-            # Bots on QQ send their output as markdown, and the segment carries the
-            # whole body, not a decoration on it - dropping it drops the entire message.
-            body = _markdown_text(str(data.get("content") or data.get("data") or ""))
-            if body:
-                pm.parts.append(body)
-        elif stype == "dice":
-            pm.parts.append(sysmark(f"骰子:{data.get('result')}点")
-                            if data.get("result") else sysmark("骰子"))
-        elif stype == "rps":
-            name = RPS_NAMES.get(str(data.get("result") or ""))
-            pm.parts.append(sysmark(f"猜拳:{name}") if name else sysmark("猜拳"))
-        elif stype:
-            # A type nobody has taught this function about. Say something rather than
-            # drop the message on the floor, and log it once so it can be added - QQ
-            # keeps inventing these, and a silent drop is invisible from outside.
-            if stype not in _SEEN_UNKNOWN:
-                _SEEN_UNKNOWN.add(stype)
-                log.info("unhandled message segment type %r: %s", stype, list(data)[:8])
-            pm.parts.append(sysmark(defang(str(stype))))
+                self.parse(segs, line.parts, depth=depth)
+            block.lines.append(line)
+            self.lines_left -= 1
+            self.chars_left -= len(when) + len(who) + len(_join(line.parts, {}, depth=depth)) + 4
+        return block
+
+
+def parse_segments(segments: list[dict], self_id: str,
+                   limits: PromptCfg | None = None) -> ParsedMessage:
+    """Synchronous, allocation-only. Anything needing an API call becomes a Ref.
+
+    `limits` bounds how much of a forwarded record is rendered; the default
+    config applies when none is given."""
+    pm = ParsedMessage()
+    _Walk(pm, self_id, limits or config().default.prompt).parse(segments, pm.parts, depth=0)
     return pm
+
+
+def parse_forward(nodes: list, self_id: str,
+                  limits: PromptCfg | None = None) -> tuple[ForwardBlock, ParsedMessage]:
+    """A record fetched through the API, as a block plus the refs it registered -
+    for the id-only forward segment that older protocol sides send. The refs
+    belong to a throwaway message here: the block is rendered by whoever fetched
+    it and folded into the carrying message as text, so its pictures do not join
+    that message's numbering."""
+    pm = ParsedMessage()
+    block = _Walk(pm, self_id, limits or config().default.prompt).block(nodes, depth=1)
+    return block, pm
 
 
 def segments_of(msg: dict) -> tuple[list | None, str]:

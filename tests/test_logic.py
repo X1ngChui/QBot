@@ -416,28 +416,13 @@ check("why() still names a message-less exception", _util.why(TimeoutError()) ==
 
 check("history anchor set", st.history_anchor is not None, str(st.history_anchor))
 
-# original pictures ride inside the messages that posted them: text first, then the
-# file blocks; stale ids are left out (the vendor expires them, and a dead id fails
-# the request it rides in); the sanity rail keeps the newest when it binds; and with
-# no ids at all every message stays a plain string.
-from datetime import timedelta as _td2
-_sti = GroupState(group_id="77")
-_old_ts = now_local() - _td2(days=cfg.prompt.image_max_age_days) - _td2(hours=1)
-_sti.add(ChatMsg(msg_id="i0", user_id="u", nickname="a", text="[图片:旧图]",
-                 ts=_old_ts, images=["file-old"]))
-for i in range(8):
-    _sti.add(ChatMsg(msg_id=f"i{i+1}", user_id="u", nickname="a", text=f"[图片:第{i}张]",
-                     ts=now_local(), images=[f"file-{i}"]))
-_bi = [ChatMsg(msg_id="iq", user_id="u2", nickname="b", text="小X 看这张", ts=now_local(),
-               images=["file-batch"])]
-# Rail out of the way on a copy of the config: freshness alone decides here.
-_wide = cfg.model_copy(deep=True)
-_wide.prompt.max_images = 99
-# Every picture in the prompt carries a number, and the number is what open_image
-# resolves. It has to be one coordinate rather than two ("the second picture in
-# message #12"), because two is a pair the model gets to miscount independently.
-# Numbered oldest first, like the line numbers, so both count the same direction -
-# and stickers share the run, so there is one rule rather than two.
+# No picture rides in the prompt: every marker carries a number and the model opens
+# what it wants to see with open_image. Every picture in the prompt carries a
+# number, and the number is what open_image resolves. It has to be one coordinate
+# rather than two ("the second picture in message #12"), because two is a pair the
+# model gets to miscount independently. Numbered oldest first, like the line
+# numbers, so both count the same direction - and stickers share the run, so there
+# is one rule rather than two.
 from qqbot.core.segments import ImageRef as _IR
 _p1 = ChatMsg(msg_id="p1", user_id="u", nickname="王大锤", text="看 ⟦图片:一只橘猫⟧",
               ts=now_local(), image_refs=[_IR(key="a" * 32)])
@@ -457,75 +442,97 @@ check("the number rides inside the marker, description untouched",
       _p3.render(seq=9, pic_nums=_per["p3"]).endswith(
           "还有 ⟦图片2:一条狗⟧ 和 ⟦表情3:笑到打滚⟧"),
       _p3.render(seq=9, pic_nums=_per["p3"]))
-# A forwarded chat log carries its own nested picture markers, which belong to
-# messages this one does not own. Numbering them would hand the model a number that
-# opens somebody else's picture, so a count mismatch leaves the line alone.
+# A line whose markers outnumber its references (an old archived rendering, a
+# record fetched by id after numbering) is left alone: a number that opened the
+# wrong picture would be worse than none.
 _pf = ChatMsg(msg_id="pf", user_id="u", nickname="小红",
               text="⟦图片:我的图⟧ ⟦转发的聊天记录：李芳: ⟦图片⟧⟧", ts=now_local(),
               image_refs=[_IR(key="d" * 32)])
 check("a line whose markers outnumber its pictures stays unnumbered",
       "⟦图片1:" not in _pf.render(seq=1, pic_nums=[1]), _pf.render(seq=1, pic_nums=[1]))
-
-_att = prompt.attached_images(list(_sti.recent), _bi, _wide)
-check("every fresh picture is attached to its own message",
-      all(_att.get(f"i{i+1}") == [f"file-{i}"] for i in range(8))
-      and _att.get("iq") == ["file-batch"], str(_att))
-check("a picture past the freshness cutoff is left out", "i0" not in _att)
-_none = cfg.model_copy(deep=True)
-_none.prompt.max_images = 0
-check("a rail of zero attaches nothing, leaving every picture to open_image",
-      prompt.attached_images(list(_sti.recent), _bi, _none) == {})
-_tight = cfg.model_copy(deep=True)
-_tight.prompt.max_images = 3
-_att2 = prompt.attached_images(list(_sti.recent), _bi, _tight)
-check("when the rail binds it keeps the newest messages' pictures",
-      set(_att2) == {"iq", "i8", "i7"}, str(_att2))
-# The blocks behind a message are paired with its markers by order alone, so a
-# message that can only bring some of its pictures brings none: two blocks under
-# three numbered markers is a pairing the model gets wrong rather than a partial one.
-_part = GroupState(group_id="78")
-_part.add(ChatMsg(msg_id="pp", user_id="u", nickname="a",
-                  text="⟦图片:能传的⟧ ⟦图片:太大了⟧", ts=now_local(),
-                  images=["file-ok"],
-                  image_refs=[_IR(key="e" * 32), _IR(key="f" * 32)]))
-check("a message whose pictures did not all upload attaches none",
-      prompt.attached_images(list(_part.recent), [], _wide) == {},
-      str(prompt.attached_images(list(_part.recent), [], _wide)))
-_two = ChatMsg(msg_id="tt", user_id="u", nickname="a",
-               text="⟦图片:一⟧ ⟦图片:二⟧", ts=now_local(),
-               images=["file-1", "file-2"],
-               image_refs=[_IR(key="g" * 32), _IR(key="h" * 32)])
-_part2 = GroupState(group_id="79")
-_part2.add(_two)
-_one_slot = cfg.model_copy(deep=True)
-_one_slot.prompt.max_images = 1
-check("and a message that does not fit the rail waits rather than half-arriving",
-      prompt.attached_images(list(_part2.recent), [], _one_slot) == {})
-_mi = prompt.assemble(persona=persona, cfg=cfg, st=_sti, batch=_bi, profiles=[])
-_hist_msgs = _mi[1:-1]
-_with_files = [m for m in _hist_msgs if isinstance(m["content"], list)]
-# Nine fresh pictures against the default rail of eight: the batch plus the newest
-# seven history messages carry originals, and the oldest history picture falls back
-# to its description line like any other unattached one.
-check("history messages with pictures become text-then-file blocks",
-      len(_with_files) == cfg.prompt.max_images - 1
-      and all(m["content"][0]["type"] == "text"
-              and all(b["type"] == "image" for b in m["content"][1:])
-              for m in _with_files), str(_with_files[:1])[:120])
-check("the rail-dropped picture keeps its description line",
-      any(isinstance(m["content"], str) and "第0张" in m["content"] for m in _hist_msgs))
-check("the old picture's line stays a plain string",
-      any(isinstance(m["content"], str) and "旧图" in m["content"] for m in _hist_msgs))
-check("the batch picture rides the tail, text first",
-      isinstance(_mi[-1]["content"], list)
-      and _mi[-1]["content"][0]["type"] == "text"
-      and _mi[-1]["content"][-1] == {"type": "image", "id": "file-batch"},
-      str(_mi[-1]["content"])[:120])
-check("the legend explains what a block behind a marker is",
-      "原图" in _mi[0]["content"])
 _mn = prompt.assemble(persona=persona, cfg=cfg, st=st, batch=batch, profiles=[])
-check("with no pictures every message is a plain string",
+check("every prompt message is a plain string - pictures are opened, never pushed",
       all(isinstance(m["content"], str) for m in _mn))
+check("the legend tells the model to open pictures by number",
+      "open_image" in _mn[0]["content"])
+
+# ---- forwarded chat records: delivered inline, rendered as an indented block
+# The protocol side sends a forwarded record's entries inside the segment, nested
+# records included. Each entry renders as a stamped, named line under the message
+# that carries the record, one indent level per nesting; the pictures inside are
+# the carrying message's own references, numbered in render order and openable.
+def _node(t, who, *segs):
+    return {"time": t, "sender": {"nickname": who}, "message": list(segs)}
+
+
+def _txt(s):
+    return {"type": "text", "data": {"text": s}}
+
+
+def _img(h):
+    return {"type": "image", "data": {"file": h * 32 + ".jpg", "url": "http://x/" + h}}
+
+
+_t0 = int(now_local().timestamp())
+_inner = {"type": "forward", "data": {"id": "in", "content": [
+    _node(_t0 - 86400, "王大锤", _txt("已经来啦")),
+    _node(_t0 - 86000, "王大锤", {"type": "at", "data": {"qq": "999"}}, _txt("草")),
+]}}
+_outer = [
+    _txt("看这个"),
+    {"type": "forward", "data": {"id": "out", "content": [
+        _node(_t0 - 3600, "李芳", _txt("苹果的下载榜一了")),
+        _node(_t0 - 3500, "李芳", _img("a")),
+        _node(_t0 - 3400, "李芳", _inner),
+        _node(_t0 - 3300, "李芳", {"type": "record", "data": {"file": "v.amr"}}),
+    ]}},
+    _txt("怎么看"),
+]
+_fw = parse_segments(_outer, "999")
+_fw_text = _fw.render()
+_fw_lines = _fw_text.splitlines()
+check("the record renders as a block under the carrying message",
+      _fw_lines[0] == "看这个 ⟦转发的聊天记录 4条⟧" and _fw_lines[-1] == "怎么看", _fw_text)
+check("entries are stamped and named, one indent level in",
+      _fw_lines[1].startswith("  ⟦") and _fw_lines[1].endswith("李芳: 苹果的下载榜一了"),
+      _fw_lines[1])
+check("a record inside the record goes one level deeper",
+      any(ln.startswith("    ⟦") and ln.endswith("王大锤: 已经来啦") for ln in _fw_lines),
+      _fw_text)
+check("a forwarded picture is the carrying message's own reference",
+      len(_fw.pictures) == 1 and _fw.pictures[0].nested and _fw.pictures[0].free
+      and _fw.pictures[0].key == "a" * 32, str(_fw.pictures))
+check("and its marker takes a number like any other",
+      "⟦图片7⟧" in ChatMsg(msg_id="fw", user_id="u", nickname="n", text=_fw_text,
+                          ts=now_local(), image_refs=_fw.pictures).render(pic_nums=[7]))
+check("a forwarded voice clip is a bare marker, never transcribed",
+      "  ⟦" in _fw_text and _fw_text.count("⟦语音⟧") == 1
+      and not any(not r.free for r in _fw.refs), _fw_text)
+check("an @ inside the record names the person, never addresses the bot",
+      not _fw.at_bot and any(isinstance(r, AtRef) and r.ident == "999" for r in _fw.refs)
+      and _fw.mentions == [], str(_fw.refs))
+check("what was typed excludes the record", _fw.typed_text == "看这个 怎么看", _fw.typed_text)
+# The bounds: lines in all, depth, and characters - the rest is said as a count, and
+# a picture in an entry that is not rendered is not registered.
+_tight = cfg.prompt.model_copy(update={"forward_lines": 2})
+_fw2 = parse_segments(_outer, "999", limits=_tight)
+check("past the line bound the rest is counted, not rendered",
+      "⟦其余2条未显示⟧" in _fw2.render() and "已经来啦" not in _fw2.render(), _fw2.render())
+_shallow = cfg.prompt.model_copy(update={"forward_depth": 1})
+_fw3 = parse_segments(_outer, "999", limits=_shallow)
+check("past the depth bound a record shows only its header",
+      "⟦转发的聊天记录 2条⟧" in _fw3.render() and "已经来啦" not in _fw3.render(), _fw3.render())
+_short = cfg.prompt.model_copy(update={"forward_chars": 100})
+_fw4 = parse_segments(_outer, "999", limits=_short)
+check("past the character bound the rest is counted too",
+      "未显示⟧" in _fw4.render(), _fw4.render())
+_onlyfirst = cfg.prompt.model_copy(update={"forward_lines": 1})
+_fw5 = parse_segments(_outer, "999", limits=_onlyfirst)
+check("a picture in an unrendered entry is not registered",
+      _fw5.pictures == [] and "⟦图片⟧" not in _fw5.render(), _fw5.render())
+check("an id-only forward stays a fetchable ref",
+      isinstance(parse_segments([{"type": "forward", "data": {"id": "abc"}}], "999").refs[0],
+                 ForwardRef))
 
 # Prompts are data: <prompts_dir>/<key>.txt is the source of truth and the manifest in
 # settings.py is the only list of keys. The filename IS the key, so there is no mapping

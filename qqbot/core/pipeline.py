@@ -37,7 +37,7 @@ from .command_catalog import PREFIXES as COMMANDS
 from .media import MEDIA
 from .members import MEMBERS
 from .ratelimit import DedupSet
-from .segments import ImageRef, ParsedMessage, parse_segments
+from .segments import ParsedMessage, parse_segments
 from .state import REGISTRY, ChatMsg
 
 log = logging.getLogger("qqbot.pipeline")
@@ -205,8 +205,8 @@ class Gateway:
             reply_to=parsed.reply_to,
             # Kept beyond the describe: pending is unpaid work and gets cleared,
             # but the references stay for the window's lifetime so open_image
-            # can reopen a picture whose one-line description is already in.
-            image_refs=[x for x in parsed.refs if isinstance(x, ImageRef)],
+            # can open any picture by number, forwarded ones included.
+            image_refs=parsed.pictures,
         )
 
         # Before this message joins the deque: after a restart the window is rebuilt from
@@ -555,7 +555,6 @@ class Gateway:
         except Exception as e:
             log.warning("group %s: media resolution failed: %s", group_id, why(e))
             return
-        _carry_file_ids(pm, msg)
         if MEDIA.settled(pm, resolved):
             # The paid content is in (or was refused with a cached verdict); nothing
             # is left to buy for this message - and that verdict now matters on the
@@ -621,19 +620,6 @@ class Gateway:
             await repo.backfill_plain_text(msg_id, text)
         except Exception:
             log.exception("failed to backfill plain_text for %s", msg_id)
-
-
-def _carry_file_ids(pm, msg) -> None:
-    """Copy where each picture was filed from the parsed segments onto the ChatMsg.
-
-    The refs live on the parsed message, which is dropped once media settles; the
-    ChatMsg is what the window keeps and what the prompt reads. Runs after every
-    settle because an id can arrive on either pass, and overwriting with the same
-    list is harmless.
-    """
-    fids = [r.file_id for r in pm.refs if isinstance(r, ImageRef) and r.file_id]
-    if fids:
-        msg.images = fids
 
 
 GATEWAY = Gateway()

@@ -658,15 +658,14 @@ async def main():
     check("a picture that draws a reply is understood", len(VISION_SEEN) == 2,
           str(VISION_SEEN))
     tail_i = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["messages"][-1]["content"]
-    # The backend keeps files (upload returned an id) and the picture is in the batch,
-    # so the tail is the multimodal form: the text block first, its pictures behind it.
-    check("the original pixels ride behind the message that posted them",
-          isinstance(tail_i, list)
-          and tail_i[0].get("type") == "text"
-          and any(b.get("type") == "image" and b.get("id", "").startswith("file-api-")
-                  for b in tail_i[1:]), str(tail_i)[:160])
-    tail_text = tail_i[0]["text"] if isinstance(tail_i, list) else tail_i
-    check("and its description reaches the model", "橘猫" in tail_text, tail_text[-120:])
+    # Nothing is pushed: the tail stays text, the description line carries a number,
+    # and the model opens the original by that number if it wants the pixels.
+    check("the tail stays plain text - no original is pushed",
+          isinstance(tail_i, str), str(tail_i)[:160])
+    tail_text = tail_i if isinstance(tail_i, str) else ""
+    check("and its description reaches the model, numbered",
+          "橘猫" in tail_text and "⟦图片" in tail_text
+          and tail_text.split("⟦图片", 1)[1][:1].isdigit(), tail_text[-120:])
     stored2 = await pool().fetchval(
         "SELECT plain_text FROM raw_event WHERE platform_event_id=$1", str(img2.message_id))
     check("and is backfilled into the archive", "橘猫" in (stored2 or ""), repr(stored2))
@@ -813,15 +812,15 @@ async def main():
                  image_refs=[_IRef(slot=0, key="9" * 32, url="http://x/ins.png")])
     _ictx = ToolCtx(bot=bot, by_pic={4: (_imsg, 0)})
     _seen0 = len(VISION_SEEN)
-    out_i = await _texec(_tcall("open_image", n=4), cfg=cfg, group_id="123", ctx=_ictx)
+    out_i = await _texec(_tcall("open_image", ns=[4]), cfg=cfg, group_id="123", ctx=_ictx)
     check("open_image hands back the original as a picture part",
           isinstance(out_i, Attachment)
-          and any(b.get("type") == "image" for b in out_i.blocks), str(out_i.blocks))
+          and any(b.get("type") == "image" for b in out_i.parts), str(out_i.parts))
     check("and costs no model call - it is a fetch, not a second opinion",
           len(VISION_SEEN) == _seen0, str(len(VISION_SEEN) - _seen0))
-    check("the tool message carries the picture beside its text",
-          [b["type"] for b in out_i.content()] == ["image", "text"],
-          str(out_i.content()))
+    check("the tool message labels the picture with its number, then the text",
+          [b["type"] for b in out_i.content()] == ["text", "image", "text"]
+          and out_i.content()[0]["text"] == "图片4：", str(out_i.content()))
     # The neutral part never reaches a vendor: each backend renders it into its own
     # wire shape on the way out, and they really do differ - DeepSeek takes a flat
     # file_id and rejects the nesting OpenAI documents.
@@ -829,15 +828,27 @@ async def main():
     from qqbot.providers.openai_compat import OpenAICompatChat as _OAC
     _neutral = [{"role": "user", "content": out_i.content()}]
     check("the picture part is translated per backend, not shipped as written",
-          _OAC()._wire(_neutral)[0]["content"][0]
+          _OAC()._wire(_neutral)[0]["content"][1]
           == {"type": "file", "file": {"file_id": "file-api-fake2048"}}
-          and _DSC()._wire(_neutral)[0]["content"][0]
+          and _DSC()._wire(_neutral)[0]["content"][1]
           == {"type": "file", "file_id": "file-api-fake2048"},
-          str(_DSC()._wire(_neutral)[0]["content"][0]))
+          str(_DSC()._wire(_neutral)[0]["content"][1]))
     check("and the caller's own messages are left as they were",
-          _neutral[0]["content"][0] == {"type": "image", "id": "file-api-fake2048"})
+          _neutral[0]["content"][1] == {"type": "image", "id": "file-api-fake2048"})
+    # Several at once: a question is often about a set, and one round per picture
+    # would spend the loop's bound on fetching. Unknown numbers are reported beside
+    # the ones that came back, not instead of them.
+    _imsg2 = _CM0(msg_id="ins2", user_id="1", nickname="某人", text="⟦图片⟧", ts=_nl0(),
+                  image_refs=[_IRef(slot=0, key="8" * 32, url="http://x/ins2.png")])
+    _ictx.by_pic[5] = (_imsg2, 0)
+    out_m = await _texec(_tcall("open_image", ns=[4, 5, 99]), cfg=cfg, group_id="123",
+                         ctx=_ictx)
+    check("open_image fetches several pictures in one call",
+          isinstance(out_m, Attachment)
+          and [b["type"] for b in out_m.content()] == ["text", "image", "text", "image", "text"]
+          and "图片5：" in str(out_m.content()) and "99" in str(out_m), str(out_m.content()))
     check("a number outside the prompt is answered, not crashed",
-          "99" in await _texec(_tcall("open_image", n=99),
+          "99" in await _texec(_tcall("open_image", ns=[99]),
                                cfg=cfg, group_id="123", ctx=_ictx))
     check("a missing number is answered too",
           "编号" in await _texec(_tcall("open_image"), cfg=cfg, group_id="123",
@@ -869,12 +880,10 @@ async def main():
     set_providers(Providers(text=FakeText(), vision=SeeingVision(),
                             asr=UnusedAsr(), embedding=_EMBED, search=UnusedSearch()))
 
-    # The window still remembers where this section's pictures were filed, and every
-    # later reply in the group would attach them; the sections below assert on plain
-    # string tails, so put the fixture world back the way they expect it.
+    # The backlog pass would re-file this section's pictures on the next reply;
+    # the sections below count calls, so settle the fixture world first.
     for m in st_m.recent:
-        m.images = []
-        m.pending = None      # or the backlog pass re-files them on the next reply
+        m.pending = None
 
     # 12e. reply and forward segments reach the model as content
     await REGISTRY.get("123")
@@ -903,8 +912,33 @@ async def main():
     ]))
     await drain(2.0)
     tail_f = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["messages"][-1]["content"]
-    check("a forwarded bundle is expanded", "第一条" in tail_f and "第二条" in tail_f,
+    check("an id-only forward is fetched and expanded", "第一条" in tail_f and "第二条" in tail_f,
           tail_f[-140:])
+    # The usual delivery carries the record inline: no fetch, and the pictures inside
+    # are numbered with the carrying message and openable by that number.
+    _t12 = int(_nl0().timestamp())
+    await GATEWAY.handle(bot, FakeEvent(segments=[
+        Seg("forward", {"id": "fi", "content": [
+            {"time": _t12 - 60, "sender": {"nickname": "阿花"},
+             "message": [{"type": "text", "data": {"text": "内嵌第一条"}}]},
+            {"time": _t12 - 30, "sender": {"nickname": "阿花"},
+             "message": [{"type": "image", "data": {"file": "f" * 32 + ".png",
+                                                     "url": "http://x/fwd.png"}}]},
+        ]}),
+        Seg("text", {"text": "小X 里面的图是啥"}),
+    ]))
+    await drain(2.0)
+    tail_i = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["messages"][-1]["content"]
+    check("an inline forward renders as an indented block without a fetch",
+          "内嵌第一条" in tail_i and "\n  ⟦" in tail_i, tail_i[-200:])
+    _fw_line = next(m for m in reversed((await REGISTRY.get("123")).recent)
+                    if "内嵌第一条" in m.text)
+    check("the forwarded picture is the message's own reference",
+          len(_fw_line.image_refs) == 1 and _fw_line.image_refs[0].nested,
+          str(_fw_line.image_refs))
+    check("and its marker is numbered in the prompt",
+          "⟦图片" in tail_i and any(ch.isdigit() for ch in tail_i.split("⟦图片")[-1][:3]),
+          tail_i[-200:])
 
     # The trigger reads the text as it arrived, never the resolved form: a forwarded
     # conversation that merely *mentions* the bot's name inside is nothing anybody

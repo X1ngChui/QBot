@@ -403,10 +403,13 @@ CREATE TABLE IF NOT EXISTS image_cache (
     -- Empty until the describing call has run: the file_id can land first, and a row
     -- exists from whichever write happens first.
     description TEXT        NOT NULL DEFAULT '',
-    -- Where the vision backend filed the original picture (Files API). Referenced by
-    -- reply prompts to show the model the actual pixels; NULL when never uploaded, and
-    -- stale once the backend's retention lapses - readers treat it as a hint.
+    -- Where the reply model's backend filed the original picture (Files API), and
+    -- when. The open_image tool hands the id to the model so it reads the pixels;
+    -- NULL when never uploaded. The backend drops files after its own retention, so
+    -- an id older than llm.vision.file_max_age_days is treated as gone and the
+    -- picture is uploaded again rather than cited by a dead id.
     file_id     VARCHAR(64),
+    file_uploaded_at TIMESTAMPTZ,
     -- When the description was written, which is not when the row was last used.
     -- The describing path treats one older than llm.vision.description_ttl_days as
     -- a miss and pays to write a fresh one: models improve, and a vendor can put a

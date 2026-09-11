@@ -19,10 +19,8 @@ so sliding rarely is most of what there is to win.
 
 from __future__ import annotations
 
-from datetime import timedelta
-
 from ..settings import Persona, Settings, ptext
-from ..util import defang, describe_now, now_local, sysmark
+from ..util import defang, describe_now, sysmark
 from .state import ChatMsg, GroupState
 
 # The history window is a message count, not a token budget: money bounds what a
@@ -238,11 +236,11 @@ def numbered(visible: list[ChatMsg]) -> tuple[dict[str, int], dict[str, str]]:
 def numbered_images(visible: list[ChatMsg]) -> tuple[dict[str, list[int]], dict[int, tuple]]:
     """Give every picture in this prompt a number, oldest first.
 
-    The reply model reads pictures itself now, but only the newest few arrive as pixels
-    (prompt.max_images); the rest are description lines. A number is how the model names
-    one it wants opened, and it has to be a number rather than "the second picture in
-    message #12" because that is two coordinates for one thing and the model gets to
-    pick which it miscounts.
+    The reply model reads pictures itself, and a number is how it names the ones it
+    wants opened - it has to be a number rather than "the second picture in message
+    #12" because that is two coordinates for one thing and the model gets to pick
+    which it miscounts. Pictures inside a forwarded record count with the message
+    that carries the record, in the order its block renders them.
 
     Numbered oldest first, like the line numbers, so both count the same direction.
     Returns the numbers per message - the render puts them into the markers - and the
@@ -266,17 +264,14 @@ def numbered_images(visible: list[ChatMsg]) -> tuple[dict[str, list[int]], dict[
 
 def render_history(window: list[ChatMsg], nums: dict[str, int],
                    marks: dict[str, str],
-                   images: dict[str, list[str]] | None = None,
                    traces: dict[str, str] | None = None,
                    pics: dict[str, list[int]] | None = None) -> list[dict]:
-    """One chat message per line of transcript; a message that posted pictures carries
-    their originals as file blocks right behind its text.
+    """One chat message per line of transcript, text only.
 
-    Inline rather than gathered at the tail, because a picture is part of the message
-    that posted it - the model reads it where the conversation had it. Cache-safe all
-    the same: the blocks are stable content, so an untouched message renders
-    byte-identical between turns, and the only things that reshape one are the
-    freshness cutoff and the rail in attached_images - both rare, both a single miss.
+    No picture rides in the history. Every marker carries a number and the model
+    opens what it wants to see with open_image, so a message's render depends on
+    nothing but the message: it stays byte-identical between turns, and the
+    prefix cache is never spent on a picture that a newer one pushed off a rail.
 
     A reply with a stored trajectory gets it seated directly before it, as its own
     assistant message: what was looked up, then what was said. Unnumbered and
@@ -285,7 +280,6 @@ def render_history(window: list[ChatMsg], nums: dict[str, int],
     what keeps the rendering stable between turns. The deque never holds these;
     the table is the single source and eviction follows the reply's own.
     """
-    images = images or {}
     traces = traces or {}
     pics = pics or {}
     out: list[dict] = []
@@ -301,54 +295,8 @@ def render_history(window: list[ChatMsg], nums: dict[str, int],
         line = m.render(seq=nums.get(m.msg_id, 0),
                         quote="" if m.is_bot else marks.get(m.msg_id, ""),
                         pic_nums=pics.get(m.msg_id))
-        fids = images.get(m.msg_id)
-        out.append({
-            "role": "assistant" if m.is_bot else "user",
-            "content": ([{"type": "text", "text": line}]
-                        + [{"type": "image", "id": f} for f in fids])
-            if fids else line,
-        })
+        out.append({"role": "assistant" if m.is_bot else "user", "content": line})
     return out
-
-
-#: How many original pictures a prompt carries and how old they may be is config
-#: (prompt.max_images, prompt.image_max_age_days). Not a layout budget: pictures sit
-#: inside the messages that posted them and the window is the real bound - the cap
-#: only stops a sticker-flood day from carrying hundreds of blocks into every reply,
-#: and when it binds the oldest fall back to their description lines.
-
-
-def attached_images(window: list[ChatMsg], batch: list[ChatMsg],
-                    cfg: Settings) -> dict[str, list[str]]:
-    """Which originals each message carries into this prompt, by message id.
-
-    Walked newest message first, so when the rail binds it keeps what the
-    conversation is most likely about - people discuss the picture just posted, not
-    yesterday's. What it leaves out is not lost: those pictures keep their
-    description lines and their numbers, and open_image fetches any of them.
-
-    All or nothing per message. The blocks ride behind that message's own markers
-    with nothing but their order to pair them up, so a message contributing some of
-    its pictures leaves the model matching three numbered markers against two
-    pictures - and the pairing it settles on is wrong. That happens when the rail
-    runs out mid-message, and when a picture has no id at all because it was too
-    large to send or its upload failed.
-    """
-    keep: dict[str, list[str]] = {}
-    n = 0
-    cap = cfg.prompt.max_images
-    cutoff = now_local() - timedelta(days=cfg.prompt.image_max_age_days)
-    for m in reversed(list(window) + list(batch)):
-        if not m.images or m.ts < cutoff:
-            continue
-        refs = getattr(m, "image_refs", None) or []
-        if refs and len(m.images) != len(refs):
-            continue
-        if n + len(m.images) > cap:
-            continue
-        keep[m.msg_id] = list(m.images)
-        n += len(m.images)
-    return keep
 
 
 def build_tail(*, batch: list[ChatMsg],
@@ -417,16 +365,7 @@ def assemble(
         nums, marks = numbered(window + list(batch))
     if pics is None:
         pics, _ = numbered_images(window + list(batch))
-    images = attached_images(window, batch, cfg)
-    messages.extend(render_history(window, nums, marks, images, traces, pics))
-    tail = build_tail(batch=batch, nums=nums, marks=marks, pics=pics)
-    # The batch renders inside the tail text, so its pictures attach here - behind the
-    # text, like every other message's. The legend explains what a block behind a
-    # picture marker is; no per-turn notice needed.
-    fids = [f for m in batch for f in images.get(m.msg_id, [])]
-    content = (
-        [{"type": "text", "text": tail}] + [{"type": "image", "id": f} for f in fids]
-        if fids else tail
-    )
-    messages.append({"role": "user", "content": content})
+    messages.extend(render_history(window, nums, marks, traces, pics))
+    messages.append({"role": "user",
+                     "content": build_tail(batch=batch, nums=nums, marks=marks, pics=pics)})
     return messages

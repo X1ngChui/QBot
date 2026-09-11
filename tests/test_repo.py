@@ -137,6 +137,21 @@ async def main():
           await repo.image_cache_get("k2") == "[图片:占位测试]")
     check("and the file_id survives it",
           await repo.image_cache_file("k2") == "file-api-abc")
+    # The backend expires files, so an id is only trusted while young: one older
+    # than the window (or stamped before the upload time was recorded) reads as
+    # absent and the picture is uploaded again.
+    from datetime import timedelta as _td_f
+    check("a fresh file_id is trusted inside the age window",
+          await repo.image_cache_file("k2", max_age=_td_f(days=1)) == "file-api-abc")
+    await pool().execute(
+        "UPDATE image_cache SET file_uploaded_at = now() - interval '2 days' WHERE key='k2'")
+    check("an old file_id reads as absent",
+          await repo.image_cache_file("k2", max_age=_td_f(days=1)) is None)
+    await pool().execute("UPDATE image_cache SET file_uploaded_at = NULL WHERE key='k2'")
+    check("an unstamped file_id reads as absent too",
+          await repo.image_cache_file("k2", max_age=_td_f(days=1)) is None)
+    check("and without an age it is still returned as a hint",
+          await repo.image_cache_file("k2") == "file-api-abc")
     check("a picture never uploaded has no file_id",
           await repo.image_cache_file("k1") is None)
 

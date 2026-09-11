@@ -122,6 +122,11 @@ llm:
     # transcript lines already archived keep the wording they were written
     # with. 0 disables expiry.
     description_ttl_days: 15
+    # How long a stored file id (where the original was filed with the reply
+    # model's backend) is trusted to still exist there; past it open_image
+    # uploads the picture again. Keep it under the backend's retention (30 days
+    # for DeepSeek).
+    file_max_age_days: 20
     max_images_per_min: 6
     # Biggest picture worth handling, in MB. Bounds both halves of picture
     # handling: the download that feeds the description call, and the upload
@@ -197,15 +202,14 @@ prompt:
   # How many messages leave at once. A prefix cache matches from the start, so
   # every slide is a miss - sliding rarely is most of what there is to win.
   evict_chunk: 30
-  # Original pictures one prompt may carry, newest first, and how old one may be
-  # and still be shown as pixels rather than as its description line. A message
-  # brings all of its pictures or none, so the count binds at message
-  # granularity. What it leaves out is not lost: those pictures keep their
-  # description lines and their numbers, and open_image fetches any of them.
-  # The age must stay under the file retention of the backend that stores them
-  # (the text one).
-  max_images: 8
-  image_max_age_days: 7
+  # How much of a forwarded chat record is rendered into the message carrying
+  # it: lines in all (nested records count towards the same total), how deep a
+  # record inside a record is still expanded, and the characters the whole
+  # block may take. Past any bound the rest is summarised as a count. Keep the
+  # character bound under gateway.max_msg_len.
+  forward_lines: 20
+  forward_depth: 3
+  forward_chars: 1500
 
 retrieval:
   # Lines of surrounding conversation around each search_history hit, each way.
@@ -225,9 +229,6 @@ retrieval:
   # its own - past the model's context the request fails outright - and a cut page
   # is told it was cut.
   url_content_chars: 8000
-  # Entries of a merged forward that get rendered. Entries, not characters: what
-  # each one says is shown whole.
-  forward_nodes: 6
 
 # How much the memory pipeline reads, and how fast it lets go. The model that runs
 # extraction is not here - it belongs to the capability doing the work

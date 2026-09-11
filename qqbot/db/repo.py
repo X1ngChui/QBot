@@ -67,6 +67,7 @@ async def ensure_schema() -> None:
                ('raw_event','plain_text'),
                ('group_state','first_seen_at'),
                ('image_cache','file_id'),
+               ('image_cache','file_uploaded_at'),
                ('image_cache','described_at'),
                ('image_cache','refused'),
                ('cost_ledger','day'),
@@ -211,20 +212,29 @@ async def image_cache_put(key: str, description: str, *, refused: bool = False) 
     )
 
 
-async def image_cache_file(key: str) -> str | None:
-    """Where this picture was filed with the model that reads it, if it was ever
-    uploaded. A hint, not a guarantee: the backend expires files, and a dead id can
-    fail the request it rides in - which is why the prompt only ever attaches ids
-    from recent messages."""
-    return await pool().fetchval(
-        "SELECT file_id FROM image_cache WHERE key=$1", key)
+async def image_cache_file(key: str, *, max_age: timedelta | None = None) -> str | None:
+    """Where this picture was filed with the model that reads it, if it was uploaded
+    within `max_age`. The backend expires files, and a dead id fails the whole
+    request it rides in, so an id past the age (or one stored before its upload
+    time was recorded) is reported as absent and the caller uploads again."""
+    row = await pool().fetchrow(
+        "SELECT file_id, file_uploaded_at FROM image_cache WHERE key=$1", key)
+    if not row or not row["file_id"]:
+        return None
+    if max_age is not None:
+        at = row["file_uploaded_at"]
+        if at is None or at < now_local() - max_age:
+            return None
+    return row["file_id"]
 
 
 async def image_cache_set_file(key: str, file_id: str) -> None:
     await pool().execute(
-        """INSERT INTO image_cache (key, file_id) VALUES ($1,$2)
+        """INSERT INTO image_cache (key, file_id, file_uploaded_at)
+           VALUES ($1,$2,now())
            ON CONFLICT (key) DO UPDATE
-             SET file_id = EXCLUDED.file_id, last_seen = now()""",
+             SET file_id = EXCLUDED.file_id, file_uploaded_at = now(),
+                 last_seen = now()""",
         key,
         file_id,
     )

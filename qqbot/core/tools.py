@@ -116,12 +116,14 @@ def tool_defs() -> list[dict]:
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "n": {
-                            "type": "integer",
-                            "description": "图片编号，取自转写里 ⟦图片N:…⟧ 或 ⟦表情N:…⟧ 的 N",
+                        "ns": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                            "description": "要查看的图片编号列表，取自转写里 ⟦图片N:…⟧、"
+                                           "⟦表情N:…⟧ 或 ⟦图片N⟧ 的 N；一次最多 6 张",
                         },
                     },
-                    "required": ["n"],
+                    "required": ["ns"],
                 },
             },
         },
@@ -407,25 +409,33 @@ class Failure(str):
 
 
 class Attachment(str):
-    """A tool answer that hands the model a picture rather than describing one.
+    """A tool answer that hands the model pictures rather than describing them.
 
     Still a string - what it says is what everything downstream reads, so the
     provenance marker and the trajectory digest need no special case - but it
-    carries the file blocks that go into the tool message beside that text. The
-    vendor accepts a content array on a tool message, so the picture arrives as
-    the answer to the call rather than as a separate turn appended behind it.
+    carries the content parts that go into the tool message ahead of that text:
+    each picture's number as a text part, then its file block, so the model can
+    tell which number it is looking at. The vendor accepts a content array on a
+    tool message, so the pictures arrive as the answer to the call rather than
+    as a separate turn appended behind it.
     """
 
-    __slots__ = ("blocks",)
+    __slots__ = ("parts",)
 
-    def __new__(cls, text: str, blocks: list[dict]):
+    def __new__(cls, text: str, parts: list[dict]):
         s = super().__new__(cls, text)
-        s.blocks = blocks
+        s.parts = parts
         return s
 
     def content(self) -> list[dict]:
         """This answer as the tool message's content."""
-        return [*self.blocks, {"type": "text", "text": str(self)}]
+        return [*self.parts, {"type": "text", "text": str(self)}]
+
+
+#: How many pictures one open_image call may fetch. Each is a file block in the
+#: next request, and a model asking for the whole window's pictures at once is
+#: better answered with a first batch than with a request that fails on size.
+OPEN_IMAGE_MAX = 6
 
 
 def verified(out: str) -> bool:
@@ -452,23 +462,51 @@ async def execute(call: dict, *, cfg: Settings, group_id: str,
 
     if name == "open_image":
         # Free: bytes and an upload, no model call. The reply model reads pictures
-        # itself, so this hands it one rather than asking another model to look -
-        # which could only ever answer the single question it was given.
-        n = args.get("n")
-        if not isinstance(n, int):
-            return Failure("（需要一个图片编号）")
-        found = (ctx.by_pic if ctx else {}).get(n)
-        if found is None:
-            return Failure(f"（上文里没有编号为 {n} 的图片）")
-        msg, idx = found
-        refs = getattr(msg, "image_refs", None) or []
-        if idx >= len(refs):
-            return Failure(f"（图片 {n} 已经取不回来了，以文字描述为准）")
-        fid = await MEDIA.ensure_uploaded(refs[idx], bot=ctx.bot if ctx else None,
-                                          group_id=group_id, cfg=cfg)
-        if not fid:
-            return Failure(f"（图片 {n} 已经取不回来了，以文字描述为准）")
-        return Attachment(f"（这是图片 {n} 的原图。）", [{"type": "image", "id": fid}])
+        # itself, so this hands them over rather than asking another model to look
+        # - which could only ever answer the single question it was given. Several
+        # at a time, because a question is often about a set (the two screenshots
+        # being compared, every picture in a forwarded record), and one round per
+        # picture would spend the loop's bound on fetching.
+        ns = args.get("ns")
+        if ns is None and isinstance(args.get("n"), int):
+            ns = [args["n"]]
+        if (not isinstance(ns, list) or not ns
+                or not all(isinstance(x, int) and not isinstance(x, bool) for x in ns)):
+            return Failure("（需要图片编号列表。）")
+        wanted = list(dict.fromkeys(ns))[:OPEN_IMAGE_MAX]
+        parts: list[dict] = []
+        shown: list[int] = []
+        unknown: list[int] = []
+        gone: list[int] = []
+        for n in wanted:
+            found = (ctx.by_pic if ctx else {}).get(n)
+            if found is None:
+                unknown.append(n)
+                continue
+            msg, idx = found
+            refs = getattr(msg, "image_refs", None) or []
+            fid = None
+            if idx < len(refs):
+                fid = await MEDIA.ensure_uploaded(refs[idx], bot=ctx.bot if ctx else None,
+                                                  group_id=group_id, cfg=cfg)
+            if not fid:
+                gone.append(n)
+                continue
+            parts += [{"type": "text", "text": f"图片{n}："}, {"type": "image", "id": fid}]
+            shown.append(n)
+
+        def nums(xs: list[int]) -> str:
+            return "、".join(str(x) for x in xs)
+
+        notes = []
+        if unknown:
+            notes.append(f"记录中没有编号为 {nums(unknown)} 的图片或表情")
+        if gone:
+            notes.append(f"图片 {nums(gone)} 的原图已无法取回，以记录中的描述或标注为准")
+        if not shown:
+            return Failure("（" + "；".join(notes) + "。）")
+        text = f"（以上是图片 {nums(shown)} 的原图。" + ("".join(f"{n}。" for n in notes)) + "）"
+        return Attachment(text, parts)
 
     if name == "read_url":
         url = (args.get("url") or "").strip()

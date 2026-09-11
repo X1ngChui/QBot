@@ -79,10 +79,13 @@ rather than accumulate as flags. Adding one is: write the subclass, add a line t
   answers in still gets a readable archive. Every picture is described in one
   line, cached by image content so a repost costs nothing, and the description
   expires by age so a better model gets to look again. The reply model is
-  multimodal, so the newest few originals ride behind the messages that posted
-  them and it reads the pixels; the rest carry their description line and a
-  number, and the `open_image` tool fetches any of them by number. Voice clips
-  are transcribed into the same archive the text goes to.
+  multimodal, but no picture is pushed into the prompt: every picture carries
+  its description line and a number, and the model fetches the originals it
+  wants to see - several per call - with the `open_image` tool, so the history
+  stays text and the prefix cache never turns over on a picture. Forwarded chat
+  records render as an indented block under the message that carries them,
+  nested records one level deeper, and their pictures are numbered with the
+  rest. Voice clips are transcribed into the same archive the text goes to.
 
 - **Money is the only limit.** The daily cap, checked before anything is spent,
   means silence when hit. What costs nothing is not gated by it: voice

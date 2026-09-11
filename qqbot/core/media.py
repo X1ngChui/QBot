@@ -21,13 +21,14 @@ line between this file and segments.py. Two rules shape it:
    days ago. So _bytes tries the shared data directory, then the link, then get_image -
    and a picture stays readable long after the link in the original message stopped
    working.
-2. **Nested content gets the free budget and no more.** A quoted or forwarded message has
-   its @s resolved to names and reuses any description already paid for, because a bare
-   account number is the thing the prompt works hardest to keep out and a picture quoted
-   from earlier in the same group is exactly the one already described. What it will not
-   do is spend: a first sighting of a picture, or a voice clip, stays a placeholder down
-   there, so one forwarded album cannot trigger dozens of vision calls. A forward nested
-   inside a quote is left alone for the same reason - free per hop, unbounded in hops.
+2. **Forwarded content gets the free budget and no more.** The entries of a forwarded
+   record have their @s resolved to names and reuse any description already paid for,
+   because a bare account number is the thing the prompt works hardest to keep out and
+   a picture forwarded from earlier in the same group is exactly the one already
+   described. What it will not do is spend: a first sighting of a picture, or a voice
+   clip, stays a bare marker down there, so one forwarded album cannot trigger dozens
+   of vision calls. The pictures are still filed (free), numbered with the carrying
+   message's own, and the model opens any it wants to see with open_image.
 
 Raw media never touches disk: memory -> API -> discarded, only text and cache keys are
 kept.
@@ -63,8 +64,7 @@ from .segments import (
     ImageRef,
     ParsedMessage,
     Ref,
-    parse_segments,
-    segments_of,
+    parse_forward,
 )
 
 log = logging.getLogger("qqbot.media")
@@ -257,7 +257,10 @@ class MediaProcessor:
             return ref.file_id
         if not ref.key:
             return None
-        cached = await repo.image_cache_file(ref.key)
+        # Only an id young enough to still exist at the backend: a dead one fails
+        # the whole request it rides in, and re-uploading is free.
+        cached = await repo.image_cache_file(
+            ref.key, max_age=timedelta(days=cfg.llm.vision.file_max_age_days))
         if cached:
             ref.file_id = cached
             return cached
@@ -491,50 +494,17 @@ class MediaProcessor:
                 name = ""
         return f"@{name}" if name else None
 
-    async def _nested(self, segments, *, bot: BotApi, group_id: str, self_id: str) -> str:
-        """Flatten nested content on the free budget: everything that costs no model call.
-
-        The budget is the whole rule here, not the nesting depth. A mention left as its
-        placeholder is a bare account number in front of the model - the thing the prompt
-        works hardest to keep out - and a picture quoted from earlier in the same group is
-        exactly the one whose description is already sitting in the cache.
-
-        So: names, and any description already bought. What is refused is spending - a
-        first sighting of a picture, or a voice message, stays a placeholder down here.
-        That is what keeps one forwarded album from fanning out into a vision call each.
-        """
-        pm = parse_segments(segments or [], self_id)
-        if not pm.refs:
-            return pm.render()
-        return pm.render(await self._free_refs(pm, bot=bot, group_id=group_id))
-
-    async def _free_refs(self, pm: ParsedMessage, *, bot: BotApi, group_id: str) -> dict[int, str]:
-        """Everything in one parsed message that can be had without spending."""
-
-        async def free(ref: Ref):
-            if isinstance(ref, AtRef):
-                return await self.name_for(ref, bot=bot, group_id=group_id)
-            # A description already paid for. Stickers cache under their emoji id and
-            # repeat constantly, so they are the most likely of all to be answered here.
-            if isinstance(ref, ImageRef):
-                return await self.cached(ref)
-            # A forward is free too, but it is a fetch, and a forward nested in a quote
-            # would make the number of fetches a property of what the group forwarded.
-            return None
-
-        outs = await asyncio.gather(*(free(r) for r in pm.refs), return_exceptions=True)
-        return {r.slot: o for r, o in zip(pm.refs, outs, strict=True)
-                if isinstance(o, str) and o}
-
-    async def _body_of(self, msg: dict, *, bot: BotApi, group_id: str, self_id: str) -> str:
-        """One forward node's text, on the free budget."""
-        segs, raw = segments_of(msg)
-        if segs is None:
-            return raw
-        return await self._nested(segs, bot=bot, group_id=group_id, self_id=self_id)
-
     async def read_forward(self, ref: ForwardRef, *, bot: BotApi, group_id: str,
                            self_id: str) -> str | None:
+        """A record the protocol side sent by id alone, fetched and rendered.
+
+        The usual delivery carries the record inline and never reaches here; this
+        is the older shape. The fetched entries go through the same parser and
+        block as an inline record, on the free budget: names for mentions, and
+        descriptions already paid for. The pictures inside are filed so a later
+        look is possible, but they do not join the carrying message's numbering -
+        the message was numbered when it arrived, before this fetch answered.
+        """
         try:
             res = await bot.call_api("get_forward_msg", message_id=ref.ident)
         except Exception as e:
@@ -542,27 +512,23 @@ class MediaProcessor:
             log.info("get_forward_msg failed for %s: %s", ref.ident, why(e))
             return None
         nodes = res.get("messages") or res.get("message") or []
-        lines = []
-        limit = config().default.retrieval.forward_nodes
-        for node in nodes[:limit]:
-            data = node.get("data") if node.get("type") == "node" else node
-            data = data or {}
-            sender = data.get("sender") or {}
-            who = defang(
-                sender.get("card") or sender.get("nickname")
-                or data.get("nickname") or ""
-            ).strip()
-            body = await self._body_of(data, bot=bot, group_id=group_id, self_id=self_id)
-            if not body:
-                continue
-            lines.append(f"{who}: {body}" if who else body)
-        if not lines:
+        if not nodes:
             return None
-        more = "" if len(nodes) <= limit else f" 等{len(nodes)}条"
-        # The nested bodies came through parse_segments and are already defanged;
-        # their own media markers keep the system brackets - a nested description
-        # is system writing even inside a forward.
-        return sysmark("转发的聊天记录" + more + "：" + " / ".join(lines))
+        block, pm = parse_forward(nodes, self_id)
+
+        async def free(r: Ref):
+            if isinstance(r, AtRef):
+                return await self.name_for(r, bot=bot, group_id=group_id)
+            if isinstance(r, ImageRef):
+                await self.ensure_uploaded(r, bot=bot, group_id=group_id,
+                                           cfg=config().for_group(group_id)[0])
+                return await self.cached(r)
+            return None
+
+        outs = await asyncio.gather(*(free(r) for r in pm.refs), return_exceptions=True)
+        resolved = {r.slot: o for r, o in zip(pm.refs, outs, strict=True)
+                    if isinstance(o, str) and o}
+        return block.render(resolved, depth=1)
 
     async def resolve(
         self,

@@ -199,9 +199,9 @@ class DeepSeekChat(OpenAICompatChat):
 
     #: Uploaded files expire at the vendor after this long, which is what keeps the
     #: account's file store from silting up with no cleanup job to run or forget.
-    #: It must stay comfortably above prompt.image_max_age_days, the age past which
-    #: the reply prompt stops attaching a picture: expiring first would leave the
-    #: prompt carrying file ids the vendor has already dropped.
+    #: It must stay comfortably above llm.vision.file_max_age_days, the age past
+    #: which a stored file id is re-uploaded rather than trusted: expiring first
+    #: would let open_image hand the model an id the vendor has already dropped.
     FILE_TTL_SEC = 30 * 24 * 3600
 
     async def upload(

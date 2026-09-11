@@ -51,7 +51,7 @@ from qqbot.gateway.ingest import ingestor
 from qqbot.gateway.onebot import GroupMessage, Sender
 from qqbot.providers import build_default, providers, set_providers
 from qqbot.settings import config
-from qqbot.util import now_local, sysmark
+from qqbot.util import fmt_when, now_local, sysmark
 
 #: A group id no real group uses, so the ledger rows are attributable to evals.
 GROUP = "424242"
@@ -286,31 +286,62 @@ def _two_colour_png() -> bytes:
 
 
 async def picture_case(cfg) -> dict:
-    """The reply model reads the pixels, not the description line.
+    """The reply model fetches the pixels itself, by number, and reads them.
 
-    This is the one thing the offline suites cannot show: they prove the file block
-    reaches the request, while whether the model on the other end actually looked is
-    a property of the real backend - and it is the whole reason for going multimodal.
-    The marker in the transcript carries no description on purpose, so an answer
-    naming both colours can only have come from the picture itself.
+    This is the one thing the offline suites cannot show: they prove open_image
+    hands a file block back and that the block reaches the request, while whether
+    the model decides to look, and actually looks, is a property of the real
+    backend. The marker in the transcript carries no description on purpose, so an
+    answer naming both colours can only have come from the picture itself - and
+    only through the tool, since nothing is attached.
     """
     data = _two_colour_png()
     fid = await providers().text.upload(data, cfg=cfg.llm.text, mime="image/png")
     poster = ChatMsg(
         msg_id="pic-1", user_id="u2", nickname="小北",
         text="看看这个 " + sysmark("图片"), ts=now_local() - timedelta(minutes=2),
-        images=[fid] if fid else [],
         image_refs=[ImageRef(key="eval-two-colour", file_id=fid)],
     )
     return {
         "name": "picture_read",
-        "why": "the reply model is multimodal: the original rides behind the message "
-               "that posted it, and only the pixels say what colour anything is",
+        "why": "nothing is attached: the model has to open the picture by number, "
+               "and only the pixels say what colour anything is",
         "window": [poster],
         "trigger": _msg("u1", "阿强", "@我 小北发的那张图，左右两半分别是什么颜色", 0),
         "checks": NO_MARKERS + [
             ("names the left half red", lambda t: "红" in t),
             ("names the right half blue", lambda t: "蓝" in t),
+        ],
+        "loop_checks": [
+            ("the picture was opened", lambda prov, trace: "看了图" in prov),
+        ],
+    }
+
+
+def forward_case() -> dict:
+    """A forwarded record renders as an indented block, and the model reads it as
+    a record - who said what, when - rather than as the forwarder's own words."""
+    t0 = now_local()
+
+    def entry(hours_ago: int, who: str, said: str) -> str:
+        return "  " + sysmark(fmt_when(t0 - timedelta(days=2, hours=hours_ago))) + f" {who}: {said}"
+
+    block = "\n".join([
+        "看看这个 " + sysmark("转发的聊天记录 3条"),
+        entry(3, "李芳", "周六下午三点老地方，带上你的帐篷"),
+        entry(3, "王大锤", "帐篷借给我表弟了，我带炉子"),
+        entry(2, "李芳", "行，那我多带一顶"),
+    ])
+    return {
+        "name": "forward_read",
+        "why": "a forwarded record is an indented block under the carrying message; "
+               "the entries are other people's words at another time",
+        "window": [ChatMsg(msg_id="fw-1", user_id="u2", nickname="小北", text=block,
+                           ts=t0 - timedelta(minutes=3))],
+        "trigger": _msg("u1", "阿强", "@我 小北转的那段里，最后谁负责带帐篷", 0),
+        "checks": NO_MARKERS + [
+            ("names the tent bringer", lambda t: "李芳" in t),
+            ("does not credit the forwarder", lambda t: "小北带" not in t),
         ],
     }
 
@@ -356,7 +387,7 @@ async def main() -> int:
     cfg, persona = config().for_group(GROUP)
     bot = EvalBot()
     failures = 0
-    for case in CASES + [await picture_case(cfg)]:
+    for case in CASES + [forward_case(), await picture_case(cfg)]:
         verdict, raw = await run_case(case, cfg, persona, bot)
         if verdict.startswith("FAIL"):
             failures += 1

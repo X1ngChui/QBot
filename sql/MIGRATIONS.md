@@ -14,6 +14,15 @@ Apply with:
 docker exec qbot-postgres-1 psql -U qqbot -d qqbot -c "<statement>"
 ```
 
+## 2026-09-11 — uploaded originals carry their upload time
+
+```sql
+ALTER TABLE image_cache ADD COLUMN IF NOT EXISTS file_uploaded_at TIMESTAMPTZ;
+```
+
+Existing rows keep a NULL, which reads as "too old to trust": the next open_image on
+such a picture uploads it again and stamps the row.
+
 ## 2026-09-09 — image descriptions expire
 
 ```sql
