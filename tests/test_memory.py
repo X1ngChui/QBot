@@ -125,11 +125,25 @@ class Unused(VisionModel, AsrModel, SearchEngine):
         pass
 
 
+async def settle(mid):
+    """Age one archived row past the extraction watermark's settling margin.
+
+    The unread predicate leaves out the newest few seconds of ingest (see
+    EventRepository.UNREAD_MESSAGE), and a test that writes and reads within the
+    same second would otherwise see nothing to extract. Backdating created_at is
+    what the passage of time would do.
+    """
+    await pool().execute(
+        """UPDATE raw_event SET created_at = created_at - INTERVAL '10 seconds'
+            WHERE platform='qq' AND platform_event_id=$1""", mid)
+
+
 async def say(uid, name, text, mid, gid=G):
     await ingestor().ingest(
         GroupMessage(message_id=mid, group_id=gid, sender=Sender(user_id=uid, card=name),
                      segments=[], self_id="999", occurred_at=now_local(),
                      plain_text=text))
+    await settle(mid)
 
 
 async def main():
@@ -313,6 +327,7 @@ async def main():
     await ingestor().record_own_reply(
         group_id=G, self_id="999", message_id="b1", text="我也在玩鸣潮",
         at=now_local(), name="小X")
+    await settle("b1")
     _codes, _roster, lines = await w._render(G, await pool().fetch(
         """SELECT id, platform_user_id, occurred_at, payload, plain_text FROM raw_event
             WHERE group_id=$1 AND event_type='message' ORDER BY occurred_at""", G))
@@ -459,6 +474,7 @@ async def main():
     await _ing2().record_own_reply(group_id=G, self_id="999", message_id="own-1",
                                    text="切片记得用新采样", at=now_local(),
                                    name="小X")
+    await settle("own-1")
     _rows3 = await pool().fetch(
         """SELECT id, platform_user_id, occurred_at, payload, plain_text FROM raw_event
             WHERE group_id=$1 AND event_type='message' ORDER BY occurred_at""", G)
@@ -653,8 +669,9 @@ async def main():
     left = {r["predicate"]: r["status"] for r in await pool().fetch(
         "SELECT predicate, status FROM memory_fact WHERE group_id=$1"
         " AND subject_entity_id=$2", G, subj)}
+    # Aged out reads as expired, not superseded: nothing contradicted it.
     check("at forty days a current-state fact is gone and a stable one holds",
-          left == {"plays": "superseded", "lives_in": "active"}, str(left))
+          left == {"plays": "expired", "lives_in": "active"}, str(left))
 
     # /relearn's contract, last because it dirties the watermark: an owner asking for a
     # re-read gets one even though nothing is new. The reset is what makes the gate

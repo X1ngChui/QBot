@@ -29,7 +29,7 @@ from ..db import repo
 from ..gateway.ingest import ingestor
 from ..gateway.onebot import GroupMessage, Sender
 from ..settings import Settings, config
-from ..util import defang, now_local, sysmark, tz, why
+from ..util import cut_text, defang, now_local, sysmark, tz, why
 from . import agreement, engine, perms, prompt, trigger
 from .botapi import BotApi
 from .budget import BUDGET
@@ -74,10 +74,12 @@ class Inbound:
         self.parsed = parsed
         self.media_task = media_task
         self.archive_task = archive_task
-        #: The text as it arrived, before any media patch. The patch task mutates
-        #: msg in place on its own schedule, so ordering alone cannot keep the
-        #: trigger reading what was typed; only a snapshot can.
-        self.heard = msg.text
+        #: What was typed, and only that: the text segments, before any media
+        #: patch. The patch task mutates msg in place on its own schedule, so
+        #: ordering alone cannot keep the trigger reading what was typed; only a
+        #: snapshot can - and a snapshot of the render would still carry a share
+        #: card's title or a file name, which nobody typed at the bot.
+        self.heard = parsed.typed_text
 
 
 class Gateway:
@@ -132,13 +134,22 @@ class Gateway:
         if self._dedup_set().seen(msg_id):
             return
         try:
-            st = await REGISTRY.get(group_id)
+            await self._admit(bot, event, group_id=group_id, user_id=user_id,
+                              msg_id=msg_id, cfg=cfg)
         except Exception:
-            # Marked seen, then failed before doing anything with the message: give
-            # the mark back, or the adapter's replay of this event is swallowed and
-            # the message is neither archived nor answered.
+            # Marked seen, then failed before the message reached the window or
+            # the archive: give the mark back, or the adapter's replay of this
+            # event is swallowed and the message is neither archived nor answered.
             self._dedup_set().discard(msg_id)
             raise
+
+    async def _admit(self, bot: BotApi, event, *, group_id: str, user_id: str,
+                     msg_id: str, cfg: Settings) -> None:
+        """Everything handle() does under the dedup mark: parse, window, archive,
+        decide. Split out so one guard covers the whole stretch - the parser and
+        the history load can both raise, and either would otherwise leave the
+        mark held on a message nothing was done with."""
+        st = await REGISTRY.get(group_id)
         # A blocked account is NOT dropped here: its messages arrive, archive and
         # feed memory like anyone's, so the window stays coherent around them - a
         # hole where a person used to be reads as broken context. The price is that
@@ -165,12 +176,13 @@ class Gateway:
             parsed.reply_to = str(getattr(reply, "message_id", "") or "") or None
 
         text = parsed.render()
-        if text.lstrip().startswith(COMMANDS):
-            return  # routed to the command matchers instead
+        # Routed to the command matchers instead. Whole word: the matchers require
+        # whitespace after the name, so "/topology" is chat, not "/top".
+        if text.strip() and text.split(maxsplit=1)[0] in COMMANDS:
+            return
         if not text and not parsed.refs:
             return
-        if len(text) > cfg.gateway.max_msg_len:
-            text = text[: cfg.gateway.max_msg_len]
+        text = cut_text(text, cfg.gateway.max_msg_len)
 
         sender = event.sender
         # The reply path reads the live event, not gateway.Sender - so it defangs
@@ -190,7 +202,6 @@ class Gateway:
             text=text,
             ts=datetime.fromtimestamp(when, tz()) if when else now_local(),
             is_owner=user_id in cfg.owners,
-            mentions=list(parsed.mentions),
             reply_to=parsed.reply_to,
             # Kept beyond the describe: pending is unpaid work and gets cleared,
             # but the references stay for the window's lifetime so open_image
@@ -202,11 +213,7 @@ class Gateway:
         # the archive, so the bot rejoins a conversation knowing what was being discussed
         # rather than starting blind. Only the message path can do this - it is the one
         # place that knows which account is the bot and who its owners are.
-        try:
-            await st.load_history(self_id=str(bot.self_id), owners=set(cfg.owners))
-        except Exception:
-            self._dedup_set().discard(msg_id)   # same rule: fail unmarked
-            raise
+        await st.load_history(self_id=str(bot.self_id), owners=set(cfg.owners))
 
         # Archive unconditionally, off the hot path.
         inbound = GroupMessage.from_event(event, segments, bot.self_id, plain_text=text)
@@ -214,11 +221,11 @@ class Gateway:
             self._archive(inbound, at_accounts=list(parsed.mentions))
         )
 
-        # Free lookups and the pictures run now; only voice waits for a reply. The free
-        # half has to happen on arrival because an unresolved mention archives as a bare
-        # account number; the pictures happen now because the link is freshest, the
-        # upload is free, and the describing call carries its own cache, rate limit and
-        # budget gate - see media.resolve for the full schedule.
+        # Everything the message points at resolves now. The free lookups have to,
+        # because an unresolved mention archives as a bare account number; the
+        # pictures and voice because the link is freshest, the upload is free, and
+        # each paid call carries its own cache, rate limit and budget gate - see
+        # media.resolve.
         media_task = None
         if parsed.refs:
             media_task = self._track(self._resolve_and_patch(
@@ -234,15 +241,15 @@ class Gateway:
             msg.pending = parsed
         st.add(msg)
 
-        # Decided on the text as it arrived (Inbound.heard), never the resolved
-        # form: patched content - a forwarded conversation whose body names the
-        # bot, a mention rendering to a card that matches a nickname - can contain
-        # the trigger word without anyone having typed it at the bot, and being
-        # spoken to means something somebody typed deliberately. A typed nickname
-        # is in the arrival text and an @ is a parse-time flag, so no legitimate
-        # trigger needs the resolved form. The media tasks keep running and patch
-        # the window on their own; the paid settle in the reply task waits for
-        # them before the prompt reads the text.
+        # Decided on what was typed (Inbound.heard), never the render or the
+        # resolved form: a forwarded conversation whose body names the bot, a
+        # share card whose title does, a mention rendering to a card that matches
+        # a nickname - all can contain the trigger word without anyone having
+        # typed it at the bot, and being spoken to means something somebody typed
+        # deliberately. A typed nickname is in the text segments and an @ is a
+        # parse-time flag, so no legitimate trigger needs more. The media tasks
+        # keep running and patch the window on their own; the paid settle in the
+        # reply task waits for them before the prompt reads the text.
         decision = trigger.decide(replace(msg, text=item.heard), parsed.at_bot,
                                   st=st, cfg=cfg)
         if not decision.reply:
@@ -304,20 +311,34 @@ class Gateway:
         except Exception:
             self._dedup_set().discard(nid)   # same rule as handle(): fail unmarked
             raise
-        # The window line wears the rendered (possibly numbered) name; the
-        # archived sender must carry the raw card or nothing, because the
-        # ingest chain files sender names into the alias table as
-        # platform-reported - a namesake suffix (or a bare account number)
-        # written there would assert the platform reported a name nobody
-        # carries, and it would stick.
+        ts = datetime.fromtimestamp(when, tz()) if when else now_local()
+        await self._transcribe(bot, group_id, actor=actor, text=text, msg_id=nid, ts=ts)
+
+    async def _transcribe(self, bot: BotApi, group_id: str, *, actor: str,
+                          text: str, msg_id: str, ts: datetime) -> None:
+        """One system-written line about a member, into the window and the archive.
+
+        The line is attributed to the member it is about and worded as something
+        that happened to them, the way a ban or a recall is - never as words the
+        bot spoke. What the bot is recorded as saying, the model takes as its own
+        voice and repeats when the same question comes back; a gate's notice
+        written as bot speech was answered, verbatim, to a member who had just
+        satisfied the gate.
+
+        The window line wears the rendered (possibly numbered) name; the
+        archived sender must carry the raw card or nothing, because the ingest
+        chain files sender names into the alias table as platform-reported - a
+        namesake suffix (or a bare account number) written there would assert
+        the platform reported a name nobody carries, and it would stick.
+        """
+        cfg, _persona = config().for_group(group_id)
+        st = await REGISTRY.get(group_id)
         name = (await MEMBERS.name_of(bot, group_id, actor)) or actor
         raw = await MEMBERS.raw_name_of(bot, group_id, actor)
-        ts = datetime.fromtimestamp(when, tz()) if when else now_local()
-        msg = ChatMsg(msg_id=nid, user_id=actor, nickname=name, text=text,
-                      ts=ts, is_owner=actor in cfg.owners)
-        st.add(msg)
+        st.add(ChatMsg(msg_id=msg_id, user_id=actor, nickname=name, text=text,
+                       ts=ts, is_owner=actor in cfg.owners))
         inbound = GroupMessage(
-            message_id=nid, group_id=int(group_id),
+            message_id=msg_id, group_id=int(group_id),
             sender=Sender(user_id=actor, nickname=raw or ""),
             segments=[{"type": "text", "data": {"text": text}}],
             self_id=str(bot.self_id), occurred_at=ts, sub_type="notice",
@@ -425,13 +446,16 @@ class Gateway:
                         message=[{"type": "at", "data": {"qq": who}},
                                  {"type": "text",
                                   "data": {"text": " " + agreement.POINTER}}])
-                    # On the record like any bot line: the pointer is speech in
-                    # the group, and the model gets asked about it too.
-                    await note_console_reply(
-                        group_id=group_id, self_id=str(bot.self_id),
-                        text=agreement.POINTER,
-                        message_id=str((sent or {}).get("message_id") or ""),
-                        name=config().persona_for(group_id).name)
+                    # On the record as a notice about the member, not as a line
+                    # the bot spoke: the model repeats what it reads as its own
+                    # earlier answer, and this one must not come back once the
+                    # member has consented. Filed under the platform id of the
+                    # sent message, so a quote of the pointer still resolves.
+                    mid = (str((sent or {}).get("message_id") or "")
+                           or f"consent-{uuid.uuid4().hex[:12]}")
+                    await self._transcribe(
+                        bot, group_id, actor=who, msg_id=mid, ts=now_local(),
+                        text=sysmark("被提示先同意用户协议"))
                 except Exception as e:
                     log.warning("group %s: agreement prompt failed: %s",
                                 group_id, why(e))
@@ -452,23 +476,19 @@ class Gateway:
                 # And whatever is still unread in the history about to be sent: a
                 # question about a voice clip refers to the message before it, which
                 # was never worth paying for on its own.
-                await self._settle_backlog(
-                    st, group_id, bot=bot, cfg=cfg, batch=[item.msg], who=who,
-                )
+                await self._settle_backlog(window, group_id, bot=bot, cfg=cfg, who=who)
                 await engine.respond(
                     bot=bot, st=st, cfg=cfg, persona=persona,
                     batch=[item.msg], window=window,
                     reply_to=decision.initiator_msg_id,
                     initiator=decision.initiator,
                 )
-        except asyncio.CancelledError:
-            raise
         except Exception:
             # A bare task has no worker loop above it to log for it.
             log.exception("group %s: reply task failed", group_id)
 
     async def _settle_backlog(
-        self, st, group_id: str, *, bot: BotApi, cfg, batch: list[ChatMsg],
+        self, window: list[ChatMsg], group_id: str, *, bot: BotApi, cfg,
         who: str | None = None,
     ) -> None:
         """Understand the media still unread in the history this reply will be given.
@@ -478,14 +498,14 @@ class Gateway:
         Voice more so: asking what a clip said is very nearly the only way a voice clip
         is ever discussed.
 
-        The bound is the prompt's own history window, not a count of its own. A picture is
-        worth understanding exactly when the model is about to read the message it is in;
-        one that has already fallen out of the window would be paid for and never seen.
+        The bound is the reply's own window - the slice cut at arrival, the very
+        lines the prompt will carry - not a count of its own and not a fresh cut:
+        a picture is worth understanding exactly when the model is about to read
+        the message it is in, and a slice cut again here, after more messages
+        arrived, could pay for pictures the prompt will not show and skip ones
+        it will.
         """
-        stale = [
-            m for m in prompt.history_window(st, batch, cfg)
-            if m.pending is not None and not m.is_bot
-        ]
+        stale = [m for m in window if m.pending is not None and not m.is_bot]
         # Each attempt owns its own persistence and survives this wait; `pending`
         # is cleared inside it only when every paid slot settled, so a slow or
         # failed try is simply retried next turn - against warm caches and the
@@ -496,8 +516,7 @@ class Gateway:
         tasks = [
             self._track(self._resolve_and_patch(
                 msg.pending, msg, bot=bot, group_id=group_id, cfg=cfg,
-                allow_models=True, note="understood a message from the backlog",
-                who=who))
+                note="understood a message from the backlog", who=who))
             for msg in stale
         ]
         if tasks:
@@ -505,7 +524,6 @@ class Gateway:
 
     async def _resolve_and_patch(
         self, pm, msg: ChatMsg, *, bot: BotApi, group_id: str, cfg: Settings,
-        allow_models: bool = False, media_now: bool = True,
         archive_task=None, note: str | None = None,
         after: asyncio.Task | None = None, who: str | None = None,
     ) -> None:
@@ -533,10 +551,7 @@ class Gateway:
             # way the attribution covers everything paid inside, the single-flight
             # describe included (create_task copies the context).
             with BUDGET.attribute(who if who is not None else msg.user_id):
-                resolved = await MEDIA.resolve(
-                    pm, bot=bot, group_id=group_id, cfg=cfg,
-                    allow_models=allow_models, media_now=media_now,
-                )
+                resolved = await MEDIA.resolve(pm, bot=bot, group_id=group_id, cfg=cfg)
         except Exception as e:
             log.warning("group %s: media resolution failed: %s", group_id, why(e))
             return
@@ -557,8 +572,7 @@ class Gateway:
         # undo it. pm.parts holds the full original text, so an unbounded render
         # would put a 10k-char message back into the window and the archive - past
         # the one per-line bound the no-token-budget prompt layout relies on.
-        if len(new_text) > cfg.gateway.max_msg_len:
-            new_text = new_text[: cfg.gateway.max_msg_len]
+        new_text = cut_text(new_text, cfg.gateway.max_msg_len)
         if new_text and new_text != msg.text:
             msg.text = new_text
             await self._backfill(msg.msg_id, new_text, archive_task)
@@ -574,17 +588,17 @@ class Gateway:
         The tasks persist their own results (_resolve_and_patch), so this only waits:
         a task that finishes in time has already patched the message; one that does
         not keeps running and patches it for the next turn. Nothing is cancelled.
-        Runs only on a replying batch - it starts the paid voice work (arrival
-        covers pictures) and waits out the free arrival tasks alongside it, so the
-        prompt reads the resolved text without a batch that draws no reply ever
-        having stalled the worker.
+        Runs only on a replying batch: a message whose paid content the arrival
+        pass could not settle (rate limited, over the cap, a transient failure)
+        gets a second attempt here, on the asker's account, and the prompt waits
+        a bounded moment for it - so a batch that draws no reply never stalls the
+        worker, and one that does reads the resolved text when it can be had.
         """
         for item in batch:
             if item.parsed.needs_model and item.msg.pending is not None:
                 item.media_task = self._track(self._resolve_and_patch(
                     item.parsed, item.msg, bot=bot, group_id=group_id, cfg=cfg,
-                    allow_models=True, archive_task=item.archive_task,
-                    after=item.media_task, who=who))
+                    archive_task=item.archive_task, after=item.media_task, who=who))
         tasks = [i.media_task for i in batch if i.media_task is not None]
         if not tasks:
             return

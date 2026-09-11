@@ -23,7 +23,8 @@ from ..domain.memory import (
 from ..repositories import EpisodeRepository, IdentityRepository, MemoryRepository
 from ..settings import config
 from .memory_extractor import (
-    ALIAS_KINDS, GROUP_TERM, GROUP_TOPIC, multi_valued, opposites, predicate_names,
+    ALIAS_KINDS, GROUP_TERM, GROUP_TOPIC, line_body, multi_valued, opposites,
+    predicate_names, quoted_in,
 )
 
 log = logging.getLogger("qqbot.consolidate")
@@ -65,7 +66,7 @@ class Validator:
 
     def __init__(self, codes: dict[int, uuid.UUID], lines: tuple[str, ...]) -> None:
         self._codes = codes
-        self._lines = lines
+        self._bodies = tuple(line_body(line) for line in lines)
         self._transcript = "\n".join(lines)
 
     def check(self, c: Candidate) -> Verdict:
@@ -74,9 +75,11 @@ class Validator:
             return Verdict.no(RejectReason.EMPTY)
 
         quote = (p.get("quote") or "").strip()
-        if not quote or not any(quote in line for line in self._lines):
-            # The quote has to be present word for word, inside one message. This is the
-            # only check that stops something that sounds plausible but was never said.
+        if not quote or quoted_in(quote, self._bodies) is None:
+            # The quote has to be present word for word, inside exactly one message,
+            # and inside what the member typed rather than the speaker prefix. This
+            # is the only check that stops something that sounds plausible but was
+            # never said - and a quote found in two messages backs neither.
             return Verdict.no(RejectReason.MALFORMED)
         if c.source_event_id is None:
             # The extractor could not say which message the quote came from, so nothing
@@ -178,15 +181,24 @@ class MemoryConsolidator:
     async def consolidate(
         self, cands: list[Candidate], *, group_id: int, codes: dict[int, uuid.UUID],
         lines: tuple[str, ...], when: datetime,
+        occurred: dict[uuid.UUID, datetime] | None = None,
     ) -> tuple[int, int]:
         """Validate and write one batch. Returns (written, rejected).
 
         `lines` must be the batch the model read, not whatever is recent now - see
         MemoryWorker.consolidate, which reproduces it from the anchor stored on each
         candidate.
+
+        `occurred` maps each of the batch's event ids to when that message was sent.
+        A record is dated by the conversation it came from, not by this write: the
+        two are hours apart on the nightly drain and days apart after a retry, and a
+        fact that started aging from the write would outlive its evidence. `when` is
+        the write time and stamps last_confirmed_at only. A candidate whose source
+        is not in the map falls back to `when`.
         """
         v = Validator(codes, lines)
         ambiguous = v.ambiguous_aliases(cands)
+        occurred = occurred or {}
         written = rejected = 0
 
         for c in cands:
@@ -202,14 +214,16 @@ class MemoryConsolidator:
                          group_id, verdict.reason.value, c.payload)
                 continue
 
+            at = occurred.get(c.source_event_id, when)
             if c.candidate_type is CandidateType.EPISODE:
-                await self._write_episode(c, group_id, codes, when)
+                await self._write_episode(c, group_id, codes, at)
             elif c.candidate_type is CandidateType.GROUP_FACT:
-                await self._write_group_fact(c, group_id, when)
+                await self._write_group_fact(c, group_id, when, at)
             elif c.candidate_type is CandidateType.ALIAS:
                 await self._write_alias(c, group_id, codes[c.payload["account"]])
             else:
-                await self._write_fact(c, group_id, codes[c.payload["account"]], when)
+                await self._write_fact(c, group_id, codes[c.payload["account"]],
+                                       when, at)
             await self._mem.settle(c.accepted())
             written += 1
 
@@ -231,20 +245,26 @@ class MemoryConsolidator:
         )
 
     async def _write_episode(self, c: Candidate, group_id: int,
-                             codes: dict[int, uuid.UUID], when: datetime) -> None:
+                             codes: dict[int, uuid.UUID], at: datetime) -> None:
         """One thing that happened, with the people it happened to.
 
         Retrieval finds an episode by participant before it considers what the text looks
         like, which is why the participants are the part that has to be right - a summary
         that resembles the question is worth nothing if it is filed under the wrong
         people. The raw event it came from rides along as the evidence.
+
+        The episode takes the candidate's id. One candidate is one episode, and a
+        job retried after writing the row but before settling the candidate must
+        find the same row rather than file the event twice - the repository's insert
+        tolerates the duplicate on that id.
         """
         p = c.payload
         await self._eps.add(Episode(
+            id=c.id,
             group_id=group_id,
             summary=p["summary"].strip(),
-            started_at=when,
-            ended_at=when,
+            started_at=at,
+            ended_at=at,
             # The extractor does not score importance yet, so this is a constant in
             # practice and episode ranking degrades to recency - acceptable. Written so
             # an explicit 0.0 is not coerced the day a real score arrives.
@@ -257,7 +277,7 @@ class MemoryConsolidator:
         ))
 
     async def _write_group_fact(self, c: Candidate, group_id: int,
-                                when: datetime) -> None:
+                                when: datetime, at: datetime) -> None:
         """A fact whose subject is the group itself.
 
         A term's object_key is the word being defined, so redefining a word supersedes
@@ -292,20 +312,22 @@ class MemoryConsolidator:
                 confidence=earned_confidence(1),
             ),
             [FactEvidence(c.source_event_id)] if c.source_event_id else [],
-            when=when,
+            when=when, observed_at=at,
         )
 
     async def _write_fact(self, c: Candidate, group_id: int,
-                          entity_id: uuid.UUID, when: datetime) -> None:
+                          entity_id: uuid.UUID, when: datetime, at: datetime) -> None:
         pred = c.payload["predicate"]
         obj = c.payload["object"].strip()
 
         # Saying somebody has gone off a thing retracts their liking it. The two are
         # separate rows about the same object, so nothing else would ever reconcile them
-        # and both would end up in the prompt.
+        # and both would end up in the prompt. Compared in folded form, the way the
+        # keys themselves are matched: "Yyds" and "yyds" are one object.
         if (opposite := opposites().get(pred)) is not None:
             for f in await self._mem.current_facts(group_id, [entity_id]):
-                if f.predicate == opposite and f.object_key == obj:
+                if (f.predicate == opposite and f.object_key
+                        and normalize(f.object_key) == normalize(obj)):
                     await self._mem.retract(f.id)
 
         await self._mem.supersede(
@@ -322,5 +344,5 @@ class MemoryConsolidator:
                 confidence=earned_confidence(1),
             ),
             [FactEvidence(c.source_event_id)] if c.source_event_id else [],
-            when=when,
+            when=when, observed_at=at,
         )

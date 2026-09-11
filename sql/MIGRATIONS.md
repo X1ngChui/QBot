@@ -3,8 +3,9 @@
 `init.sql` only runs on an empty `data/pg`, so every schema change after first start
 is applied by hand to the live database (and to the `qbot-pgtest` test database).
 `ensure_schema` (qqbot/db/repo.py) refuses to boot until the live schema has the
-tables, columns and the cost_ledger primary key the code expects - but it checks by
-name, so this file records the actual statements, newest first. Types mirror
+tables, columns, unique indexes, the cost_ledger primary key and the vector width
+the code expects - but it checks by name, so this file records the actual
+statements, newest first. Types mirror
 `init.sql`, which is always the authoritative shape of a fresh database.
 
 Apply with:
@@ -33,9 +34,11 @@ indistinguishable from real descriptions in the data, and they expire anyway.
 ## 2026-09-08 — reserved-bracket markers (data rewrite, no schema change)
 
 ```sql
--- No DDL. Transcript markers moved from ASCII square brackets to the reserved
--- pair (see docs 6.2, "system markers are unforgeable"); the stored derived
--- readings in raw_event.plain_text and image_cache.description were rewritten
+-- No DDL. Transcript markers moved from ASCII square brackets to a reserved
+-- bracket pair that is stripped from every string a member can type, so a
+-- marker in a transcript can only have been written by this system; the
+-- stored derived readings in raw_event.plain_text and image_cache.description
+-- were rewritten
 -- once by scripts/migrate_markers.py (best-effort pattern rules documented in
 -- the script). Run it inside the bot container while the bot is stopped or
 -- idle, and only with memory_candidate empty of pending rows - consolidation

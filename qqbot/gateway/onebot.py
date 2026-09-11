@@ -25,7 +25,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Self
 
-from ..util import defang, now_local, tz
+from ..util import defang, now_local, scrub_nul, tz
 
 
 class Role(StrEnum):
@@ -112,6 +112,9 @@ class GroupMessage:
         Only fields the adapter guarantees are read directly; reply and to_me are
         products of its preprocessing and are read with getattr, because another adapter
         version may not have them.
+
+        The segments are stored verbatim, so this is the one place a NUL can be
+        taken out of them before the archive write refuses the whole message.
         """
         reply = getattr(event, "reply", None)
         # The event's own epoch timestamp, when it carries one: messages queued
@@ -127,11 +130,11 @@ class GroupMessage:
                 getattr(event.sender, "__dict__", None) or dict(event.sender or {}),
                 fallback_id=str(event.user_id),
             ),
-            segments=segments,
+            segments=scrub_nul(segments),
             self_id=str(self_id),
             occurred_at=(datetime.fromtimestamp(when, tz()) if when else now_local()),
             sub_type=str(getattr(event, "sub_type", "normal") or "normal"),
-            plain_text=plain_text,
+            plain_text=plain_text.replace("\x00", ""),
             reply_to_message_id=(
                 str(getattr(reply, "message_id", "") or "") or None
                 if reply is not None else None

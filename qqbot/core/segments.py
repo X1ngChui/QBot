@@ -144,6 +144,15 @@ class ParsedMessage:
     reply_to: str | None = None
     #: Accounts this message addressed, by id. Not the bot itself - that is at_bot.
     mentions: list[str] = field(default_factory=list)
+    #: The text segments alone - what somebody actually typed. The trigger reads
+    #: this rather than the render: a share card's title, another bot's markdown
+    #: body or a file name can carry the nickname without anyone addressing the
+    #: bot, and being spoken to means something typed deliberately.
+    typed: list[str] = field(default_factory=list)
+
+    @property
+    def typed_text(self) -> str:
+        return " ".join(self.typed)
 
     def render(self, resolved: dict[int, str] | None = None) -> str:
         resolved = resolved or {}
@@ -219,20 +228,34 @@ def _markdown_text(md: str) -> str:
     return "\n".join(ln.strip() for ln in text.splitlines() if ln.strip()).strip()
 
 
+def _int_or_none(v) -> int | None:
+    """A size field as an int, or None for anything a client did not send as one.
+    The parser has to be total: it runs while the message's dedup mark is held,
+    and an exception here would swallow the adapter's replay of the message."""
+    try:
+        return int(v) or None
+    except (TypeError, ValueError):
+        return None
+
+
 def _card_text(raw: str) -> str:
     """Share cards and mini-programs arrive as a JSON blob. The interesting part is a
-    title and a description buried a few levels down; the rest is layout."""
+    title and a description buried a few levels down; the rest is layout. Nothing
+    about the blob's shape is trusted: a list where an object was expected, or a
+    number where a string was, degrades to the bare marker."""
     try:
         data = json.loads(raw)
     except (ValueError, TypeError):
         return sysmark("卡片消息")
-    prompt = defang((data.get("prompt") or "").strip())
-    meta = data.get("meta") or {}
-    for entry in meta.values():
+    if not isinstance(data, dict):
+        return sysmark("卡片消息")
+    prompt = defang(str(data.get("prompt") or "").strip())
+    meta = data.get("meta")
+    for entry in (meta.values() if isinstance(meta, dict) else ()):
         if not isinstance(entry, dict):
             continue
-        title = defang((entry.get("title") or entry.get("tag") or "").strip())
-        desc = defang((entry.get("desc") or entry.get("summary") or "").strip())
+        title = defang(str(entry.get("title") or entry.get("tag") or "").strip())
+        desc = defang(str(entry.get("desc") or entry.get("summary") or "").strip())
         if title or desc:
             # Whole: a card is a headline and a blurb, and the rendered line answers
             # to gateway.max_msg_len like any other message.
@@ -255,15 +278,18 @@ def parse_segments(segments: list[dict], self_id: str) -> ParsedMessage:
 
     for seg in segments:
         stype = seg.get("type")
-        data = seg.get("data") or {}
+        data = seg.get("data")
+        if not isinstance(data, dict):
+            data = {}
 
         if stype == "text":
             # defang before anything else: member-typed text is the one string an
             # adversary fully controls, and stripping the system brackets here is
             # what makes every marker downstream trustworthy by construction.
-            txt = defang(data.get("text") or "").strip()
+            txt = defang(str(data.get("text") or "")).strip()
             if txt:
                 pm.parts.append(txt)
+                pm.typed.append(txt)
         elif stype == "at":
             qq = str(data.get("qq") or "")
             if qq == self_id:
@@ -292,7 +318,7 @@ def parse_segments(segments: list[dict], self_id: str) -> ParsedMessage:
                 sticker=True,
                 key=str(data.get("emoji_id") or "") or None,
                 url=data.get("url"),
-                summary=defang(data.get("summary") or "").strip("[]") or None,
+                summary=defang(str(data.get("summary") or "")).strip("[]") or None,
             )
         elif stype == "image":
             file_field = str(data.get("file") or "")
@@ -303,8 +329,8 @@ def parse_segments(segments: list[dict], self_id: str) -> ParsedMessage:
                 url=data.get("url"),
                 file=file_field or None,
                 path=data.get("path"),
-                size=int(data.get("file_size") or 0) or None,
-                summary=defang(data.get("summary") or "").strip("[]") or None,
+                size=_int_or_none(data.get("file_size")),
+                summary=defang(str(data.get("summary") or "")).strip("[]") or None,
             )
         elif stype == "record":
             add_ref(
@@ -312,7 +338,7 @@ def parse_segments(segments: list[dict], self_id: str) -> ParsedMessage:
                 url=data.get("url"),
                 file=str(data.get("file") or "") or None,
                 path=data.get("path"),
-                size=int(data.get("file_size") or 0) or None,
+                size=_int_or_none(data.get("file_size")),
             )
         elif stype == "reply":
             # Recorded, not rendered. The quoted message is almost always one the bot is
@@ -323,8 +349,10 @@ def parse_segments(segments: list[dict], self_id: str) -> ParsedMessage:
             pm.reply_to = str(data.get("id") or "") or None
         elif stype == "forward":
             fid = str(data.get("id") or "")
-            add_ref(ForwardRef, ident=fid) if fid else pm.parts.append(
-                sysmark("转发的聊天记录"))
+            if fid:
+                add_ref(ForwardRef, ident=fid)
+            else:
+                pm.parts.append(sysmark("转发的聊天记录"))
         elif stype == "json":
             pm.parts.append(_card_text(data.get("data") or ""))
         elif stype == "xml":

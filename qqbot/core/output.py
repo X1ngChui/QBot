@@ -35,7 +35,12 @@ _QUOTE = re.compile(r"^\s{0,3}>\s?", re.M)
 #: what QQ cannot show. Numbered lists need no rule: they are ordinary text already.
 _BULLET_MARK = re.compile(r"^(\s*)[*+]\s+", re.M)
 _HR = re.compile(r"^\s*(?:\*\s*){3,}$|^\s*(?:-\s*){3,}$", re.M)
-_BOLD = re.compile(r"(\*{1,3}|_{2,3})(?=\S)(.+?)(?<=\S)\1", re.S)
+#: Strong emphasis takes two or three markers. A single asterisk is handled apart,
+#: because one is also multiplication: "3*5*2" is arithmetic, and a rule that reads
+#: any starred span as emphasis turns it into "352". Italics therefore need a word
+#: boundary on the outside of each marker, which a product sign never has.
+_BOLD = re.compile(r"(\*{2,3}|_{2,3})(?=\S)(.+?)(?<=\S)\1", re.S)
+_ITALIC = re.compile(r"(?<![\w*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![\w*])")
 _CODE = re.compile(r"`+([^`]+)`+")
 _MULTI_NL = re.compile(r"\n{3,}")
 #: A line number copied back out of the history, with or without the speaker prefix that
@@ -70,9 +75,9 @@ _PROV = re.compile(r"\s*[\[⟦]依据[:：][^\]⟧]*[\]⟧]")
 _TRACE_LINE = re.compile(r"^.*[\[⟦]检索记录[\]⟧].*$\n?", re.M)
 #: The quote pointer copied back out of the history. The real quote is the reply
 #: segment the send path attaches; the bracketed form is transcript notation, and
-#: the prompt asking not to reproduce it did not hold (twice) - one reached a
-#: group verbatim. Anchored to line starts like _LINE_NO and _TS_ONLY: format
-#: imitation reproduces the transcript line's shape, which opens with the mark,
+#: the prompt instruction not to reproduce it is not reliable on its own - replies
+#: carrying it verbatim have been observed. Anchored to line starts like _LINE_NO
+#: and _TS_ONLY: format imitation reproduces the transcript line's shape, which opens with the mark,
 #: while one sitting mid-sentence is likelier the reply's own content (somebody's
 #: words restated, or the notation being talked about) - where the readings
 #: collide, the guard declines.
@@ -80,7 +85,8 @@ _REPLY_MARK = re.compile(r"^\s*[\[⟦]回复\s*(?:#\d{1,4}|更早的消息)[\]�
 #: Speaker tags copied out of the history: the owner/self/namesake annotations
 #: that ride behind names in transcripts. Dropped whole wherever they appear -
 #: they are annotations about a line, never words anyone says.
-_NAME_TAG = re.compile(r"⟦(?:拥有者|你|同名\d{1,9})⟧")
+_NAME_TAG = re.compile(
+    rf"{re.escape(SYS_L)}(?:拥有者|你|同名\d{{1,9}}){re.escape(SYS_R)}")
 
 
 def strip_markdown(text: str) -> str:
@@ -99,6 +105,7 @@ def strip_markdown(text: str) -> str:
         if new == t:
             break
         t = new
+    t = _ITALIC.sub(r"\1", t)
     t = _CODE.sub(r"\1", t)
     t = _MULTI_NL.sub("\n\n", t)
     return t.strip()

@@ -1,4 +1,4 @@
-"""L1/L2 persistence: people, accounts, names, and the trace behind each reference."""
+"""L1 persistence: people, accounts, names, and the evidence behind each name."""
 
 from __future__ import annotations
 
@@ -216,10 +216,10 @@ class IdentityRepository:
     async def split(self, account: IdentityAccount) -> uuid.UUID:
         """Detach one account from the person it is currently filed under.
 
-        A wrong merge is the most damaging thing this system can do to itself (design
-        doc 56): everything the two people ever said becomes one person's history, and
-        nothing downstream can tell which half came from where. The undo has to exist,
-        and it has to be evidence-driven rather than a guess.
+        A wrong merge is the most damaging thing this system can do to itself:
+        everything the two people ever said becomes one person's history, and nothing
+        downstream can tell which half came from where. The undo has to exist, and it
+        has to be evidence-driven rather than a guess.
 
         So the aliases move with the account only when the evidence says they belong to
         it: every supporting row must point at a raw event this account produced. A name
@@ -343,14 +343,25 @@ class IdentityRepository:
         - A platform name's evidence is scored by how many distinct days it has been
           seen, so a card worn for three minutes of a renaming game enters at candidate
           weight and only a card that endures into a second day confirms.
-        - A retired alias stays retired against automatic evidence: the platform
-          re-reports the nickname on every message, and letting that rescore the row
-          would walk back a name the owner just struck out. Only a manual action
-          revives it.
+        - A name an owner struck out stays struck out against automatic evidence: the
+          platform re-reports the nickname on every message, and letting that rescore
+          the row would walk back the owner's decision. The pin is the MANUAL row
+          retire_alias leaves behind, not the inactive status by itself - a name that
+          merely aged out of use carries no pin, so the next sighting revives it.
         - At most one MANUAL evidence row exists per alias, replaced on each manual
           action, so the owner's latest decision is the one the domain reads - setting
           0.4 after 1.0 must mean 0.4, which a max over history cannot express.
         """
+        try:
+            return await self._upsert_alias(alias, evidence)
+        except asyncpg.UniqueViolationError:
+            # Lost a first-sighting race on alias_unique_in_scope (the same new name
+            # arriving on two concurrent messages): the winner's row exists now, and
+            # the rollback took this call's insert with it. Rerun lands on the
+            # row-exists path and strengthens the winner instead.
+            return await self._upsert_alias(alias, evidence)
+
+    async def _upsert_alias(self, alias: Alias, evidence: list[AliasEvidence]) -> Alias:
         async with pool().acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
                 """SELECT * FROM alias
@@ -382,9 +393,16 @@ class IdentityRepository:
                         "UPDATE alias SET last_used_at=NOW() WHERE id=$1", row["id"])
                     return _alias(row)
 
-            if row is not None and row["status"] == "inactive" and not manual_in:
-                # Dead stays dead. The sighting is still written down - the trail should
-                # say the name kept appearing - but it moves nothing.
+            if (row is not None and row["status"] == "inactive" and not manual_in
+                    and await conn.fetchval(
+                        """SELECT 1 FROM alias_evidence
+                            WHERE alias_id=$1 AND evidence_type=$2 LIMIT 1""",
+                        row["id"], EvidenceType.MANUAL.value)):
+                # Struck out by hand: dead stays dead. The sighting is still written
+                # down - the trail should say the name kept appearing - but it moves
+                # nothing. An inactive row without the pin was retired by decay, and
+                # falls through: the name is being used again, so it re-enters as a
+                # candidate and earns its way back like any other sighting.
                 for ev in evidence:
                     await conn.execute(
                         """INSERT INTO alias_evidence
@@ -404,11 +422,14 @@ class IdentityRepository:
                         "DELETE FROM alias_evidence WHERE alias_id=$1 AND evidence_type=$2",
                         row["id"], EvidenceType.MANUAL.value,
                     )
+                current = _alias(row)
+                if current.status is AliasStatus.INACTIVE:
+                    # Revived, whether by the owner or by a fresh sighting of a name
+                    # decay had retired: the validity window reopens and the rescore
+                    # below decides what it is worth now.
                     await conn.execute(
                         "UPDATE alias SET valid_to=NULL WHERE id=$1", row["id"],
                     )
-                current = _alias(row)
-                if current.status is AliasStatus.INACTIVE:
                     current = replace(current, status=AliasStatus.CANDIDATE, valid_to=None)
                 # The stored MANUAL row rides along into scoring - it is what keeps an
                 # owner's earlier verdict authoritative over this sighting. When this
@@ -607,6 +628,9 @@ class IdentityRepository:
         A name the model marked as a joke gets a shorter window. Most of them are true for
         an afternoon, and the alias_type field would otherwise be one the model is asked
         to fill and nothing ever reads.
+
+        A candidate carrying a MANUAL row is not a guess: an owner set it below the
+        confirmation line on purpose, and that verdict does not lapse for want of use.
         """
         rows = await pool().fetch(
             """UPDATE alias
@@ -616,7 +640,10 @@ class IdentityRepository:
                       < NOW() - (CASE WHEN alias_type = 'joke_name'
                                       THEN COALESCE($3::float, $2::float)
                                       ELSE $2::float END * INTERVAL '1 day')
+                  AND NOT EXISTS (SELECT 1 FROM alias_evidence
+                                   WHERE alias_id = alias.id
+                                     AND evidence_type = $4)
              RETURNING id""",
-            group_id, unused_days, joke_days,
+            group_id, unused_days, joke_days, EvidenceType.MANUAL.value,
         )
         return len(rows)

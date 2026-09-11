@@ -14,7 +14,6 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
-from typing import Self
 
 
 class EntityType(StrEnum):
@@ -60,11 +59,6 @@ class Entity:
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
-    @classmethod
-    def new(cls, *, name: str | None = None,
-            entity_type: EntityType = EntityType.PERSON) -> Self:
-        return cls(id=uuid.uuid4(), entity_type=entity_type, canonical_name=name)
-
 
 @dataclass(frozen=True, slots=True)
 class IdentityAccount:
@@ -81,8 +75,3 @@ class IdentityAccount:
     id: uuid.UUID = field(default_factory=uuid.uuid4)
     first_seen_at: datetime | None = None
     last_seen_at: datetime | None = None
-
-    @property
-    def key(self) -> tuple[str, str]:
-        """The key that is unique within a platform, matching the table's UNIQUE."""
-        return (self.platform, self.platform_user_id)

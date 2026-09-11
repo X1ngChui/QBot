@@ -8,14 +8,17 @@ Pydantic validates; /reload re-reads from disk and swaps the global singleton at
 from __future__ import annotations
 
 import copy
+import logging
 import os
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from . import util
+
+log = logging.getLogger("qqbot.settings")
 #: Every prompt the system may read, by key. The texts are data: each key is a
 #: `<key>.txt` under `prompts_dir`, edited without touching code and re-read on
 #: /reload. This manifest is the only list of them - the filename is the key, so
@@ -56,7 +59,10 @@ Effort = Literal["off", "low", "high", "max"]
 
 class GatewayCfg(_M):
     dedup_ttl_sec: int = 300
-    max_msg_len: int = 2000
+    #: Longest message text kept on arrival and sent as a reply. Command answers
+    #: reserve a 200-character margin under it for their own framing, so the floor
+    #: keeps them a usable width.
+    max_msg_len: int = Field(2000, ge=400)
     #: How long a reply waits for a picture or a voice clip to be understood before
     #: building the prompt without it. The work is never cancelled - it lands for the
     #: next turn either way - so this only decides whether the person waits or the
@@ -113,6 +119,31 @@ class TriggerCfg(_M):
 # `backend` picks the implementation class (see providers/registry.py). Backend quirks -
 # how usage is reported, how to ask it not to deliberate, what extra fields a request
 # needs - belong in that class, not in config.
+class _BackendCfg(_M):
+    """A capability section: its `backend` must name a class the registry lists.
+
+    Checked at load rather than at construction, because the bundle is built once at
+    startup: a name misspelled in an edit would pass /reload and fail the next restart,
+    days later, as a boot error far from its cause.
+    """
+
+    #: Which registry table the name is looked up in; each section names its own.
+    capability: ClassVar[str] = ""
+
+    @field_validator("backend", check_fields=False)
+    @classmethod
+    def _known_backend(cls, v: str) -> str:
+        # Imported here, not at module scope: the registry imports this module for
+        # the config classes, and the tables are the single list of known names.
+        from .providers import registry
+        table = getattr(registry, f"{cls.capability.upper()}_BACKENDS")
+        if v not in table:
+            raise ValueError(
+                f"unknown {cls.capability} backend {v!r}; "
+                f"available: {', '.join(sorted(table))}")
+        return v
+
+
 class TextUseCfg(_M):
     """How one use of the text model differs from the reply path's settings.
 
@@ -128,7 +159,8 @@ class TextUseCfg(_M):
     timeout_sec: float | None = None
 
 
-class TextCfg(_M):
+class TextCfg(_BackendCfg):
+    capability = "text"
     backend: str = "openai_compat"
     base_url: str
     api_key_env: str = "TEXT_API_KEY"
@@ -164,7 +196,8 @@ class TextCfg(_M):
         })
 
 
-class VisionCfg(_M):
+class VisionCfg(_BackendCfg):
+    capability = "vision"
     backend: str = "openai_compat"
     base_url: str
     api_key_env: str = "MEDIA_API_KEY"
@@ -190,7 +223,8 @@ class VisionCfg(_M):
     timeout_sec: float = 30.0
 
 
-class AsrCfg(_M):
+class AsrCfg(_BackendCfg):
+    capability = "asr"
     backend: str = "openai_compat"
     #: Empty is valid for in-process backends (sherpa), which have no endpoint;
     #: the API-backed ones fail their first call without it, loudly enough.
@@ -211,13 +245,16 @@ class AsrCfg(_M):
     timeout_sec: float = 60.0
 
 
-class SearchCfg(_M):
+class SearchCfg(_BackendCfg):
+    capability = "search"
     backend: str
     base_url: str
     api_key_env: str = "SEARCH_API_KEY"
     count: int = 5
     #: Result depth the vendor is asked for; "basic" is one credit, "advanced" two.
-    depth: str = "basic"
+    #: Closed on purpose: the credit booking keys on the exact word, and a
+    #: misspelling would be metered as basic while the vendor charged advanced.
+    depth: Literal["basic", "advanced"] = "basic"
     #: The free tier's credit allowance per calendar month. At it search refuses; there
     #: is no paid fallback.
     monthly_quota: int = 1000
@@ -228,7 +265,8 @@ class SearchCfg(_M):
     timeout_sec: float = 20.0
 
 
-class EmbeddingCfg(_M):
+class EmbeddingCfg(_BackendCfg):
+    capability = "embedding"
     backend: str = "dashscope"
     base_url: str
     api_key_env: str = "MEDIA_API_KEY"
@@ -520,6 +558,13 @@ class Settings(_M):
     # Everyone allowed to run ops commands and receive the daily report. A list because
     # a bot outliving one person's attention needs more than one pair of hands.
     owners: list[str] = Field(default_factory=list)
+
+    @field_validator("owners", mode="before")
+    @classmethod
+    def _ids_as_text(cls, v: Any) -> Any:
+        # Account ids are numbers to YAML unless quoted, and the checks compare
+        # strings: an unquoted entry is the same person, not a schema error.
+        return [str(x) for x in v] if isinstance(v, list) else v
     # IANA zone name. Applied at startup to every local-time reading: the clock the model
     # is told, the cron schedules, and the day the budget rolls over on.
     timezone: str = "Asia/Shanghai"
@@ -647,11 +692,36 @@ class ConfigBundle:
         cached = self._merged.get(group_id)
         if cached is None:
             if persona.overrides:
-                cached = Settings.model_validate(_deep_merge(self._raw, persona.overrides))
+                cached = Settings.model_validate(
+                    _deep_merge(self._raw, self._without_backends(group_id, persona.overrides)))
             else:
                 cached = self.default
             self._merged[group_id] = cached
         return cached, persona
+
+    @staticmethod
+    def _without_backends(group_id: str, overrides: dict) -> dict:
+        """A group's overrides with any llm.<capability>.backend dropped, and logged.
+
+        The backend classes are built once at startup from the top-level config;
+        a group may repoint endpoint and model (passed per call) but cannot change
+        which class serves it. Left in, the value would read back from the group's
+        merged settings as though it applied.
+        """
+        llm = overrides.get("llm")
+        if not isinstance(llm, dict):
+            return overrides
+        touched = [cap for cap, sec in llm.items()
+                   if isinstance(sec, dict) and "backend" in sec]
+        if not touched:
+            return overrides
+        log.warning("group %s overrides llm.%s.backend: backends are chosen once at "
+                    "startup from the top-level config, override ignored",
+                    group_id, "/".join(touched))
+        out = copy.deepcopy(overrides)
+        for cap in touched:
+            del out["llm"][cap]["backend"]
+        return out
 
 
 def _resolve(root: Path, p: str) -> Path:

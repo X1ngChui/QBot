@@ -24,6 +24,7 @@ from ..domain.identity import AliasType
 from ..domain.memory import Candidate, CandidateType
 from ..providers import Kind, providers
 from ..settings import PREDICATE_SLOT, Settings, config, ptext
+from ..util import SYS_R
 
 log = logging.getLogger("qqbot.extract")
 
@@ -43,17 +44,14 @@ def predicate_names() -> tuple[str, ...]:
     return tuple(_table())
 
 
-def single_valued() -> tuple[str, ...]:
-    """Predicates a person can only have one of at a time. A new answer overturns the
-    old one, which is what makes "he moved" expressible: the previous city gets a
-    valid_to rather than sitting alongside the new one."""
-    return tuple(n for n, p in _table().items() if p.cardinality == "single")
-
-
 def multi_valued() -> tuple[str, ...]:
     """Predicates a person can hold many of at once. Each object is stored as its own
     row - the object doubles as the row's object_key - so a second thing somebody
-    likes sits beside the first, and each ages on its own evidence."""
+    likes sits beside the first, and each ages on its own evidence.
+
+    Everything else is single-valued: a new answer overturns the old one, which is
+    what makes "he moved" expressible - the previous city gets a valid_to rather than
+    sitting alongside the new one."""
     return tuple(n for n, p in _table().items() if p.cardinality == "multi")
 
 
@@ -247,6 +245,31 @@ def tools() -> list[dict]:
     ]
 
 
+def line_body(line: str) -> str:
+    """What the member typed, without the line's time stamp and speaker prefix.
+
+    A transcript line reads `⟦time⟧ name⟦code⟧: body`, and the prefix must not take
+    part in quote matching: a quote that is somebody's name would otherwise be
+    "found" on every line that person spoke, and the evidence for it filed under
+    whichever line came first. Names are defanged before they enter a line, so the
+    first closing marker followed by ": " is the end of the prefix and nothing else
+    can be. A line with no such prefix is taken whole.
+    """
+    _, sep, body = line.partition(SYS_R + ": ")
+    return body if sep else line
+
+
+def quoted_in(quote: str, bodies) -> int | None:
+    """The index of the one message body containing `quote`, or None.
+
+    None both when no body contains it and when more than one does: a quote that
+    matches several messages names no single message, and evidence attached to the
+    first of them would be attributed to a speaker by accident of ordering.
+    """
+    hits = [i for i, body in enumerate(bodies) if quote in body]
+    return hits[0] if len(hits) == 1 else None
+
+
 @dataclass(frozen=True, slots=True)
 class SourceLine:
     """One line of the transcript, and the event it came from."""
@@ -296,19 +319,19 @@ class ExtractionInput:
         evidence from a message that does not contain it. Evidence attribution is not
         decorative here - how many *different* people were seen using a name is the one
         route by which a name the model merely observed becomes usable, and that count
-        is taken over exactly these rows.
+        is taken over exactly these rows. For the same reason a quote found in two
+        messages sources neither: picking the first would credit a speaker by luck.
+
+        Matched against each line's body, never its speaker prefix - see line_body.
         """
         quote = (quote or "").strip()
         if not quote:
             return None
-        for line in self.lines:
-            if line.own:
-                # The bot's own lines are context, never evidence: a quote found
-                # only there validates nowhere, and the candidate dies for it.
-                continue
-            if quote in line.text:
-                return line.event_id
-        return None
+        # The bot's own lines are context, never evidence: a quote found only
+        # there validates nowhere, and the candidate dies for it.
+        members = [line for line in self.lines if not line.own]
+        hit = quoted_in(quote, [line_body(line.text) for line in members])
+        return members[hit].event_id if hit is not None else None
 
 
 class MemoryExtractor:
@@ -378,6 +401,12 @@ class MemoryExtractor:
             args = json.loads(fn.get("arguments") or "{}")
         except json.JSONDecodeError:
             log.warning("group %s: tool arguments were not JSON, dropped", inp.group_id)
+            return None
+        if not isinstance(args, dict):
+            # Valid JSON but not an object - a bare list or string. One such call
+            # must not take the whole batch down after the read was paid for.
+            log.warning("group %s: tool arguments were not an object, dropped",
+                        inp.group_id)
             return None
 
         kind = {"record_alias": CandidateType.ALIAS,

@@ -25,8 +25,8 @@ from zoneinfo import ZoneInfo
 import httpx
 
 from ..settings import TextCfg
-from ..util import read_api_key
-from .base import Rate, retire
+from ..util import require_key
+from .base import Rate, retire, with_retry
 from .openai_compat import OpenAICompatChat, OpenAICompatVision
 
 log = logging.getLogger("qqbot.deepseek")
@@ -207,9 +207,7 @@ class DeepSeekChat(OpenAICompatChat):
     async def upload(
         self, data: bytes, *, cfg: TextCfg, mime: str = "image/jpeg",
     ) -> str | None:
-        key = read_api_key(cfg.api_key_env)
-        if not key:
-            raise RuntimeError(f"no text API key: {cfg.api_key_env} resolved to nothing")
+        key = require_key(cfg.api_key_env, "text")
         if self._files is None or self._files_timeout != cfg.timeout_sec:
             if self._files is not None:
                 retire(self._files.aclose())
@@ -218,17 +216,23 @@ class DeepSeekChat(OpenAICompatChat):
         # The vendor takes the format from the filename, so give it the one the
         # mime type names.
         ext = mime.partition("/")[2] or "bin"
-        r = await self._files.post(
-            f"{cfg.base_url.rstrip('/')}/files",
-            headers={"Authorization": f"Bearer {key}"},
-            files={"file": (f"img.{ext}", data, mime)},
-            data={
-                "purpose": "user_data",
-                "expires_after[anchor]": "created_at",
-                "expires_after[seconds]": str(self.FILE_TTL_SEC),
-            },
-        )
-        r.raise_for_status()
+        client = self._files
+
+        async def post() -> httpx.Response:
+            r = await client.post(
+                f"{cfg.base_url.rstrip('/')}/files",
+                headers={"Authorization": f"Bearer {key}"},
+                files={"file": (f"img.{ext}", data, mime)},
+                data={
+                    "purpose": "user_data",
+                    "expires_after[anchor]": "created_at",
+                    "expires_after[seconds]": str(self.FILE_TTL_SEC),
+                },
+            )
+            r.raise_for_status()
+            return r
+
+        r = await with_retry(post, what="file upload")
         fid = (r.json() or {}).get("id") or ""
         return fid or None
 

@@ -198,8 +198,6 @@ class AliasEvidence:
     evidence_type: EvidenceType
     raw_event_id: uuid.UUID | None = None
     score: float | None = None
-    id: uuid.UUID = field(default_factory=uuid.uuid4)
-    created_at: datetime | None = None
 
     @property
     def weight(self) -> float:

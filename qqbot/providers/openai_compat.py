@@ -25,8 +25,11 @@ from openai import AsyncOpenAI
 
 from ..core.budget import BUDGET
 from ..settings import AsrCfg, TextCfg, VisionCfg
-from ..util import read_api_key, why
-from .base import AsrModel, ChatResult, Kind, Rate, TextModel, VisionModel, retire
+from ..util import read_api_key, require_key, why
+from .base import (
+    AsrModel, ChatResult, Kind, Rate, TextModel, VisionModel, backoff_delay, retire,
+    retry_after_seconds,
+)
 
 log = logging.getLogger("qqbot.llm")
 
@@ -53,19 +56,51 @@ RETRYABLE = (
 NEVER_BILLED = (openai.APIConnectionError, openai.RateLimitError)
 
 
+#: What the SDK is handed when an endpoint checks no credential at all. It refuses an
+#: empty string, and a self-hosted model has no key to give it.
+NO_KEY_PLACEHOLDER = "local"
+
+
+async def _book_timeout(*, kind: Kind, model: str, cny: float, group_id: str | None,
+                        in_miss: int = 0, out: int = 0) -> None:
+    """Book a call that timed out, at what the vendor charged for it.
+
+    A timed-out attempt is not a free one: the request reached the vendor, which
+    billed the prompt (or the clip) on arrival and everything generated up to the
+    cut - but usage travels in the response, which a timeout never reads. Left
+    unbooked this would be the one path that understates spend, in a module whose
+    every other guess leans high, so each caller books an estimate that leans high
+    too. Callers catch both timeout shapes: the outer wait_for and the SDK's own
+    APITimeoutError, which can fire first because the request carries the same
+    deadline - half of all timeouts would otherwise slip through unbooked.
+    """
+    await BUDGET.record(kind=kind, model=model, cny=cny, group_id=group_id,
+                        in_miss=in_miss, out=out)
+
+
 class OpenAIClient:
-    """Lazily built AsyncOpenAI client, rebuilt if the endpoint or credential changes."""
+    """Lazily built AsyncOpenAI client, rebuilt if the endpoint or credential changes.
+
+    The identity is the endpoint and the resolved key value - not the variable's name:
+    a key rotated in place would otherwise keep serving the client built on the old
+    value until a restart, while the plain-HTTP backends read theirs on every call.
+    Timeout is deliberately not part of it: two configs that share an account (the
+    reply path and its extraction copy) differ only in timeout, and keying on it would
+    rebuild the pool every time they alternate. Callers pass the deadline per request.
+    """
 
     def __init__(self) -> None:
         self._client: AsyncOpenAI | None = None
         self._id: tuple[str, str] = ("", "")
 
-    def api(self, *, base_url: str, api_key_env: str, timeout: float, what: str) -> AsyncOpenAI:
-        ident = (base_url, api_key_env)
+    def api(self, *, base_url: str, api_key_env: str, timeout: float, what: str,
+            key_required: bool = True) -> AsyncOpenAI:
+        if key_required:
+            key = require_key(api_key_env, what)
+        else:
+            key = read_api_key(api_key_env) or NO_KEY_PLACEHOLDER
+        ident = (base_url, key)
         if self._client is None or self._id != ident:
-            key = read_api_key(api_key_env)
-            if not key:
-                raise RuntimeError(f"no {what} API key: {api_key_env} resolved to nothing")
             if self._client is not None:
                 retire(self._client.close())
             self._client = AsyncOpenAI(
@@ -89,6 +124,10 @@ class OpenAICompatChat(TextModel):
     failure this raises and the caller decides to stay silent."""
 
     name = "openai_compat"
+    #: Whether an empty credential is a configuration error. A hosted endpoint
+    #: without a key answers 401 on every call, so failing early names the cause; a
+    #: self-hosted one may check nothing, and its subclass turns this off.
+    key_required: bool = True
 
     def __init__(self) -> None:
         self._conn = OpenAIClient()
@@ -170,7 +209,7 @@ class OpenAICompatChat(TextModel):
         tools: list[dict] | None = None,
         max_tokens: int | None = None,
         effort: str | None = None,
-        kind: str = "reply",
+        kind: Kind = Kind.REPLY,
         group_id: str | None = None,
     ) -> ChatResult:
         model = cfg.model
@@ -189,19 +228,14 @@ class OpenAICompatChat(TextModel):
                 break
             except RETRYABLE as e:
                 if isinstance(e, (asyncio.TimeoutError, openai.APITimeoutError)):
-                    # A timed-out attempt is not a free one: the vendor billed the
-                    # prompt on arrival and everything generated up to the cut -
-                    # possibly thousands of reasoning tokens - but usage travels in
-                    # the stream's final chunk, the one a timeout never reads. Left
-                    # unbooked, this was the single path that systematically
-                    # *under*stated spend, in a file whose every other guess leans
-                    # high. So book an estimate that leans high too: the prompt's
-                    # rendered characters as miss-rate input tokens (≥1 token/char
-                    # for Chinese never undercounts), the full output allowance as
-                    # output. Booked per attempt - each retry spends again.
+                    # The estimate: the prompt's rendered characters as miss-rate
+                    # input tokens (at least one token per character for Chinese, so
+                    # never an undercount), the full output allowance as output -
+                    # possibly thousands of reasoning tokens went into the cut.
+                    # Booked per attempt, because each retry spends again.
                     est_in = sum(len(str(m)) for m in messages)
                     est_out = max_tokens or 4096
-                    await BUDGET.record(
+                    await _book_timeout(
                         kind=kind, model=model,
                         cny=self.rate_for(model).tokens(0, est_in, est_out),
                         group_id=group_id, in_miss=est_in, out=est_out,
@@ -210,7 +244,12 @@ class OpenAICompatChat(TextModel):
                 if attempt > cfg.retries:
                     log.warning("text model %s out of retries: %s", model, why(e))
                     raise
-                await asyncio.sleep(0.5 * 2 ** (attempt - 1))
+                # A rate limit names its own wait; everything else takes the short
+                # schedule, since a dropped connection or a 5xx is usually over by
+                # the next second.
+                wait = (retry_after_seconds(e.response.headers)
+                        if isinstance(e, openai.RateLimitError) else None)
+                await asyncio.sleep(backoff_delay(attempt, retry_after=wait))
 
         if res.truncated and not res.text:
             # Silent-failure guard: a deliberating backend can spend the whole output
@@ -260,7 +299,7 @@ class OpenAICompatChat(TextModel):
 
         client = self._conn.api(
             base_url=cfg.base_url, api_key_env=cfg.api_key_env,
-            timeout=cfg.timeout_sec, what="text",
+            timeout=cfg.timeout_sec, what="text", key_required=self.key_required,
         )
         # Per request, always. The client is cached by endpoint and credential, so its
         # own timeout is whichever config built it first - and a background batch
@@ -293,8 +332,22 @@ class OpenAICompatChat(TextModel):
             if delta.content:
                 parts.append(delta.content)
             for tc in delta.tool_calls or []:
+                idx = tc.index
+                if idx is None:
+                    # Not every backend numbers its deltas. Without an index, a
+                    # delta carrying an unseen id opens the next slot; one carrying
+                    # no id continues the latest. A None key would sort against the
+                    # integers below and fail the whole reply.
+                    known = next((i for i, c in calls.items() if tc.id and c["id"] == tc.id),
+                                 None)
+                    if known is not None:
+                        idx = known
+                    elif tc.id or not calls:
+                        idx = max(calls, default=-1) + 1
+                    else:
+                        idx = max(calls)
                 slot = calls.setdefault(
-                    tc.index,
+                    idx,
                     {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
                 )
                 if tc.id:
@@ -354,19 +407,19 @@ class OpenAICompatVision(VisionModel):
             base_url=cfg.base_url, api_key_env=cfg.api_key_env,
             timeout=cfg.timeout_sec, what="vision",
         )
+        # The deadline per request, as the chat path does: the client's own timeout
+        # is whichever config built it, and a /reload that changes it must apply.
+        kwargs["timeout"] = cfg.timeout_sec
         try:
             res = await asyncio.wait_for(
                 client.chat.completions.create(**kwargs), timeout=cfg.timeout_sec
             )
         except (TimeoutError, openai.APITimeoutError):
-            # Same rule as chat and ASR: the vendor billed the image and whatever
-            # was generated up to the cut, so a timeout books a leaning-high
-            # estimate rather than nothing - this was the one paid capability
-            # whose timeouts were invisible to the cap. An image resolves to at
-            # most a few thousand prompt tokens on these backends; a deliberating
-            # describe measures under a thousand out.
+            # The estimate: an image resolves to at most a few thousand prompt
+            # tokens on these backends, and a deliberating describe measures under
+            # a thousand out.
             est_in = 2500 + len(prompt)
-            await BUDGET.record(
+            await _book_timeout(
                 kind=Kind.VISION, model=cfg.model,
                 cny=self.rate_for(cfg.model).tokens(0, est_in, 1000),
                 group_id=group_id, in_miss=est_in, out=1000,
@@ -384,6 +437,10 @@ class OpenAICompatVision(VisionModel):
             cny=self.rate_for(billed).tokens(0, in_miss, out),
             group_id=group_id, in_miss=in_miss, out=out,
         )
+        # No choice at all is the contract's "nothing to say", not a broken reply:
+        # a filtered or empty answer arrives that way on some backends.
+        if not res.choices:
+            return ""
         return " ".join((res.choices[0].message.content or "").split())
 
 
@@ -441,18 +498,16 @@ class OpenAICompatAsr(AsrModel):
         )
         # Billed per second of audio; when the duration is unknown assume 32 kbps.
         secs = seconds if seconds else len(data) / 4000.0
+        kwargs["timeout"] = cfg.timeout_sec
         try:
             res = await asyncio.wait_for(
                 client.chat.completions.create(**kwargs), timeout=cfg.timeout_sec
             )
         except (TimeoutError, openai.APITimeoutError):
-            # Both timeout shapes: the client carries cfg.timeout_sec too, so the
-            # SDK's own APITimeoutError can fire before the outer wait_for - half
-            # of all timeouts would otherwise slip through unbooked. The clip
-            # reached the vendor, which bills its full duration whether or not the
-            # answer arrived in time - and here the duration is known, so the
-            # booking is exact rather than an estimate.
-            await BUDGET.record(
+            # The clip is billed by its full duration whether or not the answer
+            # arrived in time, and the duration is known - so this booking is exact
+            # rather than an estimate.
+            await _book_timeout(
                 kind=Kind.ASR, model=cfg.model,
                 cny=self.rate_for(cfg.model).units(secs), group_id=group_id,
             )
@@ -464,6 +519,8 @@ class OpenAICompatAsr(AsrModel):
             kind=Kind.ASR, model=billed,
             cny=self.rate_for(billed).units(secs), group_id=group_id,
         )
+        if not res.choices:
+            return ""          # nothing was said, by the contract - not an error
         content = res.choices[0].message.content
         if isinstance(content, list):  # some backends return the multimodal array form
             content = "".join(p.get("text", "") for p in content if isinstance(p, dict))

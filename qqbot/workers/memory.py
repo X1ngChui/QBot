@@ -18,11 +18,15 @@ import logging
 import uuid
 from datetime import datetime, timedelta
 
+import openai
+
 from ..core.budget import BUDGET
 from ..providers import providers
-from ..db import pool, repo
+from ..providers.base import QuotaExhausted
+from ..db import repo
 from ..repositories import (
-    EpisodeRepository, IdentityRepository, JobQueue, MemoryRepository, VectorRepository,
+    EpisodeRepository, EventRepository, IdentityRepository, JobQueue, MemoryRepository,
+    VectorRepository,
 )
 from ..repositories.job import Job, JobType
 from ..services import ExtractionInput, MemoryConsolidator, MemoryExtractor
@@ -33,11 +37,28 @@ from ..util import defang, fmt_when, now_local, sysmark, why
 
 log = logging.getLogger("qqbot.worker")
 
-#: What the extraction window was before the nightly redesign. Candidates staged back then carry
-#: no batch_size, and their batches must be replayed at the width they were made
-#: with - replaying at the new width prepends rows the model never saw, which
-#: shifts every account code and files records against the wrong people.
+#: The width of an extraction batch from before batches recorded their own size.
+#: Candidates staged by such a batch carry no batch_size, and must be replayed at
+#: the width they were made with - replaying at the current width prepends rows
+#: the model never saw, which shifts every account code and files records against
+#: the wrong people.
 LEGACY_WINDOW = 60
+
+#: How many rounds of pending candidates one consolidation job settles before
+#: handing back. Each round settles everything it fetched, so the loop ends when
+#: the queue is empty; the cap only bounds a job whose candidates keep arriving.
+CONSOLIDATE_ROUNDS = 50
+
+#: Episodes embedded per job. A backlog wider than this - a model switch, which
+#: invalidates every stored vector at once - is paged across successive jobs
+#: rather than held under one lease.
+EMBED_PAGE = 200
+
+#: Failures the outside world causes: a slow or refusing model, a used-up
+#: allowance. Logged in one line, because a traceback through the client library
+#: says nothing the message does not. Anything else is this code's own fault and
+#: gets the traceback.
+EXPECTED_FAILURES = (TimeoutError, QuotaExhausted, openai.APIError)
 
 
 def transcript_legend() -> str:
@@ -85,6 +106,7 @@ class MemoryWorker:
         self._ids = IdentityRepository()
         self._mem = MemoryRepository()
         self._eps = EpisodeRepository()
+        self._events = EventRepository()
         self._extractor = MemoryExtractor(cfg, legend=transcript_legend())
         self._consolidator = MemoryConsolidator(self._ids, self._mem, self._eps)
         # The bundle's own embedding backend: vectors are stored under the model that
@@ -117,7 +139,8 @@ class MemoryWorker:
         try:
             await self._dispatch(job)
         except Exception as e:
-            log.warning("job %s (%s) failed: %s", job.id, job.job_type, why(e))
+            log.warning("job %s (%s) failed: %s", job.id, job.job_type, why(e),
+                        exc_info=not isinstance(e, EXPECTED_FAILURES))
             await self._queue.fail(
                 job, why(e), backoff=BACKOFF[min(job.retry_count, len(BACKOFF) - 1)])
         else:
@@ -142,36 +165,17 @@ class MemoryWorker:
     async def _next_unread(self, group_id: int) -> list:
         """The oldest unread chunk, in ingest (created_at) order.
 
-        Oldest-first from the watermark, because the nightly drain reads a whole
-        day in several passes: newest-first would mark everything read after the
-        first pass and silently skip the rest. Cut at a conversation gap when more
-        remains (see _gap_cut), so batch boundaries fall where conversations end
-        rather than mid-topic - which is what keeps one episode from being split
-        into two half-known ones.
-
-        created_at, not occurred_at, on both the filter and the order: the
-        watermark lives on created_at, and a batch must be a contiguous prefix of
-        that axis or marking its end would skip rows never read. The two axes
-        agree except for out-of-order redelivery; rendering re-sorts by
-        occurred_at so the model still reads conversation order.
-
-        The watermark predicate here is the same one db.repo.unread_since_extract
-        gates on; a change to one must reach the other, or the gate and the fetch
-        disagree about what "unread" means.
+        The rows come from EventRepository.next_unread, which owns the watermark
+        predicate (and explains the ingest-order axis); what happens here is
+        policy over them. Cut at a conversation gap when more remains (see
+        _gap_cut), so batch boundaries fall where conversations end rather than
+        mid-topic - which is what keeps one episode from being split into two
+        half-known ones.
         """
-        rows = await pool().fetch(
-            """SELECT id, platform_user_id, occurred_at, created_at, payload, plain_text
-                 FROM raw_event
-                WHERE group_id=$1 AND event_type='message'
-                  AND created_at > COALESCE(
-                      (SELECT last_extract_at FROM group_state WHERE group_id=$1),
-                      'epoch')
-                ORDER BY created_at ASC, id ASC LIMIT $2""",
-            group_id, self._m.extract_window,
-        )
+        rows = await self._events.next_unread(group_id, limit=self._m.extract_window)
         if len(rows) < self._m.extract_window:
-            return list(rows)
-        rows = self._gap_cut(list(rows))
+            return rows
+        rows = self._gap_cut(rows)
         # A truncated chunk must never end mid-tie: the watermark is a bare
         # created_at and the unread filter is strictly greater, so a row sharing
         # the last row's timestamp but left outside the chunk would be marked read
@@ -207,34 +211,15 @@ class MemoryWorker:
         quoted would come back rejected as if the model had invented them. The
         anchor (the batch's last row) plus the stored batch size name the exact
         set; a candidate from before the size column was added falls back to the
-        fixed window its batch was made with. Ordered by (created_at, id) at both
-        ends because ties must not reorder between the read and the replay.
+        fixed window its batch was made with.
         """
         if size is None:
             # Legacy batches were the newest LEGACY_WINDOW by occurred_at ending at
             # the anchor; reproduce them the way they were made, at the width they
             # were made with.
-            return list(reversed(await pool().fetch(
-                """SELECT id, platform_user_id, occurred_at, created_at, payload,
-                          plain_text
-                     FROM raw_event
-                    WHERE group_id=$1 AND event_type='message'
-                      AND ($3::uuid IS NULL
-                           OR (occurred_at, id)
-                               <= (SELECT occurred_at, id FROM raw_event WHERE id=$3))
-                    ORDER BY occurred_at DESC, id DESC LIMIT $2""",
-                group_id, LEGACY_WINDOW, ending_at,
-            )))
-        return list(reversed(await pool().fetch(
-            """SELECT id, platform_user_id, occurred_at, created_at, payload, plain_text
-                 FROM raw_event
-                WHERE group_id=$1 AND event_type='message'
-                  AND ($3::uuid IS NULL
-                       OR (created_at, id)
-                           <= (SELECT created_at, id FROM raw_event WHERE id=$3))
-                ORDER BY created_at DESC, id DESC LIMIT $2""",
-            group_id, size, ending_at,
-        )))
+            return await self._events.batch_ending_at_by_time(
+                group_id, anchor=ending_at, size=LEGACY_WINDOW)
+        return await self._events.batch_ending_at(group_id, anchor=ending_at, size=size)
 
     async def _known(self, group_id: int, codes: dict[int, uuid.UUID]) -> str:
         """What is already on record for this group, for the model to work against.
@@ -331,7 +316,7 @@ class MemoryWorker:
                          "tomorrow", group_id)
                 break
 
-            unread, _newest = await repo.unread_since_extract(group_id)
+            unread, _newest = await self._events.unread_since_extract(group_id)
             if not unread or (unread < self._m.drain_floor and not force):
                 if not total:
                     log.info("group %s: %d unread, not worth a pass", group_id, unread)
@@ -513,27 +498,36 @@ class MemoryWorker:
         extractions - one failure and the next run picks up both - and a quote from the
         older one is not in the newer one's messages, so validating them all against a
         single window would reject correctly-quoted records as inventions.
+
+        Pending candidates are read a page at a time, and the job keeps going until a
+        page comes back empty: a nightly drain of several chunks stages more than
+        one page, and a job that settled only the first would leave the rest waiting
+        for whatever extraction happened next.
         """
-        cands = await self._mem.pending(group_id)
-        if not cands:
-            return 0, 0
-
-        batches: dict[uuid.UUID | None, list] = {}
-        for c in cands:
-            batches.setdefault(c.batch_event_id, []).append(c)
-
         written = rejected = 0
-        for anchor, batch in batches.items():
-            rows = await self._replay(group_id, ending_at=anchor,
-                                      size=batch[0].batch_size)
-            rows = sorted(rows, key=lambda r: (r["occurred_at"], r["id"]))
-            codes, _roster, lines = await self._render(group_id, rows)
-            w, r = await self._consolidator.consolidate(
-                batch, group_id=group_id, codes=codes,
-                lines=tuple(ln.text for ln in lines), when=when or now_local(),
-            )
-            written += w
-            rejected += r
+        for _ in range(CONSOLIDATE_ROUNDS):
+            cands = await self._mem.pending(group_id)
+            if not cands:
+                break
+            batches: dict[uuid.UUID | None, list] = {}
+            for c in cands:
+                batches.setdefault(c.batch_event_id, []).append(c)
+
+            for anchor, batch in batches.items():
+                rows = await self._replay(group_id, ending_at=anchor,
+                                          size=batch[0].batch_size)
+                rows = sorted(rows, key=lambda r: (r["occurred_at"], r["id"]))
+                codes, _roster, lines = await self._render(group_id, rows)
+                w, r = await self._consolidator.consolidate(
+                    batch, group_id=group_id, codes=codes,
+                    lines=tuple(ln.text for ln in lines), when=when or now_local(),
+                    # Records are dated by the conversation, not by tonight's write.
+                    occurred={r["id"]: r["occurred_at"] for r in rows},
+                )
+                written += w
+                rejected += r
+        if not written and not rejected:
+            return 0, 0
         log.info("group %s: consolidated %d, rejected %d", group_id, written, rejected)
         if written:
             # Episodes are retrieved by participant first and by similarity second, so a
@@ -569,12 +563,21 @@ class MemoryWorker:
 
     # -- vectors -----------------------------------------------------------
     async def embed(self, group_id: int) -> int:
-        """Fill in vectors for episodes that have none. Incremental, never a full pass."""
+        """Fill in vectors for episodes that have none. Incremental, never a full pass.
+
+        One page per job. A page that comes back full means more is waiting, so the
+        next page is queued as its own job rather than taken here: the lease stays
+        short, and a backlog the size of the whole store (a model switch) drains
+        across jobs at the queue's pace. The dedup index does not collapse the
+        resubmit - this job is running, not pending.
+        """
         if await BUDGET.exceeded(self._cfg.budget.daily_cny_cap):
             return 0
-        todo = await self._vec.unembedded_episodes(group_id)
+        todo = await self._vec.unembedded_episodes(group_id, limit=EMBED_PAGE)
         if not todo:
             return 0
+        if len(todo) == EMBED_PAGE:
+            await self._queue.submit(JobType.EMBED, {"group_id": group_id})
         vecs = await self._embed.embed(
             [summary for _, summary in todo], cfg=self._cfg.llm.embedding,
             group_id=str(group_id))

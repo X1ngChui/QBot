@@ -55,7 +55,13 @@ class MemoryRepository:
         self, group_id: int, subject_ids: list[uuid.UUID], *, limit: int = 200
     ) -> list[Fact]:
         """What currently holds about these people. The group filter comes first; that
-        is where isolation is enforced."""
+        is where isolation is enforced.
+
+        `limit` is per subject, not per call: the worker asks for a whole roster at
+        once, and one shared cap would let a few talkative members crowd everyone
+        else out of the answer. The id tie-break keeps the order stable between two
+        reads of the same data, which the prompt cache depends on.
+        """
         if not subject_ids:
             return []
         # Merged-away ids are followed rather than rewritten: a fact recorded before two
@@ -67,11 +73,16 @@ class MemoryRepository:
                    UNION ALL
                    SELECT e.id, f.root FROM entity e JOIN family f ON e.merged_into = f.id
                )
-               SELECT m.*, family.root
-                 FROM memory_fact m JOIN family ON m.subject_entity_id = family.id
-                WHERE m.group_id=$1 AND m.status='active' AND m.valid_to IS NULL
-                ORDER BY m.confidence DESC, m.last_confirmed_at DESC NULLS LAST
-                LIMIT $3""",
+               SELECT top.* FROM (SELECT DISTINCT root FROM family) r
+               CROSS JOIN LATERAL (
+                   SELECT m.*, r.root
+                     FROM memory_fact m
+                     JOIN family ON m.subject_entity_id = family.id
+                                AND family.root = r.root
+                    WHERE m.group_id=$1 AND m.status='active' AND m.valid_to IS NULL
+                    ORDER BY m.confidence DESC, m.last_confirmed_at DESC NULLS LAST, m.id
+                    LIMIT $3
+               ) top""",
             group_id, subject_ids, limit,
         )
         # Reported against the person the caller asked about, not the account the row was
@@ -80,14 +91,23 @@ class MemoryRepository:
         return [_fact(r, subject=r["root"]) for r in rows]
 
     async def supersede(
-        self, fact: Fact, evidence: list[FactEvidence], *, when: datetime
+        self, fact: Fact, evidence: list[FactEvidence], *, when: datetime,
+        observed_at: datetime | None = None,
     ) -> Fact:
         """Write a new fact and close out the one it overturns.
 
         Confirming the same object again adds no row; it moves last_confirmed_at and
         the confidence instead. Something a group repeats every week should not pile up
         as fifty identical records.
+
+        Two clocks: `when` is the moment this write happens and stamps
+        last_confirmed_at; `observed_at` is when the conversation that stated the fact
+        took place and stamps valid_from / first_observed_at. They differ by however
+        long the fact waited in the candidate queue - hours for the nightly drain, days
+        after a retry - and a fact dated by its write would age from the wrong day.
+        Callers with no source event (an owner's note) leave it unset.
         """
+        observed_at = observed_at or when
         async with pool().acquire() as conn, conn.transaction():
             # The predecessor is looked up across the whole family, so a fact recorded
             # against an account before it was merged is superseded rather than joined
@@ -168,11 +188,11 @@ class MemoryRepository:
                        (group_id, subject_entity_id, predicate, object_key,
                         object_entity_id, object_value, memory_type, confidence,
                         status, valid_from, first_observed_at, last_confirmed_at)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9,$9,$9)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9,$9,$10)
                 RETURNING *""",
                 fact.group_id, fact.subject_entity_id, fact.predicate, fact.object_key,
                 fact.object_entity_id, fact.object_value, fact.memory_type.value,
-                fact.confidence, when,
+                fact.confidence, observed_at, when,
             )
             await self._add_evidence(conn, row["id"], evidence)
             return _fact(row)
@@ -221,6 +241,10 @@ class MemoryRepository:
         the same reason platform names confirm by enduring a second day.
 
         `keep_predicates` never expires. What an owner typed is not a guess that fades.
+
+        What ages out is marked expired, not superseded: nothing contradicted it, it
+        simply stopped coming up, and a reader of the history should be able to tell
+        the two apart.
         """
         rows = await pool().fetch(
             """WITH support AS (
@@ -245,7 +269,7 @@ class MemoryRepository:
                     GROUP BY f.id, f.predicate
                )
                UPDATE memory_fact f
-                  SET status = 'superseded', valid_to = NOW(),
+                  SET status = $9, valid_to = NOW(),
                       revision = revision + 1, updated_at = NOW()
                  FROM support s
                 WHERE f.id = s.id
@@ -255,22 +279,30 @@ class MemoryRepository:
              RETURNING f.id""",
             group_id, list(stable), list(fast),
             stable_days, default_days, fast_days, list(keep_predicates), tz_sql(),
+            FactStatus.EXPIRED.value,
         )
         return len(rows)
 
     # -- candidates -------------------------------------------------------
     async def stage(self, candidates: list[Candidate]) -> None:
         """Where the model's output lands first. Writing and validating are separate so
-        that one bad extraction can be dropped whole, leaving nothing behind (design
-        doc 63)."""
-        for c in candidates:
-            await pool().execute(
+        that one bad extraction can be dropped whole, leaving nothing behind.
+
+        One transaction for the batch: a staging that fails halfway would otherwise
+        leave part of an extraction pending, and the consolidation that follows would
+        validate a batch the model never produced in that shape.
+        """
+        if not candidates:
+            return
+        async with pool().acquire() as conn, conn.transaction():
+            await conn.executemany(
                 """INSERT INTO memory_candidate
                        (id, group_id, source_event_id, batch_event_id, batch_size,
                         candidate_type, payload, confidence, status)
                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending')""",
-                c.id, c.group_id, c.source_event_id, c.batch_event_id, c.batch_size,
-                c.candidate_type.value, c.payload, c.confidence,
+                [(c.id, c.group_id, c.source_event_id, c.batch_event_id, c.batch_size,
+                  c.candidate_type.value, c.payload, c.confidence)
+                 for c in candidates],
             )
 
     async def pending(self, group_id: int, *, limit: int = 100) -> list[Candidate]:
@@ -317,12 +349,20 @@ class EpisodeRepository:
     that back it all land together."""
 
     async def add(self, ep: Episode) -> Episode:
+        """Write one episode, idempotently on its id.
+
+        The consolidator derives the id from the candidate it came from, so a job
+        retried after a crash between writing the episode and settling the candidate
+        finds its own row and adds nothing - every insert here tolerates a duplicate.
+        The first write's content stands; a retry carries the same content anyway.
+        """
         async with pool().acquire() as conn, conn.transaction():
-            row = await conn.fetchrow(
+            await conn.execute(
                 """INSERT INTO episode
                        (id, group_id, episode_type, title, summary, started_at,
                         ended_at, importance, confidence, status)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id""",
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                   ON CONFLICT (id) DO NOTHING""",
                 ep.id, ep.group_id, ep.episode_type.value, ep.title, ep.summary,
                 ep.started_at, ep.ended_at, ep.importance, ep.confidence, ep.status,
             )
@@ -330,13 +370,13 @@ class EpisodeRepository:
                 await conn.execute(
                     """INSERT INTO episode_participant (episode_id, entity_id, role)
                        VALUES ($1,$2,$3) ON CONFLICT DO NOTHING""",
-                    row["id"], p.entity_id, p.role,
+                    ep.id, p.entity_id, p.role,
                 )
             for eid in ep.event_ids:
                 await conn.execute(
                     """INSERT INTO episode_event (episode_id, raw_event_id)
                        VALUES ($1,$2) ON CONFLICT DO NOTHING""",
-                    row["id"], eid,
+                    ep.id, eid,
                 )
             return ep
 

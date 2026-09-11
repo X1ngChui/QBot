@@ -108,10 +108,21 @@ class Budget:
 
     async def _roll(self) -> None:
         day = today_local()
-        if not self._loaded or day != self._day:
-            self._day = day
-            self._spent = await repo.day_cost(day)
-            self._loaded = True
+        if self._loaded and day == self._day:
+            return
+        try:
+            spent = await repo.day_cost(day)
+        except Exception:
+            # Not re-raised, for the same reason the ledger write below is not:
+            # record() runs after the call it books has been paid for, and a
+            # failed read of the day's total must not turn a finished reply into
+            # silence. The in-memory figure stands and the read is retried on the
+            # next booking.
+            log.exception("day total unavailable, keeping the in-memory figure")
+            return
+        self._day = day
+        self._spent = spent
+        self._loaded = True
 
     async def record(
         self,

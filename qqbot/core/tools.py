@@ -21,7 +21,7 @@ from luqum.parser import parser as _luqum_parser
 from ..db import pool, repo
 from ..providers import providers
 from ..providers.base import QuotaExhausted
-from ..settings import Settings, config, ptext
+from ..settings import RetrievalCfg, Settings, config, ptext
 from ..util import SYS_L, SYS_R, defang, fmt_when, merge_overlapping, sysmark, why
 from . import retrieval
 from .media import MEDIA
@@ -194,8 +194,8 @@ def _terms_of(node) -> int:
     return sum(_terms_of(c) for c in node.children)
 
 
-def _parse_query(q: str):
-    """The query as a validated luqum tree: boolean subset only, term cap applied."""
+def _parse_query(q: str, cap: int):
+    """The query as a validated luqum tree: boolean subset only, at most `cap` terms."""
     q = (q or "").translate(_QUERY_NORMALIZE).strip()
     if not q:
         raise QueryError("关键词为空")
@@ -203,7 +203,6 @@ def _parse_query(q: str):
         ast = _luqum_parser.parse(q)
     except _LuqumParseError as e:
         raise QueryError(f"无法解析（{e}）") from None
-    cap = config().default.retrieval.max_query_terms
     if _terms_of(ast) > cap:
         raise QueryError(f"关键词太多（最多 {cap} 个），请拆成两次检索")
     return ast
@@ -239,7 +238,7 @@ def _condition(node, params: list, offset: int) -> str:
 
 
 async def search_history(group_id: int, query: str, *, speaker: str | None = None,
-                         days: int | None = None) -> str:
+                         days: int | None = None, rcfg: RetrievalCfg | None = None) -> str:
     """The archive, searched. Free - one SQL query, no model involved.
 
     The query is a boolean expression (_parse_query): juxtaposition is AND -
@@ -275,16 +274,18 @@ async def search_history(group_id: int, query: str, *, speaker: str | None = Non
     """
     # One read of the retrieval settings for the whole call, so how many hits are
     # fetched and how much context is rendered cannot come from two different
-    # configs if /reload lands in between.
-    rcfg = config().default.retrieval
+    # configs if /reload lands in between. The tool loop passes the group's own
+    # section, so a per-group override applies; a bare call reads the default.
+    rcfg = rcfg or config().default.retrieval
     # Parse and compile under one roof: the subset check lives in the compile
     # walk, and a rejected feature must answer in words exactly like a syntax
-    # error does.
+    # error does. A Failure, not a plain answer: a search that never ran earns
+    # no provenance badge.
     terms: list[str] = []
     try:
-        cond = _condition(_parse_query(query or ""), terms, offset=5)
+        cond = _condition(_parse_query(query or "", rcfg.max_query_terms), terms, offset=5)
     except QueryError as e:
-        return f"（检索式有误：{e}）"
+        return Failure(f"（检索式有误：{e}）")
     sp = (speaker or "").strip()
     uid: str | None = None
     if m := (_SEQ_NAME.fullmatch(sp) or _SEQ_NAME_LEGACY.fullmatch(sp)):
@@ -523,6 +524,7 @@ async def execute(call: dict, *, cfg: Settings, group_id: str,
                 int(group_id), query,
                 speaker=(args.get("speaker") or "").strip() or None,
                 days=args.get("days") if isinstance(args.get("days"), int) else None,
+                rcfg=cfg.retrieval,
             )
         except QuotaExhausted:
             raise

@@ -25,7 +25,6 @@ class CandidateType(StrEnum):
     FACT = "fact"
     #: A fact about the group rather than about anyone in it.
     GROUP_FACT = "group_fact"
-    RELATION = "relation"
     EPISODE = "episode"
 
 

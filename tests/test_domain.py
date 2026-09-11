@@ -32,12 +32,11 @@ def check(name, cond, detail=""):
 # Merging, superseding and group isolation are enforced by SQL in one transaction, and
 # they are checked there - see test_repositories.py. They were also restated as domain
 # methods, tested here, and never called: two versions of one rule where only one runs.
-wang = Entity.new(name="老王")
-alt = Entity.new(name="老王的小号")
+wang = Entity(id=uuid.uuid4(), canonical_name="老王")
 check("一个新实体默认是人", wang.entity_type == "person" and wang.merged_into is None)
 
 acc = IdentityAccount(entity_id=wang.id, platform="qq", platform_user_id="123456")
-check("账号的唯一键与表上的 UNIQUE 一致", acc.key == ("qq", "123456"))
+check("账号记的是平台和平台账号号", (acc.platform, acc.platform_user_id) == ("qq", "123456"))
 
 # ---- name normalization ---------------------------------------------------
 # Padding a group card with full-width and zero-width characters is a common enough

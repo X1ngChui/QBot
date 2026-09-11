@@ -28,6 +28,7 @@ from pathlib import Path
 from nonebot import on_command
 from nonebot.adapters.onebot.v11 import GroupMessageEvent
 from nonebot.matcher import Matcher, current_bot, current_event
+from pydantic import ValidationError
 
 from ..core import agreement, command_catalog, debug, errors, perms
 from ..core.pipeline import note_console_reply
@@ -38,7 +39,7 @@ from ..core.state import REGISTRY
 from ..db import repo
 from ..domain.identity.alias import CONFIRM_THRESHOLD
 from ..providers import Kind, providers
-from ..services import NameTaken, PersonCard, UnknownAccount
+from ..services import NameTaken, NotMerged, PersonCard, UnknownAccount
 from ..settings import config, reload_config
 from ..util import fmt_when, now_local, parse_duration, today_local, why
 
@@ -66,7 +67,9 @@ def _fit(text: str, *, head: bool = True, gid: str | None = None) -> str:
     function exists to prevent.
     """
     cfg = config().for_group(gid)[0] if gid else config().default
-    limit = cfg.gateway.max_msg_len - OUT_MARGIN
+    # Never below one: at zero the tail slice text[-0:] is the whole text, and a
+    # negative limit silently drops the end instead of marking it.
+    limit = max(1, cfg.gateway.max_msg_len - OUT_MARGIN)
     if len(text) <= limit:
         return text
     kept = text[:limit] if head else text[-limit:]
@@ -154,31 +157,35 @@ async def _finish(matcher: Matcher, message: str) -> None:
     await matcher.finish()
 
 
-agree_cmd = on_command("agree", block=True, priority=1)
-terms_cmd = on_command("terms", block=True, priority=1)
-reload_cmd = on_command("reload", block=True, priority=1)
-mute_cmd = on_command("mute", block=True, priority=1)
-block_cmd = on_command("block", block=True, priority=1)
-unblock_cmd = on_command("unblock", block=True, priority=1)
-unmute_cmd = on_command("unmute", block=True, priority=1)
-stats_cmd = on_command("stats", block=True, priority=1)
-groupstats_cmd = on_command("groupstats", block=True, priority=1)
-top_cmd = on_command("top", block=True, priority=1)
-card_cmd = on_command("card", block=True, priority=1)
-who_cmd = on_command("who", block=True, priority=1)
-# Registered in their own right rather than left to fall through: NoneBot matches the
-# longest registered prefix, so an unregistered name that contains a registered one
-# arrives as the shorter command carrying the rest as its argument. /relearn against
-# /reload is the live case.
-note_cmd = on_command("note", block=True, priority=1)
-alias_cmd = on_command("alias", block=True, priority=1)
-forget_cmd = on_command("forget", block=True, priority=1)
-merge_cmd = on_command("merge", block=True, priority=1)
-split_cmd = on_command("split", block=True, priority=1)
-relearn_cmd = on_command("relearn", block=True, priority=1)
-log_cmd = on_command("log", block=True, priority=1)
-debug_cmd = on_command("debug", block=True, priority=1)
-help_cmd = on_command("help", block=True, priority=1)
+# Every name is registered in its own right, and every registration demands a break
+# after the name. NoneBot resolves a message against the longest registered prefix,
+# so a name nobody registered would otherwise arrive as the shorter command it
+# starts with, carrying the rest as its argument - /topology as /top, /cards as
+# /card, /whoami as /who - and block=True would keep it from the chat path as well.
+# With force_whitespace such a message matches no command at all.
+_CMD = {"block": True, "priority": 1, "force_whitespace": True}
+
+agree_cmd = on_command("agree", **_CMD)
+terms_cmd = on_command("terms", **_CMD)
+reload_cmd = on_command("reload", **_CMD)
+mute_cmd = on_command("mute", **_CMD)
+block_cmd = on_command("block", **_CMD)
+unblock_cmd = on_command("unblock", **_CMD)
+unmute_cmd = on_command("unmute", **_CMD)
+stats_cmd = on_command("stats", **_CMD)
+groupstats_cmd = on_command("groupstats", **_CMD)
+top_cmd = on_command("top", **_CMD)
+card_cmd = on_command("card", **_CMD)
+who_cmd = on_command("who", **_CMD)
+note_cmd = on_command("note", **_CMD)
+alias_cmd = on_command("alias", **_CMD)
+forget_cmd = on_command("forget", **_CMD)
+merge_cmd = on_command("merge", **_CMD)
+split_cmd = on_command("split", **_CMD)
+relearn_cmd = on_command("relearn", **_CMD)
+log_cmd = on_command("log", **_CMD)
+debug_cmd = on_command("debug", **_CMD)
+help_cmd = on_command("help", **_CMD)
 
 
 # -- argument parsing -------------------------------------------------------
@@ -287,6 +294,22 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     await _finish(matcher, _fit(agreement.text(), gid=str(event.group_id)))
 
 
+def _validation_summary(e: ValidationError) -> str:
+    """One line per failing key - the key's path and what is wrong with it, never
+    the value that failed.
+
+    pydantic's own rendering prints the offending input next to each error, and for
+    a missing or unknown key that input is the whole parent block: a proxy URL with
+    its credentials, the owner list, every endpoint. This text is posted to the
+    group, so it carries what the owner needs to fix the file and nothing else.
+    """
+    lines = []
+    for err in e.errors(include_input=False, include_url=False):
+        loc = ".".join(str(p) for p in err["loc"]) or "(root)"
+        lines.append(f"{loc}: {err['msg']}")
+    return "\n".join(lines)
+
+
 @reload_cmd.handle()
 async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     # global_only: the reload lands on every group at once, so an owner a single
@@ -295,12 +318,20 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     await _gate(matcher, event, global_only=True)
     try:
         bundle = reload_config()
-    except Exception as e:
+    except ValidationError as e:
         log.warning("config reload rejected: %s", why(e))
-        # A multi-error validation dump can outgrow a QQ message; oversize is
-        # refused whole, and the one command that reports what broke must not
-        # answer with silence.
-        await _finish(matcher, _fit(f"配置未通过校验，本次重载未生效：{e}",
+        # A multi-error summary can outgrow a QQ message; oversize is refused
+        # whole, and the one command that reports what broke must not answer
+        # with silence.
+        await _finish(matcher, _fit("配置未通过校验，本次重载未生效：\n"
+                                  + _validation_summary(e),
+                                  gid=str(event.group_id)))
+        return
+    except Exception as e:
+        # Anything short of validation - an unreadable file, malformed YAML - has
+        # no input to leak and is small enough to quote as is.
+        log.warning("config reload rejected: %s", why(e))
+        await _finish(matcher, _fit(f"配置读取失败，本次重载未生效：{why(e)}",
                                   gid=str(event.group_id)))
         return
     for gid in list(bundle.personas):
@@ -466,7 +497,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     await _gate(matcher, event, open_to_members=True)
     gid = str(event.group_id)
     arg = _strip_cmd(event.get_plaintext(), "top")
-    k = min(int(arg), 20) if arg.isdigit() and int(arg) > 0 else 5
+    k = min(int(arg), 20) if arg.isdecimal() and int(arg) > 0 else 5
     rows = await repo.top_spenders(int(gid), k=k)
     if not rows:
         await _finish(matcher, "本月本群还没有可归因的花费。")
@@ -733,7 +764,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     owner = await _gate(matcher, event, self_serve=True)
     gid = int(event.group_id)
     arg = _strip_cmd(event.get_plaintext(), "forget").strip()
-    digits = next((w for w in arg.split() if w.isdigit()), "")
+    digits = next((w for w in arg.split() if w.isdecimal()), "")
     if not digits:
         await _finish(matcher, "要删除哪一条？编号取自 /who @某人 或 /card。")
 
@@ -810,6 +841,11 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     except UnknownAccount as e:
         await _finish(matcher, f"账号 {e.user_id} 没有任何记录，无法拆分。")
         return
+    except NotMerged as e:
+        # A lone account has nothing to split from; the service refuses rather
+        # than strand every fact under an emptied person.
+        await _finish(matcher, e.message)
+        return
     await _finish(matcher, "已拆分。")
 
 
@@ -845,7 +881,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     if arg in ("off", "0"):
         debug.arm(0)
         await _finish(matcher, "已关闭捕获。")
-    if not arg.isdigit():
+    if not arg.isdecimal():
         await _finish(matcher, "用法：/debug 轮数（最多 50），/debug off 关闭。")
     took = debug.arm(int(arg))
     await _finish(matcher, f"已开启：接下来 {took} 轮模型调用写入 logs/debug/。")
@@ -857,7 +893,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     await _gate(matcher, event, global_only=True)
     arg = event.get_plaintext().strip().split()
     n = LOG_LINES_DEFAULT
-    if len(arg) > 1 and arg[-1].isdigit():
+    if len(arg) > 1 and arg[-1].isdecimal():
         n = max(1, min(int(arg[-1]), LOG_LINES_MAX))
     path = Path(os.getenv("LOG_DIR", "/app/logs")) / "qqbot.log"
     try:

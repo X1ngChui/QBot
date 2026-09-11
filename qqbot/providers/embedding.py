@@ -23,8 +23,8 @@ import httpx
 
 from ..core.budget import BUDGET
 from ..settings import EmbeddingCfg
-from ..util import read_api_key
-from .base import EmbeddingModel, Kind, Rate, retire
+from ..util import require_key
+from .base import EmbeddingModel, Kind, Rate, retire, with_retry
 
 log = logging.getLogger("qqbot.embed")
 
@@ -60,21 +60,24 @@ class DashScopeEmbedding(EmbeddingModel):
     async def embed(self, texts: Sequence[str], *, cfg: EmbeddingCfg,
                     group_id: str | None = None) -> list[list[float]]:
         out: list[list[float]] = []
-        key = read_api_key(cfg.api_key_env)
-        if not key:
-            raise RuntimeError(
-                f"no embedding API key: {cfg.api_key_env} resolved to nothing")
+        key = require_key(cfg.api_key_env, "embedding")
         base = cfg.base_url.rstrip("/")
         for i in range(0, len(texts), BATCH):
             chunk = list(texts[i:i + BATCH])
-            r = await self._client(cfg).post(
-                f"{base}/embeddings",
-                headers={"Authorization": f"Bearer {key}"},
-                json={"model": cfg.model, "input": chunk,
-                      "dimensions": cfg.dimensions},
-            )
-            r.raise_for_status()
-            body = r.json()
+
+            async def post(chunk=chunk) -> httpx.Response:
+                r = await self._client(cfg).post(
+                    f"{base}/embeddings",
+                    headers={"Authorization": f"Bearer {key}"},
+                    json={"model": cfg.model, "input": chunk,
+                          "dimensions": cfg.dimensions},
+                )
+                r.raise_for_status()
+                return r
+
+            # Retried per batch, so a momentary refusal costs one request's worth
+            # of sleep, and a batch already booked below is never sent twice.
+            body = (await with_retry(post, what="embedding")).json()
             # Booked like every other paid capability: unbooked, this spend was
             # invisible to the daily cap, /stats and the report. The vendor reports
             # input tokens; missing usage bills the batch's characters instead,

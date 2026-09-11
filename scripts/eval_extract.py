@@ -30,10 +30,9 @@ os.environ["DATABASE_PASSWORD"] = "testpw"
 if not (ROOT / ".env").exists():
     sys.exit("eval makes real model calls and needs credentials: "
              "create .env at the repo root (see .env.example)")
-for _line in (ROOT / ".env").read_text(encoding="utf-8").splitlines():
-    if "=" in _line and not _line.lstrip().startswith("#"):
-        _k, _v = _line.split("=", 1)
-        os.environ.setdefault(_k.strip(), _v.strip())
+from _env import load_dotenv
+
+load_dotenv(ROOT / ".env")
 
 from qqbot.db import close_pool, init_pool
 from qqbot.providers import build_default, set_providers

@@ -71,6 +71,91 @@ def wiring() -> None:
               mod in imported, str(sorted(imported)))
 
 
+def _commands_source():
+    """plugins/commands.py as a syntax tree - the only way a test can look at it."""
+    import ast
+    return ast.parse((ROOT / "qqbot" / "plugins" / "commands.py").read_text(encoding="utf-8"))
+
+
+def registrations() -> None:
+    """Every catalogued command is registered, and registered so that only its own
+    name reaches it.
+
+    NoneBot resolves a message against the longest registered prefix, so without a
+    required break after the name an unregistered longer name - /topology, /cards,
+    /whoami - would run the shorter command it starts with, carrying the rest as
+    its argument. Read from the source, like wiring(): the registrations run at
+    import time and cannot be observed any other way.
+    """
+    import ast
+    tree = _commands_source()
+    shared = next((ast.literal_eval(node.value) for node in ast.walk(tree)
+                   if isinstance(node, ast.Assign)
+                   and any(isinstance(t, ast.Name) and t.id == "_CMD" for t in node.targets)),
+                  {})
+    calls = [node for node in ast.walk(tree)
+             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+             and node.func.id == "on_command"]
+
+    def demands_break(call) -> bool:
+        for kw in call.keywords:
+            if kw.arg == "force_whitespace":
+                return isinstance(kw.value, ast.Constant) and kw.value.value is True
+            if kw.arg is None and isinstance(kw.value, ast.Name) and kw.value.id == "_CMD":
+                return shared.get("force_whitespace") is True
+        return False
+
+    names = {"/" + c.args[0].value for c in calls
+             if c.args and isinstance(c.args[0], ast.Constant)}
+    check("every catalogued command is registered, and nothing else is",
+          names == set(PREFIXES), str(names ^ set(PREFIXES)))
+    check("every registration demands a break after the name",
+          bool(calls) and all(demands_break(c) for c in calls),
+          str([c.args[0].value for c in calls if not demands_break(c)]))
+
+
+def reload_refusal() -> None:
+    """What /reload posts when the config fails validation.
+
+    The formatter is compiled out of the source on its own, because the module it
+    lives in cannot be imported here. It is written to need nothing but the
+    exception, which is what makes that possible.
+    """
+    import ast
+    from pydantic import BaseModel, ValidationError
+
+    tree = _commands_source()
+    fn = next(node for node in ast.walk(tree)
+              if isinstance(node, ast.FunctionDef) and node.name == "_validation_summary")
+    ns = {"ValidationError": ValidationError}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), "commands.py", "exec"), ns)
+    summary = ns["_validation_summary"]
+
+    class Proxy(BaseModel):
+        url: str
+        timeout: int
+
+    class Settings(BaseModel):
+        proxy: Proxy
+        owners: list[str]
+
+    try:
+        Settings.model_validate({"proxy": {"url": "http://user:hunter2@proxy.test"},
+                                 "owners": "10001"})
+        check("the fixture fails validation", False)
+        return
+    except ValidationError as e:
+        err = e
+    out = summary(err)
+    # The guard is only meaningful if the naive rendering would have leaked.
+    check("pydantic's own rendering echoes the block that failed", "hunter2" in str(err))
+    check("the summary names each failing key by its path",
+          "proxy.timeout: " in out and "owners: " in out, out)
+    check("one line per error", len(out.splitlines()) == err.error_count(), out)
+    check("and never the value that failed", "hunter2" not in out and "10001" not in out,
+          out)
+
+
 def catalogue() -> None:
     """The listing, the routing table and the permission rules. No I/O."""
     # Every documented command must be routed away from the reply pipeline, otherwise
@@ -538,6 +623,8 @@ async def directory_service() -> None:
 
 async def main():
     wiring()
+    registrations()
+    reload_refusal()
     catalogue()
     await init_pool()
     await reset()

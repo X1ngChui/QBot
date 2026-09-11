@@ -20,14 +20,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 
 from ..db import repo
 from ..settings import config
-from ..util import defang, sysmark, why
+from ..util import SYS_L, SYS_R, defang, sysmark, why
 from .botapi import BotApi
 
 log = logging.getLogger("qqbot.members")
+
+#: The namesake tag the fetch appends to a clashing member's name.
+_NAMESAKE_TAG = re.compile(rf"{re.escape(SYS_L)}同名\d{{1,9}}{re.escape(SYS_R)}$")
 
 
 class MemberDirectory:
@@ -40,15 +44,25 @@ class MemberDirectory:
         self._raw_by_group: dict[str, dict[str, str]] = {}
         self._fetched: dict[str, float] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        #: Accounts asked about and absent from the table as of its last fetch -
+        #: members who have left, quoted or still in the window. A miss forces a
+        #: refresh once; remembered here, it does not force one on every reply.
+        self._missing: dict[str, set[str]] = {}
 
     def _fresh(self, group_id: str) -> bool:
         ttl = config().default.gateway.member_cache_ttl_sec
         return time.monotonic() - self._fetched.get(group_id, 0.0) < ttl
 
-    async def _fetch(self, bot: BotApi, group_id: str) -> None:
+    async def _fetch(self, bot: BotApi, group_id: str, *, force: bool = False) -> None:
+        """Refresh one group's table. `force` refetches inside the TTL - for a member
+        the table has never heard of - but never twice for one decision: a refresh
+        that landed while this caller waited for the lock is the refresh it wanted."""
+        asked = time.monotonic()
         lock = self._locks.setdefault(group_id, asyncio.Lock())
         async with lock:
-            if self._fresh(group_id):  # another waiter refreshed it
+            if self._fetched.get(group_id, 0.0) > asked:
+                return
+            if not force and self._fresh(group_id):
                 return
             try:
                 rows = await bot.call_api("get_group_member_list", group_id=int(group_id))
@@ -105,36 +119,47 @@ class MemberDirectory:
                     log.warning("group %s: namesake numbering unavailable, "
                                 "names stay bare: %s", group_id, why(e))
             self._by_group[group_id] = table
+            self._missing.pop(group_id, None)
             self._fetched[group_id] = time.monotonic()
             log.info("group %s: member list refreshed (%d people)", group_id, len(table))
 
-    async def name_of(self, bot: BotApi, group_id: str, qq: str) -> str | None:
-        """The display name for one member, refreshing the group's list when stale.
+    async def _current(self, bot: BotApi, group_id: str,
+                       wanted: list[str]) -> dict[str, str]:
+        """The live table, refreshed when stale or when it lacks a member it has not
+        been asked about since its last fetch.
 
-        Staleness alone triggers the refetch - not only a miss. The TTL is what makes
-        renames visible at all: every reader of current names sits behind this cache, so
-        a cache that only refreshed on misses would serve a fully-known group the same
-        names forever.
+        Staleness alone refreshes - not only a miss. The TTL is what makes renames
+        visible at all: every reader of current names sits behind this cache, so a
+        cache that only refreshed on misses would serve a fully-known group the
+        same names forever. A miss refreshes too, inside the TTL: a member who
+        joined a minute ago and was @-ed at once would otherwise archive as a bare
+        account number until the next refresh. Misses that survive the refresh are
+        remembered until the next one, so a member who has left the group does not
+        cost a fetch on every reply their old lines appear in.
         """
+        table = self._by_group.get(group_id) or {}
+        gone = self._missing.get(group_id) or set()
+        if any(q not in table and q not in gone for q in wanted):
+            await self._fetch(bot, group_id, force=True)
+        elif not self._fresh(group_id):
+            await self._fetch(bot, group_id)
+        table = self._by_group.get(group_id) or {}
+        self._missing.setdefault(group_id, set()).update(
+            q for q in wanted if q not in table)
+        return table
+
+    async def name_of(self, bot: BotApi, group_id: str, qq: str) -> str | None:
+        """The display name for one member - see _current for when the list is refetched."""
         if not qq:
             return None
-        if not self._fresh(group_id):
-            await self._fetch(bot, group_id)
-        return (self._by_group.get(group_id) or {}).get(qq)
+        return (await self._current(bot, group_id, [qq])).get(qq)
 
     async def names_of(self, bot: BotApi, group_id: str, qqs: list[str]) -> dict[str, str]:
-        """Display names for several members in one go - at most one API call.
-
-        Refetches when stale or when any wanted member is unknown, for the same reason
-        as name_of: staleness must refresh even with zero misses.
-        """
+        """Display names for several members in one go - at most one API call."""
         wanted = [q for q in qqs if q]
         if not wanted:
             return {}
-        table = self._by_group.get(group_id) or {}
-        if not self._fresh(group_id) or any(q not in table for q in wanted):
-            await self._fetch(bot, group_id)
-            table = self._by_group.get(group_id) or {}
+        table = await self._current(bot, group_id, wanted)
         return {q: table[q] for q in wanted if q in table}
 
     async def raw_name_of(self, bot: BotApi, group_id: str, qq: str) -> str | None:
@@ -143,8 +168,7 @@ class MemberDirectory:
         transcript rendering, never a name anyone carries."""
         if not qq:
             return None
-        if not self._fresh(group_id):
-            await self._fetch(bot, group_id)
+        await self._current(bot, group_id, [qq])
         return (self._raw_by_group.get(group_id) or {}).get(qq)
 
     async def raw_names_of(self, bot: BotApi, group_id: str,
@@ -153,8 +177,7 @@ class MemberDirectory:
         wanted = [q for q in qqs if q]
         if not wanted:
             return {}
-        if not self._fresh(group_id):
-            await self._fetch(bot, group_id)
+        await self._current(bot, group_id, wanted)
         table = self._raw_by_group.get(group_id) or {}
         return {q: table[q] for q in wanted if q in table}
 
@@ -166,30 +189,38 @@ class MemberDirectory:
         transcript, the profiles - which read the name at query time, and the model then
         sees one person under two names. Renames are rare, so the cost of re-rendering
         history is rare too.
+
+        Returns how many lines changed name. A line from a namesake arrives carrying the
+        bare card and gains its tag here on every message; that is this render step
+        doing its job, so a changed tag alone is applied without being counted.
         """
         ids = {m.user_id for m in msgs if not m.is_bot and m.user_id}
         if not ids:
             return 0
         live = await self.names_of(bot, group_id, list(ids))
-        changed = 0
+        renamed = 0
         for m in msgs:
             new = live.get(m.user_id)
-            if new and not m.is_bot and new != m.nickname:
-                m.nickname = new
-                changed += 1
-        if changed:
-            log.info("group %s: %d message(s) relabelled after a rename", group_id, changed)
-        return changed
+            if not new or m.is_bot or new == m.nickname:
+                continue
+            if _NAMESAKE_TAG.sub("", new) != _NAMESAKE_TAG.sub("", m.nickname):
+                renamed += 1
+            m.nickname = new
+        if renamed:
+            log.info("group %s: %d message(s) relabelled after a rename", group_id, renamed)
+        return renamed
 
     def forget(self, group_id: str | None = None) -> None:
         if group_id is None:
             self._by_group.clear()
             self._raw_by_group.clear()
             self._fetched.clear()
+            self._missing.clear()
         else:
             self._by_group.pop(group_id, None)
             self._raw_by_group.pop(group_id, None)
             self._fetched.pop(group_id, None)
+            self._missing.pop(group_id, None)
 
 
 MEMBERS = MemberDirectory()

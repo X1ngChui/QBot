@@ -42,9 +42,6 @@ class ChatMsg:
     #: The QQ id of the message this one quotes, if any. What the model is shown is a
     #: pointer to that message's line number - see prompt.numbered.
     reply_to: str | None = None
-    #: Accounts this message addressed. Carried so retrieval can load their profiles:
-    #: being talked *about* is as good a reason as speaking.
-    mentions: list[str] = field(default_factory=list)
     #: The parsed message, kept only while it still holds a picture or voice clip nobody
     #: has paid to understand. People post a picture and ask about it in the *next*
     #: message, by which time this one has been processed and its refs would otherwise be
@@ -137,12 +134,14 @@ class GroupState:
     history_loaded: bool = False
 
     def __post_init__(self) -> None:
-        # Two chunks of headroom past the window: the anchor walks forward a chunk at
-        # a time, so the deque has to hold a full window plus what has not been
-        # evicted from in front of it yet.
+        self.recent = deque(self.recent, maxlen=self._capacity())
+
+    def _capacity(self) -> int:
+        """Two chunks of headroom past the window: the anchor walks forward a chunk
+        at a time, so the deque has to hold a full window plus what has not been
+        evicted from in front of it yet."""
         p = config().for_group(self.group_id)[0].prompt
-        self.recent = deque(
-            self.recent, maxlen=p.evict_chunk * (p.window_chunks + 2))
+        return p.evict_chunk * (p.window_chunks + 2)
 
     def add(self, msg: ChatMsg) -> None:
         # The pipeline's dedup set dies with the process, so a message the adapter
@@ -152,6 +151,11 @@ class GroupState:
         # the same #N, and quotes point at the wrong one until eviction clears it.
         if msg.msg_id and any(m.msg_id == msg.msg_id for m in self.recent):
             return
+        # A deque keeps the length it was built with, and /reload can have grown
+        # the window since: one smaller than the window binds first and slides the
+        # prefix one message per turn, which the chunked eviction exists to avoid.
+        if self.recent.maxlen != (want := self._capacity()):
+            self.recent = deque(self.recent, maxlen=want)
         self.recent.append(msg)
 
     async def blocked_now(self, user_id: str) -> bool:

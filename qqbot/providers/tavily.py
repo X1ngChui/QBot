@@ -29,8 +29,8 @@ import httpx
 from ..core.budget import BUDGET
 from ..db import repo
 from ..settings import SearchCfg
-from ..util import read_api_key
-from .base import Kind, QuotaExhausted, Rate, SearchEngine, retire
+from ..util import require_key
+from .base import Kind, QuotaExhausted, Rate, SearchEngine, retire, with_retry
 
 log = logging.getLogger("qqbot.search")
 
@@ -44,50 +44,65 @@ class TavilySearch(SearchEngine):
 
     def __init__(self) -> None:
         self._client: httpx.AsyncClient | None = None
-        self._proxy: str = ""
+        #: What the cached client was built for - the same rule as the other
+        #: clients, so a /reload that changes either the proxy or the timeout
+        #: rebuilds it. The endpoint is not part of it: it is named per request.
+        self._id: tuple[float, str] | None = None
 
     def rate_for(self, model: str) -> Rate:
         return _FREE
 
     def _http(self, cfg: SearchCfg) -> httpx.AsyncClient:
-        if self._client is None or self._proxy != cfg.proxy:
+        ident = (cfg.timeout_sec, cfg.proxy)
+        if self._client is None or self._id != ident:
             if self._client is not None:
                 retire(self._client.aclose())
             self._client = httpx.AsyncClient(
                 timeout=cfg.timeout_sec, proxy=cfg.proxy or None
             )
-            self._proxy = cfg.proxy
+            self._id = ident
         return self._client
 
     async def aclose(self) -> None:
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+            self._id = None
 
-    async def search(
-        self, query: str, *, cfg: SearchCfg, group_id: str | None = None
-    ) -> list[dict]:
-        # The meter is read before the vendor is called, so a call past the monthly
-        # allowance never leaves the building. Counted in vendor credits via the
-        # ledger's calls column, under this backend's model name: rows from a
-        # previous backend do not eat this one's allowance.
+    async def _admit(self, cfg: SearchCfg) -> str:
+        """Read the meter and resolve the key; the credential a call may go out with.
+
+        The meter is read before the vendor is called, so a call past the monthly
+        allowance never leaves the building. Counted in vendor credits via the
+        ledger's calls column, under this backend's model name: rows from a
+        previous backend do not eat this one's allowance.
+        """
         used = await repo.month_calls(Kind.SEARCH, self.name)
         if used >= cfg.monthly_quota:
             raise QuotaExhausted(
                 f"search allowance used up: {used}/{cfg.monthly_quota} this month")
-        key = read_api_key(cfg.api_key_env)
-        if not key:
-            raise RuntimeError(f"no search API key: {cfg.api_key_env} resolved to nothing")
-        r = await self._http(cfg).post(
-            f"{cfg.base_url.rstrip('/')}/search",
-            headers={"Authorization": f"Bearer {key}"},
-            json={
-                "query": query,
-                "search_depth": cfg.depth,
-                "max_results": cfg.count,
-            },
-        )
-        r.raise_for_status()
+        return require_key(cfg.api_key_env, "search")
+
+    async def _post(self, cfg: SearchCfg, key: str, path: str, body: dict) -> httpx.Response:
+        async def once() -> httpx.Response:
+            r = await self._http(cfg).post(
+                f"{cfg.base_url.rstrip('/')}{path}",
+                headers={"Authorization": f"Bearer {key}"}, json=body,
+            )
+            r.raise_for_status()
+            return r
+
+        return await with_retry(once, what=f"search {path}")
+
+    async def search(
+        self, query: str, *, cfg: SearchCfg, group_id: str | None = None
+    ) -> list[dict]:
+        key = await self._admit(cfg)
+        r = await self._post(cfg, key, "/search", {
+            "query": query,
+            "search_depth": cfg.depth,
+            "max_results": cfg.count,
+        })
         # Booked even at zero cost: the calls figure is what advances the quota
         # meter above - in the vendor's own unit. Tavily debits credits, not calls,
         # and advanced depth costs two; metered by calls, the real 1000 would be
@@ -119,19 +134,8 @@ class TavilySearch(SearchEngine):
         reused. Booked pessimistically at one credit per call - under-counting a
         shared pool is how the vendor starts refusing while the meter reads full.
         """
-        used = await repo.month_calls(Kind.SEARCH, self.name)
-        if used >= cfg.monthly_quota:
-            raise QuotaExhausted(
-                f"search allowance used up: {used}/{cfg.monthly_quota} this month")
-        key = read_api_key(cfg.api_key_env)
-        if not key:
-            raise RuntimeError(f"no search API key: {cfg.api_key_env} resolved to nothing")
-        r = await self._http(cfg).post(
-            f"{cfg.base_url.rstrip('/')}/extract",
-            headers={"Authorization": f"Bearer {key}"},
-            json={"urls": [url], "extract_depth": "basic"},
-        )
-        r.raise_for_status()
+        key = await self._admit(cfg)
+        r = await self._post(cfg, key, "/extract", {"urls": [url], "extract_depth": "basic"})
         await BUDGET.record(
             kind=Kind.SEARCH, model=self.name, cny=0.0, group_id=group_id, calls=1,
         )

@@ -10,6 +10,7 @@ a phrase.
 from __future__ import annotations
 
 from ..settings import config
+from .memory_extractor import GROUP_TERM, GROUP_TOPIC
 
 #: The predicate a hand-written note is filed under. It renders as itself, with no verb
 #: in front: an owner who types a note has already written the sentence they want.
@@ -43,9 +44,9 @@ def render_fact(predicate: str, object_value, object_key: str | None = None) -> 
         return obj
     # A group's terms are keyed by the word they define, so the word is half the sentence
     # and there is no verb to put in front of it.
-    if predicate == "term":
+    if predicate == GROUP_TERM:
         return f"{object_key}：{obj}"
-    if predicate == "topic":
+    if predicate == GROUP_TOPIC:
         return obj
     verb = verb_of(predicate)
     if not verb:

@@ -54,6 +54,21 @@ class NameTaken(ValueError):
         self.holder = holder
 
 
+class NotMerged(ValueError):
+    """This account is already a person of its own; there is nothing to split.
+
+    Its own class because the command layer answers it as a plain "nothing to do":
+    splitting a lone account would create an empty person and strand every fact
+    under the old one, so it is refused rather than performed.
+    """
+
+    def __init__(self, user_id: str) -> None:
+        super().__init__(f"account {user_id} is not merged with anything")
+        self.user_id = user_id
+        #: What the owner is told.
+        self.message = "这个账号没有和别的账号合并过，不需要拆分。"
+
+
 @dataclass(frozen=True, slots=True)
 class NameCard:
     """One name this person answers to, with what backs it."""
@@ -554,7 +569,19 @@ class Directory:
         return touched
 
     async def split(self, user_id: str) -> uuid.UUID:
-        """Give one account its own person again. See IdentityResolver.split."""
+        """Give one account its own person again. See IdentityResolver.split.
+
+        Raises NotMerged when the account is the only one its person holds. A split
+        moves the account to a fresh person and leaves facts and episodes with the
+        old one, on the evidence that they may belong to the other account - with no
+        other account, that would orphan everything ever learned about this person
+        for nothing.
+        """
+        acc = await self._identity.account(user_id)
+        ent = await self._ids.entity(acc.entity_id)
+        eid = ent.id if ent else acc.entity_id
+        if len(await self._ids.accounts_of(eid)) < 2:
+            raise NotMerged(user_id)
         return await self._identity.split(user_id)
 
     async def relearn(self, group_id: int) -> uuid.UUID | None:
@@ -611,4 +638,4 @@ class Directory:
 
 
 __all__ = ["Directory", "PersonCard", "FactCard", "NameCard", "UnknownAccount",
-           "NameTaken"]
+           "NameTaken", "NotMerged"]

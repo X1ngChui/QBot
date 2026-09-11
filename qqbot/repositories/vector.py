@@ -73,22 +73,31 @@ class VectorRepository:
             object_type, object_id,
         )
 
-    async def unembedded_episodes(self, group_id: int) -> list[tuple[uuid.UUID, str]]:
-        """Active episodes with no vector for the current model, as (id, summary).
+    async def unembedded_episodes(
+        self, group_id: int, *, limit: int = 200,
+    ) -> list[tuple[uuid.UUID, str]]:
+        """Active episodes with no vector for the current model, as (id, summary),
+        oldest first.
 
         The anti-join keeps the nightly fill incremental in the query itself -
         fetching every episode to diff in Python re-read the whole store per group
         per night. Keyed on model and version like every read here, so switching
         embedding model makes the old vectors invisible and the fill re-covers
         everything, exactly as the coexist-then-switch design intends.
+
+        Capped, because that re-cover is the one case where the backlog is the whole
+        store: one job must not hold a lease while it embeds months of episodes in a
+        single batch. The caller sees a full page and queues the next one.
         """
         rows = await pool().fetch(
             """SELECT e.id, e.summary FROM episode e
                  LEFT JOIN embedding_index x
                         ON x.object_type='episode' AND x.object_id=e.id
                        AND x.embedding_model=$2 AND x.embedding_version=$3
-                WHERE e.group_id=$1 AND e.status='active' AND x.object_id IS NULL""",
-            group_id, self._model, self._version,
+                WHERE e.group_id=$1 AND e.status='active' AND x.object_id IS NULL
+                ORDER BY e.created_at, e.id
+                LIMIT $4""",
+            group_id, self._model, self._version, limit,
         )
         return [(r["id"], r["summary"]) for r in rows]
 

@@ -6,7 +6,7 @@ constructed without a bot runtime, which is what makes them testable.
 """
 
 from .context_builder import render_fact
-from .directory import Directory, FactCard, NameCard, NameTaken, PersonCard
+from .directory import Directory, FactCard, NameCard, NameTaken, NotMerged, PersonCard
 from .identity_resolver import IdentityResolver, UnknownAccount
 from .memory_consolidator import MemoryConsolidator, Validator, Verdict
 from .memory_extractor import ExtractionInput, MemoryExtractor
@@ -27,4 +27,5 @@ __all__ = [
     "FactCard",
     "NameCard",
     "NameTaken",
+    "NotMerged",
 ]

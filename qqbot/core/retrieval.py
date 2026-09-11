@@ -249,8 +249,12 @@ async def group_knowledge(group_id: str) -> list[str]:
     subject = await ids.group_entity(gid)
     facts = await MemoryRepository().current_facts(gid, [subject])
 
+    # Fully ordered: this block sits above the history in the prompt, and two facts
+    # of equal confidence swapping places between turns would miss the prefix cache
+    # for every reply that follows.
     out = []
-    for f in sorted(facts, key=lambda f: (f.predicate != GROUP_TOPIC, f.predicate)):
+    for f in sorted(facts, key=lambda f: (f.predicate != GROUP_TOPIC, f.predicate,
+                                          f.object_key or "", str(f.object_value or ""))):
         value = "" if f.object_value is None else str(f.object_value).strip()
         if not value:
             continue

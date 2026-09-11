@@ -1,14 +1,15 @@
 """SQL for the ops and infrastructure tables: switches, ledger, blocklist, traces,
 schema checks - the state that belongs to running the bot rather than to what it
-remembers. The domain aggregates (identity, memory, episodes, jobs) live in
-`qqbot.repositories`; a handful of hot-path readers (tools.search_history, the
-extraction worker's drain queries) issue their own SQL where the query is the logic.
+remembers. The domain aggregates (identity, memory, episodes, jobs, the archive's
+read side) live in `qqbot.repositories`; a handful of hot-path readers
+(tools.search_history) issue their own SQL where the query is the logic.
 """
 
 from __future__ import annotations
 
 from datetime import date, timedelta
 
+from ..settings import config
 from ..util import now_local, today_local, tz_sql
 from .pool import pool
 
@@ -104,9 +105,14 @@ async def ensure_schema() -> None:
     # live as separate CREATE INDEX statements in init.sql - a hand migration
     # that runs the CREATE TABLE block and stops there passes every check above
     # while every inbound insert (raw_event) or trace write (reply_trace) fails.
+    # job_pending_once collapses duplicate job submits, alias_unique_in_scope makes a
+    # repeated sighting an upsert rather than a second row, and fact_one_current is
+    # the one-current-fact invariant itself - without it two writers can both
+    # succeed and a person answers with two contradictory current facts.
     no_index = await pool().fetch(
         """SELECT n.name FROM unnest(ARRAY[
-               'raw_event_platform_key','reply_trace_reply'
+               'raw_event_platform_key','reply_trace_reply','job_pending_once',
+               'alias_unique_in_scope','fact_one_current'
            ]) AS n(name)
            LEFT JOIN pg_indexes p
                   ON p.indexname = n.name AND p.schemaname = 'public'
@@ -116,6 +122,21 @@ async def ensure_schema() -> None:
         raise RuntimeError(
             "missing unique indexes (ON CONFLICT depends on them): "
             + ", ".join(r["name"] for r in no_index))
+
+    # The vector column's declared width must match what the embedding backend is
+    # configured to produce. pgvector keeps the width as the column's type modifier,
+    # and a mismatch is not caught until the first insert - inside the background
+    # worker, hours later, where it reads as a group with nothing to embed.
+    width = await pool().fetchval(
+        """SELECT atttypmod FROM pg_attribute
+            WHERE attrelid = 'embedding_index'::regclass AND attname = 'embedding'""",
+    )
+    want_dims = config().default.llm.embedding.dimensions
+    if width != want_dims:
+        raise RuntimeError(
+            f"embedding_index.embedding is VECTOR({width}) but "
+            f"llm.embedding.dimensions is {want_dims}; the column and the backend "
+            "must agree, or every vector insert fails")
 
 
 async def recent_messages(group_id: int, *, limit: int) -> list:
@@ -323,24 +344,16 @@ async def unblock_expired(group_id: int) -> None:
 
 async def unread_since_extract(group_id: int) -> tuple[int, object]:
     """How many messages this group has that no extraction has read, and the newest one's
-    arrival time.
+    arrival time. See EventRepository.unread_since_extract, which owns the predicate.
 
-    The watermark records what was actually *read*, not what was queued, so this count is
-    the honest answer to "is there anything to extract" - and it is what stops a retried
-    or hand-triggered job from paying to re-read a batch it already paid for.
-
-    The WHERE clause is the same watermark predicate workers/memory._next_unread fetches
-    by (that copy documents the created_at-vs-occurred_at axis choice); a change to one
-    must reach the other, or the gate and the fetch disagree about what "unread" means.
+    Kept here for the ops console, which reports the count beside the other
+    group_state switches and does not otherwise touch the repositories. Imported
+    inside the function: the repositories build on this package, not the other way
+    round, and a module-level import here would make the two load each other.
     """
-    row = await pool().fetchrow(
-        """SELECT count(*) AS n, max(created_at) AS newest FROM raw_event
-            WHERE group_id=$1 AND event_type='message'
-              AND created_at > COALESCE(
-                  (SELECT last_extract_at FROM group_state WHERE group_id=$1), 'epoch')""",
-        group_id,
-    )
-    return (row["n"] or 0), row["newest"]
+    from ..repositories.event import EventRepository
+
+    return await EventRepository().unread_since_extract(group_id)
 
 
 async def mark_extracted(group_id: int, upto) -> None:

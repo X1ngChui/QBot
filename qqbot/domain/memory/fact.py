@@ -71,6 +71,11 @@ class FactStatus(StrEnum):
     SUPERSEDED = "superseded"
     #: Struck out by hand.
     RETRACTED = "retracted"
+    #: Aged out: nothing confirmed it within its class's half-life. Kept apart from
+    #: SUPERSEDED because the two mean different things about the world - a fact that
+    #: was contradicted is known to be false now, while one that merely went quiet may
+    #: still hold and simply stopped coming up.
+    EXPIRED = "expired"
 
 
 class EvidenceRelation(StrEnum):
@@ -86,7 +91,6 @@ class FactEvidence:
     raw_event_id: uuid.UUID
     relation: EvidenceRelation = EvidenceRelation.SUPPORTS
     score: float | None = None
-    id: uuid.UUID = field(default_factory=uuid.uuid4)
 
 
 @dataclass(frozen=True, slots=True)

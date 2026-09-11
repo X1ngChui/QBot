@@ -21,7 +21,7 @@ import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from qqbot.providers import providers
+from qqbot.providers import Kind, providers
 from qqbot.settings import config
 from qqbot.util import read_api_key
 
@@ -100,7 +100,7 @@ async def check_text() -> None:
             cfg=cfg,
             max_tokens=512,
             effort="off",
-            kind="preflight",
+            kind=Kind.PREFLIGHT,
         )
         think = f" reasoning={res.reasoning}" if res.reasoning else ""
         record(label, bool(res.text),

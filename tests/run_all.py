@@ -38,8 +38,27 @@ def lint() -> bool:
                             str(HERE.parent)]) == 0
 
 
+def complete() -> bool:
+    """Whether the ordered list above names every test_*.py here, and nothing else.
+
+    The order matters (the suites that share the test database run in a fixed
+    sequence), so the list stays hand-written; what must not happen is a new suite
+    that nobody added to it running only when somebody remembers to.
+    """
+    on_disk = sorted(p.name for p in HERE.glob("test_*.py"))
+    missing = sorted(set(on_disk) - set(SCRIPTS))
+    stale = sorted(set(SCRIPTS) - set(on_disk))
+    if missing:
+        print(f"suites on disk but not in run_all.SCRIPTS: {', '.join(missing)}")
+    if stale:
+        print(f"suites listed in run_all.SCRIPTS but not on disk: {', '.join(stale)}")
+    return not missing and not stale
+
+
 def main() -> int:
     failed = []
+    if not complete():
+        failed.append("run_all.SCRIPTS")
     for name in SCRIPTS:
         print(f"\n{'=' * 70}\n{name}\n{'=' * 70}")
         rc = subprocess.call([sys.executable, str(HERE / name)])

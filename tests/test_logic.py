@@ -42,6 +42,12 @@ owners = b.default.owners
 check("owners is a list of ids", isinstance(owners, list) and len(owners) == 2, str(owners))
 check("a listed owner is recognised", "10001" in owners)
 check("a stranger is not", "999999" not in owners)
+# An id typed without quotes is an int to YAML; it must land as the string the
+# permission checks compare against, not fail the whole config over a quote.
+from qqbot.settings import Settings as _OwnerSettings
+check("an unquoted owner id validates as a string",
+      _OwnerSettings.model_validate({**b._raw, "owners": [10001, "10002"]}).owners
+      == ["10001", "10002"])
 
 # Persona inheritance: a group file states only its differences. Without this the shared
 # blocks are copied into every group file, and they drift - which is exactly what had
@@ -83,6 +89,11 @@ cases = [
     ("看这个[链接](https://x.com)", "看这个链接 https://x.com"),
     ("`code`和***粗斜***", "code和粗斜"),
     ("正常文本不动", "正常文本不动"),
+    # A single asterisk is also multiplication; only a starred span with word
+    # boundaries outside it is emphasis.
+    ("算式 3*5*2 等于 30", "算式 3*5*2 等于 30"),
+    ("a*b, c*d", "a*b, c*d"),
+    ("*强调*，然后", "强调，然后"),
 ]
 for src, want in cases:
     got = strip_markdown(src)
@@ -340,6 +351,68 @@ check("a fixed eastern offset is inverted into POSIX form",
 _util._TZ = _tzc(_tdc(hours=-5))
 check("and a western one likewise", _util.tz_sql() == "UTC+05:00", _util.tz_sql())
 _util._TZ = _saved_tz
+
+# A NUL inside a message is refused by PostgreSQL in text and jsonb alike, so it has to
+# leave at the envelope: the rendered text through defang, the verbatim segments
+# through the event parser. Before this, one stray NUL cost the whole message its
+# place in the archive (three times in a month).
+from qqbot.gateway.onebot import GroupMessage as _GM
+check("defang drops NUL", _util.defang("a\x00b⟦c⟧") == "ab[c]", repr(_util.defang("a\x00b")))
+check("scrub_nul walks a nested structure",
+      _util.scrub_nul({"a": ["x\x00", {"b": "\x00y"}], "n": 3})
+      == {"a": ["x", {"b": "y"}], "n": 3})
+
+
+class _Ev:
+    message_id = 1
+    group_id = 12345
+    user_id = 10001
+    time = 0
+    sub_type = "normal"
+    sender = {"user_id": 10001, "nickname": "王\x00大锤", "card": ""}
+
+
+_gm = _GM.from_event(_Ev(), [{"type": "text", "data": {"text": "hi\x00there"}}], "999",
+                     plain_text="hi\x00there")
+_pl_json = json.dumps(_gm.as_payload(), ensure_ascii=False) + _gm.plain_text
+check("an event carrying NUL is archived without it",
+      "\x00" not in _pl_json and _gm.sender.nickname == "王大锤", repr(_pl_json[:80]))
+
+# The per-line cut never leaves a marker half open: an unbalanced bracket in the
+# window is the one thing defang rules out everywhere else.
+check("cut_text keeps a whole marker", _util.cut_text("你看 ⟦图片:一只猫⟧", 8) == "你看 ",
+      repr(_util.cut_text("你看 ⟦图片:一只猫⟧", 8)))
+check("cut_text leaves short text alone", _util.cut_text("短", 8) == "短")
+check("cut_text cuts plain text at the limit", _util.cut_text("一二三四五", 3) == "一二三")
+
+# The parser is total: it runs under the message's dedup mark, so a card whose
+# JSON is a list, or a size that is not a number, must degrade rather than raise.
+_odd = parse_segments([
+    {"type": "json", "data": {"data": "[1, 2]"}},
+    {"type": "json", "data": {"data": '{"meta": {"x": {"title": 7}}, "prompt": 3}'}},
+    {"type": "image", "data": {"file": "a.jpg", "file_size": "big"}},
+    {"type": "text", "data": "not a dict"},
+], "999")
+check("a card that is not an object degrades to the bare marker",
+      _odd.parts[0] == "⟦卡片消息⟧", _odd.parts[0])
+check("a card with non-string fields still renders", _odd.parts[1] == "⟦分享:7⟧", _odd.parts[1])
+check("a non-numeric size is no size", _odd.refs[0].size is None)
+# The trigger reads what was typed, not the render: a share card whose title
+# carries the nickname is not somebody addressing the bot.
+_card_nick = parse_segments([
+    {"type": "json", "data": {"data": '{"meta": {"x": {"title": "小X 教程"}}}'}},
+    {"type": "text", "data": {"text": "看这个"}},
+], "999")
+check("typed text is the text segments alone", _card_nick.typed_text == "看这个",
+      _card_nick.typed_text)
+check("while the render carries the card", "小X" in _card_nick.render())
+
+# A log line is one line: an HTTP client's "for more information see <link>" second
+# line would otherwise appear in the log as a separate, unlabelled event.
+check("why() keeps the first line of a multi-line message",
+      _util.why(RuntimeError("bad request\nFor more information check: https://x")) ==
+      "RuntimeError: bad request", _util.why(RuntimeError("a\nb")))
+check("why() still names a message-less exception", _util.why(TimeoutError()) == "TimeoutError")
 
 check("history anchor set", st.history_anchor is not None, str(st.history_anchor))
 

@@ -293,8 +293,7 @@ async def main():
     # plus media_now must transcribe, so extraction reads text even in groups
     # the bot never answers.
     _pm_v = _PM([_AR(slot=0, file="v2.amr", url="http://cdn/v2.amr")])
-    _res_v = await MEDIA.resolve(_pm_v, bot=VoiceBot(), group_id="g9", cfg=cfg,
-                                 allow_models=False, media_now=True)
+    _res_v = await MEDIA.resolve(_pm_v, bot=VoiceBot(), group_id="g9", cfg=cfg)
     check("a voice clip transcribes on arrival, before any reply",
           _res_v.get(0) == "⟦语音:明天一起去吃饭⟧", repr(_res_v))
     MEDIA._local = _local_saved

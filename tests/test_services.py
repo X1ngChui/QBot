@@ -17,16 +17,19 @@ os.environ.setdefault("CONFIG_DIR", str(ROOT / "tests" / "fixtures" / "config"))
 from qqbot.domain.memory import Candidate, CandidateType, RejectReason
 from qqbot.services import Validator
 from qqbot.services.memory_extractor import (
-    ExtractionInput, MemoryExtractor, SourceLine, predicate_names, tools,
+    ExtractionInput, MemoryExtractor, SourceLine, line_body, predicate_names, tools,
 )
+from qqbot.util import sysmark
 
 fails = []
 E1, E2 = uuid.uuid4(), uuid.uuid4()
 CODES = {1: E1, 2: E2}
 # One entry per message, not one blob: a quote has to be inside a single message, because
 # that is what somebody said. Text that only matches once the lines are joined spans a
-# line break, which nobody typed.
-LINES = ("老王[1]: 我最近在玩鸣潮", "小北[2]: 老周你又来了")
+# line break, which nobody typed. Rendered the way the worker renders them: a time
+# stamp, the speaker's name and code, then the body.
+LINES = (f"{sysmark('08-30 14:03')} 老王{sysmark('1')}: 我最近在玩鸣潮",
+         f"{sysmark('08-30 14:04')} 小北{sysmark('2')}: 老周你又来了")
 
 
 def check(name, cond, detail=""):
@@ -70,9 +73,25 @@ check("空候选被拒", v.check(cand(CandidateType.FACT)).reason is RejectReaso
 # A quote has to sit inside one message. Joined, these two lines contain the string; but
 # nobody said it - it spans a line break, so it is two people's words glued together.
 across = cand(CandidateType.FACT, account=1, predicate="plays", object="x",
-              quote="我最近在玩鸣潮\n小北[2]: 老周你又来了")
+              quote="我最近在玩鸣潮\n" + LINES[1])
 check("跨行拼出来的引用不算引用", v.check(across).reason is RejectReason.MALFORMED,
       "整段拼接里找得到，但没有任何一条发言是这么说的")
+
+# The speaker prefix is not something anybody said. A quote that is a member's name
+# would otherwise be "found" on every line that member spoke, and the record filed
+# against whichever line came first.
+check("the speaker prefix is stripped before matching",
+      line_body(LINES[0]) == "我最近在玩鸣潮", line_body(LINES[0]))
+check("and a line with no prefix is taken whole", line_body("裸文本") == "裸文本")
+named = cand(CandidateType.FACT, account=1, predicate="plays", object="x", quote="老王")
+check("a quote that is only a speaker's name is not a quote",
+      v.check(named).reason is RejectReason.MALFORMED)
+# Said twice, by two people: the quote backs neither of them.
+twice = Validator(CODES, LINES + (f"{sysmark('08-30 14:05')} 老王{sysmark('1')}: 老周你又来了",))
+echoed = cand(CandidateType.FACT, account=1, predicate="plays", object="x",
+              quote="老周你又来了")
+check("a quote found in two messages validates against neither",
+      twice.check(echoed).reason is RejectReason.MALFORMED)
 
 # The extractor could not attribute the quote to a message, and it must not fall
 # back to any other message: a record filed as evidence from a message that does
@@ -154,8 +173,9 @@ check("the predicate is an enum in the tool definition itself",
 # classes, the rendering.
 from qqbot.services.context_builder import render_fact
 from qqbot.services.memory_extractor import (
-    decay_classes, multi_valued, opposites, rules_block, single_valued,
+    decay_classes, multi_valued, opposites, rules_block,
 )
+from qqbot.settings import config as _cfg
 
 PREDS = predicate_names()
 check("the table holds predicates at all", len(PREDS) > 10, str(len(PREDS)))
@@ -184,9 +204,10 @@ check("decay classes only name real predicates",
       (set(_stable) | set(_fast)) <= set(PREDS) | {"topic"},
       str((set(_stable) | set(_fast)) - set(PREDS) - {"topic"}))
 check("no predicate is in two decay classes", not set(_stable) & set(_fast))
-check("cardinality covers every predicate exactly once",
-      set(single_valued()) | set(multi_valued()) == set(PREDS)
-      and not set(single_valued()) & set(multi_valued()))
+_table = _cfg().predicates.person
+check("multi_valued is exactly the predicates the table marks multi",
+      set(multi_valued()) == {p for p in PREDS if _table[p].cardinality == "multi"}
+      and all(_table[p].cardinality in ("single", "multi") for p in PREDS))
 check("opposites are mutual",
       all(opposites().get(b) == a for a, b in opposites().items()),
       str(opposites()))
@@ -245,6 +266,17 @@ nowhere = MemoryExtractor._to_candidate(
     inp)
 check("a quote in no message gets no source, rather than a plausible one",
       nowhere.source_event_id is None, str(nowhere.source_event_id))
+check("a quote that is only a speaker's name has no source",
+      inp.source_of("老王") is None)
+_twice = ExtractionInput(
+    group_id=1, transcript="", roster="", account_codes=CODES,
+    lines=SRC + (SourceLine(event_id=uuid.uuid4(),
+                            text=f"{sysmark('08-30 14:05')} 老王{sysmark('1')}: 老周你又来了"),))
+check("a quote found in two messages has no source, rather than the first",
+      _twice.source_of("老周你又来了") is None)
+check("arguments that are JSON but not an object are dropped",
+      MemoryExtractor._to_candidate(
+          {"function": {"name": "record_fact", "arguments": "[1, 2]"}}, inp) is None)
 
 group = MemoryExtractor._to_candidate(
     call("record_group_term", term="切片", meaning="把采样切成小段再重排",

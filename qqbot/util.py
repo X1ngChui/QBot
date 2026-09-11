@@ -63,7 +63,7 @@ def _read_key_file(path: Path) -> str:
     """utf-8-sig, because a secret written by a Windows editor carries a BOM that strip()
     will not remove (U+FEFF is not whitespace) - it would ride along into the auth header
     and come back as an unexplained 401."""
-    return path.read_text(encoding="utf-8-sig").strip().lstrip("﻿")
+    return path.read_text(encoding="utf-8-sig").strip().lstrip("\ufeff")
 
 
 def read_secret(env_name: str, fallback_env: str | None = None) -> str:
@@ -74,7 +74,7 @@ def read_secret(env_name: str, fallback_env: str | None = None) -> str:
         if p.is_file():
             return _read_key_file(p)
     if fallback_env:
-        return (os.getenv(fallback_env) or "").strip().lstrip("﻿")
+        return (os.getenv(fallback_env) or "").strip().lstrip("\ufeff")
     return ""
 
 
@@ -103,6 +103,20 @@ def read_api_key(name: str) -> str:
     if conventional.is_file():
         return _read_key_file(conventional)
     return ""
+
+
+def require_key(name: str, what: str) -> str:
+    """read_api_key, or a RuntimeError naming the capability and the variable.
+
+    Every paid backend resolves its key at the moment of the call rather than at
+    construction, so a rotated key is picked up without a restart; this is the one
+    wording of the failure when there is nothing to pick up, so a log reader sees
+    which section of settings.yaml points at the empty name.
+    """
+    key = read_api_key(name)
+    if not key:
+        raise RuntimeError(f"no {what} API key: {name} resolved to nothing")
+    return key
 
 
 def now_local() -> datetime:
@@ -154,16 +168,51 @@ def defang(text: str) -> str:
     the one property that matters, being mistakable for system markup. Applied at
     the boundaries where outside text enters a transcript: segment parsing, media
     descriptions, member names, tool digests. Idempotent, cheap, total.
+
+    NUL is dropped on the same pass. A client can put one into a message, and
+    PostgreSQL accepts it in neither text nor jsonb - one stray NUL would cost the
+    whole message its place in the archive.
     """
     if not text:
         return text
-    return text.replace(SYS_L, "[").replace(SYS_R, "]")
+    return text.replace(SYS_L, "[").replace(SYS_R, "]").replace("\x00", "")
+
+
+def scrub_nul(value):
+    """The same NUL rule applied through a nested structure of the kind a message
+    event carries (dicts, lists, strings). Everything else passes through as is.
+    For the raw segments stored verbatim, where defang() would be too much: the
+    brackets are neutralised at render time, but a NUL fails the write itself."""
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, dict):
+        return {k: scrub_nul(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [scrub_nul(v) for v in value]
+    return value
 
 
 def sysmark(body: str) -> str:
     """One system marker, in the reserved brackets. The single spelling of the
     grammar, so a marker written here can never drift from the defang() pair."""
     return f"{SYS_L}{body}{SYS_R}"
+
+
+def cut_text(text: str, limit: int) -> str:
+    """text[:limit], never leaving a system marker cut in half.
+
+    The per-line bound is applied to arriving messages and to renders patched
+    later, and a cut landing inside a marker leaves an unbalanced bracket in the
+    window and the archive - the one thing defang() rules out everywhere else -
+    and a picture-marker count that no longer matches the message's references.
+    The cut moves back to the marker's opening bracket instead.
+    """
+    if len(text) <= limit:
+        return text
+    t = text[:limit]
+    if t.count(SYS_L) > t.count(SYS_R):
+        t = t[:t.rfind(SYS_L)]
+    return t
 
 
 def merge_overlapping(sets: list[set]) -> list[set]:
@@ -213,6 +262,10 @@ def why(e: BaseException) -> str:
     str(TimeoutError()) is "", and a timeout is exactly the failure worth logging -
     logging str(e) alone writes lines that carry no information at all. The type name is
     the part that is always there.
+
+    First line only: an HTTP client that appends a documentation link on a second
+    line would otherwise put that line into the log on its own, looking like a
+    separate event.
     """
-    text = str(e).strip()
+    text = str(e).strip().partition("\n")[0].strip()
     return f"{type(e).__name__}: {text}" if text else type(e).__name__

@@ -3,15 +3,17 @@
 Everything here costs something - an HTTP fetch, an API call, a model call - which is the
 line between this file and segments.py. Two rules shape it:
 
-1. **Everything but voice resolves on arrival.** Who was @-ed, what was quoted and
-   what was forwarded cost nothing, and an unresolved mention would archive as a bare
-   account number - the thing the prompt is most careful to keep out. Pictures resolve
-   on arrival too: the upload that files them with the vision backend is free and wants
+1. **Everything resolves on arrival.** Who was @-ed, what was quoted and what was
+   forwarded cost nothing, and an unresolved mention would archive as a bare account
+   number - the thing the prompt is most careful to keep out. Pictures resolve on
+   arrival too: the upload that files them with the vision backend is free and wants
    the freshest link, and the describing call is cached per unique picture, rate
-   limited, and behind the daily budget cap - so paying at arrival is the same money at
-   better latency, and it reaches groups the bot never speaks in. Voice alone waits for
-   a reply: billed per second, never repeated, and only ever discussed right after
-   being sent.
+   limited, and behind the daily budget cap - so paying at arrival is the same money
+   at better latency, and it reaches groups the bot never speaks in. Voice is
+   transcribed on arrival as well: clips are rarer than pictures, and without an
+   arrival transcript they were a blind spot in extraction, which reads only text.
+   The per-minute gates and the daily cap apply here as on any paid path, and a
+   clip turned away stays pending, so the next reply's backlog pass tries again.
 
    Late resolution stays possible in reach. A received image link carries an rkey that
    expires in about two hours, but the file id does not: get_image trades it for a
@@ -179,7 +181,11 @@ class MediaProcessor:
                         return None
                 return bytes(buf)
         except Exception as e:
-            log.warning("media download failed %s: %s", url[:80], why(e))
+            # Info, not warning: a received link is one of three routes to the bytes
+            # and the one that expires (its rkey lasts about two hours), so it fails
+            # routinely for any picture read late. _bytes reports when no route
+            # answered, which is the failure worth a warning.
+            log.info("media download failed %s: %s", url[:80], why(e))
             return None
 
     @staticmethod
@@ -215,7 +221,10 @@ class MediaProcessor:
                 if data is None and info.get("url"):
                     data = await self._fetch(info["url"], max_bytes)
             except Exception as e:
-                log.warning("get_image failed: %s", why(e))
+                log.info("get_image failed: %s", why(e))
+        if data is None:
+            log.warning("picture unreadable by every route (path=%s link=%s file=%s)",
+                        bool(ref.path), bool(ref.url), bool(ref.file))
         return data
 
     @staticmethod
@@ -294,7 +303,7 @@ class MediaProcessor:
         as the fallback for when the image cannot be fetched.
         """
         if ref.key and (flight := self._describing.get(ref.key)) is not None:
-            return await flight
+            return await asyncio.shield(flight)
         if not ref.key:
             return await self._describe_once(ref, bot=bot, group_id=group_id, cfg=cfg)
         task = asyncio.create_task(
@@ -303,9 +312,12 @@ class MediaProcessor:
         # Popped when the FLIGHT ends, not when this awaiter does: a cancelled
         # awaiter must not unregister a flight still in the air, or the next
         # caller starts (and pays for) a duplicate. The callback also keeps the
-        # only strong reference alive - asyncio holds tasks weakly.
+        # only strong reference alive - asyncio holds tasks weakly. Awaited
+        # through shield for the same reason: cancelling a task cancels what it
+        # is awaiting, and one cancelled awaiter must not abort the paid call
+        # every other waiter is sharing.
         task.add_done_callback(lambda _t, k=ref.key: self._describing.pop(k, None))
-        return await task
+        return await asyncio.shield(task)
 
     async def _describe_once(self, ref: ImageRef, *, bot: BotApi, group_id: str,
                              cfg: Settings) -> str | None:
@@ -382,16 +394,17 @@ class MediaProcessor:
         backend and double billing."""
         key = ref.file or ref.url or ref.path
         if key and (flight := self._transcribing.get(key)) is not None:
-            return await flight
+            return await asyncio.shield(flight)
         if not key:
             return await self._transcribe_once(ref, bot=bot, group_id=group_id, cfg=cfg)
         task = asyncio.create_task(
             self._transcribe_once(ref, bot=bot, group_id=group_id, cfg=cfg))
         self._transcribing[key] = task
-        # Same rule as describe_image's registry: pop when the flight ends, never
-        # when an awaiter does.
+        # Same rules as describe_image's registry: pop when the flight ends, never
+        # when an awaiter does, and await through shield so a cancelled awaiter
+        # cannot abort the shared call.
         task.add_done_callback(lambda _t, k=key: self._transcribing.pop(k, None))
-        return await task
+        return await asyncio.shield(task)
 
     async def _transcribe_once(self, ref: AudioRef, *, bot: BotApi, group_id: str,
                                cfg: Settings) -> str | None:
@@ -558,36 +571,23 @@ class MediaProcessor:
         bot,
         group_id: str,
         cfg: Settings,
-        allow_models: bool = True,
-        media_now: bool = False,
     ) -> dict[int, str]:
-        """`allow_models=False` keeps the free lookups (who was @-ed, what was quoted,
-        what was forwarded) and skips what costs money; `media_now=True` re-admits
-        pictures and voice.
+        """Every reference in one message, resolved: the free lookups (who was
+        @-ed, what was quoted, what was forwarded) and the paid media alike.
 
-        The schedule this encodes: mentions, quotes and forwards resolve on arrival
-        because a bare account number must not reach the archive. Pictures and voice
-        also resolve on arrival (media_now): understood now, archived as text (design
-        goal 8) - the download link is freshest then, the describing call is cached
-        per unique picture, and both sit behind the daily cap, so arrival-time
-        understanding is the same money at better latency, and it reaches groups the
-        bot never replies in. Voice clips are rarer than pictures and bill by the
-        second; without an arrival transcript they were a blind spot in extraction,
-        which reads only text. Calling this twice on the same message is expected and
-        cheap - the second pass hits warm caches or the in-flight registries."""
+        The paid kinds carry their own gates - the per-picture cache, the
+        per-minute windows, the daily cap - so this runs on arrival for every
+        message, and calling it again on the same message is expected and cheap:
+        the second pass hits warm caches or the in-flight registries. The
+        free-only path for nested content is _free_refs.
+        """
         if not pm.refs:
             return {}
         self_id = str(getattr(bot, "self_id", ""))
 
         async def one(ref: Ref):
-            if (ref.free or allow_models
-                    or (media_now and isinstance(ref, (ImageRef, AudioRef)))):
-                return await ref.resolve(self, bot=bot, group_id=group_id, cfg=cfg,
-                                         self_id=self_id)
-            # A description already paid for costs nothing to reuse, and stickers repeat
-            # constantly - so the free pass still answers for anything seen before. Only a
-            # first sighting is left as a bare marker.
-            return await self.cached(ref) if isinstance(ref, ImageRef) else None
+            return await ref.resolve(self, bot=bot, group_id=group_id, cfg=cfg,
+                                     self_id=self_id)
 
         results = await asyncio.gather(*(one(r) for r in pm.refs), return_exceptions=True)
         out: dict[int, str] = {}

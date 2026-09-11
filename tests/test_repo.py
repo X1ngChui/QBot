@@ -41,7 +41,12 @@ def check(name, cond, detail=""):
 
 
 async def say(group, uid, name, text, *, msg_id=None, at=None):
-    """One message through the real inbound path."""
+    """One message through the real inbound path.
+
+    Backdated by a few seconds afterwards: the extraction watermark leaves out the
+    newest seconds of ingest (see EventRepository.UNREAD_MESSAGE), and a test that
+    writes and counts within the same second would otherwise see nothing unread.
+    """
     mid = msg_id or f"auto{next(_SEQ)}"
     await ingestor().ingest(
         GroupMessage(
@@ -50,6 +55,9 @@ async def say(group, uid, name, text, *, msg_id=None, at=None):
             self_id="999", occurred_at=at or now_local(), plain_text=text,
         )
     )
+    await pool().execute(
+        """UPDATE raw_event SET created_at = created_at - INTERVAL '10 seconds'
+            WHERE platform='qq' AND platform_event_id=$1""", mid)
     return mid
 
 
@@ -243,7 +251,7 @@ async def main():
 
     ts = TavilySearch()
     ts._client = _hx.AsyncClient(transport=_hx.MockTransport(_fake_tavily))
-    ts._proxy = scfg.proxy
+    ts._id = (scfg.timeout_sec, scfg.proxy)   # what _http() keys the cached client on
 
     spent_before = await repo.day_cost(day)
     items = await ts.search("天气 上海", cfg=scfg, group_id=str(G1))

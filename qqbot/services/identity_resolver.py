@@ -89,8 +89,9 @@ class IdentityResolver:
         return acc
 
     async def merge(self, loser_account: str, winner_account: str) -> bool:
-        """Declare two accounts to be the same person. Owner-triggered only (design
-        doc 55).
+        """Declare two accounts to be the same person. Owner-triggered only: no
+        automatic path may fold two people into one, because a wrong merge mixes two
+        histories and nothing downstream can tell them apart again.
 
         Takes accounts rather than entity ids: what an owner can see from inside the
         group is a number and a display name, and asking them for a UUID would be

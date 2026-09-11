@@ -35,22 +35,35 @@ log = logging.getLogger("qqbot.providers")
 _FREE = Rate("second", per_unit=0.0, source="self-hosted: watts, not CNY")
 
 
-def _pcm_from_wav(data: bytes) -> tuple[list[float], int]:
-    """Decode a WAV container to mono float32 samples in [-1, 1] plus its rate.
+def _pcm_from_wav(data: bytes) -> tuple[Any, int]:
+    """Decode a WAV container to mono float samples in [-1, 1] plus its rate.
 
-    Stdlib only: sherpa-onnx wants raw samples, and pulling in numpy/soundfile
-    for one 16-bit PCM parse would be the heaviest dependency in the file.
-    Multi-channel audio is averaged down; NapCat always sends mono anyway.
+    Vectorised through numpy, which the sherpa-onnx wheel already brings: a
+    five-minute clip is nearly five million samples, and a Python list of floats
+    for it is a hundred megabytes built one element at a time. A venv without
+    numpy (no wheel installed) falls back to the pure-Python path, so the parser
+    stays testable without the model. Multi-channel audio is averaged down;
+    NapCat always sends mono anyway. A payload that is not a whole number of
+    frames is cut to one rather than refused - a truncated upload still holds
+    speech.
     """
     with wave.open(io.BytesIO(data)) as w:
         n_ch, width, rate = w.getnchannels(), w.getsampwidth(), w.getframerate()
         if width != 2:
             raise ValueError(f"expected 16-bit PCM, got sample width {width}")
         raw = w.readframes(w.getnframes())
-    ints = memoryview(raw).cast("h")
-    if n_ch > 1:
-        ints = [sum(ints[i:i + n_ch]) // n_ch for i in range(0, len(ints), n_ch)]
-    return [s / 32768.0 for s in ints], rate
+    frame = 2 * n_ch
+    raw = raw[:len(raw) // frame * frame]
+    try:
+        import numpy as np
+    except ImportError:
+        ints = memoryview(raw).cast("h")
+        if n_ch > 1:
+            ints = [sum(ints[i:i + n_ch]) // n_ch for i in range(0, len(ints), n_ch)]
+        return [s / 32768.0 for s in ints], rate
+    pcm = np.frombuffer(raw, np.int16).reshape(-1, n_ch)
+    mono = pcm.mean(axis=1) if n_ch > 1 else pcm[:, 0]
+    return mono.astype(np.float32) / 32768.0, rate
 
 
 class SherpaAsr(AsrModel):
@@ -94,11 +107,14 @@ class SherpaAsr(AsrModel):
             log.info("sherpa ASR loaded: %s (%d threads)", model, cfg.threads)
         return self._recognizer
 
-    def _decode(self, rec: Any, samples: list[float], rate: int) -> str:
+    def _decode(self, rec: Any, data: bytes) -> tuple[str, float]:
+        """WAV bytes to (transcript, clip seconds). Runs off the loop, whole: the
+        PCM decode of a long clip is as much CPU as the recognition."""
+        samples, rate = _pcm_from_wav(data)
         stream = rec.create_stream()
         stream.accept_waveform(rate, samples)
         rec.decode_stream(stream)
-        return stream.result.text.strip()
+        return stream.result.text.strip(), len(samples) / max(rate, 1)
 
     async def transcribe(
         self, data: bytes, *, cfg: AsrCfg, fmt: str = "wav",
@@ -108,14 +124,13 @@ class SherpaAsr(AsrModel):
             # media.py always transcodes through NapCat first; anything else is
             # a caller bug, and decoding compressed audio is out of scope here.
             raise ValueError(f"sherpa backend takes WAV only, got {fmt!r}")
-        samples, rate = _pcm_from_wav(data)
         async with self._lock:
             rec = self._get(cfg)
             # Model load above stays on the loop (once, ~a second); decoding is
             # the recurring cost and runs off-loop so a long clip cannot stall
             # message handling.
-            text = await asyncio.to_thread(self._decode, rec, samples, rate)
-        secs = seconds if seconds else len(samples) / max(rate, 1)
+            text, clip_secs = await asyncio.to_thread(self._decode, rec, data)
+        secs = seconds if seconds else clip_secs
         await BUDGET.record(kind=Kind.ASR, model=cfg.model or "sense-voice",
                             cny=_FREE.units(secs), group_id=group_id)
         return text

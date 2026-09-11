@@ -1451,6 +1451,18 @@ async def main():
           await pool().fetchval(
               "SELECT count(*) FROM raw_event WHERE platform_event_id=$1",
               str(ev16.message_id)) == 1)
+    # The pointer enters the record as a notice about the member, never as
+    # the bot's own words: a bot line reading "please accept the agreement"
+    # was read by the model as its answer to that question and repeated to a
+    # member who had just consented.
+    st16 = await REGISTRY.get("123")
+    _last16 = st16.recent[-1]
+    check("the pointer is transcribed as a notice about the member",
+          not _last16.is_bot and _last16.user_id == "newbie"
+          and "用户协议" in _last16.text and "/agree" not in _last16.text,
+          f"{_last16.is_bot} {_last16.user_id} {_last16.text!r}")
+    check("and no bot line in the window carries the pointer",
+          not any(m.is_bot and _agree.POINTER in m.text for m in st16.recent))
     await GATEWAY.handle(bot, FakeEvent("小X 在吗", user_id="newbie",
                                         nickname="新人", to_me=True))
     await drain()
@@ -1589,9 +1601,26 @@ async def main():
           f"{named} vs {first}")
     line18 = _CM0(msg_id="ns-1", user_id="u31", nickname="张伟",
                   text="改锥在我这", ts=_nl0())
-    await _MEM18.relabel(bot, "123", [line18])
+    n18 = await _MEM18.relabel(bot, "123", [line18])
     check("relabel carries the numbered name onto window lines",
           line18.nickname == first["u31"], line18.nickname)
+    # Every line a namesake sends arrives with the bare card and gains its tag here.
+    # That is the render step, not a rename, or the log reports one per message.
+    check("tagging a namesake's fresh line is not counted as a rename", n18 == 0, str(n18))
+    # A member the table has never heard of forces one refresh inside the TTL -
+    # a newcomer @-ed a minute after joining must resolve - and a miss that
+    # survives the refresh is remembered, so a departed member's old lines do
+    # not cost a fetch on every reply.
+    calls18 = bot.member_list_calls
+    await _MEM18.names_of(bot, "123", ["u31", "u-gone"])
+    check("an unknown member forces one refresh inside the TTL",
+          bot.member_list_calls == calls18 + 1, str(bot.member_list_calls - calls18))
+    await _MEM18.names_of(bot, "123", ["u31", "u-gone"])
+    check("and a miss that survived it does not force another",
+          bot.member_list_calls == calls18 + 1, str(bot.member_list_calls - calls18))
+    bot.members.append({"user_id": "u-new", "card": "新人甲", "nickname": "n"})
+    check("a newcomer resolves at once, inside the TTL",
+          (await _MEM18.name_of(bot, "123", "u-new")) == "新人甲")
     await seed(123, "u31", "张伟", text="改锥昨天借给阿强了")
     await seed(123, "u32", "张伟", text="改锥我根本没见过")
     n31 = int(first["u31"].split("⟦同名")[1].rstrip("⟧"))

@@ -40,7 +40,7 @@ from .settings import config
 __plugin_meta__ = PluginMetadata(
     name="qqbot",
     description="QQ group chat AI bot",
-    usage="/reload /mute /unmute /stats",
+    usage="/help",
 )
 
 log = logging.getLogger("qqbot")

@@ -17,12 +17,18 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from abc import ABC, abstractmethod
-from collections.abc import Coroutine
+from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from enum import StrEnum
 
+import httpx
+
 from ..settings import AsrCfg, EmbeddingCfg, SearchCfg, TextCfg, VisionCfg
+from ..util import why
 
 log = logging.getLogger("qqbot.providers")
 
@@ -34,6 +40,9 @@ class Kind(StrEnum):
     """
 
     REPLY = "reply"
+    #: The launch checklist's one real call per capability (scripts/preflight.py).
+    #: Its own kind so a check run never reads as a reply in /stats.
+    PREFLIGHT = "preflight"
     #: Reading a batch of transcript into memory candidates. Its own kind because it is
     #: the one recurring cost that scales with how much the group talks rather than with
     #: how often the bot answers, and the two need to be readable apart.
@@ -68,6 +77,96 @@ def retire(closing: Coroutine) -> None:
         return
     _RETIRING.add(task)
     task.add_done_callback(_RETIRING.discard)
+
+
+# -- retrying ---------------------------------------------------------------
+
+#: The longest a Retry-After header may hold a call. A vendor asking for minutes is
+#: asking the wrong client: a reply somebody is waiting for fails and is retried by
+#: the person, and a background batch is rescheduled by its queue.
+RETRY_AFTER_CAP = 30.0
+
+#: Retries for the plain-HTTP backends, which carry no `retries` setting of their own.
+#: Same count the text config defaults to.
+HTTP_RETRIES = 2
+
+
+def retry_after_seconds(headers: Mapping[str, str]) -> float | None:
+    """The Retry-After header as seconds, or None when absent or unreadable.
+
+    Both spellings the header allows: a delay in seconds, or an HTTP-date; a date
+    already past is zero, not negative.
+    """
+    raw = (headers.get("retry-after") or "").strip()
+    if not raw:
+        return None
+    if raw.isdigit():
+        return float(raw)
+    try:
+        when = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=UTC)
+    return max(0.0, (when - datetime.now(UTC)).total_seconds())
+
+
+def backoff_delay(attempt: int, *, retry_after: float | None = None,
+                  cap: float = RETRY_AFTER_CAP) -> float:
+    """How long to sleep before retry number `attempt` (1-based).
+
+    The base schedule is short and doubling (0.5 s, 1 s, 2 s ...): a connection
+    reset or a 5xx is usually gone by the next second. A vendor that names its own
+    wait (Retry-After on a 429) is honoured up to the cap, since retrying before it
+    only burns the attempt. Jitter of up to a quarter keeps every caller that hit
+    the same limit from returning in one wave.
+    """
+    delay = 0.5 * 2 ** (attempt - 1)
+    if retry_after is not None:
+        delay = max(delay, retry_after)
+    delay = min(delay, cap)
+    return delay + random.uniform(0.0, 0.25 * delay)
+
+
+def _http_retryable(e: Exception) -> bool:
+    # Transport failures never reached a reply; a 429 or a 5xx is the vendor's own
+    # request to try again. A 4xx of any other kind is the request's fault and is
+    # the same request next time.
+    if isinstance(e, httpx.TransportError):
+        return True
+    if isinstance(e, httpx.HTTPStatusError):
+        status = e.response.status_code
+        return status == 429 or status >= 500
+    return False
+
+
+async def with_retry[T](
+    fn: Callable[[], Awaitable[T]], *, what: str,
+    retries: int = HTTP_RETRIES, retry_after_cap: float = RETRY_AFTER_CAP,
+) -> T:
+    """Run `fn` again on a transport error, a 429 or a 5xx, up to `retries` times.
+
+    For the backends that speak plain httpx rather than the OpenAI SDK, so that a
+    flaky proxy or a momentary rate limit costs a short sleep instead of the whole
+    call. `fn` must raise httpx.HTTPStatusError itself (raise_for_status) for the
+    status rule to see it. Anything else propagates on the first attempt.
+    """
+    attempt = 0
+    while True:
+        try:
+            return await fn()
+        except (httpx.TransportError, httpx.HTTPStatusError) as e:
+            if not _http_retryable(e):
+                raise
+            attempt += 1
+            if attempt > retries:
+                raise
+            wait = (retry_after_seconds(e.response.headers)
+                    if isinstance(e, httpx.HTTPStatusError) else None)
+            delay = backoff_delay(attempt, retry_after=wait, cap=retry_after_cap)
+            log.info("%s failed (%s), retry %d/%d in %.1fs", what, why(e),
+                     attempt, retries, delay)
+            await asyncio.sleep(delay)
 
 
 class QuotaExhausted(RuntimeError):
@@ -168,12 +267,15 @@ class TextModel(Capability):
         tools: list[dict] | None = None,
         max_tokens: int | None = None,
         effort: str | None = None,
-        kind: str = "reply",
+        kind: Kind = Kind.REPLY,
         group_id: str | None = None,
     ) -> ChatResult:
         """Run one completion. Model, deliberation grade and timeout come from `cfg`,
         so a caller with different needs passes a different config rather than a pile
         of exceptions.
+
+        `kind` is what the call is booked as, and it is the enum: a purpose the
+        ledger's readers do not know about is a purpose /stats cannot show.
 
         `effort` overrides cfg.reasoning_effort for the one call, and exists for
         diagnostics that must pin a grade regardless of configuration. A request,

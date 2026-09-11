@@ -20,6 +20,10 @@ _FREE = Rate("Mtoken", in_hit=0.0, in_miss=0.0, out=0.0,
 
 class LocalChat(OpenAICompatChat):
     name = "local"
+    #: A self-hosted server usually checks no credential, so an empty key is not a
+    #: misconfiguration here; the client sends a placeholder the SDK accepts. A key
+    #: that is set is still used, for a server that does check one.
+    key_required = False
 
     def rate_for(self, model: str) -> Rate:
         return _FREE

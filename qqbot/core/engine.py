@@ -34,12 +34,23 @@ log = logging.getLogger("qqbot.engine")
 #: and a stop rather than an endless loop.
 RUNAWAY_ROUNDS = 20
 
-#: What an unexecuted tool request is answered with once the allowance died mid-round,
-#: and what the wrap-up round is told. Mechanical one-line notices, so they live in
-#: code like the repeated-call notice, not in the prompt registry.
+#: What a tool request is answered with when it is not executed: after the
+#: allowance died mid-round, past the per-round cap, or as a repeat of a call
+#: already answered - and what the wrap-up round is told. Mechanical one-line
+#: notices, so they live in code, not in the prompt registry.
 QUOTA_NOTE = "（检索额度已用完，这个查询没有执行。）"
+OVERFLOW_NOTE = ("（本轮工具调用次数已达上限，这个查询没有执行；"
+                 "先用已有结果作答，如需再查请下一轮再发。）")
+REPEAT_NOTE = "（这个查询刚执行过，结果就在上面。换个关键词，或用已有资料回答。）"
 WRAP_UP_NOTE = ("（本次回复的额度已用完，不能再执行任何检索或查看；"
                 "请只依据上文已有的材料直接作答，不要提及额度或系统限制。）")
+
+#: How many tool calls one round may carry. Each call is free, but each result is
+#: appended to the prompt, and a round asking for thirty pages at once would grow
+#: the next request past the model's context before money had a chance to bind -
+#: which ends in a failed call and silence, not a budget stop. The rest of the
+#: round is answered with a note; a model that still wants them asks next round.
+MAX_CALLS_PER_ROUND = 8
 
 #: Caps on the provenance marker appended to the bot's own archived line: how many
 #: tool uses it names, and how much of each query survives. A record, not a transcript
@@ -261,48 +272,10 @@ async def generate(
                 {"role": "assistant", "content": res.text or None,
                  "tool_calls": res.tool_calls}
             )
-            quota_hit = False
-            for call in res.tool_calls:
-                fn = call.get("function", {}) or {}
-                key = (fn.get("name") or "", (fn.get("arguments") or "").strip())
-                if quota_hit:
-                    # The allowance died mid-round; the remaining requests are
-                    # answered with the placeholder so every tool_call id gets
-                    # its reply and the wrap-up call is protocol-clean.
-                    out = QUOTA_NOTE
-                elif key in seen_calls:
-                    # Nothing here is paginated, so the same call again returns the same
-                    # bytes. Answered in words rather than re-executed: a model repeating
-                    # itself is a model stuck, and handing it identical results once more
-                    # is how a bounded loop spends its whole bound standing still.
-                    out = "（这个查询刚执行过，结果就在上面。换个关键词，或用已有资料回答。）"
-                else:
-                    seen_calls.add(key)
-                    try:
-                        _args = json.loads(key[1] or "{}")
-                    except json.JSONDecodeError:
-                        _args = {}
-                    try:
-                        # Every tool here is free per call - a SQL query, an HTTP
-                        # fetch, a file upload. What money bounds is the rounds that
-                        # carry them, each a paid model call.
-                        out = await tools.execute(call, cfg=cfg, group_id=st.group_id,
-                                                  ctx=ctx)
-                    except QuotaExhausted as e:
-                        log.info("group %s: %s - wrapping up on what is already "
-                                 "fetched", st.group_id, why(e))
-                        quota_hit = True
-                        out = QUOTA_NOTE
-                    else:
-                        executed.append(
-                            (key[0], _args if isinstance(_args, dict) else {}, out))
-                # A picture answers as a content array carrying the file block; the
-                # vendor takes one on a tool message, so what was asked for arrives
-                # as the answer to the call rather than as a turn appended behind it.
-                messages.append({
-                    "role": "tool", "tool_call_id": call.get("id", ""),
-                    "content": out.content() if isinstance(out, tools.Attachment) else out,
-                })
+            answers, quota_hit = await _run_round(
+                res.tool_calls, cfg=cfg, st=st, ctx=ctx,
+                seen_calls=seen_calls, executed=executed)
+            messages.extend(answers)
             if quota_hit:
                 return await _wrap_up(messages, cfg=cfg, st=st,
                                       executed=executed, round_no=round_no + 1)
@@ -312,6 +285,68 @@ async def generate(
     log.error("group %s: %d tool rounds without running out of money - a backend "
               "is billing zero; giving up", st.group_id, RUNAWAY_ROUNDS)
     return None, "", ""
+
+
+async def _run_round(
+    calls: list[dict], *, cfg: Settings, st: GroupState, ctx: tools.ToolCtx,
+    seen_calls: set[tuple[str, str]], executed: list[tuple[str, dict, str]],
+) -> tuple[list[dict], bool]:
+    """One round's tool requests, each answered: the tool messages to append, and
+    whether the allowance died on the way.
+
+    Every request gets its tool message whatever became of it, so the next call
+    is protocol-clean. Every tool here is free per call - a SQL query, an HTTP
+    fetch, a file upload; what money bounds is the rounds that carry them, each
+    a paid model call. What is not executed is answered in words: a repeat of a
+    call already answered (nothing here is paginated, so the same call returns
+    the same bytes, and a model repeating itself is a model stuck - handing it
+    identical results once more is how a bounded loop spends its whole bound
+    standing still), anything past the per-round cap, and everything after the
+    allowance died mid-round.
+    """
+    answers: list[dict] = []
+    quota_hit = False
+    for n, call in enumerate(calls):
+        fn = call.get("function", {}) or {}
+        name = fn.get("name") or ""
+        raw = (fn.get("arguments") or "").strip()
+        try:
+            args = json.loads(raw or "{}")
+        except json.JSONDecodeError:
+            args = None
+        # Keyed on the parsed arguments, so the same query spelled with different
+        # whitespace or key order is the same call. execute() parses again and
+        # answers a malformed string in-band; the raw string keys those.
+        key = (name, json.dumps(args, sort_keys=True, ensure_ascii=False)
+               if isinstance(args, dict) else raw)
+        if quota_hit:
+            out = QUOTA_NOTE
+        elif n >= MAX_CALLS_PER_ROUND:
+            out = OVERFLOW_NOTE
+        elif key in seen_calls:
+            out = REPEAT_NOTE
+        else:
+            seen_calls.add(key)
+            try:
+                out = await tools.execute(call, cfg=cfg, group_id=st.group_id, ctx=ctx)
+            except QuotaExhausted as e:
+                log.info("group %s: %s - wrapping up on what is already fetched",
+                         st.group_id, why(e))
+                quota_hit = True
+                out = QUOTA_NOTE
+            else:
+                executed.append((name, args if isinstance(args, dict) else {}, out))
+        # A picture answers as a content array carrying the file block; the
+        # vendor takes one on a tool message, so what was asked for arrives
+        # as the answer to the call rather than as a turn appended behind it.
+        answers.append({
+            "role": "tool", "tool_call_id": call.get("id", ""),
+            "content": out.content() if isinstance(out, tools.Attachment) else out,
+        })
+    if len(calls) > MAX_CALLS_PER_ROUND:
+        log.info("group %s: %d tool calls in one round, %d past the cap left unexecuted",
+                 st.group_id, len(calls), len(calls) - MAX_CALLS_PER_ROUND)
+    return answers, quota_hit
 
 
 async def respond(
