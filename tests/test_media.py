@@ -233,6 +233,54 @@ async def main():
     check("and the picture did reach the model", len(VISION_CALLS) == seen0 + 1)
     MEDIA._fetch = _fetch3
 
+    # A marketplace sticker arrives as a directory link whose redirect target is
+    # often absent; the same directory serves a 300x300 PNG, so that is asked first.
+    seen_links = []
+
+    async def recording_fetch(url, max_bytes):
+        seen_links.append(url)
+        return b"z" * 2048 if url.endswith("/300x300.png") else None
+
+    MEDIA._fetch = recording_fetch
+    _sticker = ImageRef(slot=0, key="e" * 32,
+                        url="https://gxh.vip.qq.com/club/item/parcel/item/74/" + "e" * 32)
+    check("a marketplace sticker is fetched as its 300x300 PNG",
+          await MEDIA._bytes(_sticker, bot=RefreshingBot(), max_bytes=1 << 20) is not None
+          and seen_links[0].endswith("/300x300.png"), str(seen_links))
+    MEDIA._fetch = _fetch3
+
+    # A picture the platform can no longer serve does not fail get_image, it hangs;
+    # the fetch has its own short deadline, and the picture is then remembered as
+    # unreadable so the next reply looking at it does not wait it out again.
+    from qqbot.core import media as _media_mod
+    _saved_to = _media_mod._GET_IMAGE_TIMEOUT_SEC
+    _media_mod._GET_IMAGE_TIMEOUT_SEC = 0.2
+
+    class HangingBot:
+        self_id = "999"
+        calls = 0
+
+        async def call_api(self, api, **kw):
+            HangingBot.calls += 1
+            await asyncio.sleep(5)
+            return {}
+
+    async def dead_link(url, max_bytes):
+        return None
+
+    MEDIA._fetch = dead_link
+    _dead = ImageRef(slot=0, key="f" * 32, url="http://example/gone.jpg", file="GONE.jpg")
+    _t = asyncio.get_event_loop().time()
+    check("a hanging get_image is given up on quickly",
+          await MEDIA._bytes(_dead, bot=HangingBot(), max_bytes=1 << 20) is None
+          and asyncio.get_event_loop().time() - _t < 2, str(HangingBot.calls))
+    await MEDIA._bytes(_dead, bot=HangingBot(), max_bytes=1 << 20)
+    check("and an unreadable picture is not retried for a while", HangingBot.calls == 1,
+          str(HangingBot.calls))
+    MEDIA._unreadable.clear()
+    MEDIA._fetch = _fetch3
+    _media_mod._GET_IMAGE_TIMEOUT_SEC = _saved_to
+
     # Voice never takes the shortcut pictures take. The stored file (and the CDN
     # original) is SILK v3 wearing an .amr suffix, and SILK sent raw draws a
     # politely empty transcript - a perfectly clear clip the bot claims it cannot
@@ -281,7 +329,7 @@ async def main():
     set_providers(Providers(text=_real.text, vision=FakeVision(),
                             asr=CapturingAsr(), embedding=_EMBED, search=_real.search))
     _vref = _AR(slot=0, file="v.amr",
-                path="/app/.config/QQ/nt/Ptt/v.amr", url="http://cdn/v.amr")
+                url="http://cdn/v.amr")
     _vout = await MEDIA.transcribe(_vref, bot=VoiceBot(), group_id="g9", cfg=cfg)
     check("transcription goes through get_record even with a local file on offer",
           VoiceBot.record_calls == 1)

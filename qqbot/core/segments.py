@@ -85,7 +85,6 @@ class ImageRef(Ref):
     sticker: bool = False
     url: str | None = None
     file: str | None = None
-    path: str | None = None      # napcat's own path, usable through the shared mount
     summary: str | None = None
     #: Where the reply model filed this picture, once ensure_uploaded has run - the
     #: model that reads it is the one that holds it. What a chat message's file block
@@ -119,7 +118,6 @@ class AudioRef(Ref):
 
     free: bool = False
     file: str | None = None
-    path: str | None = None
     url: str | None = None
     size: int | None = None
 
@@ -433,7 +431,6 @@ class _Walk:
                     key=(m.group(1).lower() if m else None),
                     url=data.get("url"),
                     file=file_field or None,
-                    path=data.get("path"),
                     size=_int_or_none(data.get("file_size")),
                     summary=defang(str(data.get("summary") or "")).strip("[]") or None,
                 )
@@ -447,7 +444,6 @@ class _Walk:
                         parts, AudioRef,
                         url=data.get("url"),
                         file=str(data.get("file") or "") or None,
-                        path=data.get("path"),
                         size=_int_or_none(data.get("file_size")),
                     )
             elif stype == "reply":

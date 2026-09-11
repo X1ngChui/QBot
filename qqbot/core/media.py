@@ -18,9 +18,9 @@ line between this file and segments.py. Two rules shape it:
    Late resolution stays possible in reach. A received image link carries an rkey that
    expires in about two hours, but the file id does not: get_image trades it for a
    fresh link at any time, which is how the QQ client itself still shows pictures from
-   days ago. So _bytes tries the shared data directory, then the link, then get_image -
-   and a picture stays readable long after the link in the original message stopped
-   working.
+   days ago. So _bytes tries the link, then get_image - and a picture stays readable
+   long after the link in the original message stopped working, for as long as the
+   platform itself still serves it.
 2. **Forwarded content gets the free budget and no more.** The entries of a forwarded
    record have their @s resolved to names and reuse any description already paid for,
    because a bare account number is the thing the prompt works hardest to keep out and
@@ -40,6 +40,8 @@ import asyncio
 import base64
 import logging
 import os
+import re
+import time
 from datetime import timedelta
 from pathlib import Path
 
@@ -76,6 +78,19 @@ NAPCAT_DATA_DIR = os.getenv("NAPCAT_DATA_DIR", "/app/napcat_data")
 #: from the byte count through it. What QQ actually stores is SILK v3 at ~1600 B/s,
 #: but that never reaches the ASR backend - see transcribe.
 _WAV_BYTES_PER_SEC = 32000
+
+
+#: How long get_image may take before the fetch is given up. The protocol side's
+#: own deadline is half a minute, and a picture the platform can no longer serve
+#: spends all of it.
+_GET_IMAGE_TIMEOUT_SEC = 10.0
+
+#: How long a picture found unreadable by every route stays that way before
+#: another attempt is made.
+_UNREADABLE_TTL_SEC = 600
+
+#: The marketplace-sticker CDN: a directory link per sticker.
+_STICKER_CDN = re.compile(r"^https?://gxh\.vip\.qq\.com/club/item/parcel/item/")
 
 
 def _audio_seconds(n_bytes: int) -> float:
@@ -137,6 +152,10 @@ class MediaProcessor:
         #: And ASR calls in the air, by clip file id - same rule, dearer stakes:
         #: voice has no result cache, so a duplicate flight is a duplicate bill.
         self._transcribing: dict[str, asyncio.Task] = {}
+        #: Pictures no route could read, by key, with when that was found out.
+        #: Consulted by _bytes so one dead picture does not cost every reply that
+        #: looks at it a full timeout.
+        self._unreadable: dict[str, float] = {}
 
     def _client(self) -> httpx.AsyncClient:
         if self._http is None:
@@ -190,10 +209,13 @@ class MediaProcessor:
 
     @staticmethod
     def _local(napcat_path: str | None, max_bytes: int) -> bytes | None:
-        """Read through the QQ data directory both containers mount.
+        """Read a file NapCat has on disk, through the QQ data directory both
+        containers mount.
 
-        NapCat hands over an absolute path inside its own container; the same file is
-        visible here under NAPCAT_DATA_DIR, which avoids a download entirely.
+        The paths come from NapCat's own answers - get_image and get_record report
+        where they put the file, as an absolute path inside NapCat's container - and
+        the same file is visible here under NAPCAT_DATA_DIR, which spares a second
+        download. Message segments themselves carry no path.
         """
         if not napcat_path:
             return None
@@ -208,23 +230,56 @@ class MediaProcessor:
             log.debug("local media read failed %s: %s", p, why(e))
         return None
 
+    @staticmethod
+    def _links(url: str) -> list[str]:
+        """The links worth trying for a picture, best first.
+
+        A marketplace sticker arrives as a directory link on the sticker CDN, which
+        redirects to a raw GIF that is often absent; the same directory serves a
+        300x300 PNG for every sticker, so that is asked for first.
+        """
+        if _STICKER_CDN.match(url) and not url.rstrip("/").rsplit("/", 1)[-1].count("."):
+            return [url.rstrip("/") + "/300x300.png", url]
+        return [url]
+
     # -- per-kind resolution ----------------------------------------------
     async def _bytes(self, ref: Ref, *, bot, max_bytes: int) -> bytes | None:
-        """Fetch the picture itself, by whichever route answers."""
-        data = self._local(ref.path, max_bytes)
-        if data is None and ref.url:
-            data = await self._fetch(ref.url, max_bytes)
+        """Fetch the picture itself, by whichever route answers: the link the
+        message carried, then get_image for a fresh copy.
+
+        A picture no route could read is remembered for a while and not tried
+        again until that passes: get_image on a picture the platform can no longer
+        serve does not fail, it hangs until the timeout, and every reply that
+        looked at the same picture would otherwise wait it out anew.
+        """
+        key = ref.key or ref.file or ref.url or ""
+        failed_at = self._unreadable.get(key) if key else None
+        if failed_at is not None and time.monotonic() - failed_at < _UNREADABLE_TTL_SEC:
+            log.debug("picture %s recently unreadable, not retried", key[:40])
+            return None
+        data = None
+        for link in (self._links(ref.url) if ref.url else []):
+            data = await self._fetch(link, max_bytes)
+            if data is not None:
+                break
         if data is None and ref.file:
             try:
-                info = await bot.call_api("get_image", file=ref.file)
+                # Its own deadline, well under the protocol side's: a fetch the
+                # platform cannot complete times out there, and half a minute per
+                # attempt is what a reply would otherwise stand still for.
+                info = await asyncio.wait_for(bot.call_api("get_image", file=ref.file),
+                                              timeout=_GET_IMAGE_TIMEOUT_SEC)
                 data = self._local(info.get("file"), max_bytes)
                 if data is None and info.get("url"):
                     data = await self._fetch(info["url"], max_bytes)
             except Exception as e:
                 log.info("get_image failed: %s", why(e))
         if data is None:
-            log.warning("picture unreadable by every route (path=%s link=%s file=%s)",
-                        bool(ref.path), bool(ref.url), bool(ref.file))
+            if key:
+                self._unreadable[key] = time.monotonic()
+            log.warning("picture unreadable by every route (link=%s file=%s), "
+                        "not retried for %ds", bool(ref.url), bool(ref.file),
+                        _UNREADABLE_TTL_SEC)
         return data
 
     @staticmethod
@@ -395,7 +450,7 @@ class MediaProcessor:
         pay for - a second identical call. Voice has no result cache to fall back
         on, so the in-flight registry is the only thing standing between a slow
         backend and double billing."""
-        key = ref.file or ref.url or ref.path
+        key = ref.file or ref.url
         if key and (flight := self._transcribing.get(key)) is not None:
             return await asyncio.shield(flight)
         if not key:

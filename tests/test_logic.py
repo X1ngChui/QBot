@@ -234,8 +234,10 @@ real_rec = parse_segments([{"type": "record", "data": {
     "file": "409756b4fccbfe3bb257d6ccfe6da742.amr",
     "path": "/app/.config/QQ/nt_qq_abc/nt_data/Ptt/2026-07/Ori/409756b4.amr",
     "file_size": "10726"}}], "999")
-check("voice keeps the path napcat gave us", real_rec.refs[0].path.endswith(".amr"))
 check("voice is an audio ref", isinstance(real_rec.refs[0], AudioRef))
+# The path a clip arrives with is not kept: the file there is SILK, which no
+# transcriber reads, and get_record's WAV is the only route ever taken.
+check("a clip's local path is not carried", not hasattr(real_rec.refs[0], "path"))
 
 # reply and forward segments carry content and must parse, not drop
 quoted = parse_segments([{"type": "reply", "data": {"id": "123"}},

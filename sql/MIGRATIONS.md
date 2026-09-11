@@ -20,8 +20,24 @@ docker exec qbot-postgres-1 psql -U qqbot -d qqbot -c "<statement>"
 ALTER TABLE image_cache ADD COLUMN IF NOT EXISTS file_uploaded_at TIMESTAMPTZ;
 ```
 
-Existing rows keep a NULL, which reads as "too old to trust": the next open_image on
-such a picture uploads it again and stamps the row.
+A NULL reads as "too old to trust", and re-uploading needs the bytes - which for a
+picture whose link has expired means a get_image the platform may never answer. So
+the rows are stamped from each picture's first sighting, which is when the upload
+happened; only pictures first seen beyond the backend's retention stay NULL:
+
+```sql
+WITH first AS (
+  SELECT CASE WHEN seg->>'type'='mface' THEN seg->'data'->>'emoji_id'
+              ELSE lower(substring(coalesce(seg->'data'->>'file', seg->'data'->>'file_id','')
+                                   from '[0-9a-fA-F]{32}')) END AS key,
+         min(occurred_at) AS first_seen
+    FROM raw_event, jsonb_array_elements(payload->'segments') seg
+   WHERE seg->>'type' IN ('image','mface') GROUP BY 1)
+UPDATE image_cache c SET file_uploaded_at = f.first_seen
+  FROM first f
+ WHERE c.key = f.key AND c.file_id IS NOT NULL AND c.file_uploaded_at IS NULL
+   AND f.first_seen > now() - interval '30 days';
+```
 
 ## 2026-09-09 — image descriptions expire
 
