@@ -102,7 +102,7 @@ CATALOG: tuple[Command, ...] = (
 置信度达到 {CONFIRM_THRESHOLD} 才会启用该称呼。手动设置的数值为最终决定，
 后续自动观察不会覆盖它。撤销仅标记为不再使用，历史消息仍可识别。
 
-普通成员也可使用，但只能 @自己：登记、撤销自己的称呼，效力与拥有者录入的相同。
+普通成员也可使用，但只能 @自己：登记、撤销自己的称呼或设置其置信度，效力与拥有者录入的相同。
 
 示例：/alias @小明 阿明""", self_serve=True),
     # Two accounts, one person. The identity layer exists to make this expressible; these

@@ -2,11 +2,10 @@
 --   psql -U qqbot -d qqbot -v gid=424242 -f dump_memory.sql
 \set QUIET on
 \pset pager off
-\set gid :gid
 
 \echo '===== 规模 ====='
 SELECT (SELECT count(*) FROM raw_event  WHERE group_id = :gid) AS 原始消息,
-       (SELECT count(*) FROM alias      WHERE group_id = :gid
+       (SELECT count(*) FROM alias      WHERE (group_id = :gid OR group_id IS NULL)
                                           AND status <> 'inactive')          AS 在用称呼,
        (SELECT count(*) FROM memory_fact WHERE group_id = :gid
                                           AND status = 'active'
@@ -54,9 +53,13 @@ SELECT COALESCE(
 \echo '===== 称呼（含未确认的候选） ====='
 SELECT a.alias_text AS 称呼, a.alias_type AS 来源, a.status AS 状态,
        round(a.confidence::numeric, 2) AS 置信,
+       -- The same three evidence kinds the usage count in code reads, so a card
+       -- alias does not read as "one person used it".
        (SELECT count(DISTINCT r.platform_user_id)
           FROM alias_evidence ae JOIN raw_event r ON r.id = ae.raw_event_id
-         WHERE ae.alias_id = a.id) AS 多少人用过,
+         WHERE ae.alias_id = a.id
+           AND ae.evidence_type IN ('llm_inference','speaker_usage',
+                                    'multi_user_usage')) AS 多少人用过,
        to_char(a.last_used_at, 'MM-DD') AS 最近一次
   FROM alias a
  WHERE (a.group_id = :gid OR a.group_id IS NULL) AND a.status <> 'inactive'

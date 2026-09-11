@@ -29,6 +29,19 @@ from .memory_extractor import (
 
 log = logging.getLogger("qqbot.consolidate")
 
+#: The alias column's width. A longer "name" is not a name, and the store would
+#: refuse the row after the validator had passed it.
+ALIAS_MAX_CHARS = 256
+
+
+def _text(p: dict, key: str) -> str:
+    """A string field of a payload, stripped; "" for a missing one or one of another
+    type. The model can send a number or a list where the schema said string, and
+    the validator's job is to reject that shape, not to crash on it."""
+    v = p.get(key)
+    return v.strip() if isinstance(v, str) else ""
+
+
 def _fact_kind(pred: str) -> MemoryType:
     """How a fact is classified once stored, from the predicate table."""
     entry = config().predicates.person.get(pred)
@@ -74,7 +87,7 @@ class Validator:
         if not isinstance(p, dict) or not p:
             return Verdict.no(RejectReason.EMPTY)
 
-        quote = (p.get("quote") or "").strip()
+        quote = _text(p, "quote")
         if not quote or quoted_in(quote, self._bodies) is None:
             # The quote has to be present word for word, inside exactly one message,
             # and inside what the member typed rather than the speaker prefix. This
@@ -109,10 +122,10 @@ class Validator:
         return Verdict.no(RejectReason.MALFORMED)
 
     def _check_alias(self, p: dict) -> Verdict:
-        text = (p.get("alias") or "").strip()
+        text = _text(p, "alias")
         if not text:
             return Verdict.no(RejectReason.EMPTY)
-        if p.get("kind") not in ALIAS_KINDS:
+        if p.get("kind") not in ALIAS_KINDS or len(text) > ALIAS_MAX_CHARS:
             return Verdict.no(RejectReason.MALFORMED)
         if text not in self._transcript:
             return Verdict.no(RejectReason.MALFORMED)
@@ -121,28 +134,29 @@ class Validator:
     def _check_fact(self, p: dict) -> Verdict:
         if p.get("predicate") not in predicate_names():
             return Verdict.no(RejectReason.MALFORMED)
-        if not (p.get("object") or "").strip():
+        if not _text(p, "object"):
             return Verdict.no(RejectReason.EMPTY)
         return PASS
 
     def _check_group(self, p: dict) -> Verdict:
         kind = p.get("kind")
         if kind == GROUP_TERM:
-            if not (p.get("term") or "").strip() or not (p.get("meaning") or "").strip():
+            term = _text(p, "term")
+            if not term or not _text(p, "meaning"):
                 return Verdict.no(RejectReason.EMPTY)
             # The word has to be one the group actually used. A definition of a word that
             # appears nowhere in the transcript is the model explaining its own vocabulary.
-            if (p.get("term") or "").strip() not in self._transcript:
+            if term not in self._transcript:
                 return Verdict.no(RejectReason.MALFORMED)
             return PASS
         if kind == GROUP_TOPIC:
-            if not (p.get("topic") or "").strip():
+            if not _text(p, "topic"):
                 return Verdict.no(RejectReason.EMPTY)
             return PASS
         return Verdict.no(RejectReason.MALFORMED)
 
     def _check_episode(self, p: dict) -> Verdict:
-        if not (p.get("summary") or "").strip():
+        if not _text(p, "summary"):
             return Verdict.no(RejectReason.EMPTY)
         codes = p.get("participants")
         if not isinstance(codes, list) or not codes:
@@ -159,9 +173,9 @@ class Validator:
         person, so writing both means both are wrong - and neither is written."""
         seen: dict[str, set[int]] = {}
         for c in cands:
-            if c.candidate_type is not CandidateType.ALIAS:
+            if c.candidate_type is not CandidateType.ALIAS or not isinstance(c.payload, dict):
                 continue
-            text = normalize(c.payload.get("alias") or "")
+            text = normalize(_text(c.payload, "alias"))
             code = c.payload.get("account")
             if text and isinstance(code, int):
                 seen.setdefault(text, set()).add(code)
@@ -204,7 +218,7 @@ class MemoryConsolidator:
         for c in cands:
             verdict = v.check(c)
             if verdict.ok and c.candidate_type is CandidateType.ALIAS \
-                    and normalize(c.payload.get("alias") or "") in ambiguous:
+                    and normalize(_text(c.payload, "alias")) in ambiguous:
                 verdict = Verdict.no(RejectReason.AMBIGUOUS_ALIAS)
 
             if not verdict.ok:
@@ -215,15 +229,26 @@ class MemoryConsolidator:
                 continue
 
             at = occurred.get(c.source_event_id, when)
-            if c.candidate_type is CandidateType.EPISODE:
-                await self._write_episode(c, group_id, codes, at)
-            elif c.candidate_type is CandidateType.GROUP_FACT:
-                await self._write_group_fact(c, group_id, when, at)
-            elif c.candidate_type is CandidateType.ALIAS:
-                await self._write_alias(c, group_id, codes[c.payload["account"]])
-            else:
-                await self._write_fact(c, group_id, codes[c.payload["account"]],
-                                       when, at)
+            try:
+                if c.candidate_type is CandidateType.EPISODE:
+                    await self._write_episode(c, group_id, codes, at)
+                elif c.candidate_type is CandidateType.GROUP_FACT:
+                    await self._write_group_fact(c, group_id, when, at)
+                elif c.candidate_type is CandidateType.ALIAS:
+                    await self._write_alias(c, group_id, codes[c.payload["account"]])
+                else:
+                    await self._write_fact(c, group_id, codes[c.payload["account"]],
+                                           when, at)
+            except Exception:
+                # One candidate the store will not take (a shape the validator did
+                # not anticipate) is settled as rejected and the batch goes on.
+                # Left pending it would head every later page - pending() reads
+                # oldest first - and fail every consolidation of this group for good.
+                log.exception("group %s: candidate could not be written, rejected: %s",
+                              group_id, c.payload)
+                await self._mem.settle(c.rejected(RejectReason.MALFORMED.value))
+                rejected += 1
+                continue
             await self._mem.settle(c.accepted())
             written += 1
 

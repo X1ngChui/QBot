@@ -33,25 +33,32 @@ if [ -n "$KEY" ]; then SSH=(ssh -i "$KEY" -o StrictHostKeyChecking=accept-new "$
 # data/ - those live only on the server.
 PAYLOAD=(qqbot scripts config sql bot.py requirements.txt Dockerfile docker-compose.yml .dockerignore)
 
-# Directories are replaced, not merged. `tar x` only overwrites, so without the rm a
-# deleted module would stay on the server forever and get COPYed into every next image -
-# and a deleted module that something can still import is a very quiet bug.
+# Directories are replaced, not merged. A plain `tar x` only overwrites, so a deleted
+# module would stay on the server forever and get COPYed into every next image - and
+# a deleted module that something can still import is a very quiet bug.
 # config/ is NOT in this list: it is bind-mounted into the running container, and
 # rm -rf would orphan the mounted inode - if the build then failed, the old container
 # would keep running against an empty /app/config until someone recreated it. Its
-# *contents* are deleted instead, which the mount survives.
+# *contents* are replaced instead, which the mount survives.
 REPLACE=(qqbot scripts sql)
+FILES=(bot.py requirements.txt Dockerfile docker-compose.yml .dockerignore)
 
 echo "==> sending $(git rev-parse --short HEAD 2>/dev/null || echo 'working tree')"
-# Land the whole archive first: if the transfer dies, the server still has a working tree.
+# Land the whole archive first, and extract it beside the tree rather than over it:
+# nothing of the old tree is removed until the new one has extracted whole, so a
+# transfer or extract that dies leaves a server that still builds what it ran before.
 tar czf - --exclude=__pycache__ "${PAYLOAD[@]}" | "${SSH[@]}" "cat > '$REMOTE/.deploy.tar.gz'"
-"${SSH[@]}" "cd '$REMOTE' && rm -rf ${REPLACE[*]} && mkdir -p config && find config -mindepth 1 -delete && tar xzf .deploy.tar.gz && rm -f .deploy.tar.gz"
+"${SSH[@]}" "cd '$REMOTE' && rm -rf .deploy.new && mkdir .deploy.new && tar xzf .deploy.tar.gz -C .deploy.new && rm -f .deploy.tar.gz \
+  && rm -rf ${REPLACE[*]} && for d in ${REPLACE[*]}; do mv .deploy.new/\$d .; done \
+  && mkdir -p config && find config -mindepth 1 -delete && cp -a .deploy.new/config/. config/ \
+  && for f in ${FILES[*]}; do mv -f .deploy.new/\$f .; done && rm -rf .deploy.new"
 
 echo "==> rebuilding"
 # Keep one step back: tag the running image as :rollback before the build replaces
 # it. A deploy that passes the fingerprint check but misbehaves at runtime can then
-# be undone from the server alone - see README "回滚" for the two commands.
-"${SSH[@]}" "img=\$(docker inspect --format '{{.Image}}' qbot-bot-1 2>/dev/null); [ -n \"\$img\" ] && docker tag \"\$img\" qbot-bot:rollback || true"
+# be undone from the server alone - see README "回滚" for the two commands. The
+# container is found through compose, so the project name is not assumed.
+"${SSH[@]}" "cd '$REMOTE' && cid=\$(docker compose ps -q bot 2>/dev/null); img=\$([ -n \"\$cid\" ] && docker inspect --format '{{.Image}}' \"\$cid\"); [ -n \"\$img\" ] && docker tag \"\$img\" qbot-bot:rollback || true"
 "${SSH[@]}" "cd '$REMOTE' && docker compose up -d --build bot"
 
 echo "==> verifying"

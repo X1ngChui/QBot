@@ -75,6 +75,8 @@ class FakeText(TextModel):
                             in_hit=100, in_miss=10, out=20, group_id=group_id)
         return ChatResult(text=text, model=self.MODEL, in_hit=100, in_miss=10, out=20)
 
+    keeps_files = True
+
     async def upload(self, data, *, cfg, mime="image/jpeg"):
         # The model that reads the picture is the one that holds it, so the id
         # comes from here - the same place a multimodal backend puts it.
@@ -290,7 +292,7 @@ async def main():
     # not know that the picture marker is its own eyesight rather than something a person
     # typed.
     check("the reply prompt explains the numbered markers",
-          "⟦图片N:描述⟧" in sys_prompt and "open_image" in sys_prompt)
+          "⟦图片N:描述⟧" in sys_prompt and "open_images" in sys_prompt)
     # The transcript carries names but never account ids, so two people with similar names
     # are indistinguishable to the model - three members rearranging the same joke
     # nickname read as one person renaming himself, and it said so out loud. The system
@@ -785,7 +787,7 @@ async def main():
     check("and in the archive",
           _lstored and len(_lstored) <= _cap_len, str(len(_lstored or "")))
 
-    # open_image: the reply model reads pictures itself, so the tool hands it one by
+    # open_images: the reply model reads pictures itself, so the tool hands it one by
     # number rather than asking a second model to look. Free - bytes and an upload -
     # and it answers with a content array carrying the file block, which is what lets
     # the picture arrive as the answer to the call instead of a turn appended behind it.
@@ -804,8 +806,8 @@ async def main():
                  image_refs=[_IRef(slot=0, key="9" * 32, url="http://x/ins.png")])
     _ictx = ToolCtx(bot=bot, by_pic={4: (_imsg, 0)})
     _seen0 = len(VISION_SEEN)
-    out_i = await _texec(_tcall("open_image", ns=[4]), cfg=cfg, group_id="123", ctx=_ictx)
-    check("open_image hands back the original as a picture part",
+    out_i = await _texec(_tcall("open_images", ns=[4]), cfg=cfg, group_id="123", ctx=_ictx)
+    check("open_images hands back the original as a picture part",
           isinstance(out_i, Attachment)
           and any(b.get("type") == "image" for b in out_i.parts), str(out_i.parts))
     check("and costs no model call - it is a fetch, not a second opinion",
@@ -833,17 +835,17 @@ async def main():
     _imsg2 = _CM0(msg_id="ins2", user_id="1", nickname="某人", text="⟦图片⟧", ts=_nl0(),
                   image_refs=[_IRef(slot=0, key="8" * 32, url="http://x/ins2.png")])
     _ictx.by_pic[5] = (_imsg2, 0)
-    out_m = await _texec(_tcall("open_image", ns=[4, 5, 99]), cfg=cfg, group_id="123",
+    out_m = await _texec(_tcall("open_images", ns=[4, 5, 99]), cfg=cfg, group_id="123",
                          ctx=_ictx)
-    check("open_image fetches several pictures in one call",
+    check("open_images fetches several pictures in one call",
           isinstance(out_m, Attachment)
           and [b["type"] for b in out_m.content()] == ["text", "image", "text", "image", "text"]
           and "图片5：" in str(out_m.content()) and "99" in str(out_m), str(out_m.content()))
     check("a number outside the prompt is answered, not crashed",
-          "99" in await _texec(_tcall("open_image", ns=[99]),
+          "99" in await _texec(_tcall("open_images", ns=[99]),
                                cfg=cfg, group_id="123", ctx=_ictx))
     check("a missing number is answered too",
-          "编号" in await _texec(_tcall("open_image"), cfg=cfg, group_id="123",
+          "编号" in await _texec(_tcall("open_images"), cfg=cfg, group_id="123",
                                  ctx=_ictx))
     # "null", "[]" and "42" are valid JSON: a degenerate argument string must get
     # the same in-band answer as an unparsable one, not crash the whole reply.
@@ -1075,13 +1077,13 @@ async def main():
     # about while absent, and a tail rebuilt every turn would pay for it every turn.
     _one = [_CM0(msg_id="x", user_id="u7", nickname="小南", text="在", ts=_nl0())]
     check("identity is in the system block, not the tail",
-          "曾用名" not in prompt_mod.build_tail(batch=_one))
+          "曾用名" not in prompt_mod.build_tail(msg=_one[0]))
 
     # The tail carries nothing but the clock and the message on purpose: whatever
     # sits here is the nearest context the incoming message has, and a pushed block
     # of past events once captured an elliptical question that referred to the
     # conversation. The past is pulled through recall_events, never pushed.
-    _tail = prompt_mod.build_tail(batch=_one)
+    _tail = prompt_mod.build_tail(msg=_one[0])
     check("the tail is the clock and the message, nothing pushed beside them",
           _tail.index("当前时间") < _tail.index("下面是刚收到的消息")
           and "相关的事" not in _tail, _tail[:120])
@@ -1220,8 +1222,8 @@ async def main():
     st13 = await REGISTRY.get("123")
     text, _prov1, _tr1 = await _eng.generate(
         bot=bot, st=st13, cfg=cfg, persona=config().for_group("123")[1],
-        batch=[_CM0(msg_id="loop1", user_id="u1", nickname="阿强",
-                    text="帮我查个东西", ts=_nl0())])
+        msg=_CM0(msg_id="loop1", user_id="u1", nickname="阿强",
+                 text="帮我查个东西", ts=_nl0()))
     # The scripted allowance dies on the third search, in round two: the limit ends
     # the spending, and a tool-less wrap-up round answers from what rounds one and
     # two already fetched (the daily cap, checked before anything is spent, still
@@ -1265,14 +1267,35 @@ async def main():
     n_llm2 = len(LLM_CALLS)
     text2, _prov2, _tr2 = await _eng.generate(
         bot=bot, st=st13, cfg=cfg, persona=config().for_group("123")[1],
-        batch=[_CM0(msg_id="loop2", user_id="u1", nickname="阿强",
-                    text="再查个东西", ts=_nl0())])
+        msg=_CM0(msg_id="loop2", user_id="u1", nickname="阿强",
+                 text="再查个东西", ts=_nl0()))
     check("a reply that runs out of money wraps up the same way",
           text2 == "就查到这些了" and len(LLM_CALLS) - n_llm2 == 3
           and LLM_CALLS[-1]["tools"] is None,
           f"{text2!r}, {len(LLM_CALLS) - n_llm2} rounds")
     check("and the unaffordable round's tools were never executed",
           len(EndlessSearch.calls) == 2, str(EndlessSearch.calls))
+
+    # The per-round cap: the scripted round asks for three calls; capped at two,
+    # the third is answered with the overflow note and never reaches the backend.
+    class CappedSearch(EndlessSearch):
+        calls = []
+
+    _cap0, cfg.retrieval.max_tool_calls_per_round = cfg.retrieval.max_tool_calls_per_round, 2
+    set_providers(Providers(text=ScriptedText(), vision=UnusedVision(),
+                            asr=UnusedAsr(), embedding=_EMBED, search=CappedSearch()))
+    await _eng.generate(
+        bot=bot, st=st13, cfg=cfg, persona=config().for_group("123")[1],
+        msg=_CM0(msg_id="loop3", user_id="u1", nickname="阿强",
+                 text="再查一次", ts=_nl0()))
+    cfg.retrieval.max_tool_calls_per_round = _cap0
+    _tool_texts3 = [m.get("content") or "" for m in LLM_CALLS[-1]["messages"]
+                    if m.get("role") == "tool"]
+    check("a call past the per-round cap is answered with the overflow note",
+          any("次数已达上限" in t for t in _tool_texts3), str(_tool_texts3)[:200])
+    check("and was never executed",
+          all(not q.startswith("话题") or q == "话题A" for q in CappedSearch.calls),
+          str(CappedSearch.calls))
 
     # A reply that searched leaves its provenance on the archived line: what the
     # group read carries no marker, what the bot remembers does. credibility_rules then
@@ -1281,10 +1304,10 @@ async def main():
     from qqbot.core.engine import _provenance as _pvfn
     from qqbot.core.output import clean_reply as _cr
     check("provenance names the tool and the query",
-          _pvfn([("web_search", {"query": "明天 天气"}, "1. T C")])
+          _pvfn([("web_search", {"query": "明天 天气"}, "1. T C")], cfg)
           == "⟦依据:搜索“明天 天气”⟧",
-          _pvfn([("web_search", {"query": "明天 天气"}, "1. T C")]))
-    check("no tools means no marker", _pvfn([]) == "")
+          _pvfn([("web_search", {"query": "明天 天气"}, "1. T C")], cfg))
+    check("no tools means no marker", _pvfn([], cfg) == "")
     from qqbot.core.engine import _trace as _trfn
     check("no tools means no trace either", _trfn([], cfg) == "")
 
@@ -1309,8 +1332,8 @@ async def main():
     st_pv = await REGISTRY.get("123")
     ok_pv = await _eng.respond(
         bot=bot, st=st_pv, cfg=cfg, persona=config().for_group("123")[1],
-        batch=[_CM0(msg_id="pv1", user_id="u1", nickname="阿强",
-                    text="明天天气怎样", ts=_nl0())])
+        msg=_CM0(msg_id="pv1", user_id="u1", nickname="阿强",
+                 text="明天天气怎样", ts=_nl0()))
     check("the searched reply is sent without the marker",
           ok_pv and bot.sent[-1][1] == "明天多云", str(bot.sent[-1:]))
     _pv_line = st_pv.recent[-1]
@@ -1375,8 +1398,8 @@ async def main():
           not any(m.text.startswith("⟦检索记录⟧") for m in st_pv.recent))
     _t2, _p2, _tr2b = await _eng.generate(
         bot=bot, st=st_pv, cfg=cfg, persona=config().for_group("123")[1],
-        batch=[_CM0(msg_id="pv2", user_id="u1", nickname="阿强",
-                    text="后天呢", ts=_nl0())])
+        msg=_CM0(msg_id="pv2", user_id="u1", nickname="阿强",
+                 text="后天呢", ts=_nl0()))
     _msgs2 = list(LLM_CALLS[-1]["messages"])
     _ri = next(i for i, m in enumerate(_msgs2)
                if m.get("role") == "assistant"
@@ -1648,6 +1671,23 @@ async def main():
     _rcfg18.history_context = _ctx18
     check("search_history narrows by the serial, not the shared name",
           "借给阿强" in got and "没见过" not in got, got)
+    # A serial that resolves to nobody falls back to the name half rather than a
+    # pattern nothing can match.
+    got_nb = await _tools.search_history(123, "改锥", speaker="张伟⟦同名999999⟧")
+    check("an unresolvable namesake serial falls back to the name",
+          "借给阿强" in got_nb or "没见过" in got_nb, got_nb)
+    # The answer as a whole is bounded; a cut answer says so.
+    _chars18, _rcfg18.history_chars = _rcfg18.history_chars, 1000
+    _rcfg18.history_context = 0
+    got_cut = await _tools.search_history(123, "改锥", rcfg=_rcfg18)
+    _rcfg18.history_chars, _rcfg18.history_context = _chars18, _ctx18
+    check("a short search answer is not cut", "结果过长" not in got_cut, got_cut[-60:])
+    from qqbot.settings import RetrievalCfg as _RC
+    _tiny = _RC(**{**_rcfg18.model_dump(), "history_chars": 1000, "history_context": 0})
+    await seed(123, "u31", "张伟", text="改锥" + "很长的话" * 300)
+    got_cut2 = await _tools.search_history(123, "改锥", rcfg=_tiny)
+    check("an over-long search answer is cut at a line and says so",
+          "结果过长" in got_cut2 and len(got_cut2) < 1200, str(len(got_cut2)))
 
     # Last, so every kind of memory write has actually happened by now. Reasoning
     # models bill deliberation as output, so a memory call must ask for a terse

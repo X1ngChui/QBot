@@ -30,6 +30,7 @@ from nonebot_plugin_apscheduler import scheduler
 
 from ..core import errors, output
 from ..core.budget import hit_split
+from ..core.media import NAPCAT_DATA_DIR
 from ..core.state import REGISTRY
 from ..db import repo
 from ..db.pool import dsn
@@ -201,7 +202,7 @@ def _sweep_dir(root: Path, cutoff: float) -> tuple[int, int]:
 async def clean_napcat_cache() -> None:
     """NTQQ's media cache is the reason the partition needs 50 GB; left alone it grows
     into the tens of GB."""
-    root = Path(os.getenv("NAPCAT_DATA_DIR", "/app/napcat_data"))
+    root = Path(NAPCAT_DATA_DIR)
     if not root.is_dir():
         log.warning("napcat data dir not found: %s", root)
         return
@@ -251,7 +252,7 @@ async def daily_report() -> None:
     refused = f"，其中后端拒看 {img['refused']} 条" if img.get("refused") else ""
     lines.append(f"图片缓存 {img['n']} 条，累计命中 {img['hits']} 次{refused}")
 
-    used = await repo.month_calls(Kind.SEARCH.value, providers().search.name)
+    used = await repo.month_calls(Kind.SEARCH, providers().search.name)
     lines.append(f"搜索额度 本月 {used}/{cfg.llm.search.monthly_quota}")
 
     # The memory queue, because a stuck worker has no other symptom. Nothing goes

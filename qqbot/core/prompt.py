@@ -94,7 +94,7 @@ def _known_block(profiles: list[dict]) -> str:
             bits.append(note)
         if bits:
             lines.append((str(p.get("user_id") or ""), f"- {name}，" + "；".join(bits)))
-    return _block("已确认（系统记录的名字，以及拥有者写明的信息）：", lines)
+    return _block("已确认（系统记录的名字，以及拥有者或成员本人写明的信息）：", lines)
 
 
 def _guessed_block(profiles: list[dict]) -> str:
@@ -168,16 +168,16 @@ def build_system(
     return "\n\n".join(x for x in blocks if x)
 
 
-def history_window(st: GroupState, batch: list[ChatMsg],
+def history_window(st: GroupState, msg: ChatMsg | None,
                    cfg: Settings) -> list[ChatMsg]:
-    """The messages that will actually appear in the prompt, oldest first.
+    """The messages that will actually appear in the prompt, oldest first: the
+    context before `msg`, the message being answered (None for a bare render
+    of the window).
 
     Separate from rendering them because the answer is needed before the prompt is
-    built: what the window holds decides which pictures are attached and which backlog
-    media is worth settling.
+    built: what the window holds decides which backlog media is worth settling.
     """
-    batch_ids = {m.msg_id for m in batch}
-    hist = [m for m in st.recent if m.msg_id not in batch_ids]
+    hist = [m for m in st.recent if msg is None or m.msg_id != msg.msg_id]
     if not hist:
         st.history_anchor = None
         return []
@@ -244,7 +244,7 @@ def numbered_images(visible: list[ChatMsg]) -> tuple[dict[str, list[int]], dict[
 
     Numbered oldest first, like the line numbers, so both count the same direction.
     Returns the numbers per message - the render puts them into the markers - and the
-    map back to (message, index into image_refs) that open_image resolves against.
+    map back to (message, index into image_refs) that open_images resolves against.
     """
     per_msg: dict[str, list[int]] = {}
     by_pic: dict[int, tuple] = {}
@@ -269,7 +269,7 @@ def render_history(window: list[ChatMsg], nums: dict[str, int],
     """One chat message per line of transcript, text only.
 
     No picture rides in the history. Every marker carries a number and the model
-    opens what it wants to see with open_image, so a message's render depends on
+    opens what it wants to see with open_images, so a message's render depends on
     nothing but the message: it stays byte-identical between turns, and the
     prefix cache is never spent on a picture that a newer one pushed off a rail.
 
@@ -299,7 +299,7 @@ def render_history(window: list[ChatMsg], nums: dict[str, int],
     return out
 
 
-def build_tail(*, batch: list[ChatMsg],
+def build_tail(*, msg: ChatMsg,
                nums: dict[str, int] | None = None,
                marks: dict[str, str] | None = None,
                pics: dict[str, list[int]] | None = None) -> str:
@@ -319,11 +319,8 @@ def build_tail(*, batch: list[ChatMsg],
     parts.append("当前时间：" + describe_now() + "。")
 
     nums, marks, pics = nums or {}, marks or {}, pics or {}
-    now = "\n".join(
-        m.render(seq=nums.get(m.msg_id, 0), quote=marks.get(m.msg_id, ""),
-                 pic_nums=pics.get(m.msg_id))
-        for m in batch
-    )
+    now = msg.render(seq=nums.get(msg.msg_id, 0), quote=marks.get(msg.msg_id, ""),
+                     pic_nums=pics.get(msg.msg_id))
     # Each reply task carries exactly one addressed message; this header is the
     # anchor reply_final points at when naming which message to answer.
     parts.append("下面是刚收到的消息：\n" + now)
@@ -339,7 +336,7 @@ def assemble(
     persona: Persona,
     cfg: Settings,
     st: GroupState,
-    batch: list[ChatMsg],
+    msg: ChatMsg,
     profiles: list[dict],
     group_facts: list[str] | None = None,
     traces: dict[str, str] | None = None,
@@ -361,11 +358,11 @@ def assemble(
     # the model reads have to come from one pass, not from two passes that merely
     # happen to agree while nothing appends to the deque in between.
     if window is None:
-        window = history_window(st, batch, cfg)
-        nums, marks = numbered(window + list(batch))
+        window = history_window(st, msg, cfg)
+        nums, marks = numbered(window + [msg])
     if pics is None:
-        pics, _ = numbered_images(window + list(batch))
+        pics, _ = numbered_images(window + [msg])
     messages.extend(render_history(window, nums, marks, traces, pics))
     messages.append({"role": "user",
-                     "content": build_tail(batch=batch, nums=nums, marks=marks, pics=pics)})
+                     "content": build_tail(msg=msg, nums=nums, marks=marks, pics=pics)})
     return messages

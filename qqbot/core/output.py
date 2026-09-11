@@ -38,11 +38,16 @@ _HR = re.compile(r"^\s*(?:\*\s*){3,}$|^\s*(?:-\s*){3,}$", re.M)
 #: Strong emphasis takes two or three markers. A single asterisk is handled apart,
 #: because one is also multiplication: "3*5*2" is arithmetic, and a rule that reads
 #: any starred span as emphasis turns it into "352". Italics therefore need a word
-#: boundary on the outside of each marker, which a product sign never has.
-_BOLD = re.compile(r"(\*{2,3}|_{2,3})(?=\S)(.+?)(?<=\S)\1", re.S)
+#: boundary on the outside of each marker, which a product sign never has. The
+#: underscore form needs the same boundary for a different reason: `__init__` is
+#: an identifier, and Markdown itself does not read underscores inside a word.
+_BOLD_STAR = re.compile(r"(\*{2,3})(?=\S)(.+?)(?<=\S)\1", re.S)
+_BOLD_UNDER = re.compile(r"(?<!\w)(_{2,3})(?=\S)(.+?)(?<=\S)\1(?!\w)", re.S)
 _ITALIC = re.compile(r"(?<![\w*])\*(?=\S)([^*\n]+?)(?<=\S)\*(?![\w*])")
 _CODE = re.compile(r"`+([^`]+)`+")
 _MULTI_NL = re.compile(r"\n{3,}")
+#: The reserved pair, escaped for the patterns below - one spelling with util.
+_L, _R = re.escape(SYS_L), re.escape(SYS_R)
 #: A line number copied back out of the history, with or without the speaker prefix that
 #: follows it there.
 #:
@@ -52,7 +57,7 @@ _MULTI_NL = re.compile(r"\n{3,}")
 #: collide, the guard declines. The character class is the short list of classifiers a
 #: number can take.
 _LINE_NO = re.compile(
-    r"^\s*#\d{1,4}(?:\s+⟦\d{2}-\d{2} \d{2}:\d{2}⟧)?(?:\s+[^\s:：]{1,20}[:：])?"
+    rf"^\s*#\d{{1,4}}(?:\s+{_L}\d{{2}}-\d{{2}} \d{{2}}:\d{{2}}{_R})?(?:\s+[^\s:：]{{1,20}}[:：])?"
     r"\s*+(?![号位名楼队班组层期版区])",
     re.M,  # every line: a multi-line reply imitates the numbered format on each one
 )
@@ -63,25 +68,25 @@ _LINE_NO = re.compile(
 #: collide, the guard declines, same as _LINE_NO. Only the reserved pair: a square
 #: form is what a member's imitation looks like after defang, and quoting a
 #: member is content.
-_TS_ONLY = re.compile(r"^\s*⟦\d{2}-\d{2} \d{2}:\d{2}⟧\s*", re.M)
+_TS_ONLY = re.compile(rf"^\s*{_L}\d{{2}}-\d{{2}} \d{{2}}:\d{{2}}{_R}\s*", re.M)
 #: The provenance marker the engine appends to the bot's own archived lines. The
 #: history is an example the model may follow, and a reply that imitates it would
 #: leak a system annotation into the group. Nobody writes the bracketed form by
 #: hand, so this one is stripped wherever it appears.
-_PROV = re.compile(r"\s*⟦依据[:：][^⟧]*⟧")
+_PROV = re.compile(rf"\s*{_L}依据[:：][^{_R}]*{_R}")
 #: A line imitating the trajectory-entry marker. Whole lines carrying it are
 #: dropped: the marker is system-written and must never reach the group, while the
 #: digest lines that follow one read as ordinary speech and are left to stand.
-_TRACE_LINE = re.compile(r"^.*⟦检索记录⟧.*$\n?", re.M)
+_TRACE_LINE = re.compile(rf"^.*{_L}检索记录{_R}.*$\n?", re.M)
 #: The quote pointer copied back out of the history. The real quote is the reply
 #: segment the send path attaches; the bracketed form is transcript notation, and
-#: the prompt instruction not to reproduce it is not reliable on its own - replies
-#: carrying it verbatim have been observed. Anchored to line starts like _LINE_NO
-#: and _TS_ONLY: format imitation reproduces the transcript line's shape, which opens with the mark,
-#: while one sitting mid-sentence is likelier the reply's own content (somebody's
-#: words restated, or the notation being talked about) - where the readings
-#: collide, the guard declines.
-_REPLY_MARK = re.compile(r"^\s*⟦回复\s*(?:#\d{1,4}|更早的消息)⟧\s*", re.M)
+#: the prompt instruction not to reproduce it is not reliable on its own. Anchored
+#: to line starts like _LINE_NO and _TS_ONLY: format imitation reproduces the
+#: transcript line's shape, which opens with the mark, while one sitting
+#: mid-sentence is likelier the reply's own content (somebody's words restated, or
+#: the notation being talked about) - where the readings collide, the guard
+#: declines.
+_REPLY_MARK = re.compile(rf"^\s*{_L}回复\s*(?:#\d{{1,4}}|更早的消息){_R}\s*", re.M)
 #: Speaker tags copied out of the history: the owner/self/namesake annotations
 #: that ride behind names in transcripts. Dropped whole wherever they appear -
 #: they are annotations about a line, never words anyone says.
@@ -101,7 +106,7 @@ def strip_markdown(text: str) -> str:
     t = _QUOTE.sub("", t)
     t = _BULLET_MARK.sub(r"\1- ", t)
     for _ in range(3):  # nested emphasis such as ***x***
-        new = _BOLD.sub(r"\2", t)
+        new = _BOLD_UNDER.sub(r"\2", _BOLD_STAR.sub(r"\2", t))
         if new == t:
             break
         t = new

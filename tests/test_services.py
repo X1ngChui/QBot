@@ -42,7 +42,7 @@ def cand(ctype, **payload):
     # Every candidate carries the message its quote came from. One without it is one whose
     # quote matched no message, and it is refused - see the check further down.
     return Candidate(candidate_type=ctype, payload=payload, group_id=1,
-                     source_event_id=uuid.uuid4())
+                     source_event_id=uuid.uuid4(), batch_size=len(LINES))
 
 
 v = Validator(CODES, LINES)
@@ -100,7 +100,7 @@ check("a quote found in two messages validates against neither",
 unsourced = Candidate(candidate_type=CandidateType.FACT, group_id=1,
                       payload={"account": 1, "predicate": "plays", "object": "鸣潮",
                                "quote": "我最近在玩鸣潮"},
-                      source_event_id=None)
+                      source_event_id=None, batch_size=len(LINES))
 check("指不出引文出处的候选被拒", v.check(unsourced).reason is RejectReason.MALFORMED,
       "以前会回退到批次末条，写出一条来源不实的证据")
 
@@ -239,7 +239,7 @@ BATCH = uuid.uuid4()
 SRC = tuple(SourceLine(event_id=uuid.uuid4(), text=t) for t in LINES)
 inp = ExtractionInput(group_id=1, transcript="\n".join(LINES),
                       roster="老王[1]\n小北[2]", account_codes=CODES,
-                      lines=SRC, source_event_id=BATCH)
+                      lines=SRC, source_event_id=BATCH, batch_size=len(SRC))
 
 
 def call(name, **args):
@@ -269,7 +269,7 @@ check("a quote in no message gets no source, rather than a plausible one",
 check("a quote that is only a speaker's name has no source",
       inp.source_of("老王") is None)
 _twice = ExtractionInput(
-    group_id=1, transcript="", roster="", account_codes=CODES,
+    group_id=1, transcript="", roster="", account_codes=CODES, batch_size=len(SRC) + 1,
     lines=SRC + (SourceLine(event_id=uuid.uuid4(),
                             text=f"{sysmark('08-30 14:05')} 老王{sysmark('1')}: 老周你又来了"),))
 check("a quote found in two messages has no source, rather than the first",

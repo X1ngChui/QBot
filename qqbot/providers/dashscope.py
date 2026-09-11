@@ -19,9 +19,9 @@ from .base import Rate
 from .openai_compat import OpenAICompatAsr
 
 
-# Billed per second of audio, not per token. USD 0.000035/s at the 7.14 CNY/USD the
-# vendor's own CNY and USD price pages imply (rechecked 2026-08-27: OpenRouter still
-# lists $0.000035/s; the vendor's own pages do not print a per-second figure).
+# Billed per second of audio, not per token: USD 0.000035/s (OpenRouter's listing;
+# the vendor's own pages print no per-second figure) at the 7.14 CNY/USD the
+# vendor's CNY and USD price pages imply.
 _ASR_PRICES = {
     "qwen3-asr-flash": Rate("second", per_unit=0.00025, source="openrouter, converted"),
 }

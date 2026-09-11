@@ -72,7 +72,8 @@ async def ensure_schema() -> None:
                ('image_cache','refused'),
                ('cost_ledger','day'),
                ('cost_ledger','user_id'),
-               ('group_blocklist','blocked_until')
+               ('group_blocklist','blocked_until'),
+               ('user_agreement','version')
            ) AS c(tbl, col)
            LEFT JOIN information_schema.columns i
                   ON i.table_name = c.tbl AND i.column_name = c.col

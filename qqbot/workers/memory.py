@@ -67,10 +67,10 @@ def transcript_legend() -> str:
     return ptext("legend") + "\n\n" + ptext("extract_legend_note")
 
 
-#: Fact lifetimes come from the predicate class tables in memory_extractor - the kind of
-#: fact is the primary axis of forgetting, evidence a bounded multiplier on top. See
-#: MemoryRepository.decay for the reasoning and the citations. How long an unused name
-#: survives is config (memory.alias_unused_days / joke_unused_days).
+# Fact lifetimes come from the predicate class tables in memory_extractor - the kind of
+# fact is the primary axis of forgetting, evidence a bounded multiplier on top. See
+# MemoryRepository.decay for the reasoning. How long an unused name survives is
+# config (memory.alias_unused_days / joke_unused_days).
 
 #: Backoff after a failure. Exponential, capped at an hour - background work is not
 #: urgent, and what is urgent is not burning money on retries.
@@ -120,11 +120,10 @@ class MemoryWorker:
 
     async def step(self) -> bool:
         """Do one job. Returns whether there was one to do."""
-        # Half an hour, not the default ten minutes: a full drain is up to
-        # several background model calls and can outlive a short lease, and a
-        # deploy overlap would then reclaim the running job and pay for the same
-        # transcript twice. The cost of the longer lease is only that a crashed
-        # worker's job waits this long to be retried - nobody is watching at 02:30.
+        # The lease (memory.job_lease_min) has to outlast a full drain - several
+        # background model calls - or a deploy overlap reclaims the running job
+        # and pays for the same transcript twice. Its cost is only that a crashed
+        # worker's job waits this long to be retried.
         job = await self._queue.claim(
             lease=timedelta(minutes=self._m.job_lease_min))
         if job is None:
@@ -262,7 +261,7 @@ class MemoryWorker:
                 f"{f.predicate} = {defang(str(f.object_value))}")
         for code in sorted(per.keys() | notes.keys()):
             bits = "；".join(sorted(per.get(code, [])))
-            note = f"拥有者注：{notes[code]}" if code in notes else ""
+            note = f"备注：{notes[code]}" if code in notes else ""
             joined = "；".join(x for x in (bits, note) if x)
             # The same reserved account-code form the roster and the transcript
             # lines wear, so "already recorded" is recognisably about the same
@@ -340,11 +339,11 @@ class MemoryWorker:
         ))
         # The watermark moves for what was read, not for what was learned from it: a
         # batch of nothing but stickers is still a batch nobody should pay to read
-        # twice. But it moves only once the paid read *succeeded* - marked first, a
-        # timed-out extraction left the job's retry facing "nothing unread", and the
-        # batch was skipped forever. Marked before staging on purpose: the model call
-        # is the fragile, expensive step; if staging fails the loss is one batch's
-        # candidates, not a second charge for the same transcript.
+        # twice. But it moves only once the paid read *succeeded*: marked first, a
+        # timed-out extraction would leave the job's retry facing "nothing unread"
+        # and the batch skipped forever. Marked before staging on purpose: the model
+        # call is the fragile, expensive step; if staging fails the loss is one
+        # batch's candidates, not a second charge for the same transcript.
         await repo.mark_extracted(group_id, max(r["created_at"] for r in rows))
         if not cands:
             log.info("group %s: nothing worth extracting in this batch", group_id)
@@ -504,9 +503,13 @@ class MemoryWorker:
                                           size=batch[0].batch_size)
                 rows = sorted(rows, key=lambda r: (r["occurred_at"], r["id"]))
                 codes, _roster, lines = await self._render(group_id, rows)
+                # Members' lines only, as the extractor's source_of sees them: the
+                # bot's own lines are context, never evidence, and a quote the bot
+                # echoed back must not count as found twice.
                 w, r = await self._consolidator.consolidate(
                     batch, group_id=group_id, codes=codes,
-                    lines=tuple(ln.text for ln in lines), when=when or now_local(),
+                    lines=tuple(ln.text for ln in lines if not ln.own),
+                    when=when or now_local(),
                     # Records are dated by the conversation, not by tonight's write.
                     occurred={r["id"]: r["occurred_at"] for r in rows},
                 )
@@ -558,6 +561,11 @@ class MemoryWorker:
         resubmit - this job is running, not pending.
         """
         if await BUDGET.exceeded(self._cfg.budget.daily_cny_cap):
+            # Not dropped: nothing else queues an embed for episodes already
+            # written, so the job comes back after the longest backoff and keeps
+            # coming back until the ledger day has rolled over.
+            await self._queue.submit(JobType.EMBED, {"group_id": group_id},
+                                     delay=BACKOFF[-1])
             return 0
         todo = await self._vec.unembedded_episodes(group_id, limit=EMBED_PAGE)
         if not todo:

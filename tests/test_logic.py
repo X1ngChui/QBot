@@ -310,10 +310,10 @@ st = GroupState(group_id="12345")
 for i in range(25):
     st.add(ChatMsg(msg_id=f"m{i}", user_id="u1", nickname="阿强",
                    text=f"第{i}条消息", ts=now_local()))
-batch = [ChatMsg(msg_id="m99", user_id="u2", nickname="阿花", text="小X你在吗", ts=now_local())]
-st.add(batch[0])
+asked = ChatMsg(msg_id="m99", user_id="u2", nickname="阿花", text="小X你在吗", ts=now_local())
+st.add(asked)
 msgs = prompt.assemble(
-    persona=persona, cfg=cfg, st=st, batch=batch,
+    persona=persona, cfg=cfg, st=st, msg=asked,
     profiles=[{"user_id": "u1", "nickname": "阿强", "persona_card": "爱打游戏"}],
 )
 check("system first", msgs[0]["role"] == "system")
@@ -387,6 +387,27 @@ check("cut_text keeps a whole marker", _util.cut_text("你看 ⟦图片:一只�
       repr(_util.cut_text("你看 ⟦图片:一只猫⟧", 8)))
 check("cut_text leaves short text alone", _util.cut_text("短", 8) == "短")
 check("cut_text cuts plain text at the limit", _util.cut_text("一二三四五", 3) == "一二三")
+check("cut_text steps back out of nested markers",
+      _util.cut_text("a ⟦x ⟦y⟧⟧ tail", 6) == "a ", repr(_util.cut_text("a ⟦x ⟦y⟧⟧ tail", 6)))
+
+# The parser is total: a forward entry with a stamp no calendar can hold, a
+# numeric faceText and a dice result all still render.
+_odd = parse_segments([
+    {"type": "forward", "data": {"id": "f", "content": [
+        {"sender": {"nickname": "王大锤"}, "time": 10 ** 14,
+         "message": [{"type": "text", "data": {"text": "早"}}]}]}},
+    {"type": "face", "data": {"id": "14", "raw": {"faceText": 5}}},
+    {"type": "dice", "data": {"result": 6}},
+], "999")
+_odd_text = _odd.render()
+check("an out-of-range forward stamp leaves the entry untimed",
+      "王大锤: 早" in _odd_text and "⟦转发的聊天记录 1条⟧" in _odd_text, _odd_text)
+check("a numeric faceText still renders", "⟦表情:5⟧" in _odd_text, _odd_text)
+check("a dice result renders its number", "⟦骰子:6点⟧" in _odd_text, _odd_text)
+from qqbot.core.segments import _markdown_text as _mdt
+check("a hashtag is not a heading", _mdt("#话题 今天") == "#话题 今天", repr(_mdt("#话题 今天")))
+_hd = _mdt("## 标题\n正文")
+check("a real heading loses its hashes", _hd == "标题\n正文", repr(_hd))
 
 # The parser is total: it runs under the message's dedup mark, so a card whose
 # JSON is a list, or a size that is not a number, must degrade rather than raise.
@@ -420,8 +441,8 @@ check("why() still names a message-less exception", _util.why(TimeoutError()) ==
 check("history anchor set", st.history_anchor is not None, str(st.history_anchor))
 
 # No picture rides in the prompt: every marker carries a number and the model opens
-# what it wants to see with open_image. Every picture in the prompt carries a
-# number, and the number is what open_image resolves. It has to be one coordinate
+# what it wants to see with open_images. Every picture in the prompt carries a
+# number, and the number is what open_images resolves. It has to be one coordinate
 # rather than two ("the second picture in message #12"), because two is a pair the
 # model gets to miscount independently. Numbered oldest first, like the line
 # numbers, so both count the same direction - and stickers share the run, so there
@@ -453,11 +474,11 @@ _pf = ChatMsg(msg_id="pf", user_id="u", nickname="小红",
               image_refs=[_IR(key="d" * 32)])
 check("a line whose markers outnumber its pictures stays unnumbered",
       "⟦图片1:" not in _pf.render(seq=1, pic_nums=[1]), _pf.render(seq=1, pic_nums=[1]))
-_mn = prompt.assemble(persona=persona, cfg=cfg, st=st, batch=batch, profiles=[])
+_mn = prompt.assemble(persona=persona, cfg=cfg, st=st, msg=asked, profiles=[])
 check("every prompt message is a plain string - pictures are opened, never pushed",
       all(isinstance(m["content"], str) for m in _mn))
 check("the legend tells the model to open pictures by number",
-      "open_image" in _mn[0]["content"])
+      "open_images" in _mn[0]["content"])
 
 # ---- forwarded chat records: delivered inline, rendered as an indented block
 # The protocol side sends a forwarded record's entries inside the segment, nested
@@ -644,18 +665,18 @@ small.prompt.evict_chunk, small.prompt.window_chunks = 5, 4
 st2 = GroupState(group_id="9")
 for i in range(22):
     st2.add(ChatMsg(msg_id=f"x{i}", user_id="u", nickname="a", text="消息", ts=now_local()))
-h1 = prompt.history_window(st2, [], small)
+h1 = prompt.history_window(st2, None, small)
 a1 = st2.history_anchor
 check("an over-full window is cut back by whole chunks",
       len(h1) == 17 and a1 == "x5", f"{len(h1)} msgs, anchor {a1}")
 anchors = []
 for i in range(22, 25):
     st2.add(ChatMsg(msg_id=f"x{i}", user_id="u", nickname="a", text="短消息", ts=now_local()))
-    prompt.history_window(st2, [], small)
+    prompt.history_window(st2, None, small)
     anchors.append(st2.history_anchor)
 check("history anchor is stable across turns", all(a == a1 for a in anchors), f"{a1} -> {anchors}")
 st2.add(ChatMsg(msg_id="x25", user_id="u", nickname="a", text="压过线", ts=now_local()))
-prompt.history_window(st2, [], small)
+prompt.history_window(st2, None, small)
 check("and moves by a whole chunk when the window fills again",
       st2.history_anchor == "x10", str(st2.history_anchor))
 
@@ -694,9 +715,32 @@ check("and every module attribute the handlers reach for exists",
       not _missing, "; ".join(_missing))
 _tree = _ast.parse(_pl.Path("qqbot/plugins/commands.py").read_text(encoding="utf-8"))
 
+# The gate's decision table, as the pure function the handlers call.
+from qqbot.core.perms import Verdict as _V, decide as _decide
+_own, _glob = ["10001", "20001"], ["10001"]
+
+
+def _d(uid, **flags):
+    return _decide(uid, owners=_own, global_owners=_glob, **flags)
+
+
+check("a group owner holds an ordinary command", _d("20001") is _V.OWNER)
+check("a member is denied an owner-only command", _d("30001") is _V.DENIED)
+check("a group-added owner does not hold a global-only command",
+      _d("20001", global_only=True) is _V.DENIED)
+check("the global owner does", _d("10001", global_only=True) is _V.OWNER)
+check("a member reaches a self-serve command only past the agreement",
+      _d("30001", self_serve=True) is _V.MEMBER_IF_AGREED)
+check("and a member-readable surface the same way",
+      _d("30001", open_to_members=True) is _V.MEMBER_IF_AGREED)
+check("consenting itself is open before the agreement",
+      _d("30001", self_serve=True, pre_agreement=True) is _V.MEMBER)
+check("a global-only command stays closed to members whatever else it is flagged",
+      _d("30001", global_only=True, self_serve=True, open_to_members=True) is _V.DENIED)
+
 # Every handler has to decide who may run it. A handler that simply forgets to ask is
 # indistinguishable from one open on purpose, and that is how /who came to hand any
-# member every impression in the group while /who all was carefully gated. The decision
+# member every impression in the group while the owner-only commands were gated. The decision
 # itself is tested in test_pipeline (qqbot/core/perms.py); what is checked here is only
 # that each handler asks at all.
 _ungated = []

@@ -54,9 +54,5 @@ real server, and it avoids the Windows reserved range that swallows 55270-55469.
 
 Override `DATABASE_URL` / `DATABASE_PASSWORD` to point somewhere else.
 
-Torch and sentence-transformers are stubbed out, so a lightweight venv is enough:
-
-```bash
-pip install pydantic pyyaml jieba asyncpg openai httpx nonebot2[fastapi] \
-            nonebot-adapter-onebot nonebot-plugin-apscheduler
-```
+No protocol side is needed; the README's development install (pydantic, pyyaml,
+jieba, asyncpg, openai, httpx, luqum) is enough.

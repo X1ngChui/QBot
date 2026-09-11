@@ -41,7 +41,7 @@ rather than accumulate as flags. Adding one is: write the subclass, add a line t
 | `qqbot/providers/openai_compat.py` | shared plumbing for chat-protocol backends, quirks as hooks |
 | `qqbot/providers/deepseek.py`, `dashscope.py`, `tavily.py`, `sherpa.py` | one module per backend; sherpa is the in-process one - CPU speech recognition, no endpoint |
 | `qqbot/providers/registry.py` | backend name from config -> class |
-| `qqbot/plugins/tasks.py` | the five scheduled jobs |
+| `qqbot/plugins/tasks.py` | the scheduled jobs: the nightly memory drain and the daily report |
 | `scripts/preflight.py` | one real minimal call per capability, run before going live |
 
 ## How it behaves
@@ -81,7 +81,7 @@ rather than accumulate as flags. Adding one is: write the subclass, add a line t
   expires by age so a better model gets to look again. The reply model is
   multimodal, but no picture is pushed into the prompt: every picture carries
   its description line and a number, and the model fetches the originals it
-  wants to see - several per call - with the `open_image` tool, so the history
+  wants to see - several per call - with the `open_images` tool, so the history
   stays text and the prefix cache never turns over on a picture. Forwarded chat
   records render as an indented block under the message that carries them,
   nested records one level deeper, and their pictures are numbered with the

@@ -5,8 +5,8 @@ Run it inside the bot container after the keys are in place:
     docker compose run --rm bot python scripts/preflight.py
 
 Checks, in order: the database answers, every key the config names resolves, and each
-capability makes one real minimal call - text, vision and ASR (both
-inline base64), search.
+capability makes one real minimal call - text, vision (inline base64), ASR, search,
+embedding.
 Each call takes the production path, proxy included: search goes through the
 configured proxy exactly as it will at runtime, everything else direct.
 """
@@ -28,7 +28,6 @@ from qqbot.util import read_api_key
 def test_png(side: int = 64) -> bytes:
     """A real PNG, built here so the check needs no image library and no asset on disk.
     Vision models reject anything under 10px a side, so a 1x1 pixel will not do."""
-    import struct
     import zlib
 
     def chunk(tag: bytes, payload: bytes) -> bytes:
@@ -159,15 +158,19 @@ def check_keys() -> None:
     """Check the key each capability actually points at, not a hardcoded list - two
     capabilities may share one name or not, and only the config knows."""
     llm = config().default.llm
-    record("backends selected", True, providers().describe())
+    p = providers()
+    record("backends selected", True, p.describe())
     seen: dict[str, str] = {}
-    for label, name in (
-        ("text", llm.text.api_key_env),
-        ("vision", llm.vision.api_key_env),
-        ("asr", llm.asr.api_key_env),
-        ("search", llm.search.api_key_env),
-        ("embedding", llm.embedding.api_key_env),
+    for label, name, backend in (
+        ("text", llm.text.api_key_env, p.text),
+        ("vision", llm.vision.api_key_env, p.vision),
+        ("asr", llm.asr.api_key_env, p.asr),
+        ("search", llm.search.api_key_env, p.search),
+        ("embedding", llm.embedding.api_key_env, p.embedding),
     ):
+        if not backend.needs_key:
+            record(f"{label} key not needed ({backend.name})", True)
+            continue
         key = read_api_key(name)
         shared = f", shared with {seen[name]}" if name in seen else ""
         seen.setdefault(name, label)

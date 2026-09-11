@@ -16,7 +16,7 @@ from datetime import datetime
 
 from ..db import repo
 from ..settings import config
-from ..util import SYS_L, SYS_R, defang, fmt_when, now_local, sysmark, why
+from ..util import SYS_L, SYS_R, display_name, fmt_when, now_local, sysmark, why
 from .segments import parse_segments
 
 log = logging.getLogger("qqbot.state")
@@ -27,7 +27,8 @@ OWNER_TAG = sysmark("拥有者")
 
 #: A picture marker in a rendered line, either kind. The number the prompt gives
 #: it is inserted right after the label, so the description stays where it was.
-_PIC_MARK = re.compile(rf"{SYS_L}(图片|表情)(:[^{SYS_R}]*)?{SYS_R}")
+_PIC_MARK = re.compile(
+    rf"{re.escape(SYS_L)}(图片|表情)(:[^{re.escape(SYS_R)}]*)?{re.escape(SYS_R)}")
 
 
 @dataclass
@@ -53,7 +54,7 @@ class ChatMsg:
     #: The message's picture references (segments.ImageRef), forwarded ones
     #: included, in the order their markers render - kept for as long as the
     #: message is in the window, unlike `pending`, which is unpaid *work* and is
-    #: cleared once settled. This is what lets the open_image tool hand the model
+    #: cleared once settled. This is what lets the open_images tool hand the model
     #: any picture by number: QQ's file id trades for a fresh link at any time (see
     #: media._bytes). Typed loosely for the same reason `pending` is.
     image_refs: list = field(default_factory=list)
@@ -61,7 +62,7 @@ class ChatMsg:
     def numbered_text(self, pic_nums: list[int] | None) -> str:
         """This message's text with its picture markers carrying their prompt numbers.
 
-        The number is how the model names a picture to open_image, and it is a position
+        The number is how the model names a picture to open_images, and it is a position
         in one render - so it is applied here rather than stored, exactly like the line
         number. Markers are matched in order against image_refs; if the two counts
         disagree the message is left unnumbered rather than numbered wrong - a
@@ -137,20 +138,26 @@ class GroupState:
         p = config().for_group(self.group_id)[0].prompt
         return p.evict_chunk * (p.window_chunks + 2)
 
-    def add(self, msg: ChatMsg) -> None:
-        # The pipeline's dedup set dies with the process, so a message the adapter
-        # replays across a restart passes it - and load_history, triggered by that
-        # same replay, has already rebuilt this deque from the archive including the
-        # original. Without this guard both copies render, two transcript lines carry
-        # the same #N, and quotes point at the wrong one until eviction clears it.
+    def add(self, msg: ChatMsg) -> bool:
+        """Append one line to the window; False when it was already there.
+
+        The pipeline's dedup set dies with the process, so a message the adapter
+        replays across a restart passes it - and load_history, triggered by that
+        same replay, has already rebuilt this deque from the archive including the
+        original. Without this guard both copies render, two transcript lines carry
+        the same #N, and quotes point at the wrong one until eviction clears it.
+        The verdict is returned so the caller can skip the trigger too: the
+        original was already answered before the restart.
+        """
         if msg.msg_id and any(m.msg_id == msg.msg_id for m in self.recent):
-            return
+            return False
         # A deque keeps the length it was built with, and /reload can have grown
         # the window since: one smaller than the window binds first and slides the
         # prefix one message per turn, which the chunked eviction exists to avoid.
         if self.recent.maxlen != (want := self._capacity()):
             self.recent = deque(self.recent, maxlen=want)
         self.recent.append(msg)
+        return True
 
     async def blocked_now(self, user_id: str) -> bool:
         """Whether this account is blocked at this moment.
@@ -211,9 +218,12 @@ class GroupState:
         group first loads the mute flag and nothing else, and the history fills in on the
         first real message. Filled into a local list first: a failure mid-read leaves the
         deque untouched and the flag unset, so the next message simply tries again.
+        Lines already in the deque (a command's answer, a notice that arrived
+        first) are kept, behind the archive's: they are the newer ones.
         """
         if self.history_loaded:
             return
+        limits = config().for_group(self.group_id)[0].prompt
         msgs: list[ChatMsg] = []
         for r in await repo.recent_messages(int(self.group_id),
                                             limit=self.recent.maxlen or 50):
@@ -224,15 +234,14 @@ class GroupState:
                 continue
             sender = payload.get("sender") or {}
             # The payload keeps the segments verbatim, so picture references survive
-            # a restart: re-parsed here, they are what lets open_image hand over a
+            # a restart: re-parsed here, they are what lets open_images hand over a
             # picture posted before the deploy. Parsing is pure and costs nothing.
             segs = payload.get("segments") or []
-            refs = parse_segments(segs, self_id).pictures if segs else []
+            refs = parse_segments(segs, self_id, limits=limits).pictures if segs else []
             msgs.append(ChatMsg(
                 msg_id=str(r["platform_event_id"] or r["id"]),
                 user_id=uid,
-                nickname=defang(sender.get("card") or sender.get("nickname")
-                                 or uid).strip(),
+                nickname=display_name(sender.get("card"), sender.get("nickname"), uid),
                 text=text,
                 ts=r["occurred_at"],
                 is_bot=uid == self_id,
@@ -240,8 +249,9 @@ class GroupState:
                 reply_to=payload.get("reply_to") or None,
                 image_refs=refs,
             ))
-        if not self.recent:  # a live message that beat us here outranks the archive
-            self.recent.extend(msgs)
+        archived = {m.msg_id for m in msgs}
+        live = [m for m in self.recent if m.msg_id not in archived]
+        self.recent = deque(msgs + live, maxlen=self._capacity())
         self.history_loaded = True
         if msgs:
             log.info("group %s: rebuilt %d message(s) of history from the archive",

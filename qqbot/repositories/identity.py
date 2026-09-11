@@ -143,6 +143,10 @@ class IdentityRepository:
         makes an account resolvable makes a group resolvable too.
         """
         async with pool().acquire() as conn, conn.transaction():
+            # One creator per group at a time: two first calls racing here would
+            # both insert an entity, and the loser's would stay behind as an orphan
+            # no account references.
+            await conn.execute("SELECT pg_advisory_xact_lock($1)", int(group_id))
             row = await conn.fetchrow(
                 """SELECT entity_id FROM identity_account
                     WHERE platform=$1 AND platform_user_id=$2""",
@@ -158,19 +162,10 @@ class IdentityRepository:
             await conn.execute(
                 """INSERT INTO identity_account
                        (entity_id, platform, platform_user_id, first_seen_at, last_seen_at)
-                   VALUES ($1,$2,$3,NOW(),NOW())
-                   ON CONFLICT (platform, platform_user_id) DO NOTHING""",
+                   VALUES ($1,$2,$3,NOW(),NOW())""",
                 ent, self.GROUP_PLATFORM, str(group_id),
             )
-            # Re-read rather than return `ent`: on the conflict path a concurrent
-            # call won the account row, and returning this call's own entity would
-            # hand back an orphan no account references - facts written against it
-            # would be invisible to every later read, permanently.
-            return await conn.fetchval(
-                """SELECT entity_id FROM identity_account
-                    WHERE platform=$1 AND platform_user_id=$2""",
-                self.GROUP_PLATFORM, str(group_id),
-            )
+            return ent
 
     async def entity(self, entity_id: uuid.UUID) -> Entity | None:
         """Read one person, following the merge pointer.
@@ -197,6 +192,10 @@ class IdentityRepository:
         left alone: the ids they point at still resolve, because reads follow the pointer.
         Rewriting them would make it impossible to say which person a record was
         originally filed under - which is the only thing that makes a split recoverable.
+
+        The invariant callers rely on: an account's entity_id is always the live
+        person, because every account of the loser is repointed here. Only records
+        (facts, evidence, participants) may hold a merged id.
         """
         if loser == winner:
             raise ValueError("cannot merge an entity into itself")
@@ -259,19 +258,6 @@ class IdentityRepository:
                 account.entity_id, account.platform_user_id, new_id, account.platform,
             )
             return new_id
-
-    async def rename(self, entity_id: uuid.UUID, name: str | None) -> None:
-        """Set the name this person is filed under.
-
-        Only a label for the operator's benefit: nothing resolves through it, because a
-        canonical name that took part in matching would be a second alias table with no
-        evidence behind it.
-        """
-        await pool().execute(
-            """UPDATE entity SET canonical_name=$2, revision=revision+1, updated_at=NOW()
-                WHERE id=$1""",
-            entity_id, name,
-        )
 
     async def accounts_of(self, entity_id: uuid.UUID) -> list[IdentityAccount]:
         rows = await pool().fetch(
@@ -380,8 +366,8 @@ class IdentityRepository:
                 # ignores platform evidence entirely, and channel-max fusion is blind
                 # to a duplicate of a row already in the trail. So a sighting already
                 # filed today only bumps last_used_at - no trail row, no full-trail
-                # fetch, no rescore. Without this the trail grew two rows per message
-                # and every message paid aggregates over all of them.
+                # fetch, no rescore - where every message would otherwise add two
+                # trail rows and pay aggregates over all of them.
                 last = await conn.fetchval(
                     """SELECT max(created_at) FROM alias_evidence
                         WHERE alias_id=$1 AND evidence_type=$2""",

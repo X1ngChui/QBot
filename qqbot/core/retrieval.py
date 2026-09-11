@@ -2,11 +2,11 @@
 
 Why the whole roster rather than a retrieval: this block sits in the
 system prompt, ahead of the history, and prefix caching only matches forward from the
-start - rebuilding the roster around whoever is speaking invalidates everything after it
-- measured, and rejected on the measurement. Held whole and rendered in a fixed order, it
-is identical word for word between turns. A real group of thirty accounts renders to
-about two thousand characters; while it fits, there is nothing to rank and nothing to
-leave out.
+start - rebuilding the roster around whoever is speaking invalidates everything after
+it, which costs more than the tokens it saves. Held whole and rendered in a fixed
+order, it is identical word for word between turns. A real group of thirty accounts
+renders to about two thousand characters; while it fits, there is nothing to rank and
+nothing to leave out.
 
 The rows are assembled by `Directory`, the same service the ops commands read through.
 That is on purpose: with a single query behind both, /who shows an owner exactly the
@@ -23,7 +23,7 @@ from datetime import datetime
 
 from ..db import pool, repo
 from ..settings import config
-from ..util import defang, merge_overlapping, sysmark
+from ..util import defang, merge_overlapping, namesake_tag, sysmark, why
 from ..repositories import (
     EpisodeRepository, EventRepository, IdentityRepository, JobQueue,
     MemoryRepository, VectorRepository,
@@ -66,10 +66,13 @@ async def _stamp(gid: int, live: dict[str, str]) -> tuple:
     ordered by account rather than by recency - so one query deciding whether to rebuild
     stands in for the hundred-odd it takes to rebuild it.
 
-    What can actually change it: a fact written or retracted, a name added or retired, or
-    somebody editing their group card. The first two move an `updated_at`; the third shows
-    up in the live names, which the member list already caches. Message counts are not in
-    it, because they only decide who survives truncation, not what any line says.
+    What can actually change it: a fact written or retracted, a name added or retired,
+    two people merged into one (or split apart), or somebody editing their group card.
+    The first three move an `updated_at`; the last shows up in the live names, which
+    the member list already caches. Message counts are not in it, because they only
+    decide who survives truncation, not what any line says. Merges are read over every
+    entity rather than this group's: they are rare, and one rebuild per group after
+    one is cheaper than working out which groups the two people spoke in.
 
     Deriving the stamp rather than invalidating by hand is what makes this safe: a new
     write path cannot forget to clear a cache it does not know about.
@@ -77,10 +80,11 @@ async def _stamp(gid: int, live: dict[str, str]) -> tuple:
     row = await pool().fetchrow(
         """SELECT (SELECT max(updated_at) FROM memory_fact WHERE group_id=$1) AS facts,
                   (SELECT max(updated_at) FROM alias
-                    WHERE group_id=$1 OR group_id IS NULL) AS names""",
+                    WHERE group_id=$1 OR group_id IS NULL) AS names,
+                  (SELECT max(updated_at) FROM entity) AS people""",
         gid,
     )
-    return (row["facts"], row["names"], tuple(sorted(live.items())))
+    return (row["facts"], row["names"], row["people"], tuple(sorted(live.items())))
 
 
 async def gather(*, group_id: str, bot=None) -> list[dict]:
@@ -158,10 +162,10 @@ async def gather(*, group_id: str, bot=None) -> list[dict]:
                 if s := seqs.get(str(row["user_id"])):
                     # The same reserved namesake tag members.py renders, so the
                     # roster and the transcript spell one member one way.
-                    row["nickname"] = row["nickname"] + sysmark(f"同名{s}")
+                    row["nickname"] = row["nickname"] + namesake_tag(s)
         except Exception as e:
             log.warning("group %s: roster namesake numbering unavailable: %s",
-                        group_id, e)
+                        group_id, why(e))
     _CACHE[group_id] = (stamp, out, speakers)
     return out
 

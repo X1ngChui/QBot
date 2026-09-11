@@ -43,9 +43,8 @@ def tz_sql() -> str:
     An IANA name passes through as itself. A fixed offset must be *inverted*: bare
     offset strings are POSIX zone syntax, in which the sign runs the other way -
     'UTC+08:00' places local time eight hours *behind* Greenwich. Serialising the
-    fallback zone with str() shifted every derived date by sixteen hours (a real
-    incident: the daily report saw no new groups, and a first-day platform name could
-    score as multi-day).
+    fallback zone with str() would shift every date derived in SQL by twice the
+    offset, which is enough to move the daily report's day boundary.
     """
     z = _TZ
     if isinstance(z, ZoneInfo):
@@ -60,7 +59,7 @@ def _read_key_file(path: Path) -> str:
     """utf-8-sig, because a secret written by a Windows editor carries a BOM that strip()
     will not remove (U+FEFF is not whitespace) - it would ride along into the auth header
     and come back as an unexplained 401."""
-    return path.read_text(encoding="utf-8-sig").strip().lstrip("\ufeff")
+    return path.read_text(encoding="utf-8-sig").strip()
 
 
 def read_secret(env_name: str, fallback_env: str | None = None) -> str:
@@ -188,6 +187,21 @@ def sysmark(body: str) -> str:
     return f"{SYS_L}{body}{SYS_R}"
 
 
+def namesake_tag(seq: int) -> str:
+    """The tag two members sharing one display name wear behind it, carrying the
+    group's permanent serial for the account. One spelling for the member table,
+    the roster and the search tool's parser, so a namesake reads the same
+    everywhere."""
+    return sysmark(f"同名{seq}")
+
+
+def display_name(card: object, nickname: object = "", fallback: object = "") -> str:
+    """A member's name as transcripts show it: the group card, else the platform
+    nickname, else whatever the caller falls back on - defanged, because all
+    three are member-written and flow into system-marked text."""
+    return defang(str(card or nickname or fallback or "")).strip()
+
+
 def cut_text(text: str, limit: int) -> str:
     """text[:limit], never leaving a system marker cut in half.
 
@@ -200,7 +214,9 @@ def cut_text(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     t = text[:limit]
-    if t.count(SYS_L) > t.count(SYS_R):
+    # Repeated because markers can nest (a forwarded record's own markers sit
+    # inside its block), and one step back may land inside an outer one.
+    while t.count(SYS_L) > t.count(SYS_R):
         t = t[:t.rfind(SYS_L)]
     return t
 

@@ -45,14 +45,11 @@ _PRICES = {
                                          source="deepseek vision launch note: priced as V4-Flash"),
     "deepseek-v4-pro": Rate("Mtoken", in_hit=0.15, in_miss=4.5, out=13.5,
                             source="deepseek pricing page, verified 2026-09-10"),
-    # V4.1-Flash, released 2026-09-10 under this id and cheaper than the V4-Flash it
-    # replaces. It is what actually answers the two ids above: both are routed here
-    # now, so a call naming either bills at these rates once the response's own model
-    # is read back - which is why the ledger books what served a call, not what asked.
-    #
-    # From 2026-09-14 12:00 Beijing, deepseek-v4-pro routes here too, until a V4.1 Pro
-    # ships. Nothing in config has to change on that day: the id keeps working and the
-    # ledger follows the answer.
+    # The current flash tier (V4.1-Flash). The vendor routes calls naming the two
+    # flash ids above here as well, and from 2026-09-14 12:00 Beijing those naming
+    # deepseek-v4-pro, until a V4.1 Pro ships. A routed call bills at these rates
+    # whatever id asked, because the ledger books the model the response reports,
+    # not the one the request named - so nothing in config has to change.
     "deepseek-flash": Rate("Mtoken", in_hit=0.02, in_miss=1.0, out=4.0,
                            source="deepseek pricing page, verified 2026-09-10"),
 }
@@ -129,6 +126,7 @@ def _at_peak(now: datetime | None = None) -> bool:
 
 class DeepSeekChat(OpenAICompatChat):
     name = "deepseek"
+    keeps_files = True
 
     def __init__(self) -> None:
         super().__init__()
@@ -186,7 +184,7 @@ class DeepSeekChat(OpenAICompatChat):
     #: account's file store from silting up with no cleanup job to run or forget.
     #: It must stay comfortably above llm.vision.file_max_age_days, the age past
     #: which a stored file id is re-uploaded rather than trusted: expiring first
-    #: would let open_image hand the model an id the vendor has already dropped.
+    #: would let open_images hand the model an id the vendor has already dropped.
     FILE_TTL_SEC = 30 * 24 * 3600
 
     async def upload(

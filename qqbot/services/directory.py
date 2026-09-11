@@ -261,9 +261,9 @@ class Directory:
             acc = await self._ids.account_of("qq", uid)
             if acc is None:
                 continue
-            # Follow the merge pointer, so two merged accounts land on one card.
-            ent = await self._ids.entity(acc.entity_id)
-            by_entity.setdefault(ent.id if ent else acc.entity_id, []).append(uid)
+            # An account's entity is always the live one (merge repoints every
+            # account), so two merged accounts land on one card without a chase.
+            by_entity.setdefault(acc.entity_id, []).append(uid)
 
         cards = [
             await self._card(group_id, eid, uids, counts, display or {},
@@ -280,8 +280,7 @@ class Directory:
         answer from "nothing is known about them yet", and the caller says so differently.
         """
         acc = await self._identity.account(user_id)
-        ent = await self._ids.entity(acc.entity_id)
-        eid = ent.id if ent else acc.entity_id
+        eid = acc.entity_id
         accounts = [a.platform_user_id for a in await self._ids.accounts_of(eid)]
         counts = await self._events.speaker_counts(group_id)
         return await self._card(group_id, eid, accounts or [user_id], counts, {})
@@ -299,9 +298,8 @@ class Directory:
             acc = await self._identity.account(user_id)
         except UnknownAccount:
             return [user_id]
-        ent = await self._ids.entity(acc.entity_id)
-        eid = ent.id if ent else acc.entity_id
-        found = [a.platform_user_id for a in await self._ids.accounts_of(eid)]
+        found = [a.platform_user_id
+                 for a in await self._ids.accounts_of(acc.entity_id)]
         return found if user_id in found else [*found, user_id]
 
     async def _card(
@@ -419,19 +417,13 @@ class Directory:
             when=now_local(),
         )
 
-    async def name(
-        self, group_id: int, user_id: str, text: str, *, globally: bool = False
-    ) -> NameCard:
+    async def name(self, group_id: int, user_id: str, text: str) -> NameCard:
         """Bind a name to somebody by hand.
 
         The escape hatch for names the group uses that the transcript never spells out -
         the ones people say out loud and type at nobody. MANUAL evidence carries the
         weight of platform identity, so the alias is confirmed on the spot rather than
         waiting for a second sighting.
-
-        `globally` is the only way an alias ever crosses groups, and it is owner-only for
-        that reason: a name that resolves everywhere carries what one group knows into
-        another.
 
         Raises NameTaken if somebody else here already answers to it. A name belongs to
         one person - the same rule under which the validator refuses a batch pointing one
@@ -448,7 +440,7 @@ class Directory:
             Alias(
                 alias_text=text.strip(),
                 target_entity_id=entity_id,
-                group_id=None if globally else group_id,
+                group_id=group_id,
                 alias_type=AliasType.NICKNAME,
             ),
             [AliasEvidence(EvidenceType.MANUAL)],
@@ -578,9 +570,7 @@ class Directory:
         for nothing.
         """
         acc = await self._identity.account(user_id)
-        ent = await self._ids.entity(acc.entity_id)
-        eid = ent.id if ent else acc.entity_id
-        if len(await self._ids.accounts_of(eid)) < 2:
+        if len(await self._ids.accounts_of(acc.entity_id)) < 2:
             raise NotMerged(user_id)
         return await self._identity.split(user_id)
 
@@ -632,9 +622,8 @@ class Directory:
                 or str(entity_id))
 
     async def _entity(self, user_id: str) -> uuid.UUID:
-        acc = await self._identity.account(user_id)
-        ent = await self._ids.entity(acc.entity_id)
-        return ent.id if ent else acc.entity_id
+        # The live person: merge() repoints every account, so no chase is needed.
+        return (await self._identity.account(user_id)).entity_id
 
 
 __all__ = ["Directory", "PersonCard", "FactCard", "NameCard", "UnknownAccount",

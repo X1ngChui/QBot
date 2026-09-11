@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ..domain.identity import AliasType
 from ..domain.memory import Candidate, CandidateType
@@ -300,15 +300,15 @@ class ExtractionInput:
     #: whatever the recent messages happen to be by then.
     source_event_id: uuid.UUID | None = None
     #: How many rows the batch held - the other half of exact reproduction, since
-    #: gap-cut batches vary in length.
-    batch_size: int = 0
+    #: gap-cut batches vary in length. Required: a candidate carries it into the
+    #: store, which refuses NULL.
+    batch_size: int = field(kw_only=True)
     #: What is already on record for this group, rendered. Given to the model so it
     #: proposes what is new rather than re-deriving what is known - see the extract prompt.
     known: str = ""
     #: The bot's own trigger names, joined for display. Without them the extractor
-    #: cannot recognise its own name in other people's mouths and files it as an
-    #: alias of whichever member happens to sit nearby - measured in production,
-    #: where the bot's name ended up a confirmed alias of another bot's account.
+    #: cannot recognise its own name in other people's mouths and would file it as
+    #: an alias of whichever member happens to sit nearby.
     self_names: str = ""
 
     def source_of(self, quote: str) -> uuid.UUID | None:
@@ -323,8 +323,10 @@ class ExtractionInput:
         messages sources neither: picking the first would credit a speaker by luck.
 
         Matched against each line's body, never its speaker prefix - see line_body.
+        A quote of another type (a model can send a number where the schema said
+        string) sources nothing, the same as an empty one.
         """
-        quote = (quote or "").strip()
+        quote = quote.strip() if isinstance(quote, str) else ""
         if not quote:
             return None
         # The bot's own lines are context, never evidence: a quote found only

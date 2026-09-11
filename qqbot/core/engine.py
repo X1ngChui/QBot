@@ -12,6 +12,7 @@ daily cap, checked before anything is spent, means silence.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 
@@ -22,17 +23,13 @@ from ..providers.base import QuotaExhausted
 from ..settings import Persona, Settings
 from ..util import defang, now_local, sysmark, why
 from . import debug, prompt, retrieval, tools
+from .botapi import BotApi
 from .budget import BUDGET
 from .members import MEMBERS
 from .output import clean_reply
 from .state import ChatMsg, GroupState
 
 log = logging.getLogger("qqbot.engine")
-
-#: A tripwire, not a policy: money ends the loop, and only a backend reporting zero
-#: cost could make a money-bounded loop unbounded. That failure deserves a loud log
-#: and a stop rather than an endless loop.
-RUNAWAY_ROUNDS = 20
 
 #: What a tool request is answered with when it is not executed: after the
 #: allowance died mid-round, past the per-round cap, or as a repeat of a call
@@ -44,14 +41,6 @@ OVERFLOW_NOTE = ("（本轮工具调用次数已达上限，这个查询没有�
 REPEAT_NOTE = "（这个查询刚执行过，结果就在上面。换个关键词，或用已有资料回答。）"
 WRAP_UP_NOTE = ("（本次回复的额度已用完，不能再执行任何检索或查看；"
                 "请只依据上文已有的材料直接作答，不要提及额度或系统限制。）")
-
-#: Caps on the provenance marker appended to the bot's own archived line: how many
-#: tool uses it names, and how much of each query survives. A record, not a transcript
-#: - enough for a later turn to see what that answer rested on, not to replay it.
-#: The query has to survive whole to be a record at all: a boolean search expression
-#: cut in half reads as a different search than the one that ran.
-PROV_ITEMS = 4
-PROV_QUERY_CHARS = 80
 
 #: How each query tool reads in the provenance marker and the trace. One dict for
 #: both, or a renamed tool would let the marker and the trace quietly diverge.
@@ -77,10 +66,10 @@ async def _wrap_up(messages: list, *, cfg: Settings, st: GroupState,
                     st.group_id, why(e))
         return None, "", ""
     debug.capture(st.group_id, round_no, messages, res)
-    return res.text or None, _provenance(executed), _trace(executed, cfg)
+    return res.text or None, _provenance(executed, cfg), _trace(executed, cfg)
 
 
-def _provenance(executed: list[tuple[str, dict, str]]) -> str:
+def _provenance(executed: list[tuple[str, dict, str]], cfg: Settings) -> str:
     """The provenance marker for a reply that used tools - what this answer rested on.
 
     Appended to the archived/history form of the bot's own line, never to what the
@@ -101,7 +90,7 @@ def _provenance(executed: list[tuple[str, dict, str]]) -> str:
             continue
         if name == "read_url":
             parts.append("读了网页")
-        elif name == "open_image":
+        elif name == "open_images":
             # No number: numbering is per-render and shifts on every eviction, while
             # this marker is frozen into the archive - a stale one would point at
             # whatever picture sits there next week. That a picture was looked at is
@@ -109,23 +98,24 @@ def _provenance(executed: list[tuple[str, dict, str]]) -> str:
             parts.append("看了图")
         elif name in TOOL_VERB:
             q = str(args.get("query") or args.get("question") or "").strip()
-            parts.append(f"{TOOL_VERB[name]}“{q[:PROV_QUERY_CHARS]}”")
+            parts.append(f"{TOOL_VERB[name]}“{q[:cfg.prompt.provenance_query_chars]}”")
     if not parts:
         return ""
-    shown, extra = parts[:PROV_ITEMS], len(parts) - PROV_ITEMS
+    cap = cfg.prompt.provenance_items
+    shown, extra = parts[:cap], len(parts) - cap
     # defang the queries: they are model-written, and a model echoing chat can
     # echo anything. The wrap itself is the reserved pair.
     return sysmark("依据:" + defang("、".join(shown)) + ("等" if extra > 0 else ""))
 
 
-def _label(name: str, args: dict) -> str:
+def _label(name: str, args: dict, cfg: Settings) -> str:
     """One tool use as the trace names it - the provenance vocabulary, reused.
 
     No numbers anywhere in here: a number is a position in one render, and this
     text is frozen into reply_trace forever."""
     if name == "read_url":
-        return f"读网页 {str(args.get('url') or '')[:60]}"
-    if name == "open_image":
+        return f"读网页 {str(args.get('url') or '')[:cfg.prompt.provenance_query_chars]}"
+    if name == "open_images":
         return "看了图"
     q = str(args.get("query") or args.get("question") or "").strip()
     return f"{TOOL_VERB.get(name, name)}“{q}”"
@@ -153,7 +143,7 @@ def _trace(executed: list[tuple[str, dict, str]], cfg: Settings) -> str:
         # Web pages and search results are outside text; a page carrying the
         # system brackets must not smuggle markup into the frozen trace.
         digest = defang(" ".join((out or "").split()))[:cfg.prompt.trace_result_chars]
-        line = f"{_label(name, args)}：{digest}"
+        line = f"{_label(name, args, cfg)}：{digest}"
         if used + len(line) > cfg.prompt.trace_total_chars:
             lines.append("（其余从略）")
             break
@@ -164,17 +154,17 @@ def _trace(executed: list[tuple[str, dict, str]], cfg: Settings) -> str:
 
 async def generate(
     *,
-    bot,
+    bot: BotApi,
     st: GroupState,
     cfg: Settings,
     persona: Persona,
-    batch: list[ChatMsg],
+    msg: ChatMsg,
     window: list[ChatMsg] | None = None,
 ) -> tuple[str | None, str, str]:
     """Returns (reply text, provenance marker, trajectory entry). Both extras are ""
     for a reply that used no tools; the caller appends the marker to the archived
     line and files the trajectory as its own window entry - neither reaches what is
-    sent to the group."""
+    sent to the group. `msg` is the one message being answered."""
     # Names in history were captured when each message arrived. Re-read them so a rename
     # does not leave the same person appearing under two names across the prompt.
     await MEMBERS.relabel(bot, st.group_id, list(st.recent))
@@ -185,16 +175,16 @@ async def generate(
     # of against the conversation. The model pulls with recall_events instead.
     #
     # Window and numbering are computed once and handed to both the tool context and
-    # assemble: the picture numbers open_image resolves against and the numbers
+    # assemble: the picture numbers open_images resolves against and the numbers
     # the model reads must come from the same pass. The caller normally passes the
     # window in, cut when the message arrived, so later arrivals cannot shift what
     # this reply is looking at. Trajectories are fetched from reply_trace by id - the
     # deque holds only conversation - and render_history seats each before the reply
     # it fed, so eviction needs no bookkeeping.
     if window is None:
-        window = prompt.history_window(st, batch, cfg)
-    nums, marks = prompt.numbered(window + list(batch))
-    pics, by_pic = prompt.numbered_images(window + list(batch))
+        window = prompt.history_window(st, msg, cfg)
+    nums, marks = prompt.numbered(window + [msg])
+    pics, by_pic = prompt.numbered_images(window + [msg])
     ctx = tools.ToolCtx(bot=bot, by_pic=by_pic)
     traces = await repo.traces_for(
         int(st.group_id), [m.msg_id for m in window if m.is_bot])
@@ -202,7 +192,7 @@ async def generate(
         persona=persona,
         cfg=cfg,
         st=st,
-        batch=batch,
+        msg=msg,
         profiles=profiles,
         group_facts=await retrieval.group_knowledge(st.group_id),
         traces=traces,
@@ -215,12 +205,12 @@ async def generate(
     # picture for details past its one-line description. The middle two are the pull
     # half of context - the prompt pushes a fixed window, and they are the only way
     # to reach anything behind it.
-    tool_defs = tools.tool_defs()
+    tool_defs = tools.tool_defs(cfg)
     seen_calls: set[tuple[str, str]] = set()
     executed: list[tuple[str, dict, str]] = []
 
     with BUDGET.scope(cfg.budget.per_reply_cny) as spend:
-        for round_no in range(RUNAWAY_ROUNDS):
+        for round_no in range(cfg.retrieval.max_rounds):
             res = await providers().text.chat(
                 messages,
                 cfg=cfg.llm.text,
@@ -232,7 +222,7 @@ async def generate(
             )
             debug.capture(st.group_id, round_no, messages, res)
             if not res.tool_calls:
-                return res.text or None, _provenance(executed), _trace(executed, cfg)
+                return res.text or None, _provenance(executed, cfg), _trace(executed, cfg)
 
             # The gate sits between the request for tools and their execution:
             # tools whose results no further round could read would burn search
@@ -266,7 +256,7 @@ async def generate(
                      st.group_id, round_no + 1, spend.spent, spend.cap)
 
     log.error("group %s: %d tool rounds without running out of money - a backend "
-              "is billing zero; giving up", st.group_id, RUNAWAY_ROUNDS)
+              "is billing zero; giving up", st.group_id, cfg.retrieval.max_rounds)
     return None, "", ""
 
 
@@ -313,7 +303,6 @@ async def _run_round(
         elif key in seen_calls:
             out = REPEAT_NOTE
         else:
-            seen_calls.add(key)
             try:
                 out = await tools.execute(call, cfg=cfg, group_id=st.group_id, ctx=ctx)
             except QuotaExhausted as e:
@@ -323,6 +312,11 @@ async def _run_round(
                 out = QUOTA_NOTE
             else:
                 executed.append((name, args if isinstance(args, dict) else {}, out))
+                # Only a call that obtained something is a repeat worth refusing:
+                # a failed one (a network blip, a bad page) may be retried, and
+                # "the result is above" would be false for it.
+                if tools.verified(out):
+                    seen_calls.add(key)
         # A picture answers as a content array carrying the file block; the
         # vendor takes one on a tool message, so what was asked for arrives
         # as the answer to the call rather than as a turn appended behind it.
@@ -338,24 +332,34 @@ async def _run_round(
 
 async def respond(
     *,
-    bot,
+    bot: BotApi,
     st: GroupState,
     cfg: Settings,
     persona: Persona,
-    batch: list[ChatMsg],
+    msg: ChatMsg,
     window: list[ChatMsg] | None = None,
     reply_to: str = "",
     initiator: str = "",
 ) -> bool:
     try:
         raw, prov, trace = await generate(
-            bot=bot, st=st, cfg=cfg, persona=persona, batch=batch, window=window)
+            bot=bot, st=st, cfg=cfg, persona=persona, msg=msg, window=window)
     except Exception as e:
-        log.warning("group %s: generation failed, staying silent: %s", st.group_id, why(e))
+        # A provider or transport failure is a one-line warning; anything else is
+        # a fault in this code, and the traceback is the only way to find it.
+        log.warning("group %s: generation failed, staying silent: %s", st.group_id, why(e),
+                    exc_info=not _expected(e))
         return False
 
     text = clean_reply(raw or "")
     if not text:
+        # Silence is the one symptom that looks the same whether the bot chose
+        # not to speak or something broke, so an empty reply is always logged.
+        if raw and raw.strip():
+            log.warning("group %s: reply stripped to nothing (%d chars: %r)",
+                        st.group_id, len(raw), raw[:60])
+        else:
+            log.warning("group %s: the model returned an empty reply", st.group_id)
         return False
     if len(text) > cfg.gateway.max_msg_len:
         text = text[: cfg.gateway.max_msg_len]
@@ -400,11 +404,35 @@ async def respond(
             return False
 
     msg_id = str((sent or {}).get("message_id") or f"self-{now_local().timestamp()}")
+    # The words are in the group now; the record of them must land whatever
+    # happens to this task. Shielded because shutdown cancels reply tasks, and a
+    # delivered reply missing from the window and the archive is exactly the
+    # one-sided conversation the restart rebuild must never read.
+    await asyncio.shield(_record(bot, st, persona, msg_id=msg_id, text=kept,
+                                 trace=trace, reply_to=reply_to))
+    log.info("group %s: replied (%d chars)", st.group_id, len(text))
+    return True
+
+
+def _expected(e: BaseException) -> bool:
+    """Whether a generation failure is the kind a log line explains on its own:
+    the provider or the network said no. Matched by name so this module stays
+    importable without the SDK's error classes at hand."""
+    names = {c.__name__ for c in type(e).__mro__}
+    return bool(names & {"APIError", "HTTPError", "TimeoutError", "QuotaExhausted",
+                         "OSError"})
+
+
+async def _record(bot: BotApi, st: GroupState, persona: Persona, *, msg_id: str,
+                  text: str, trace: str, reply_to: str) -> None:
+    """The bot's own line, into the window and the archive, with its trajectory.
+
+    The trajectory is persisted and nothing else: reply_trace is the single
+    source of truth, the deque holds only conversation, and the next prompt
+    assembly queries the table for the window's replies and seats each entry
+    right before the reply it fed (see _trace and prompt.render_history).
+    """
     now = now_local()
-    # The trajectory is persisted and nothing else: reply_trace is the single
-    # source of truth, the deque holds only conversation, and the next prompt
-    # assembly queries the table for the window's replies and seats each entry
-    # right before the reply it fed (see _trace and prompt.render_history).
     if trace:
         try:
             await repo.trace_add(int(st.group_id), msg_id, trace)
@@ -415,7 +443,7 @@ async def respond(
             msg_id=msg_id,
             user_id=str(bot.self_id),
             nickname=persona.name,
-            text=kept,
+            text=text,
             ts=now,
             is_bot=True,
             # The same quote pointer any member's reply carries: the window line
@@ -433,12 +461,10 @@ async def respond(
             group_id=int(st.group_id),
             self_id=str(bot.self_id),
             message_id=msg_id,
-            text=kept,
+            text=text,
             at=now,
             name=persona.name,
             reply_to=reply_to,
         )
     except Exception:
         log.exception("failed to archive the bot's own reply in group %s", st.group_id)
-    log.info("group %s: replied (%d chars)", st.group_id, len(text))
-    return True

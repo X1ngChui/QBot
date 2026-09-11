@@ -25,7 +25,7 @@ import time
 
 from ..db import repo
 from ..settings import config
-from ..util import SYS_L, SYS_R, defang, sysmark, why
+from ..util import SYS_L, SYS_R, display_name, namesake_tag, why
 from .botapi import BotApi
 
 log = logging.getLogger("qqbot.members")
@@ -84,7 +84,7 @@ class MemberDirectory:
                 # defang at the fetch: these names flow to transcripts, notice
                 # lines and @-resolution, and the namesake tag appended below is
                 # only unforgeable if the name half cannot carry system brackets.
-                name = defang(r.get("card") or r.get("nickname") or "").strip()
+                name = display_name(r.get("card"), r.get("nickname"))
                 if qq and name:
                     table[qq] = name
             self._raw_by_group[group_id] = dict(table)
@@ -114,7 +114,7 @@ class MemberDirectory:
                             # card cannot contain: in parentheses it would be
                             # indistinguishable from a member whose literal card
                             # ends in "(3)".
-                            table[qq] = table[qq] + sysmark(f"同名{seqs[qq]}")
+                            table[qq] = table[qq] + namesake_tag(seqs[qq])
                 except Exception as e:
                     log.warning("group %s: namesake numbering unavailable, "
                                 "names stay bare: %s", group_id, why(e))

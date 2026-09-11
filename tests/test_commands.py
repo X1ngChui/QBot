@@ -9,8 +9,9 @@ is invisible until somebody exploits it, and one was: an ordinary member wrote o
 another member's record because the check read a QQ group role.
 
 The second half runs against a real database, through services.Directory - the object the
-handlers call. Between them, everything a command does is covered except the four lines
-of argument parsing inside each handler.
+handlers call. Between them, what a command does is covered; the handlers' own argument
+parsing and the wiring of each check into a handler are not, because the handler module
+cannot be imported here.
 """
 import os
 import pathlib

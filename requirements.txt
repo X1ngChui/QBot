@@ -1,4 +1,4 @@
-# Pinned to the exact versions production runs. 
+# Pinned to the exact versions production runs.
 # A rebuild must not change behavior by itself: ranges let any
 # cache-busting build resolve a fresh minor release between two deploys that
 # "changed nothing". Bump these on purpose, one at a time, and redeploy.

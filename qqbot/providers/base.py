@@ -229,6 +229,9 @@ class Capability(ABC):
 
     #: Short name this backend is selected by in config.
     name: str = ""
+    #: Whether this backend authenticates at all. An in-process backend has no
+    #: endpoint and no key, and a launch check must not report its missing one.
+    needs_key: bool = True
 
     @abstractmethod
     async def aclose(self) -> None:
@@ -276,6 +279,10 @@ class TextModel(Capability):
         not a guarantee: backends that cannot deliberate ignore it, and no caller
         may depend on it for correctness - only for cost, latency and depth.
         """
+
+    #: Whether upload() files anything. Read before a picture's bytes are fetched
+    #: for filing, so a backend that keeps no files costs no download either.
+    keeps_files: bool = False
 
     async def upload(
         self, data: bytes, *, cfg: TextCfg, mime: str = "image/jpeg",

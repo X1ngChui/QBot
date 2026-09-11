@@ -138,7 +138,7 @@ llm:
     # with. 0 disables expiry.
     description_ttl_days: 15
     # How long a stored file id (where the original was filed with the reply
-    # model's backend) is trusted to still exist there; past it open_image
+    # model's backend) is trusted to still exist there; past it open_images
     # uploads the picture again. Keep it under the backend's retention (30 days
     # for DeepSeek).
     file_max_age_days: 20
@@ -229,6 +229,11 @@ prompt:
   # survives: characters of each tool result, and of the whole entry.
   trace_result_chars: 1200
   trace_total_chars: 4000
+  # The provenance marker on the bot's own archived lines: how many tool uses it
+  # names and how much of each query survives - a record of what an answer rested
+  # on, not a replay.
+  provenance_items: 4
+  provenance_query_chars: 80
 
 retrieval:
   # Lines of surrounding conversation around each search_history hit, each way.
@@ -249,9 +254,17 @@ retrieval:
   # is told it was cut.
   url_content_chars: 8000
   # How many tool calls one round of the reply loop may carry - each result is
-  # appended to the prompt - and how many pictures one open_image call may fetch.
+  # appended to the prompt - and how many pictures one open_images call may fetch.
   max_tool_calls_per_round: 8
-  open_image_max: 6
+  open_images_max: 6
+  # How much of one search_history answer the model is handed: hits times context
+  # lines times the per-message bound can outgrow the model's context, where the
+  # request fails outright. A cut answer says so on its last line.
+  history_chars: 12000
+  # A tripwire on the tool loop, not a policy: money ends the loop, and only a
+  # backend billing zero could make it endless. Past this many rounds the reply
+  # is abandoned with an error in the log.
+  max_rounds: 20
 
 # How much the memory pipeline reads, and how fast it lets go. The model that runs
 # extraction is not here - it belongs to the capability doing the work

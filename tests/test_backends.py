@@ -304,6 +304,20 @@ def main() -> int:
           abs(base.Rate("Mtoken", in_hit=0.02).tokens(1_000_000, 0, 0) - 0.02) < 1e-9)
     check("unit arithmetic",
           abs(base.Rate("call", per_unit=0.01).units(3) - 0.03) < 1e-9)
+
+    # The billing boundary: a connection error never reached the vendor, a rate
+    # limit was refused before processing - but a timeout did arrive and was billed,
+    # even though the SDK files it under the connection errors.
+    import httpx as _hx
+    import openai as _oa
+    from qqbot.providers.openai_compat import never_billed
+    _req = _hx.Request("POST", "http://x")
+    check("a connection error is never billed",
+          never_billed(_oa.APIConnectionError(request=_req)))
+    check("a timeout is billed, whatever the SDK calls it",
+          not never_billed(_oa.APITimeoutError(request=_req)))
+    check("an ordinary failure is billed",
+          not never_billed(RuntimeError("x")))
     asyncio.run(bundle2.aclose())
 
     print()

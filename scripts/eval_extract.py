@@ -53,7 +53,7 @@ ROSTER = "\n".join([
 KNOWN = "\n".join([
     "本群：",
     "- term 切片 = 把采样切成小段再重排",
-    "⟦1⟧：lives_in = 苏州；拥有者注：本名王小锤，只在周末上线",
+    "⟦1⟧：lives_in = 苏州；备注：本名王小锤，只在周末上线",
     "已记过的事：",
     "- 王大锤答应周末把切片做完",
     # An infected prior episode, planted on purpose: editorial style once written

@@ -116,7 +116,7 @@ except ValueError:
 
 # ---- candidates -----------------------------------------------------------
 cand = Candidate(candidate_type=CandidateType.ALIAS, payload={"alias": "老周"},
-                 group_id=1)
+                 group_id=1, batch_size=1)
 check("候选默认待处理", cand.status == "pending")
 bad = cand.rejected(RejectReason.AMBIGUOUS_ALIAS)
 check("否掉时记下理由", bad.status == "rejected" and bad.reject_reason == "ambiguous_alias")

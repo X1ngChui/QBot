@@ -22,8 +22,10 @@ from ..db import pool, repo
 from ..providers import providers
 from ..providers.base import QuotaExhausted
 from ..settings import RetrievalCfg, Settings, config, ptext
-from ..util import SYS_L, SYS_R, defang, fmt_when, merge_overlapping, sysmark, why
+from ..util import (SYS_L, SYS_R, defang, display_name, fmt_when, merge_overlapping,
+                    sysmark, why)
 from . import retrieval
+from .botapi import BotApi
 from .media import MEDIA
 
 log = logging.getLogger("qqbot.tools")
@@ -33,19 +35,22 @@ log = logging.getLogger("qqbot.tools")
 class ToolCtx:
     """What tool execution may reach beyond the database: the live protocol side,
     and the map from the numbers the prompt shows to what they name. Only
-    open_image needs either; the retrieval tools stay context-free."""
+    open_images needs either; the retrieval tools stay context-free."""
 
-    bot: object = None
+    bot: BotApi | None = None
     #: Picture number -> (the message that posted it, its index in image_refs).
     by_pic: dict[int, tuple] = field(default_factory=dict)
 
 
-def tool_defs() -> list[dict]:
+def tool_defs(cfg: Settings | None = None) -> list[dict]:
     """The tool definitions, built fresh so a /reload'ed description applies.
 
     The schemas stay in code - they are the contract the executor matches on -
-    while the descriptions, which are prompts, come from the registry.
+    while the descriptions, which are prompts, come from the registry. `cfg` is
+    the group's own settings, so a limit the description states is the one the
+    executor enforces for that group.
     """
+    rcfg = (cfg or config().default).retrieval
     return [
         {
             "type": "function",
@@ -111,8 +116,8 @@ def tool_defs() -> list[dict]:
         {
             "type": "function",
             "function": {
-                "name": "open_image",
-                "description": ptext("tool_open_image"),
+                "name": "open_images",
+                "description": ptext("tool_open_images"),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -121,7 +126,7 @@ def tool_defs() -> list[dict]:
                             "items": {"type": "integer"},
                             "description": "要查看的图片编号列表，取自转写里 ⟦图片N:…⟧、"
                                            "⟦表情N:…⟧ 或 ⟦图片N⟧ 的 N；一次最多 "
-                                           f"{config().default.retrieval.open_image_max} 张",
+                                           f"{rcfg.open_images_max} 张",
                         },
                     },
                     "required": ["ns"],
@@ -224,7 +229,8 @@ def _condition(node, params: list, offset: int) -> str:
         return f"plain_text ILIKE ${offset + len(params)}"
     if isinstance(node, (_lq.Not, _lq.Prohibit)):
         return "NOT " + _condition(node.children[0], params, offset)
-    if isinstance(node, _lq.Group):
+    if isinstance(node, (_lq.Group, _lq.Plus)):
+        # A required term (+word) is what juxtaposition already means here.
         return _condition(node.children[0], params, offset)
     if isinstance(node, (_lq.AndOperation, _lq.UnknownOperation)):
         return ("(" + " AND ".join(_condition(c, params, offset)
@@ -265,12 +271,11 @@ async def search_history(group_id: int, query: str, *, speaker: str | None = Non
     often the very thing a line responds to. Windows that touch merge into one
     block; blocks are separated by an ellipsis line.
 
-    Every matched message is returned whole, and the result carries no length quota
-    of its own. What it holds is already settled by retrieval.history_hits hits, each
-    with its context lines, each line a message bounded by gateway.max_msg_len - and
-    past that by money, the only limit this system has. A character budget on top
-    would be a second bound on the same thing and the cruder one: it cannot tell a
-    result worth its size from one that is not, while money can.
+    Every matched message is returned whole: what a search is for is the substance
+    of what was said. The answer as a whole is bounded by retrieval.history_chars,
+    because hits times context lines times gateway.max_msg_len can outgrow the
+    model's context, where a request fails outright instead of degrading; a cut
+    answer says so on its last line.
     """
     # One read of the retrieval settings for the whole call, so how many hits are
     # fetched and how much context is rendered cannot come from two different
@@ -292,12 +297,15 @@ async def search_history(group_id: int, query: str, *, speaker: str | None = Non
         uid = await repo.member_of_seq(group_id, int(m.group(2)))
         if uid is not None and not await _carried_name(group_id, uid,
                                                        m.group(1).strip()):
-            # A member whose literal card ends in (3) must not resolve through
-            # serial 3 to an unrelated account: the serial only decides when
-            # its account has actually carried the name half. (The reserved form
-            # cannot be a literal card, but the guard is kept uniform - the
-            # model can mistype a serial either way.)
+            # The serial only decides when its account has actually carried the
+            # name half; a mistyped serial must not resolve to an unrelated
+            # account.
             uid = None
+        if uid is None:
+            # No account for the tag: fall back to the name half. The tag itself
+            # is system notation nobody's card contains, so left in the pattern
+            # it could only ever match nothing.
+            sp = m.group(1).strip()
     # The condition string holds only this module's own connectives and ILIKE
     # placeholders numbered past the five fixed parameters; the member's words
     # travel in `terms`, never in SQL text.
@@ -322,17 +330,24 @@ async def search_history(group_id: int, query: str, *, speaker: str | None = Non
         return "（存档里没有搜到）"
     ctx = max(0, rcfg.history_context)
     if not ctx:
-        return "\n".join(_history_line(r) for r in reversed(rows))
-    return await _with_context(group_id, [r["id"] for r in rows], ctx)
+        text = "\n".join(_history_line(r) for r in reversed(rows))
+    else:
+        text = await _with_context(group_id, [r["id"] for r in rows], ctx)
+    if len(text) > rcfg.history_chars:
+        # Cut at a line boundary so no message is shown half-said.
+        head = text[:rcfg.history_chars]
+        text = head[:head.rfind("\n")] if "\n" in head else head
+        text += "\n（结果过长，后面的没有显示；请换更具体的检索式或缩小时间范围）"
+    return text
 
 
 def _history_line(r) -> str:
     payload = r["payload"] or {}
     sender = payload.get("sender") or {}
-    # defang the name on render: rows filed before Sender.parse neutralized
-    # names can carry anything. The text is left as stored - its markers are
+    # The name is defanged on render: rows filed before names were neutralized at
+    # ingest can carry anything. The text is left as stored - its markers are
     # system writing, and defanging would destroy them.
-    who = defang(sender.get("card") or sender.get("nickname") or "?").strip()
+    who = display_name(sender.get("card"), sender.get("nickname"), "?")
     # The message whole. What a search is for is the substance of what was said, and
     # the archive's long messages are where that lives.
     text = (r["plain_text"] or "").strip()
@@ -398,11 +413,10 @@ def render_results(items: list[dict]) -> str:
 class Failure(str):
     """A tool answer that obtained nothing - a transport failure, a bad argument,
     an unreachable target. Rendered to the model verbatim like any other answer;
-    the *type* is the out-of-band verdict, the way media.Unsettled carries one.
-    It replaces a hand-maintained list of string openings that had already
-    drifted (it guarded an answer nothing returned any more). A no-result search
-    is NOT a Failure on purpose - searching and finding nothing is verification
-    work, and the provenance marker may certify it."""
+    the *type* is the out-of-band verdict, the way media.Unsettled carries one,
+    so no reader has to recognise the wording. A no-result search is NOT a
+    Failure on purpose - searching and finding nothing is verification work, and
+    the provenance marker may certify it."""
     __slots__ = ()
 
 
@@ -439,6 +453,33 @@ def verified(out: str) -> bool:
     return not isinstance(out, Failure)
 
 
+def _text(args: dict, key: str) -> str:
+    """A string argument, stripped; "" for a missing one or one of another type.
+    A model can send a number or a list where the schema said string, and a
+    type error mid-loop would kill the whole reply where an empty argument is
+    answered in words."""
+    v = args.get(key)
+    return v.strip() if isinstance(v, str) else ""
+
+
+#: The furthest back a day filter reaches; past it the filter means "unbounded"
+#: and would only overflow the interval arithmetic.
+_MAX_DAYS = 36500
+
+
+def _days(v: object) -> int | None:
+    """The `days` argument as a positive int, or None for none. Digit strings
+    are read (a common way models send integers); bools and non-positive values
+    mean no filter."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, str) and v.strip().isdigit():
+        v = int(v.strip())
+    if isinstance(v, int) and v > 0:
+        return min(v, _MAX_DAYS)
+    return None
+
+
 async def execute(call: dict, *, cfg: Settings, group_id: str,
                   ctx: ToolCtx | None = None) -> str:
     name = call.get("function", {}).get("name")
@@ -453,7 +494,7 @@ async def execute(call: dict, *, cfg: Settings, group_id: str,
     if not isinstance(args, dict):
         return Failure("（工具参数解析失败）")
 
-    if name == "open_image":
+    if name == "open_images":
         # Free: bytes and an upload, no model call. The reply model reads pictures
         # itself, so this hands them over rather than asking another model to look
         # - which could only ever answer the single question it was given. Several
@@ -461,12 +502,10 @@ async def execute(call: dict, *, cfg: Settings, group_id: str,
         # being compared, every picture in a forwarded record), and one round per
         # picture would spend the loop's bound on fetching.
         ns = args.get("ns")
-        if ns is None and isinstance(args.get("n"), int):
-            ns = [args["n"]]
         if (not isinstance(ns, list) or not ns
                 or not all(isinstance(x, int) and not isinstance(x, bool) for x in ns)):
             return Failure("（需要图片编号列表。）")
-        wanted = list(dict.fromkeys(ns))[:cfg.retrieval.open_image_max]
+        wanted = list(dict.fromkeys(ns))[:cfg.retrieval.open_images_max]
         parts: list[dict] = []
         shown: list[int] = []
         unknown: list[int] = []
@@ -480,8 +519,14 @@ async def execute(call: dict, *, cfg: Settings, group_id: str,
             refs = getattr(msg, "image_refs", None) or []
             fid = None
             if idx < len(refs):
-                fid = await MEDIA.ensure_uploaded(refs[idx], bot=ctx.bot if ctx else None,
-                                                  group_id=group_id, cfg=cfg)
+                try:
+                    fid = await MEDIA.ensure_uploaded(
+                        refs[idx], bot=ctx.bot if ctx else None, group_id=group_id, cfg=cfg)
+                except Exception as e:
+                    # Answered in words like every other tool failure: an exception
+                    # mid-loop would kill the whole reply, and "the picture could
+                    # not be fetched" is an answerable situation.
+                    log.warning("open_images failed on picture %d: %s", n, why(e))
             if not fid:
                 gone.append(n)
                 continue
@@ -502,7 +547,7 @@ async def execute(call: dict, *, cfg: Settings, group_id: str,
         return Attachment(text, parts)
 
     if name == "read_url":
-        url = (args.get("url") or "").strip()
+        url = _text(args, "url")
         if not url.startswith(("http://", "https://")):
             return Failure("（需要一个 http/https 网址）")
         try:
@@ -530,7 +575,7 @@ async def execute(call: dict, *, cfg: Settings, group_id: str,
         return body
 
     if name == "recall_events":
-        question = (args.get("question") or args.get("query") or "").strip()
+        question = _text(args, "question") or _text(args, "query")
         if not question:
             return Failure("（问题为空）")
         try:
@@ -545,7 +590,7 @@ async def execute(call: dict, *, cfg: Settings, group_id: str,
             return Failure("（记忆检索失败）")
         return found or "（事件记忆里没有相关的事）"
 
-    query = (args.get("query") or "").strip()
+    query = _text(args, "query")
     if not query:
         return Failure("（搜索词为空）")
 
@@ -553,8 +598,8 @@ async def execute(call: dict, *, cfg: Settings, group_id: str,
         try:
             return await search_history(
                 int(group_id), query,
-                speaker=(args.get("speaker") or "").strip() or None,
-                days=args.get("days") if isinstance(args.get("days"), int) else None,
+                speaker=_text(args, "speaker") or None,
+                days=_days(args.get("days")),
                 rcfg=cfg.retrieval,
             )
         except QuotaExhausted:

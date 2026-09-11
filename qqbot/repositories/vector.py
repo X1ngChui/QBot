@@ -79,9 +79,9 @@ class VectorRepository:
         """Active episodes with no vector for the current model, as (id, summary),
         oldest first.
 
-        The anti-join keeps the nightly fill incremental in the query itself -
-        fetching every episode to diff in Python re-read the whole store per group
-        per night. Keyed on model and version like every read here, so switching
+        The anti-join keeps the nightly fill incremental in the query itself, where
+        fetching every episode to diff in Python would re-read the whole store per
+        group per night. Keyed on model and version like every read here, so switching
         embedding model makes the old vectors invisible and the fill re-covers
         everything, exactly as the coexist-then-switch design intends.
 

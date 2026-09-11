@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import unicodedata
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 
@@ -257,7 +257,7 @@ class Alias:
             conf = manual[-1].weight
             status = (AliasStatus.CONFIRMED if conf >= CONFIRM_THRESHOLD
                       else AliasStatus.CANDIDATE)
-            return self._with(conf, status)
+            return replace(self, confidence=conf, status=status)
         conf = fused_confidence(evidence)
         status = (AliasStatus.CONFIRMED if conf >= CONFIRM_THRESHOLD
                   else AliasStatus.CANDIDATE)
@@ -265,18 +265,4 @@ class Alias:
         if self.status is AliasStatus.CONFIRMED:
             status = AliasStatus.CONFIRMED
             conf = max(conf, self.confidence)
-        return self._with(conf, status)
-
-    def _with(self, conf: float, status: AliasStatus) -> Alias:
-        return type(self)(
-            alias_text=self.alias_text,
-            target_entity_id=self.target_entity_id,
-            group_id=self.group_id,
-            alias_type=self.alias_type,
-            confidence=conf,
-            status=status,
-            valid_from=self.valid_from,
-            valid_to=self.valid_to,
-            last_used_at=self.last_used_at,
-            id=self.id,
-        )
+        return replace(self, confidence=conf, status=status)

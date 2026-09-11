@@ -338,7 +338,7 @@ async def main():
           str([ln.text for ln in lines]))
     from qqbot.services import ExtractionInput as _EI0
     _probe = _EI0(group_id=G, transcript="", roster=_roster, account_codes=_codes,
-                  lines=tuple(lines))
+                  lines=tuple(lines), batch_size=len(lines))
     check("but never on the roster and never a source",
           "小X" not in _roster and _probe.source_of("我也在玩鸣潮") is None,
           _roster)
@@ -460,7 +460,7 @@ async def main():
     await _dir().note(G, "u1", "只在周末上线")
     _known2 = await w._known(G, _codes2)
     check("the owner's note rides the known block under its own label",
-          "拥有者注：只在周末上线" in _known2, _known2)
+          "备注：只在周末上线" in _known2, _known2)
     # The persona's hand-written group background reaches extraction too - the
     # same fixed material the reply path reads, because understanding is
     # upstream of extraction.
@@ -485,7 +485,8 @@ async def main():
           any("小X⟦你⟧: 切片记得用新采样" in ln.text for ln in _own)
           and "小X" not in _roster3, str(_own))
     _inp3 = _EI(group_id=G, transcript="\n".join(ln.text for ln in _lines3),
-                roster=_roster3, account_codes=_codes3, lines=tuple(_lines3))
+                roster=_roster3, account_codes=_codes3, lines=tuple(_lines3),
+                batch_size=len(_lines3))
     check("a quote from the bot's own line validates nowhere",
           _inp3.source_of("切片记得用新采样") is None)
     check("while a member's line still sources",
@@ -807,7 +808,7 @@ async def main():
     _covr = config().default.model_copy(deep=True)
     _covr.llm.text.extract.model = "flash-probe"
     await _MEovr(_covr, legend="x").extract(_EIovr(
-        group_id=G, transcript="", roster="", account_codes={}, lines=()))
+        group_id=G, transcript="", roster="", account_codes={}, lines=(), batch_size=0))
     check("the extract model override moves extraction alone",
           SEEN_MODELS[-1] == "flash-probe" and SEEN_MODELS[0] == _txt.model,
           f"first={SEEN_MODELS[0]} last={SEEN_MODELS[-1]}")

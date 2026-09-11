@@ -56,8 +56,9 @@ class Candidate:
     #: And how many rows that batch held. Batches are cut at conversation gaps, so
     #: their length varies; without the count, replay could only guess a fixed
     #: window ending at the anchor - a superset that would shift every account code
-    #: and misattribute records.
-    batch_size: int = 0
+    #: and misattribute records. Required (the store refuses NULL, and 0 would
+    #: replay an empty batch that rejects everything).
+    batch_size: int = field(kw_only=True)
     confidence: float | None = None
     status: CandidateStatus = CandidateStatus.PENDING
     reject_reason: str | None = None

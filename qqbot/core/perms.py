@@ -29,6 +29,7 @@ on_command() runs at import time and needs a NoneBot runtime.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from enum import StrEnum
 
 
 def is_owner(user_id: str, owners: Iterable[str]) -> bool:
@@ -36,3 +37,34 @@ def is_owner(user_id: str, owners: Iterable[str]) -> bool:
     config may override it - the gateway already reads it that way."""
     listed = {str(o).strip() for o in owners if str(o).strip()}
     return str(user_id) in listed
+
+
+class Verdict(StrEnum):
+    """What the gate decided about one caller of one command."""
+
+    OWNER = "owner"
+    #: A member let through; the handler narrows every operation to their own person.
+    MEMBER = "member"
+    #: A member let through only if they have accepted the user agreement - the one
+    #: fact this decision cannot read for itself, so the gate resolves it.
+    MEMBER_IF_AGREED = "member_if_agreed"
+    DENIED = "denied"
+
+
+def decide(user_id: str, *, owners: Iterable[str], global_owners: Iterable[str],
+           global_only: bool = False, self_serve: bool = False,
+           open_to_members: bool = False, pre_agreement: bool = False) -> Verdict:
+    """The whole decision table of the command gate, as a pure function.
+
+    `owners` is the group's list (a per-group config may override it), and
+    `global_owners` the default one: `global_only` commands - whose blast radius
+    is every group at once - answer only to the latter, so an owner a single
+    group's override added holds none of them. A member reaches a `self_serve`
+    or `open_to_members` command, but only past the user agreement; the commands
+    that consent itself needs (`pre_agreement`) are open before it.
+    """
+    if is_owner(user_id, global_owners if global_only else owners):
+        return Verdict.OWNER
+    if global_only or not (self_serve or open_to_members):
+        return Verdict.DENIED
+    return Verdict.MEMBER if pre_agreement else Verdict.MEMBER_IF_AGREED

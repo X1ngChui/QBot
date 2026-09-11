@@ -92,7 +92,7 @@ class ImageRef(Ref):
     file_id: str | None = None
     size: int | None = None
     #: Inside a forwarded chat record rather than posted here. Such a picture is
-    #: filed (free) so open_image can show it, and reuses a description already
+    #: filed (free) so open_images can show it, and reuses a description already
     #: paid for, but is never described on its own account: one forwarded album
     #: would otherwise fan out into a vision call per picture. `free` is set to
     #: match, so the message never waits on it as unpaid work.
@@ -103,13 +103,10 @@ class ImageRef(Ref):
 
     async def resolve(self, proc: MediaProcessor, *, bot: BotApi, group_id: str,
                       cfg: Settings, self_id: str) -> str | None:
-        # Filing comes first and is free: the download link is freshest now, and the
-        # id is what open_image hands the model. Describing follows, with its own
-        # cache, rate limit and budget gate - unless the picture is only forwarded.
-        await proc.ensure_uploaded(self, bot=bot, group_id=group_id, cfg=cfg)
-        if self.nested:
-            return await proc.cached(self)
-        return await proc.describe_image(self, bot=bot, group_id=group_id, cfg=cfg)
+        # Filing (free, and first, while the download link is freshest), then
+        # describing with its own cache, rate limit and budget gate - or, for a
+        # picture that is only forwarded, whatever description is already paid for.
+        return await proc.resolve_picture(self, bot=bot, group_id=group_id, cfg=cfg)
 
 
 @dataclass
@@ -154,7 +151,7 @@ class ParsedMessage:
     def pictures(self) -> list[ImageRef]:
         """Every picture this message shows, in the order its markers render -
         those posted here and those inside a forwarded record alike. The prompt
-        numbers markers in text order and open_image resolves a number back
+        numbers markers in text order and open_images resolves a number back
         through this list, so the two orders must be the same one."""
         return [r for r in self.refs if isinstance(r, ImageRef)]
 
@@ -272,8 +269,9 @@ RPS_NAMES = {"1": "石头", "2": "剪刀", "3": "布"}
 
 _MD_IMAGE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 _MD_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
-_MD_HEADING = re.compile(r"^\s{0,3}#{1,6}\s*", re.M)
-_MD_QUOTE = re.compile(r"^\s{0,3}>\s?", re.M)
+#: A heading needs the space after its hashes; without one it is a hashtag, kept.
+_MD_HEADING = re.compile(r"^[ \t]{0,3}#{1,6}[ \t]+", re.M)
+_MD_QUOTE = re.compile(r"^[ \t]{0,3}>\s?", re.M)
 _MD_BLANKS = re.compile(r"\n{2,}")
 
 
@@ -397,7 +395,7 @@ class _Walk:
                         self.add_ref(parts, AtRef, ident=qq)
             elif stype == "face":
                 raw = data.get("raw") if isinstance(data.get("raw"), dict) else {}
-                name = defang(raw.get("faceText") or "").strip().lstrip("/")
+                name = defang(str(raw.get("faceText") or "")).strip().lstrip("/")
                 name = name or FACE_NAMES.get(str(data.get("id") or ""), "")
                 parts.append(sysmark(f"表情:{name}") if name else sysmark("表情"))
             elif stype == "mface":
@@ -469,7 +467,7 @@ class _Walk:
                 if body:
                     parts.append(body)
             elif stype == "dice":
-                parts.append(sysmark(f"骰子:{data.get('result')}点")
+                parts.append(sysmark(f"骰子:{defang(str(data.get('result')))}点")
                              if data.get("result") else sysmark("骰子"))
             elif stype == "rps":
                 name = RPS_NAMES.get(str(data.get("result") or ""))
@@ -505,8 +503,12 @@ class _Walk:
             sender = data.get("sender") if isinstance(data.get("sender"), dict) else {}
             who = defang(str(sender.get("card") or sender.get("nickname")
                              or data.get("nickname") or "")).strip() or "成员"
-            stamp = _int_or_none(data.get("time"))
-            when = sysmark(fmt_when(datetime.fromtimestamp(stamp, tz()))) + " " if stamp else ""
+            when = ""
+            if stamp := _int_or_none(data.get("time")):
+                try:
+                    when = sysmark(fmt_when(datetime.fromtimestamp(stamp, tz()))) + " "
+                except (OverflowError, OSError, ValueError):
+                    pass  # a stamp no calendar can hold: the entry goes untimed
             line = ForwardLine(when=when, who=who)
             segs, raw = segments_of(data)
             if segs is None:
@@ -517,8 +519,16 @@ class _Walk:
                 self.parse(segs, line.parts, depth=depth)
             block.lines.append(line)
             self.lines_left -= 1
-            self.chars_left -= len(when) + len(who) + len(_join(line.parts, {}, depth=depth)) + 4
+            self.chars_left -= len(when) + len(who) + _own_len(line.parts) + 4
         return block
+
+
+def _own_len(parts: list) -> int:
+    """The characters a forwarded entry contributes by itself: its text and its
+    markers' placeholders. A record nested inside it is not counted again - its
+    own entries were charged as they were parsed."""
+    return sum(len(p.placeholder()) if isinstance(p, Ref) else len(p)
+               for p in parts if not isinstance(p, ForwardBlock))
 
 
 def parse_segments(segments: list[dict], self_id: str,

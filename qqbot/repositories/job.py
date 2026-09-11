@@ -162,9 +162,9 @@ class JobQueue:
         try:
             # The locked_by guard, like done()'s: a worker that hung past its lease
             # reports its failure late, after a reclaim - or after the sweep above
-            # buried the job dead. Without the guard that stale report resurrected
-            # a dead job to pending, buying runs past the max_retry cap the sweep
-            # exists to enforce.
+            # buried the job dead - and without the guard that stale report would
+            # resurrect a dead job to pending, buying runs past the max_retry cap
+            # the sweep exists to enforce.
             await pool().execute(
                 """UPDATE memory_job
                       SET status='pending', retry_count=retry_count+1,

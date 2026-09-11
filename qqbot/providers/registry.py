@@ -60,13 +60,15 @@ SEARCH_BACKENDS: dict[str, type[SearchEngine]] = {
 
 
 def _pick(table: dict, name: str, capability: str):
-    try:
-        return table[name]()
-    except KeyError:
+    # Looked up first and constructed outside the check, so a KeyError raised
+    # inside a backend's own __init__ is not reported as an unknown name.
+    cls = table.get(name)
+    if cls is None:
         raise RuntimeError(
             f"unknown {capability} backend {name!r}; "
             f"available: {', '.join(sorted(table))}"
-        ) from None
+        )
+    return cls()
 
 
 def build(settings: Settings) -> Providers:

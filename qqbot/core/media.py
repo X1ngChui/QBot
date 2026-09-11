@@ -28,7 +28,7 @@ line between this file and segments.py. Two rules shape it:
    described. What it will not do is spend: a first sighting of a picture, or a voice
    clip, stays a bare marker down there, so one forwarded album cannot trigger dozens
    of vision calls. The pictures are still filed (free), numbered with the carrying
-   message's own, and the model opens any it wants to see with open_image.
+   message's own, and the model opens any it wants to see with open_images.
 
 Raw media never touches disk: memory -> API -> discarded, only text and cache keys are
 kept.
@@ -50,7 +50,7 @@ import httpx
 from ..db import repo
 from ..providers import providers
 from ..providers.base import retire
-from ..providers.openai_compat import NEVER_BILLED
+from ..providers.openai_compat import never_billed
 from ..services import UnknownAccount
 from ..settings import Settings, VisionCfg, config, ptext
 from ..util import defang, sysmark, why
@@ -83,6 +83,40 @@ def _audio_seconds(n_bytes: int) -> float:
 
 def _byte_cap(max_seconds: int) -> int:
     return max_seconds * _WAV_BYTES_PER_SEC
+
+
+#: What the byte routes answer for a file that exists but is over the caller's cap.
+#: Distinct from None (nothing could be read) because the verdicts differ: an
+#: unreadable picture is worth trying again later; an oversize one never shrinks.
+OVERSIZE = b""
+
+#: "Not fetched yet" for the per-arrival byte closure in resolve_picture, where None
+#: already means "fetched and failed".
+_UNFETCHED = object()
+
+#: Picture formats told apart by their first bytes.
+_MAGIC = (
+    (b"\x89PNG", "image/png"),
+    (b"GIF8", "image/gif"),
+    (b"\xff\xd8", "image/jpeg"),
+    (b"BM", "image/bmp"),
+)
+
+
+def _mime(data: bytes, name: str | None) -> str:
+    """The picture's format, from its bytes first and its file name second.
+
+    The format matters to the backend that files it (a GIF's joke is its motion),
+    and the name alone is not enough: a stored picture is often called `.image`,
+    and a marketplace sticker carries no name at all.
+    """
+    for magic, mime in _MAGIC:
+        if data.startswith(magic):
+            return mime
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    suffix = Path(name or "").suffix.lower().lstrip(".")
+    return f"image/{'jpeg' if suffix in ('', 'jpg', 'image') else suffix}"
 
 
 class Unsettled(str):
@@ -137,9 +171,14 @@ class MediaProcessor:
         #: And ASR calls in the air, by clip file id - same rule, dearer stakes:
         #: voice has no result cache, so a duplicate flight is a duplicate bill.
         self._transcribing: dict[str, asyncio.Task] = {}
+        #: Byte fetches in the air, by picture key. The same rule again: a second
+        #: reader of a dead picture waits on the first's verdict instead of
+        #: spending the same protocol deadline finding it out for itself.
+        self._fetching: dict[str, asyncio.Task] = {}
         #: Pictures no route could read, by key, with when that was found out.
         #: Consulted by _bytes so one dead picture does not cost every reply that
-        #: looks at it a full timeout.
+        #: looks at it a full timeout. Entries past their hold are dropped as new
+        #: ones are written, so it holds at most one hold's worth of dead pictures.
         self._unreadable: dict[str, float] = {}
 
     def _client(self) -> httpx.AsyncClient:
@@ -164,10 +203,30 @@ class MediaProcessor:
             bot.call_api(api, **params),
             timeout=config().default.gateway.protocol_call_timeout_sec)
 
+    @staticmethod
+    async def _flight(registry: dict[str, asyncio.Task], key: str, start):
+        """Run `start()` once per key at a time; late callers share the result.
+
+        The registry entry is popped when the FLIGHT ends, not when an awaiter
+        does: a cancelled awaiter must not unregister a call still in the air, or
+        the next caller starts (and pays for) a duplicate. The done-callback also
+        holds the only strong reference - asyncio keeps tasks weakly. Awaiting
+        through shield is the other half of the rule: cancelling a task cancels
+        what it awaits, and one cancelled awaiter must not abort the call every
+        other waiter is sharing.
+        """
+        flight = registry.get(key)
+        if flight is None:
+            flight = asyncio.create_task(start())
+            registry[key] = flight
+            flight.add_done_callback(lambda _t, k=key: registry.pop(k, None))
+        return await asyncio.shield(flight)
+
     async def close(self) -> None:
         if self._http is not None:
             await self._http.aclose()
             self._http = None
+            self._http_timeout = None
 
     def _img_window(self, group_id: str, limit: int) -> SlidingWindow:
         return self._window(self._img_windows, group_id, limit)
@@ -193,13 +252,13 @@ class MediaProcessor:
                 clen = int(r.headers.get("content-length") or 0)
                 if clen and clen > max_bytes:
                     log.info("media over size limit, skipped: %d > %d", clen, max_bytes)
-                    return None
+                    return OVERSIZE
                 buf = bytearray()
                 async for chunk in r.aiter_bytes():
                     buf.extend(chunk)
                     if len(buf) > max_bytes:
                         log.info("media over size limit mid-stream, skipped")
-                        return None
+                        return OVERSIZE
                 return bytes(buf)
         except Exception as e:
             # Info, not warning: a received link is one of three routes to the bytes
@@ -226,8 +285,8 @@ class MediaProcessor:
             return None
         p = Path(NAPCAT_DATA_DIR) / napcat_path.split(marker, 1)[1]
         try:
-            if p.is_file() and p.stat().st_size <= max_bytes:
-                return p.read_bytes()
+            if p.is_file():
+                return p.read_bytes() if p.stat().st_size <= max_bytes else OVERSIZE
         except OSError as e:
             log.debug("local media read failed %s: %s", p, why(e))
         return None
@@ -245,19 +304,29 @@ class MediaProcessor:
         return [url]
 
     # -- per-kind resolution ----------------------------------------------
-    async def _bytes(self, ref: Ref, *, bot, max_bytes: int) -> bytes | None:
+    async def _bytes(self, ref: ImageRef, *, bot, max_bytes: int) -> bytes | None:
         """Fetch the picture itself, by whichever route answers: the link the
-        message carried, then get_image for a fresh copy.
+        message carried, then get_image for a fresh copy. Single-flight per
+        picture, and a picture no route could read is remembered for a while.
 
-        A picture no route could read is remembered for a while and not tried
-        again until that passes: get_image on a picture the platform can no longer
-        serve does not fail, it hangs until the timeout, and every reply that
-        looked at the same picture would otherwise wait it out anew.
+        Both guard the same cost: get_image on a picture the platform can no
+        longer serve does not fail, it hangs until the deadline, and without them
+        every reader of the same picture - the arrival pass, a reply's backlog
+        pass, open_images - would wait it out anew.
         """
         key = ref.key or ref.file or ref.url or ""
+        if not key:
+            return await self._bytes_once(ref, bot=bot, max_bytes=max_bytes)
+        return await self._flight(
+            self._fetching, key,
+            lambda: self._bytes_once(ref, bot=bot, max_bytes=max_bytes))
+
+    async def _bytes_once(self, ref: ImageRef, *, bot, max_bytes: int) -> bytes | None:
+        key = ref.key or ref.file or ref.url or ""
         hold = config().default.gateway.unreadable_retry_sec
+        now = time.monotonic()
         failed_at = self._unreadable.get(key) if key else None
-        if failed_at is not None and time.monotonic() - failed_at < hold:
+        if failed_at is not None and now - failed_at < hold:
             log.debug("picture %s recently unreadable, not retried", key[:40])
             return None
         data = None
@@ -273,9 +342,13 @@ class MediaProcessor:
                     data = await self._fetch(info["url"], max_bytes)
             except Exception as e:
                 log.info("get_image failed: %s", why(e))
-        if data is None:
+        if data is OVERSIZE:
+            log.info("picture over the size cap, skipped")
+        elif data is None:
             if key:
-                self._unreadable[key] = time.monotonic()
+                self._unreadable = {k: t for k, t in self._unreadable.items()
+                                    if now - t < hold}
+                self._unreadable[key] = now
             log.warning("picture unreadable by every route (link=%s file=%s), "
                         "not retried for %ds", bool(ref.url), bool(ref.file), hold)
         return data
@@ -295,20 +368,48 @@ class MediaProcessor:
         """
         return await repo.image_cache_get(ref.key) if ref.key else None
 
-    async def ensure_uploaded(self, ref: ImageRef, *, bot: BotApi, group_id: str,
+    async def resolve_picture(self, ref: ImageRef, *, bot: BotApi, group_id: str,
                               cfg: Settings) -> str | None:
+        """Everything one picture gets on arrival: filed with the reply model's
+        backend (free), then described - unless it is only forwarded, in which
+        case a description already paid for is all it may have.
+
+        The bytes are fetched at most once for both steps, through a closure they
+        share. Neither step fetches before passing its own gates, so a picture
+        already described, with nothing to file, costs no download at all.
+        """
+        data: object = _UNFETCHED
+        max_bytes = int(cfg.llm.vision.max_image_mb * 1024 * 1024)
+
+        async def fetch() -> bytes | None:
+            nonlocal data
+            if data is _UNFETCHED:
+                data = await self._bytes(ref, bot=bot, max_bytes=max_bytes)
+            return data  # type: ignore[return-value]
+
+        await self.ensure_uploaded(ref, bot=bot, group_id=group_id, cfg=cfg, fetch=fetch)
+        if ref.nested:
+            return await self.cached(ref)
+        return await self.describe_image(ref, bot=bot, group_id=group_id, cfg=cfg,
+                                         fetch=fetch)
+
+    async def ensure_uploaded(self, ref: ImageRef, *, bot: BotApi, group_id: str,
+                              cfg: Settings, fetch=None) -> str | None:
         """File this picture with the reply model's backend, once, and remember where.
 
-        The upload itself is free and the id is what lets a reply prompt carry the
-        original pixels instead of a one-line description. Runs on arrival, while the
-        message's download link is still fresh; the id lands both on the ref (for this
-        process) and in image_cache (for reposts and for the message's later turns in
-        the window). A backend that keeps no files answers None once and this feature
-        simply stays off.
+        The upload itself is free and the id is what lets open_images put the
+        original pixels in front of the model. Runs on arrival, while the message's
+        download link is still fresh; the id lands both on the ref (for this
+        process) and in image_cache (for reposts and for the message's later turns
+        in the window). A backend that keeps no files is skipped before any
+        download, so the feature costs nothing where it is off.
+
+        `fetch` is the arrival pass's shared byte closure; without one the bytes
+        are fetched here.
         """
         if ref.file_id:
             return ref.file_id
-        if not ref.key:
+        if not ref.key or not providers().text.keeps_files:
             return None
         # Only an id young enough to still exist at the backend: a dead one fails
         # the whole request it rides in, and re-uploading is free.
@@ -321,17 +422,14 @@ class MediaProcessor:
         max_bytes = int(vcfg.max_image_mb * 1024 * 1024)
         if ref.size and ref.size > max_bytes:
             return None
-        data = await self._bytes(ref, bot=bot, max_bytes=max_bytes)
+        data = await (fetch() if fetch else self._bytes(ref, bot=bot, max_bytes=max_bytes))
         if not data:
             return None
-        # The stored format matters to the backend (a GIF's joke is its motion), and the
-        # segment's file name is the only place the format is stated.
-        suffix = Path(ref.file or "").suffix.lower().lstrip(".")
-        mime = f"image/{'jpeg' if suffix in ('', 'jpg') else suffix}"
         try:
             # Through the text capability: it is the model that will be handed the
             # file block, so it is the one that has to resolve the id.
-            fid = await providers().text.upload(data, cfg=cfg.llm.text, mime=mime)
+            fid = await providers().text.upload(data, cfg=cfg.llm.text,
+                                                mime=_mime(data, ref.file))
         except Exception as e:
             log.warning("image upload failed: %s", why(e))
             return None
@@ -341,7 +439,7 @@ class MediaProcessor:
         return fid
 
     async def describe_image(self, ref: ImageRef, *, bot: BotApi, group_id: str,
-                             cfg: Settings) -> str | None:
+                             cfg: Settings, fetch=None) -> str | None:
         """Describe a picture, whether it arrived as a photo or as a sticker.
 
         Single-flight per picture: a deliberating describe runs 10-20s, and in that
@@ -358,29 +456,23 @@ class MediaProcessor:
         that description ages out (llm.vision.description_ttl_days). The summary stays
         as the fallback for when the image cannot be fetched.
         """
-        if ref.key and (flight := self._describing.get(ref.key)) is not None:
-            return await asyncio.shield(flight)
         if not ref.key:
-            return await self._describe_once(ref, bot=bot, group_id=group_id, cfg=cfg)
-        task = asyncio.create_task(
-            self._describe_once(ref, bot=bot, group_id=group_id, cfg=cfg))
-        self._describing[ref.key] = task
-        # Popped when the FLIGHT ends, not when this awaiter does: a cancelled
-        # awaiter must not unregister a flight still in the air, or the next
-        # caller starts (and pays for) a duplicate. The callback also keeps the
-        # only strong reference alive - asyncio holds tasks weakly. Awaited
-        # through shield for the same reason: cancelling a task cancels what it
-        # is awaiting, and one cancelled awaiter must not abort the paid call
-        # every other waiter is sharing.
-        task.add_done_callback(lambda _t, k=ref.key: self._describing.pop(k, None))
-        return await asyncio.shield(task)
+            return await self._describe_once(ref, bot=bot, group_id=group_id, cfg=cfg,
+                                             fetch=fetch)
+        return await self._flight(
+            self._describing, ref.key,
+            lambda: self._describe_once(ref, bot=bot, group_id=group_id, cfg=cfg,
+                                        fetch=fetch))
 
     async def _describe_once(self, ref: ImageRef, *, bot: BotApi, group_id: str,
-                             cfg: Settings) -> str | None:
+                             cfg: Settings, fetch=None) -> str | None:
         vcfg = cfg.llm.vision
         label = "表情" if ref.sticker else "图片"
         # ref.summary was defanged at segment parse; the wrap is system-authored.
         fallback = sysmark(f"{label}:{ref.summary}") if ref.summary else None
+        # The verdict on a picture that is never going to be described. Terminal,
+        # so the pipeline stops paying attention to the slot.
+        final = fallback or sysmark(label)
 
         if ref.key:
             # The paid path is the one that asks for a *current* description: an
@@ -389,25 +481,28 @@ class MediaProcessor:
             if cached:
                 return cached
 
+        # A picture does not shrink, so the size verdict is final - and it is
+        # reached before any gate below is spent on it.
+        max_bytes = int(vcfg.max_image_mb * 1024 * 1024)
+        if ref.size and ref.size > max_bytes:
+            return final
+
         # Transient turn-aways return Unsettled: the same fallback text, but marked
-        # retryable so the pipeline keeps the message's pending work alive. Only the
-        # oversize verdict below is terminal - a picture does not shrink.
+        # retryable so the pipeline keeps the message's pending work alive.
         retry_later = Unsettled(fallback) if fallback else None
 
         if not self._img_window(group_id, vcfg.max_images_per_min).take():
             log.info("image understanding rate limited, skipped (%s)", group_id)
             return retry_later
 
-        # Understanding now happens on arrival rather than behind a reply, so the daily
-        # cap has to be asked here - there is no upstream gate on this path.
+        # This path runs on arrival, with no reply-side gate above it, so the daily
+        # cap is asked here.
         if await BUDGET.exceeded(cfg.budget.daily_cny_cap):
             return retry_later
 
-        max_bytes = int(vcfg.max_image_mb * 1024 * 1024)
-        if ref.size and ref.size > max_bytes:
-            return fallback
-
-        data = await self._bytes(ref, bot=bot, max_bytes=max_bytes)
+        data = await (fetch() if fetch else self._bytes(ref, bot=bot, max_bytes=max_bytes))
+        if data is OVERSIZE:
+            return final
         if not data:
             return retry_later
 
@@ -449,25 +544,18 @@ class MediaProcessor:
         on, so the in-flight registry is the only thing standing between a slow
         backend and double billing."""
         key = ref.file or ref.url
-        if key and (flight := self._transcribing.get(key)) is not None:
-            return await asyncio.shield(flight)
         if not key:
             return await self._transcribe_once(ref, bot=bot, group_id=group_id, cfg=cfg)
-        task = asyncio.create_task(
-            self._transcribe_once(ref, bot=bot, group_id=group_id, cfg=cfg))
-        self._transcribing[key] = task
-        # Same rules as describe_image's registry: pop when the flight ends, never
-        # when an awaiter does, and await through shield so a cancelled awaiter
-        # cannot abort the shared call.
-        task.add_done_callback(lambda _t, k=key: self._transcribing.pop(k, None))
-        return await asyncio.shield(task)
+        return await self._flight(
+            self._transcribing, key,
+            lambda: self._transcribe_once(ref, bot=bot, group_id=group_id, cfg=cfg))
 
     async def _transcribe_once(self, ref: AudioRef, *, bot: BotApi, group_id: str,
                                cfg: Settings) -> str | None:
         acfg = cfg.llm.asr
-        # Transcription now happens on arrival rather than behind a reply, so
-        # the arrival gates live here - there is no upstream gate on this path.
-        # None keeps the slot unsettled, so a reply-path settle can retry later.
+        # This path runs on arrival, with no reply-side gate above it, so the
+        # per-minute window and the daily cap are asked here. None keeps the slot
+        # unsettled, so a reply-path settle can retry later.
         if not self._asr_window(group_id, acfg.max_clips_per_min).take():
             log.info("voice transcription rate limited, deferred (%s)", group_id)
             return None
@@ -492,12 +580,18 @@ class MediaProcessor:
             info = {}
         data = None
         if info.get("base64"):
-            raw = base64.b64decode(str(info["base64"]).split(",", 1)[-1])
-            data = raw if len(raw) <= wav_cap else None
+            data = base64.b64decode(str(info["base64"]).split(",", 1)[-1])
+            if len(data) > wav_cap:
+                data = OVERSIZE
         if data is None:
             data = self._local(info.get("file"), wav_cap)
         if data is None and info.get("url"):
             data = await self._fetch(info["url"], wav_cap)
+        if data is OVERSIZE:
+            # Terminal: a clip does not get shorter, and leaving the slot unsettled
+            # would have the protocol side transcode it again on every turn.
+            log.info("voice clip over the length cap, skipped")
+            return sysmark("语音")
         if not data:
             return None
 
@@ -506,13 +600,13 @@ class MediaProcessor:
                 data, cfg=acfg, fmt="wav", seconds=_audio_seconds(len(data)),
                 group_id=group_id,
             )
-        except NEVER_BILLED as e:
-            # The request provably cost nothing (never sent, or refused before
-            # processing), so the one-paid-attempt rule below does not apply: a
-            # network blip must not abandon a clip a free retry would rescue.
-            log.warning("ASR call failed before billing, retryable: %s", why(e))
-            return None
         except Exception as e:
+            if never_billed(e):
+                # The request provably cost nothing (never sent, or refused before
+                # processing), so the one-paid-attempt rule below does not apply:
+                # a network blip must not abandon a clip a free retry would rescue.
+                log.warning("ASR call failed before billing, retryable: %s", why(e))
+                return None
             # Terminal, not retryable: a failed attempt may already have billed the
             # clip's full duration (the vendor charges per second on arrival), and
             # with no result cache every later turn's retry would bill it again -

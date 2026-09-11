@@ -288,7 +288,7 @@ def _two_colour_png() -> bytes:
 async def picture_case(cfg) -> dict:
     """The reply model fetches the pixels itself, by number, and reads them.
 
-    This is the one thing the offline suites cannot show: they prove open_image
+    This is the one thing the offline suites cannot show: they prove open_images
     hands a file block back and that the block reaches the request, while whether
     the model decides to look, and actually looks, is a property of the real
     backend. The marker in the transcript carries no description on purpose, so an
@@ -353,7 +353,7 @@ async def run_case(case, cfg, persona, bot) -> tuple[str, str]:
         st.add(m)
     st.add(case["trigger"])
     raw, prov, trace = await engine.generate(
-        bot=bot, st=st, cfg=cfg, persona=persona, batch=[case["trigger"]])
+        bot=bot, st=st, cfg=cfg, persona=persona, msg=case["trigger"])
     raw = raw or ""
     if case["checks"] is None:
         return "OBSERVE", raw

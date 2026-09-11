@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -45,7 +46,7 @@ class Ingestor:
         self._identity = identity
 
     async def ingest(
-        self, msg: GroupMessage, *, at_accounts: list[str] = (),
+        self, msg: GroupMessage, *, at_accounts: Sequence[str] = (),
     ) -> Ingested:
         """Archive one message and make sure everybody in it has an owner."""
         raw_id = await self._record(msg)
@@ -64,9 +65,9 @@ class Ingestor:
                     uid, group_id=msg.group_id, at=msg.occurred_at, raw_event_id=raw_id,
                 )
 
-        # No extraction trigger here any more: reading the day's transcript is the
-        # nightly drain's job (schedule.nightly_cron), at off-peak prices and in
-        # gap-aligned batches. The message path only writes.
+        # The message path only writes. Reading the day's transcript is the nightly
+        # drain's job (schedule.nightly_cron), at off-peak prices and in
+        # gap-aligned batches.
         return Ingested(raw_event_id=raw_id, speaker_entity_id=speaker.entity_id)
 
     async def record_own_reply(

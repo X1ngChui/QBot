@@ -68,6 +68,7 @@ def _pcm_from_wav(data: bytes) -> tuple[Any, int]:
 
 class SherpaAsr(AsrModel):
     name = "sherpa"
+    needs_key = False
 
     def __init__(self) -> None:
         self._recognizer: Any = None

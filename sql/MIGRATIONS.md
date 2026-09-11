@@ -163,7 +163,7 @@ CREATE INDEX IF NOT EXISTS raw_event_group_created
 -- trace upsert's ON CONFLICT depends on the index, not the table.
 ```
 
-## Earlier (pre-ledger; reconstructed from ensure_schema's column list)
+## Earlier (pre-ledger; reconstructed from ensure_schema's checks)
 
 ```sql
 ALTER TABLE raw_event        ADD COLUMN IF NOT EXISTS plain_text TEXT;
@@ -172,4 +172,19 @@ ALTER TABLE image_cache      ADD COLUMN IF NOT EXISTS file_id VARCHAR(64);
 ALTER TABLE memory_fact      ADD COLUMN IF NOT EXISTS object_key TEXT;
 ALTER TABLE memory_candidate ADD COLUMN IF NOT EXISTS batch_event_id UUID REFERENCES raw_event(id);
 ALTER TABLE cost_ledger      ADD COLUMN IF NOT EXISTS day DATE;
+
+-- The unique indexes every ON CONFLICT upsert depends on; ensure_schema refuses to
+-- boot without them. As in init.sql:
+CREATE UNIQUE INDEX IF NOT EXISTS raw_event_platform_key
+    ON raw_event (platform, platform_event_id)
+    WHERE platform_event_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS alias_unique_in_scope
+    ON alias (COALESCE(group_id, 0), normalized_text, target_entity_id);
+CREATE UNIQUE INDEX IF NOT EXISTS fact_one_current
+    ON memory_fact (COALESCE(group_id, 0), subject_entity_id, predicate,
+                    COALESCE(object_key, ''))
+    WHERE valid_to IS NULL AND status = 'active';
+CREATE UNIQUE INDEX IF NOT EXISTS job_pending_once
+    ON memory_job (job_type, (payload->>'group_id'))
+    WHERE status = 'pending';
 ```

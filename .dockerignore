@@ -12,3 +12,9 @@ models/
 secrets/
 __pycache__/
 *.pyc
+# Not image content either: config/ is bind-mounted, the rest is workstation-only.
+config/
+tests/
+docs/
+.venv/
+requirements-dev.txt

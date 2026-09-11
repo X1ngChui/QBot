@@ -17,15 +17,11 @@ from enum import StrEnum
 
 
 class EntityType(StrEnum):
-    """Only PERSON is handled properly in this version; the rest are placeholders."""
+    """What an entity stands for: a member, or the group itself (the subject of
+    group-level facts, see IdentityRepository.group_entity)."""
 
     PERSON = "person"
-    ORGANIZATION = "organization"
-    GAME = "game"
-    PLACE = "place"
-    PRODUCT = "product"
     GROUP = "group"
-    OTHER = "other"
 
 
 class EntityStatus(StrEnum):

@@ -69,7 +69,9 @@ async def note_console_reply(*, group_id: str | int, self_id: str, text: str,
 class Inbound:
     __slots__ = ("msg", "parsed", "media_task", "archive_task", "heard")
 
-    def __init__(self, msg: ChatMsg, parsed: ParsedMessage, media_task, archive_task=None):
+    def __init__(self, msg: ChatMsg, parsed: ParsedMessage,
+                 media_task: asyncio.Task | None,
+                 archive_task: asyncio.Task | None = None):
         self.msg = msg
         self.parsed = parsed
         self.media_task = media_task
@@ -159,7 +161,7 @@ class Gateway:
         segments = [
             {"type": seg.type, "data": dict(seg.data)} for seg in event.get_message()
         ]
-        parsed = parse_segments(segments, str(bot.self_id))
+        parsed = parse_segments(segments, str(bot.self_id), limits=cfg.prompt)
 
         # The adapter pops a leading or trailing @me segment off the message and reports it
         # as event.to_me, so the segments alone cannot show the bot was addressed - the one
@@ -205,7 +207,7 @@ class Gateway:
             is_owner=user_id in cfg.owners,
             reply_to=parsed.reply_to,
             # Kept beyond the describe: pending is unpaid work and gets cleared,
-            # but the references stay for the window's lifetime so open_image
+            # but the references stay for the window's lifetime so open_images
             # can open any picture by number, forwarded ones included.
             image_refs=parsed.pictures,
         )
@@ -240,7 +242,11 @@ class Gateway:
         # backlog settle is what pays for it - see ChatMsg.pending.
         if parsed.needs_model:
             msg.pending = parsed
-        st.add(msg)
+        if not st.add(msg):
+            # Already in the window: the adapter replayed a message across a
+            # restart, and the rebuilt history holds both it and its answer.
+            log.info("group %s: message %s replayed, already handled", group_id, msg_id)
+            return
 
         # Decided on what was typed (Inbound.heard), never the render or the
         # resolved form: a forwarded conversation whose body names the bot, a
@@ -267,7 +273,7 @@ class Gateway:
         # no await sits between st.add above and this line, so the slice ends
         # exactly at the message being answered, and whatever arrives while the
         # task is generating can neither leak in nor steal the reply's target.
-        window = prompt.history_window(st, [msg], cfg)
+        window = prompt.history_window(st, msg, cfg)
         task = asyncio.create_task(self._reply(bot, group_id, item, decision, window))
         self._replies.add(task)
         task.add_done_callback(self._replies.discard)
@@ -322,9 +328,9 @@ class Gateway:
         The line is attributed to the member it is about and worded as something
         that happened to them, the way a ban or a recall is - never as words the
         bot spoke. What the bot is recorded as saying, the model takes as its own
-        voice and repeats when the same question comes back; a gate's notice
-        written as bot speech was answered, verbatim, to a member who had just
-        satisfied the gate.
+        voice and repeats when the same question comes back, so a gate's notice
+        filed as bot speech would be repeated to a member who has since satisfied
+        the gate.
 
         The window line wears the rendered (possibly numbered) name; the
         archived sender must carry the raw card or nothing, because the ingest
@@ -473,14 +479,10 @@ class Gateway:
                 # exactly when the model is about to read the message it is in - which,
                 # since the bot only speaks when spoken to, is a question that has
                 # already been answered by here.
-                await self._settle_media([item], group_id, bot=bot, cfg=cfg, who=who)
-                # And whatever is still unread in the history about to be sent: a
-                # question about a voice clip refers to the message before it, which
-                # was never worth paying for on its own.
-                await self._settle_backlog(window, group_id, bot=bot, cfg=cfg, who=who)
+                await self._settle(item, window, group_id, bot=bot, cfg=cfg, who=who)
                 await engine.respond(
                     bot=bot, st=st, cfg=cfg, persona=persona,
-                    batch=[item.msg], window=window,
+                    msg=item.msg, window=window,
                     reply_to=decision.initiator_msg_id,
                     initiator=decision.initiator,
                 )
@@ -488,11 +490,32 @@ class Gateway:
             # A bare task has no worker loop above it to log for it.
             log.exception("group %s: reply task failed", group_id)
 
-    async def _settle_backlog(
-        self, window: list[ChatMsg], group_id: str, *, bot: BotApi, cfg,
+    async def _settle(self, item: Inbound, window: list[ChatMsg], group_id: str, *,
+                      bot: BotApi, cfg: Settings, who: str | None) -> None:
+        """Give the paid media this reply will read a bounded moment to land before
+        the prompt is built: the message being answered, and whatever is still
+        unread in the history about to be sent - a question about a voice clip
+        refers to the message before it, which was never worth paying for on its
+        own. Both sets start together and share one wait (gateway.media_wait_sec).
+
+        The tasks persist their own results (_resolve_and_patch), so this only
+        waits: a task that finishes in time has already patched its message; one
+        that does not keeps running and patches it for the next turn. Nothing is
+        cancelled.
+        """
+        tasks = self._settle_media(item, group_id, bot=bot, cfg=cfg, who=who)
+        tasks += self._settle_backlog(window, group_id, bot=bot, cfg=cfg, who=who)
+        if tasks:
+            await asyncio.wait(tasks, timeout=cfg.gateway.media_wait_sec)
+        if item.media_task is not None and item.media_task.done():
+            item.media_task = None
+
+    def _settle_backlog(
+        self, window: list[ChatMsg], group_id: str, *, bot: BotApi, cfg: Settings,
         who: str | None = None,
-    ) -> None:
-        """Understand the media still unread in the history this reply will be given.
+    ) -> list[asyncio.Task]:
+        """Start understanding the media still unread in the history this reply
+        will be given; the tasks, for the caller's one bounded wait.
 
         People post a picture and ask about it in the *next* message, so the thing being
         asked about usually sits in a message that drew no reply and was never paid for.
@@ -507,21 +530,17 @@ class Gateway:
         it will.
         """
         stale = [m for m in window if m.pending is not None and not m.is_bot]
-        # Each attempt owns its own persistence and survives this wait; `pending`
+        # Each attempt owns its own persistence and survives the wait; `pending`
         # is cleared inside it only when every paid slot settled, so a slow or
         # failed try is simply retried next turn - against warm caches and the
         # in-flight registry, so a retry never starts a second paid call for the
-        # same picture. All tasks start together and share one bounded wait:
-        # waiting them out one at a time stalled this group's only worker for up
-        # to N windows while the queue backed up behind it.
-        tasks = [
+        # same picture.
+        return [
             self._track(self._resolve_and_patch(
                 msg.pending, msg, bot=bot, group_id=group_id, cfg=cfg,
                 note="understood a message from the backlog", who=who))
             for msg in stale
         ]
-        if tasks:
-            await asyncio.wait(tasks, timeout=cfg.gateway.media_wait_sec)
 
     async def _resolve_and_patch(
         self, pm, msg: ChatMsg, *, bot: BotApi, group_id: str, cfg: Settings,
@@ -579,33 +598,24 @@ class Gateway:
             if note:
                 log.info("group %s: %s", group_id, note)
 
-    async def _settle_media(
-        self, batch: list[Inbound], group_id: str, *, bot: BotApi,
+    def _settle_media(
+        self, item: Inbound, group_id: str, *, bot: BotApi,
         cfg: Settings, who: str | None = None,
-    ) -> None:
-        """Give this batch's media a bounded moment to land before the prompt is built.
+    ) -> list[asyncio.Task]:
+        """Start the second attempt at the answered message's own paid media; the
+        task, for the caller's one bounded wait.
 
-        The tasks persist their own results (_resolve_and_patch), so this only waits:
-        a task that finishes in time has already patched the message; one that does
-        not keeps running and patches it for the next turn. Nothing is cancelled.
-        Runs only on a replying batch: a message whose paid content the arrival
-        pass could not settle (rate limited, over the cap, a transient failure)
-        gets a second attempt here, on the asker's account, and the prompt waits
-        a bounded moment for it - so a batch that draws no reply never stalls the
-        worker, and one that does reads the resolved text when it can be had.
+        Runs only for a message that drew a reply: one whose paid content the
+        arrival pass could not settle (rate limited, over the cap, a transient
+        failure) gets this attempt on the asker's account, so a message that draws
+        no reply costs nothing more, and one that does reads the resolved text
+        when it can be had.
         """
-        for item in batch:
-            if item.parsed.needs_model and item.msg.pending is not None:
-                item.media_task = self._track(self._resolve_and_patch(
-                    item.parsed, item.msg, bot=bot, group_id=group_id, cfg=cfg,
-                    archive_task=item.archive_task, after=item.media_task, who=who))
-        tasks = [i.media_task for i in batch if i.media_task is not None]
-        if not tasks:
-            return
-        await asyncio.wait(tasks, timeout=cfg.gateway.media_wait_sec)
-        for item in batch:
-            if item.media_task is not None and item.media_task.done():
-                item.media_task = None
+        if item.parsed.needs_model and item.msg.pending is not None:
+            item.media_task = self._track(self._resolve_and_patch(
+                item.parsed, item.msg, bot=bot, group_id=group_id, cfg=cfg,
+                archive_task=item.archive_task, after=item.media_task, who=who))
+        return [item.media_task] if item.media_task is not None else []
 
     @staticmethod
     async def _backfill(msg_id: str, text: str, archive_task=None) -> None:

@@ -48,12 +48,19 @@ RETRYABLE = (
     asyncio.TimeoutError,
 )
 
-#: Failures that provably cost nothing: the request never left the machine, or the
-#: vendor refused it before processing. Callers that treat a paid call's failure as
-#: terminal (media abandons a voice clip after one billed attempt) may keep
-#: retrying these - the billing boundary is the vendor taxonomy's to know, which
-#: is why this lives here and not with the caller.
-NEVER_BILLED = (openai.APIConnectionError, openai.RateLimitError)
+def never_billed(exc: BaseException) -> bool:
+    """Whether a failed call provably cost nothing: the request never left the
+    machine, or the vendor refused it before processing.
+
+    Callers that treat a paid call's failure as terminal (media abandons a voice
+    clip after one billed attempt) may keep retrying these. The billing boundary
+    is the vendor taxonomy's to know, which is why this lives here and not with
+    the caller - and the taxonomy has one trap: the SDK files its timeout under
+    the connection errors, but a timed-out request did reach the vendor, which
+    billed it on arrival, so it is a paid failure like any other.
+    """
+    return (isinstance(exc, (openai.APIConnectionError, openai.RateLimitError))
+            and not isinstance(exc, openai.APITimeoutError))
 
 
 #: What the SDK is handed when an endpoint checks no credential at all. It refuses an

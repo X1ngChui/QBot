@@ -40,7 +40,7 @@ PROMPT_KEYS = frozenset({
     # media and tools
     "describe_image",
     "tool_web_search", "tool_search_history", "tool_recall_events",
-    "tool_read_url", "tool_open_image",
+    "tool_read_url", "tool_open_images",
 })
 
 CONFIG_DIR = Path(os.getenv("CONFIG_DIR", "/app/config"))
@@ -119,6 +119,13 @@ class PromptCfg(_M):
     #: characters recorded only the chatter leading up to what was found.
     trace_result_chars: int = Field(1200, ge=100)
     trace_total_chars: int = Field(4000, ge=500)
+    #: Caps on the provenance marker appended to the bot's own archived line: how
+    #: many tool uses it names, and how much of each query survives. A record, not
+    #: a transcript - enough for a later turn to see what an answer rested on. The
+    #: query cap is set where a boolean expression survives whole (cut in half it
+    #: reads as a different search); it only guards against a runaway string.
+    provenance_items: int = Field(4, ge=1)
+    provenance_query_chars: int = Field(80, ge=20)
 
 
 class TriggerCfg(_M):
@@ -180,7 +187,7 @@ class TextUseCfg(_M):
 
     model: str = ""
     reasoning_effort: Effort | None = None
-    timeout_sec: float | None = None
+    timeout_sec: float | None = Field(None, gt=0)
 
 
 class TextCfg(_BackendCfg):
@@ -195,9 +202,9 @@ class TextCfg(_BackendCfg):
     #: Applied at startup only: the semaphore is built once, and resizing it under
     #: load would lose the permits already handed out. A change is logged and takes
     #: effect at the next start.
-    max_concurrency: int = 3
-    timeout_sec: float = 30.0
-    retries: int = 2
+    max_concurrency: int = Field(3, ge=1)
+    timeout_sec: float = Field(30.0, gt=0)
+    retries: int = Field(2, ge=0)
     #: Reading a batch of transcript into memory candidates - the same account and
     #: endpoint, a different task. It is schema-guarded and eval-covered, which is
     #: what makes it the one place a cheaper tier can measurably do the reply
@@ -224,7 +231,7 @@ class VisionCfg(_BackendCfg):
     capability = "vision"
     backend: str = "openai_compat"
     base_url: str
-    api_key_env: str = "MEDIA_API_KEY"
+    api_key_env: str = "TEXT_API_KEY"
     model: str
     #: Deliberation grade for the describing call. "low" keeps sanity-check thinking
     #: (what a meme actually shows) at a fraction of "high"'s thought-token bill.
@@ -240,17 +247,17 @@ class VisionCfg(_BackendCfg):
     #: they were written with; this decides what the *next* sighting reads.
     description_ttl_days: int = Field(15, ge=0)
     #: How long a stored file id - where the original was filed with the reply
-    #: model's backend - is trusted to still exist there. Past it, open_image
+    #: model's backend - is trusted to still exist there. Past it, open_images
     #: re-uploads instead of handing the model an id the vendor may have dropped,
-    #: which would fail the whole request the id rides in. Must stay under the
-    #: backend's own retention (the DeepSeek client sets 30 days).
-    file_max_age_days: int = Field(20, ge=1)
-    max_images_per_min: int = 6
+    #: which would fail the whole request the id rides in. Bounded below the
+    #: shortest retention any backend keeps files for (DeepSeek: 30 days).
+    file_max_age_days: int = Field(20, ge=1, le=29)
+    max_images_per_min: int = Field(6, ge=1)
     #: Bounds both halves of picture handling: the download that feeds the
     #: description call, and the upload that puts the original in front of the
     #: reply model.
-    max_image_mb: float = 8.0
-    timeout_sec: float = 30.0
+    max_image_mb: float = Field(8.0, gt=0)
+    timeout_sec: float = Field(30.0, gt=0)
 
 
 class AsrCfg(_BackendCfg):
@@ -266,13 +273,13 @@ class AsrCfg(_BackendCfg):
     model_dir: str = ""
     #: CPU threads for in-process decoding. Clips are short and rare; two threads
     #: keep a clip under a second without contending with the event loop's core.
-    threads: int = 2
-    max_audio_sec: int = 300
+    threads: int = Field(2, ge=1)
+    max_audio_sec: int = Field(300, ge=1)
     #: Transcription happens on arrival, so a burst of long clips spends real
     #: money before the daily cap can matter - the same reason pictures carry
     #: max_images_per_min. Clips are rarer, so the same number is generous.
-    max_clips_per_min: int = 6
-    timeout_sec: float = 60.0
+    max_clips_per_min: int = Field(6, ge=1)
+    timeout_sec: float = Field(60.0, gt=0)
 
 
 class SearchCfg(_BackendCfg):
@@ -292,7 +299,7 @@ class SearchCfg(_BackendCfg):
     #: from the deployment region directly. Empty means direct; model traffic never
     #: goes through this.
     proxy: str = ""
-    timeout_sec: float = 20.0
+    timeout_sec: float = Field(20.0, gt=0)
 
 
 class EmbeddingCfg(_BackendCfg):
@@ -307,7 +314,7 @@ class EmbeddingCfg(_BackendCfg):
     #: recall answering "nothing found" in the meantime.
     model: str
     dimensions: int = 2048
-    timeout_sec: float = 60.0
+    timeout_sec: float = Field(60.0, gt=0)
 
 
 class LlmCfg(_M):
@@ -372,9 +379,18 @@ class RetrievalCfg(_M):
     #: grow the next request past the model's context before money had a chance to
     #: bind. The rest of the round is answered with a note.
     max_tool_calls_per_round: int = Field(8, ge=1)
-    #: How many pictures one open_image call may fetch; each is a file block in the
+    #: How many pictures one open_images call may fetch; each is a file block in the
     #: next request.
-    open_image_max: int = Field(6, ge=1)
+    open_images_max: int = Field(6, ge=1)
+    #: How much of one search_history answer the model is handed. Hits are bounded
+    #: by count and each line by gateway.max_msg_len, but their product can still
+    #: outgrow the model's context, where the request fails outright rather than
+    #: degrading. A cut answer is told it was cut.
+    history_chars: int = Field(12000, ge=1000)
+    #: A tripwire on the tool loop, not a policy: money ends the loop, and only a
+    #: backend reporting zero cost could make a money-bounded loop unbounded. Past
+    #: this many rounds the reply is abandoned with an error in the log.
+    max_rounds: int = Field(20, ge=1)
 
 
 class MemoryCfg(_M):
@@ -510,8 +526,9 @@ class PredicateCfg(_M):
 
 
 class HalfLifeCfg(_M):
-    """Base half-lives in days, one per decay class. A fact loses confidence on this
-    clock unless its evidence is renewed."""
+    """Base lifetimes in days, one per decay class. A fact nothing has confirmed
+    for its base lifetime (stretched by how many distinct days supported it, up
+    to fourfold) is expired outright - see MemoryRepository.decay."""
 
     stable: float = Field(90.0, gt=0)
     default: float = Field(30.0, gt=0)

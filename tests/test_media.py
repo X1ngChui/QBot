@@ -18,7 +18,7 @@ from _stubs import FakeEmbedding
 
 #: One stub for every bundle in this suite.
 _EMBED = FakeEmbedding()
-from qqbot.core.media import MEDIA
+from qqbot.core.media import MEDIA, OVERSIZE, Unsettled, _mime
 from qqbot.core.segments import (AudioRef, ImageRef, ParsedMessage as _PMcls,
                                  parse_segments)
 from qqbot.providers import Providers, VisionModel, build_default, providers, set_providers
@@ -276,9 +276,36 @@ async def main():
     await MEDIA._bytes(_dead, bot=HangingBot(), max_bytes=1 << 20)
     check("and an unreadable picture is not retried for a while", HangingBot.calls == 1,
           str(HangingBot.calls))
+    # Two readers at once share one flight: the second must not spend the
+    # deadline again while the first is still finding out the picture is dead.
+    MEDIA._unreadable.clear()
+    HangingBot.calls = 0
+    _dead2 = ImageRef(slot=0, key="e" * 32, url="http://example/gone2.jpg", file="GONE2.jpg")
+    _pair = await asyncio.gather(
+        MEDIA._bytes(_dead2, bot=HangingBot(), max_bytes=1 << 20),
+        MEDIA._bytes(_dead2, bot=HangingBot(), max_bytes=1 << 20))
+    check("concurrent readers of one picture share a single fetch",
+          HangingBot.calls == 1 and _pair == [None, None], str(HangingBot.calls))
+    check("the flight registry is empty once the fetch ends", not MEDIA._fetching)
+    # An oversize picture is a verdict, not a failure: it is not marked unreadable.
+    async def too_big(url, max_bytes):
+        return OVERSIZE
+    MEDIA._fetch = too_big
+    _big = ImageRef(slot=0, key="d" * 32, url="http://example/big.jpg", file="BIG.jpg")
+    _got = await MEDIA._bytes(_big, bot=HangingBot(), max_bytes=1 << 20)
+    check("an oversize picture answers the sentinel and is not marked unreadable",
+          _got is OVERSIZE and "d" * 32 not in MEDIA._unreadable)
     MEDIA._unreadable.clear()
     MEDIA._fetch = _fetch3
     _gw.protocol_call_timeout_sec = _saved_to
+
+    check("mime sniffed from bytes beats the file name",
+          _mime(b"GIF89a....", "x.image") == "image/gif"
+          and _mime(b"\x89PNG\r\n", None) == "image/png"
+          and _mime(b"RIFF....WEBPVP8 ", "a.jpg") == "image/webp"
+          and _mime(b"\xff\xd8\xff", "a.png") == "image/jpeg")
+    check("mime falls back to the suffix, and .image means jpeg",
+          _mime(b"????", "a.image") == "image/jpeg" and _mime(b"????", "a.bmp") == "image/bmp")
 
     # Voice never takes the shortcut pictures take. The stored file (and the CDN
     # original) is SILK v3 wearing an .amr suffix, and SILK sent raw draws a
@@ -417,8 +444,14 @@ async def main():
     big = ImageRef(slot=0, key="b" * 32, url="http://x",
                    size=int(cfg.llm.vision.max_image_mb * 1024 * 1024) + 1)
     out = await MEDIA.describe_image(big, bot=bot, group_id="g", cfg=cfg)
-    check("oversized image skipped", out is None, str(out))
+    check("oversized image gets a terminal bare marker",
+          out == "⟦图片⟧" and not isinstance(out, Unsettled), repr(out))
     check("oversized image costs nothing", len(VISION_CALLS) == base)
+    _w = MEDIA._img_window("g", cfg.llm.vision.max_images_per_min)
+    _n = len(_w._hits) if hasattr(_w, "_hits") else None
+    await MEDIA.describe_image(big, bot=bot, group_id="g", cfg=cfg)
+    check("oversized image spends no rate-window slot",
+          _n is None or len(_w._hits) == _n, str(_n))
 
     # per-minute image cap
     cfg.llm.vision.max_images_per_min = 2

@@ -53,7 +53,7 @@ LOG_LINES_DEFAULT = 15
 LOG_LINES_MAX = 60
 #: Enough tail to hold LOG_LINES_MAX lines of any plausible length.
 LOG_TAIL_BYTES = 64 * 1024
-#: How many people one /who all lists in full before it is trimmed to fit.
+#: How many people the bare /who roster lists in full before it is trimmed to fit.
 ROSTER_MAX = 60
 
 #: Prefix that marks an argument as a removal rather than an addition.
@@ -104,21 +104,20 @@ async def _gate(matcher: Matcher, event: GroupMessageEvent,
     event.sender.role is deliberately not consulted. Running the QQ group is not running
     the bot.
     """
-    owners = (config().default.owners if global_only
-              else config().for_group(str(event.group_id))[0].owners)
-    if perms.is_owner(str(event.user_id), owners):
+    gid, uid = str(event.group_id), str(event.user_id)
+    # The decision table is perms.decide, a pure function tested on its own; this
+    # wrapper only supplies the owner lists and, when the verdict asks for it,
+    # whether the member has accepted the user agreement.
+    verdict = perms.decide(
+        uid, owners=config().for_group(gid)[0].owners,
+        global_owners=config().default.owners, global_only=global_only,
+        self_serve=self_serve, open_to_members=open_to_members,
+        pre_agreement=pre_agreement)
+    if verdict is perms.Verdict.OWNER:
         return True
-    if (self_serve or open_to_members) and not global_only:  # noqa: SIM102
-        # Kept nested: folded into one condition the test below would be a
-        # four-term boolean, and the note explaining it would no longer sit
-        # against the clause it explains.
-        # The member surface opens only past the user agreement; before it the
-        # only commands that exist are /agree and /terms (their handlers set
-        # pre_agreement - consenting needs both the pen and the document).
-        # Same silence as any other refusal.
-        if pre_agreement or await agreement.ok(str(event.group_id),
-                                               str(event.user_id)):
-            return False
+    if verdict is perms.Verdict.MEMBER or (
+            verdict is perms.Verdict.MEMBER_IF_AGREED and await agreement.ok(gid, uid)):
+        return False
     await matcher.finish()
     return False  # unreachable; finish() raises
 
@@ -723,6 +722,8 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
         try:
             conf = float(value.strip())
         except ValueError:
+            conf = -1.0
+        if not 0.0 <= conf <= 1.0:
             await _finish(matcher, "置信度需为 0 到 1 的数字，例如：/alias @某人 阿明=0.6")
             return
         if not name:
@@ -801,6 +802,10 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     loser, winner = at[0], at[1]
     if loser == winner:
         await _finish(matcher, "这是同一个账号。")
+    if str(event.self_id) in (loser, winner):
+        # The bot has no person of its own to fold anyone into: merged with a
+        # member, its id would follow that person into every block and roster.
+        await _finish(matcher, "这是我自己。")
     try:
         changed = await directory().merge(loser, winner)
     except UnknownAccount as e:
@@ -837,6 +842,8 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     at = _mentioned(event)
     if not at:
         await _finish(matcher, "要拆分哪个账号？用法：/split @某人")
+    if at[0] == str(event.self_id):
+        await _finish(matcher, "这是我自己。")
     try:
         await directory().split(at[0])
     except UnknownAccount as e:

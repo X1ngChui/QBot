@@ -52,8 +52,9 @@ CREATE INDEX IF NOT EXISTS raw_event_group_time
 CREATE INDEX IF NOT EXISTS raw_event_speaker
     ON raw_event (group_id, platform_user_id, occurred_at DESC);
 -- unread_since_extract filters on created_at (the ingest watermark), which the
--- occurred_at indexes cannot serve: without this the count is a full-group scan,
--- paid synchronously on every incoming message, over a table that only ever grows.
+-- occurred_at indexes cannot serve: without this the count (read by /stats,
+-- /groupstats and every worker pass) is a full-group scan over a table that only
+-- ever grows.
 CREATE INDEX IF NOT EXISTS raw_event_group_created
     ON raw_event (group_id, created_at)
     WHERE event_type = 'message';
@@ -404,7 +405,7 @@ CREATE TABLE IF NOT EXISTS image_cache (
     -- exists from whichever write happens first.
     description TEXT        NOT NULL DEFAULT '',
     -- Where the reply model's backend filed the original picture (Files API), and
-    -- when. The open_image tool hands the id to the model so it reads the pixels;
+    -- when. The open_images tool hands the id to the model so it reads the pixels;
     -- NULL when never uploaded. The backend drops files after its own retention, so
     -- an id older than llm.vision.file_max_age_days is treated as gone and the
     -- picture is uploaded again rather than cited by a dead id.

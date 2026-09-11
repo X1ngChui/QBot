@@ -170,7 +170,8 @@ async def main() -> int:
 
     # ---- candidates -------------------------------------------------------
     cand = Candidate(candidate_type=CandidateType.ALIAS, payload={"alias": "狗王"},
-                     group_id=GROUP_A, source_event_id=ev_id, confidence=0.3)
+                     group_id=GROUP_A, source_event_id=ev_id, confidence=0.3,
+                     batch_size=1)
     await mem.stage([cand])
     check("候选进的是候选表", len(await mem.pending(GROUP_A)) == 1)
     await mem.settle(cand.rejected(RejectReason.AMBIGUOUS_ALIAS))

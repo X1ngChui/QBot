@@ -155,9 +155,9 @@ class MemoryRepository:
                     # at 1.0 and must not be argued down by arithmetic.
                     counts = await conn.fetchrow(
                         """SELECT
-                             count(DISTINCT COALESCE(raw_event_id::text, id::text))
+                             count(DISTINCT raw_event_id)
                                FILTER (WHERE relation='supports') AS r,
-                             count(DISTINCT COALESCE(raw_event_id::text, id::text))
+                             count(DISTINCT raw_event_id)
                                FILTER (WHERE relation='contradicts') AS s
                             FROM memory_fact_evidence WHERE fact_id=$1""",
                         prev["id"],
@@ -248,14 +248,19 @@ class MemoryRepository:
         """
         rows = await pool().fetch(
             """WITH support AS (
-                   -- Days bucket in the configured zone, like the analogous alias
+                   -- Days are counted by when the supporting messages were SENT, not
+                   -- when their evidence was written: a drain that reads several days
+                   -- at once writes all of it in one transaction, and by write time
+                   -- a fact restated every day for a week would count as one day.
+                   -- Bucketed in the configured zone, like the analogous alias
                    -- stability count: bare ::date buckets in the session zone (UTC
                    -- here), where an evening conversation straddling local midnight
                    -- counts as two days of support and evening-heavy traffic
                    -- systematically inflates the lifetime multiplier.
                    SELECT f.id,
-                          GREATEST(count(DISTINCT (e.created_at AT TIME ZONE $8)::date),
-                                   1) AS days,
+                          GREATEST(count(DISTINCT
+                                     (COALESCE(r.occurred_at, e.created_at)
+                                      AT TIME ZONE $8)::date), 1) AS days,
                           CASE WHEN f.predicate = ANY($2::text[])
                                  THEN $4::float
                                WHEN f.predicate = ANY($3::text[])
@@ -264,6 +269,7 @@ class MemoryRepository:
                      FROM memory_fact f
                      LEFT JOIN memory_fact_evidence e
                             ON e.fact_id = f.id AND e.relation = 'supports'
+                     LEFT JOIN raw_event r ON r.id = e.raw_event_id
                     WHERE f.group_id = $1 AND f.status = 'active' AND f.valid_to IS NULL
                       AND NOT (f.predicate = ANY($7::text[]))
                     GROUP BY f.id, f.predicate

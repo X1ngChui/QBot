@@ -411,6 +411,20 @@ async def main():
     check("and survives into a rebuilt window",
           any(m.text.startswith("阿强：住在苏州") and m.is_bot
               for m in st_rebuilt.recent))
+    # A line that reached the window before the first chat message (a command's
+    # answer after a deploy) must not stand in for the whole archive: the rebuild
+    # merges behind it rather than skipping.
+    from qqbot.core.state import ChatMsg as _CMsg
+    st_early = GroupState(group_id=str(G1))
+    st_early.add(_CMsg(msg_id="cmd-early", user_id="999", nickname="小X",
+                         text="（控制台回答）", ts=now_local(), is_bot=True))
+    await st_early.load_history(self_id="999", owners=set())
+    _ids_early = [m.msg_id for m in st_early.recent]
+    check("a window seeded before the rebuild still gets the archive",
+          "收到了" in [m.text for m in st_early.recent] and "cmd-early" in _ids_early,
+          str(len(_ids_early)))
+    check("and the early line stays newest, after the archived ones",
+          _ids_early[-1] == "cmd-early")
     _REG._groups.pop(str(G1), None)
 
     # -- the archive, searched ----------------------------------------------
