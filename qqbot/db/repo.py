@@ -7,6 +7,7 @@ read side) live in `qqbot.repositories`; a handful of hot-path readers
 
 from __future__ import annotations
 
+import uuid
 from datetime import date, timedelta
 
 from ..settings import config
@@ -498,6 +499,29 @@ async def member_of_seq(group_id: int, seq: int) -> str | None:
     return await pool().fetchval(
         "SELECT platform_user_id FROM member_seq WHERE group_id=$1 AND seq=$2",
         group_id, seq)
+
+
+async def person_of_accounts(user_ids: list[str]) -> dict[str, uuid.UUID]:
+    """Which person each account belongs to, for the accounts the identity layer
+    knows. A merge repoints every account of the loser, so equal ids here mean one
+    person; an account absent from the answer has never spoken anywhere."""
+    want = sorted({u for u in user_ids if u})
+    if not want:
+        return {}
+    rows = await pool().fetch(
+        """SELECT platform_user_id, entity_id FROM identity_account
+            WHERE platform='qq' AND platform_user_id = ANY($1::text[])""", want)
+    return {r["platform_user_id"]: r["entity_id"] for r in rows}
+
+
+async def accounts_sharing_person(user_id: str) -> list[str]:
+    """Every account of the person this one belongs to, itself included."""
+    rows = await pool().fetch(
+        """SELECT b.platform_user_id FROM identity_account a
+             JOIN identity_account b ON b.entity_id = a.entity_id AND b.platform = 'qq'
+            WHERE a.platform='qq' AND a.platform_user_id=$1""", user_id)
+    found = [r["platform_user_id"] for r in rows]
+    return found if user_id in found else [*found, user_id]
 
 
 async def muted_groups() -> list[int]:

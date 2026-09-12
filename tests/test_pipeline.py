@@ -1344,6 +1344,39 @@ async def main():
         "SELECT plain_text FROM raw_event WHERE platform_event_id=$1", _pv_line.msg_id)
     check("and so does the archive",
           "⟦依据:搜索“明天 天气”⟧" in (_pv_row or ""), repr(_pv_row))
+
+    # A reply that quotes and @s its asker is remembered the way the group read
+    # it, "@asker" first - that opening is what tells a later turn whom each of
+    # the bot's own answers was for. A model that writes the @ itself (the
+    # history now shows one) is not sent out doubled.
+    class AtText(FakeText):
+        async def chat(self, messages, *, cfg, tools=None, max_tokens=None,
+                       effort=None, kind="reply", group_id=None):
+            LLM_CALLS.append({"kind": kind, "messages": messages, "tools": tools,
+                              "effort": effort, "max_tokens": max_tokens,
+                              "grade": cfg.reasoning_effort, "timeout": cfg.timeout_sec})
+            return ChatResult(text="@阿强 明天多云", model=self.MODEL)
+
+    bot.members.append({"user_id": "u1", "card": "阿强", "nickname": "aq"})
+    from qqbot.core.members import MEMBERS as _MEMpv
+    _MEMpv.forget("123")
+    set_providers(Providers(text=AtText(), vision=UnusedVision(),
+                            asr=UnusedAsr(), embedding=_EMBED, search=EndlessSearch()))
+    ok_at = await _eng.respond(
+        bot=bot, st=st_pv, cfg=cfg, persona=config().for_group("123")[1],
+        msg=_CM0(msg_id="pv-at", user_id="u1", nickname="阿强",
+                 text="后天呢", ts=_nl0()),
+        reply_to="pv-at", initiator="u1")
+    check("a model-written @ of the asker is taken off before the send adds its own",
+          ok_at and bot.sent[-1][1] == "明天多云" and bot.ats[-1] == "u1",
+          str(bot.sent[-1:]))
+    check("the window remembers the answer with its addressee",
+          st_pv.recent[-1].is_bot and st_pv.recent[-1].text == "@阿强 明天多云",
+          repr(st_pv.recent[-1].text))
+    _at_row = await pool().fetchval(
+        "SELECT plain_text FROM raw_event WHERE platform_event_id=$1",
+        st_pv.recent[-1].msg_id)
+    check("and so does the archive", _at_row == "@阿强 明天多云", repr(_at_row))
     check("an imitated provenance marker never reaches the group",
           _cr("明天多云 ⟦依据:搜索“天气”⟧") == "明天多云",
           repr(_cr("明天多云 ⟦依据:搜索“天气”⟧")))
@@ -1638,6 +1671,40 @@ async def main():
     named = await _MEM18.names_of(bot, "123", ["u31", "u32"])
     check("re-clashing restores the very same serials", named == first,
           f"{named} vs {first}")
+    # One person under two same-named accounts is not two namesakes: after a
+    # merge the pair goes bare, and a third, unrelated namesake gets a tag of
+    # their own while the pair shares one.
+    bot.members += [{"user_id": "u41", "card": "王大锤", "nickname": "a"},
+                    {"user_id": "u42", "card": "王大锤", "nickname": "b"}]
+    await seed(123, "u41", "王大锤", text="大号在此")
+    await seed(123, "u42", "王大锤", text="小号在此")
+    await _retr.directory().merge("u42", "u41")
+    _MEM18.forget("123")
+    named = await _MEM18.names_of(bot, "123", ["u41", "u42"])
+    check("a merged main and alt sharing a name wear no tag",
+          named.get("u41") == "王大锤" and named.get("u42") == "王大锤", str(named))
+    bot.members.append({"user_id": "u43", "card": "王大锤", "nickname": "c"})
+    _MEM18.forget("123")
+    named = await _MEM18.names_of(bot, "123", ["u41", "u42", "u43"])
+    check("a third, unrelated namesake is told apart from the pair, who share one tag",
+          named["u41"] == named["u42"] and named["u41"].startswith("王大锤⟦同名")
+          and named["u43"].startswith("王大锤⟦同名") and named["u43"] != named["u41"],
+          str(named))
+    for r in list(bot.members):
+        if r["user_id"] == "u43":
+            bot.members.remove(r)
+    # A namesake who has left keeps the name their lines arrived with; when a
+    # live member carries it too, both sides are tagged, or the bare live name
+    # reads as the departed account.
+    _MEM18.forget("123")
+    _gone = _CM0(msg_id="ns-gone", user_id="u99", nickname="张伟", text="我先走了",
+                 ts=_nl0())
+    _here = _CM0(msg_id="ns-here", user_id="u31", nickname="张伟", text="我还在",
+                 ts=_nl0())
+    await _MEM18.relabel(bot, "123", [_gone, _here])
+    check("a departed namesake and the live one are both tagged",
+          _gone.nickname.startswith("张伟⟦同名") and _here.nickname.startswith("张伟⟦同名")
+          and _gone.nickname != _here.nickname, f"{_gone.nickname} / {_here.nickname}")
     line18 = _CM0(msg_id="ns-1", user_id="u31", nickname="张伟",
                   text="改锥在我这", ts=_nl0())
     n18 = await _MEM18.relabel(bot, "123", [line18])
@@ -1673,6 +1740,18 @@ async def main():
           "借给阿强" in got and "没见过" not in got, got)
     # A serial that resolves to nobody falls back to the name half rather than a
     # pattern nothing can match.
+    # Search results spell namesakes the way the window does, and mark the
+    # bot's own archived lines as its own rather than as some member's.
+    _rcfg18.history_context = 0
+    got_tags = await _tools.search_history(123, "改锥", rcfg=_rcfg18)
+    _rcfg18.history_context = _ctx18
+    check("search results tag both namesakes",
+          got_tags.count("张伟⟦同名") >= 2
+          and len({ln.split(": ", 1)[0] for ln in got_tags.splitlines() if "张伟" in ln}) >= 2,
+          got_tags)
+    got_own = await _tools.search_history(123, "明天多云", self_id="999")
+    check("the bot's own archived line wears the self tag in search results",
+          "⟦你⟧: " in got_own, got_own)
     got_nb = await _tools.search_history(123, "改锥", speaker="张伟⟦同名999999⟧")
     check("an unresolvable namesake serial falls back to the name",
           "借给阿强" in got_nb or "没见过" in got_nb, got_nb)

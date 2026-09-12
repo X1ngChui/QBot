@@ -20,19 +20,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import time
 
-from ..db import repo
 from ..settings import config
-from ..util import SYS_L, SYS_R, display_name, namesake_tag, why
+from ..util import display_name, why
+from . import namesakes
 from .botapi import BotApi
 
 log = logging.getLogger("qqbot.members")
-
-#: The namesake tag the fetch appends to a clashing member's name.
-_NAMESAKE_TAG = re.compile(rf"{re.escape(SYS_L)}同名\d{{1,9}}{re.escape(SYS_R)}$")
-
 
 class MemberDirectory:
     def __init__(self) -> None:
@@ -89,35 +84,22 @@ class MemberDirectory:
                     table[qq] = name
             self._raw_by_group[group_id] = dict(table)
             # Two members sharing one display name is ordinary, and a name is
-            # all the model ever sees - so each clashing member's entry becomes
-            # name(N), with N the group's permanent serial for that account
-            # (member_seq: never reused, never reassigned, so a suffixed name
-            # keeps meaning the same person in every transcript that carried
-            # it). This runs on every refresh, which is what tracks renames:
-            # a new clash gains suffixes, a dissolved one loses them. Every
-            # reader of current names sits behind this table - relabel, the
-            # roster's live names, @-resolution, the notice lines - so live
-            # names are numbered only here (the roster keeps its own pass for
-            # rows falling back to archived names). A numbering failure
+            # all the model ever sees - so a clashing member's entry wears the
+            # namesake tag (core.namesakes: permanent serials, one per person,
+            # none between a person's own accounts). The tag wears the system
+            # brackets, which a card cannot contain: in parentheses it would be
+            # indistinguishable from a member whose literal card ends in "(3)".
+            # This runs on every refresh, which is what tracks renames: a new
+            # clash gains tags, a dissolved one loses them. Every reader of
+            # current names sits behind this table - relabel, the roster's live
+            # names, @-resolution, the notice lines. A numbering failure
             # degrades to bare names rather than losing the fetch.
-            names: dict[str, list[str]] = {}
-            for qq, name in table.items():
-                names.setdefault(name, []).append(qq)
-            clashing = sorted(
-                q for qqs in names.values() if len(qqs) > 1 for q in qqs)
-            if clashing:
-                try:
-                    seqs = await repo.member_seqs(int(group_id), clashing)
-                    for qq in clashing:
-                        if qq in seqs:
-                            # The namesake tag wears the system brackets, which a
-                            # card cannot contain: in parentheses it would be
-                            # indistinguishable from a member whose literal card
-                            # ends in "(3)".
-                            table[qq] = table[qq] + namesake_tag(seqs[qq])
-                except Exception as e:
-                    log.warning("group %s: namesake numbering unavailable, "
-                                "names stay bare: %s", group_id, why(e))
+            try:
+                for qq, tag in (await namesakes.tags(int(group_id), table)).items():
+                    table[qq] = table[qq] + tag
+            except Exception as e:
+                log.warning("group %s: namesake numbering unavailable, "
+                            "names stay bare: %s", group_id, why(e))
             self._by_group[group_id] = table
             self._missing.pop(group_id, None)
             self._fetched[group_id] = time.monotonic()
@@ -193,17 +175,33 @@ class MemberDirectory:
         Returns how many lines changed name. A line from a namesake arrives carrying the
         bare card and gains its tag here on every message; that is this render step
         doing its job, so a changed tag alone is applied without being counted.
+
+        A member no longer in the group keeps the name their lines arrived with -
+        but when that name is a live member's too, both sides are tagged: the live
+        table alone sees no clash once one namesake leaves or renames, and a bare
+        name beside a tagged one reads as the same account.
         """
         ids = {m.user_id for m in msgs if not m.is_bot and m.user_id}
         if not ids:
             return 0
         live = await self.names_of(bot, group_id, list(ids))
+        raw = await self.raw_names_of(bot, group_id, list(ids))
+        gone = {m.user_id: namesakes.bare(m.nickname) for m in msgs
+                if not m.is_bot and m.user_id and m.user_id not in raw}
+        if gone and set(gone.values()) & set(raw.values()):
+            try:
+                tags = await namesakes.tags(int(group_id), {**raw, **gone})
+                live = {u: raw[u] + tags.get(u, "") for u in raw}
+                live.update({u: n + tags.get(u, "") for u, n in gone.items()})
+            except Exception as e:
+                log.warning("group %s: namesake numbering unavailable, "
+                            "names stay bare: %s", group_id, why(e))
         renamed = 0
         for m in msgs:
             new = live.get(m.user_id)
             if not new or m.is_bot or new == m.nickname:
                 continue
-            if _NAMESAKE_TAG.sub("", new) != _NAMESAKE_TAG.sub("", m.nickname):
+            if namesakes.bare(new) != namesakes.bare(m.nickname):
                 renamed += 1
             m.nickname = new
         if renamed:

@@ -53,9 +53,9 @@ rather than accumulate as flags. Adding one is: write the subclass, add a line t
   and left alone; the bot never speaks uninvited. Group notices - joins,
   leaves, recalls, bans, pokes - are transcribed as bracketed lines into the
   window and archive, and never draw a reply. Members sharing a display name
-  render apart under a reserved namesake tag, N a permanent per-group serial (`member_seq`);
-  renames dissolve and restore the suffix on the next member-list refresh,
-  never the number.
+  render apart under a reserved namesake tag, N a permanent per-group serial (`member_seq`),
+  one per person (a merged main and alt share it); renames dissolve and restore
+  the tag on the next member-list refresh, never the number.
 - **Replies require consent.** A member who has not accepted the user agreement
   gets a one-line pointer instead of a reply, at most once per cooldown:
   `/terms` shows the full text, `/agree` records acceptance permanently, per

@@ -24,7 +24,7 @@ from ..providers.base import QuotaExhausted
 from ..settings import RetrievalCfg, Settings, config, ptext
 from ..util import (SYS_L, SYS_R, defang, display_name, fmt_when, merge_overlapping,
                     sysmark, why)
-from . import retrieval
+from . import namesakes, retrieval
 from .botapi import BotApi
 from .media import MEDIA
 
@@ -244,7 +244,8 @@ def _condition(node, params: list, offset: int) -> str:
 
 
 async def search_history(group_id: int, query: str, *, speaker: str | None = None,
-                         days: int | None = None, rcfg: RetrievalCfg | None = None) -> str:
+                         days: int | None = None, rcfg: RetrievalCfg | None = None,
+                         self_id: str | None = None) -> str:
     """The archive, searched. Free - one SQL query, no model involved.
 
     The query is a boolean expression (_parse_query): juxtaposition is AND -
@@ -259,10 +260,15 @@ async def search_history(group_id: int, query: str, *, speaker: str | None = Non
 
     `speaker` narrows to one person's lines by display name - "what did X say about Y"
     is unanswerable with keywords alone, which match everyone who mentioned X. A name,
-    not an account id: names are all the model ever sees. The numbered form the prompt
-    shows for namesakes - name(N) - is accepted too: the serial maps to exactly one
-    account, where the name half would match both people. `days` narrows to the recent
-    past the same way.
+    not an account id: names are all the model ever sees. The tagged form the prompt
+    shows for namesakes is accepted too: the serial maps to one person - every
+    account of theirs - where the name half would match both people. `days` narrows
+    to the recent past the same way.
+
+    Lines render with the same namesake tags the window shows (core.namesakes), and
+    the bot's own lines - archived under the persona's name - wear the self tag, so
+    what it said earlier is not read as some member's statement. `self_id` is the
+    bot's account; without it, own lines render like anyone's.
 
     Each hit comes wrapped in its surrounding lines (retrieval.history_context each
     way): chat is written in fragments, and the matched line is routinely a bare
@@ -306,11 +312,13 @@ async def search_history(group_id: int, query: str, *, speaker: str | None = Non
             # is system notation nobody's card contains, so left in the pattern
             # it could only ever match nothing.
             sp = m.group(1).strip()
+    # A serial names a person, and a person may hold several accounts here.
+    uids = await repo.accounts_sharing_person(uid) if uid is not None else None
     # The condition string holds only this module's own connectives and ILIKE
     # placeholders numbered past the five fixed parameters; the member's words
     # travel in `terms`, never in SQL text.
     rows = await pool().fetch(
-        f"""SELECT id, occurred_at, payload, plain_text FROM raw_event
+        f"""SELECT id, occurred_at, payload, plain_text, platform_user_id FROM raw_event
             WHERE group_id=$1 AND event_type='message'
               AND {cond}
               AND ($3::text IS NULL
@@ -318,21 +326,21 @@ async def search_history(group_id: int, query: str, *, speaker: str | None = Non
                    OR payload->'sender'->>'nickname' ILIKE $3)
               AND ($4::int IS NULL
                    OR occurred_at >= NOW() - make_interval(days => $4))
-              AND ($5::text IS NULL OR platform_user_id = $5)
+              AND ($5::text[] IS NULL OR platform_user_id = ANY($5::text[]))
             ORDER BY occurred_at DESC, id DESC LIMIT $2""",
         group_id, rcfg.history_hits,
         _like(sp) if sp and uid is None else None,
         days if days and days > 0 else None,
-        uid,
+        uids,
         *terms,
     )
     if not rows:
         return "（存档里没有搜到）"
     ctx = max(0, rcfg.history_context)
     if not ctx:
-        text = "\n".join(_history_line(r) for r in reversed(rows))
+        text = _render_lines(list(reversed(rows)), await _tags_for(group_id, rows), self_id)
     else:
-        text = await _with_context(group_id, [r["id"] for r in rows], ctx)
+        text = await _with_context(group_id, [r["id"] for r in rows], ctx, self_id)
     if len(text) > rcfg.history_chars:
         # Cut at a line boundary so no message is shown half-said.
         head = text[:rcfg.history_chars]
@@ -341,22 +349,48 @@ async def search_history(group_id: int, query: str, *, speaker: str | None = Non
     return text
 
 
-def _history_line(r) -> str:
-    payload = r["payload"] or {}
-    sender = payload.get("sender") or {}
-    # The name is defanged on render: rows filed before names were neutralized at
-    # ingest can carry anything. The text is left as stored - its markers are
-    # system writing, and defanging would destroy them.
-    who = display_name(sender.get("card"), sender.get("nickname"), "?")
+def _who(r) -> str:
+    """The archived speaker's bare display name. Defanged on render: rows filed
+    before names were neutralized at ingest can carry anything."""
+    sender = (r["payload"] or {}).get("sender") or {}
+    return display_name(sender.get("card"), sender.get("nickname"), "成员")
+
+
+async def _tags_for(group_id: int, rows: list) -> dict[str, str]:
+    """Namesake tags over every row one answer shows, so two accounts sharing a
+    name are told apart wherever in the answer they fall."""
+    names = {str(r["platform_user_id"] or ""): _who(r) for r in rows}
+    try:
+        return await namesakes.tags(group_id, names)
+    except Exception as e:
+        log.warning("group %s: search namesake numbering unavailable: %s",
+                    group_id, why(e))
+        return {}
+
+
+def _render_lines(rows: list, tags: dict[str, str], self_id: str | None) -> str:
+    """Archive rows as transcript lines, in the order given."""
+    return "\n".join(_history_line(r, tags, self_id) for r in rows)
+
+
+def _history_line(r, tags: dict[str, str], self_id: str | None) -> str:
+    uid = str(r["platform_user_id"] or "")
+    who = _who(r) + tags.get(uid, "")
+    if self_id and uid == self_id:
+        # The same self tag the extraction transcript wears: the line is archived
+        # under the persona's name, which reads as a member's otherwise.
+        who += sysmark("你")
     # The message whole. What a search is for is the substance of what was said, and
-    # the archive's long messages are where that lives.
+    # the archive's long messages are where that lives. The text is left as stored -
+    # its markers are system writing, and defanging would destroy them.
     text = (r["plain_text"] or "").strip()
     # fmt_when, not strftime on the raw value: asyncpg returns timestamptz in UTC,
     # and a UTC wall time here would disagree with every stamp in the history window.
     return f"{sysmark(fmt_when(r['occurred_at']))} {who}: {text}"
 
 
-async def _with_context(group_id: int, hit_ids: list, ctx: int) -> str:
+async def _with_context(group_id: int, hit_ids: list, ctx: int,
+                        self_id: str | None = None) -> str:
     """The hits rendered inside their surrounding conversation.
 
     One query fetches, per hit, the ctx archive lines on either side of it (by
@@ -368,16 +402,19 @@ async def _with_context(group_id: int, hit_ids: list, ctx: int) -> str:
     lines.
     """
     nrows = await pool().fetch(
-        """SELECT h.id AS hit, n.id, n.occurred_at, n.payload, n.plain_text
+        """SELECT h.id AS hit, n.id, n.occurred_at, n.payload, n.plain_text,
+                  n.platform_user_id
              FROM unnest($2::uuid[]) AS h(id)
              JOIN raw_event he ON he.id = h.id
             CROSS JOIN LATERAL (
-              (SELECT id, occurred_at, payload, plain_text FROM raw_event
+              (SELECT id, occurred_at, payload, plain_text, platform_user_id
+                 FROM raw_event
                 WHERE group_id=$1 AND event_type='message'
                   AND (occurred_at, id) <= (he.occurred_at, he.id)
                 ORDER BY occurred_at DESC, id DESC LIMIT $3)
               UNION ALL
-              (SELECT id, occurred_at, payload, plain_text FROM raw_event
+              (SELECT id, occurred_at, payload, plain_text, platform_user_id
+                 FROM raw_event
                 WHERE group_id=$1 AND event_type='message'
                   AND (occurred_at, id) > (he.occurred_at, he.id)
                 ORDER BY occurred_at ASC, id ASC LIMIT $4)
@@ -393,12 +430,12 @@ async def _with_context(group_id: int, hit_ids: list, ctx: int) -> str:
     def order(rid):
         return by_id[rid]["occurred_at"], by_id[rid]["id"]
 
-    lines: list[str] = []
+    tags = await _tags_for(group_id, list(by_id.values()))
+    parts: list[str] = []
     for b in sorted(blocks, key=lambda b: min(order(rid) for rid in b)):
-        if lines:
-            lines.append("……")
-        lines.extend(_history_line(by_id[rid]) for rid in sorted(b, key=order))
-    return "\n".join(lines)
+        rows = [by_id[rid] for rid in sorted(b, key=order)]
+        parts.append(_render_lines(rows, tags, self_id))
+    return "\n……\n".join(parts)
 
 
 def render_results(items: list[dict]) -> str:
@@ -601,6 +638,7 @@ async def execute(call: dict, *, cfg: Settings, group_id: str,
                 speaker=_text(args, "speaker") or None,
                 days=_days(args.get("days")),
                 rcfg=cfg.retrieval,
+                self_id=str(getattr(ctx.bot, "self_id", "") or "") if ctx else None,
             )
         except QuotaExhausted:
             raise

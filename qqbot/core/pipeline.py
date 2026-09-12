@@ -29,7 +29,7 @@ from ..db import repo
 from ..gateway.ingest import ingestor
 from ..gateway.onebot import GroupMessage, Sender
 from ..settings import Settings, config
-from ..util import cut_text, defang, now_local, sysmark, tz, why
+from ..util import cut_text, display_name, now_local, sysmark, tz, why
 from . import agreement, engine, perms, prompt, trigger
 from .botapi import BotApi
 from .budget import BUDGET
@@ -45,19 +45,23 @@ log = logging.getLogger("qqbot.pipeline")
 
 async def note_console_reply(*, group_id: str | int, self_id: str, text: str,
                              message_id: str = "", reply_to: str = "",
-                             name: str = "") -> None:
+                             name: str = "", addressee: str = "") -> None:
     """A command's answer, entered into the window and the archive like any
     other line the bot speaks.
 
     Off the record, /who's card or /stats' table would land in the group but reach
     neither the window nor L0, and the next question about it ("what does that note
     mean?") would meet a model that had never seen it - the one speaker in the room
-    whose words vanish. Both writes mirror the engine's own send path. A missing
-    platform id falls back to a synthetic one, which costs only the quote-pointer
-    render if someone replies to that exact message.
+    whose words vanish. Both writes mirror the engine's own send path, the
+    "@asker" opening included (`addressee` is the asker's display name): it is
+    what the group read, and what tells a later turn whom the answer was for. A
+    missing platform id falls back to a synthetic one, which costs only the
+    quote-pointer render if someone replies to that exact message.
     """
     now = now_local()
     mid = message_id or f"cmd-{uuid.uuid4().hex[:12]}"
+    if addressee:
+        text = f"@{addressee} {text}"
     if (st := REGISTRY.loaded(str(group_id))) is not None:
         st.add(ChatMsg(msg_id=mid, user_id=str(self_id), nickname=name,
                        text=text, ts=now, is_bot=True, reply_to=reply_to or None))
@@ -190,8 +194,10 @@ class Gateway:
         sender = event.sender
         # The reply path reads the live event, not gateway.Sender - so it defangs
         # here, in step with Sender.parse doing the same for the archived copy.
-        nickname = defang(getattr(sender, "card", "")
-                           or getattr(sender, "nickname", "") or user_id).strip()
+        # A sender with neither card nor nickname is shown by the generic member
+        # word, never as the bare account number the prompt is told it will not see.
+        nickname = display_name(getattr(sender, "card", ""),
+                                getattr(sender, "nickname", ""), "成员")
 
         # The event's own timestamp when it carries one, so the line's [MM-dd HH:mm]
         # stamp and the archive's occurred_at agree - late-delivered messages after

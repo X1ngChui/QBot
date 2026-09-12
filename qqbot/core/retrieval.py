@@ -21,9 +21,10 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
-from ..db import pool, repo
+from ..db import pool
 from ..settings import config
-from ..util import defang, merge_overlapping, namesake_tag, sysmark, why
+from ..util import defang, merge_overlapping, sysmark, why
+from . import namesakes
 from ..repositories import (
     EpisodeRepository, EventRepository, IdentityRepository, JobQueue,
     MemoryRepository, VectorRepository,
@@ -145,27 +146,21 @@ async def gather(*, group_id: str, bot=None) -> list[dict]:
             "manual_note": c.note,
             "msg_count": c.messages,
         })
-    # Live names arrive already told apart (members.py numbers clashing cards),
+    # Live names arrive already told apart (members.py tags clashing cards),
     # but a row can still show an archived name - somebody who left, or a member
-    # fetch that failed - and clash with another row's. Number whatever still
-    # collides, by the account the row shows; the serials are permanent, so the
+    # fetch that failed - and clash with another row's. Tag whatever still
+    # collides by the same rule (core.namesakes), so the roster and the
+    # transcript spell one member one way; the serials are permanent, so the
     # rendering is deterministic and the stamp cache stays coherent.
-    by_name: dict[str, list[dict]] = {}
-    for row in out:
-        by_name.setdefault(row["nickname"], []).append(row)
-    clashing = [r for rows in by_name.values() if len(rows) > 1 for r in rows]
-    if clashing:
-        try:
-            seqs = await repo.member_seqs(
-                gid, [str(r["user_id"]) for r in clashing])
-            for row in clashing:
-                if s := seqs.get(str(row["user_id"])):
-                    # The same reserved namesake tag members.py renders, so the
-                    # roster and the transcript spell one member one way.
-                    row["nickname"] = row["nickname"] + namesake_tag(s)
-        except Exception as e:
-            log.warning("group %s: roster namesake numbering unavailable: %s",
-                        group_id, why(e))
+    try:
+        tags = await namesakes.tags(
+            gid, {str(r["user_id"]): namesakes.bare(r["nickname"]) for r in out})
+        for row in out:
+            if tag := tags.get(str(row["user_id"])):
+                row["nickname"] = namesakes.bare(row["nickname"]) + tag
+    except Exception as e:
+        log.warning("group %s: roster namesake numbering unavailable: %s",
+                    group_id, why(e))
     _CACHE[group_id] = (stamp, out, speakers)
     return out
 

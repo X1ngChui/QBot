@@ -241,7 +241,7 @@ class GroupState:
             msgs.append(ChatMsg(
                 msg_id=str(r["platform_event_id"] or r["id"]),
                 user_id=uid,
-                nickname=display_name(sender.get("card"), sender.get("nickname"), uid),
+                nickname=display_name(sender.get("card"), sender.get("nickname"), "成员"),
                 text=text,
                 ts=r["occurred_at"],
                 is_bot=uid == self_id,

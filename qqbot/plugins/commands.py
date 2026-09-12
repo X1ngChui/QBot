@@ -33,6 +33,7 @@ from pydantic import ValidationError
 from ..core import agreement, command_catalog, debug, errors, perms
 from ..core.pipeline import note_console_reply
 from ..core.budget import BUDGET, hit_split
+from ..core.members import MEMBERS
 from ..core.nickname import register as register_nicknames
 from ..core.retrieval import directory
 from ..core.state import REGISTRY
@@ -146,12 +147,13 @@ async def _finish(matcher: Matcher, message: str) -> None:
     sent = await matcher.send(message, at_sender=True, reply_message=True)
     try:
         bot, event = current_bot.get(), current_event.get()
+        gid = str(getattr(event, "group_id", ""))
         await note_console_reply(
-            group_id=str(getattr(event, "group_id", "")),
-            self_id=str(bot.self_id), text=message,
+            group_id=gid, self_id=str(bot.self_id), text=message,
             message_id=str((sent or {}).get("message_id") or ""),
             reply_to=str(getattr(event, "message_id", "") or ""),
-            name=config().persona_for(str(getattr(event, "group_id", ""))).name)
+            name=config().persona_for(gid).name,
+            addressee=(await MEMBERS.name_of(bot, gid, str(event.user_id))) or "")
     except Exception as e:
         log.warning("command reply not recorded: %s", why(e))
     await matcher.finish()

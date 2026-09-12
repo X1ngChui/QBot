@@ -22,7 +22,7 @@ from ..providers import Kind, providers
 from ..providers.base import QuotaExhausted
 from ..settings import Persona, Settings
 from ..util import defang, now_local, sysmark, why
-from . import debug, prompt, retrieval, tools
+from . import debug, namesakes, prompt, retrieval, tools
 from .botapi import BotApi
 from .budget import BUDGET
 from .members import MEMBERS
@@ -364,11 +364,31 @@ async def respond(
     if len(text) > cfg.gateway.max_msg_len:
         text = text[: cfg.gateway.max_msg_len]
 
-    # What the group reads and what the bot remembers differ by exactly the
-    # provenance marker: the archived/window form carries what this answer rested
-    # on, so a later turn can cite a searched answer instead of re-searching, and
-    # knows an unmarked one was improvised off the context.
-    kept = f"{text} {prov}" if prov else text
+    # The group reads "@asker text": the send below attaches the @. A reply the
+    # model opened with that @ itself would go out doubled, so the address is
+    # taken back off here - the prompt says not to write it, and the history now
+    # shows the bot's own lines opening with one, which is an example to imitate.
+    who = ""
+    if reply_to and initiator:
+        who = (await MEMBERS.name_of(bot, st.group_id, initiator)) or ""
+        for form in {who, namesakes.bare(who)} - {""}:
+            if text.startswith("@" + form):
+                text = text[len(form) + 1:].lstrip()
+                break
+        if not text:
+            log.warning("group %s: reply was nothing but the asker's name", st.group_id)
+            return False
+
+    # What the bot remembers is what the group read, address included, plus the
+    # provenance marker: the archived/window form opens with "@asker" so a later
+    # turn can see whom each of its own answers was for - two people asking at
+    # once get two answers, and without the address nothing ties either to its
+    # question - and carries what this answer rested on, so a later turn can cite
+    # a searched answer instead of re-searching, and knows an unmarked one was
+    # improvised off the context.
+    kept = f"@{who} {text}" if who else text
+    if prov:
+        kept = f"{kept} {prov}"
 
     # The reply quotes the message that asked for it and @-es its sender - the
     # exact shape QQ's own reply button produces, so the answer reads native and
@@ -446,9 +466,9 @@ async def _record(bot: BotApi, st: GroupState, persona: Persona, *, msg_id: str,
             text=text,
             ts=now,
             is_bot=True,
-            # The same quote pointer any member's reply carries: the window line
-            # renders with the ordinary quote mark, so the model can see which
-            # message each of its own answers was anchored to.
+            # Kept for the archive and for numbering; the window does not render
+            # a quote mark on the bot's own lines (see prompt.render_history) -
+            # the "@asker" opening the text is what shows whom this answered.
             reply_to=reply_to or None,
         )
     )
