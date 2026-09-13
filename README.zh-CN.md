@@ -169,3 +169,7 @@ docker run -d --name qbot-pgtest \
 | `scripts/` | 部署、上线检查、模型下载、评测 |
 | `tests/` | 测试套件 |
 | `docs/` | 架构、配置、指令、运维 |
+
+## 许可证
+
+[MIT](LICENSE)

@@ -185,3 +185,7 @@ for what each suite covers.
 | `scripts/` | Deployment, preflight, model download, evaluations |
 | `tests/` | The test suites |
 | `docs/` | Architecture, configuration, commands, operations |
+
+## License
+
+[MIT](LICENSE)
