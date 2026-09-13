@@ -40,6 +40,18 @@ class Command:
     #: nothing to narrow.
     member: bool = False
 
+    @property
+    def global_only(self) -> bool:
+        """Whether only the default (all-group) owner list holds this command -
+        the ones whose blast radius is every group at once. The gate and the
+        filtered listing both read this, so the two cannot disagree."""
+        return self.name in GLOBAL_ONLY
+
+
+#: The commands that rewrite the platform-global identity graph, swap every
+#: group's config, capture every group's model rounds or read the global log.
+GLOBAL_ONLY = frozenset({"/merge", "/split", "/reload", "/debug", "/log"})
+
 
 #: The order is the listing's only structure - there are no headings - so what a reader
 #: can tell about a command before opening it is whatever its neighbours suggest.
@@ -74,7 +86,7 @@ CATALOG: tuple[Command, ...] = (
     Command("/who", "查看成员记录", """/who　　　　列出全群成员
 /who @某人　查看该成员的记录
 
-记录包含两类信息：称呼来自群名片与 /alias；条目由模型从聊天记录归纳，可能有误。
+记录包含两类信息：称呼来自群名片、/alias 与聊天中观察到的叫法；条目由模型从聊天记录归纳，可能有误。
 括号内的数字是置信度（0 到 1）：由不同消息反复确认的次数算出，说得越多越高。
 条目前的编号用于 /forget。
 
@@ -164,7 +176,7 @@ CATALOG: tuple[Command, ...] = (
 
 示例：/top 10""", member=True),
     Command("/groupstats", "查看本群用量",
-            "本群当日数据：人设、花费、回复次数、待归纳条数、静音状态。\n"
+            "本群当日数据：人设、花费、回复次数、待归纳条数、静音状态、屏蔽人数。\n"
             "普通成员也可查看。\n\n"
             "示例：/groupstats", member=True),
     Command("/block", "屏蔽某个成员", """/block　　　　　　　列出本群的屏蔽名单
@@ -202,7 +214,7 @@ CATALOG: tuple[Command, ...] = (
 
 示例：/debug 5"""),
     Command("/reload", "重载配置与人设",
-            "重新读取配置与人设文件，无需重启。若新配置有误，则继续使用原配置。\n"
+            "重新读取配置、人设、提示词、谓词表与用户协议，无需重启。若新配置有误，则继续使用原配置。\n"
             "定时任务的改动（含其时区）需重启生效；改动代码不能靠它生效，需重建镜像。\n\n"
             "示例：/reload"),
 )
@@ -218,13 +230,19 @@ def find(name: str) -> Command | None:
     return _BY_NAME.get((name or "").strip().lstrip("/").lower())
 
 
-def help_text(*, owner: bool = True) -> str:
+def help_text(*, owner: bool = True, global_owner: bool | None = None) -> str:
     """The listing: one line each, and how to get more.
 
-    A member's listing shows only what a member can run - the rest must not
-    be advertised to whoever cannot run it.
+    A reader's listing shows only what that reader can run - the rest must not
+    be advertised to whoever cannot run it. `global_owner` is whether the reader
+    is on the default owner list (the group-override owners are not); it
+    defaults to `owner`.
     """
-    shown = [c for c in CATALOG if owner or c.self_serve or c.member]
+    if global_owner is None:
+        global_owner = owner
+    shown = [c for c in CATALOG
+             if c.self_serve or c.member
+             or (global_owner if c.global_only else owner)]
     width = max(len(c.name) for c in shown)
     lines = ["可用指令："]
     lines.extend(f"{c.name.ljust(width)}  {c.what}" for c in shown)

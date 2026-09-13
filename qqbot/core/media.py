@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import binascii
 import logging
 import os
 import re
@@ -88,7 +89,13 @@ def _byte_cap(max_seconds: int) -> int:
 #: What the byte routes answer for a file that exists but is over the caller's cap.
 #: Distinct from None (nothing could be read) because the verdicts differ: an
 #: unreadable picture is worth trying again later; an oversize one never shrinks.
-OVERSIZE = b""
+#: Its own type, not the empty bytes object: every empty payload *is* b"" (the
+#: interned singleton), and an empty body must fall through to the next route.
+class _Oversize(bytes):
+    __slots__ = ()
+
+
+OVERSIZE = _Oversize()
 
 #: "Not fetched yet" for the per-arrival byte closure in resolve_picture, where None
 #: already means "fetched and failed".
@@ -259,7 +266,8 @@ class MediaProcessor:
                     if len(buf) > max_bytes:
                         log.info("media over size limit mid-stream, skipped")
                         return OVERSIZE
-                return bytes(buf)
+                # An empty body is no picture: None lets the next route try.
+                return bytes(buf) or None
         except Exception as e:
             # Info, not warning: a received link is one of three routes to the bytes
             # and the one that expires (its rkey lasts about two hours), so it fails
@@ -286,7 +294,7 @@ class MediaProcessor:
         p = Path(NAPCAT_DATA_DIR) / napcat_path.split(marker, 1)[1]
         try:
             if p.is_file():
-                return p.read_bytes() if p.stat().st_size <= max_bytes else OVERSIZE
+                return (p.read_bytes() or None) if p.stat().st_size <= max_bytes else OVERSIZE
         except OSError as e:
             log.debug("local media read failed %s: %s", p, why(e))
         return None
@@ -295,13 +303,18 @@ class MediaProcessor:
     def _links(url: str) -> list[str]:
         """The links worth trying for a picture, best first.
 
-        A marketplace sticker arrives as a directory link on the sticker CDN, which
-        redirects to a raw GIF that is often absent; the same directory serves a
-        300x300 PNG for every sticker, so that is asked for first.
+        A marketplace sticker arrives as a link into its directory on the sticker
+        CDN - usually the raw GIF (`.../raw300.gif`), sometimes the directory alone -
+        and the GIF redirects to a file that is often absent. The same directory
+        serves a 300x300 PNG for every sticker, so that is asked for first.
         """
-        if _STICKER_CDN.match(url) and not url.rstrip("/").rsplit("/", 1)[-1].count("."):
-            return [url.rstrip("/") + "/300x300.png", url]
-        return [url]
+        if not _STICKER_CDN.match(url):
+            return [url]
+        base = url.rstrip("/")
+        if base.rsplit("/", 1)[-1].count("."):
+            base = base.rsplit("/", 1)[0]
+        png = base + "/300x300.png"
+        return [png] if url == png else [png, url]
 
     # -- per-kind resolution ----------------------------------------------
     async def _bytes(self, ref: ImageRef, *, bot, max_bytes: int) -> bytes | None:
@@ -317,8 +330,10 @@ class MediaProcessor:
         key = ref.key or ref.file or ref.url or ""
         if not key:
             return await self._bytes_once(ref, bot=bot, max_bytes=max_bytes)
+        # The cap is part of the key: a flight started under one group's
+        # max_image_mb must not hand its oversize verdict to a group with a wider one.
         return await self._flight(
-            self._fetching, key,
+            self._fetching, f"{key}:{max_bytes}",
             lambda: self._bytes_once(ref, bot=bot, max_bytes=max_bytes))
 
     async def _bytes_once(self, ref: ImageRef, *, bot, max_bytes: int) -> bytes | None:
@@ -508,7 +523,8 @@ class MediaProcessor:
 
         try:
             desc = await providers().vision.describe(
-                data, cfg=vcfg, prompt=ptext("describe_image"), group_id=group_id)
+                data, cfg=vcfg, prompt=ptext("describe_image"),
+                mime=_mime(data, ref.file), group_id=group_id)
         except Exception as e:
             if _is_refusal(e):
                 # The backend looked and declined - its content filter, not a fault here.
@@ -518,9 +534,8 @@ class MediaProcessor:
                 # failures someone actually has to act on.
                 log.info("vision backend declined an image; recording it as unseen")
                 if ref.key:
-                    await repo.image_cache_put(ref.key, fallback or sysmark(label),
-                                               refused=True)
-                return fallback
+                    await repo.image_cache_put(ref.key, final, refused=True)
+                return final
             log.warning("vision model call failed: %s", why(e))
             return retry_later
         if not desc:
@@ -580,8 +595,12 @@ class MediaProcessor:
             info = {}
         data = None
         if info.get("base64"):
-            data = base64.b64decode(str(info["base64"]).split(",", 1)[-1])
-            if len(data) > wav_cap:
+            try:
+                data = base64.b64decode(str(info["base64"]).split(",", 1)[-1]) or None
+            except (binascii.Error, ValueError) as e:
+                log.info("get_record answered malformed base64: %s", why(e))
+                data = None
+            if data is not None and len(data) > wav_cap:
                 data = OVERSIZE
         if data is None:
             data = self._local(info.get("file"), wav_cap)
@@ -601,10 +620,12 @@ class MediaProcessor:
                 group_id=group_id,
             )
         except Exception as e:
-            if never_billed(e):
-                # The request provably cost nothing (never sent, or refused before
-                # processing), so the one-paid-attempt rule below does not apply:
-                # a network blip must not abandon a clip a free retry would rescue.
+            if never_billed(e) or providers().asr.rate_for(acfg.model).units(1.0) == 0:
+                # The request provably cost nothing (never sent, refused before
+                # processing, or a backend that bills nothing at all), so the
+                # one-paid-attempt rule below does not apply: a network blip, or a
+                # model bundle missing until the next deploy, must not abandon a
+                # clip a free retry would rescue.
                 log.warning("ASR call failed before billing, retryable: %s", why(e))
                 return None
             # Terminal, not retryable: a failed attempt may already have billed the

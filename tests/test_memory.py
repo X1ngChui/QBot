@@ -222,9 +222,9 @@ async def main():
           f"{written2} written, {rejected2} rejected of {n2}")
     after = await pool().fetchval(
         "SELECT count(*) FROM memory_fact WHERE group_id=$1 AND status='active'", G)
-    # Same records, re-proposed: confirmed in place rather than rewritten. The churn this
-    # replaces had one term rewritten eleven times in eleven hours, its evidence reset to
-    # one each time, so nothing ever aged on how often the group said it.
+    # Same records, re-proposed: confirmed in place rather than rewritten, so the
+    # evidence accumulates and the record ages on how often the group said it
+    # rather than on when it was last rewritten.
     check("re-proposing what is already known adds no rows", after == before,
           f"{before} -> {after}")
     confirmed = await pool().fetchval(
@@ -245,8 +245,8 @@ async def main():
           conf_now is not None and abs(conf_now - earned_confidence(1)) < 1e-3,
           f"{conf_now} vs {earned_confidence(1):.2f}")
     # A confirmation from a different message is genuinely new evidence, and the number
-    # moves. Production had every fact frozen at its initial guess forever, because the
-    # old branch could only ever keep the maximum of two constants.
+    # moves: a confidence that only ever kept the larger of two constants would
+    # freeze every fact at its initial guess.
     person = (await ids_probe().account_of("qq", "u1")).entity_id
     other_event = await pool().fetchval(
         "SELECT id FROM raw_event WHERE platform_event_id='e3'")
@@ -352,8 +352,8 @@ async def main():
           people == 2 and events == 1, f"{people} people, {events} events")
 
     # The vectors the worker computes have to be the ones retrieval reads. They were not:
-    # the reply path was built without a backend, so it ranked by importance forever while
-    # the worker went on paying for embeddings nothing queried.
+    # the reply path's recall must read the same store the worker writes, or the
+    # worker pays for embeddings nothing ever queries.
     await w.embed(G)
     stored = await pool().fetchval(
         "SELECT count(*) FROM embedding_index WHERE group_id=$1 AND object_type='episode'",

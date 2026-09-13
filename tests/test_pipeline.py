@@ -1644,6 +1644,22 @@ async def main():
     check("quoting anybody else without an @ stays silence",
           len(bot.sent) == n17b + 1, f"{len(bot.sent) - n17b - 1} extra")
 
+    # A typed command is the command matchers' to answer, never the reply
+    # path's - but the line itself stays on the record, so the console's
+    # answer (which quotes it) has an antecedent in the window and the archive.
+    n_cmd = len(bot.sent)
+    _cmd_ev = FakeEvent("/who 阿强", user_id="u1")
+    await GATEWAY.handle(bot, _cmd_ev)
+    await drain()
+    check("a command line draws no chat reply",
+          len(bot.sent) == n_cmd, f"{len(bot.sent) - n_cmd} sent")
+    check("but it enters the window",
+          any(m.msg_id == str(_cmd_ev.message_id) for m in st17b.recent))
+    _cmd_row = await pool().fetchval(
+        "SELECT plain_text FROM raw_event WHERE platform_event_id=$1",
+        str(_cmd_ev.message_id))
+    check("and the archive", _cmd_row is not None and "/who" in _cmd_row, repr(_cmd_row))
+
     # 18. namesakes: two members sharing a card are told apart by a permanent
     # serial - renames dissolve and restore the suffix, never the number.
     from qqbot.core import tools as _tools

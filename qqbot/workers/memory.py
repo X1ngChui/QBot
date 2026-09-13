@@ -494,13 +494,15 @@ class MemoryWorker:
             cands = await self._mem.pending(group_id)
             if not cands:
                 break
-            batches: dict[uuid.UUID | None, list] = {}
+            # Anchor and size together name a batch: two batches can end at the
+            # same row with different widths (a failed nightly batch, then a
+            # /relearn), and the account codes are positions within one render.
+            batches: dict[tuple[uuid.UUID | None, int], list] = {}
             for c in cands:
-                batches.setdefault(c.batch_event_id, []).append(c)
+                batches.setdefault((c.batch_event_id, c.batch_size), []).append(c)
 
-            for anchor, batch in batches.items():
-                rows = await self._replay(group_id, ending_at=anchor,
-                                          size=batch[0].batch_size)
+            for (anchor, size), batch in batches.items():
+                rows = await self._replay(group_id, ending_at=anchor, size=size)
                 rows = sorted(rows, key=lambda r: (r["occurred_at"], r["id"]))
                 codes, _roster, lines = await self._render(group_id, rows)
                 # Members' lines only, as the extractor's source_of sees them: the

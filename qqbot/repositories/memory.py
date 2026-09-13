@@ -100,9 +100,11 @@ class MemoryRepository:
         the confidence instead. Something a group repeats every week should not pile up
         as fifty identical records.
 
-        Two clocks: `when` is the moment this write happens and stamps
-        last_confirmed_at; `observed_at` is when the conversation that stated the fact
-        took place and stamps valid_from / first_observed_at. They differ by however
+        Two clocks: `when` is the moment this write happens and closes what it
+        supersedes; `observed_at` is when the conversation that stated the fact
+        took place and stamps valid_from / first_observed_at /
+        last_confirmed_at, so a record ages from what was said, not from the
+        night it was written. They differ by however
         long the fact waited in the candidate queue - hours for the nightly drain, days
         after a retry - and a fact dated by its write would age from the wrong day.
         Callers with no source event (an owner's note) leave it unset.
@@ -168,7 +170,7 @@ class MemoryRepository:
                                   confidence=GREATEST($3::float8, $4::float8),
                                   revision=revision+1, updated_at=NOW()
                             WHERE id=$1""",
-                        prev["id"], when,
+                        prev["id"], observed_at,
                         earned_confidence(counts["r"] or 0, counts["s"] or 0),
                         fact.confidence,
                     )
@@ -188,11 +190,11 @@ class MemoryRepository:
                        (group_id, subject_entity_id, predicate, object_key,
                         object_entity_id, object_value, memory_type, confidence,
                         status, valid_from, first_observed_at, last_confirmed_at)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9,$9,$10)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'active',$9,$9,$9)
                 RETURNING *""",
                 fact.group_id, fact.subject_entity_id, fact.predicate, fact.object_key,
                 fact.object_entity_id, fact.object_value, fact.memory_type.value,
-                fact.confidence, observed_at, when,
+                fact.confidence, observed_at,
             )
             await self._add_evidence(conn, row["id"], evidence)
             return _fact(row)
@@ -392,10 +394,17 @@ class EpisodeRepository:
         """Episodes somebody took part in. Filter by participant first, then talk about
         similarity: whether it is the right person matters more than whether the text
         looks alike."""
+        # Participants may still name a merged-away id; the chase reads them all.
         rows = await pool().fetch(
-            """SELECT e.* FROM episode e
+            """WITH RECURSIVE family AS (
+                   SELECT id FROM entity WHERE id = $2
+                   UNION ALL
+                   SELECT e.id FROM entity e JOIN family f ON e.merged_into = f.id
+               )
+               SELECT DISTINCT e.* FROM episode e
                  JOIN episode_participant p ON p.episode_id = e.id
-                WHERE e.group_id=$1 AND p.entity_id=$2 AND e.status='active'
+                WHERE e.group_id=$1 AND p.entity_id IN (SELECT id FROM family)
+                  AND e.status='active'
                 ORDER BY e.importance DESC NULLS LAST, e.started_at DESC
                 LIMIT $3""",
             group_id, entity_id, limit,

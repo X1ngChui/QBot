@@ -39,7 +39,7 @@ from ..providers.base import Kind
 from ..repositories import JobQueue
 from ..repositories.job import JobType
 from ..settings import config
-from ..util import now_local, read_secret, tz
+from ..util import now_local, read_secret, tz, why
 
 log = logging.getLogger("qqbot.tasks")
 
@@ -128,7 +128,11 @@ async def nightly() -> None:
 
     # The paid and destructive stages are behind the waits; these two are
     # plain local work and each guards itself.
-    await backup()
+    try:
+        await backup()
+    except OSError as e:
+        # A missing pg_dump/pg_restore binary must not skip the cache sweep.
+        log.error("backup could not run: %s", why(e))
     await clean_napcat_cache()
 
 
@@ -275,7 +279,7 @@ async def daily_report() -> None:
     dumps = sorted(out_dir.glob("qqbot-*.dump"), key=lambda p: p.stat().st_mtime,
                    reverse=True)
     if not dumps:
-        lines.append("备份：目录里没有任何备份文件！")
+        lines.append("备份：目录中没有备份文件！")
     else:
         age_h = (time.time() - dumps[0].stat().st_mtime) / 3600
         note = f"备份 {dumps[0].name}（{dumps[0].stat().st_size / 1e6:.1f} MB）"

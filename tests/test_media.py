@@ -188,7 +188,7 @@ async def main():
     ref_no = ImageRef(slot=0, key="c" * 32, url="http://example/nope.jpg")
     before = len(VISION_CALLS)
     out = await MEDIA.describe_image(ref_no, bot=bot, group_id="g", cfg=cfg)
-    check("a refused image reads as not received", out is None, str(out))
+    check("a refused image is a terminal bare marker", out == "⟦图片⟧", str(out))
     check("and the refusal cost one call", len(VISION_CALLS) == before + 1)
     out = await MEDIA.describe_image(ref_no, bot=bot, group_id="g", cfg=cfg)
     check("reposting it costs nothing more", len(VISION_CALLS) == before + 1,
@@ -247,6 +247,15 @@ async def main():
     check("a marketplace sticker is fetched as its 300x300 PNG",
           await MEDIA._bytes(_sticker, bot=RefreshingBot(), max_bytes=1 << 20) is not None
           and seen_links[0].endswith("/300x300.png"), str(seen_links))
+    # The shape the protocol side actually sends names the raw GIF inside the
+    # directory; the PNG sits beside it and is still asked for first.
+    seen_links.clear()
+    _gif = ImageRef(slot=0, key="h" * 32,
+                    url="https://gxh.vip.qq.com/club/item/parcel/item/74/" + "f" * 32
+                        + "/raw300.gif")
+    check("a sticker linked by its raw GIF is fetched as the PNG beside it",
+          await MEDIA._bytes(_gif, bot=RefreshingBot(), max_bytes=1 << 20) is not None
+          and seen_links[0].endswith("/" + "f" * 32 + "/300x300.png"), str(seen_links))
     MEDIA._fetch = _fetch3
 
     # A picture the platform can no longer serve does not fail get_image, it hangs;

@@ -220,7 +220,7 @@ CASES = [
                "window plants a lookalike to misattribute the purchase to",
         "window": [
             # The trap: a different member talking near the topic. Answering
-            # from the window pins the purchase on 小北.
+            # from the window pins the purchase on the wrong member.
             _msg("u2", "小北", "我最近也想搞3D打印，在看入门机", 25),
             _msg("u3", "老雷", "这玩意吃灰率很高的", 24),
         ],

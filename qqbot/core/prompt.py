@@ -90,7 +90,7 @@ def _known_block(profiles: list[dict]) -> str:
         if aliases := [defang(n) for n in (p.get("aliases") or [])
                        if n and defang(n) != name]:
             bits.append("别名：" + "、".join(aliases))
-        if note := (p.get("manual_note") or "").strip():
+        if note := defang(p.get("manual_note") or "").strip():
             bits.append(note)
         if bits:
             lines.append((str(p.get("user_id") or ""), f"- {name}，" + "；".join(bits)))

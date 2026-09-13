@@ -157,6 +157,8 @@ def tool_defs(cfg: Settings | None = None) -> list[dict]:
 #: serial's account, never by the name half - the name is exactly what the two
 #: people share.
 _SEQ_NAME = re.compile(rf"^(.+){SYS_L}同名(\d{{1,9}}){SYS_R}$")
+_TRAILING_TAGS = re.compile(
+    rf"(?:{re.escape(SYS_L)}(?:拥有者|你){re.escape(SYS_R)})+$")
 
 
 async def _carried_name(group_id: int, uid: str, name: str) -> bool:
@@ -297,7 +299,9 @@ async def search_history(group_id: int, query: str, *, speaker: str | None = Non
         cond = _condition(_parse_query(query or "", rcfg.max_query_terms), terms, offset=5)
     except QueryError as e:
         return Failure(f"（检索式有误：{e}）")
-    sp = (speaker or "").strip()
+    # A name pasted from the transcript may carry the owner or self tag behind
+    # the namesake one; neither names anybody in the archive.
+    sp = _TRAILING_TAGS.sub("", (speaker or "").strip()).strip()
     uid: str | None = None
     if m := _SEQ_NAME.fullmatch(sp):
         uid = await repo.member_of_seq(group_id, int(m.group(2)))
@@ -338,7 +342,8 @@ async def search_history(group_id: int, query: str, *, speaker: str | None = Non
         return "（存档里没有搜到）"
     ctx = max(0, rcfg.history_context)
     if not ctx:
-        text = _render_lines(list(reversed(rows)), await _tags_for(group_id, rows), self_id)
+        text = _render_lines(list(reversed(rows)),
+                             await _tags_for(group_id, rows, self_id), self_id)
     else:
         text = await _with_context(group_id, [r["id"] for r in rows], ctx, self_id)
     if len(text) > rcfg.history_chars:
@@ -356,10 +361,13 @@ def _who(r) -> str:
     return display_name(sender.get("card"), sender.get("nickname"), "成员")
 
 
-async def _tags_for(group_id: int, rows: list) -> dict[str, str]:
+async def _tags_for(group_id: int, rows: list, self_id: str | None) -> dict[str, str]:
     """Namesake tags over every row one answer shows, so two accounts sharing a
-    name are told apart wherever in the answer they fall."""
-    names = {str(r["platform_user_id"] or ""): _who(r) for r in rows}
+    name are told apart wherever in the answer they fall. The bot's own account
+    stays out: it wears the self tag instead, and must not be minted a member
+    serial for sharing its persona's name with somebody."""
+    names = {str(r["platform_user_id"] or ""): _who(r) for r in rows
+             if str(r["platform_user_id"] or "") != self_id}
     try:
         return await namesakes.tags(group_id, names)
     except Exception as e:
@@ -430,7 +438,7 @@ async def _with_context(group_id: int, hit_ids: list, ctx: int,
     def order(rid):
         return by_id[rid]["occurred_at"], by_id[rid]["id"]
 
-    tags = await _tags_for(group_id, list(by_id.values()))
+    tags = await _tags_for(group_id, list(by_id.values()), self_id)
     parts: list[str] = []
     for b in sorted(blocks, key=lambda b: min(order(rid) for rid in b)):
         rows = [by_id[rid] for rid in sorted(b, key=order)]
@@ -616,7 +624,8 @@ async def execute(call: dict, *, cfg: Settings, group_id: str,
         if not question:
             return Failure("（问题为空）")
         try:
-            found = await retrieval.episode_lookup(group_id, question)
+            found = await retrieval.episode_lookup(group_id, question,
+                                                   rcfg=cfg.retrieval)
         except QuotaExhausted:
             # A limit, not a failure: it must reach the engine and drop the reply,
             # whichever tool's backend it comes from - only transport errors below

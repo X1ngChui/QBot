@@ -56,7 +56,7 @@ tar czf - --exclude=__pycache__ "${PAYLOAD[@]}" | "${SSH[@]}" "cat > '$REMOTE/.d
 echo "==> rebuilding"
 # Keep one step back: tag the running image as :rollback before the build replaces
 # it. A deploy that passes the fingerprint check but misbehaves at runtime can then
-# be undone from the server alone - see README "回滚" for the two commands. The
+# be undone from the server alone - see README "Rollback" for the two commands. The
 # container is found through compose, so the project name is not assumed.
 "${SSH[@]}" "cd '$REMOTE' && cid=\$(docker compose ps -q bot 2>/dev/null); img=\$([ -n \"\$cid\" ] && docker inspect --format '{{.Image}}' \"\$cid\"); [ -n \"\$img\" ] && docker tag \"\$img\" qbot-bot:rollback || true"
 "${SSH[@]}" "cd '$REMOTE' && docker compose up -d --build bot"

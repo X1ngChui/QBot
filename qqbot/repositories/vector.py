@@ -67,12 +67,6 @@ class VectorRepository:
         )
         return [(r["object_id"], r["distance"]) for r in rows]
 
-    async def forget(self, object_type: str, object_id: uuid.UUID) -> None:
-        await pool().execute(
-            "DELETE FROM embedding_index WHERE object_type=$1 AND object_id=$2",
-            object_type, object_id,
-        )
-
     async def unembedded_episodes(
         self, group_id: int, *, limit: int = 200,
     ) -> list[tuple[uuid.UUID, str]]:

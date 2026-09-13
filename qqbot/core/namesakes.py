@@ -50,8 +50,15 @@ async def tags(group_id: int, names: dict[str, str]) -> dict[str, str]:
         if len(parts) < 2:
             continue  # one person under several accounts: nobody to tell apart
         seqs = await repo.member_seqs(group_id, uids)
-        for members in parts.values():
+        for person, members in parts.items():
             have = [seqs[u] for u in members if u in seqs]
+            if person != members[0]:  # a known person, not an account standing alone
+                # The serial is the person's, not the caller's subset's: every
+                # account of theirs already numbered here counts, or the same
+                # person would wear one serial in the window and another in
+                # the roster, depending on which accounts each render passed.
+                others = await repo.accounts_sharing_person(members[0])
+                have += list((await repo.member_seqs_known(group_id, others)).values())
             if have:
                 tag = namesake_tag(min(have))
                 for u in members:

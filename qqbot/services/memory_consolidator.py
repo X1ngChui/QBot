@@ -14,7 +14,8 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
-from ..domain.identity import Alias, AliasEvidence, AliasType, EvidenceType, normalize
+from ..domain.identity import (ALIAS_MAX_CHARS, Alias, AliasEvidence, AliasType,
+                               EvidenceType, normalize)
 from ..domain.memory import (
     earned_confidence,
     Candidate, CandidateType, Episode, Fact, FactEvidence, MemoryType, Participant,
@@ -28,11 +29,6 @@ from .memory_extractor import (
 )
 
 log = logging.getLogger("qqbot.consolidate")
-
-#: The alias column's width. A longer "name" is not a name, and the store would
-#: refuse the row after the validator had passed it.
-ALIAS_MAX_CHARS = 256
-
 
 def _text(p: dict, key: str) -> str:
     """A string field of a payload, stripped; "" for a missing one or one of another

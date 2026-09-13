@@ -549,7 +549,7 @@ class IdentityRepository:
             rows = await conn.fetch(
                 FAMILY.format(arg="$2") + """
                    SELECT a.* FROM alias a JOIN family ON a.target_entity_id = family.id
-                    WHERE (a.group_id=$1 OR a.group_id IS NULL) AND a.normalized_text=$3
+                    WHERE a.group_id=$1 AND a.normalized_text=$3
                     FOR UPDATE OF a""",
                 group_id, entity_id, normalize(text),
             )

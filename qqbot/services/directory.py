@@ -19,7 +19,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, UTC
 
-from ..domain.identity import Alias, AliasEvidence, AliasType, EvidenceType, normalize
+from ..domain.identity import (ALIAS_MAX_CHARS, Alias, AliasEvidence, AliasType,
+                               EvidenceType, normalize)
 from ..domain.memory import Fact, MemoryType
 from ..repositories import (
     EventRepository, IdentityRepository, JobQueue, MemoryRepository,
@@ -38,6 +39,13 @@ log = logging.getLogger("qqbot.directory")
 #: every inference, because it is the one input the model is not allowed to overrule -
 #: a correction that the next extraction round could outvote would not be a correction.
 MANUAL_CONFIDENCE = 1.0
+
+
+def _check_length(text: str) -> None:
+    """A name longer than the column is not a name; said in words, before the
+    store says it in an error the command could not answer."""
+    if len(text.strip()) > ALIAS_MAX_CHARS:
+        raise ValueError(f"称呼太长，最多 {ALIAS_MAX_CHARS} 个字。")
 
 
 class NameTaken(ValueError):
@@ -294,13 +302,7 @@ class Directory:
         An account nobody has seen yet is a person of one: the caller acts on what
         it was given rather than failing.
         """
-        try:
-            acc = await self._identity.account(user_id)
-        except UnknownAccount:
-            return [user_id]
-        found = [a.platform_user_id
-                 for a in await self._ids.accounts_of(acc.entity_id)]
-        return found if user_id in found else [*found, user_id]
+        return await db_repo.accounts_sharing_person(user_id)
 
     async def _card(
         self, group_id: int, entity_id: uuid.UUID, accounts: list[str],
@@ -431,11 +433,13 @@ class Directory:
         the one path allowed to break it. Retire the name from the other person first if
         that is really what is wanted.
         """
+        _check_length(text)
         entity_id = await self._entity(user_id)
         for other in await self._ids.lookup(group_id, text):
             if other.target_entity_id != entity_id:
                 raise NameTaken(text.strip(),
-                                await self._display_of(group_id, other.target_entity_id))
+                                await self._display_of(group_id, other.target_entity_id,
+                                                       excluding=text))
         alias = await self._ids.upsert_alias(
             Alias(
                 alias_text=text.strip(),
@@ -465,11 +469,13 @@ class Directory:
         Raises NameTaken if somebody else here answers to it.
         """
         confidence = max(0.0, min(1.0, confidence))
+        _check_length(text)
         entity_id = await self._entity(user_id)
         for other in await self._ids.lookup(group_id, text):
             if other.target_entity_id != entity_id:
                 raise NameTaken(text.strip(),
-                                await self._display_of(group_id, other.target_entity_id))
+                                await self._display_of(group_id, other.target_entity_id,
+                                                       excluding=text))
         updated = await self._ids.set_alias_confidence(
             group_id, entity_id, text, confidence)
         if updated is None:
@@ -501,7 +507,9 @@ class Directory:
         # per pre-merge account, and retiring one row of two leaves the name showing -
         # which reads as the command having silently failed.
         for a in await self._ids.aliases_for(group_id, entity_id):
-            if a.normalized_text == wanted:
+            # A group's command reaches the group's rows only; a global alias
+            # (group_id NULL) is not this group's to retire.
+            if a.normalized_text == wanted and not a.is_global:
                 await self._ids.retire_alias(a.id)
                 gone += 1
         return gone > 0
@@ -610,16 +618,21 @@ class Directory:
                     priority=2)
         return jid
 
-    async def _display_of(self, group_id: int, entity_id: uuid.UUID) -> str:
+    async def _display_of(self, group_id: int, entity_id: uuid.UUID, *,
+                          excluding: str = "") -> str:
         """How somebody shows up here, for an answer that has to name them.
 
         Cheaper than a whole card: this is only ever wanted to say who already holds a
         name, and the card would cost a fact read and an evidence count to say it.
+        `excluding` is the contested name itself, which would name nobody; a person
+        with no other name here is called another member rather than by an id.
         """
         aliases = await self._ids.aliases_for(group_id, entity_id)
+        skip = normalize(excluding)
         return (_current_platform_name(aliases)
-                or next((a.alias_text for a in aliases if a.is_usable), "")
-                or str(entity_id))
+                or next((a.alias_text for a in aliases
+                         if a.is_usable and a.normalized_text != skip), "")
+                or "另一位成员")
 
     async def _entity(self, user_id: str) -> uuid.UUID:
         # The live person: merge() repoints every account, so no chase is needed.

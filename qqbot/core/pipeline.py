@@ -183,10 +183,13 @@ class Gateway:
             parsed.reply_to = str(getattr(reply, "message_id", "") or "") or None
 
         text = parsed.render()
-        # Routed to the command matchers instead. Whole word: the matchers require
-        # whitespace after the name, so "/topology" is chat, not "/top".
-        if text.strip() and text.split(maxsplit=1)[0] in COMMANDS:
-            return
+        # A command is answered by the command matchers, never by the reply
+        # path - but the typed line still enters the window and the archive:
+        # the console's answer quotes it, and a record with the answer but not
+        # the question would show the model an @ with no antecedent. Whole
+        # word: the matchers require whitespace after the name, so "/topology"
+        # is chat, not "/top".
+        is_command = bool(text.strip()) and text.split(maxsplit=1)[0] in COMMANDS
         if not text and not parsed.refs:
             return
         text = cut_text(text, cfg.gateway.max_msg_len)
@@ -225,6 +228,19 @@ class Gateway:
         await st.load_history(self_id=str(bot.self_id), owners=set(cfg.owners))
 
         # Archive unconditionally, off the hot path.
+        # Hold on to anything still unresolved and expensive. A picture is usually
+        # asked about in the message *after* it - a separate task by then, whose
+        # backlog settle is what pays for it - see ChatMsg.pending.
+        if parsed.needs_model:
+            msg.pending = parsed
+        if not st.add(msg):
+            # Already in the window: the adapter replayed a message across a
+            # restart, and the rebuilt history holds both it and its answer.
+            # Before any task starts: a voice clip has no result cache, and a
+            # replay must not pay for it twice.
+            log.info("group %s: message %s replayed, already handled", group_id, msg_id)
+            return
+
         inbound = GroupMessage.from_event(event, segments, bot.self_id, plain_text=text)
         archive_task = self._track(
             self._archive(inbound, at_accounts=list(parsed.mentions))
@@ -242,17 +258,10 @@ class Gateway:
                 archive_task=archive_task,
             ))
 
-        item = Inbound(msg, parsed, media_task, archive_task)
-        # Hold on to anything still unresolved and expensive. A picture is usually
-        # asked about in the message *after* it - a separate task by then, whose
-        # backlog settle is what pays for it - see ChatMsg.pending.
-        if parsed.needs_model:
-            msg.pending = parsed
-        if not st.add(msg):
-            # Already in the window: the adapter replayed a message across a
-            # restart, and the rebuilt history holds both it and its answer.
-            log.info("group %s: message %s replayed, already handled", group_id, msg_id)
+        if is_command:
             return
+
+        item = Inbound(msg, parsed, media_task, archive_task)
 
         # Decided on what was typed (Inbound.heard), never the render or the
         # resolved form: a forwarded conversation whose body names the bot, a
@@ -346,7 +355,7 @@ class Gateway:
         """
         cfg, _persona = config().for_group(group_id)
         st = await REGISTRY.get(group_id)
-        name = (await MEMBERS.name_of(bot, group_id, actor)) or actor
+        name = (await MEMBERS.name_of(bot, group_id, actor)) or "成员"
         raw = await MEMBERS.raw_name_of(bot, group_id, actor)
         st.add(ChatMsg(msg_id=msg_id, user_id=actor, nickname=name, text=text,
                        ts=ts, is_owner=actor in cfg.owners))
@@ -397,8 +406,8 @@ class Gateway:
                 return uid, sysmark("戳了戳你")
             if not target:
                 return uid, sysmark("戳了戳别人")
-            tname = (await MEMBERS.name_of(bot, group_id, target)) or target
-            return uid, sysmark(f"戳了戳 {tname}")
+            tname = await MEMBERS.name_of(bot, group_id, target)
+            return uid, sysmark(f"戳了戳 {tname}" if tname else "戳了戳别人")
         return "", ""
 
     @staticmethod
@@ -428,7 +437,17 @@ class Gateway:
         """
         cfg, persona = config().for_group(group_id)
         st = await REGISTRY.get(group_id)
+        try:
+            await self._answer(bot, group_id, item, decision, window, cfg=cfg,
+                               persona=persona, st=st)
+        except Exception:
+            # A bare task has no worker loop above it to log for it.
+            log.exception("group %s: reply task failed", group_id)
 
+    async def _answer(self, bot: BotApi, group_id: str, item: Inbound,
+                      decision: trigger.Decision, window: list[ChatMsg], *,
+                      cfg: Settings, persona, st) -> None:
+        """The body of one reply task, under _reply's guard."""
         if await BUDGET.exceeded(cfg.budget.daily_cny_cap):
             # After the trigger on purpose: it fires once per suppressed reply, not
             # once per message all afternoon - hundreds of identical warnings would
@@ -479,22 +498,19 @@ class Gateway:
         # the trigger decision already named. An attribution, not a charge: the
         # budget stays shared, this only feeds the /top leaderboard's ledger
         # column.
-        try:
-            with BUDGET.attribute(who):
-                # Only now is anything paid for. Understanding a picture is worth money
-                # exactly when the model is about to read the message it is in - which,
-                # since the bot only speaks when spoken to, is a question that has
-                # already been answered by here.
-                await self._settle(item, window, group_id, bot=bot, cfg=cfg, who=who)
-                await engine.respond(
-                    bot=bot, st=st, cfg=cfg, persona=persona,
-                    msg=item.msg, window=window,
-                    reply_to=decision.initiator_msg_id,
-                    initiator=decision.initiator,
-                )
-        except Exception:
-            # A bare task has no worker loop above it to log for it.
-            log.exception("group %s: reply task failed", group_id)
+        with BUDGET.attribute(who):
+            # Only now is anything paid for. Understanding a picture is worth money
+            # exactly when the model is about to read the message it is in - which,
+            # since the bot only speaks when spoken to, is a question that has
+            # already been answered by here.
+            await self._settle(item, window, group_id, bot=bot, cfg=cfg, who=who)
+            await engine.respond(
+                bot=bot, st=st, cfg=cfg, persona=persona,
+                msg=item.msg, window=window,
+                reply_to=decision.initiator_msg_id,
+                initiator=decision.initiator,
+                track=self._track,
+            )
 
     async def _settle(self, item: Inbound, window: list[ChatMsg], group_id: str, *,
                       bot: BotApi, cfg: Settings, who: str | None) -> None:

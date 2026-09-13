@@ -202,10 +202,11 @@ class OpenAICompatChat(TextModel):
         if self._sem is None:
             self._sem = asyncio.Semaphore(cfg.max_concurrency)
             self._sem_size = cfg.max_concurrency
-        elif self._sem_size != cfg.max_concurrency:
+        elif self._sem_size != cfg.max_concurrency and not self._sem_noted:
+            # Once: with a per-group override the value alternates on every call.
+            self._sem_noted = True
             log.info("max_concurrency %d -> %d applies after restart",
                      self._sem_size, cfg.max_concurrency)
-            self._sem_size = cfg.max_concurrency
         return self._sem
 
     async def chat(
@@ -222,6 +223,9 @@ class OpenAICompatChat(TextModel):
         model = cfg.model
         attempt = 0
         while True:
+            # Set once the vendor has started answering: an attempt cut off after
+            # that was billed like a timeout, whatever the exception says.
+            started = [False]
             try:
                 async with self._gate(cfg):
                     res = await asyncio.wait_for(
@@ -229,12 +233,13 @@ class OpenAICompatChat(TextModel):
                             messages, cfg=cfg, model=model, tools=tools,
                             max_tokens=max_tokens,
                             effort=effort if effort is not None else cfg.reasoning_effort,
+                            started=started,
                         ),
                         timeout=cfg.timeout_sec,
                     )
                 break
             except RETRYABLE as e:
-                if isinstance(e, (asyncio.TimeoutError, openai.APITimeoutError)):
+                if started[0] or isinstance(e, (asyncio.TimeoutError, openai.APITimeoutError)):
                     # The estimate: the prompt's rendered characters as miss-rate
                     # input tokens (at least one token per character for Chinese, so
                     # never an undercount), the full output allowance as output -
@@ -285,6 +290,7 @@ class OpenAICompatChat(TextModel):
         tools: list[dict] | None,
         max_tokens: int | None,
         effort: str,
+        started: list | None = None,
     ) -> ChatResult:
         kwargs: dict[str, Any] = {
             "model": model,
@@ -315,6 +321,8 @@ class OpenAICompatChat(TextModel):
         # and the outer wait_for could never extend anything.
         kwargs["timeout"] = cfg.timeout_sec
         async for chunk in await client.chat.completions.create(**kwargs):
+            if started is not None:
+                started[0] = True
             # What actually served the request, which is not always what was asked
             # for: a vendor may retire an id and route it to its successor. The
             # ledger and the price lookup follow the served model, so a routed

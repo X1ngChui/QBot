@@ -15,6 +15,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
+from collections.abc import Callable, Coroutine
 
 from ..db import repo
 from ..gateway.ingest import ingestor
@@ -113,11 +115,13 @@ def _label(name: str, args: dict, cfg: Settings) -> str:
 
     No numbers anywhere in here: a number is a position in one render, and this
     text is frozen into reply_trace forever."""
+    # defang the model's own arguments: the trace is frozen and replayed.
     if name == "read_url":
-        return f"读网页 {str(args.get('url') or '')[:cfg.prompt.provenance_query_chars]}"
+        url = defang(str(args.get("url") or ""))
+        return f"读网页 {url[:cfg.prompt.provenance_query_chars]}"
     if name == "open_images":
         return "看了图"
-    q = str(args.get("query") or args.get("question") or "").strip()
+    q = defang(str(args.get("query") or args.get("question") or "")).strip()
     return f"{TOOL_VERB.get(name, name)}“{q}”"
 
 
@@ -340,7 +344,11 @@ async def respond(
     window: list[ChatMsg] | None = None,
     reply_to: str = "",
     initiator: str = "",
+    track: Callable[[Coroutine], asyncio.Task] | None = None,
 ) -> bool:
+    """One reply, sent. `track` registers the record of a delivered reply with
+    whoever waits out loose work at shutdown, so the pool is not closed under
+    it; without one the record runs as a bare task."""
     try:
         raw, prov, trace = await generate(
             bot=bot, st=st, cfg=cfg, persona=persona, msg=msg, window=window)
@@ -372,8 +380,11 @@ async def respond(
     if reply_to and initiator:
         who = (await MEMBERS.name_of(bot, st.group_id, initiator)) or ""
         for form in {who, namesakes.bare(who)} - {""}:
-            if text.startswith("@" + form):
-                text = text[len(form) + 1:].lstrip()
+            # Only the asker's whole name: an address of a longer name that merely
+            # starts with the asker's must survive, as must anyone else's.
+            m = re.match(rf"@{re.escape(form)}(?=$|\s|[:：,，])[\s:：,，]*", text)
+            if m:
+                text = text[m.end():]
                 break
         if not text:
             log.warning("group %s: reply was nothing but the asker's name", st.group_id)
@@ -428,8 +439,9 @@ async def respond(
     # happens to this task. Shielded because shutdown cancels reply tasks, and a
     # delivered reply missing from the window and the archive is exactly the
     # one-sided conversation the restart rebuild must never read.
-    await asyncio.shield(_record(bot, st, persona, msg_id=msg_id, text=kept,
-                                 trace=trace, reply_to=reply_to))
+    record = _record(bot, st, persona, msg_id=msg_id, text=kept,
+                     trace=trace, reply_to=reply_to)
+    await asyncio.shield(track(record) if track else asyncio.create_task(record))
     log.info("group %s: replied (%d chars)", st.group_id, len(text))
     return True
 
@@ -453,11 +465,6 @@ async def _record(bot: BotApi, st: GroupState, persona: Persona, *, msg_id: str,
     right before the reply it fed (see _trace and prompt.render_history).
     """
     now = now_local()
-    if trace:
-        try:
-            await repo.trace_add(int(st.group_id), msg_id, trace)
-        except Exception:
-            log.exception("failed to persist the reply trace in group %s", st.group_id)
     st.add(
         ChatMsg(
             msg_id=msg_id,
@@ -472,6 +479,11 @@ async def _record(bot: BotApi, st: GroupState, persona: Persona, *, msg_id: str,
             reply_to=reply_to or None,
         )
     )
+    if trace:
+        try:
+            await repo.trace_add(int(st.group_id), msg_id, trace)
+        except Exception:
+            log.exception("failed to persist the reply trace in group %s", st.group_id)
     # Archive it like any other message. NapCat is configured not to report the bot's
     # own messages, so nothing else ever writes them down - and the archive feeds both
     # the restart-rebuilt history and the group card memory reads back, neither of which

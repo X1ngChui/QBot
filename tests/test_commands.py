@@ -226,11 +226,8 @@ def catalogue() -> None:
     check("a merge can be undone from inside the group",
           {"/merge", "/split"} <= set(PREFIXES))
     check("with the log reachable from inside the group", "/log" in PREFIXES)
-    # The member-facing half is gone: reading your own record and correcting it are things
-    # the bot does in conversation, and a command that duplicates them is a second
-    # interface to maintain.
-    check("nothing is left that duplicates talking to the bot",
-          "/whoami" not in PREFIXES)
+    # The catalogue is the whole routing table: a name nobody registered is chat.
+    check("an unregistered name is not a command", "/whoami" not in PREFIXES)
 
     # NoneBot resolves a message against the longest *registered* prefix, so a command
     # containing another is safe only while both are registered - the danger is a name

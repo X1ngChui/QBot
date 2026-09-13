@@ -192,7 +192,7 @@ person:
   # -- how to reach them, and what to call them -------------------------------
   handle_on:
     # The object carries both halves, so it is the whole phrase and there is no verb
-    # in front of it: it renders as "微博：@wang" rather than as a sentence about it.
+    # in front of it: it renders as "<platform>: <id>" rather than as a sentence about it.
     verb: "{}"
     cardinality: multi
     decay: stable

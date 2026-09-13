@@ -768,6 +768,26 @@ for _n in _ast.walk(_tree):
 check("every command handler checks who is calling it",
       not _ungated, "; ".join(_ungated))
 
+# The global-only set is catalogue data, and each handler's gate must agree with
+# it: a /merge that lost its global_only flag would answer a group-added owner.
+from qqbot.core.command_catalog import CATALOG as _CAT
+_gated_global = set()
+for _n in _ast.walk(_tree):
+    if not isinstance(_n, _ast.AsyncFunctionDef):
+        continue
+    _cmds = [_d.func.value.id for _d in _n.decorator_list
+             if isinstance(_d, _ast.Call) and isinstance(_d.func, _ast.Attribute)
+             and _d.func.attr == "handle" and isinstance(_d.func.value, _ast.Name)]
+    for _c in _ast.walk(_n):
+        if (isinstance(_c, _ast.Call) and isinstance(_c.func, _ast.Name)
+                and _c.func.id == "_gate"
+                and any(k.arg == "global_only" and isinstance(k.value, _ast.Constant)
+                        and k.value.value is True for k in _c.keywords)):
+            _gated_global.update("/" + c.removesuffix("_cmd") for c in _cmds)
+_catalog_global = {c.name for c in _CAT if c.global_only}
+check("the handlers gated global-only are exactly the catalogue's global-only set",
+      _gated_global == _catalog_global, f"{_gated_global} vs {_catalog_global}")
+
 # A name that does not exist anywhere in the file. Parsing catches a typo in the syntax;
 # nothing caught `int(owner)` in a function whose list is called `owners`, so the 09:00
 # report raised NameError on send and the report was never delivered - for three days,

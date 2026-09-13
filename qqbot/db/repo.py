@@ -494,6 +494,18 @@ async def member_seqs(group_id: int, user_ids: list[str]) -> dict[str, int]:
     return {r["platform_user_id"]: r["seq"] for r in rows}
 
 
+async def member_seqs_known(group_id: int, user_ids: list[str]) -> dict[str, int]:
+    """The serials these accounts already hold here; none is assigned."""
+    want = sorted({u for u in user_ids if u})
+    if not want:
+        return {}
+    rows = await pool().fetch(
+        "SELECT platform_user_id, seq FROM member_seq"
+        " WHERE group_id=$1 AND platform_user_id = ANY($2::text[])",
+        group_id, want)
+    return {r["platform_user_id"]: r["seq"] for r in rows}
+
+
 async def member_of_seq(group_id: int, seq: int) -> str | None:
     """The account a serial points at, or None for a number never assigned."""
     return await pool().fetchval(

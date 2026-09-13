@@ -287,14 +287,15 @@ class SearchCfg(_BackendCfg):
     backend: str
     base_url: str
     api_key_env: str = "SEARCH_API_KEY"
-    count: int = 5
+    #: Results per search; the vendor takes at most 20.
+    count: int = Field(5, ge=1, le=20)
     #: Result depth the vendor is asked for; "basic" is one credit, "advanced" two.
     #: Closed on purpose: the credit booking keys on the exact word, and a
     #: misspelling would be metered as basic while the vendor charged advanced.
     depth: Literal["basic", "advanced"] = "basic"
     #: The free tier's credit allowance per calendar month. At it search refuses; there
     #: is no paid fallback.
-    monthly_quota: int = 1000
+    monthly_quota: int = Field(1000, ge=0)
     #: HTTP proxy for the search client only - the endpoint is not reliably reachable
     #: from the deployment region directly. Empty means direct; model traffic never
     #: goes through this.
@@ -338,7 +339,7 @@ class BudgetCfg(_M):
     over. There is no softer fallback mode to fall to.
     """
 
-    daily_cny_cap: float = 5.0
+    daily_cny_cap: float = Field(5.0, ge=0)
     #: What one reply may spend, tool loop included. Money is the only limit - there is
     #: no per-day search count or per-reply round count, which are proxies for cost that
     #: drift whenever prices move. A reply that cannot afford another round stops
@@ -346,7 +347,7 @@ class BudgetCfg(_M):
     #: bounds the spending (overshoot is exactly that one round), it does not discard
     #: what was already paid for. Only the daily cap, checked before anything is spent,
     #: means silence.
-    per_reply_cny: float = 0.30
+    per_reply_cny: float = Field(0.30, ge=0)
 
 
 class RetrievalCfg(_M):
@@ -455,7 +456,7 @@ class ScheduleCfg(_M):
     #: At least 1: pruning keeps the newest `backup_keep` dumps, and 0 would read as
     #: "no pruning" while actually deleting the backup just written, every night.
     backup_keep: int = Field(14, ge=1)
-    napcat_cache_days: int = 7
+    napcat_cache_days: int = Field(7, ge=1)
     #: How long the pipeline waits for each stage's jobs to drain before moving on
     #: anyway. Extraction's worst honest night is max_passes model calls per group
     #: plus retry backoff; decay is one UPDATE per group. Moving on late beats a
@@ -761,26 +762,41 @@ class ConfigBundle:
 
     @staticmethod
     def _without_backends(group_id: str, overrides: dict) -> dict:
-        """A group's overrides with any llm.<capability>.backend dropped, and logged.
+        """A group's overrides with the keys no group may change dropped, and logged.
 
         The backend classes are built once at startup from the top-level config;
         a group may repoint endpoint and model (passed per call) but cannot change
-        which class serves it. Left in, the value would read back from the group's
-        merged settings as though it applied.
+        which class serves it. The daily cap and the monthly search allowance are
+        totals over every group, compared against one shared ledger: a group's
+        own number there would let it keep spending after the rest went quiet.
+        Left in, any of these would read back from the group's merged settings
+        as though it applied.
         """
+        out = overrides
         llm = overrides.get("llm")
-        if not isinstance(llm, dict):
-            return overrides
-        touched = [cap for cap, sec in llm.items()
-                   if isinstance(sec, dict) and "backend" in sec]
-        if not touched:
-            return overrides
-        log.warning("group %s overrides llm.%s.backend: backends are chosen once at "
-                    "startup from the top-level config, override ignored",
-                    group_id, "/".join(touched))
-        out = copy.deepcopy(overrides)
-        for cap in touched:
-            del out["llm"][cap]["backend"]
+        if isinstance(llm, dict):
+            touched = [cap for cap, sec in llm.items()
+                       if isinstance(sec, dict) and "backend" in sec]
+            if touched:
+                log.warning("group %s overrides llm.%s.backend: backends are chosen "
+                            "once at startup from the top-level config, override "
+                            "ignored", group_id, "/".join(touched))
+                out = copy.deepcopy(out)
+                for cap in touched:
+                    del out["llm"][cap]["backend"]
+        for path in (("budget", "daily_cny_cap"), ("llm", "search", "monthly_quota")):
+            node = out
+            for key in path[:-1]:
+                node = node.get(key) if isinstance(node, dict) else None
+            if isinstance(node, dict) and path[-1] in node:
+                log.warning("group %s overrides %s: a total over every group, "
+                            "override ignored", group_id, ".".join(path))
+                if out is overrides:
+                    out = copy.deepcopy(overrides)
+                node = out
+                for key in path[:-1]:
+                    node = node[key]
+                del node[path[-1]]
         return out
 
 

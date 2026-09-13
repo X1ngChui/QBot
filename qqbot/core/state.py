@@ -223,10 +223,19 @@ class GroupState:
         """
         if self.history_loaded:
             return
+        # Claimed before the read: two first arrivals would otherwise both
+        # rebuild, and the second would replace the deque under the first's
+        # message with an archived copy of it. Released again on failure.
+        self.history_loaded = True
+        try:
+            rows = await repo.recent_messages(int(self.group_id),
+                                              limit=self.recent.maxlen or 50)
+        except Exception:
+            self.history_loaded = False
+            raise
         limits = config().for_group(self.group_id)[0].prompt
         msgs: list[ChatMsg] = []
-        for r in await repo.recent_messages(int(self.group_id),
-                                            limit=self.recent.maxlen or 50):
+        for r in rows:
             payload = r["payload"] or {}
             text = (r["plain_text"] or "").strip()
             uid = (r["platform_user_id"] or "").strip()
@@ -252,7 +261,6 @@ class GroupState:
         archived = {m.msg_id for m in msgs}
         live = [m for m in self.recent if m.msg_id not in archived]
         self.recent = deque(msgs + live, maxlen=self._capacity())
-        self.history_loaded = True
         if msgs:
             log.info("group %s: rebuilt %d message(s) of history from the archive",
                      self.group_id, len(msgs))

@@ -37,6 +37,9 @@ trigger:
   # If it ever gets annoying, keep only the unambiguous names - @ still works.
   nicknames: ["小X", "小叉", "叉子"]
 
+# The deadlines and the shutdown wait below are read from this top-level section
+# only: they size clients and registries shared by every group, so a persona
+# override of them is ignored. media_wait_sec and max_msg_len honour overrides.
 gateway:
   dedup_ttl_sec: 300
   max_msg_len: 2000
@@ -163,7 +166,7 @@ llm:
     # max_images_per_min. With the free backend this is a CPU guard; for a
     # paid one (below) it is what stands before the daily cap, so lower it.
     max_clips_per_min: 20
-    timeout_sec: 60
+    timeout_sec: 60   # read by the API backends only; sherpa decodes in-process with no deadline
     # API alternative (per-second billing, MEDIA_API_KEY):
     #   backend: dashscope
     #   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
@@ -187,6 +190,7 @@ llm:
     api_key_env: SEARCH_API_KEY
     count: 5
     depth: basic              # 1 credit; "advanced" costs 2
+    # A total over every group, like the daily cap: a persona override is ignored.
     monthly_quota: 1000       # the free tier; at it search refuses, nothing bills
     # HTTP proxy for the search client only; model traffic stays direct. Empty
     # means direct. A proxy running on the deploy host is reached at the docker
@@ -200,6 +204,8 @@ budget:
   # timezone above.
   # Only paid backends answer to it: free ones (sherpa transcription) pass
   # straight through, so their pace gates are the only thing holding them.
+  # A total over every group against one shared ledger; a persona override of
+  # it is ignored (see _without_backends in settings.py).
   daily_cny_cap: 3.0
   # What one reply may spend, in CNY, tool loop included. Money is the only
   # constraint: free tools run without limit, paid rounds account against this
@@ -348,3 +354,5 @@ agreement:
 # (settings.PROMPT_KEYS); ls this directory to see the set. A file missing or
 # empty fails the load. Wording rationale: prompts/README.md.
 prompts_dir: prompts
+# What may be recorded about a person, one entry per predicate (see the file).
+predicates_file: predicates.yaml

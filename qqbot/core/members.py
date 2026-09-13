@@ -188,10 +188,11 @@ class MemberDirectory:
         raw = await self.raw_names_of(bot, group_id, list(ids))
         gone = {m.user_id: namesakes.bare(m.nickname) for m in msgs
                 if not m.is_bot and m.user_id and m.user_id not in raw}
-        if gone and set(gone.values()) & set(raw.values()):
+        if gone:
             try:
                 tags = await namesakes.tags(int(group_id), {**raw, **gone})
                 live = {u: raw[u] + tags.get(u, "") for u in raw}
+                # A departed name that collides with nobody goes bare again.
                 live.update({u: n + tags.get(u, "") for u, n in gone.items()})
             except Exception as e:
                 log.warning("group %s: namesake numbering unavailable, "

@@ -22,7 +22,7 @@ import logging
 from datetime import datetime
 
 from ..db import pool
-from ..settings import config
+from ..settings import RetrievalCfg, config
 from ..util import defang, merge_overlapping, sysmark, why
 from . import namesakes
 from ..repositories import (
@@ -182,7 +182,8 @@ def _retriever() -> Retriever:
     return got
 
 
-async def episode_lookup(group_id: str, question: str) -> str:
+async def episode_lookup(group_id: str, question: str,
+                         rcfg: RetrievalCfg | None = None) -> str:
     """Episodic memory searched on demand, rendered. "" when nothing is close.
 
     On demand is the only way the past reaches a reply: a block pushed per turn
@@ -208,7 +209,7 @@ async def episode_lookup(group_id: str, question: str) -> str:
         return (f"{sysmark(f'{e.started_at:%m-%d}')} {defang(e.summary)}"
                 if e.started_at else f"- {defang(e.summary)}")
 
-    ctx = max(0, config().default.retrieval.episode_context)
+    ctx = max(0, (rcfg or config().default.retrieval).episode_context)
     windows = (await EpisodeRepository().around(
         int(group_id), [e.id for e in eps], ctx)) if ctx else {}
     if not windows:
@@ -254,11 +255,12 @@ async def group_knowledge(group_id: str) -> list[str]:
     out = []
     for f in sorted(facts, key=lambda f: (f.predicate != GROUP_TOPIC, f.predicate,
                                           f.object_key or "", str(f.object_value or ""))):
-        value = "" if f.object_value is None else str(f.object_value).strip()
+        # defang on render: the values are extractor output over member text.
+        value = "" if f.object_value is None else defang(str(f.object_value)).strip()
         if not value:
             continue
         if f.predicate == GROUP_TERM:
-            out.append(f"{f.object_key}：{value}")
+            out.append(f"{defang(str(f.object_key or ''))}：{value}")
         else:
             out.append(value)
     return out

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -30,7 +31,7 @@ from nonebot.adapters.onebot.v11 import GroupMessageEvent
 from nonebot.matcher import Matcher, current_bot, current_event
 from pydantic import ValidationError
 
-from ..core import agreement, command_catalog, debug, errors, perms
+from ..core import agreement, command_catalog, debug, errors, namesakes, perms
 from ..core.pipeline import note_console_reply
 from ..core.budget import BUDGET, hit_split
 from ..core.members import MEMBERS
@@ -43,7 +44,7 @@ from ..providers import Kind, providers
 from ..repositories.event import EventRepository
 from ..services import NameTaken, NotMerged, PersonCard, UnknownAccount
 from ..settings import config, reload_config
-from ..util import fmt_when, now_local, parse_duration, today_local, why
+from ..util import defang, fmt_when, now_local, parse_duration, today_local, why
 
 log = logging.getLogger("qqbot.cmd")
 
@@ -123,6 +124,24 @@ async def _gate(matcher: Matcher, event: GroupMessageEvent,
     return False  # unreachable; finish() raises
 
 
+async def _name(gid: str, user_id: str) -> str:
+    """How an answer names an account: the current group card, else the name the
+    archive knows them by, else the account number said as such. Answers name
+    people the way the group does; a bare number is what nobody recognises.
+    Bare of the namesake tag: that is transcript notation, and nothing the
+    console posts to the group may carry a system marker."""
+    bot = current_bot.get()
+    if name := await MEMBERS.name_of(bot, gid, user_id):
+        return namesakes.bare(name)
+    try:
+        card = await directory().person(int(gid), user_id)
+        if card.display and card.display not in card.accounts:
+            return namesakes.bare(card.display)
+    except UnknownAccount:
+        pass
+    return f"账号 {user_id}"
+
+
 async def _own_accounts(event: GroupMessageEvent) -> list[str]:
     """Every account of the person speaking - "yourself" means the person, so
     a merged alt operates its main's record, same as /block treats them."""
@@ -194,7 +213,11 @@ help_cmd = on_command("help", **_CMD)
 
 
 def _strip_cmd(text: str, name: str) -> str:
-    text = text.strip()
+    """The typed argument after the command name, defanged: it is member text,
+    and what a note or an alias says is stored, echoed into the window and
+    rendered into the prompt - a reserved bracket typed here would otherwise
+    read as a system marker on every later turn."""
+    text = defang(text.strip())
     for cmd in (f"/{name}", name):
         if text.startswith(cmd):
             return text[len(cmd):].strip()
@@ -239,32 +262,40 @@ def _one_person(card: PersonCard) -> str:
     """One person in full, with the numbers /forget takes and what each entry rests on."""
     lines = [f"{card.display}（{card.messages} 条发言）"]
     if card.merged:
-        lines.append(f"  账号：{len(card.accounts)} 个已合并")
+        lines.append(f"　账号：{len(card.accounts)} 个，已合并")
     if named := [n for n in card.names if n.text != card.display]:
-        lines.append("  称呼：" + "、".join(
+        lines.append("　称呼：" + "、".join(
             f"{n.text}（{n.confidence:.2f}）" for n in named))
     if card.candidates:
-        lines.append("  未确认：" + "、".join(
+        lines.append("　未确认：" + "、".join(
             f"{n.text}（{n.confidence:.2f}）" for n in card.candidates))
     if not card.facts:
-        lines.append("  记录：（暂无）")
+        lines.append("　记录：（暂无）")
         return "\n".join(lines)
 
-    lines.append("  记录：")
+    lines.append("　记录：")
     for f in card.facts:
         if not f.text:
             continue
         tail = "（人工）" if f.manual else f"（{f.confidence:.2f}）"
-        lines.append(f"　{f.index}. {f.text}{tail}")
+        lines.append(f"　　{f.index}. {f.text}{tail}")
     return "\n".join(lines)
 
 
 async def _card_of(matcher: Matcher, group_id: int, user_id: str) -> PersonCard:
-    """The person behind an @, or a refusal saying which of the two things went wrong."""
+    """The person behind an @, or a refusal saying which of the two things went wrong.
+
+    A card whose display is a bare account number (an account only ever @-ed
+    here, so no group card was ever filed) is renamed the way every other
+    answer names people.
+    """
     try:
-        return await directory().person(group_id, user_id)
+        card = await directory().person(group_id, user_id)
     except UnknownAccount:
-        await _finish(matcher, "本群还没有这个账号的记录。多聊几句就有了。")
+        await _finish(matcher, "本群还没有该成员的记录。")
+    if not card.display or card.display in card.accounts:
+        card = replace(card, display=await _name(str(group_id), user_id))
+    return card
 
 
 # -- configuration ----------------------------------------------------------
@@ -280,7 +311,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     """
     await _gate(matcher, event, self_serve=True, pre_agreement=True)
     if await agreement.accept(str(event.group_id), str(event.user_id)):
-        await _finish(matcher, "已记录：你在本群同意了用户协议。")
+        await _finish(matcher, "已记录你在本群同意用户协议。")
     await _finish(matcher, "你已在本群同意过用户协议，无需重复发送。")
 
 
@@ -366,10 +397,11 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
                 if t is None or t > now_local()}
         if not live:
             await _finish(matcher, "本群没有屏蔽任何人。用法：/block @某人")
+        named = [(await _name(gid, uid), t) for uid, t in live.items()]
         shown = "、".join(
-            uid + (f"（至 {fmt_when(t)}）" if t else "")
-            for uid, t in sorted(live.items()))
-        await _finish(matcher, _fit(f"本群已屏蔽 {shown}（共 {len(live)} 个账号）",
+            name + (f"（至 {fmt_when(t)}）" if t else "")
+            for name, t in sorted(named, key=lambda p: p[0]))
+        await _finish(matcher, _fit(f"本群屏蔽名单（{len(live)} 个账号）：{shown}",
                                   gid=gid))
     target = at[0]
     arg = _strip_cmd(event.get_plaintext(), "block").strip()
@@ -377,12 +409,13 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     if arg:
         span = parse_duration(arg)
         if span is None:
-            await _finish(matcher, "时长看不懂。示例：/block @某人 3d（m 分钟、h 小时、d 天）")
+            await _finish(matcher,
+                          "时长格式无效。示例：/block @某人 3d（单位：m 分钟、h 小时、d 天）")
         until = now_local() + span
     if perms.is_owner(target, cfg.owners):
         await _finish(matcher, "不能屏蔽拥有者。")
     if str(event.self_id) == target:
-        await _finish(matcher, "这是我自己。")
+        await _finish(matcher, "不能屏蔽机器人自己。")
     # A merge made several accounts one person, and blocking the account that was
     # @-ed while the alt keeps talking is not blocking anybody.
     accounts = await directory().accounts_of_person(target)
@@ -395,7 +428,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
              f", until {until:%m-%d %H:%M}" if until else "")
     extra = f"（同一人的 {len(accounts)} 个账号）" if len(accounts) > 1 else ""
     lapse = f"，{fmt_when(until)} 自动解除" if until else ""
-    await _finish(matcher, f"已屏蔽 {target}{extra}{lapse}。")
+    await _finish(matcher, f"已屏蔽 {await _name(gid, target)}{extra}{lapse}。")
 
 
 @unblock_cmd.handle()
@@ -405,11 +438,11 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     st = await REGISTRY.get(gid)
     at = _mentioned(event)
     if not at:
-        await _finish(matcher, "要解除谁？用法：/unblock @某人")
+        await _finish(matcher, "请 @ 要解除屏蔽的成员。用法：/unblock @某人")
     target = at[0]
     accounts = await directory().accounts_of_person(target)
     if not any(a in st.blocked for a in accounts):
-        await _finish(matcher, f"{target} 不在本群的屏蔽名单里。")
+        await _finish(matcher, f"{await _name(gid, target)} 不在本群的屏蔽名单里。")
     # Lifted for the whole person, like it was applied: leaving one account of a
     # merged pair blocked would look like the command silently failed.
     for a in accounts:
@@ -418,7 +451,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     log.info("group %s: person %s unblocked by owner (%d account(s))",
              gid, target, len(accounts))
     extra = f"（同一人的 {len(accounts)} 个账号）" if len(accounts) > 1 else ""
-    await _finish(matcher, f"已解除对 {target}{extra} 的屏蔽。")
+    await _finish(matcher, f"已解除对 {await _name(gid, target)}{extra} 的屏蔽。")
 
 
 @mute_cmd.handle()
@@ -502,14 +535,11 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     k = min(int(arg), 20) if arg.isdecimal() and int(arg) > 0 else 5
     rows = await repo.top_spenders(int(gid), k=k)
     if not rows:
-        await _finish(matcher, "本月本群还没有可归因的花费。")
+        await _finish(matcher, "本群本月尚无可归因的花费。")
     lines = ["本群本月花费排行"]
     for i, r in enumerate(rows, 1):
         accounts = list(r["accounts"])
-        try:
-            name = (await directory().person(int(gid), accounts[0])).display
-        except UnknownAccount:
-            name = accounts[0]
+        name = await _name(gid, accounts[0])
         tag = f"（{len(accounts)} 个账号）" if len(accounts) > 1 else ""
         lines.append(f"{i}. {name}{tag}　¥{float(r['cny']):.3f}　{int(r['calls'])} 次")
     await _finish(matcher, _fit("\n".join(lines), gid=gid))
@@ -563,12 +593,12 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
 
     parts = []
     if fixed:
-        parts.append("固定资料（人工写在人设里）：\n" + fixed)
+        parts.append("固定资料（写在人设文件里）：\n" + fixed)
     if learned:
         parts.append("自动归纳：\n" + "\n".join(
             f"　{f.index}. {f.text}（{f.confidence:.2f}）" for f in learned))
     else:
-        parts.append("自动归纳：（暂为空）")
+        parts.append("自动归纳：（暂无）")
     await _finish(matcher, _fit("\n\n".join(parts), gid=str(gid)))
 
 
@@ -607,14 +637,14 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
             except UnknownAccount:
                 continue
         if not cards:
-            await _finish(matcher, "这些账号在本群还没有说过话，暂时没有记录。")
+            await _finish(matcher, "这些成员在本群还没有记录。")
         await _finish(matcher, _fit("\n".join(_one_person(c) for c in cards),
                                   gid=str(gid)))
 
-    if wanted := _strip_cmd(event.get_plaintext(), "who"):
+    if _strip_cmd(event.get_plaintext(), "who"):
         await _finish(matcher,
-            f"要查「{wanted}」请用 /who @{wanted}，直接 @ 他。\n"
-            "名字会重复、会改，@ 带的是账号，指到的一定是那个人。"
+            "请用 @ 指定成员：/who @某人。\n"
+            "昵称可能重复或更改，@ 才能准确指向账号。"
         )
 
     rows = await directory().roster(gid)
@@ -641,7 +671,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     gid = int(event.group_id)
     at = _mentioned(event)
     if not at:
-        await _finish(matcher, "要指定成员，请 @ 他：/note @某人 内容")
+        await _finish(matcher, "请 @ 指定成员。用法：/note @某人 内容")
     if not owner:
         if at[0] not in await _own_accounts(event):
             await matcher.finish()
@@ -655,16 +685,16 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     if not text:
         if not card.note:
             await _finish(matcher,
-                f"{card.display} 目前没有备注。\n"
-                "用法：/note @某人 内容　写入；内容写 - 清除"
+                f"{card.display} 暂无备注。\n"
+                "用法：/note @某人 内容（写入）；/note @某人 -（清除）"
             )
-        await _finish(matcher, f"{card.display} 当前的备注：\n{card.note}")
+        await _finish(matcher, f"{card.display} 的备注：\n{card.note}")
 
     note = "" if text == DROP else text
     await directory().note(gid, target, note)
     if not note:
         await _finish(matcher, f"已清除 {card.display} 的备注。")
-    await _finish(matcher, f"已记下 {card.display} 的备注：\n{note}")
+    await _finish(matcher, f"已写入 {card.display} 的备注：\n{note}")
 
 
 @alias_cmd.handle()
@@ -685,7 +715,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     gid = int(event.group_id)
     at = _mentioned(event)
     if not at:
-        await _finish(matcher, "要指定成员，请 @ 他：/alias @某人 称呼")
+        await _finish(matcher, "请 @ 指定成员。用法：/alias @某人 称呼")
     if not owner:
         if at[0] not in await _own_accounts(event):
             await matcher.finish()
@@ -698,10 +728,10 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
 
     if not arg:
         if not card.names and not card.candidates:
-            await _finish(matcher, f"{card.display} 目前没有记录在案的称呼。")
-        lines = [f"· {n.text}（{n.confidence:.2f}）"
-                 + ("（平台）" if n.platform_given else "")
-                 + ("（全局）" if n.is_global else "")
+            await _finish(matcher, f"{card.display} 暂无记录在案的称呼。")
+        lines = [f"· {n.text}（{n.confidence:.2f}"
+                 + ("，平台" if n.platform_given else "")
+                 + ("，全局" if n.is_global else "") + "）"
                  for n in card.names]
         if card.candidates:
             lines.append("未确认：")
@@ -712,7 +742,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     if arg.startswith(DROP):
         name = arg[len(DROP):].strip()
         if not name:
-            await _finish(matcher, "要撤销哪个称呼？用法：/alias @某人 -称呼")
+            await _finish(matcher, "请写明要撤销的称呼。用法：/alias @某人 -称呼")
         if await directory().unname(gid, target, name):
             await _finish(matcher, f"已撤销 {card.display} 的称呼「{name}」。")
         await _finish(matcher, f"{card.display} 名下没有「{name}」这个称呼。")
@@ -729,9 +759,12 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
             await _finish(matcher, "置信度需为 0 到 1 的数字，例如：/alias @某人 阿明=0.6")
             return
         if not name:
-            await _finish(matcher, "要设置哪个称呼？用法：/alias @某人 称呼=0.6")
+            await _finish(matcher, "请写明称呼。用法：/alias @某人 称呼=0.6")
         try:
             n = await directory().set_confidence(gid, target, name, conf)
+        except ValueError as e:
+            await _finish(matcher, str(e))
+            return
         except NameTaken as e:
             await _finish(matcher,
                 f"「{e.text}」在本群已经指向 {e.holder}，一个称呼只能指一个人。")
@@ -743,10 +776,13 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
 
     try:
         await directory().name(gid, target, arg)
+    except ValueError as e:
+        await _finish(matcher, str(e))
+        return
     except NameTaken as e:
         await _finish(matcher,
             f"「{e.text}」在本群已经指向 {e.holder}，一个称呼只能指一个人。\n"
-            f"要改的话，先在他名下撤销：/alias @他 -{e.text}")
+            f"如需改为指向本人，请先在对方名下撤销：/alias @对方 -{e.text}")
         return
     await _finish(matcher, f"已登记：{card.display} 也叫「{arg}」。")
 
@@ -770,7 +806,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     arg = _strip_cmd(event.get_plaintext(), "forget").strip()
     digits = next((w for w in arg.split() if w.isdecimal()), "")
     if not digits:
-        await _finish(matcher, "要删除哪一条？编号取自 /who @某人 或 /card。")
+        await _finish(matcher, "请写明要删除的编号。编号见 /who @某人 或 /card。")
 
     at = _mentioned(event)
     if not owner:
@@ -782,7 +818,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
                else await directory().forget_group_fact(gid, int(digits)))
     if dropped is None:
         await _finish(matcher,
-            f"没有编号 {digits} 这一条。用 /who @某人 或 /card 看当前的编号。")
+            f"没有编号为 {digits} 的记录。编号见 /who @某人 或 /card。")
     await _finish(matcher, f"已删除：{dropped.text}")
 
 
@@ -800,18 +836,19 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     await _gate(matcher, event, global_only=True)
     at = _mentioned(event)
     if len(at) < 2:
-        await _finish(matcher, "要合并哪两个账号？用法：/merge @小号 @大号")
+        await _finish(matcher, "请 @ 两个账号。用法：/merge @小号 @大号")
     loser, winner = at[0], at[1]
     if loser == winner:
         await _finish(matcher, "这是同一个账号。")
     if str(event.self_id) in (loser, winner):
         # The bot has no person of its own to fold anyone into: merged with a
         # member, its id would follow that person into every block and roster.
-        await _finish(matcher, "这是我自己。")
+        await _finish(matcher, "不能合并机器人自己的账号。")
     try:
         changed = await directory().merge(loser, winner)
     except UnknownAccount as e:
-        await _finish(matcher, f"账号 {e.user_id} 没有任何记录，无法合并。")
+        await _finish(matcher,
+                      f"{await _name(str(event.group_id), e.user_id)} 没有任何记录，无法合并。")
         return
     # Being blocked is a decision about a person, so it follows them across the
     # merge: an alt that stayed unblocked would keep talking, keep being archived
@@ -843,13 +880,14 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     await _gate(matcher, event, global_only=True)
     at = _mentioned(event)
     if not at:
-        await _finish(matcher, "要拆分哪个账号？用法：/split @某人")
+        await _finish(matcher, "请 @ 要拆分的账号。用法：/split @某人")
     if at[0] == str(event.self_id):
-        await _finish(matcher, "这是我自己。")
+        await _finish(matcher, "不能拆分机器人自己的账号。")
     try:
         await directory().split(at[0])
     except UnknownAccount as e:
-        await _finish(matcher, f"账号 {e.user_id} 没有任何记录，无法拆分。")
+        await _finish(matcher,
+                      f"{await _name(str(event.group_id), e.user_id)} 没有任何记录，无法拆分。")
         return
     except NotMerged as e:
         # A lone account has nothing to split from; the service refuses rather
@@ -915,11 +953,11 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
             f.seek(max(0, size - LOG_TAIL_BYTES))
             tail = f.read().decode("utf-8", "replace")
     except OSError as e:
-        await _finish(matcher, f"读不到日志文件：{e}")
+        await _finish(matcher, f"无法读取日志文件：{e}")
         return
     lines = [ln for ln in tail.splitlines() if ln.strip()][-n:]
     if not lines:
-        await _finish(matcher, "日志是空的。")
+        await _finish(matcher, "日志为空。")
         return
     await _finish(matcher, _fit("\n".join(lines), head=False, gid=str(event.group_id)))
 
@@ -938,12 +976,16 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     directory of what is being hidden.
     """
     owner = await _gate(matcher, event, self_serve=True)
+    # The global-only commands answer the default owner list alone, so an
+    # owner a single group's override added must not see them advertised.
+    global_owner = owner and perms.is_owner(str(event.user_id), config().default.owners)
     wanted = _strip_cmd(event.get_plaintext(), "help")
     if not wanted:
-        await _finish(matcher, _fit(command_catalog.help_text(owner=owner),
-                                  gid=str(event.group_id)))
+        await _finish(matcher, _fit(command_catalog.help_text(
+            owner=owner, global_owner=global_owner), gid=str(event.group_id)))
 
     cmd = command_catalog.find(wanted)
-    if cmd is None or not (owner or cmd.self_serve or cmd.member):
-        await _finish(matcher, f"没有「{wanted}」这条指令。用 /help 看全部。")
+    if cmd is None or not (owner or cmd.self_serve or cmd.member) or (
+            cmd.global_only and not global_owner):
+        await _finish(matcher, f"没有「{wanted}」这条指令。发送 /help 查看全部。")
     await _finish(matcher, _fit(command_catalog.detail_text(cmd), gid=str(event.group_id)))

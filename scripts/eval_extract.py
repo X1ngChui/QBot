@@ -58,7 +58,8 @@ KNOWN = "\n".join([
     "- 王大锤答应周末把切片做完",
     # An infected prior episode, planted on purpose: editorial style once written
     # comes back through the known block every night, and the model must not
-    # copy it (production caught this loop live - the "属又一轮…测试" tail).
+    # copy it (the failure mode is a summary that grows a tail of editorial
+    # commentary on the previous summary).
     "- 小红和陈其向王大锤连环提问考他的知识，属又一轮对老王记忆能力的测试",
 ])
 
@@ -73,8 +74,8 @@ LINES = [
     "⟦09-07 21:02⟧ 王大锤⟦1⟧: 就是换了个住处，工作没变",
     # The boundaries the newer predicates draw, each against the one it would
     # otherwise leak into: a school already finished (not studies_at), a city
-    # lived in before (not lives_in, which the same batch changes to 无锡), an
-    # account that has to arrive as 平台：ID whatever the sentence said, and a
+    # lived in before (not lives_in, which the same batch changes to a new city), an
+    # account that has to arrive in the platform:id shape whatever the sentence said, and a
     # name the person asks for (not an alias somebody else used).
     "⟦09-07 21:02⟧ 王大锤⟦1⟧: 我临江大学毕业好几年了，现在早不读书了",
     "⟦09-07 21:02⟧ 王大锤⟦1⟧: 之前在成都住过三年，那边冬天湿冷",
@@ -121,7 +122,8 @@ def main_checks(cands: list) -> list[tuple[str, bool, str]]:
     episodes = [str(p.get("summary", "")) for p in payloads("record_episode")]
     dinner = any("聚餐" in s or "周六" in s for s in episodes)
     # The infected known episode plants the style; a clean summary neither
-    # editorialises (属…测试/考验) nor reaches outside its own batch (又一轮).
+    # editorialises (calling it a test or an ordeal) nor reaches outside its own batch
+    # (calling it another round).
     styled = [s for s in episodes
               if re.search(r"又一轮|考验|属.{0,10}(测试|考察)", s)]
     self_named = [p for p in payloads("record_alias")

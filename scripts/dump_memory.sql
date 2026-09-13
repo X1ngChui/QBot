@@ -1,5 +1,7 @@
 -- What one group's long-term memory currently holds. Read-only.
---   psql -U qqbot -d qqbot -v gid=424242 -f dump_memory.sql
+--   psql -U qqbot -d qqbot -v gid=424242 -v model=text-embedding-v4 -f dump_memory.sql
+-- `model` is the embedding backend in use: a vector written by another model does
+-- not count, exactly as the worker sees it.
 \set QUIET on
 \pset pager off
 
@@ -14,7 +16,8 @@ SELECT (SELECT count(*) FROM raw_event  WHERE group_id = :gid) AS 原始消息,
                                           AND status = 'active')             AS 情景,
        (SELECT count(*) FROM memory_candidate WHERE group_id = :gid
                                           AND status = 'rejected')           AS 被拒候选,
-       (SELECT count(*) FROM memory_job WHERE status = 'pending')            AS 待办作业;
+       (SELECT count(*) FROM memory_job WHERE status = 'pending'
+                                          AND payload->>'group_id' = :'gid')  AS 待办作业;
 
 \echo ''
 \echo '===== 关于群本身 ====='
@@ -72,7 +75,8 @@ SELECT to_char(ep.started_at, 'MM-DD') AS 日期, ep.episode_type AS 类型,
        round(ep.importance::numeric, 2) AS 重要度,
        (SELECT count(*) FROM episode_participant p WHERE p.episode_id = ep.id) AS 参与人,
        (SELECT count(*) FROM embedding_index ix
-         WHERE ix.object_id = ep.id AND ix.object_type = 'episode') AS 有向量
+         WHERE ix.object_id = ep.id AND ix.object_type = 'episode'
+           AND ix.embedding_model = :'model') AS 有向量
   FROM episode ep
  WHERE ep.group_id = :gid AND ep.status = 'active'
  ORDER BY ep.importance DESC, ep.started_at DESC;

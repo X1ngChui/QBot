@@ -127,6 +127,10 @@ def fused_confidence(evidence: list[AliasEvidence]) -> float:
     return 1.0 - miss
 
 
+#: The alias column's width. A longer "name" is not a name, and the store would
+#: refuse the row after every check had passed it.
+ALIAS_MAX_CHARS = 256
+
 #: What it takes to reach confirmed. One inference by the model (0.25) does not get
 #: there; a platform name that endures into a second day, or three different people
 #: using the same nickname, does - which is exactly the line worth drawing.
