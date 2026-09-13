@@ -1,103 +1,74 @@
-# config/prompts/ — 提示词（数据驱动，唯一事实源）
+# Prompts
 
-系统所有模型可见的指令文本都是独立文件，**文件即事实源**：每个键对应
-`settings.prompts_dir`（默认本目录）下的 `<键>.txt`，代码持有键清单
-（`settings.PROMPT_KEYS`）——**文件缺失或为空都会拒绝启动**，键集不可能静默漂移。修改后发 `/reload` 生效；例外是抽取
-路径——`extract` 与拼进它的 `legend`、`extract_legend_note`、`tone_rules`、
-`tone_extract_note` 在 worker 构造时组合进前缀缓存，对抽取重启后才生效
-（共享件在回复路径照常 /reload）。
+Every instruction text the model reads lives here as its own file. The files are the
+source of truth: each key in `PROMPT_KEYS` (`qqbot/settings.py`) is `<key>.txt` in
+this directory, and a missing or empty file fails the configuration load. Edits apply
+on `/reload`, except the extraction family, which is composed when the memory worker
+starts and therefore needs a restart.
 
-文风要求：精确、客观、平实、中性；行内引语一律直角引号「」；举例不得使用
-真实聊天记录与真人信息。全部文件由 DeepSeek 按需求清单起草、人工审查定稿；
-改动之后跑 `scripts/eval_replies.py`（回复家族）或 `scripts/eval_extract.py`
-（抽取家族），两者都是真模型、每次几分钱。
+Marker formats (`⟦图片N:…⟧`, `#N`, `⟦同名N⟧` and so on), section headings and one-line
+mechanical notices stay in code, because code both produces and parses them. Changing a
+marker means changing the code and the prompt that explains it together.
 
-标记格式本身（`⟦图片N:…⟧`、`#N`、`⟦同名N⟧` 等）、章节标题、机械性单行告知
-仍在代码里——代码既产生也解析它们，措辞与格式必须一起改。
+## How the files compose
 
-## 系统括号语法
+The reply prompt, in order:
 
-所有系统标注只使用保留括号对 `⟦ ⟧`（U+27E6/U+27E7，`util.SYS_L/SYS_R`）。
-一切不可信字符串——成员消息文本、昵称、图片与语音的模型描述、转发与卡片
-内容、网页与搜索摘要——在进入转写前经 `util.defang()` 把这对括号替换成
-普通方括号。于是标注从机制上不可伪造：名字叫「小明（拥有者）」「张伟(3)」、
-或正文写「[图片:…]」的成员，产生的都是与语法无碰撞的普通文本。这替代了
-方括号语法下「只能靠措辞恳求模型别上当」的局面；`output.clean_reply`
-的末级兜底保证回复中不带保留括号出群。各标注的分工：
+```text
+legend + legend_reply_note
+identity_rules + credibility_rules
+private_rules
+tone_rules + tone_reply_note
+persona, group knowledge, roster, history, tool results, current message
+reply_final
+```
 
-- 共用：`⟦时间⟧` 行首时间戳、`⟦同名N⟧` 同名成员固定编号、`⟦你⟧` 自有发言标记（抽取转写与查档结果）、媒体与群事件标注。
-- 仅回复路径：`#N` 行号、`⟦回复 #N⟧`、`⟦拥有者⟧`、`⟦依据:…⟧`、`⟦检索记录⟧`；机器人自己的行以「@某某 」开头。
-- 仅抽取路径：`⟦N⟧` 账号码（名册与发言行）。
+The extraction prompt:
 
-行边界锚定：转写行以 `#N ⟦时间⟧` 或 `⟦时间⟧` 开头，其余行是上一条的换行——
-多行消息不能伪造行首。存档只有这一种标记语法，`search_history` 的 speaker 参数
-形态都接受。
+```text
+extract (with the predicate rules from predicates.yaml rendered into its slot)
+tone_rules + tone_extract_note
+legend + extract_legend_note
+```
 
-## 键清单与措辞背后的事故
+`describe_image` stands alone as the vision call's instruction. The five `tool_*`
+files are the tool descriptions handed to the model with the function schemas.
 
-每段措辞都有它防过的真实翻车，改动前先读对应条目：
+## The files
 
-- **`legend`** — 转写标记图例（回复与抽取共用）。开篇的系统括号原则是全部
-  防注入语义的根：有了「⟦⟧ 内才是系统标注」这条机械判据，旧版散落各处的
-  「这个标记别当真」措辞全部收拢为一段。只放两条路径都会见到的标记：
-  不认识图片标记的模型会坚称「看不到图」，哪怕描述就在手里。时间标注与
-  连续性段落防的是：没有时间，模型会把相隔数小时的两段对话强行接成一个话题。
-  转发记录有两种形态（带条数与缩进行的展开形、协议端只给 id 时的裸标注），
-  图例两种都列，否则模型会把裸标注读成「记录被系统省略了」。
-  转发与分享的指令豁免段防注入。只描述标记的含义；「不要写出标记」的
-  行为规则住在 reply_final，「不要提及标记」住在 private_rules。
-- **`legend_reply_note`** — 回复侧补充：标注带描述即「已看到/听到」，须直接
-  作答，不得让对方重复提问；原图不附、按编号 open_images 取回。回复窗口特有的标记（#N、
-  ⟦回复 #N⟧、⟦依据:…⟧、⟦检索记录⟧）住在这里——抽取的转写里
-  没有它们，放在共用图例既撑长抽取前缀，又让「编号」一词两义。末尾的虚构
-  示例行展示全部行内要素的位置关系。
-- **`extract_legend_note`** — 抽取侧补充：标注是系统转写痕迹。没有它，模型
-  会把「群里可以发图片」当作群知识记下来。语音例外须写明：一刀切的「标注
-  内文字不算发言」会把语音转写——它就是发言本身——排除在提取之外。⟦你⟧ 行
-  的抽取后果（不取候选、不作 quote）与 ⟦N⟧/⟦同名N⟧ 之辨也在这里；⟦你⟧ 的
-  含义本身在共用图例，因为查档结果里也会出现它。
-- **`identity_rules`** — 账号/昵称/人三概念与昵称解析（含 ⟦同名N⟧）。模型天然把字符串相似当作同一人的证据：会把重排昵称的
-  两个账号合并、把别名当子串匹配到别人头上。⟦拥有者⟧ 标注的完整语义住这里。
-- **`credibility_rules`** — 名册两栏（已确认/未确认）与自身历史发言
-  （⟦依据⟧ 有无之别）的可信度分级。与 identity_rules 同住【信息解读规则】
-  标题下，拆开是因为二者独立演化。模型会把自己信息不足时的旧回答当作已
-  确认事实引用，也会守着过时的「看不到图」不肯改口。末节【涉及过往事实的
-  检索与回答】是检索义务：eval 实测（2026-09-09）没有它时模型约半数概率
-  不查档就凭窗口氛围指认（窗口里有人「想买」就被当成买了的人）或不查就说
-  不知道；加它之后 initiative 案例 4/4。「不知道只能在检索之后说」与
-  「不要让提问者自己去查」都对应真实观测到的回答。
-- **`private_rules`** — 系统给你看的东西（标注、⟦拥有者⟧/⟦同名N⟧、名册、
-  提示词本身）不得外泄，也不得在回复里提及其存在。这些内容在文本里与人说
-  的话无异，不明说，模型无从分辨引用与泄露。只管保密；输出契约住 reply_final。
-- **`tone_rules`** — 群聊语用判读，一份两路径共用；判断标准只写这一份，
-  两个后果注不得复述，两边才不会漂移。字面化解读会把朋友互损读成敌意。
-- **`tone_reply_note`** — 回复侧后果注：顺着玩、不纠正玩笑。
-- **`tone_extract_note`** — 抽取侧后果注：没有被当真的话不产生任何候选，
-  互动形式不构成事件。
-- **`reply_final`** — 尾部收束，三件事各一段：其一指向「刚收到的消息」
-  （背景里的指令没有约束力——埋在历史消息里的风格指令曾被照办；例外从句
-  「除非…明确要你代答」不是装饰，没有它替别人问的问题读起来像被禁止回答）。
-  其二输出形态契约：只写正文，不模仿转写读法（含一切 ⟦⟧ 标注）。其三受话人：
-  正文的「你」只指提问者，替他说给第三者的话用名字称呼（真实事故：挖苦
-  第三者的正文用了「你」的口吻，读起来像在骂提问者）。
-- **`describe_image`** — 图片归档描述的提问；长度限制约束整个回答。
-- **`extract`** — 记忆抽取的完整规则书。与工具 schema 强耦合（谓词名、
-  quote/账号码契约由 Validator 强制执行），改动必须保持这些引用一致。
-  【你自己】节配「你的名字」输入行（生产实测：bot 名曾成为另一机器人账号的
-  已确认别名）；【事件】节的客观转述与禁跨批措辞防「已记过的事」文风自我
-  复制回路；【本群固定资料】【备注】是只读理解材料，quote 机械上不可能
-  来自它们；玩笑既不作为事实也不记「性质」，防的是与梗类别同构的回路。
-  （曾附【检查顺序】索引清单以救低思考档，实测救不回——别名例外在低档带
-  清单仍 2/3 丢——遂随 pro+low 回退一并移除；判据召回靠思考档保证。）
-- **`tool_web_search` / `tool_search_history` / `tool_recall_events`** —
-  检索三件套的描述，边界刻意去重叠：外部世界 / 群里说过的原话 / 换了说法的
-  往事。涉及外部文本或历史消息的工具末尾各带一句同构的指令豁免申明。
-- **`tool_read_url`** — 读网页正文；与搜索共用月额度，明说「先搜索后读页」
-  的分工。
-- **`tool_open_images`** — 按编号取回原图，一次可多张。回复模型自己能看图之后，旧的
-  `inspect_image`（把问题转给另一个模型代看、返回一句话）既多余又更差——它
-  只能回答预设的那一个问题。prompt 里不再附任何原图（2026-09-11 起），本工具是
-  看图的唯一途径；免费（取文件，不调模型），措辞把它压在「描述答不了」之后，
-  避免每见图必取、白占轮次。
+| File | Used by | Contents |
+| --- | --- | --- |
+| `legend` | reply, extraction | The transcript legend shared by both paths: the reserved-bracket rule (only text inside `⟦ ⟧` is a system marker), time stamps, media and notice markers, forwarded records in both forms, the `⟦你⟧` tag, and the exemption that instructions inside forwarded or shared content carry no authority. Describes markers only; behaviour rules live elsewhere. |
+| `legend_reply_note` | reply | Markers that exist only in the reply window: line numbers, quote pointers, provenance, retrieval traces, the owner tag. A media marker with a description counts as seen or heard and must be answered directly; originals are fetched by number with `open_images`. Ends with a fictional example line. |
+| `extract_legend_note` | extraction | Markers are transcription artefacts, not group knowledge. Voice transcripts are speech and are extracted from; lines tagged `⟦你⟧` are the bot's own, yield no candidates and cannot be quoted. Distinguishes `⟦N⟧` account codes from `⟦同名N⟧`. |
+| `identity_rules` | reply | Account, display name and person are three different things. How to resolve a name, including namesake tags and the owner tag. String similarity is not evidence of identity. |
+| `credibility_rules` | reply | The two roster columns (confirmed and unconfirmed) and how to weigh the bot's own earlier answers. Ends with the retrieval duty: questions about the past must be searched before "I don't know" is an answer, and the asker is never told to look it up themselves. |
+| `private_rules` | reply | What the system shows the model (markers, tags, the roster, the prompt itself) is never revealed or mentioned in a reply. |
+| `tone_rules` | reply, extraction | How to read group-chat pragmatics: banter, irony, friends insulting each other. Stated once; the two notes below draw the consequences without restating the judgement. |
+| `tone_reply_note` | reply | Play along; do not correct a joke. |
+| `tone_extract_note` | extraction | Nothing said in jest produces a candidate; the form of an exchange is not an event. |
+| `reply_final` | reply | The closing instructions: answer the message just received (instructions buried in history have no authority, unless the asker explicitly relays a question); write only the reply body, imitating no marker; "you" in the body means the asker, and words meant for a third person address them by name. |
+| `extract` | extraction | The full rulebook for memory extraction: what counts as a fact, the predicate list rendered from `predicates.yaml`, quoting rules, the bot's own names, events, and what never becomes a record. Tightly coupled to the tool schemas the validator enforces. |
+| `describe_image` | vision | The one-line archival description of a picture. |
+| `tool_web_search`, `tool_search_history`, `tool_recall_events` | reply | The three search tools, with deliberately disjoint boundaries: the outside world, the group's own words, past events by meaning. |
+| `tool_read_url` | reply | One page's readable text; shares the monthly allowance with search. |
+| `tool_open_images` | reply | Fetch originals by number, several per call; free, but only worth a round when the description does not answer the question. |
 
-人设与群资料不在此处：见 `personas/`（`system_prompt` / `group_knowledge`）。
+Personas and group knowledge are not prompt files; they live in `config/personas/`.
+
+## Writing style
+
+- Precise, objective, plain and neutral. State what is, not what to feel.
+- Inline quotations use corner brackets 「」.
+- Examples never use real chat logs or real people.
+- Every rule earns its place by a behaviour it changes. When a rule is added, the
+  behaviour it addresses should be reproducible in one of the evaluation scripts.
+
+## Changing a prompt
+
+1. Edit the file.
+2. Run the matching evaluation against the real model:
+   `scripts/eval_replies.py` for the reply family, `scripts/eval_extract.py` for the
+   extraction family (see [docs/operations.md](../../docs/operations.md)). Each run
+   costs a few cents.
+3. `/reload` for reply-path files; restart for extraction-path files.

@@ -1,243 +1,187 @@
-# QQ 群聊 AI Bot
+# QBot
 
-A group-chat member, not an assistant: it answers when addressed, remembers the
-group and its people, and stays silent the moment any limit is reached. Design
-rationale lives in [docs/QQ-AI-Bot-设计文档.md](docs/QQ-AI-Bot-设计文档.md)
-(English: [docs/design-en.md](docs/design-en.md)). Three containers:
+QBot is an AI member for QQ group chats. It answers when it is @-mentioned, called by
+name, or quoted; it keeps a structured, per-group memory of the people and events it
+reads about; it understands pictures and voice messages; and it spends money only
+within limits you set.
+
+[中文说明](README.zh-CN.md)
+
+## Features
+
+- **Speaks only when spoken to.** A reply happens on an @, a nickname used as a whole
+  word, or a quote of one of the bot's own messages. Everything else is read and
+  archived in silence.
+- **Structured memory.** Facts about members and about the group are extracted nightly
+  by a language model, validated by code against verbatim quotes, and stored with
+  evidence, confidence and an expiry. Wrong entries can be deleted by number.
+- **Identity, not nicknames.** Accounts, display names and people are kept apart.
+  Two accounts can be merged into one person; namesakes are told apart in every
+  transcript the model reads.
+- **Pictures and voice.** Every picture is described in one line and archived as text;
+  the reply model can fetch the originals it wants to look at. Voice clips are
+  transcribed on arrival, on the CPU, at no cost.
+- **Tools.** The reply model can search the web, search the group's own archive with a
+  boolean query, recall past episodes by meaning, read a web page, and open pictures.
+- **Money is the only limit.** A daily spending cap, a per-reply cap and a monthly
+  search allowance. There are no token budgets and no call quotas.
+- **Per-group everything.** Persona, group knowledge, memory, block list, mute switch
+  and user-agreement consent are all scoped to the group.
+- **Consent gate.** Members are answered only after they accept a user agreement, whose
+  text and version you control.
+- **An operator console in chat.** Inspect and correct memory, block or mute, read
+  usage, reload configuration, and capture model calls for debugging.
+
+## How it works
 
 ```text
-QQ <-> napcat <-OneBot v11 reverse WS-> bot <-asyncpg-> postgres
+QQ  <->  NapCat (OneBot v11)  <-- reverse WebSocket -->  bot  <-- asyncpg -->  PostgreSQL + pgvector
 ```
 
-Everything about behaviour lives in `config/`; credentials live in `.env`; runtime
-state lives in the DB.
+Three containers. NapCat is the QQ protocol client and connects to the bot over a
+reverse WebSocket. The bot is a NoneBot2 application. PostgreSQL holds the archive,
+the memory model, the job queue and the cost ledger.
 
-The code knows five capabilities - text, vision, ASR, embedding, search - and reaches
-them through `providers()`. Which platform serves each one, on which endpoint, with
-which model and credential, is stated only in `config/settings.yaml`.
+The bot deals in five capabilities: text, vision, speech recognition, embedding and
+web search. Which provider serves each capability, with which model and credential,
+is declared in `config/settings.yaml`. The defaults use DeepSeek for text and vision,
+sherpa-onnx with SenseVoice in-process for speech recognition, Alibaba DashScope for
+embeddings, and Tavily for search. Adding a provider means writing one subclass and
+registering it.
 
-Each backend is its own subclass of the ABC in `qqbot/providers/base.py`, because platforms
-differ in more than their URL and those differences should be forced into a named class
-rather than accumulate as flags. Adding one is: write the subclass, add a line to
-`registry.py`, name it in config.
+Read [docs/architecture.md](docs/architecture.md) for the full picture.
 
-## Layout
+## Requirements
 
-| Path | What |
-| --- | --- |
-| `bot.py` | entrypoint; NoneBot2 serves the reverse WS at `/onebot/v11/ws` |
-| `qqbot/plugin.py` | plugin wiring: startup order, the message handler |
-| `qqbot/settings.py` | pydantic config models, two-layer merge, `/reload` |
-| `qqbot/core/pipeline.py` | the pipeline: dedup, archive, one reply task per addressed message |
-| `qqbot/core/trigger.py` | whether this message is addressed to the bot |
-| `qqbot/core/prompt.py` | cache-friendly prompt ordering |
-| `qqbot/core/retrieval.py` | what the prompt reads: the roster, the group's facts, this turn's episodes |
-| `qqbot/domain/`, `qqbot/repositories/`, `qqbot/services/` | the memory model: people, names, facts, episodes, evidence |
-| `qqbot/gateway/` | the platform edge and the inbound chain |
-| `qqbot/workers/memory.py` | the background extractor and consolidator |
-| `qqbot/core/media.py` | image/voice understanding, cache, limits |
-| `qqbot/core/budget.py` | the single daily spend gate |
-| `qqbot/providers/base.py` | the capability ABCs - names no vendor |
-| `qqbot/providers/openai_compat.py` | shared plumbing for chat-protocol backends, quirks as hooks |
-| `qqbot/providers/deepseek.py`, `dashscope.py`, `tavily.py`, `sherpa.py` | one module per backend; sherpa is the in-process one - CPU speech recognition, no endpoint |
-| `qqbot/providers/registry.py` | backend name from config -> class |
-| `qqbot/plugins/tasks.py` | the scheduled jobs: the nightly memory drain and the daily report |
-| `scripts/preflight.py` | one real minimal call per capability, run before going live |
+- Docker and Docker Compose
+- A QQ account for the bot (a dedicated account is strongly recommended)
+- API keys for the providers named in your configuration
+- Python 3.12 if you want to run the test suite or the evaluation scripts locally
 
-## How it behaves
+Third-party QQ protocol clients violate Tencent's terms of service and the account may
+be banned. Use an account you can afford to lose.
 
-- **The trigger is being addressed** - an @, a nickname matching as a whole
-  word (jieba token plus an ASCII boundary check, so a Latin-lettered nickname
-  cannot match inside a longer Latin word), or a quote of one of the bot's own
-  lines still in the window. Everything else is read, archived,
-  and left alone; the bot never speaks uninvited. Group notices - joins,
-  leaves, recalls, bans, pokes - are transcribed as bracketed lines into the
-  window and archive, and never draw a reply. Members sharing a display name
-  render apart under a reserved namesake tag, N a permanent per-group serial (`member_seq`),
-  one per person (a merged main and alt share it); renames dissolve and restore
-  the tag on the next member-list refresh, never the number.
-- **Replies require consent.** A member who has not accepted the user agreement
-  gets a one-line pointer instead of a reply, at most once per cooldown:
-  `/terms` shows the full text, `/agree` records acceptance permanently, per
-  group, account and agreement version - and those two are the only commands
-  that answer before consent. The version and the text file's path are
-  mandatory config (the `agreement:` block in settings.yaml; a missing or
-  empty file fails the load); bumping the version re-asks everyone. Reading and archiving are untouched;
-  owners are exempt. A `/block`ed member is the converse: read and remembered
-  as always, only never answered - context stays coherent either way.
-- **Memory is one store of facts.** What is known about a person and what is
-  known about the group are rows in `memory_fact` - the group is an entity too -
-  each with a verbatim quote as evidence, a validity window, and a predicate
-  from a closed set. Extraction runs once nightly, draining the day's messages
-  oldest-first in chunks cut at conversation gaps; names, facts and episodes all
-  arrive through function calling, a validator writes, and the model may only
-  propose. A wrong entry is deleted by number (`/forget`), and everything
-  expires: a fact survives one half-life per supporting event, so what a group
-  repeats stays and a passing remark fades in a fortnight.
-- **Pictures and voice are understood when they arrive**, not when somebody asks
-  about them: the download link is freshest then, and a group the bot never
-  answers in still gets a readable archive. Every picture is described in one
-  line, cached by image content so a repost costs nothing, and the description
-  expires by age so a better model gets to look again. The reply model is
-  multimodal, but no picture is pushed into the prompt: every picture carries
-  its description line and a number, and the model fetches the originals it
-  wants to see - several per call - with the `open_images` tool, so the history
-  stays text and the prefix cache never turns over on a picture. Forwarded chat
-  records render as an indented block under the message that carries them,
-  nested records one level deeper, and their pictures are numbered with the
-  rest. Voice clips are transcribed into the same archive the text goes to.
-
-- **Money is the only limit.** The daily cap, checked before anything is spent,
-  means silence when hit. What costs nothing is not gated by it: voice
-  transcription runs in-process (sherpa-onnx + SenseVoice on CPU, zero rates,
-  still booked to the ledger) and keeps the archive whole even on an exhausted
-  day. A limit tripping mid-reply - the per-reply cap, the
-  monthly search allowance - stops the spending instead: one tool-less wrap-up
-  round answers from what was already fetched, an overshoot of exactly one
-  bounded round. There is no token budget anywhere:
-  the history window is counted in messages and evicts thirty at a time to keep
-  the prefix cache warm, and billing always uses the usage the API returns.
-  Prices live in the backend classes as rate tables (peak/off-peak included);
-  an unknown model bills at the priciest tier. `/top` attributes each reply's
-  full cost to the member who triggered it.
-- **The text models deliberate before answering.** Reasoning tokens bill as
-  output and arrive in a separate field, so they never reach the group but do
-  reach the invoice. Replies, extraction and describing each carry their own
-  `reasoning_effort` grade — `off`, `low`, `high` or `max`, translated into
-  whatever request fields the backend uses; all three currently run `low`.
-- **Ops state has its own tables.** `group_state` holds what must survive a
-  restart (the mute switch, extraction watermarks); `cost_ledger` is what the
-  budget gate, `/stats`, `/top` and the daily report read. Neither carries
-  memory semantics.
-
-## Deploy
+## Quick start
 
 ```bash
-cp .env.example .env                      # then fill in the credentials it documents
+git clone <this repository> qbot
+cd qbot
+
+cp .env.example .env
 cp config/settings.yaml.example config/settings.yaml
 cp config/personas/default.yaml.example config/personas/default.yaml
-$EDITOR config/settings.yaml              # owners, trigger.nicknames
-$EDITOR config/personas/default.yaml      # persona, group knowledge
-# Both copies stay untracked: they name real accounts and real groups, so only
-# the .example templates live in version control. deploy.sh ships the working
-# tree, untracked local config included.
+```
 
-bash scripts/fetch_asr_model.sh           # once: the ASR weights, into models/ (mounted, not baked in)
+Edit the three files:
+
+- `.env`: API keys, the PostgreSQL password, and the QQ number NapCat logs in as.
+- `config/settings.yaml`: the owner accounts, the bot's nicknames, the providers.
+- `config/personas/default.yaml`: the bot's name and personality.
+
+Then fetch the speech-recognition model, start the containers, log NapCat in, and
+verify the providers before going live:
+
+```bash
+bash scripts/fetch_asr_model.sh          # once; ~250 MB into models/
 
 docker compose up -d postgres napcat
+docker compose logs -f napcat             # scan the QR code, or open http://127.0.0.1:6099
+
+# After the first login, point NapCat at the bot (see docs/operations.md):
+#   merge napcat/onebot11.json.template into data/napcat/config/onebot11_<QQ>.json
+docker compose restart napcat
+
 docker compose build bot
-docker compose run --rm bot python scripts/preflight.py
+docker compose run --rm bot python scripts/preflight.py   # one real call per provider
 docker compose up -d bot
 ```
 
-`sql/init.sql` only runs when `data/pg` is empty. If you change the schema after the
-first start, apply it by hand and record the statement in
-[sql/MIGRATIONS.md](sql/MIGRATIONS.md) - `ensure_schema` refuses to boot until the
-live schema has caught up, but it checks names, not the ALTERs that get you there.
+A group is served from its first message. There is no allow list; new groups appear in
+the daily report.
 
-### Rollback
+Both real configuration files are ignored by git because they name real accounts.
+Only the `.example` templates are committed.
 
-`deploy.sh` tags the previously running image `qbot-bot:rollback` before every build.
-If a deploy verifies but misbehaves at runtime, from the server:
+## Configuration
 
-```bash
-cd /opt/docker/qbot
-docker tag qbot-bot:rollback qbot-bot:latest    # adjust if `docker compose images bot` names it differently
-docker compose up -d --no-build bot
-```
+Behaviour lives in `config/`, credentials in `.env`, runtime state in the database.
 
-The tag holds exactly one step of history and is overwritten on every deploy: after
-two bad deploys in a row it points at the *first* bad image, so roll back promptly
-or not at all.
+| File | Purpose |
+| --- | --- |
+| `.env` | Credentials and infrastructure settings read by Docker Compose |
+| `config/settings.yaml` | Global settings: owners, trigger, providers, budget, prompt window, memory, schedule |
+| `config/personas/default.yaml` | The default persona: name, system prompt, group knowledge |
+| `config/personas/group_<id>.yaml` | Per-group persona and overrides of any setting |
+| `config/predicates.yaml` | What may be recorded about a person |
+| `config/prompts/*.txt` | Every instruction text the model reads |
+| `config/agreement.txt` | The user agreement shown by `/terms` |
 
-The server's source tree stays at the bad version - fix forward from the workstation
-(git revert + deploy.sh) as soon as the fire is out, or the next `compose up --build`
-rebuilds the bad code.
+Most settings apply on `/reload`; a few need a restart. The reference is in
+[docs/configuration.md](docs/configuration.md).
 
-### Restore from a backup
+## Commands
 
-The nightly `pg_dump -Fc` dumps land in `backups/`. To restore onto a fresh volume:
+Commands are typed in the group, prefixed with `/`. Owners hold the whole console.
+Members can read and correct their own record, view read-only statistics, and accept
+the agreement. Anything a member may not run is ignored without a reply.
 
-```bash
-docker compose stop bot
-docker compose up -d postgres
-docker cp backups/qqbot-<date>.dump qbot-postgres-1:/tmp/r.dump
-docker exec qbot-postgres-1 dropdb  -U qqbot --if-exists qqbot
-docker exec qbot-postgres-1 createdb -U qqbot qqbot
-docker exec qbot-postgres-1 pg_restore -U qqbot -d qqbot /tmp/r.dump
-docker exec qbot-postgres-1 rm /tmp/r.dump
-docker compose up -d bot          # ensure_schema verifies the result at boot
-```
+| Command | Purpose |
+| --- | --- |
+| `/help` | List the commands you may run |
+| `/agree`, `/terms` | Accept or read the user agreement |
+| `/who`, `/note`, `/alias`, `/forget` | Inspect and correct what is known about a member |
+| `/card` | What is known about the group itself |
+| `/merge`, `/split` | Declare that two accounts are one person, or undo it |
+| `/block`, `/unblock`, `/mute`, `/unmute` | Stop answering a member, or the whole group |
+| `/stats`, `/groupstats`, `/top` | Spending and usage |
+| `/relearn`, `/reload`, `/debug`, `/log` | Maintenance |
 
-The dump carries the extensions and every table; `-Fc` archives are verified nightly
-with `pg_restore --list` before old ones rotate out.
+See [docs/commands.md](docs/commands.md) for usage and permissions.
 
-### NapCat login and the reverse WS
+## Operations
 
-1. `docker compose logs -f napcat` and scan the QR code, or open the WebUI on
-   `http://127.0.0.1:6099` (bound to loopback - use an SSH tunnel from elsewhere).
-   The WebUI token is printed in the logs on first start.
-2. After login, NapCat writes `data/napcat/config/onebot11_<QQ>.json`. Merge in the
-   `websocketClients` entry from [napcat/onebot11.json.template](napcat/onebot11.json.template)
-   so it dials `ws://bot:8080/onebot/v11/ws`, keep `messagePostFormat: "array"`, then
-   `docker compose restart napcat`.
-3. `docker compose logs bot` should show the adapter connecting.
+Deployment, backups, restore, rollback, schema changes, scheduled jobs, the daily
+report, debugging and the behavioural evaluation scripts are described in
+[docs/operations.md](docs/operations.md).
 
-## Ops
+## Development
 
-The console is the owner's, with two carve-outs. Any member may run `/who`,
-`/note`, `/alias` and `/forget` against themselves - their own record, note and
-names, at the same full trust as the owner's hand - plus `/agree` and `/terms`
-for themselves by nature; and the read-only surfaces `/card`, `/stats`, `/top` and
-`/groupstats` whole. `/help` lists each reader exactly what they may run;
-everything else answers members with silence. A member can still just ask the
-bot in conversation - the roster is already in its prompt - but the command
-path answers for free. Command answers are on the record like any bot line -
-window and archive both - so the model can be asked about a card or a table
-it just posted.
-
-Scheduled: one nightly pipeline at 02:30 running its stages in dependency order -
-memory extraction (the drain), memory decay, `pg_dump -Fc` (keeps 14, into
-`backups/` - point that volume at a NAS mount; until then the dumps share the
-disk they protect), NapCat media cleanup - each stage waiting for the job queue
-to empty before the next; and the daily report to the owners at 00:00, the
-moment the ledger day closes.
-
-Routine intervention is meant to be one thing: read the daily report, change the config.
-
-Model-behaviour tooling: `scripts/eval_extract.py` does the same for the extraction
-path (joke stays out, known stays unrepeated, a reused alias still confirms, nothing
-derives from an owner's note, episode summaries stay objective even against an
-infected style planted in the known block, the bot's own name never becomes a
-member's alias) - run it around any change to the extract prompt family.
-`scripts/eval_replies.py` runs the deterministic eval set against
-the real model from the workstation (needs the test DB and `.env`; a few fen a run) — run
-it before and after any prompt or model change. Beyond format discipline and
-injection inertness it now measures tool initiative: a question only the archive
-can answer must be searched (the planted fact's invented model number proves the
-search was read, the window plants a lookalike to misattribute to), an
-unanswerable one must end in a searched, honest blank — and failing cases print
-the tool-loop trace, so "did not look" and "looked badly" read apart. `/debug N` captures the next N model
-rounds' full requests and responses into `logs/debug/` for when a reply misbehaves and
-you need to see what the model was actually shown. The daily report carries the output
-stripper's hit counters: every hit is a marker the model wrote and the stripper caught.
-
-## Local development
-
-The container is the only supported runtime, but the pure logic runs without a
-protocol side:
+The test suite runs against a throwaway PostgreSQL and needs no QQ connection:
 
 ```bash
-python -m venv .venv && .venv/bin/pip install pydantic pyyaml jieba asyncpg openai httpx luqum
-.venv/bin/pip install -r requirements-dev.txt      # the linter, workstation only
-docker run -d --name qbot-pgtest -e POSTGRES_DB=qqbot -e POSTGRES_USER=qqbot \
-  -e POSTGRES_PASSWORD=testpw -p 15432:5432 \
+python -m venv .venv
+.venv/bin/pip install -r requirements.txt -r requirements-dev.txt
+
+docker run -d --name qbot-pgtest \
+  -e POSTGRES_DB=qqbot -e POSTGRES_USER=qqbot -e POSTGRES_PASSWORD=testpw \
+  -p 15432:5432 \
   -v "$PWD/sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro" \
   pgvector/pgvector:0.8.5-pg17
 
-.venv/bin/python tests/run_all.py                  # every suite, then ruff
+.venv/bin/python tests/run_all.py        # every suite, then ruff
 ```
 
-The suites need that database up. `run_all.py` finishes with `ruff check` over the
-whole tree (settings in [ruff.toml](ruff.toml)); with ruff not installed that step
-reports as skipped, so a bare runtime venv still passes.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for conventions and [tests/README.md](tests/README.md)
+for what each suite covers.
+
+## Project layout
+
+| Path | Contents |
+| --- | --- |
+| `bot.py` | Entry point; serves the OneBot reverse WebSocket |
+| `qqbot/plugin.py` | NoneBot plugin wiring and startup order |
+| `qqbot/settings.py` | Configuration models, persona merge, `/reload` |
+| `qqbot/gateway/` | Inbound message handling: segments, dedup, archiving |
+| `qqbot/core/` | Trigger, pipeline, prompt assembly, reply engine, tools, media, budget, commands catalogue |
+| `qqbot/domain/` | The memory model: identities, aliases, facts, episodes, evidence |
+| `qqbot/repositories/` | Database access for the memory model |
+| `qqbot/services/` | Extraction, validation, consolidation, the member directory |
+| `qqbot/workers/` | The background memory worker |
+| `qqbot/providers/` | Provider abstractions and one module per backend |
+| `qqbot/plugins/` | The command handlers and the scheduled jobs |
+| `qqbot/db/` | Connection pool, schema check, archive and ledger access |
+| `config/` | Configuration templates, prompts, predicates, agreement |
+| `sql/` | Database schema and the schema changelog |
+| `scripts/` | Deployment, preflight, model download, evaluations |
+| `tests/` | The test suites |
+| `docs/` | Architecture, configuration, commands, operations |

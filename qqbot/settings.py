@@ -23,7 +23,7 @@ log = logging.getLogger("qqbot.settings")
 #: `<key>.txt` under `prompts_dir`, edited without touching code and re-read on
 #: /reload. This manifest is the only list of them - the filename is the key, so
 #: a misspelled name is a missing file and fails the load rather than shipping a
-#: prompt nobody reads. The rationale behind each text's wording lives in
+#: prompt nobody reads. Each text's role and how they compose is described in
 #: config/prompts/README.md.
 PROMPT_KEYS = frozenset({
     # transcript legend, shared by reply and extraction; plus each side's addendum

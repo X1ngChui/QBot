@@ -1,48 +1,46 @@
-# Hand migrations
+# Schema changelog
 
-`init.sql` only runs on an empty `data/pg`, so every schema change after first start
-is applied by hand to the live database (and to the `qbot-pgtest` test database).
-`ensure_schema` (qqbot/db/repo.py) refuses to boot until the live schema has the
-tables, columns, unique indexes, the cost_ledger primary key and the vector width
-the code expects - but it checks by name, so this file records the actual
-statements, newest first. Types mirror
-`init.sql`, which is always the authoritative shape of a fresh database.
+`init.sql` is the schema of a fresh database and only runs when the data directory is
+empty. Every later change is applied by hand to existing databases and recorded here,
+newest first. At boot the bot checks that the live schema has the tables, columns,
+unique indexes and vector width the code expects and refuses to start until it does;
+it checks names, not the statements that get you there, which is why this file exists.
 
-Apply with:
+Apply a statement with:
 
 ```bash
 docker exec qbot-postgres-1 psql -U qqbot -d qqbot -c "<statement>"
 ```
 
-## 2026-09-11 — one shape per thing
+Types mirror `init.sql`. Where an entry says to run a block from `init.sql`, copy it
+verbatim: some `ON CONFLICT` clauses depend on the unique index that follows the table.
 
-Every batch records its width, every description carries its time, and the
-archive holds one marker grammar and one namesake form. The code that read the
-older shapes is gone, so the data has to match before the code is deployed.
+## 2026-09-11 — batch width and description stamps become mandatory
 
 ```sql
--- Candidates staged before batches recorded their width were cut at a fixed
--- sixty rows; say so, then require it.
 UPDATE memory_candidate SET batch_size = 60 WHERE batch_size IS NULL;
 ALTER TABLE memory_candidate ALTER COLUMN batch_size SET NOT NULL;
 
--- Descriptions written before described_at existed are of unknown age: stamp
--- them as expired (any date before the first deployment), then require a stamp
--- wherever there is a description.
 UPDATE image_cache SET described_at = TIMESTAMPTZ '2026-07-31 00:00+08'
  WHERE description <> '' AND described_at IS NULL;
 ALTER TABLE image_cache ADD CONSTRAINT image_cache_described_stamped
     CHECK (description = '' OR described_at IS NOT NULL);
+```
 
--- The archive's last lines in the older forms: an @-resolution rendered with the
--- parenthesised namesake serial, and a forwarded entry's picture description in
--- square brackets. Both rewritten by id after reading them.
-UPDATE raw_event SET plain_text = replace(replace(plain_text,
-           '@<name>(3)', '@<name>⟦同名3⟧'), '@<name>(4)', '@<name>⟦同名4⟧')
- WHERE id IN ('<id>', '<id>');
+Candidates staged before batches recorded their width were cut at sixty rows.
+Descriptions without a stamp are of unknown age and are stamped as expired.
+
+Archived lines written under earlier marker forms (a namesake serial in parentheses,
+a picture description in square brackets) are rewritten to the reserved-bracket
+grammar:
+
+```sql
+UPDATE raw_event SET plain_text = regexp_replace(plain_text,
+           '@([^\s(]+)\((\d+)\)', '@\1⟦同名\2⟧', 'g')
+ WHERE plain_text ~ '@[^\s(]+\(\d+\)';
 UPDATE raw_event SET plain_text = regexp_replace(plain_text,
            '\[图片:([^\]]*)\]', '⟦图片:\1⟧', 'g')
- WHERE id = '<id>';
+ WHERE plain_text LIKE '%[图片:%';
 ```
 
 ## 2026-09-11 — uploaded originals carry their upload time
@@ -51,10 +49,8 @@ UPDATE raw_event SET plain_text = regexp_replace(plain_text,
 ALTER TABLE image_cache ADD COLUMN IF NOT EXISTS file_uploaded_at TIMESTAMPTZ;
 ```
 
-A NULL reads as "too old to trust", and re-uploading needs the bytes - which for a
-picture whose link has expired means a get_image the platform may never answer. So
-the rows are stamped from each picture's first sighting, which is when the upload
-happened; only pictures first seen beyond the backend's retention stay NULL:
+A NULL means the upload is too old to trust and the picture is uploaded again when
+opened. Existing rows can be stamped from each picture's first sighting:
 
 ```sql
 WITH first AS (
@@ -77,55 +73,35 @@ ALTER TABLE image_cache ADD COLUMN IF NOT EXISTS described_at TIMESTAMPTZ;
 ALTER TABLE image_cache ADD COLUMN IF NOT EXISTS refused BOOLEAN NOT NULL DEFAULT FALSE;
 ```
 
-The cache had no expiry of any kind, so the first description a picture ever got
-was served forever - including the placeholder written when a content filter
-declined to look at one. Existing rows keep `described_at` NULL deliberately:
-their descriptions are of unknown age and count as expired, so each is rewritten
-the next time that picture is actually posted again. Nothing is refreshed in
-bulk, and a picture never seen twice is never paid for twice.
+Existing rows keep `described_at` NULL: their descriptions count as expired and are
+rewritten the next time the picture is posted. Nothing is refreshed in bulk.
 
-`refused` is not backfilled either - the old placeholder rows are
-indistinguishable from real descriptions in the data, and they expire anyway.
+## 2026-09-08 — reserved-bracket markers
 
-## 2026-09-08 — reserved-bracket markers (data rewrite, no schema change)
-
-```sql
--- No DDL. Transcript markers moved from ASCII square brackets to a reserved
--- bracket pair that is stripped from every string a member can type, so a
--- marker in a transcript can only have been written by this system; the
--- stored derived readings in raw_event.plain_text and image_cache.description
--- were rewritten once by a script since removed; the handful of lines it
--- missed were fixed by hand on 2026-09-11 (see that entry).
-```
+No DDL. Transcript markers moved from ASCII square brackets to the reserved pair
+`⟦ ⟧`; `raw_event.plain_text` and `image_cache.description` were rewritten once.
 
 ## 2026-09-07 — namesake serials
 
-```sql
--- New table: run the CREATE TABLE member_seq block from init.sql verbatim
--- (the UNIQUE (group_id, seq) constraint is part of the block and the
--- assignment relies on it).
-```
+New table: run the `CREATE TABLE member_seq` block from `init.sql`, including its
+`UNIQUE (group_id, seq)` constraint.
 
-## 2026-09-04 — the user agreement gate
+## 2026-09-04 — user agreement
+
+New table: run the `CREATE TABLE user_agreement` block from `init.sql`. On a database
+that already has the table without the version column:
 
 ```sql
--- Same-day reshapes: the first cut was keyed by user alone (consent is per
--- (group, user)), the second lacked the version column. Drop and re-run the
--- CREATE TABLE user_agreement block from init.sql verbatim, or on the
--- two-column shape:
 ALTER TABLE user_agreement ADD COLUMN IF NOT EXISTS version INT NOT NULL DEFAULT 1;
 ```
 
-## 2026-09-04 — the exit guard stops punishing
-
-A flagged reply is simply dropped; no member is auto-blocked, so the strike
-table goes.
+## 2026-09-04 — output moderation strike table removed
 
 ```sql
 DROP TABLE IF EXISTS censor_offense;
 ```
 
-## 2026-09-04 — alias evidence fast-path probe
+## 2026-09-04 — alias evidence probe index
 
 ```sql
 CREATE INDEX IF NOT EXISTS alias_evidence_probe
@@ -139,7 +115,7 @@ DROP INDEX IF EXISTS alias_evidence_alias;
 ALTER TABLE group_blocklist ADD COLUMN IF NOT EXISTS blocked_until TIMESTAMPTZ;
 ```
 
-## 2026-09-02 — spend attribution (/top)
+## 2026-09-02 — spend attribution
 
 ```sql
 ALTER TABLE cost_ledger ADD COLUMN IF NOT EXISTS user_id VARCHAR(64) NOT NULL DEFAULT '';
@@ -157,13 +133,10 @@ CREATE INDEX IF NOT EXISTS raw_event_group_created
 
 ## 2026-08-30 — retrieval traces
 
-```sql
--- New table: run the CREATE TABLE reply_trace block from init.sql verbatim,
--- AND the CREATE UNIQUE INDEX reply_trace_reply statement below it - the
--- trace upsert's ON CONFLICT depends on the index, not the table.
-```
+New table: run the `CREATE TABLE reply_trace` block from `init.sql` and the
+`CREATE UNIQUE INDEX reply_trace_reply` statement that follows it.
 
-## Earlier (pre-ledger; reconstructed from ensure_schema's checks)
+## Earlier
 
 ```sql
 ALTER TABLE raw_event        ADD COLUMN IF NOT EXISTS plain_text TEXT;
@@ -173,8 +146,6 @@ ALTER TABLE memory_fact      ADD COLUMN IF NOT EXISTS object_key TEXT;
 ALTER TABLE memory_candidate ADD COLUMN IF NOT EXISTS batch_event_id UUID REFERENCES raw_event(id);
 ALTER TABLE cost_ledger      ADD COLUMN IF NOT EXISTS day DATE;
 
--- The unique indexes every ON CONFLICT upsert depends on; ensure_schema refuses to
--- boot without them. As in init.sql:
 CREATE UNIQUE INDEX IF NOT EXISTS raw_event_platform_key
     ON raw_event (platform, platform_event_id)
     WHERE platform_event_id IS NOT NULL;

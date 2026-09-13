@@ -325,8 +325,7 @@ def build_tail(*, msg: ChatMsg,
     # anchor reply_final points at when naming which message to answer.
     parts.append("下面是刚收到的消息：\n" + now)
     # Which message to answer, said outright: the history is context; only this block
-    # is the question (the wording's full rationale sits in config/prompts/README.md,
-    # key "reply_final").
+    # is the question (see config/prompts/README.md, key "reply_final").
     parts.append(ptext("reply_final"))
     return "\n\n".join(parts)
 
