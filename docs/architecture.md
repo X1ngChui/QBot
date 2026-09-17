@@ -128,10 +128,8 @@ With neither `at` nor `reply` the message goes out plain. Whether to @ anyone an
 whether to reply to a line is the model's decision. A member number or line number the
 prompt never showed is dropped with a log line and the rest is sent; a call with no text
 is answered with a note and the loop continues, so the model can send again. At most
-five accounts are @-ed per message. Bare text is never sent. The text model's thinking
-mode refuses a forced tool choice, and a deliberating model occasionally writes its
-answer out instead of calling the tool, so a round that ends in bare text is told once
-that nothing was sent and gets one more round; a second bare-text round is silence.
+five accounts are @-ed per message. Bare text is never sent: a round that ends without
+a tool call ends the reply in silence, with a warning in the log.
 
 If a send with a reply segment is refused by the platform (the replied-to message may
 have been recalled), it is retried once without the segment.

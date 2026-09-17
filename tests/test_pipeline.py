@@ -1560,30 +1560,19 @@ async def main():
           ok_b and bot.sent[-1][1] == "先这样" and EndlessSearch.calls == [],
           f"{bot.sent[-1:]} {EndlessSearch.calls}")
 
-    # The send tool is the only way out: bare text is never sent. A round that writes
-    # its reply out is told so once and sends on the next round; a second bare round
-    # is silence.
-    _bare = lambda _m: ChatResult(text="明天多云", model="fake-light")  # noqa: E731
-    _use(_bare, lambda m: ChatResult(text="", model="fake-light",
-                                     tool_calls=send_to_asker(m, "明天多云")))
-    n_bare = len(bot.sent)
-    ok_told = await _eng.respond(
-        bot=bot, st=st_pv, cfg=cfg, persona=config().for_group("123")[1],
-        msg=_CM0(msg_id="pv-told", user_id="u1", nickname="阿强",
-                 text="大后天呢", ts=_nl0()))
-    _told = LLM_CALLS[-1]["messages"]
-    check("bare text is told it was not sent, and the next round's send goes out",
-          ok_told and len(bot.sent) == n_bare + 1 and bot.sent[-1][1] == "明天多云"
-          and _told[-2] == {"role": "assistant", "content": "明天多云"}
-          and "没有发到群里" in _told[-1]["content"], str(_told[-2:]))
-    _use(_bare)
-    n_bare = len(bot.sent)
+    # The send tool is the only way out: a round that writes its reply out as bare
+    # text sends nothing, and no further round is spent on it.
+    _use(lambda _m: ChatResult(text="明天多云", model="fake-light"),
+         lambda m: ChatResult(text="", model="fake-light",
+                              tool_calls=send_to_asker(m, "明天多云")))
+    n_bare, n_calls = len(bot.sent), len(LLM_CALLS)
     ok_bare = await _eng.respond(
         bot=bot, st=st_pv, cfg=cfg, persona=config().for_group("123")[1],
         msg=_CM0(msg_id="pv-bare", user_id="u1", nickname="阿强",
                  text="大后天呢", ts=_nl0()))
-    check("a second bare-text round sends nothing",
-          not ok_bare and len(bot.sent) == n_bare, str(bot.sent[n_bare:]))
+    check("bare text sends nothing, and ends the reply",
+          not ok_bare and len(bot.sent) == n_bare and len(LLM_CALLS) == n_calls + 1,
+          f"{bot.sent[n_bare:]} {len(LLM_CALLS) - n_calls} round(s)")
 
     _use(lambda m: ChatResult(text="", model="fake-light",
                               tool_calls=send_to_asker(m, "@阿强 明天多云")))

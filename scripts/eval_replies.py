@@ -17,10 +17,10 @@ case also prints whom the reply @-ed and which line it replied to, and a case ca
 assert on those choices ("send_checks") as well as on the text.
 
 Tool discipline is counted apart from the verdicts: every reply round that ends in
-bare text instead of a tool call is tallied per case. The engine tells such a round
-it sent nothing and gives it one more, so a case can PASS with a bare round behind
-it; the tally is what shows how often the prompt fails to make the send tool the
-way to speak. `--repeat N` runs every case N times, for a rate worth comparing.
+bare text instead of a tool call is tallied per case. Such a round sends nothing, so
+the case also fails its "says something" check; the tally is what shows how often
+the prompt fails to make the send tool the way to speak. `--repeat N` runs every
+case N times, for a rate worth comparing.
 
 Usage (workstation, test DB up, real keys in .env):
     docker start qbot-pgtest

@@ -6,10 +6,7 @@ nothing.
 A reply is a call to the send tool (tools.SEND): the text, whom to @ and which
 line to reply to are arguments the model fills in, and every one but the text is
 optional - with none, the message goes out plain. The call is the only way out:
-bare text is never sent. A round that ends in bare text is told so once and gets
-one more round to send it properly - the vendor's thinking mode refuses a forced
-tool choice, and a deliberating model does now and then write its answer out
-instead of calling the tool; a second bare-text round is silence.
+a round that ends in bare text sends nothing, and the reply ends there.
 
 Money is what bounds the tool loop - no round count, no per-tool quota. Free tools
 run as often as they like; what bounds them is that the rounds carrying them are
@@ -59,9 +56,6 @@ WRAP_UP_NOTE = ("（本次回复的额度已用完，不能再执行任何检索
 #: call it again properly.
 SEND_UNREADABLE_NOTE = "（send_message 的参数无法解析，没有发出。请重新调用。）"
 SEND_EMPTY_NOTE = "（send_message 的正文为空，没有发出。请写好正文后重新调用。）"
-#: What a round that ended in bare text is told before its one more round.
-UNSENT_NOTE = ("（你刚才输出的文字没有发到群里，因为没有调用 send_message；"
-               "请直接调用 send_message 把要说的话发出，不要再输出其他文字。）")
 
 #: The most accounts one message may @. A reply that @-s half the group is a
 #: prompt injection's idea of fun, not an answer.
@@ -344,7 +338,6 @@ async def generate(
     tool_defs = tools.tool_defs(cfg)
     seen_calls: set[tuple[str, str]] = set()
     executed: list[tuple[str, dict, str]] = []
-    told_unsent = False
 
     with BUDGET.scope(cfg.budget.per_reply_cny) as spend:
         for round_no in range(cfg.retrieval.max_rounds):
@@ -359,15 +352,8 @@ async def generate(
             )
             debug.capture(st.group_id, round_no, messages, res)
             if not res.tool_calls:
-                if told_unsent or not res.text.strip() or spend.exhausted:
-                    _unsent(st.group_id, res.text)
-                    return None
-                log.info("group %s: round %d wrote its reply without calling %s; "
-                         "telling it so", st.group_id, round_no + 1, tools.SEND)
-                told_unsent = True
-                messages += [{"role": "assistant", "content": res.text},
-                             {"role": "user", "content": UNSENT_NOTE}]
-                continue
+                _unsent(st.group_id, res.text)
+                return None
 
             # A send ends the reply, whatever else the round asked for: the calls
             # beside it could only feed a round that will not happen. One that
