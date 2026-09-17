@@ -16,8 +16,10 @@ within limits you set.
   by a language model, validated by code against verbatim quotes, and stored with
   evidence, confidence and an expiry. Wrong entries can be deleted by number.
 - **Identity, not nicknames.** Accounts, display names and people are kept apart.
-  Two accounts can be merged into one person; namesakes are told apart in every
-  transcript the model reads.
+  Two accounts can be merged into one person; every person in a prompt wears a member
+  number, so members sharing a name are never confused.
+- **QQ-native replies.** The model sends each reply through a tool call and decides
+  whom to @ and which message to reply to, or sends a plain message.
 - **Pictures and voice.** Every picture is described in one line and archived as text;
   the reply model can fetch the originals it wants to look at. Voice clips are
   transcribed on arrival, on the CPU, at no cost.

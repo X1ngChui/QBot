@@ -60,15 +60,15 @@ message arrives
  |             yes: cut the context slice now and spawn one reply task
  |
  |- in the task: daily budget -> block list -> mute -> user agreement
- |- retrieval: member roster with known facts, group knowledge
+ |- retrieval: member roster (everyone who has appeared, with known facts), group knowledge
  |- prompt assembly
- |- tool loop until the model answers in text
- |- clean the reply, send it quoting the addressed message, archive the bot's own line
+ |- tool loop until the model calls send_message
+ |- clean the text, send it with the @s and reply it asked for, archive the bot's own line
 ```
 
 Every message that addresses the bot gets its own task, running concurrently with any
-others. Each task works on the window as it stood when its message arrived, quotes that
-message, @-mentions its sender, and bills its whole cost to that sender.
+others. Each task works on the window as it stood when its message arrived, answers that
+message, and bills its whole cost to that sender.
 
 Group notices (joins, leaves, kicks, recalls, bans, pokes) are transcribed as one marked
 line into the window and the archive. They never trigger a reply.
@@ -97,30 +97,56 @@ The engine is an agent loop bounded by money rather than by a round count:
 with budget.scope(per_reply_cny):
     loop:
         call the model with every tool offered
-        no tool calls -> return the text
-        per-reply cap already spent -> one final round without tools, then return
+        a send_message call -> return it (other calls in the same round are not run)
+        no tool calls, only text -> tell the model it was not sent (once), else silence
+        per-reply cap already spent -> one final round offered only send_message
         execute the tool calls (a repeated identical call is answered in words, not re-run)
         monthly search allowance exhausted -> the same final round
         append results as tool messages
 ```
 
 The first round always runs. A cap that trips mid-reply does not discard the reply:
-outstanding tool requests receive a placeholder result and one tool-less round answers
-from what was already fetched, so the overshoot is exactly one round. A transport
+outstanding tool requests receive a placeholder result and one final round, offered only
+`send_message`, answers from what was already fetched, so the overshoot is exactly one
+round. A transport
 failure is reported to the model as a failure and the loop continues; a broken network
 is an error, not a limit. A configurable round cap exists only as a tripwire against a
 backend that bills zero.
 
+### Sending
+
+A reply is a call to `send_message`. Its parameters follow the OneBot message segments
+it becomes:
+
+| Parameter | Segment | Meaning |
+| --- | --- | --- |
+| `text` | `text` | The body, plain text. Required. |
+| `at` | `at` | Member numbers to @, placed before the body in order. Optional. |
+| `reply` | `reply` | The line number of the message to reply to. Optional. |
+
+With neither `at` nor `reply` the message goes out plain. Whether to @ anyone and
+whether to reply to a line is the model's decision. A member number or line number the
+prompt never showed is dropped with a log line and the rest is sent; a call with no text
+is answered with a note and the loop continues, so the model can send again. At most
+five accounts are @-ed per message. Bare text is never sent. The text model's thinking
+mode refuses a forced tool choice, and a deliberating model occasionally writes its
+answer out instead of calling the tool, so a round that ends in bare text is told once
+that nothing was sent and gets one more round; a second bare-text round is silence.
+
+If a send with a reply segment is refused by the platform (the replied-to message may
+have been recalled), it is retried once without the segment.
+
 ### Tools
 
-All five tools are free in themselves; what costs money is the model round that carries
-them.
+All the query tools are free in themselves; what costs money is the model round that
+carries them.
 
 | Tool | What it does |
 | --- | --- |
+| `send_message` | Sends the reply and ends the loop (see above). |
 | `web_search` | Web search through the configured search backend. Debits the monthly allowance. |
 | `read_url` | The readable text of one page, bounded in characters. Debits the same allowance. |
-| `search_history` | Boolean search over this group's archive. Lucene syntax parsed by luqum: space means AND, `OR`, `-` exclusion, parentheses, quoted phrases. Only the boolean subset is accepted; fields and ranges are refused in words. The query compiles to one parameterised `ILIKE` expression. Narrowable by speaker and by days. Each hit is returned with surrounding lines, touching windows merged, and the whole answer is bounded in characters with a note when cut. |
+| `search_history` | Boolean search over this group's archive. Lucene syntax parsed by luqum: space means AND, `OR`, `-` exclusion, parentheses, quoted phrases. Only the boolean subset is accepted; fields and ranges are refused in words. The query compiles to one parameterised `ILIKE` expression. Narrowable by speaker (a member number, or a display name for someone the prompt shows no number for) and by days. Each hit is returned with surrounding lines, touching windows merged, and the whole answer is bounded in characters with a note when cut. |
 | `recall_events` | Vector search over this group's episodes. Each recalled episode is framed by its neighbours in group time. |
 | `open_images` | Fetches picture originals by their number in the transcript, several per call, and hands them to the model as file blocks. |
 
@@ -130,11 +156,12 @@ and pixels.
 
 ### Output
 
-The only exit is `clean_reply`. It strips Markdown that QQ cannot render (emphasis,
+The text of every send passes `clean_reply`. It strips Markdown that QQ cannot render (emphasis,
 headings, code fences, rules, link syntax) while keeping plain-text lists readable;
 removes every system marker (line numbers, timestamps, provenance, trace lines, quote
-pointers, name tags) and any text-form tool-call markup; and finally replaces any
-reserved bracket left over. The engine truncates to the configured message length
+pointers, owner and self tags, member numbers) and any text-form tool-call markup; and finally replaces any
+reserved bracket left over. An `@name` opening the text for an account the message
+already @-s is removed, so the address is not sent twice. The engine truncates to the configured message length
 before sending. The stripper counts what it removed, and the daily report shows the
 counters: every hit is a marker the model wrote and the stripper caught.
 
@@ -147,7 +174,7 @@ hit as often as possible:
 constant rules (transcript legend, identity and credibility rules, private rules, tone)
 -> persona
 -> group knowledge
--> member roster with confirmed facts (stable order)
+-> member roster: everyone who has appeared, numbered, with confirmed facts (stable order)
 -> conversation history (append-only chunks)
 -> [cache boundary]
 -> current time
@@ -184,28 +211,37 @@ Markers in use:
 | --- | --- |
 | `#N ⟦MM-dd HH:mm⟧` | Line number and send time |
 | `⟦回复 #N⟧` | This message quotes line N |
+| `名字⟦N⟧` | Member number: who this is, within this one prompt |
 | `⟦拥有者⟧` | The speaker is one of the bot's owners |
-| `名字⟦同名N⟧` | A namesake; N is the person's permanent serial in this group |
 | `⟦你⟧` | The bot's own line (extraction transcript and search results) |
 | `⟦图片N:描述⟧`, `⟦语音:转写⟧` | Media, with the archived description or transcript |
 | `⟦转发的聊天记录 N条⟧` | A forwarded record, rendered as an indented block |
 | `⟦依据:…⟧`, `⟦检索记录⟧` | Provenance of a bot reply and the retrieval trace that fed it |
-| `⟦N⟧` | Account code, extraction transcript only |
 
-### Names and namesakes
+### Member numbers
 
-Names are the model's only handle on people, and two members sharing a display name
-is ordinary. One rule (`qqbot/core/namesakes.py`) decides who wears the namesake tag
-wherever names are rendered: accounts whose bare names collide are tagged unless they
-all belong to one person. Every account of a person wears that person's serial, the
-smallest of the permanent per-group serials assigned to their accounts (`member_seq`,
-assigned once and never reused). Renames create and dissolve clashes and converge on
-the next member-list refresh. A departed namesake's lines are retagged against the live
-member who still carries the name. `search_history` accepts the tagged form as a speaker
-filter and narrows to that person's accounts.
+Two members sharing a display name is ordinary, so every person a prompt shows wears a
+member number behind their name (`qqbot/core/member_numbers.py`). The number belongs to
+a person: accounts merged into one person share it. The numbers follow the roster. The
+roster lists everyone who has appeared in the group, whether or not anything is known
+about them, ordered by first appearance, and is numbered in that order, so a newcomer
+joins at the end and nobody else's number moves. The roster is therefore also where the
+model finds the number of someone who is not in the current conversation. Anybody a
+prompt shows who is not in the roster yet (a first message still being archived) is
+numbered after it. Because the numbers depend on the roster alone, the conversation
+moving never renumbers anything above the history. The same numbering runs through the
+roster, the window, `search_history` results and the tool arguments that name people,
+so the model @-s and filters by the number it read.
 
-The bot's own lines in the window and the archive open with `@` and the name of the
-person they answered, so a later turn can see whom each answer was for.
+Numbers are never stored. The archive, retrieval traces and provenance markers hold
+names only. Members' own @-mentions stay in their text as names.
+
+The bot's own messages are rendered in the history as the `send_message` calls that sent
+them (text, @-ed member numbers and replied-to line number as arguments), each followed
+by a tool result carrying the message's line number, send time and provenance marker.
+What the model reads of its own output is the shape it is asked to produce. In the
+archive, the bot's line reads as the group saw it, `@name` openings included, with the
+@-ed accounts kept as `at` segments so a restart rebuilds the same window.
 
 ## Pictures and voice
 
@@ -237,12 +273,12 @@ speech backends remain available in the registry.
 
 ### Storage
 
-Twenty tables in `sql/init.sql`, layered:
+Nineteen tables in `sql/init.sql`, layered:
 
 | Layer | Tables | Holds |
 | --- | --- | --- |
 | Archive | `raw_event` | Every event, append-only. `payload` is the platform's verbatim message and is never modified; `plain_text` is the derived reading, updated with descriptions and transcripts. |
-| Identity | `entity`, `identity_account`, `alias`, `alias_evidence`, `member_seq` | Persons, their accounts, their names with evidence and scope, and permanent per-group serials. |
+| Identity | `entity`, `identity_account`, `alias`, `alias_evidence` | Persons, their accounts, and their names with evidence and scope. |
 | Facts | `memory_fact`, `memory_fact_evidence`, `memory_candidate` | Temporal facts about persons and groups, their evidence, and the model's proposals awaiting validation. |
 | Episodes | `episode`, `episode_participant`, `episode_event` | Summaries of stretches of conversation, with participants. |
 | Index and queue | `embedding_index`, `memory_job` | Vectors, kept apart from what they index; the background job queue. |

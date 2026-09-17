@@ -421,7 +421,7 @@ async def main():
     _rcfg = config().default.retrieval
     _ctx_saved, _rcfg.history_context = _rcfg.history_context, 0
     by_person = await tools_mod.execute(
-        _call("search_history", query="切片", speaker="小北"),
+        _call("search_history", query="切片", speaker_name="小北"),
         cfg=config().default, group_id=str(G))
     _rcfg.history_context = _ctx_saved
     check("a speaker filter keeps only that person's lines",
@@ -440,8 +440,9 @@ async def main():
     # Episodes reach a reply only through the recall_events tool (covered above):
     # nothing episodic is pushed per turn, so there is no per-message lookup here.
     roster = await retrieval.gather(group_id=str(G))
-    check("the roster carries the person's fact, not the group's",
-          [(r["nickname"], r["persona_card"]) for r in roster] == [("董自豪", "在玩鸣潮")],
+    check("the roster carries the person's fact, not the group's - and lists everyone",
+          [(r["nickname"], r["persona_card"]) for r in roster]
+          == [("董自豪", "在玩鸣潮"), ("小北", "")],
           str(roster))
     # A confirmed name rides the extraction roster as a comprehension key: the
     # extractor can resolve in-chat nicknames it would otherwise have to guess

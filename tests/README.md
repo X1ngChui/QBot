@@ -34,7 +34,7 @@ No QQ connection is needed. The runtime dependencies in `requirements.txt` are e
 | `test_commands.py` | yes | The command catalogue, who may run what, and every operation the command handlers perform |
 | `test_repo.py` | yes | The archive, the image cache, the per-group switches, the cost ledger |
 | `test_media.py` | yes | Every segment type QQ sends, cache hits, content refusals, size and rate caps |
-| `test_pipeline.py` | yes | The whole pipeline with a fake protocol side and stubbed models: triggers, identity, memory, media, namesakes, addressing |
+| `test_pipeline.py` | yes | The whole pipeline with a fake protocol side and stubbed models: triggers, identity, memory, media, member numbers, the send tool |
 | `test_memory.py` | yes | The extraction chain end to end: one stubbed call, four record kinds, quote validation, the nightly drain, replay |
 
 ## Conventions

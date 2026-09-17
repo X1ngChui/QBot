@@ -4,9 +4,11 @@ Why the whole roster rather than a retrieval: this block sits in the
 system prompt, ahead of the history, and prefix caching only matches forward from the
 start - rebuilding the roster around whoever is speaking invalidates everything after
 it, which costs more than the tokens it saves. Held whole and rendered in a fixed
-order, it is identical word for word between turns. A real group of thirty accounts
-renders to about two thousand characters; while it fits, there is nothing to rank and
-nothing to leave out.
+order, it is identical word for word between turns.
+
+Whole means everyone who has appeared in the group, whether or not anything is known
+about them: the roster is where member numbers are assigned (core.member_numbers), so
+it is the one list in which the model can find anybody it wants to @ or search for.
 
 The rows are assembled by `Directory`, the same service the ops commands read through.
 That is on purpose: with a single query behind both, /who shows an owner exactly the
@@ -19,12 +21,11 @@ omits it.
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import UTC, datetime
 
 from ..db import pool
 from ..settings import RetrievalCfg, config
-from ..util import defang, merge_overlapping, sysmark, why
-from . import namesakes
+from ..util import defang, merge_overlapping, sysmark
 from ..repositories import (
     EpisodeRepository, EventRepository, IdentityRepository, JobQueue,
     MemoryRepository, VectorRepository,
@@ -88,11 +89,26 @@ async def _stamp(gid: int, live: dict[str, str]) -> tuple:
     return (row["facts"], row["names"], row["people"], tuple(sorted(live.items())))
 
 
+def _named(card) -> bool:
+    """Whether a roster card shows a name rather than the account number the
+    directory falls back to when no name is on record. A name that happens to be
+    the digits of the account is still a name: it is on record."""
+    shown = card.display.strip()
+    if not shown:
+        return False
+    return shown not in card.accounts or any(
+        n.text == shown for n in (*card.names, *card.candidates))
+
+
 async def gather(*, group_id: str, bot=None) -> list[dict]:
-    """This group's roster, one row per person.
+    """This group's roster, one row per person, in order of first appearance.
 
     Per *person*, not per account: two accounts an owner has merged are one row, with
-    their message counts added together.
+    their message counts added together. Every person who has appeared here has a
+    row, including those nothing is known about yet.
+
+    Ordered by when each person first appeared, ties by account, because the order is
+    the member numbering: somebody new joins at the end, and nobody else's number moves.
 
     The row shape is what prompt.py renders. Two of the fields carry the same split the
     prompt draws between certainty and guesswork - a note was typed by an owner, a card is
@@ -121,46 +137,31 @@ async def gather(*, group_id: str, bot=None) -> list[dict]:
     live = await _live(speakers)
     stamp = await _stamp(gid, live)
 
-    # The bare names ride along so the "other names" filters can recognize a
-    # numbered member's own current card among the stored (bare) aliases -
-    # without them the card renders as a name the person supposedly dropped.
-    raw_live = ({} if bot is None
-                else await MEMBERS.raw_names_of(bot, group_id, list(live)))
-    cards = await _DIRECTORY.roster(gid, display=live, bare=raw_live,
-                                    exclude=exclude)
+    cards = await _DIRECTORY.roster(gid, display=live, exclude=exclude)
+    firsts = await EventRepository().first_appearances(gid)
+    never = datetime.max.replace(tzinfo=UTC)
+
+    def appeared(c) -> tuple:
+        seen = [firsts[u] for u in c.accounts if firsts.get(u) is not None]
+        return (min(seen) if seen else never, c.user_id)
 
     out: list[dict] = []
-    for c in cards:
-        # An entry that is nothing but an account number tells the model nothing, and a
-        # person with neither a name nor a fact to their name is exactly that.
-        if not c.display.strip():
-            continue
-        if not (c.summary or c.other_names or c.note):
-            continue
+    for c in sorted(cards, key=appeared):
         out.append({
             "user_id": c.user_id,
-            "nickname": c.display,
+            # The person and every account of theirs, so the prompt's member
+            # numbers give merged accounts one number without another lookup.
+            "entity_id": c.entity_id,
+            "accounts": list(c.accounts),
+            # A card with no name on record falls back to the account number, which
+            # the model is never shown; the generic member word stands in for it.
+            "nickname": c.display if _named(c) else "成员",
             "former_names": list(c.displayed_names),
             "aliases": list(c.nicknames),
             "persona_card": c.summary,
             "manual_note": c.note,
             "msg_count": c.messages,
         })
-    # Live names arrive already told apart (members.py tags clashing cards),
-    # but a row can still show an archived name - somebody who left, or a member
-    # fetch that failed - and clash with another row's. Tag whatever still
-    # collides by the same rule (core.namesakes), so the roster and the
-    # transcript spell one member one way; the serials are permanent, so the
-    # rendering is deterministic and the stamp cache stays coherent.
-    try:
-        tags = await namesakes.tags(
-            gid, {str(r["user_id"]): namesakes.bare(r["nickname"]) for r in out})
-        for row in out:
-            if tag := tags.get(str(row["user_id"])):
-                row["nickname"] = namesakes.bare(row["nickname"]) + tag
-    except Exception as e:
-        log.warning("group %s: roster namesake numbering unavailable: %s",
-                    group_id, why(e))
     _CACHE[group_id] = (stamp, out, speakers)
     return out
 

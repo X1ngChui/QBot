@@ -12,7 +12,9 @@ Verdicts per case:
     GUARDED - the raw output failed but clean_reply's strip fixed it (the exit
               guard caught a near-miss; source discipline is regressing)
     FAIL    - the group would have seen the violation
-OBSERVE cases carry no assertions; their replies are printed for human eyes.
+OBSERVE cases carry no assertions; their replies are printed for human eyes. Every
+case also prints whom the reply @-ed and which line it replied to, and a case can
+assert on those choices ("send_checks") as well as on the text.
 
 Usage (workstation, test DB up, real keys in .env):
     docker start qbot-pgtest
@@ -70,10 +72,11 @@ class EvalBot:
 
 
 def _msg(uid: str, name: str, text: str, mins_ago: int, *, mid: str = "",
-         is_bot: bool = False, reply_to: str | None = None) -> ChatMsg:
+         is_bot: bool = False, reply_to: str | None = None,
+         at: list[tuple[str, str]] | None = None) -> ChatMsg:
     return ChatMsg(msg_id=mid or f"e-{uid}-{mins_ago}-{len(text)}", user_id=uid,
                    nickname=name, text=text, ts=now_local() - timedelta(minutes=mins_ago),
-                   is_bot=is_bot, reply_to=reply_to)
+                   is_bot=is_bot, reply_to=reply_to, at=list(at or ()))
 
 
 #: Archive rows behind the tool-initiative cases: facts that exist ONLY in the
@@ -116,11 +119,48 @@ NO_MARKERS = [
 
 CASES = [
     {
+        "name": "send_at_namesake",
+        "why": "two members share a card; the member number is what names the right one",
+        "window": [
+            _msg("u61", "李芳", "我是做平面设计的", 12, mid="ns-a"),
+            _msg("u62", "李芳", "我是写后端代码的", 10, mid="ns-b"),
+        ],
+        "trigger": _msg("u1", "阿强", "@我 帮我跟写代码的那个李芳打个招呼", 0),
+        "checks": NO_MARKERS[:1],
+        "send_checks": [
+            ("@s the coder", lambda r: "u62" in r.at),
+            ("does not @ the designer", lambda r: "u61" not in r.at),
+        ],
+    },
+    {
+        "name": "send_reply_to_line",
+        "why": "answering a specific earlier line on someone's behalf replies to that line",
+        "window": [
+            _msg("u2", "小北", "周六爬山几点集合？", 15, mid="rl-q"),
+            _msg("u3", "小南", "我也想知道", 14),
+            _msg("u1", "阿强", "今天好热", 5),
+        ],
+        "trigger": _msg("u1", "阿强", "@我 替我回一下小北那个问题，早上八点", 0),
+        "checks": NO_MARKERS[:1],
+        "send_checks": [
+            ("reaches the one who asked: replies to the question or @s its author",
+             lambda r: r.reply_to == "rl-q" or "u2" in r.at),
+        ],
+    },
+    {
+        "name": "send_plain_choice",
+        "why": "an ordinary ask; what the model chooses to @ and reply to is shown, not scored",
+        "window": [_msg("u2", "小北", "晚上吃什么", 3)],
+        "trigger": _msg("u1", "阿强", "@我 你觉得火锅怎么样", 0),
+        "checks": None,
+    },
+    {
         "name": "marker_bait",
         "why": "a window dense with markers is the strongest imitation pressure",
         "window": [
             _msg("u1", "阿强", "今晚打不打牌", 30, mid="mk1"),
-            _msg("999", "小X", "打啊，老时间？", 29, is_bot=True, reply_to="mk1"),
+            _msg("999", "小X", "打啊，老时间？", 29, is_bot=True, reply_to="mk1",
+                 at=[("u1", "阿强")]),
             _msg("u2", "小北", "我八点才下班", 25, reply_to="mk1"),
             _msg("u1", "阿强", "那就八点半", 20),
         ],
@@ -352,9 +392,13 @@ async def run_case(case, cfg, persona, bot) -> tuple[str, str]:
     for m in case["window"]:
         st.add(m)
     st.add(case["trigger"])
-    raw, prov, trace = await engine.generate(
+    reply = await engine.generate(
         bot=bot, st=st, cfg=cfg, persona=persona, msg=case["trigger"])
-    raw = raw or ""
+    raw = reply.text if reply is not None else ""
+    prov = reply.provenance if reply is not None else ""
+    trace = reply.trace if reply is not None else ""
+    if reply is not None:
+        print(f"           send| at={reply.at} reply_to={reply.reply_to}")
     if case["checks"] is None:
         return "OBSERVE", raw
     cleaned = clean_reply(raw)
@@ -364,7 +408,10 @@ async def run_case(case, cfg, persona, bot) -> tuple[str, str]:
     # that never happened.
     loop_fail = [label for label, ok in case.get("loop_checks", ())
                  if not ok(prov, trace)]
-    clean_fail = [label for label, ok in case["checks"] if not ok(cleaned)] + loop_fail
+    send_fail = [label for label, ok in case.get("send_checks", ())
+                 if reply is None or not ok(reply)]
+    clean_fail = ([label for label, ok in case["checks"] if not ok(cleaned)]
+                  + loop_fail + send_fail)
     raw_fail = [label for label, ok in case["checks"] if not ok(raw)]
     if clean_fail:
         # A failing case prints what the tool loop actually did: whether the

@@ -282,20 +282,32 @@ check("an absent paid slot does not settle", not _MD.settled(real_img, {}))
 check("a free-only message settles trivially", _MD.settled(quoted, {}))
 check("Unsettled renders as its own text", _Un("[图片:猫]") == "[图片:猫]")
 
-# The quote mark renders on members' lines only. Assistant-role content is the
-# model's strongest example of its own output format, and the day bot lines
-# started opening with the mark, real replies started carrying it verbatim.
+# The bot's own lines render as the send call that sent them, followed by its
+# result: what the model reads of its own output is the shape it should produce.
+# Members' lines keep the transcript form, quote mark and member number included.
+from qqbot.core.member_numbers import MemberNumbers as _MN
 _qa = ChatMsg(msg_id="q1", user_id="u1", nickname="阿强", text="在吗", ts=now_local())
-_qb = ChatMsg(msg_id="q2", user_id="999", nickname="小X", text="在的", ts=now_local(),
-              is_bot=True, reply_to="q1")
+_qb = ChatMsg(msg_id="q2", user_id="999", nickname="小X",
+              text="在的 ⟦依据:搜索“在不在”⟧", ts=now_local(),
+              is_bot=True, reply_to="q1", at=[("u1", "阿强")])
 _qc = ChatMsg(msg_id="q3", user_id="u2", nickname="阿花", text="哦哦", ts=now_local(),
               reply_to="q1")
 _qn, _qm = prompt.numbered([_qa, _qb, _qc])
-_qh = prompt.render_history([_qa, _qb, _qc], _qn, _qm)
-check("the bot's own line renders without the quote mark",
-      "⟦回复" not in _qh[1]["content"], repr(_qh[1]["content"]))
-check("a member's line keeps its quote mark",
-      "⟦回复 #1⟧" in _qh[2]["content"], repr(_qh[2]["content"]))
+_qp = _MN(self_id="999")
+prompt.number_people(_qp, [], [_qa, _qb, _qc], None)
+_qh = prompt.render_history([_qa, _qb, _qc], _qn, _qm, people=_qp)
+_qcall = (_qh[1].get("tool_calls") or [{}])[0].get("function") or {}
+check("the bot's own line renders as its send call",
+      _qh[1]["role"] == "assistant" and _qcall.get("name") == "send_message"
+      and json.loads(_qcall.get("arguments") or "{}")
+      == {"text": "在的", "at": [1], "reply": 1}, repr(_qh[1]))
+check("and its result carries the line number, the time and the provenance",
+      _qh[2]["role"] == "tool"
+      and _qh[2]["tool_call_id"] == _qh[1]["tool_calls"][0]["id"]
+      and _qh[2]["content"].startswith("已发送：#2 ⟦")
+      and _qh[2]["content"].endswith("⟦依据:搜索“在不在”⟧"), repr(_qh[2]))
+check("a member's line keeps its quote mark and wears its member number",
+      "阿花⟦2⟧: ⟦回复 #1⟧" in _qh[3]["content"], repr(_qh[3]["content"]))
 
 # A message the adapter replays across a restart must not enter the window twice:
 # the pipeline's dedup set is process-local, and load_history - triggered by that

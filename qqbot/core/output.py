@@ -87,11 +87,11 @@ _TRACE_LINE = re.compile(rf"^.*{_L}检索记录{_R}.*$\n?", re.M)
 #: the notation being talked about) - where the readings collide, the guard
 #: declines.
 _REPLY_MARK = re.compile(rf"^\s*{_L}回复\s*(?:#\d{{1,4}}|更早的消息){_R}\s*", re.M)
-#: Speaker tags copied out of the history: the owner/self/namesake annotations
-#: that ride behind names in transcripts. Dropped whole wherever they appear -
-#: they are annotations about a line, never words anyone says.
+#: Speaker tags copied out of the history: the owner and self annotations and the
+#: member numbers that ride behind names in transcripts. Dropped whole wherever
+#: they appear - they are annotations about a name, never words anyone says.
 _NAME_TAG = re.compile(
-    rf"{re.escape(SYS_L)}(?:拥有者|你|同名\d{{1,9}}){re.escape(SYS_R)}")
+    rf"{re.escape(SYS_L)}(?:拥有者|你|\d{{1,9}}){re.escape(SYS_R)}")
 
 
 def strip_markdown(text: str) -> str:

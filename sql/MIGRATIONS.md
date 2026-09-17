@@ -15,6 +15,20 @@ docker exec qbot-postgres-1 psql -U qqbot -d qqbot -c "<statement>"
 Types mirror `init.sql`. Where an entry says to run a block from `init.sql`, copy it
 verbatim: some `ON CONFLICT` clauses depend on the unique index that follows the table.
 
+## 2026-09-17 — member numbers replace namesake serials
+
+```sql
+DROP TABLE IF EXISTS member_seq;
+UPDATE raw_event SET plain_text = regexp_replace(plain_text, '⟦同名\d+⟧', '', 'g')
+ WHERE plain_text LIKE '%⟦同名%';
+UPDATE reply_trace SET content = regexp_replace(content, '⟦同名\d+⟧', '', 'g')
+ WHERE content LIKE '%⟦同名%';
+```
+
+Members sharing a name are told apart by per-prompt member numbers, which are never
+stored. The serial table goes, and the serial tags written into archived text and
+retrieval traces are removed.
+
 ## 2026-09-11 — batch width and description stamps become mandatory
 
 ```sql

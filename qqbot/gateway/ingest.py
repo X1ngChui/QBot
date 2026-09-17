@@ -73,8 +73,14 @@ class Ingestor:
     async def record_own_reply(
         self, *, group_id: int, self_id: str, message_id: str, text: str,
         at: datetime, name: str = "", reply_to: str = "",
+        addressees: list[tuple[str, str]] | None = None,
     ) -> uuid.UUID:
         """Write down what the bot itself said.
+
+        `text` is the body; `addressees` are the (account, display name) pairs the
+        message @-ed. The stored reading opens with an "@name" per addressee, the
+        way the group read it, and the at segments keep the accounts so the
+        restart-rebuilt window knows whom the message addressed.
 
         NapCat is configured not to report the bot's own messages, so nothing else ever
         writes them - and memory is read back out of the archive, so an archive without
@@ -88,14 +94,18 @@ class Ingestor:
         No identity is created for it. The bot is not a group member with a history to be
         learned, and giving it an entity would put it in its own roster.
         """
+        addressees = [(qq, who) for qq, who in addressees or () if qq]
+        read = " ".join([*(f"@{who}" for _, who in addressees), text]).strip()
         return await self._record(GroupMessage(
             message_id=message_id,
             group_id=group_id,
             sender=Sender(user_id=self_id, nickname=name),
-            segments=[{"type": "text", "data": {"text": text}}],
+            segments=[*({"type": "at", "data": {"qq": qq, "name": who}}
+                        for qq, who in addressees),
+                      {"type": "text", "data": {"text": text}}],
             self_id=self_id,
             occurred_at=at,
-            plain_text=text,
+            plain_text=read,
             # The quote pointer travels into the payload the same way a member's
             # does, so the restart-rebuilt window renders the line identically.
             reply_to_message_id=reply_to or None,

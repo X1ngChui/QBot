@@ -43,6 +43,11 @@ class ChatMsg:
     #: The QQ id of the message this one quotes, if any. What the model is shown is a
     #: pointer to that message's line number - see prompt.numbered.
     reply_to: str | None = None
+    #: Whom one of the bot's own messages @-ed, as (account, display name) pairs in
+    #: send order. Kept apart from `text` so the prompt can show each target with
+    #: the number it wears in that render; members' own @-mentions stay in their
+    #: text as names.
+    at: list[tuple[str, str]] = field(default_factory=list)
     #: The parsed message, kept only while it still holds a picture or voice clip nobody
     #: has paid to understand. People post a picture and ask about it in the *next*
     #: message, by which time this one has been processed and its refs would otherwise be
@@ -78,7 +83,7 @@ class ChatMsg:
             lambda m: sysmark(f"{m.group(1)}{next(it)}{m.group(2) or ''}"), self.text)
 
     def render(self, *, seq: int = 0, quote: str = "",
-               pic_nums: list[int] | None = None) -> str:
+               pic_nums: list[int] | None = None, member_no: int = 0) -> str:
         """One line of transcript, as the model will read it.
 
         The prompt only ever sees a display name, never a QQ id, so without the owner tag
@@ -86,8 +91,9 @@ class ChatMsg:
         is derived from the (stable) user id at receive time, so a given message always
         renders identically and the history stays cache-safe.
 
-        `seq` is this line's number in whatever is being shown, and `quote` the pointer to
-        the line it replies to. Both are worked out per prompt - see prompt.numbered.
+        `seq` is this line's number in whatever is being shown, `quote` the pointer to
+        the line it replies to, and `member_no` the speaker's member number. All three
+        are worked out per prompt - see prompt.numbered and core.member_numbers.
 
         Every line carries its send time. Without one the model reads sixty messages
         as one continuous conversation and bridges topics hours apart. The stamp is
@@ -101,8 +107,47 @@ class ChatMsg:
         when = sysmark(fmt_when(self.ts)) + " "
         if self.is_bot:
             return f"{head}{when}{body}"
+        no = sysmark(str(member_no)) if member_no else ""
         tag = OWNER_TAG if self.is_owner else ""
-        return f"{head}{when}{self.nickname}{tag}: {body}"
+        return f"{head}{when}{self.nickname}{no}{tag}: {body}"
+
+
+def _split_addressees(segments: list, text: str) -> tuple[list[tuple[str, str]], str]:
+    """(whom it @-ed, body) for one of the bot's own archived messages.
+
+    The at segments carry account and name; the archived text opens with those same
+    names (Ingestor.record_own_reply writes it so), so they are taken off the front
+    in order. A line whose text does not open that way (archived before the at
+    segments were stored) keeps its text whole.
+    """
+    at = [(str((s.get("data") or {}).get("qq") or ""),
+           str((s.get("data") or {}).get("name") or ""))
+          for s in segments if isinstance(s, dict) and s.get("type") == "at"]
+    at = [(qq, name) for qq, name in at if qq]
+    rest = text
+    for _, name in at:
+        opening = f"@{name}"
+        if not rest.startswith(opening):
+            return [], text
+        rest = rest[len(opening):].lstrip(" ")
+    return at, rest
+
+
+def _asker(earlier: list[ChatMsg], reply_to: str | None,
+           text: str) -> tuple[str, str] | None:
+    """(account, name) of the member one of the bot's archived lines @-ed, for a
+    line archived without at segments: such lines always replied to the asker's
+    message and opened with "@" and the asker's name, so the replied-to line names
+    the account. None when the line does not read that way."""
+    if not reply_to or not text.startswith("@"):
+        return None
+    asked = next((m for m in reversed(earlier) if m.msg_id == reply_to), None)
+    if asked is None or asked.is_bot:
+        return None
+    opening = f"@{asked.nickname}"
+    if text == opening or text.startswith(opening + " "):
+        return asked.user_id, asked.nickname
+    return None
 
 
 @dataclass
@@ -246,17 +291,29 @@ class GroupState:
             # a restart: re-parsed here, they are what lets open_images hand over a
             # picture posted before the deploy. Parsing is pure and costs nothing.
             segs = payload.get("segments") or []
-            refs = parse_segments(segs, self_id, limits=limits).pictures if segs else []
+            is_bot = uid == self_id
+            at: list[tuple[str, str]] = []
+            if is_bot:
+                # The bot's own line was archived as the group read it, "@name "
+                # openings included; the at segments say whom, and the opening
+                # comes off so the text is the body the reply carried.
+                at, text = _split_addressees(segs, text)
+                if not at and (asker := _asker(msgs, payload.get("reply_to"), text)):
+                    at, text = [asker], text[len(asker[1]) + 1:].lstrip(" ")
+                refs = []
+            else:
+                refs = parse_segments(segs, self_id, limits=limits).pictures if segs else []
             msgs.append(ChatMsg(
                 msg_id=str(r["platform_event_id"] or r["id"]),
                 user_id=uid,
                 nickname=display_name(sender.get("card"), sender.get("nickname"), "成员"),
                 text=text,
                 ts=r["occurred_at"],
-                is_bot=uid == self_id,
+                is_bot=is_bot,
                 is_owner=uid in owners,
                 reply_to=payload.get("reply_to") or None,
                 image_refs=refs,
+                at=at,
             ))
         archived = {m.msg_id for m in msgs}
         live = [m for m in self.recent if m.msg_id not in archived]

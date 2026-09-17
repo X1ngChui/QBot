@@ -19,9 +19,17 @@ so sliding rarely is most of what there is to win.
 
 from __future__ import annotations
 
+import json
+import re
+
 from ..settings import Persona, Settings, ptext
-from ..util import defang, describe_now, sysmark
+from ..util import SYS_L, SYS_R, defang, describe_now, fmt_when, sysmark
+from .member_numbers import MemberNumbers
 from .state import ChatMsg, GroupState
+from .tools import SEND
+#: The provenance marker at the end of one of the bot's own archived lines.
+_PROV_TAIL = re.compile(
+    rf"\s*({re.escape(SYS_L)}依据[:：][^{re.escape(SYS_R)}]*{re.escape(SYS_R)})\s*$")
 
 # The history window is a message count, not a token budget: money bounds what a
 # reply may spend, and every other block is rendered whole. The count and its
@@ -43,21 +51,30 @@ H_TONE = "【群聊语用】"
 H_WHO = "【群成员名册】"
 
 
-def _block(head: str, entries: list[tuple[str, str]]) -> str:
-    """Join a heading and its entries, written out in account order.
+def _block(head: str, entries: list[tuple[int, str]]) -> str:
+    """Join a heading and its entries, written out in member-number order.
 
-    The order is the point: the account id never changes, so the block renders
-    identically between turns. This sits inside the cached prefix, and an ordering
-    that can change - any ranking by activity can, on any message - costs the cache
-    from that line to the end of the prompt.
+    The order is the point: the numbering follows the roster, which is ordered by
+    first appearance, so the block renders identically between turns. This sits inside
+    the cached prefix, and an ordering that can change - any ranking by activity can,
+    on any message - costs the cache from that line to the end of the prompt.
     """
     if not entries:
         return ""
     return head + "\n" + "\n".join(line for _, line in sorted(entries))
 
 
-def _known_block(profiles: list[dict]) -> str:
-    """What the system can vouch for about who somebody is.
+def _name(p: dict, people: MemberNumbers) -> tuple[int, str]:
+    """A roster row's member number, and its name wearing that number. defang on
+    render as well as at ingest: names are stored as the platform reported them, and
+    the render is where the grammar must hold."""
+    n = people.number(str(p.get("user_id") or ""))
+    return n, defang(p.get("nickname") or "") + (sysmark(str(n)) if n else "")
+
+
+def _known_block(profiles: list[dict], people: MemberNumbers) -> str:
+    """What the system can vouch for about who somebody is: every person in the roster,
+    by name and member number, with whatever is on record beside the name.
 
     Three things qualify, and they are three different kinds of claim, so the line says
     which is which rather than running them together:
@@ -80,8 +97,6 @@ def _known_block(profiles: list[dict]) -> str:
     """
     lines = []
     for p in profiles:
-        # defang on render as well as at ingest: names are stored as the platform
-        # reported them, and the render is where the grammar must hold.
         name = defang(p.get("nickname") or "")
         bits = []
         if former := [defang(n) for n in (p.get("former_names") or [])
@@ -92,12 +107,12 @@ def _known_block(profiles: list[dict]) -> str:
             bits.append("别名：" + "、".join(aliases))
         if note := defang(p.get("manual_note") or "").strip():
             bits.append(note)
-        if bits:
-            lines.append((str(p.get("user_id") or ""), f"- {name}，" + "；".join(bits)))
+        n, shown = _name(p, people)
+        lines.append((n, f"- {shown}，" + "；".join(bits) if bits else f"- {shown}"))
     return _block("已确认（系统记录的名字，以及拥有者或成员本人写明的信息）：", lines)
 
 
-def _guessed_block(profiles: list[dict]) -> str:
+def _guessed_block(profiles: list[dict], people: MemberNumbers) -> str:
     """What the bot worked out by watching, in its own words.
 
     Kept apart from the block above because a guess and a fact the platform reported are
@@ -110,11 +125,11 @@ def _guessed_block(profiles: list[dict]) -> str:
     """
     lines = []
     for p in profiles:
-        name = defang(p.get("nickname") or p.get("user_id") or "")
         card = defang(p.get("persona_card") or "").strip()
         if not card:
             continue
-        lines.append((str(p.get("user_id") or ""), f"- {name}。{card}"))
+        n, shown = _name(p, people)
+        lines.append((n, f"- {shown}。{card}"))
     return _block("未确认（你自行归纳的印象，不要直接复述）：", lines)
 
 
@@ -122,6 +137,7 @@ def build_system(
     persona: Persona,
     profiles: list[dict],
     group_facts: list[str] | None = None,
+    people: MemberNumbers | None = None,
 ) -> str:
     # Constants lead, so every group shares this opening span instead of each paying for
     # its own. They also have to live here rather than in each persona: a bot that does not
@@ -159,8 +175,11 @@ def build_system(
     # carries the same weight as a rename the platform reported. Everything outside the
     # certain block comes from the model's own summarising, which is what makes this
     # adaptive - it follows the group rather than a config file someone has to edit.
-    known = _known_block(profiles)
-    guessed = _guessed_block(profiles)
+    if people is None:
+        people = MemberNumbers()
+        number_people(people, profiles, [], None)
+    known = _known_block(profiles, people)
+    guessed = _guessed_block(profiles, people)
     parts = [x for x in (known, guessed) if x]
     if parts:
         blocks.append(H_WHO + "\n" + "\n\n".join(parts))
@@ -210,10 +229,9 @@ def numbered(visible: list[ChatMsg]) -> tuple[dict[str, int], dict[str, str]]:
     of the block and has already cost the prefix cache whatever the numbers do.
 
     Every line is numbered, the bot's own included, so a quote of anything is the same
-    marker pointing at the same kind of thing. The bot's number does appear in an
-    assistant turn, where it is an example the model may follow - output.clean_reply
-    takes it back off, which is a guard in one place rather than a second quote format
-    and a second rule in the legend.
+    marker pointing at the same kind of thing, and the send tool can reply to any of
+    them. A number the model copies into its text anyway is taken back off by
+    output.clean_reply.
 
     Out of the window, a quote is reported as unavailable. Fetching it would put text on
     screen belonging to no line the model can see - the same ambiguity the numbers exist
@@ -262,47 +280,113 @@ def numbered_images(visible: list[ChatMsg]) -> tuple[dict[str, list[int]], dict[
     return per_msg, by_pic
 
 
+def teach_roster(people: MemberNumbers, profiles: list[dict]) -> None:
+    """Tell the numbering which person each roster account belongs to, so merged
+    accounts share their person's number without a lookup."""
+    for p in profiles:
+        for account in p.get("accounts") or ():
+            people.teach(account, p.get("entity_id") or p.get("user_id"))
+
+
+def number_people(people: MemberNumbers, profiles: list[dict],
+                  window: list[ChatMsg], msg: ChatMsg | None) -> None:
+    """Assign member numbers in the order the prompt shows people.
+
+    The roster first, in its own order (first appearance in the group), and the
+    roster holds everyone who has appeared here - so the numbers are the roster's,
+    depend on nothing the conversation does, and keep the system block cached while
+    it moves. Anybody the window shows who is not in the roster yet (a first message
+    still being archived) is numbered after it, oldest first, then the message being
+    answered.
+    """
+    teach_roster(people, profiles)
+    for p in profiles:
+        people.number(str(p.get("user_id") or ""))
+    for m in [*window, *([msg] if msg is not None else [])]:
+        if m.is_bot:
+            for account, _ in m.at:
+                people.number(account)
+        else:
+            people.number(m.user_id, spoke=True)
+
+
+def _call_id(msg_id: str) -> str:
+    """A stable tool-call id for one of the bot's past messages: derived from the
+    message id, so the rendered history is byte-identical between turns."""
+    return SEND + "_" + re.sub(r"[^A-Za-z0-9_-]", "_", msg_id)
+
+
+def own_line(m: ChatMsg, *, nums: dict[str, int], people: MemberNumbers | None,
+             trace: str = "") -> list[dict]:
+    """One of the bot's own messages, as the send call that sent it and its result.
+
+    The model sends every reply through the send tool, so its past messages are
+    shown in exactly that form: the text, whom it @-ed and which line it replied to
+    as arguments, then a tool result carrying the line number, the send time and the
+    provenance marker. Shown this way, what the model reads of its own output is the
+    shape it should produce, rather than a transcript line - numbers, stamps,
+    brackets - that it would copy into the text.
+
+    A stored trajectory rides as the content of the same assistant message: what
+    was looked up, then what was sent. Its bytes come straight from the immutable
+    reply_trace row, which keeps the rendering stable between turns.
+    """
+    body = m.text
+    prov = ""
+    if found := _PROV_TAIL.search(body):
+        prov, body = found.group(1), body[:found.start()]
+    args: dict = {"text": body}
+    ats = [people.number(a) if people is not None else 0 for a, _ in m.at]
+    if ats := [n for n in ats if n]:
+        args["at"] = ats
+    if m.reply_to and (q := nums.get(m.reply_to)):
+        args["reply"] = q
+    cid = _call_id(m.msg_id)
+    result = f"已发送：#{nums.get(m.msg_id, 0)} {sysmark(fmt_when(m.ts))}"
+    return [
+        {"role": "assistant", "content": trace or None,
+         "tool_calls": [{"id": cid, "type": "function",
+                         "function": {"name": SEND,
+                                      "arguments": json.dumps(args, ensure_ascii=False)}}]},
+        {"role": "tool", "tool_call_id": cid,
+         "content": f"{result} {prov}" if prov else result},
+    ]
+
+
 def render_history(window: list[ChatMsg], nums: dict[str, int],
                    marks: dict[str, str],
                    traces: dict[str, str] | None = None,
-                   pics: dict[str, list[int]] | None = None) -> list[dict]:
-    """One chat message per line of transcript, text only.
+                   pics: dict[str, list[int]] | None = None,
+                   people: MemberNumbers | None = None) -> list[dict]:
+    """The window as chat messages: one user message per member line, one send
+    call and its result per line the bot sent (see own_line).
 
     No picture rides in the history. Every marker carries a number and the model
     opens what it wants to see with open_images, so a message's render depends on
-    nothing but the message: it stays byte-identical between turns, and the
-    prefix cache is never spent on a picture that a newer one pushed off a rail.
-
-    A reply with a stored trajectory gets it seated directly before it, as its own
-    assistant message: what was looked up, then what was said. Unnumbered and
-    unstamped on purpose - numbering is a property of what people can quote, and
-    the entry's bytes come straight from the immutable reply_trace row, which is
-    what keeps the rendering stable between turns. The deque never holds these;
-    the table is the single source and eviction follows the reply's own.
+    nothing but the message and the numbering: it stays byte-identical between
+    turns, and the prefix cache is never spent on a picture that a newer one pushed
+    off a rail.
     """
     traces = traces or {}
     pics = pics or {}
     out: list[dict] = []
     for m in window:
-        if m.is_bot and (t := traces.get(m.msg_id)):
-            out.append({"role": "assistant", "content": t})
-        # The bot's own lines never carry the quote mark. Assistant-role content
-        # is the strongest imitation signal there is - "what my output looks
-        # like" - and a mark shown there comes back in real replies verbatim, which
-        # prompt instruction does not reliably stop. Members' lines keep theirs:
-        # user-role content teaches reading, not writing, and the pointer is how a
-        # quote is understood at all.
-        line = m.render(seq=nums.get(m.msg_id, 0),
-                        quote="" if m.is_bot else marks.get(m.msg_id, ""),
-                        pic_nums=pics.get(m.msg_id))
-        out.append({"role": "assistant" if m.is_bot else "user", "content": line})
+        if m.is_bot:
+            out.extend(own_line(m, nums=nums, people=people,
+                                trace=traces.get(m.msg_id, "")))
+            continue
+        line = m.render(seq=nums.get(m.msg_id, 0), quote=marks.get(m.msg_id, ""),
+                        pic_nums=pics.get(m.msg_id),
+                        member_no=people.number(m.user_id) if people is not None else 0)
+        out.append({"role": "user", "content": line})
     return out
 
 
 def build_tail(*, msg: ChatMsg,
                nums: dict[str, int] | None = None,
                marks: dict[str, str] | None = None,
-               pics: dict[str, list[int]] | None = None) -> str:
+               pics: dict[str, list[int]] | None = None,
+               people: MemberNumbers | None = None) -> str:
     """Everything after the cache boundary: the clock, then the current message.
 
     Nothing else is pushed here on purpose. Whatever sits in this tail is the
@@ -320,7 +404,8 @@ def build_tail(*, msg: ChatMsg,
 
     nums, marks, pics = nums or {}, marks or {}, pics or {}
     now = msg.render(seq=nums.get(msg.msg_id, 0), quote=marks.get(msg.msg_id, ""),
-                     pic_nums=pics.get(msg.msg_id))
+                     pic_nums=pics.get(msg.msg_id),
+                     member_no=people.number(msg.user_id) if people is not None else 0)
     # Each reply task carries exactly one addressed message; this header is the
     # anchor reply_final points at when naming which message to answer.
     parts.append("下面是刚收到的消息：\n" + now)
@@ -343,25 +428,30 @@ def assemble(
     nums: dict[str, int] | None = None,
     marks: dict[str, str] | None = None,
     pics: dict[str, list[int]] | None = None,
+    people: MemberNumbers | None = None,
 ) -> list[dict]:
-    messages = [
-        {
-            "role": "system",
-            "content": build_system(persona, profiles, group_facts),
-        }
-    ]
     # One pass over the window for both halves: the marks have to agree across the cache
     # boundary, since a quote in the message being answered points at a numbered line
     # above it. A caller that also runs the tool loop MUST pass its own computation
-    # in (window/nums/marks) - the tool context's seq->message map and the numbers
-    # the model reads have to come from one pass, not from two passes that merely
-    # happen to agree while nothing appends to the deque in between.
+    # in (window/nums/marks/people) - the tool context resolves the numbers the model
+    # writes back against these very maps, and two passes that merely happen to agree
+    # while nothing appends to the deque in between are not the same thing.
     if window is None:
         window = history_window(st, msg, cfg)
         nums, marks = numbered(window + [msg])
     if pics is None:
         pics, _ = numbered_images(window + [msg])
-    messages.extend(render_history(window, nums, marks, traces, pics))
+    if people is None:
+        people = MemberNumbers()
+        number_people(people, profiles, window, msg)
+    messages = [
+        {
+            "role": "system",
+            "content": build_system(persona, profiles, group_facts, people),
+        }
+    ]
+    messages.extend(render_history(window, nums, marks, traces, pics, people))
     messages.append({"role": "user",
-                     "content": build_tail(msg=msg, nums=nums, marks=marks, pics=pics)})
+                     "content": build_tail(msg=msg, nums=nums, marks=marks, pics=pics,
+                                           people=people)})
     return messages

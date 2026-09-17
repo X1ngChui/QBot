@@ -139,7 +139,7 @@ def fmt_when(dt: datetime) -> str:
 
 
 #: The system bracket pair, U+27E6/U+27E7. Every marker the system writes into a
-#: transcript - timestamps, media descriptions, owner/self/namesake tags, quote
+#: transcript - timestamps, media descriptions, owner/self tags, member numbers, quote
 #: pointers, notice lines, provenance - uses these and only these. They are
 #: unforgeable because defang() replaces them with ASCII square brackets in every
 #: untrusted string before it can reach a rendered line: a card imitating the
@@ -185,14 +185,6 @@ def sysmark(body: str) -> str:
     """One system marker, in the reserved brackets. The single spelling of the
     grammar, so a marker written here can never drift from the defang() pair."""
     return f"{SYS_L}{body}{SYS_R}"
-
-
-def namesake_tag(seq: int) -> str:
-    """The tag two members sharing one display name wear behind it, carrying the
-    group's permanent serial for the account. One spelling for the member table,
-    the roster and the search tool's parser, so a namesake reads the same
-    everywhere."""
-    return sysmark(f"同名{seq}")
 
 
 def display_name(card: object, nickname: object = "", fallback: object = "") -> str:

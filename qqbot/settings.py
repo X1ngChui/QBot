@@ -40,7 +40,7 @@ PROMPT_KEYS = frozenset({
     # media and tools
     "describe_image",
     "tool_web_search", "tool_search_history", "tool_recall_events",
-    "tool_read_url", "tool_open_images",
+    "tool_read_url", "tool_open_images", "tool_send_message",
 })
 
 CONFIG_DIR = Path(os.getenv("CONFIG_DIR", "/app/config"))

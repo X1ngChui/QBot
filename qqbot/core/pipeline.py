@@ -6,9 +6,9 @@ being answered. (`gateway/` is the protocol layer - OneBot in, typed events out.
 
 Every addressed message gets exactly one reply task, cut loose at the moment it
 arrives with its own slice of the conversation. Tasks run concurrently: each
-quotes and @s its own initiator and bills its own asker (task-local budget
-attribution), so two people asking at once each get their own answer instead of
-the later ask absorbing the earlier one. The order is what keeps the cost down:
+answers its own message and bills its own asker (task-local budget attribution), so
+two people asking at once each get their own answer instead of the later ask
+absorbing the earlier one. The order is what keeps the cost down:
 everything before the trigger is free, and nothing is paid for until the bot has
 decided to answer - which, since it only speaks when spoken to, is settled by a
 nickname match.
@@ -45,29 +45,30 @@ log = logging.getLogger("qqbot.pipeline")
 
 async def note_console_reply(*, group_id: str | int, self_id: str, text: str,
                              message_id: str = "", reply_to: str = "",
-                             name: str = "", addressee: str = "") -> None:
+                             name: str = "",
+                             addressee: tuple[str, str] | None = None) -> None:
     """A command's answer, entered into the window and the archive like any
     other line the bot speaks.
 
     Off the record, /who's card or /stats' table would land in the group but reach
     neither the window nor L0, and the next question about it ("what does that note
     mean?") would meet a model that had never seen it - the one speaker in the room
-    whose words vanish. Both writes mirror the engine's own send path, the
-    "@asker" opening included (`addressee` is the asker's display name): it is
+    whose words vanish. Both writes mirror the engine's own send path, the @ of
+    the asker included (`addressee` is their account and display name): it is
     what the group read, and what tells a later turn whom the answer was for. A
     missing platform id falls back to a synthetic one, which costs only the
     quote-pointer render if someone replies to that exact message.
     """
     now = now_local()
     mid = message_id or f"cmd-{uuid.uuid4().hex[:12]}"
-    if addressee:
-        text = f"@{addressee} {text}"
+    at = [addressee] if addressee and addressee[0] else []
     if (st := REGISTRY.loaded(str(group_id))) is not None:
         st.add(ChatMsg(msg_id=mid, user_id=str(self_id), nickname=name,
-                       text=text, ts=now, is_bot=True, reply_to=reply_to or None))
+                       text=text, ts=now, is_bot=True, reply_to=reply_to or None,
+                       at=list(at)))
     await ingestor().record_own_reply(
         group_id=int(group_id), self_id=str(self_id), message_id=mid,
-        text=text, at=now, name=name, reply_to=reply_to)
+        text=text, at=now, name=name, reply_to=reply_to, addressees=at)
 
 
 class Inbound:
@@ -347,21 +348,19 @@ class Gateway:
         filed as bot speech would be repeated to a member who has since satisfied
         the gate.
 
-        The window line wears the rendered (possibly numbered) name; the
-        archived sender must carry the raw card or nothing, because the ingest
-        chain files sender names into the alias table as platform-reported - a
-        namesake suffix (or a bare account number) written there would assert
-        the platform reported a name nobody carries, and it would stick.
+        The window line falls back to the generic member word for a name the
+        member list does not know; the archived sender carries the card or
+        nothing, because the ingest chain files sender names into the alias table
+        as platform-reported, and a placeholder written there would stick.
         """
         cfg, _persona = config().for_group(group_id)
         st = await REGISTRY.get(group_id)
-        name = (await MEMBERS.name_of(bot, group_id, actor)) or "成员"
-        raw = await MEMBERS.raw_name_of(bot, group_id, actor)
-        st.add(ChatMsg(msg_id=msg_id, user_id=actor, nickname=name, text=text,
+        card = await MEMBERS.name_of(bot, group_id, actor)
+        st.add(ChatMsg(msg_id=msg_id, user_id=actor, nickname=card or "成员", text=text,
                        ts=ts, is_owner=actor in cfg.owners))
         inbound = GroupMessage(
             message_id=msg_id, group_id=int(group_id),
-            sender=Sender(user_id=actor, nickname=raw or ""),
+            sender=Sender(user_id=actor, nickname=card or ""),
             segments=[{"type": "text", "data": {"text": text}}],
             self_id=str(bot.self_id), occurred_at=ts, sub_type="notice",
             plain_text=text)
@@ -431,7 +430,7 @@ class Gateway:
         """One reply attempt for one addressed message, start to finish.
 
         Tasks run concurrently. Each carries its own context slice (cut at
-        arrival), quotes and @s its own initiator, and bills its own asker
+        arrival), answers its own message, and bills its own asker
         through the budget's task-local attribution - so simultaneous asks
         answer independently, in whatever order the model finishes them.
         """
@@ -507,8 +506,6 @@ class Gateway:
             await engine.respond(
                 bot=bot, st=st, cfg=cfg, persona=persona,
                 msg=item.msg, window=window,
-                reply_to=decision.initiator_msg_id,
-                initiator=decision.initiator,
                 track=self._track,
             )
 

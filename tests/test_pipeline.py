@@ -10,6 +10,7 @@ os.environ.setdefault("DATABASE_URL", "postgresql://qqbot@127.0.0.1:15432/qqbot"
 os.environ.setdefault("DATABASE_PASSWORD", "testpw")
 import asyncio
 import itertools
+import re
 import types
 
 
@@ -44,9 +45,31 @@ REPLY_TEXT = {"v": "**行啊**，我看看"}
 KNOWLEDGE = {"v": "群主是老王，外号王哥。"}
 
 
+#: The message being answered, as the reply prompt's tail shows it: its line number,
+#: then its speaker's member number behind the name.
+_TAIL_LINE = re.compile(r"下面是刚收到的消息：\n#(\d+) ⟦[^⟧]*⟧ [^\n]*?⟦(\d+)⟧")
+
+
+def send_to_asker(messages, text):
+    """The send call a well-behaved model makes: the text, replying to the message
+    being answered and @-ing its sender, both named by the numbers the prompt shows."""
+    import json as _json
+    args = {"text": text}
+    for m in reversed(messages):
+        found = (_TAIL_LINE.search(m["content"])
+                 if m.get("role") == "user" and isinstance(m.get("content"), str) else None)
+        if found:
+            args.update(reply=int(found.group(1)), at=[int(found.group(2))])
+            break
+    return [{"id": f"send-{len(LLM_CALLS)}", "type": "function",
+             "function": {"name": "send_message",
+                          "arguments": _json.dumps(args, ensure_ascii=False)}}]
+
+
 class FakeText(TextModel):
     """A real subclass of the ABC, so this test breaks if the contract changes - which is
-    exactly what happened when the deliberation flag was added."""
+    exactly what happened when the deliberation flag was added. On the reply path it
+    answers the way a well-behaved model does: through the send tool."""
 
     MODEL = "fake-light"
     RATE = Rate("Mtoken", in_hit=0.02, in_miss=1.0, out=2.0, source="fake")
@@ -73,6 +96,9 @@ class FakeText(TextModel):
         await BUDGET.record(kind=kind, model=self.MODEL,
                             cny=self.rate_for(self.MODEL).tokens(100, 10, 20),
                             in_hit=100, in_miss=10, out=20, group_id=group_id)
+        if kind == "reply" and tools:
+            return ChatResult(text="", model=self.MODEL, in_hit=100, in_miss=10, out=20,
+                              tool_calls=send_to_asker(messages, text))
         return ChatResult(text=text, model=self.MODEL, in_hit=100, in_miss=10, out=20)
 
     keeps_files = True
@@ -269,8 +295,9 @@ async def main():
             WHERE group_id=123 AND platform_user_id=$1""",
         str(bot.self_id))
     check("the bot's own reply is archived too", len(own) == 1, str([dict(r) for r in own]))
-    check("and it is the text that was actually sent",
-          own and own[0]["plain_text"] == bot.sent[0][1], str(bot.sent[:1]))
+    check("and it is the text that was actually sent, opened by the @ it carried",
+          own and own[0]["plain_text"] == "@阿强 " + bot.sent[0][1],
+          f"{bot.sent[:1]} {own[0]['plain_text'] if own else None!r}")
     # The answer is anchored to its cause: sent as a quote of the message that
     # called, and the same pointer goes into the archive so the rebuilt window
     # renders the bot's line with the ordinary quote mark.
@@ -297,8 +324,8 @@ async def main():
     # are indistinguishable to the model - three members rearranging the same joke
     # nickname read as one person renaming himself, and it said so out loud. The system
     # knows better on both counts, and now says so.
-    check("the prompt says similar names are still different people",
-          "昵称不同按不同账号处理" in sys_prompt)
+    check("the prompt says identity is judged by member number, not by name",
+          "判断是否同一个人只看编号，不看昵称" in sys_prompt)
     check("and that a rename is only a rename when it was recorded",
           "断言该账号改过或没改过名" in sys_prompt,
           sys_prompt[sys_prompt.find("曾用名"):][:120])
@@ -317,7 +344,7 @@ async def main():
           "一个人可持有多个账号" in sys_prompt
           and "不得断言二者一定不属于同一人" in sys_prompt)
     check("and stop short of what is not known",
-          "身份确认能力止于账号一级" in sys_prompt
+          "身份确认能力止于成员编号" in sys_prompt
           and "未告知的信息即为未知信息" in sys_prompt)
     check("the persona follows the constants",
           sys_prompt.index("【信息解读规则】") < sys_prompt.index("【你的身份】"))
@@ -370,7 +397,8 @@ async def main():
     await GATEWAY.handle(bot, FakeEvent("在吗", to_me=True, user_id="u9", nickname="随便改的名字"))
     await drain()
     own_tail = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["messages"][-1]["content"]
-    check("owner is tagged in the prompt", "随便改的名字⟦拥有者⟧" in own_tail, own_tail[-90:])
+    check("owner is tagged in the prompt, behind the member number",
+          re.search(r"随便改的名字⟦\d+⟧⟦拥有者⟧", own_tail), own_tail[-90:])
     await GATEWAY.handle(bot, FakeEvent("在吗", to_me=True, user_id="u1", nickname="阿强"))
     await drain()
     plain_tail = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["messages"][-1]["content"]
@@ -620,7 +648,7 @@ async def main():
           len(VISION_SEEN) == 1, str(VISION_SEEN))
     hist = "\n".join(
         m["content"] if isinstance(m["content"], str)
-        else " ".join(b["text"] for b in m["content"] if b.get("type") == "text")
+        else " ".join(b["text"] for b in m["content"] or () if b.get("type") == "text")
         for m in [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["messages"])
     check("and the description lands in the history, where the question points",
           "橘猫" in hist and "群里的阿明 ⟦图片⟧" not in hist, hist[-200:])
@@ -941,7 +969,9 @@ async def main():
     # The roster is the whole group in a fixed order, and the reason is the prefix cache:
     # it sits in the system block ahead of the history, and a cache matches from the
     # beginning, so anything that reorders per turn invalidates the history behind it every
-    # turn - so it must never be built from whoever spoke most recently.
+    # turn - so it must never be built from whoever spoke most recently. The order is
+    # first appearance, because it is also the member numbering: a newcomer joins at
+    # the end and nobody else's number moves.
     from qqbot.core import retrieval as _retr
     _DIR = _retr.directory()
     for i, uid in enumerate(["a", "b", "c", "d", "e", "f"]):
@@ -951,19 +981,24 @@ async def main():
     await seed(ORD, "tie2", "tie2")
     await _DIR.note(ORD, "tie1", "first of the pair")
     await _DIR.note(ORD, "tie2", "second of the pair")
+    await seed(ORD, "zz", "zz", n=9)                 # busiest, last to appear, no record
 
     _roster = [r["user_id"] for r in await _retr.gather(group_id=str(ORD), bot=bot)]
-    check("the roster is ordered by activity, not by recency",
-          _roster[:6] == ["a", "b", "c", "d", "e", "f"], str(_roster))
-    check("and equal counts keep a stable order",
-          _roster[6:] == ["tie1", "tie2"], str(_roster[6:]))
+    check("the roster is ordered by first appearance, not by activity or recency",
+          _roster == ["a", "b", "c", "d", "e", "f", "tie1", "tie2", "zz"], str(_roster))
     check("the same call twice gives the same order",
           [r["user_id"] for r in await _retr.gather(group_id=str(ORD), bot=bot)] == _roster)
 
     # Someone who has not spoken this turn is in it too - which is what removes the need
-    # to work out who a message is about before deciding whose record to load.
-    check("everyone with a record is in it, whoever is speaking", len(_roster) == 8,
-          str(len(_roster)))
+    # to work out who a message is about before deciding whose record to load - and so
+    # is someone nothing is known about: the roster is where every member number lives.
+    check("everyone who has appeared is in it, known about or not",
+          len(_roster) == 9 and "zz" in _roster, str(_roster))
+    _numbered = prompt_mod.build_system(config().for_group(str(ORD))[1],
+                                        await _retr.gather(group_id=str(ORD), bot=bot), "")
+    check("the roster carries the member numbers, in its own order",
+          "- a⟦1⟧，note about a" in _numbered and "\n- zz⟦9⟧\n" in _numbered + "\n",
+          _numbered[_numbered.rfind("【群成员名册】"):][:400])
 
     # Isolation, at the level the whole design turns on: a group's roster is built from
     # events in that group, so somebody talkative elsewhere is simply not here.
@@ -1160,9 +1195,11 @@ async def main():
     # could read never run. The gate reads money already spent, never a forecast of
     # the next round: a forecast needs a price for the model, and an unpriced model
     # then fails it forever, taking the tool loop dark at zero spend.
-    # Either limit (the purse, the search allowance) ends the *spending*: one tool-less
-    # wrap-up round then answers from what the paid rounds already fetched. Every
-    # number below is arranged so the arithmetic is checkable by hand.
+    # Either limit (the purse, the search allowance) ends the *spending*: one wrap-up
+    # round, offered only the send tool, then answers from what the paid rounds
+    # already fetched. Every number below is arranged so the arithmetic is checkable
+    # by hand.
+    import json as _j14
     from qqbot.core import engine as _eng
 
     ROUND_CHARGE = 0.02    # what the scripted model books per round
@@ -1192,14 +1229,22 @@ async def main():
             pass
 
     def _tc(q):
-        import json as _json
         return {"id": f"t{len(LLM_CALLS)}", "type": "function",
                 "function": {"name": "web_search",
-                             "arguments": _json.dumps({"query": q})}}
+                             "arguments": _j14.dumps({"query": q})}}
+
+    def _send(**args):
+        return {"id": f"s{len(LLM_CALLS)}", "type": "function",
+                "function": {"name": "send_message",
+                             "arguments": _j14.dumps(args, ensure_ascii=False)}}
+
+    def _names(tools):
+        return [t["function"]["name"] for t in tools or ()]
 
     class ScriptedText(FakeText):
         """Asks for searches on every round - the same word twice, plus a fresh one -
-        so only a limit can end the reply."""
+        so only a limit can end the reply. Offered nothing but the send tool, it
+        sends."""
 
         async def chat(self, messages, *, cfg, tools=None,
                        max_tokens=None, effort=None, kind="reply",
@@ -1211,8 +1256,9 @@ async def main():
                               "timeout": cfg.timeout_sec})
             await BUDGET.record(kind=kind, model=self.MODEL, cny=ROUND_CHARGE,
                                 group_id=group_id)
-            if tools is None:   # the wrap-up round: no tools offered, answer given
-                return ChatResult(text="就查到这些了", model=self.MODEL)
+            if _names(tools) == ["send_message"]:   # the wrap-up round
+                return ChatResult(text="", model=self.MODEL,
+                                  tool_calls=[_send(text="就查到这些了")])
             return ChatResult(text="", model=self.MODEL,
                               tool_calls=[_tc("话题A"), _tc("话题A"), _tc(f"话题{len(LLM_CALLS)}")])
 
@@ -1220,19 +1266,21 @@ async def main():
                             asr=UnusedAsr(), embedding=_EMBED, search=CountingSearch()))
     n_llm = len(LLM_CALLS)
     st13 = await REGISTRY.get("123")
-    text, _prov1, _tr1 = await _eng.generate(
+    r1 = await _eng.generate(
         bot=bot, st=st13, cfg=cfg, persona=config().for_group("123")[1],
         msg=_CM0(msg_id="loop1", user_id="u1", nickname="阿强",
                  text="帮我查个东西", ts=_nl0()))
     # The scripted allowance dies on the third search, in round two: the limit ends
-    # the spending, and a tool-less wrap-up round answers from what rounds one and
-    # two already fetched (the daily cap, checked before anything is spent, still
-    # means silence).
+    # the spending, and a wrap-up round answers from what rounds one and two already
+    # fetched (the daily cap, checked before anything is spent, still means silence).
     check("a reply that hits the search allowance wraps up with an answer",
-          text == "就查到这些了", repr(text))
-    check("the wrap-up is one extra round, offered no tools",
-          len(LLM_CALLS) - n_llm == 3 and LLM_CALLS[-1]["tools"] is None,
-          f"{len(LLM_CALLS) - n_llm} rounds, tools={LLM_CALLS[-1]['tools']!r}")
+          r1 is not None and r1.text == "就查到这些了", repr(r1))
+    check("the wrap-up is one extra round, offered only the send tool",
+          len(LLM_CALLS) - n_llm == 3 and _names(LLM_CALLS[-1]["tools"]) == ["send_message"],
+          f"{len(LLM_CALLS) - n_llm} rounds, tools={_names(LLM_CALLS[-1]['tools'])}")
+    check("every ordinary round offers the send tool first",
+          _names(LLM_CALLS[n_llm]["tools"])[0] == "send_message",
+          str(_names(LLM_CALLS[n_llm]["tools"])))
     check("the wrap-up round is told the allowance is gone",
           any("额度已用完" in (m.get("content") or "")
               for m in LLM_CALLS[-1]["messages"] if m.get("role") == "user"))
@@ -1265,14 +1313,14 @@ async def main():
     set_providers(Providers(text=ScriptedText(), vision=UnusedVision(),
                             asr=UnusedAsr(), embedding=_EMBED, search=EndlessSearch()))
     n_llm2 = len(LLM_CALLS)
-    text2, _prov2, _tr2 = await _eng.generate(
+    r2 = await _eng.generate(
         bot=bot, st=st13, cfg=cfg, persona=config().for_group("123")[1],
         msg=_CM0(msg_id="loop2", user_id="u1", nickname="阿强",
                  text="再查个东西", ts=_nl0()))
     check("a reply that runs out of money wraps up the same way",
-          text2 == "就查到这些了" and len(LLM_CALLS) - n_llm2 == 3
-          and LLM_CALLS[-1]["tools"] is None,
-          f"{text2!r}, {len(LLM_CALLS) - n_llm2} rounds")
+          r2 is not None and r2.text == "就查到这些了" and len(LLM_CALLS) - n_llm2 == 3
+          and _names(LLM_CALLS[-1]["tools"]) == ["send_message"],
+          f"{r2!r}, {len(LLM_CALLS) - n_llm2} rounds")
     check("and the unaffordable round's tools were never executed",
           len(EndlessSearch.calls) == 2, str(EndlessSearch.calls))
 
@@ -1310,25 +1358,42 @@ async def main():
     check("no tools means no marker", _pvfn([], cfg) == "")
     from qqbot.core.engine import _trace as _trfn
     check("no tools means no trace either", _trfn([], cfg) == "")
+    check("a trace keeps no member numbers: they belong to one render",
+          _trfn([("search_history", {"query": "改锥"},
+                  "⟦09-01 10:00⟧ 张伟⟦3⟧: 改锥在我这")], cfg)
+          == "⟦检索记录⟧\n查档“改锥”：[09-01 10:00] 张伟: 改锥在我这",
+          _trfn([("search_history", {"query": "改锥"},
+                  "⟦09-01 10:00⟧ 张伟⟦3⟧: 改锥在我这")], cfg))
 
-    class OneSearchText(FakeText):
-        _asked = False
+    class Scripted(FakeText):
+        """Answers each round from a script: a list of ChatResult makers, one per
+        round, the last repeated."""
+
+        script: list = []
 
         async def chat(self, messages, *, cfg, tools=None, max_tokens=None,
                        effort=None, kind="reply", group_id=None):
-            LLM_CALLS.append({"kind": kind, "messages": messages, "tools": tools,
+            LLM_CALLS.append({"kind": kind, "messages": list(messages), "tools": tools,
                               "effort": effort, "max_tokens": max_tokens,
                               "grade": cfg.reasoning_effort,
                               "timeout": cfg.timeout_sec})
-            if not type(self)._asked:
-                type(self)._asked = True
-                return ChatResult(text="", model=self.MODEL,
-                                  tool_calls=[_tc("明天 天气")])
-            return ChatResult(text="明天多云", model=self.MODEL)
+            n = sum(1 for c in LLM_CALLS[self.start:] if c["kind"] == "reply") - 1
+            step = self.script[min(n, len(self.script) - 1)]
+            return step(messages)
+
+    def _use(*steps):
+        text_model = Scripted()
+        text_model.script = list(steps)
+        text_model.start = len(LLM_CALLS)
+        set_providers(Providers(text=text_model, vision=UnusedVision(),
+                                asr=UnusedAsr(), embedding=_EMBED,
+                                search=EndlessSearch()))
+
+    def _calls(*calls):
+        return lambda _m: ChatResult(text="", model="fake-light", tool_calls=list(calls))
 
     cfg.budget.per_reply_cny = 0.30
-    set_providers(Providers(text=OneSearchText(), vision=UnusedVision(),
-                            asr=UnusedAsr(), embedding=_EMBED, search=EndlessSearch()))
+    _use(_calls(_tc("明天 天气")), _calls(_send(text="明天多云")))
     st_pv = await REGISTRY.get("123")
     ok_pv = await _eng.respond(
         bot=bot, st=st_pv, cfg=cfg, persona=config().for_group("123")[1],
@@ -1336,50 +1401,205 @@ async def main():
                  text="明天天气怎样", ts=_nl0()))
     check("the searched reply is sent without the marker",
           ok_pv and bot.sent[-1][1] == "明天多云", str(bot.sent[-1:]))
+    check("a send with neither at nor reply goes out as a plain message",
+          bot.quoted[-1] is None and bot.ats[-1] is None,
+          f"{bot.quoted[-1]} {bot.ats[-1]}")
     _pv_line = st_pv.recent[-1]
     check("but the window remembers what it rested on",
-          _pv_line.is_bot and _pv_line.text == "明天多云 ⟦依据:搜索“明天 天气”⟧",
-          repr(_pv_line.text))
+          _pv_line.is_bot and _pv_line.text == "明天多云 ⟦依据:搜索“明天 天气”⟧"
+          and _pv_line.at == [] and _pv_line.reply_to is None,
+          repr(_pv_line))
     _pv_row = await pool().fetchval(
         "SELECT plain_text FROM raw_event WHERE platform_event_id=$1", _pv_line.msg_id)
     check("and so does the archive",
           "⟦依据:搜索“明天 天气”⟧" in (_pv_row or ""), repr(_pv_row))
 
-    # A reply that quotes and @s its asker is remembered the way the group read
-    # it, "@asker" first - that opening is what tells a later turn whom each of
-    # the bot's own answers was for. A model that writes the @ itself (the
-    # history now shows one) is not sent out doubled.
-    class AtText(FakeText):
-        async def chat(self, messages, *, cfg, tools=None, max_tokens=None,
-                       effort=None, kind="reply", group_id=None):
-            LLM_CALLS.append({"kind": kind, "messages": messages, "tools": tools,
-                              "effort": effort, "max_tokens": max_tokens,
-                              "grade": cfg.reasoning_effort, "timeout": cfg.timeout_sec})
-            return ChatResult(text="@阿强 明天多云", model=self.MODEL)
-
-    bot.members.append({"user_id": "u1", "card": "阿强", "nickname": "aq"})
+    # The send tool: whom to @ and which line to reply to are the model's choice,
+    # named by the numbers the prompt showed. Two members share a card here - the
+    # member numbers are what keep them apart.
+    bot.members += [{"user_id": "u1", "card": "阿强", "nickname": "aq"},
+                    {"user_id": "u61", "card": "李芳", "nickname": "lf1"},
+                    {"user_id": "u62", "card": "李芳", "nickname": "lf2"}]
     from qqbot.core.members import MEMBERS as _MEMpv
     _MEMpv.forget("123")
-    set_providers(Providers(text=AtText(), vision=UnusedVision(),
-                            asr=UnusedAsr(), embedding=_EMBED, search=EndlessSearch()))
+    st_s = type(st_pv)(group_id="5601")
+    st_s.loaded = st_s.history_loaded = True
+    _w1 = _CM0(msg_id="s-w1", user_id="u61", nickname="李芳", text="我是第一个李芳",
+               ts=_nl0())
+    _w2 = _CM0(msg_id="s-w2", user_id="u62", nickname="李芳", text="我是第二个李芳",
+               ts=_nl0())
+    _ask = _CM0(msg_id="s-ask", user_id="u1", nickname="阿强",
+                text="小X 帮我跟第二个李芳打个招呼", ts=_nl0())
+    for _m in (_w1, _w2, _ask):
+        st_s.add(_m)
+    _persona = config().for_group("123")[1]
+
+    def _prompt_text(messages):
+        return "\n".join(m["content"] for m in messages
+                         if isinstance(m.get("content"), str))
+
+    _seen: dict = {}
+
+    def _look_then_send(messages):
+        _seen["prompt"] = _prompt_text(messages)
+        return ChatResult(text="", model="fake-light", tool_calls=[
+            _send(text="@李芳⟦2⟧ 你好呀", at=[2, 99], reply=2)])
+
+    _use(_look_then_send)
+    n_sent = len(bot.sent)
+    ok_s = await _eng.respond(bot=bot, st=st_s, cfg=cfg, persona=_persona, msg=_ask,
+                              window=[_w1, _w2])
+    check("two members sharing a card wear different member numbers",
+          "李芳⟦1⟧: 我是第一个李芳" in _seen.get("prompt", "")
+          and "李芳⟦2⟧: 我是第二个李芳" in _seen.get("prompt", "")
+          and "阿强⟦3⟧: 小X 帮我" in _seen.get("prompt", ""),
+          _seen.get("prompt", "")[-300:])
+    check("the send @-s the numbered member and replies to the numbered line",
+          ok_s and len(bot.sent) == n_sent + 1
+          and bot.ats[-1] == "u62" and bot.quoted[-1] == "s-w2",
+          f"{bot.ats[-1:]} {bot.quoted[-1:]}")
+    check("a model-written @ and number are taken off the text",
+          bot.sent[-1][1] == "你好呀", repr(bot.sent[-1]))
+    _s_line = st_s.recent[-1]
+    check("the window keeps whom it @-ed and which line it replied to",
+          _s_line.is_bot and _s_line.text == "你好呀"
+          and _s_line.at == [("u62", "李芳")] and _s_line.reply_to == "s-w2",
+          repr(_s_line))
+    _s_row = await pool().fetchrow(
+        "SELECT plain_text, payload FROM raw_event WHERE platform_event_id=$1",
+        _s_line.msg_id)
+    _s_payload = _j14.loads(_s_row["payload"]) if isinstance(_s_row["payload"], str) \
+        else _s_row["payload"]
+    check("the archive reads as the group read it, with the @ as a segment",
+          _s_row["plain_text"] == "@李芳 你好呀"
+          and {"type": "at", "data": {"qq": "u62", "name": "李芳"}}
+          in _s_payload["segments"] and _s_payload["reply_to"] == "s-w2",
+          repr(_s_row))
+    # A restart rebuilds the same line from the archive: the @ comes back as data,
+    # not as text the next render would show twice.
+    from qqbot.core.state import GroupState as _GS14
+    _re = _GS14(group_id="5601")
+    await _re.load_history(self_id="999", owners=set())
+    _back = next((m for m in _re.recent if m.msg_id == _s_line.msg_id), None)
+    check("a rebuilt window reads the @ back out of the archive",
+          _back is not None and _back.text == "你好呀" and _back.at == [("u62", "李芳")],
+          repr(_back))
+    # A line archived before the @ was stored as a segment opens with "@asker" and
+    # replies to the asker's message; the rebuild recovers the account from that.
+    from qqbot.gateway.ingest import ingestor as _ing14
+    from qqbot.gateway.onebot import GroupMessage as _GM14, Sender as _S14
+    await _ing14().ingest(_GM14(
+        message_id="legacy-q", group_id=5602, sender=_S14(user_id="u1", card="阿强"),
+        segments=[{"type": "text", "data": {"text": "小X 几点了"}}], self_id="999",
+        occurred_at=_nl0(), plain_text="小X 几点了"))
+    await _ing14().record_own_reply(group_id=5602, self_id="999", message_id="legacy-a",
+                                    text="@阿强 三点半", at=_nl0(), name="小X",
+                                    reply_to="legacy-q")
+    _old = _GS14(group_id="5602")
+    await _old.load_history(self_id="999", owners=set())
+    _old_line = next((m for m in _old.recent if m.msg_id == "legacy-a"), None)
+    check("a line archived with the @ only in its text is rebuilt with it as data",
+          _old_line is not None and _old_line.text == "三点半"
+          and _old_line.at == [("u1", "阿强")], repr(_old_line))
+
+    # The next prompt shows that line as the send call that made it, so what the
+    # model reads of its own output is the shape it should produce.
+    _use(_look_then_send)
+    _follow = _CM0(msg_id="s-ask2", user_id="u1", nickname="阿强", text="小X 然后呢",
+                   ts=_nl0())
+    st_s.add(_follow)
+    await _eng.generate(bot=bot, st=st_s, cfg=cfg, persona=_persona, msg=_follow,
+                        window=[_w1, _w2, _ask, _s_line])
+    _hist = LLM_CALLS[-1]["messages"]
+    _own = [m for m in _hist if m.get("role") == "assistant" and m.get("tool_calls")]
+    check("the bot's past message is rendered as its send call",
+          len(_own) == 1
+          and _j14.loads(_own[0]["tool_calls"][0]["function"]["arguments"])
+          == {"text": "你好呀", "at": [2], "reply": 2},
+          repr(_own))
+    _own_result = next((m for m in _hist if m.get("role") == "tool"), {})
+    check("followed by its result, carrying the line's number",
+          _own_result.get("tool_call_id") == _own[0]["tool_calls"][0]["id"]
+          and str(_own_result.get("content", "")).startswith("已发送：#4 "),
+          repr(_own_result))
+
+    # A member number the prompt never showed, or a line number it never showed,
+    # costs the @ or the reply and nothing else: the words still go out.
+    _use(_calls(_send(text="好的", at=[42], reply=77)))
+    ok_u = await _eng.respond(bot=bot, st=st_s, cfg=cfg, persona=_persona, msg=_follow,
+                              window=[_w1, _w2, _ask])
+    check("unknown numbers are dropped and the text still goes out",
+          ok_u and bot.sent[-1][1] == "好的" and bot.ats[-1] is None
+          and bot.quoted[-1] is None, f"{bot.sent[-1:]} {bot.ats[-1:]} {bot.quoted[-1:]}")
+
+    # A send that cannot be sent is answered like a failed tool, and the model sends
+    # again on the next round.
+    _use(_calls(_send(text="  ")), _calls(_send(text="重新发一遍", at=[3])))
+    ok_e = await _eng.respond(bot=bot, st=st_s, cfg=cfg, persona=_persona, msg=_follow,
+                              window=[_w1, _w2, _ask])
+    _e_tools = [m.get("content") for m in LLM_CALLS[-1]["messages"] if m.get("role") == "tool"]
+    check("an empty send is refused in words and the next round sends",
+          ok_e and bot.sent[-1][1] == "重新发一遍" and bot.ats[-1] == "u1"
+          and any("正文为空" in str(t) for t in _e_tools),
+          f"{bot.sent[-1:]} {_e_tools}")
+
+    # A send ends the reply: a search asked for in the same round never runs.
+    EndlessSearch.calls.clear()
+    _use(_calls(_tc("顺便查查"), _send(text="先这样")))
+    ok_b = await _eng.respond(bot=bot, st=st_s, cfg=cfg, persona=_persona, msg=_follow,
+                              window=[_w1, _w2, _ask])
+    check("calls sharing a round with the send are not executed",
+          ok_b and bot.sent[-1][1] == "先这样" and EndlessSearch.calls == [],
+          f"{bot.sent[-1:]} {EndlessSearch.calls}")
+
+    # The send tool is the only way out: bare text is never sent. A round that writes
+    # its reply out is told so once and sends on the next round; a second bare round
+    # is silence.
+    _bare = lambda _m: ChatResult(text="明天多云", model="fake-light")  # noqa: E731
+    _use(_bare, lambda m: ChatResult(text="", model="fake-light",
+                                     tool_calls=send_to_asker(m, "明天多云")))
+    n_bare = len(bot.sent)
+    ok_told = await _eng.respond(
+        bot=bot, st=st_pv, cfg=cfg, persona=config().for_group("123")[1],
+        msg=_CM0(msg_id="pv-told", user_id="u1", nickname="阿强",
+                 text="大后天呢", ts=_nl0()))
+    _told = LLM_CALLS[-1]["messages"]
+    check("bare text is told it was not sent, and the next round's send goes out",
+          ok_told and len(bot.sent) == n_bare + 1 and bot.sent[-1][1] == "明天多云"
+          and _told[-2] == {"role": "assistant", "content": "明天多云"}
+          and "群里看不到" in _told[-1]["content"], str(_told[-2:]))
+    _use(_bare)
+    n_bare = len(bot.sent)
+    ok_bare = await _eng.respond(
+        bot=bot, st=st_pv, cfg=cfg, persona=config().for_group("123")[1],
+        msg=_CM0(msg_id="pv-bare", user_id="u1", nickname="阿强",
+                 text="大后天呢", ts=_nl0()))
+    check("a second bare-text round sends nothing",
+          not ok_bare and len(bot.sent) == n_bare, str(bot.sent[n_bare:]))
+
+    _use(lambda m: ChatResult(text="", model="fake-light",
+                              tool_calls=send_to_asker(m, "@阿强 明天多云")))
     ok_at = await _eng.respond(
         bot=bot, st=st_pv, cfg=cfg, persona=config().for_group("123")[1],
         msg=_CM0(msg_id="pv-at", user_id="u1", nickname="阿强",
-                 text="后天呢", ts=_nl0()),
-        reply_to="pv-at", initiator="u1")
-    check("a model-written @ of the asker is taken off before the send adds its own",
-          ok_at and bot.sent[-1][1] == "明天多云" and bot.ats[-1] == "u1",
-          str(bot.sent[-1:]))
+                 text="后天呢", ts=_nl0()))
+    check("a send replying to the asker and @-ing them, the @ not doubled",
+          ok_at and bot.sent[-1][1] == "明天多云" and bot.ats[-1] == "u1"
+          and bot.quoted[-1] == "pv-at", str(bot.sent[-1:]))
     check("the window remembers the answer with its addressee",
-          st_pv.recent[-1].is_bot and st_pv.recent[-1].text == "@阿强 明天多云",
-          repr(st_pv.recent[-1].text))
+          st_pv.recent[-1].is_bot and st_pv.recent[-1].text == "明天多云"
+          and st_pv.recent[-1].at == [("u1", "阿强")],
+          repr(st_pv.recent[-1]))
     _at_row = await pool().fetchval(
         "SELECT plain_text FROM raw_event WHERE platform_event_id=$1",
         st_pv.recent[-1].msg_id)
-    check("and so does the archive", _at_row == "@阿强 明天多云", repr(_at_row))
+    check("and the archive reads as the group read it", _at_row == "@阿强 明天多云",
+          repr(_at_row))
     check("an imitated provenance marker never reaches the group",
           _cr("明天多云 ⟦依据:搜索“天气”⟧") == "明天多云",
           repr(_cr("明天多云 ⟦依据:搜索“天气”⟧")))
+    check("an imitated member number never reaches the group",
+          _cr("李芳⟦2⟧ 你好") == "李芳 你好", repr(_cr("李芳⟦2⟧ 你好")))
     # The quote pointer is transcript notation too - the real quote is the reply
     # segment the send path attaches. Asking in the prompt did not hold, so the
     # output layer strips it like every other imitated marker - but only at line
@@ -1417,8 +1637,8 @@ async def main():
 
     # The trajectory lives in reply_trace and nowhere else: the deque holds only
     # conversation, and prompt assembly queries the table for the window's replies
-    # and seats each entry directly before the reply it fed - which also covers
-    # the restart case with no re-seating logic at all.
+    # and seats each entry with the send call it fed - which also covers the
+    # restart case with no re-seating logic at all.
     _expected_trace = "⟦检索记录⟧\n搜索“明天 天气”：1. T C"
     check("the trajectory persists in its own table",
           await pool().fetchval(
@@ -1429,19 +1649,20 @@ async def main():
               _pv_line.msg_id)))
     check("and the deque holds only conversation",
           not any(m.text.startswith("⟦检索记录⟧") for m in st_pv.recent))
-    _t2, _p2, _tr2b = await _eng.generate(
+    _use(_calls(_send(text="后天也多云")))
+    await _eng.generate(
         bot=bot, st=st_pv, cfg=cfg, persona=config().for_group("123")[1],
         msg=_CM0(msg_id="pv2", user_id="u1", nickname="阿强",
                  text="后天呢", ts=_nl0()))
     _msgs2 = list(LLM_CALLS[-1]["messages"])
-    _ri = next(i for i, m in enumerate(_msgs2)
-               if m.get("role") == "assistant"
-               and isinstance(m.get("content"), str)
-               and "⟦依据:搜索“明天 天气”⟧" in m["content"])
-    check("assembly seats the stored trace directly before its reply",
-          _msgs2[_ri - 1].get("role") == "assistant"
-          and _msgs2[_ri - 1].get("content") == _expected_trace,
-          str(_msgs2[_ri - 1])[:160])
+    _ri = next((i for i, m in enumerate(_msgs2)
+                if m.get("role") == "tool"
+                and "⟦依据:搜索“明天 天气”⟧" in str(m.get("content"))), None)
+    check("assembly seats the stored trace with the send call it fed",
+          _ri is not None and _msgs2[_ri - 1].get("role") == "assistant"
+          and _msgs2[_ri - 1].get("content") == _expected_trace
+          and _msgs2[_ri - 1]["tool_calls"][0]["function"]["name"] == "send_message",
+          str(_msgs2[_ri - 1] if _ri else _msgs2[-3:])[:200])
     check("an imitated trace marker line never reaches the group",
           _cr("⟦检索记录⟧\n搜索“x”：y\n好的") == "搜索“x”：y\n好的",
           repr(_cr("⟦检索记录⟧\n搜索“x”：y\n好的")))
@@ -1660,75 +1881,42 @@ async def main():
         str(_cmd_ev.message_id))
     check("and the archive", _cmd_row is not None and "/who" in _cmd_row, repr(_cmd_row))
 
-    # 18. namesakes: two members sharing a card are told apart by a permanent
-    # serial - renames dissolve and restore the suffix, never the number.
+    # 18. member numbers: members sharing a card are told apart by the number each
+    # person wears in one render, not by anything stored against the name.
     from qqbot.core import tools as _tools
+    from qqbot.core.member_numbers import MemberNumbers as _MN18
     from qqbot.core.members import MEMBERS as _MEM18
     bot.members += [{"user_id": "u31", "card": "张伟", "nickname": "zw"},
                     {"user_id": "u32", "card": "张伟", "nickname": "wei"}]
     _MEM18.forget("123")
     named = await _MEM18.names_of(bot, "123", ["u31", "u32"])
-    check("namesakes render as distinct numbered names",
-          named.get("u31", "").startswith("张伟⟦同名")
-          and named.get("u32", "").startswith("张伟⟦同名")
-          and named["u31"] != named["u32"], str(named))
-    first = dict(named)
-    for r in bot.members:
-        if r["user_id"] == "u32":
-            r["card"] = "李芳"
-    _MEM18.forget("123")
-    named = await _MEM18.names_of(bot, "123", ["u31", "u32"])
-    check("a rename dissolves the clash and the suffixes go",
-          named.get("u31") == "张伟" and named.get("u32") == "李芳", str(named))
-    for r in bot.members:
-        if r["user_id"] == "u32":
-            r["card"] = "张伟"
-    _MEM18.forget("123")
-    named = await _MEM18.names_of(bot, "123", ["u31", "u32"])
-    check("re-clashing restores the very same serials", named == first,
-          f"{named} vs {first}")
-    # One person under two same-named accounts is not two namesakes: after a
-    # merge the pair goes bare, and a third, unrelated namesake gets a tag of
-    # their own while the pair shares one.
-    bot.members += [{"user_id": "u41", "card": "王大锤", "nickname": "a"},
-                    {"user_id": "u42", "card": "王大锤", "nickname": "b"}]
+    check("the member list holds plain names, shared ones included",
+          named == {"u31": "张伟", "u32": "张伟"}, str(named))
+    # A merged main and alt are one person: one number between them, while an
+    # unrelated member sharing the card gets a number of their own.
     await seed(123, "u41", "王大锤", text="大号在此")
     await seed(123, "u42", "王大锤", text="小号在此")
+    await seed(123, "u43", "王大锤", text="我是另一个王大锤")
     await _retr.directory().merge("u42", "u41")
-    _MEM18.forget("123")
-    named = await _MEM18.names_of(bot, "123", ["u41", "u42"])
-    check("a merged main and alt sharing a name wear no tag",
-          named.get("u41") == "王大锤" and named.get("u42") == "王大锤", str(named))
-    bot.members.append({"user_id": "u43", "card": "王大锤", "nickname": "c"})
-    _MEM18.forget("123")
-    named = await _MEM18.names_of(bot, "123", ["u41", "u42", "u43"])
-    check("a third, unrelated namesake is told apart from the pair, who share one tag",
-          named["u41"] == named["u42"] and named["u41"].startswith("王大锤⟦同名")
-          and named["u43"].startswith("王大锤⟦同名") and named["u43"] != named["u41"],
-          str(named))
-    for r in list(bot.members):
-        if r["user_id"] == "u43":
-            bot.members.remove(r)
-    # A namesake who has left keeps the name their lines arrived with; when a
-    # live member carries it too, both sides are tagged, or the bare live name
-    # reads as the departed account.
-    _MEM18.forget("123")
-    _gone = _CM0(msg_id="ns-gone", user_id="u99", nickname="张伟", text="我先走了",
-                 ts=_nl0())
-    _here = _CM0(msg_id="ns-here", user_id="u31", nickname="张伟", text="我还在",
-                 ts=_nl0())
-    await _MEM18.relabel(bot, "123", [_gone, _here])
-    check("a departed namesake and the live one are both tagged",
-          _gone.nickname.startswith("张伟⟦同名") and _here.nickname.startswith("张伟⟦同名")
-          and _gone.nickname != _here.nickname, f"{_gone.nickname} / {_here.nickname}")
-    line18 = _CM0(msg_id="ns-1", user_id="u31", nickname="张伟",
-                  text="改锥在我这", ts=_nl0())
-    n18 = await _MEM18.relabel(bot, "123", [line18])
-    check("relabel carries the numbered name onto window lines",
-          line18.nickname == first["u31"], line18.nickname)
-    # Every line a namesake sends arrives with the bare card and gains its tag here.
-    # That is the render step, not a rename, or the log reports one per message.
-    check("tagging a namesake's fresh line is not counted as a rename", n18 == 0, str(n18))
+    _p18 = _MN18(self_id="999")
+    await _p18.learn(["u41", "u42", "u43"])
+    n41, n42, n43 = _p18.number("u41"), _p18.number("u42", spoke=True), _p18.number("u43")
+    check("a merged person's accounts share one number; a namesake gets another",
+          n41 == n42 and n43 != n41, f"{n41} {n42} {n43}")
+    check("the account to @ for a person is the one that spoke last",
+          _p18.account(n41) == "u42" and _p18.accounts(n41) == ["u41", "u42"],
+          f"{_p18.account(n41)} {_p18.accounts(n41)}")
+    check("the bot is never numbered", _p18.number("999") == 0)
+    check("a number no render showed names nobody", _p18.account(99) is None)
+    # A rename relabels the window: the speaker's line and the bot's own @ of them.
+    _line18 = _CM0(msg_id="ns-1", user_id="u31", nickname="旧名", text="改锥在我这",
+                   ts=_nl0())
+    _own18 = _CM0(msg_id="ns-2", user_id="999", nickname="小X", text="收到", ts=_nl0(),
+                  is_bot=True, at=[("u31", "旧名")])
+    n18 = await _MEM18.relabel(bot, "123", [_line18, _own18])
+    check("relabel carries the current card onto lines and onto the bot's @s",
+          _line18.nickname == "张伟" and _own18.at == [("u31", "张伟")] and n18 == 2,
+          f"{_line18.nickname} {_own18.at} {n18}")
     # A member the table has never heard of forces one refresh inside the TTL -
     # a newcomer @-ed a minute after joining must resolve - and a miss that
     # survives the refresh is remembered, so a departed member's old lines do
@@ -1745,32 +1933,31 @@ async def main():
           (await _MEM18.name_of(bot, "123", "u-new")) == "新人甲")
     await seed(123, "u31", "张伟", text="改锥昨天借给阿强了")
     await seed(123, "u32", "张伟", text="改锥我根本没见过")
-    n31 = int(first["u31"].split("⟦同名")[1].rstrip("⟧"))
     # Bare-hit mode: the pin is about which lines are *hits* - with context on,
     # the other namesake's line would legitimately appear as surroundings.
     _rcfg18 = config().default.retrieval
     _ctx18, _rcfg18.history_context = _rcfg18.history_context, 0
-    got = await _tools.search_history(123, "改锥", speaker=f"张伟⟦同名{n31}⟧")
-    _rcfg18.history_context = _ctx18
-    check("search_history narrows by the serial, not the shared name",
+    _p18b = _MN18(self_id="999")
+    n31 = _p18b.number("u31", spoke=True)
+    got = await _tools.search_history(123, "改锥", speaker=n31, people=_p18b)
+    check("search_history narrows by member number, not the shared name",
           "借给阿强" in got and "没见过" not in got, got)
-    # A serial that resolves to nobody falls back to the name half rather than a
-    # pattern nothing can match.
-    # Search results spell namesakes the way the window does, and mark the
-    # bot's own archived lines as its own rather than as some member's.
-    _rcfg18.history_context = 0
-    got_tags = await _tools.search_history(123, "改锥", rcfg=_rcfg18)
+    got_nums = await _tools.search_history(123, "改锥", rcfg=_rcfg18, people=_p18b)
+    check("search results number both namesakes, the known one as the prompt did",
+          f"张伟⟦{n31}⟧: 改锥昨天借给阿强了" in got_nums
+          and f"张伟⟦{_p18b.known('u32')}⟧: 改锥我根本没见过" in got_nums
+          and _p18b.known("u32") not in (0, n31), got_nums)
+    got_miss = await _tools.search_history(123, "改锥", speaker=77, people=_p18b)
+    check("a member number the prompt never showed is answered in words",
+          not _tools.verified(got_miss) and "77" in got_miss, got_miss)
+    got_name = await _tools.search_history(123, "改锥", speaker=77, speaker_name="张伟",
+                                           people=_p18b)
+    check("and with a name given, falls back to matching the name",
+          "借给阿强" in got_name and "没见过" in got_name, got_name)
     _rcfg18.history_context = _ctx18
-    check("search results tag both namesakes",
-          got_tags.count("张伟⟦同名") >= 2
-          and len({ln.split(": ", 1)[0] for ln in got_tags.splitlines() if "张伟" in ln}) >= 2,
-          got_tags)
     got_own = await _tools.search_history(123, "明天多云", self_id="999")
     check("the bot's own archived line wears the self tag in search results",
           "⟦你⟧: " in got_own, got_own)
-    got_nb = await _tools.search_history(123, "改锥", speaker="张伟⟦同名999999⟧")
-    check("an unresolvable namesake serial falls back to the name",
-          "借给阿强" in got_nb or "没见过" in got_nb, got_nb)
     # The answer as a whole is bounded; a cut answer says so.
     _chars18, _rcfg18.history_chars = _rcfg18.history_chars, 1000
     _rcfg18.history_context = 0

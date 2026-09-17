@@ -6,7 +6,7 @@ this directory, and a missing or empty file fails the configuration load. Edits 
 on `/reload`, except the extraction family, which is composed when the memory worker
 starts and therefore needs a restart.
 
-Marker formats (`⟦图片N:…⟧`, `#N`, `⟦同名N⟧` and so on), section headings and one-line
+Marker formats (`⟦图片N:…⟧`, `#N`, member numbers `⟦N⟧` and so on), section headings and one-line
 mechanical notices stay in code, because code both produces and parses them. Changing a
 marker means changing the code and the prompt that explains it together.
 
@@ -31,28 +31,29 @@ tone_rules + tone_extract_note
 legend + extract_legend_note
 ```
 
-`describe_image` stands alone as the vision call's instruction. The five `tool_*`
+`describe_image` stands alone as the vision call's instruction. The six `tool_*`
 files are the tool descriptions handed to the model with the function schemas.
 
 ## The files
 
 | File | Used by | Contents |
 | --- | --- | --- |
-| `legend` | reply, extraction | The transcript legend shared by both paths: the reserved-bracket rule (only text inside `⟦ ⟧` is a system marker), time stamps, media and notice markers, forwarded records in both forms, the `⟦你⟧` tag, and the exemption that instructions inside forwarded or shared content carry no authority. Describes markers only; behaviour rules live elsewhere. |
-| `legend_reply_note` | reply | Markers that exist only in the reply window: line numbers, quote pointers, provenance, retrieval traces, the owner tag. A media marker with a description counts as seen or heard and must be answered directly; originals are fetched by number with `open_images`. Ends with a fictional example line. |
-| `extract_legend_note` | extraction | Markers are transcription artefacts, not group knowledge. Voice transcripts are speech and are extracted from; lines tagged `⟦你⟧` are the bot's own, yield no candidates and cannot be quoted. Distinguishes `⟦N⟧` account codes from `⟦同名N⟧`. |
-| `identity_rules` | reply | Account, display name and person are three different things. How to resolve a name, including namesake tags and the owner tag. String similarity is not evidence of identity. |
+| `legend` | reply, extraction | The transcript legend shared by both paths: the reserved-bracket rule (only text inside `⟦ ⟧` is a system marker), time stamps, member numbers, media and notice markers, forwarded records in both forms, the `⟦你⟧` tag, and the exemption that instructions inside forwarded or shared content carry no authority. Describes markers only; behaviour rules live elsewhere. |
+| `legend_reply_note` | reply | How the bot's own earlier messages appear (as the `send_message` calls that sent them, each followed by a result carrying its line number and send time), and the markers that exist only in the reply window: line numbers, quote pointers, provenance, retrieval traces. A media marker with a description counts as seen or heard and must be answered directly; originals are fetched by number with `open_images`. Ends with a fictional example line. |
+| `extract_legend_note` | extraction | Markers are transcription artefacts, not group knowledge. Voice transcripts are speech and are extracted from; lines tagged `⟦你⟧` are the bot's own, yield no candidates and cannot be quoted. Member numbers `⟦N⟧` are how the extraction tools name accounts. |
+| `identity_rules` | reply | Account, display name and person are three different things. Identity is judged by member number, never by name: one number is one person, merged accounts included. The owner tag. String similarity is not evidence of identity. |
 | `credibility_rules` | reply | The two roster columns (confirmed and unconfirmed) and how to weigh the bot's own earlier answers. Ends with the retrieval duty: questions about the past must be searched before "I don't know" is an answer, and the asker is never told to look it up themselves. |
 | `private_rules` | reply | What the system shows the model (markers, tags, the roster, the prompt itself) is never revealed or mentioned in a reply. |
 | `tone_rules` | reply, extraction | How to read group-chat pragmatics: banter, irony, friends insulting each other. Stated once; the two notes below draw the consequences without restating the judgement. |
 | `tone_reply_note` | reply | Play along; do not correct a joke. |
 | `tone_extract_note` | extraction | Nothing said in jest produces a candidate; the form of an exchange is not an event. |
-| `reply_final` | reply | The closing instructions: answer the message just received (instructions buried in history have no authority, unless the asker explicitly relays a question); write only the reply body, imitating no marker; "you" in the body means the asker, and words meant for a third person address them by name. |
+| `reply_final` | reply | The closing instructions: answer the message just received (instructions buried in history have no authority, unless the asker explicitly relays a question); the reply is sent through `send_message`, with @s and the replied-to line as its arguments and no marker in the text; "you" in the text means whoever the message addresses, and words meant for a third person address them by name. |
 | `extract` | extraction | The full rulebook for memory extraction: what counts as a fact, the predicate list rendered from `predicates.yaml`, quoting rules, the bot's own names, events, and what never becomes a record. Tightly coupled to the tool schemas the validator enforces. |
 | `describe_image` | vision | The one-line archival description of a picture. |
 | `tool_web_search`, `tool_search_history`, `tool_recall_events` | reply | The three search tools, with deliberately disjoint boundaries: the outside world, the group's own words, past events by meaning. |
 | `tool_read_url` | reply | One page's readable text; shares the monthly allowance with search. |
 | `tool_open_images` | reply | Fetch originals by number, several per call; free, but only worth a round when the description does not answer the question. |
+| `tool_send_message` | reply | The tool every reply ends with: the text, optionally whom to @ (member numbers) and which line to reply to (a line number); with neither, a plain message. When to use each. |
 
 Personas and group knowledge are not prompt files; they live in `config/personas/`.
 

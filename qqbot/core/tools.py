@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from dataclasses import dataclass, field
 
 from luqum import tree as _lq
@@ -22,24 +21,63 @@ from ..db import pool, repo
 from ..providers import providers
 from ..providers.base import QuotaExhausted
 from ..settings import RetrievalCfg, Settings, config, ptext
-from ..util import (SYS_L, SYS_R, defang, display_name, fmt_when, merge_overlapping,
-                    sysmark, why)
-from . import namesakes, retrieval
+from ..util import defang, display_name, fmt_when, merge_overlapping, sysmark, why
+from . import retrieval
 from .botapi import BotApi
 from .media import MEDIA
+from .member_numbers import MemberNumbers
 
 log = logging.getLogger("qqbot.tools")
+
+#: The tool every reply is sent through. Not executed here: the engine reads its
+#: arguments and sends them (see engine.respond). Named, like its parameters, after
+#: the OneBot message it becomes: text, at and reply segments.
+SEND = "send_message"
 
 
 @dataclass
 class ToolCtx:
     """What tool execution may reach beyond the database: the live protocol side,
-    and the map from the numbers the prompt shows to what they name. Only
-    open_images needs either; the retrieval tools stay context-free."""
+    and the maps from the numbers the prompt shows to what they name."""
 
     bot: BotApi | None = None
     #: Picture number -> (the message that posted it, its index in image_refs).
     by_pic: dict[int, tuple] = field(default_factory=dict)
+    #: The member numbering of this prompt; search results extend it.
+    people: MemberNumbers | None = None
+
+
+def send_def() -> dict:
+    """The send tool: the only way a reply reaches the group. Every parameter but
+    the text is optional; with none of them the message goes out plain."""
+    return {
+        "type": "function",
+        "function": {
+            "name": SEND,
+            "description": ptext("tool_send_message"),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "正文，纯文本，只写要说的话",
+                    },
+                    "at": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "要 @ 的成员编号列表，取自名字后的 ⟦N⟧；"
+                                       "不 @ 任何人时省略",
+                    },
+                    "reply": {
+                        "type": "integer",
+                        "description": "要回复（引用）的发言编号，取自行首 #N 的 N；"
+                                       "不回复某条发言时省略",
+                    },
+                },
+                "required": ["text"],
+            },
+        },
+    }
 
 
 def tool_defs(cfg: Settings | None = None) -> list[dict]:
@@ -48,10 +86,12 @@ def tool_defs(cfg: Settings | None = None) -> list[dict]:
     The schemas stay in code - they are the contract the executor matches on -
     while the descriptions, which are prompts, come from the registry. `cfg` is
     the group's own settings, so a limit the description states is the one the
-    executor enforces for that group.
+    executor enforces for that group. The send tool leads: it is the one every
+    reply ends with.
     """
     rcfg = (cfg or config().default).retrieval
     return [
+        send_def(),
         {
             "type": "function",
             "function": {
@@ -82,10 +122,14 @@ def tool_defs(cfg: Settings | None = None) -> list[dict]:
                                            "例：(打印机 OR 打印) -复印",
                         },
                         "speaker": {
+                            "type": "integer",
+                            "description": "只看这位成员说的话，填成员编号（名字后的 ⟦N⟧）；"
+                                           "不填则不限发言人",
+                        },
+                        "speaker_name": {
                             "type": "string",
-                            "description": "只看这个人说的话，填昵称；不填则不限发言人；"
-                                           "若上文中该人名字后带同名编号标注，"
-                                           "需连标注一起原样填入，以精确锁定该人，避免混入同名者",
+                            "description": "要找的人在上文中没有编号时，按昵称只看其发言；"
+                                           "有编号时用 speaker",
                         },
                         "days": {
                             "type": "integer",
@@ -151,26 +195,6 @@ def tool_defs(cfg: Settings | None = None) -> list[dict]:
             },
         },
     ]
-
-#: The namesake form names render as: the name plus the reserved namesake tag
-#: carrying the permanent serial. A speaker argument in this shape narrows by the
-#: serial's account, never by the name half - the name is exactly what the two
-#: people share.
-_SEQ_NAME = re.compile(rf"^(.+){SYS_L}同名(\d{{1,9}}){SYS_R}$")
-_TRAILING_TAGS = re.compile(
-    rf"(?:{re.escape(SYS_L)}(?:拥有者|你){re.escape(SYS_R)})+$")
-
-
-async def _carried_name(group_id: int, uid: str, name: str) -> bool:
-    """Whether this account has ever spoken here under this display name."""
-    if not name:
-        return False
-    return bool(await pool().fetchval(
-        """SELECT EXISTS(SELECT 1 FROM raw_event
-             WHERE group_id=$1 AND platform_user_id=$2 AND event_type='message'
-               AND (payload->'sender'->>'card' = $3
-                    OR payload->'sender'->>'nickname' = $3))""",
-        group_id, uid, name))
 
 
 def _like(word: str) -> str:
@@ -245,9 +269,11 @@ def _condition(node, params: list, offset: int) -> str:
     raise QueryError(f"不支持的语法（{node.__class__.__name__}）")
 
 
-async def search_history(group_id: int, query: str, *, speaker: str | None = None,
+async def search_history(group_id: int, query: str, *, speaker: int | None = None,
+                         speaker_name: str | None = None,
                          days: int | None = None, rcfg: RetrievalCfg | None = None,
-                         self_id: str | None = None) -> str:
+                         self_id: str | None = None,
+                         people: MemberNumbers | None = None) -> str:
     """The archive, searched. Free - one SQL query, no model involved.
 
     The query is a boolean expression (_parse_query): juxtaposition is AND -
@@ -260,17 +286,20 @@ async def search_history(group_id: int, query: str, *, speaker: str | None = Non
     first out of the database, shown oldest first, so what the model reads
     scans like the conversation did.
 
-    `speaker` narrows to one person's lines by display name - "what did X say about Y"
-    is unanswerable with keywords alone, which match everyone who mentioned X. A name,
-    not an account id: names are all the model ever sees. The tagged form the prompt
-    shows for namesakes is accepted too: the serial maps to one person - every
-    account of theirs - where the name half would match both people. `days` narrows
-    to the recent past the same way.
+    `speaker` narrows to one person's lines by member number - "what did X say about
+    Y" is unanswerable with keywords alone, which match everyone who mentioned X. The
+    number names a person, so every account of theirs counts, and two members sharing
+    a name stay apart. `speaker_name` is the fallback for somebody the prompt shows no
+    number for: a display-name match, which cannot tell two members sharing a name
+    apart. A number this prompt never showed falls back to the name when one is
+    given, and otherwise answers in words. `days` narrows to the recent past.
 
-    Lines render with the same namesake tags the window shows (core.namesakes), and
-    the bot's own lines - archived under the persona's name - wear the self tag, so
-    what it said earlier is not read as some member's statement. `self_id` is the
-    bot's account; without it, own lines render like anyone's.
+    Speakers render with member numbers from `people`, the prompt's own numbering -
+    somebody who appears only here is numbered on sight, so the model can name them
+    in a later call or @ them. The bot's own lines, archived under the persona's
+    name, wear the self tag, so what it said earlier is not read as some member's
+    statement. `self_id` is the bot's account; without it, own lines render like
+    anyone's.
 
     Each hit comes wrapped in its surrounding lines (retrieval.history_context each
     way): chat is written in fragments, and the matched line is routinely a bare
@@ -299,25 +328,15 @@ async def search_history(group_id: int, query: str, *, speaker: str | None = Non
         cond = _condition(_parse_query(query or "", rcfg.max_query_terms), terms, offset=5)
     except QueryError as e:
         return Failure(f"（检索式有误：{e}）")
-    # A name pasted from the transcript may carry the owner or self tag behind
-    # the namesake one; neither names anybody in the archive.
-    sp = _TRAILING_TAGS.sub("", (speaker or "").strip()).strip()
-    uid: str | None = None
-    if m := _SEQ_NAME.fullmatch(sp):
-        uid = await repo.member_of_seq(group_id, int(m.group(2)))
-        if uid is not None and not await _carried_name(group_id, uid,
-                                                       m.group(1).strip()):
-            # The serial only decides when its account has actually carried the
-            # name half; a mistyped serial must not resolve to an unrelated
-            # account.
-            uid = None
-        if uid is None:
-            # No account for the tag: fall back to the name half. The tag itself
-            # is system notation nobody's card contains, so left in the pattern
-            # it could only ever match nothing.
-            sp = m.group(1).strip()
-    # A serial names a person, and a person may hold several accounts here.
-    uids = await repo.accounts_sharing_person(uid) if uid is not None else None
+    sp = (speaker_name or "").strip()
+    uids: list[str] | None = None
+    if speaker is not None:
+        account = people.account(speaker) if people is not None else None
+        if account is not None:
+            # A number names a person, and a person may hold several accounts.
+            uids = await repo.accounts_sharing_person(account)
+        elif not sp:
+            return Failure(f"（记录里没有编号为 {speaker} 的成员）")
     # The condition string holds only this module's own connectives and ILIKE
     # placeholders numbered past the five fixed parameters; the member's words
     # travel in `terms`, never in SQL text.
@@ -333,7 +352,7 @@ async def search_history(group_id: int, query: str, *, speaker: str | None = Non
               AND ($5::text[] IS NULL OR platform_user_id = ANY($5::text[]))
             ORDER BY occurred_at DESC, id DESC LIMIT $2""",
         group_id, rcfg.history_hits,
-        _like(sp) if sp and uid is None else None,
+        _like(sp) if sp and uids is None else None,
         days if days and days > 0 else None,
         uids,
         *terms,
@@ -342,10 +361,12 @@ async def search_history(group_id: int, query: str, *, speaker: str | None = Non
         return "（存档里没有搜到）"
     ctx = max(0, rcfg.history_context)
     if not ctx:
-        text = _render_lines(list(reversed(rows)),
-                             await _tags_for(group_id, rows, self_id), self_id)
+        shown = list(reversed(rows))
+        await _learn(people, shown)
+        text = _render_lines(shown, people, self_id)
     else:
-        text = await _with_context(group_id, [r["id"] for r in rows], ctx, self_id)
+        text = await _with_context(group_id, [r["id"] for r in rows], ctx, self_id,
+                                   people)
     if len(text) > rcfg.history_chars:
         # Cut at a line boundary so no message is shown half-said.
         head = text[:rcfg.history_chars]
@@ -361,29 +382,23 @@ def _who(r) -> str:
     return display_name(sender.get("card"), sender.get("nickname"), "成员")
 
 
-async def _tags_for(group_id: int, rows: list, self_id: str | None) -> dict[str, str]:
-    """Namesake tags over every row one answer shows, so two accounts sharing a
-    name are told apart wherever in the answer they fall. The bot's own account
-    stays out: it wears the self tag instead, and must not be minted a member
-    serial for sharing its persona's name with somebody."""
-    names = {str(r["platform_user_id"] or ""): _who(r) for r in rows
-             if str(r["platform_user_id"] or "") != self_id}
-    try:
-        return await namesakes.tags(group_id, names)
-    except Exception as e:
-        log.warning("group %s: search namesake numbering unavailable: %s",
-                    group_id, why(e))
-        return {}
+async def _learn(people: MemberNumbers | None, rows: list) -> None:
+    """Look up the persons behind every speaker one answer shows, before any is
+    numbered, so accounts of one person share a number here as in the prompt."""
+    if people is not None:
+        await people.learn([str(r["platform_user_id"] or "") for r in rows])
 
 
-def _render_lines(rows: list, tags: dict[str, str], self_id: str | None) -> str:
+def _render_lines(rows: list, people: MemberNumbers | None, self_id: str | None) -> str:
     """Archive rows as transcript lines, in the order given."""
-    return "\n".join(_history_line(r, tags, self_id) for r in rows)
+    return "\n".join(_history_line(r, people, self_id) for r in rows)
 
 
-def _history_line(r, tags: dict[str, str], self_id: str | None) -> str:
+def _history_line(r, people: MemberNumbers | None, self_id: str | None) -> str:
     uid = str(r["platform_user_id"] or "")
-    who = _who(r) + tags.get(uid, "")
+    who = _who(r)
+    if people is not None and (n := people.number(uid)):
+        who += sysmark(str(n))
     if self_id and uid == self_id:
         # The same self tag the extraction transcript wears: the line is archived
         # under the persona's name, which reads as a member's otherwise.
@@ -398,7 +413,8 @@ def _history_line(r, tags: dict[str, str], self_id: str | None) -> str:
 
 
 async def _with_context(group_id: int, hit_ids: list, ctx: int,
-                        self_id: str | None = None) -> str:
+                        self_id: str | None = None,
+                        people: MemberNumbers | None = None) -> str:
     """The hits rendered inside their surrounding conversation.
 
     One query fetches, per hit, the ctx archive lines on either side of it (by
@@ -438,11 +454,11 @@ async def _with_context(group_id: int, hit_ids: list, ctx: int,
     def order(rid):
         return by_id[rid]["occurred_at"], by_id[rid]["id"]
 
-    tags = await _tags_for(group_id, list(by_id.values()), self_id)
+    await _learn(people, list(by_id.values()))
     parts: list[str] = []
     for b in sorted(blocks, key=lambda b: min(order(rid) for rid in b)):
         rows = [by_id[rid] for rid in sorted(b, key=order)]
-        parts.append(_render_lines(rows, tags, self_id))
+        parts.append(_render_lines(rows, people, self_id))
     return "\n……\n".join(parts)
 
 
@@ -510,6 +526,18 @@ def _text(args: dict, key: str) -> str:
 #: The furthest back a day filter reaches; past it the filter means "unbounded"
 #: and would only overflow the interval arithmetic.
 _MAX_DAYS = 36500
+
+
+def number(v: object) -> int | None:
+    """A number argument - a member or line number - as a positive int, or None.
+    Digit strings are read, since models send integers that way too; bools,
+    non-positive values and anything else are no number."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, str) and v.strip().isdigit():
+        v = int(v.strip())
+    return v if isinstance(v, int) and v > 0 else None
+
 
 
 def _days(v: object) -> int | None:
@@ -644,10 +672,12 @@ async def execute(call: dict, *, cfg: Settings, group_id: str,
         try:
             return await search_history(
                 int(group_id), query,
-                speaker=_text(args, "speaker") or None,
+                speaker=number(args.get("speaker")),
+                speaker_name=_text(args, "speaker_name") or None,
                 days=_days(args.get("days")),
                 rcfg=cfg.retrieval,
                 self_id=str(getattr(ctx.bot, "self_id", "") or "") if ctx else None,
+                people=ctx.people if ctx else None,
             )
         except QuotaExhausted:
             raise

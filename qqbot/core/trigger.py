@@ -9,7 +9,7 @@ bot earns its own task, so no ask is ever collapsed away behind somebody else's.
 being spoken to is the only way a reply happens, every reply has exactly one cause - the
 addressed message itself - and this is the moment it is known: the same look that answers
 "reply at all?" names the initiator, and the Decision carries them downstream (the reply
-quotes their message, the spend is attributed to them) instead of anyone re-deriving it
+answers their message, the spend is attributed to them) instead of anyone re-deriving it
 later.
 """
 

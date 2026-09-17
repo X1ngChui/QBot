@@ -128,11 +128,6 @@ class PersonCard:
     entity_id: uuid.UUID
     user_id: str
     display: str
-    #: `display` before namesake suffixing (equal to it when no clash is on).
-    #: The stored aliases hold bare names, so every "other names" filter must
-    #: compare against this too - otherwise a numbered member's current card
-    #: passes the filter and renders as a name they supposedly dropped.
-    bare: str = ""
     accounts: tuple[str, ...] = ()
     messages: int = 0
     names: tuple[NameCard, ...] = ()
@@ -149,15 +144,10 @@ class PersonCard:
         return len(self.accounts) > 1
 
     @property
-    def _shown(self) -> set[str]:
-        """Every spelling of the current name: suffixed and bare."""
-        return {self.display, self.bare or self.display}
-
-    @property
     def other_names(self) -> tuple[str, ...]:
         """Names besides the one currently shown in the group."""
         return tuple(dict.fromkeys(
-            n.text for n in self.names if n.text not in self._shown))
+            n.text for n in self.names if n.text != self.display))
 
     @property
     def displayed_names(self) -> tuple[str, ...]:
@@ -170,14 +160,14 @@ class PersonCard:
         """
         return tuple(dict.fromkeys(
             n.text for n in self.names
-            if n.platform_given and n.text not in self._shown))
+            if n.platform_given and n.text != self.display))
 
     @property
     def nicknames(self) -> tuple[str, ...]:
         """What people call this person, as opposed to what the account displays."""
         return tuple(dict.fromkeys(
             n.text for n in self.names
-            if not n.platform_given and n.text not in self._shown))
+            if not n.platform_given and n.text != self.display))
 
     @property
     def note(self) -> str:
@@ -245,7 +235,7 @@ class Directory:
     # -- reads ------------------------------------------------------------
     async def roster(
         self, group_id: int, *, display: dict[str, str] | None = None,
-        bare: dict[str, str] | None = None, exclude: set[str] | None = None,
+        exclude: set[str] | None = None,
     ) -> list[PersonCard]:
         """Everyone who has spoken here, most talkative first.
 
@@ -274,8 +264,7 @@ class Directory:
             by_entity.setdefault(acc.entity_id, []).append(uid)
 
         cards = [
-            await self._card(group_id, eid, uids, counts, display or {},
-                             bare or {})
+            await self._card(group_id, eid, uids, counts, display or {})
             for eid, uids in by_entity.items()
         ]
         cards.sort(key=lambda c: (-c.messages, c.user_id))
@@ -307,7 +296,6 @@ class Directory:
     async def _card(
         self, group_id: int, entity_id: uuid.UUID, accounts: list[str],
         counts: dict[str, int], display: dict[str, str],
-        bare: dict[str, str] | None = None,
     ) -> PersonCard:
         aliases = await self._ids.aliases_for(group_id, entity_id)
         usable = [a for a in aliases if a.is_usable]
@@ -319,13 +307,8 @@ class Directory:
         shown = (display.get(primary) or "").strip() or next(
             (display[u] for u in accounts if (display.get(u) or "").strip()), ""
         ).strip()
-        bare = bare or {}
-        bare_shown = (bare.get(primary) or "").strip() or next(
-            (bare[u] for u in accounts if (bare.get(u) or "").strip()), ""
-        ).strip()
         if not shown:
             shown = _current_platform_name(aliases) or primary
-            bare_shown = shown
 
         # Sorted by predicate rather than by confidence so the numbering an owner reads
         # off /who is still the same numbering a moment later when they type /forget.
@@ -334,7 +317,6 @@ class Directory:
             entity_id=entity_id,
             user_id=primary,
             display=shown,
-            bare=bare_shown or shown,
             accounts=tuple(sorted(accounts)),
             messages=sum(counts.get(u, 0) for u in accounts),
             names=tuple(

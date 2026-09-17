@@ -31,7 +31,7 @@ from nonebot.adapters.onebot.v11 import GroupMessageEvent
 from nonebot.matcher import Matcher, current_bot, current_event
 from pydantic import ValidationError
 
-from ..core import agreement, command_catalog, debug, errors, namesakes, perms
+from ..core import agreement, command_catalog, debug, errors, perms
 from ..core.pipeline import note_console_reply
 from ..core.budget import BUDGET, hit_split
 from ..core.members import MEMBERS
@@ -127,16 +127,14 @@ async def _gate(matcher: Matcher, event: GroupMessageEvent,
 async def _name(gid: str, user_id: str) -> str:
     """How an answer names an account: the current group card, else the name the
     archive knows them by, else the account number said as such. Answers name
-    people the way the group does; a bare number is what nobody recognises.
-    Bare of the namesake tag: that is transcript notation, and nothing the
-    console posts to the group may carry a system marker."""
+    people the way the group does; a bare number is what nobody recognises."""
     bot = current_bot.get()
     if name := await MEMBERS.name_of(bot, gid, user_id):
-        return namesakes.bare(name)
+        return name
     try:
         card = await directory().person(int(gid), user_id)
         if card.display and card.display not in card.accounts:
-            return namesakes.bare(card.display)
+            return card.display
     except UnknownAccount:
         pass
     return f"账号 {user_id}"
@@ -172,7 +170,8 @@ async def _finish(matcher: Matcher, message: str) -> None:
             message_id=str((sent or {}).get("message_id") or ""),
             reply_to=str(getattr(event, "message_id", "") or ""),
             name=config().persona_for(gid).name,
-            addressee=(await MEMBERS.name_of(bot, gid, str(event.user_id))) or "")
+            addressee=(str(event.user_id),
+                       (await MEMBERS.name_of(bot, gid, str(event.user_id))) or "成员"))
     except Exception as e:
         log.warning("command reply not recorded: %s", why(e))
     await matcher.finish()

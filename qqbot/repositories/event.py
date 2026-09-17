@@ -58,6 +58,22 @@ class EventRepository:
         )
         return {r["uid"]: r["n"] for r in rows}
 
+    async def first_appearances(self, group_id: int) -> dict[str, object]:
+        """When each account first appeared in this group's archive.
+
+        The roster is ordered by this, so a person's place in it - and with it their
+        member number - does not move when somebody new turns up.
+        """
+        rows = await pool().fetch(
+            """SELECT platform_user_id AS uid, min(occurred_at) AS first
+                 FROM raw_event
+                WHERE group_id=$1 AND event_type='message'
+                  AND platform_user_id IS NOT NULL
+                GROUP BY platform_user_id""",
+            group_id,
+        )
+        return {r["uid"]: r["first"] for r in rows}
+
     # -- the extraction watermark ------------------------------------------
     async def unread_since_extract(self, group_id: int) -> tuple[int, object]:
         """How many messages this group has that no extraction has read, and the
