@@ -22,8 +22,9 @@ from __future__ import annotations
 import json
 import re
 
+from ..prompting import PromptKey
 from ..providers.contracts import Message, PromptItem, Role, ToolCall, ToolCallId, ToolResult
-from ..settings import Persona, Settings, ptext
+from ..settings import Persona, Settings, prompt_catalog
 from ..util import SYS_L, SYS_R, defang, describe_now, fmt_when, sysmark
 from .member_numbers import MemberNumbers
 from .outbound import (
@@ -87,7 +88,9 @@ def _name(p: dict, people: MemberNumbers) -> tuple[int, str]:
     render as well as at ingest: names are stored as the platform reported them, and
     the render is where the grammar must hold."""
     n = people.number(str(p.get("user_id") or ""))
-    return n, defang(p.get("nickname") or "") + (sysmark(str(n)) if n else "")
+    if n is None or n <= 0:
+        raise ValueError("member profile has no addressable user_id")
+    return n, defang(p.get("nickname") or "") + sysmark(str(n))
 
 
 def _known_block(profiles: list[dict], people: MemberNumbers) -> str:
@@ -154,15 +157,12 @@ def _guessed_block(profiles: list[dict], people: MemberNumbers) -> str:
 def build_policy() -> str:
     """Cross-group invariants with the highest, cache-stable authority."""
 
-    blocks = [
-        H_SEND + "\n" + ptext("send_rules"),
-        H_LEGEND + "\n" + ptext("legend") + "\n\n" + ptext("legend_reply_note"),
-        H_IDENTITY + "\n" + ptext("identity_rules"),
-        H_CREDIBILITY + "\n" + ptext("credibility_rules"),
-        H_PRIVATE + "\n" + ptext("private_rules"),
-        H_TONE + "\n" + ptext("tone_rules"),
-    ]
-    return "\n\n".join(blocks)
+    prompts = prompt_catalog()
+    return prompts.render(
+        PromptKey.REPLY_SYSTEM,
+        shared_legend=prompts.source(PromptKey.SHARED_LEGEND),
+        shared_pragmatics=prompts.source(PromptKey.SHARED_PRAGMATICS),
+    )
 
 
 def build_developer(
@@ -173,30 +173,37 @@ def build_developer(
 ) -> str:
     """Group-scoped identity and context below global policy authority."""
 
-    blocks = [H_PERSONA + "\n" + persona.system_prompt.strip()]
+    persona_block = H_PERSONA + "\n" + persona.system_prompt.strip()
 
     # Split by origin, exactly like the identity block below. The hand-written half is a
     # statement; the card is the bot's own summary read back, and running them together
     # would present a guess in the voice of a fact.
     fixed = persona.group_knowledge.strip()
     learned = "\n".join(f"- {fact}" for fact in (group_facts or []))
+    group_block = ""
     if fixed or learned:
         parts = []
         if fixed:
             parts.append("已确认（固定资料）：\n" + fixed)
         if learned:
             parts.append("未确认（你自行归纳的印象，可能有误或已过时）：\n" + learned)
-        blocks.append(H_GROUP + "\n" + "\n\n".join(parts))
+        group_block = H_GROUP + "\n" + "\n\n".join(parts)
 
     if people is None:
         people = MemberNumbers()
         number_people(people, profiles, [], None)
     known = _known_block(profiles, people)
     guessed = _guessed_block(profiles, people)
-    parts = [part for part in (known, guessed) if part]
-    if parts:
-        blocks.append(H_WHO + "\n" + "\n\n".join(parts))
-    return "\n\n".join(block for block in blocks if block)
+    roster_parts = [part for part in (known, guessed) if part]
+    roster_block = (
+        H_WHO + "\n" + "\n\n".join(roster_parts) if roster_parts else ""
+    )
+    return prompt_catalog().render(
+        PromptKey.REPLY_DEVELOPER,
+        persona=persona_block,
+        group_context=group_block,
+        member_roster=roster_block,
+    )
 
 
 def build_system(
@@ -333,6 +340,8 @@ def number_people(people: MemberNumbers, profiles: list[dict],
                 people.number(account)
         else:
             people.number(m.user_id, spoke=True)
+            for account, _ in m.mentions:
+                people.number(account)
 
 
 def _call_id(msg_id: str) -> str:
@@ -353,8 +362,12 @@ def _segment_arg(
         case TextSegment(text):
             return {"type": "text", "data": {"text": text}}
         case AtSegment(account):
-            number = people.number(account) if people is not None else 0
-            return {"type": "at", "data": {"member": number}} if number else None
+            number = people.number(account) if people is not None else None
+            return (
+                {"type": "at", "data": {"member": number}}
+                if number is not None and number > 0
+                else None
+            )
         case ReplySegment(message_id):
             return (
                 {"type": "reply", "data": {"line": nums[message_id]}}
@@ -372,10 +385,11 @@ def _segment_arg(
         case RpsSegment():
             return {"type": "rps", "data": {}}
         case ContactSegment(ContactKind.MEMBER, target_id):
-            number = people.number(target_id) if people is not None else 0
+            number = people.number(target_id) if people is not None else None
             return (
                 {"type": "contact_member", "data": {"member": number}}
-                if number else None
+                if number is not None and number > 0
+                else None
             )
         case ContactSegment():
             return {"type": "contact_group", "data": {}}
@@ -439,8 +453,8 @@ def own_line(
         # Legacy rows without structured segments use the former flat contract.
         content = [{"type": "text", "data": {"text": body}}]
         for account, _ in m.at:
-            number = people.number(account) if people is not None else 0
-            if number:
+            number = people.number(account) if people is not None else None
+            if number is not None and number > 0:
                 content.insert(-1, {"type": "at", "data": {"member": number}})
         if m.reply_to and (line := nums.get(m.reply_to)):
             content.insert(0, {"type": "reply", "data": {"line": line}})
@@ -490,9 +504,13 @@ def render_history(
                 )
             )
             continue
-        line = m.render(seq=nums.get(m.msg_id, 0), quote=marks.get(m.msg_id, ""),
-                        pic_nums=pics.get(m.msg_id),
-                        member_no=people.number(m.user_id) if people is not None else 0)
+        line = m.render(
+            seq=nums.get(m.msg_id, 0),
+            quote=marks.get(m.msg_id, ""),
+            pic_nums=pics.get(m.msg_id),
+            member_no=people.number(m.user_id) if people is not None else None,
+            mention_number=people.number if people is not None else None,
+        )
         out.append(Message(Role.USER, line))
     return out
 
@@ -510,24 +528,19 @@ def build_tail(*, msg: ChatMsg,
     events pushed here hijacks the question. The past is pulled (recall_events),
     never pushed.
     """
-    parts: list[str] = []
-
-    # A model has no clock. This has to sit after the cache boundary: in the system
-    # block it would change every minute and cost the prefix cache on every call.
-    # Here it is already past the boundary, so it is free.
-    parts.append("当前时间：" + describe_now() + "。")
-
     nums, marks, pics = nums or {}, marks or {}, pics or {}
-    now = msg.render(seq=nums.get(msg.msg_id, 0), quote=marks.get(msg.msg_id, ""),
-                     pic_nums=pics.get(msg.msg_id),
-                     member_no=people.number(msg.user_id) if people is not None else 0)
-    # Each reply task carries exactly one addressed message; this header is the
-    # anchor reply_final points at when naming which message to answer.
-    parts.append("下面是刚收到的消息：\n" + now)
-    # Which message to answer, said outright: the history is context; only this block
-    # is the question (see config/prompts/README.md, key "reply_final").
-    parts.append(ptext("reply_final"))
-    return "\n\n".join(parts)
+    current = msg.render(
+        seq=nums.get(msg.msg_id, 0),
+        quote=marks.get(msg.msg_id, ""),
+        pic_nums=pics.get(msg.msg_id),
+        member_no=people.number(msg.user_id) if people is not None else None,
+        mention_number=people.number if people is not None else None,
+    )
+    return prompt_catalog().render(
+        PromptKey.REPLY_USER,
+        now=describe_now(),
+        current_message=current,
+    )
 
 
 def assemble(

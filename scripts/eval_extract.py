@@ -41,7 +41,6 @@ from qqbot.providers import build_default, set_providers
 from qqbot.services import ExtractionInput, MemoryExtractor
 from qqbot.services.memory_extractor import SourceLine
 from qqbot.settings import config
-from qqbot.workers.memory import transcript_legend
 
 #: Same eval-only group as eval_replies, so the ledger rows stay attributable.
 GROUP = 424242
@@ -97,7 +96,7 @@ LINES = [
     "⟦09-07 21:30⟧ 陈其⟦3⟧: 阿旺你说周六吃什么好",
     # The bot's own line, marked as such: readable for coherence, and nothing
     # may derive from or quote it (the own flag also blocks it mechanically).
-    "⟦09-07 21:31⟧ 阿旺⟦你⟧: 那我周六早点到，帮你们占座，我头像是只柴犬",
+    "⟦09-07 21:31⟧ 阿旺⟦0⟧: 那我周六早点到，帮你们占座，我头像是只柴犬",
 ]
 
 #: What the worker passes as ExtractionInput.self_names in production.
@@ -177,8 +176,8 @@ async def main() -> int:
     from qqbot.core.budget import BUDGET
     spent0 = await BUDGET.spent_today()
     cfg = config().default
-    extractor = MemoryExtractor(cfg, legend=transcript_legend())
-    lines = tuple(SourceLine(event_id=uuid.uuid4(), text=t, own="⟦你⟧" in t)
+    extractor = MemoryExtractor(cfg)
+    lines = tuple(SourceLine(event_id=uuid.uuid4(), text=t, own="⟦0⟧" in t)
                   for t in LINES)
     inp = ExtractionInput(
         group_id=GROUP, transcript="\n".join(LINES), roster=ROSTER,

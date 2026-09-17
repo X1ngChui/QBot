@@ -336,9 +336,9 @@ agreement:
   # every time reads as spam.
   prompt_every_sec: 600
 
-# The prompt texts the model reads, one <key>.txt per key in the code's manifest
-# (settings.PROMPT_KEYS); ls this directory to see the set. A file missing or
-# empty fails the load. Wording rationale: prompts/README.md.
+# Directory containing the versioned prompts.yaml bundle. Template keys, roles,
+# reload scopes and slots are fixed by prompting/templates.py; the whole bundle
+# must validate before any of it loads. Wording rationale: prompts/README.md.
 prompts_dir: prompts
 # What may be recorded about a person, one entry per predicate (see the file).
 predicates_file: predicates.yaml

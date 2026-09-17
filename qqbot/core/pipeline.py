@@ -37,7 +37,7 @@ from .command_catalog import PREFIXES as COMMANDS
 from .media import MEDIA
 from .members import MEMBERS
 from .ratelimit import DedupSet
-from .segments import ParsedMessage, parse_segments
+from .segments import ParsedMessage, at_mentions, parse_segments
 from .state import REGISTRY, ChatMsg
 
 log = logging.getLogger("qqbot.pipeline")
@@ -166,15 +166,40 @@ class Gateway:
         segments = [
             {"type": seg.type, "data": dict(seg.data)} for seg in event.get_message()
         ]
-        parsed = parse_segments(segments, str(bot.self_id), limits=cfg.prompt)
-
-        # The adapter pops a leading or trailing @me segment off the message and reports it
-        # as event.to_me, so the segments alone cannot show the bot was addressed - the one
-        # path that must always answer would never fire. Trust to_me, and put the marker
-        # back so the prompt still shows the bot was spoken to.
-        if getattr(event, "to_me", False) and not parsed.at_bot:
-            parsed.at_bot = True
-            parsed.parts.insert(0, "@我")
+        self_id = str(bot.self_id)
+        self_name = (
+            config().persona_for(group_id).name
+            or (cfg.trigger.nicknames[0] if cfg.trigger.nicknames else "机器人")
+        )
+        # Some adapters remove a leading/trailing @bot and retain only ``to_me``.
+        # Restore a normal segment before parsing and archiving so live and rebuilt
+        # prompts project the same structured mention instead of a magic text token.
+        if getattr(event, "to_me", False) and not any(
+            isinstance(segment, dict)
+            and segment.get("type") == "at"
+            and str((segment.get("data") or {}).get("qq") or "") == self_id
+            for segment in segments
+        ):
+            segments.insert(
+                0,
+                {"type": "at", "data": {"qq": self_id, "name": self_name}},
+            )
+        for segment in segments:
+            if not isinstance(segment, dict) or segment.get("type") != "at":
+                continue
+            data = segment.get("data")
+            if (
+                isinstance(data, dict)
+                and str(data.get("qq") or "") == self_id
+                and not data.get("name")
+            ):
+                data["name"] = self_name
+        parsed = parse_segments(
+            segments,
+            self_id,
+            limits=cfg.prompt,
+            self_name=self_name,
+        )
 
         # The adapter does the same to a quote: _check_reply resolves the reply segment,
         # moves it to event.reply, and deletes it from the message - so parse_segments
@@ -220,6 +245,11 @@ class Gateway:
             # but the references stay for the window's lifetime so open_images
             # can open any picture by number, forwarded ones included.
             image_refs=parsed.pictures,
+            mentions=at_mentions(
+                segments,
+                self_id=self_id,
+                self_name=self_name,
+            ),
         )
 
         # Before this message joins the deque: after a restart the window is rebuilt from

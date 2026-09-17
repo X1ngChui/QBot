@@ -27,7 +27,7 @@ from datetime import datetime
 from ..db import pool
 from ..repositories import IdentityRepository
 from ..services import IdentityResolver
-from .onebot import GroupMessage, Sender
+from .onebot import AuthorKind, GroupMessage, Sender
 
 log = logging.getLogger("qqbot.ingest")
 
@@ -128,6 +128,7 @@ class Ingestor:
             occurred_at=at,
             plain_text=read,
             outbound_schema=1,
+            author_kind=AuthorKind.BOT,
             # The quote pointer travels into the payload the same way a member's
             # does, so the restart-rebuilt window renders the line identically.
             reply_to_message_id=reply_to or None,

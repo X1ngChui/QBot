@@ -521,11 +521,11 @@ async def main():
           c.render(seq=nums["m3"], quote=marks["m3"])
           == f"#3 ⟦{_fw(c.ts)}⟧ 小北: ⟦回复 #1⟧ 那就辛苦了",
           c.render(seq=nums["m3"], quote=marks["m3"]))
-    # The bot's own lines are assistant turns, so they carry the number and no speaker
-    # prefix. There is nothing left that reads a flat transcript of these: the memory
-    # worker builds its own lines, because it numbers accounts rather than naming them.
-    check("the bot's line is numbered, stamped and unlabelled",
-          b.render(seq=nums["m2"]) == f"#2 ⟦{_fw(b.ts)}⟧ 我来吧，顺手的事",
+    # Bot lines use the reserved display identity too. The marker shares the member
+    # legend syntax but is never accepted as a tool target.
+    check("the bot's line carries its reserved display identity",
+          b.render(seq=nums["m2"])
+          == f"#2 ⟦{_fw(b.ts)}⟧ 机器人⟦0⟧: 我来吧，顺手的事",
           b.render(seq=nums["m2"]))
 
     # `bot` is threaded through twenty-odd signatures and was annotated in none of them,

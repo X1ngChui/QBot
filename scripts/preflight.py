@@ -153,9 +153,14 @@ async def check_vision() -> None:
     cfg = config().default.capabilities.vision
     label = f"vision, base64 inline ({cfg.model})"
     try:
-        from qqbot.settings import ptext
+        from qqbot.prompting import PromptKey
+        from qqbot.settings import prompt_catalog
         desc = await providers().vision.describe(
-            TEST_PNG, cfg=cfg, prompt=ptext("describe_image"), mime="image/png")
+            TEST_PNG,
+            cfg=cfg,
+            prompt=prompt_catalog().render(PromptKey.VISION_SYSTEM),
+            mime="image/png",
+        )
         record(label, bool(desc), repr(desc[:40]))
     except Exception as e:
         record(label, False, repr(e))

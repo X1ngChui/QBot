@@ -18,16 +18,17 @@ from luqum.exceptions import ParseError as _LuqumParseError
 from luqum.parser import parser as _luqum_parser
 
 from ..db import pool, repo
+from ..prompting import PromptKey, tool_prompt_key
 from ..providers import providers
 from ..providers.base import QuotaExhausted
 from ..providers.contracts import StoredImage, TextPart, ToolCall, ToolSpec
-from ..settings import RetrievalCfg, Settings, config, ptext
+from ..settings import RetrievalCfg, Settings, config, prompt_catalog
 from ..util import defang, display_name, fmt_when, merge_overlapping, sysmark, why
 from . import retrieval
 from .botapi import BotApi
 from .media import MEDIA
-from .member_numbers import MemberNumbers
-from .segments import FACE_NAMES
+from .member_numbers import BOT_DISPLAY_NUMBER, MemberNumbers
+from .segments import FACE_NAMES, at_mentions, number_at_mentions
 
 log = logging.getLogger("qqbot.tools")
 
@@ -52,10 +53,13 @@ class ToolCtx:
 def _tool(name: str, parameters: dict) -> ToolSpec:
     """One typed tool contract whose model-facing description lives in prompts."""
 
-    description = ptext(f"tool_{name}")
-    if name == SEND:
-        catalog = "、".join(f"{face_id}={label}" for face_id, label in FACE_NAMES.items())
-        description = description.replace("{{FACE_CATALOG}}", catalog)
+    key = tool_prompt_key(name)
+    values = {}
+    if key is PromptKey.TOOL_SEND_MESSAGE:
+        values["face_catalog"] = "、".join(
+            f"{face_id}={label}" for face_id, label in FACE_NAMES.items()
+        )
+    description = prompt_catalog().render(key, values)
     return ToolSpec(
         name=name,
         description=description,
@@ -441,10 +445,22 @@ def _who(r) -> str:
 
 
 async def _learn(people: MemberNumbers | None, rows: list) -> None:
-    """Look up the persons behind every speaker one answer shows, before any is
-    numbered, so accounts of one person share a number here as in the prompt."""
-    if people is not None:
-        await people.learn([str(r["platform_user_id"] or "") for r in rows])
+    """Load every displayed speaker and structured @ target before numbering."""
+    if people is None:
+        return
+    accounts: list[str] = []
+    for row in rows:
+        uid = str(row["platform_user_id"] or "")
+        if uid:
+            accounts.append(uid)
+        payload = row["payload"] or {}
+        row_self = str(payload.get("self_id") or "")
+        accounts.extend(
+            account
+            for account, _ in at_mentions(payload.get("segments") or [])
+            if account != row_self
+        )
+    await people.learn(accounts)
 
 
 def _render_lines(rows: list, people: MemberNumbers | None, self_id: str | None) -> str:
@@ -454,17 +470,32 @@ def _render_lines(rows: list, people: MemberNumbers | None, self_id: str | None)
 
 def _history_line(r, people: MemberNumbers | None, self_id: str | None) -> str:
     uid = str(r["platform_user_id"] or "")
+    payload = r["payload"] or {}
+    row_self = str(payload.get("self_id") or "")
+    author_kind = payload.get("author_kind")
+    is_bot = author_kind == "bot" or row_self == uid or (
+        author_kind not in {"bot", "member"} and bool(self_id) and uid == self_id
+    )
     who = _who(r)
-    if people is not None and (n := people.number(uid)):
-        who += sysmark(str(n))
-    if self_id and uid == self_id:
-        # The same self tag the extraction transcript wears: the line is archived
-        # under the persona's name, which reads as a member's otherwise.
-        who += sysmark("你")
-    # The message whole. What a search is for is the substance of what was said, and
-    # the archive's long messages are where that lives. The text is left as stored -
-    # its markers are system writing, and defanging would destroy them.
+    if is_bot:
+        who += sysmark(str(BOT_DISPLAY_NUMBER))
+    elif people is not None:
+        n = people.number(uid)
+        if n is not None:
+            who += sysmark(str(n))
     text = (r["plain_text"] or "").strip()
+    mentions = at_mentions(payload.get("segments") or [])
+    if mentions:
+        def mention_number(account: str) -> int | None:
+            if row_self and account == row_self:
+                return BOT_DISPLAY_NUMBER
+            if people is not None:
+                return people.number(account)
+            if self_id and account == self_id:
+                return BOT_DISPLAY_NUMBER
+            return None
+
+        text = number_at_mentions(text, mentions, mention_number)
     # fmt_when, not strftime on the raw value: asyncpg returns timestamptz in UTC,
     # and a UTC wall time here would disagree with every stamp in the history window.
     return f"{sysmark(fmt_when(r['occurred_at']))} {who}: {text}"

@@ -11,14 +11,16 @@ from __future__ import annotations
 import logging
 import re
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 
 from ..db import repo
 from ..settings import config
 from ..util import SYS_L, SYS_R, display_name, fmt_when, now_local, sysmark, why
+from .member_numbers import BOT_DISPLAY_NUMBER
 from .outbound import OutboundSegment, from_onebot
-from .segments import parse_segments
+from .segments import at_mentions, number_at_mentions, parse_segments
 
 log = logging.getLogger("qqbot.state")
 
@@ -44,6 +46,9 @@ class ChatMsg:
     #: The QQ id of the message this one quotes, if any. What the model is shown is a
     #: pointer to that message's line number - see prompt.numbered.
     reply_to: str | None = None
+    #: Accounts mentioned by a member message, paired with the display name carried by
+    #: the original segment. Prompt-local member numbers are projected from this list.
+    mentions: list[tuple[str, str]] = field(default_factory=list)
     #: Whom one of the bot's own messages @-ed, as (account, display name) pairs in
     #: send order. Kept apart from `text` so the prompt can show each target with
     #: the number it wears in that render; members' own @-mentions stay in their
@@ -87,7 +92,8 @@ class ChatMsg:
             lambda m: sysmark(f"{m.group(1)}{next(it)}{m.group(2) or ''}"), self.text)
 
     def render(self, *, seq: int = 0, quote: str = "",
-               pic_nums: list[int] | None = None, member_no: int = 0) -> str:
+               pic_nums: list[int] | None = None, member_no: int | None = None,
+               mention_number: Callable[[str], int | None] | None = None) -> str:
         """One line of transcript, as the model will read it.
 
         The prompt only ever sees a display name, never a QQ id, so without the owner tag
@@ -96,8 +102,9 @@ class ChatMsg:
         renders identically and the history stays cache-safe.
 
         `seq` is this line's number in whatever is being shown, `quote` the pointer to
-        the line it replies to, and `member_no` the speaker's member number. All three
-        are worked out per prompt - see prompt.numbered and core.member_numbers.
+        the line it replies to, `member_no` the speaker's member number, and
+        `mention_number` numbers direct @ targets. All are worked out per prompt - see
+        prompt.numbered and core.member_numbers.
 
         Every line carries its send time. Without one the model reads sixty messages
         as one continuous conversation and bridges topics hours apart. The stamp is
@@ -106,12 +113,15 @@ class ChatMsg:
         would invalidate the prefix on every reply.
         """
         text = self.numbered_text(pic_nums)
+        if mention_number is not None and self.mentions:
+            text = number_at_mentions(text, self.mentions, mention_number)
         body = f"{quote} {text}".strip() if quote else text
         head = f"#{seq} " if seq else ""
         when = sysmark(fmt_when(self.ts)) + " "
         if self.is_bot:
-            return f"{head}{when}{body}"
-        no = sysmark(str(member_no)) if member_no else ""
+            name = self.nickname or "机器人"
+            return f"{head}{when}{name}{sysmark(str(BOT_DISPLAY_NUMBER))}: {body}"
+        no = sysmark(str(member_no)) if member_no is not None else ""
         tag = OWNER_TAG if self.is_owner else ""
         return f"{head}{when}{self.nickname}{no}{tag}: {body}"
 
@@ -304,8 +314,14 @@ class GroupState:
             # a restart: re-parsed here, they are what lets open_images hand over a
             # picture posted before the deploy. Parsing is pure and costs nothing.
             segs = payload.get("segments") or []
-            is_bot = uid == self_id
+            author_kind = payload.get("author_kind")
+            is_bot = author_kind == "bot" or (
+                str(payload.get("self_id") or "") == uid
+            ) or (
+                author_kind not in {"bot", "member"} and uid == self_id
+            )
             at: list[tuple[str, str]] = []
+            mentions: list[tuple[str, str]] = []
             outbound: tuple[OutboundSegment, ...] = ()
             if is_bot:
                 if payload.get("outbound_schema") == 1:
@@ -319,7 +335,26 @@ class GroupState:
                         at, text = [asker], text[len(asker[1]) + 1:].lstrip(" ")
                 refs = []
             else:
-                refs = parse_segments(segs, self_id, limits=limits).pictures if segs else []
+                parsed = (
+                    parse_segments(
+                        segs,
+                        self_id,
+                        limits=limits,
+                        self_name=config().persona_for(self.group_id).name,
+                    )
+                    if segs
+                    else None
+                )
+                refs = parsed.pictures if parsed is not None else []
+                mentions = (
+                    at_mentions(
+                        segs,
+                        self_id=str(payload.get("self_id") or self_id),
+                        self_name=config().persona_for(self.group_id).name,
+                    )
+                    if segs
+                    else []
+                )
             msgs.append(ChatMsg(
                 msg_id=str(r["platform_event_id"] or r["id"]),
                 user_id=uid,
@@ -327,9 +362,10 @@ class GroupState:
                 text=text,
                 ts=r["occurred_at"],
                 is_bot=is_bot,
-                is_owner=uid in owners,
+                is_owner=not is_bot and uid in owners,
                 reply_to=payload.get("reply_to") or None,
                 image_refs=refs,
+                mentions=mentions,
                 at=at,
                 outbound=outbound,
             ))

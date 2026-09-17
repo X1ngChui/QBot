@@ -28,6 +28,13 @@ from typing import Any, Self
 from ..util import defang, now_local, scrub_nul, tz
 
 
+class AuthorKind(StrEnum):
+    """Who authored an archived message, independent of identity records."""
+
+    MEMBER = "member"
+    BOT = "bot"
+
+
 class Role(StrEnum):
     """Rank inside the QQ group. Unrelated to what the bot allows - running the group is
     not the same as running the bot."""
@@ -102,6 +109,7 @@ class GroupMessage:
     #: Versioned only for bot-authored outbound segment projections. Inbound and
     #: legacy rows stay at zero and retain their historical reconstruction rules.
     outbound_schema: int = 0
+    author_kind: AuthorKind = AuthorKind.MEMBER
     #: Also decided by the adapter: a leading or trailing @bot is removed and flagged.
     to_me: bool = False
     raw: dict = field(default_factory=dict, repr=False)
@@ -169,4 +177,6 @@ class GroupMessage:
             "reply_to": self.reply_to_message_id,
             "to_me": self.to_me,
             "outbound_schema": self.outbound_schema,
+            "author_kind": self.author_kind.value,
+            "self_id": self.self_id,
         }

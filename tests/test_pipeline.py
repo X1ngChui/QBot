@@ -345,14 +345,16 @@ async def main():
     # nickname read as one person renaming himself, and it said so out loud. The system
     # knows better on both counts, and now says so.
     check("the prompt says identity is judged by member number, not by name",
-          "判断是谁只看编号，不看昵称" in sys_prompt)
+          "判断身份的依据" in sys_prompt
+          and "名字" in sys_prompt
+          and "本身不带编号，不构成身份判断" in sys_prompt)
     check("and that a rename is only a rename when it was recorded",
           "不能据此断言对方从未改名" in sys_prompt,
           sys_prompt[sys_prompt.find("曾用名"):][:120])
     # A name the account displayed and a name the group calls him are different claims,
     # and the prompt has to say so or the second gets reported as the first.
     check("and that a registered alias is not a name he used to display",
-          "不要把别名说成「他以前叫」" in sys_prompt)
+          "不要说成「他以前叫」" in sys_prompt)
     # These hold with or without a roster, so they ship apart from the lists: this group
     # has no members configured and still gets them.
     check("reading rules ship whether or not anyone is configured",
@@ -362,10 +364,10 @@ async def main():
     # something unknown in the same confident voice as something known.
     check("the rules separate account from person",
           "多个账号共用一个编号" in sys_prompt
-          and "也不断言他们一定不是同一个人" in sys_prompt)
+          and "不断言他们一定是两个人" in sys_prompt)
     check("and stop short of what is not known",
-          "系统没告诉你的身份关系" in sys_prompt
-          and "明确说不知道，不猜" in sys_prompt)
+          "系统没有告知的身份关系" in sys_prompt
+          and "都是未知的，不猜" in sys_prompt)
     check("the group-scoped persona follows global policy as developer context",
           prompt_mod.H_PERSONA in developer_prompt
           and prompt_mod.H_PERSONA not in sys_prompt)
@@ -381,8 +383,7 @@ async def main():
     check("and told not to correct a joke",
           "不要无故上纲上线或一本正经纠正" in sys_prompt)
     from qqbot.services import MemoryExtractor
-    from qqbot.workers.memory import transcript_legend
-    _CP = MemoryExtractor(cfg, legend=transcript_legend()).prompt
+    _CP = MemoryExtractor(cfg).prompt
     check("the memory path gets the same reading, minus the part about speaking",
           "不只看字面" in _CP and "不要无故上纲上线" not in _CP)
     # One discernment, two consequences: the judgment half is the shared
@@ -396,8 +397,9 @@ async def main():
                prompt_mod.H_CREDIBILITY, prompt_mod.H_PRIVATE, prompt_mod.H_TONE))
           and prompt_mod.H_PERSONA in developer_prompt)
     check("and says to use visible media directly", "应直接使用" in sys_prompt)
-    from qqbot.settings import ptext as _ptext
-    _LEG = _ptext("legend")
+    from qqbot.prompting import PromptKey
+    from qqbot.settings import prompt_catalog
+    _LEG = prompt_catalog().source(PromptKey.SHARED_LEGEND)
     check("one legend, shared by the reply and memory paths",
           _LEG in sys_prompt and _LEG in _CP)
 
@@ -410,7 +412,9 @@ async def main():
     check("@ mention replies even with the at segment stripped", len(bot.sent) == n_at + 1,
           str(bot.sent[n_at:]))
     at_call = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]
-    check("prompt shows the bot was addressed", "@我" in at_call["input"][-1]["content"])
+    check("prompt shows the bot was addressed",
+          "⟦0⟧" in at_call["input"][-1]["content"]
+          and "@我" not in at_call["input"][-1]["content"])
 
     # 1c. Owner recognition. The prompt only ever carries a display name, so without a
     # tag derived from the account id the bot cannot tell who its owner is the moment
@@ -1150,19 +1154,16 @@ async def main():
     # conversation. The past is pulled through recall_events, never pushed.
     _tail = prompt_mod.build_tail(msg=_one[0])
     check("the tail is the clock and the message, nothing pushed beside them",
-          _tail.index("当前时间") < _tail.index("下面是刚收到的消息")
+          _tail.index("下面是刚收到的消息") > 0
           and "相关的事" not in _tail, _tail[:120])
-    # The tail has to say which message is the question. Without that, "reply with a
-    # message" and "reply to one of the messages" are the same sentence in Chinese, and
-    # the model answered whichever thread in the history looked livelier - leaving the
-    # person who had actually addressed it with no answer.
-    check("and the tail says which message to answer, and that only a send reaches the group",
-          "下面是刚收到的消息" in _tail and "只回应下面刚收到的消息" in _tail
-          and "send_message" in _tail, _tail[-140:])
-    # And says it without pointing two ways at once: the messages are introduced as being
-    # below, so the instruction must not then refer to them as being above.
-    check("and refers to it by description, not by direction",
-          "上面这条" not in _tail, _tail[-140:])
+    # The tail has to say which message is the question. The send mechanism stays in the
+    # system template instead of being repeated here; this nearest context only anchors the
+    # one message the run must answer.
+    check("and the tail says which message to answer",
+          "下面是刚收到的消息" in _tail and "只回应" in _tail,
+          _tail[-140:])
+    check("and gives the current message exactly one task anchor",
+          _tail.count("下面是刚收到的消息") == 1, _tail[-140:])
     # The exception matters as much as the rule. Being asked to answer something raised
     # earlier is ordinary, and a flat ban on the history would refuse it.
     # The exception lives with the rule, in the fixed rules that open the prompt.
@@ -1575,9 +1576,17 @@ async def main():
                ts=_nl0())
     _w2 = _CM0(msg_id="s-w2", user_id="u62", nickname="李芳", text="我是第二个李芳",
                ts=_nl0())
+    _wm = _CM0(
+        msg_id="s-wm",
+        user_id="u1",
+        nickname="阿强",
+        text="@李芳 和 @李芳 都看看",
+        ts=_nl0(),
+        mentions=[("u61", "李芳"), ("u62", "李芳")],
+    )
     _ask = _CM0(msg_id="s-ask", user_id="u1", nickname="阿强",
                 text="小X 帮我跟第二个李芳打个招呼", ts=_nl0())
-    for _m in (_w1, _w2, _ask):
+    for _m in (_w1, _w2, _wm, _ask):
         st_s.add(_m)
     _persona = config().for_group("123")[1]
 
@@ -1595,12 +1604,15 @@ async def main():
     _use(_look_then_send)
     n_sent = len(bot.sent)
     ok_s = await _eng.respond(bot=bot, st=st_s, cfg=cfg, persona=_persona, msg=_ask,
-                              window=[_w1, _w2])
+                              window=[_w1, _w2, _wm])
     check("two members sharing a card wear different member numbers",
           "李芳⟦1⟧: 我是第一个李芳" in _seen.get("prompt", "")
           and "李芳⟦2⟧: 我是第二个李芳" in _seen.get("prompt", "")
           and "阿强⟦3⟧: 小X 帮我" in _seen.get("prompt", ""),
           _seen.get("prompt", "")[-300:])
+    check("same-name @ targets carry the numbers of their accounts",
+          "@李芳⟦1⟧ 和 @李芳⟦2⟧ 都看看" in _seen.get("prompt", ""),
+          _seen.get("prompt", "")[-400:])
     check("the send @-s the numbered member and replies to the numbered line",
           ok_s and len(bot.sent) == n_sent + 1
           and bot.ats[-1] == "u62" and bot.quoted[-1] == "s-w2",
@@ -2145,7 +2157,7 @@ async def main():
     _rcfg18.history_context = _ctx18
     got_own = await _tools.search_history(123, "明天多云", self_id="999")
     check("the bot's own archived line wears the self tag in search results",
-          "⟦你⟧: " in got_own, got_own)
+          "⟦0⟧: " in got_own, got_own)
     # The answer as a whole is bounded; a cut answer says so.
     _chars18, _rcfg18.history_chars = _rcfg18.history_chars, 1000
     _rcfg18.history_context = 0

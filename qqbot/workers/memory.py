@@ -21,6 +21,8 @@ from datetime import datetime, timedelta
 import openai
 
 from ..core.budget import BUDGET
+from ..core.member_numbers import BOT_DISPLAY_NUMBER
+from ..core.segments import at_mentions, number_at_mentions
 from ..providers import providers
 from ..providers.base import QuotaExhausted
 from ..db import repo
@@ -32,7 +34,7 @@ from ..repositories.job import Job, JobType
 from ..services import ExtractionInput, MemoryConsolidator, MemoryExtractor
 from ..services.memory_extractor import SourceLine, decay_classes
 from ..services.context_builder import NOTE
-from ..settings import Settings, config, ptext
+from ..settings import Settings, config
 from ..util import defang, fmt_when, now_local, sysmark, why
 
 log = logging.getLogger("qqbot.worker")
@@ -52,19 +54,6 @@ EMBED_PAGE = 200
 #: says nothing the message does not. Anything else is this code's own fault and
 #: gets the traceback.
 EXPECTED_FAILURES = (TimeoutError, QuotaExhausted, openai.APIError)
-
-
-def transcript_legend() -> str:
-    """What the extraction prompt is told about the markers in a transcript.
-
-    Composed here rather than in the service, because the pieces belong to the layer
-    that renders messages and the service must not reach up into it - a worker may
-    know about both. A function rather than a constant so prompt overrides are read
-    when the worker is built. The extract_legend_note paragraph is one the reply path
-    does not need: these markers are annotations this system wrote, not things a
-    member typed - without it the model records that the group can send pictures.
-    """
-    return "【消息记录读法】\n" + ptext("legend") + "\n\n" + ptext("extract_legend_note")
 
 
 # Fact lifetimes come from the predicate class tables in memory_extractor - the kind of
@@ -100,7 +89,7 @@ class MemoryWorker:
         self._mem = MemoryRepository()
         self._eps = EpisodeRepository()
         self._events = EventRepository()
-        self._extractor = MemoryExtractor(cfg, legend=transcript_legend())
+        self._extractor = MemoryExtractor(cfg)
         self._consolidator = MemoryConsolidator(self._ids, self._mem, self._eps)
         # The bundle's own embedding backend: vectors are stored under the model that
         # produced them, so the store is keyed by the backend answering right now.
@@ -384,14 +373,38 @@ class MemoryWorker:
         half counts.
         """
         codes: dict[int, uuid.UUID] = {}
-        by_account: dict[str, int] = {}
+        by_account: dict[str, int | None] = {}
         lines: list[SourceLine] = []
         roster: list[str] = []
+        bot_accounts: set[str] = set()
+
+        async def assign_account(account: str, display: str) -> int | None:
+            if account in by_account:
+                return by_account[account]
+            eid = await self._identity_of(account)
+            if eid is None:
+                by_account[account] = None
+                return None
+            code = len(codes) + 1
+            by_account[account] = code
+            codes[code] = eid
+            akas = await self._known_names(group_id, eid, display)
+            shown = display or (akas[0] if akas else "成员")
+            roster.append(
+                shown
+                + sysmark(str(code))
+                + (
+                    f"（也叫：{'、'.join(defang(alias) for alias in akas)}）"
+                    if akas
+                    else ""
+                )
+            )
+            return code
 
         for r in rows:
             uid = r["platform_user_id"]
-            payload = r["payload"]
-            sender = (payload or {}).get("sender") or {}
+            payload = r["payload"] or {}
+            sender = payload.get("sender") or {}
             # defang on render: rows archived before Sender.parse neutralized
             # names can carry anything, and the account code appended below is
             # only unforgeable if the name half cannot contain the brackets.
@@ -399,28 +412,45 @@ class MemoryWorker:
                            or uid or "").strip()
             if not uid:
                 continue
-            if uid not in by_account:
-                eid = await self._identity_of(uid)
-                if eid is None:
-                    by_account[uid] = 0  # remember the answer; one lookup per account
+            self_account = str(payload.get("self_id") or "")
+            if self_account:
+                bot_accounts.add(self_account)
+            author_kind = payload.get("author_kind")
+            legacy = author_kind not in {"bot", "member"}
+            own = author_kind == "bot" or (
+                legacy and int(payload.get("outbound_schema") or 0) > 0
+            )
+            if own:
+                bot_accounts.add(uid)
+                by_account[uid] = BOT_DISPLAY_NUMBER
+                speaker_no: int | None = BOT_DISPLAY_NUMBER
+            else:
+                speaker_no = await assign_account(uid, name)
+                if legacy and speaker_no is None:
+                    # Legacy rows had no authorship discriminator. Preserve their old
+                    # classification only there; new member rows never take this branch.
+                    own = True
+                    bot_accounts.add(uid)
+                    by_account[uid] = BOT_DISPLAY_NUMBER
+                    speaker_no = BOT_DISPLAY_NUMBER
+                    log.debug("legacy archive row %s inferred as bot-authored", r["id"])
+            mentions = at_mentions(
+                payload.get("segments") or [],
+                self_id=self_account,
+                self_name=(self._cfg.trigger.nicknames[0]
+                           if self._cfg.trigger.nicknames else "机器人"),
+            )
+            for account, display in mentions:
+                if account in bot_accounts or account == self_account:
+                    by_account[account] = BOT_DISPLAY_NUMBER
                 else:
-                    code = len(codes) + 1
-                    by_account[uid] = code
-                    codes[code] = eid
-                    akas = await self._known_names(group_id, eid, name)
-                    roster.append(name + sysmark(str(code))
-                                  + (f"（也叫：{'、'.join(defang(a) for a in akas)}）"
-                                     if akas else ""))
-            if not by_account[uid]:
-                text = self._plain(r)
-                if text:
-                    who = (name + sysmark("你")) if name else sysmark("你")
-                    lines.append(SourceLine(
-                        event_id=r["id"], own=True,
-                        text=f"{sysmark(fmt_when(r['occurred_at']))} {who}: {text}"))
-                continue
-            text = self._plain(r)
+                    await assign_account(account, display)
+            text = number_at_mentions(
+                self._plain(r), mentions, lambda account: by_account.get(account)
+            )
             if text:
+                marker = sysmark(str(speaker_no)) if speaker_no is not None else ""
+                who = (name or "机器人") + marker
                 # The send time leads each line, exactly as the reply prompt stamps its
                 # history: a batch can span days (the idle floor), and without stamps
                 # two conversations hours apart read as one and get merged into one
@@ -428,8 +458,8 @@ class MemoryWorker:
                 # time is byte-identical to what the extractor read.
                 lines.append(SourceLine(
                     event_id=r["id"],
-                    text=f"{sysmark(fmt_when(r['occurred_at']))} "
-                         f"{name}{sysmark(str(by_account[uid]))}: {text}"))
+                    own=own,
+                    text=f"{sysmark(fmt_when(r['occurred_at']))} {who}: {text}"))
         return codes, "\n".join(roster), lines
 
     async def _identity_of(self, user_id: str) -> uuid.UUID | None:

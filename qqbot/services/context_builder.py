@@ -48,9 +48,9 @@ def render_fact(predicate: str, object_value, object_key: str | None = None) -> 
         return f"{object_key}：{obj}"
     if predicate == GROUP_TOPIC:
         return obj
-    verb = verb_of(predicate)
-    if not verb:
+    entry = config().predicates.person.get(predicate)
+    if entry is None:
         return ""
-    return verb.format(obj) if "{}" in verb else f"{verb}{obj}"
+    return entry.render(obj)
 
 

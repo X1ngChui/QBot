@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 
 from ..domain.identity import AliasType
 from ..domain.memory import Candidate, CandidateType
+from ..prompting import PromptKey
 from ..providers import providers
 from ..providers.contracts import (
     CallContext,
@@ -34,7 +35,7 @@ from ..providers.contracts import (
     ToolCall,
     ToolSpec,
 )
-from ..settings import PREDICATE_SLOT, Settings, config, ptext
+from ..settings import Settings, config, prompt_catalog
 from ..util import SYS_R
 
 log = logging.getLogger("qqbot.extract")
@@ -82,9 +83,10 @@ def rules_block() -> str:
     """
     lines = []
     for n, p in _table().items():
-        # A verb that is nothing but the placeholder means the object is the whole
+        # A verb that is nothing but the object slot means the object is the whole
         # phrase, so there is no reading to show alongside the name.
-        head = n if p.verb == "{}" else f"{n}（{p.verb.replace('{}', '…')}）"
+        slot = "{{object}}"
+        head = n if p.verb == slot else f"{n}（{p.verb.replace(slot, '…')}）"
         lines.append(f"- {head}：{p.rule}")
     return "\n".join(lines)
 
@@ -353,30 +355,16 @@ class ExtractionInput:
 
 
 class MemoryExtractor:
-    def __init__(self, cfg: Settings, *, legend: str = "") -> None:
-        """`legend` explains the transcript markers this system writes into the text.
+    def __init__(self, cfg: Settings) -> None:
+        """Freeze the complete extraction template family for this worker."""
 
-        Passed in rather than imported: what a marker looks like belongs to the layer that
-        renders messages, and a service reaching up into that layer would invert the
-        dependency this package is arranged around. The worker composes it, because a
-        worker is allowed to know about both sides.
-
-        Without it the model reads a picture description as something a person typed, and
-        records that the group is able to send pictures.
-        """
-        # Composed once, at construction: the fixed half lives in the prefix cache for
-        # the worker's lifetime, so a prompt override applies from the next restart
-        # rather than mid-batch. tone_rules is the discernment core shared with the
-        # reply path - what counts as said-in-earnest is one judgment, stated once -
-        # followed by this path's consequence note (what not to record).
-        base = (
-            ptext("extract").replace(PREDICATE_SLOT, rules_block())
-            + "\n\n【群聊语用】\n"
-            + ptext("tone_rules")
-            + "\n\n"
-            + ptext("tone_extract_note")
+        self._prompts = prompt_catalog()
+        self._prompt = self._prompts.render(
+            PromptKey.EXTRACT_SYSTEM,
+            shared_legend=self._prompts.source(PromptKey.SHARED_LEGEND),
+            shared_pragmatics=self._prompts.source(PromptKey.SHARED_PRAGMATICS),
+            predicate_table=rules_block(),
         )
-        self._prompt = (base + "\n\n" + legend.strip()) if legend.strip() else base
         # Extraction's own model, grade and timeout on the reply backend's wiring:
         # same endpoint, same key, its own price tier and its own patience. The
         # resolved policy is frozen here; a reload changing it is rejected until
@@ -397,15 +385,12 @@ class MemoryExtractor:
                 Message(Role.SYSTEM, self._prompt),
                 Message(
                     Role.USER,
-                    "\n\n".join(
-                        part
-                        for part in (
-                            f"你的名字：{inp.self_names}" if inp.self_names else "",
-                            f"本群账号：\n{inp.roster}",
-                            f"【已经记过的】\n{inp.known}" if inp.known else "",
-                            f"群聊记录：\n{inp.transcript}",
-                        )
-                        if part
+                    self._prompts.render(
+                        PromptKey.EXTRACT_USER,
+                        bot_names=inp.self_names or "机器人",
+                        account_roster=inp.roster,
+                        known_memory=inp.known,
+                        transcript=inp.transcript,
                     ),
                 ),
             ),

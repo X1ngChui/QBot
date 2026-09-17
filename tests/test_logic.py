@@ -17,8 +17,14 @@ from qqbot.core import nickname, prompt, trigger
 from qqbot.core.state import ChatMsg, GroupState
 import json
 
-from qqbot.core.segments import AtRef, AudioRef, parse_segments
-from qqbot.util import now_local
+from qqbot.core.segments import (
+    AtRef,
+    AudioRef,
+    at_mentions,
+    number_at_mentions,
+    parse_segments,
+)
+from qqbot.util import describe_now, now_local
 
 fails = []
 
@@ -214,8 +220,15 @@ segs = [
     {"type": "mface", "data": {"emoji_id": "e123", "summary": "[开心]"}},
     {"type": "reply", "data": {"id": "555"}},
 ]
-pm = parse_segments(segs, "999")
+pm = parse_segments(segs, "999", self_name="小X")
 check("at_bot detected", pm.at_bot)
+_plain_at_me = parse_segments(
+    [{"type": "text", "data": {"text": "@我 只是普通文字"}}],
+    "999",
+    self_name="小X",
+)
+check("typed @me is not a structured bot mention",
+      not _plain_at_me.at_bot and _plain_at_me.render() == "@我 只是普通文字")
 check("reply_to captured", pm.reply_to == "555")
 check("md5 key extracted", pm.refs[0].key == "a1b2c3d4e5f60718293a4b5c6d7e8f90", pm.refs[0].key)
 check("mface summary kept", pm.refs[1].summary == "开心")
@@ -223,7 +236,7 @@ check("mface summary kept", pm.refs[1].summary == "开心")
 # model as a pointer to a numbered line (prompt.numbered), not as an excerpt pasted
 # here - an excerpt says what was said but not which line said it.
 check("a quote adds no text of its own",
-      pm.render() == "@我 看看这个 ⟦图片⟧ ⟦图片⟧", repr(pm.render()))
+      pm.render() == "@小X 看看这个 ⟦图片⟧ ⟦图片⟧", repr(pm.render()))
 check("resolved render", "⟦图片:猫⟧" in pm.render({0: "⟦图片:猫⟧"}))
 
 # Shapes copied from what NapCat actually archived, not from the spec's examples.
@@ -264,6 +277,29 @@ check("a bare @qq becomes a ref to resolve", isinstance(at_other.refs[0], AtRef)
 check("unresolved @ falls back to the number", "@12345" in at_other.render())
 at_named = parse_segments([{"type": "at", "data": {"qq": "12345", "name": "阿强"}}], "999")
 check("@ with a name needs no lookup", not at_named.refs and "@阿强" in at_named.render())
+_same_name_mentions = [("member-a", "张伟"), ("member-b", "张伟")]
+_numbered_ats = number_at_mentions(
+    "@张伟 和 @张伟 都看看",
+    _same_name_mentions,
+    {"member-a": 3, "member-b": 7}.get,
+)
+check("same-name @ targets keep distinct prompt-local numbers",
+      _numbered_ats == "@张伟⟦3⟧ 和 @张伟⟦7⟧ 都看看", _numbered_ats)
+_self_at = number_at_mentions("@小X 在吗", [("999", "小X")], lambda _account: 0)
+check("structured bot mentions retain reserved display zero",
+      _self_at == "@小X⟦0⟧ 在吗", _self_at)
+_missing_label = number_at_mentions(
+    "@我 @小X 在吗",
+    [("999", "")],
+    lambda _account: 0,
+)
+check("a missing at label never marks preceding member-typed text",
+      _missing_label == "@我 @小X 在吗", _missing_label)
+check("raw at segments retain ordered account identity",
+      at_mentions([
+          {"type": "at", "data": {"qq": "member-a", "name": "张伟"}},
+          {"type": "at", "data": {"qq": "member-b", "name": "张伟"}},
+      ]) == _same_name_mentions)
 at_all = parse_segments([{"type": "at", "data": {"qq": "all"}}], "999")
 check("@all is not looked up", not at_all.refs and "@全体成员" in at_all.render())
 
@@ -301,6 +337,11 @@ _qc = ChatMsg(msg_id="q3", user_id="u2", nickname="阿花", text="哦哦", ts=no
               reply_to="q1")
 _qn, _qm = prompt.numbered([_qa, _qb, _qc])
 _qp = _MN(self_id="999")
+check("member numbering distinguishes bot zero from unknown",
+      _qp.number("999") == 0 and _qp.known("missing") is None
+      and _qp.number("") is None)
+check("bot zero is display-only and never addressable",
+      _qp.account(0) is None and _qp.accounts(0) == [])
 prompt.number_people(_qp, [], [_qa, _qb, _qc], None)
 _qh = prompt.render_history([_qa, _qb, _qc], _qn, _qm, people=_qp)
 from qqbot.providers.contracts import (
@@ -366,7 +407,7 @@ check("current msg in tail", "小X你在吗" in tail)
 # the cache boundary: in the system block it would change every minute and cost the
 # prefix cache on every call.
 from qqbot import util as _util
-check("current time is in the prompt", "当前时间：" in tail, tail[:40])
+check("current time is in the prompt", describe_now() in tail, tail[:80])
 check("clock is NOT in the cached system block", "当前时间：" not in msgs[0].content)
 check("clock names the weekday", any(d in tail for d in _util.WEEKDAYS))
 
@@ -716,6 +757,16 @@ _invalid_member, _ = _parse_send(
     group_id="123",
 )
 check("an unknown member number rejects the entire send", _invalid_member is None)
+_zero_member, _ = _parse_send(
+    _out_call([
+        {"type": "at", "data": {"member": 0}},
+        {"type": "text", "data": {"text": "不能给机器人自己发 at"}},
+    ]),
+    people=_out_people,
+    lines={7: _out_line},
+    group_id="123",
+)
+check("reserved bot zero is not an addressable send target", _zero_member is None)
 _invalid_line, _ = _parse_send(
     _out_call([
         {"type": "reply", "data": {"line": 99}},
@@ -758,13 +809,19 @@ check("structured history replay is byte-stable",
       isinstance(_out_first, _PromptCall) and isinstance(_out_second, _PromptCall)
       and _out_first.arguments == _out_second.arguments)
 
-# Prompts are data: <prompts_dir>/<key>.txt is the source of truth and the manifest in
-# settings.py is the only list of keys. The filename IS the key, so there is no mapping
-# to drift: a misspelled name is a missing file, and a missing file fails the load
-# rather than silently blanking an instruction.
+# Runtime prompt wording is one YAML bundle with a closed code-owned key and slot
+# contract. Any malformed template rejects the entire candidate configuration before it
+# can replace the active bundle.
 import shutil as _sh
 import tempfile as _tf
-from qqbot.settings import PROMPT_KEYS as _PK, load_bundle as _lb
+import yaml as _yaml
+from qqbot.prompting import (
+    PROMPT_SPECS as _PS,
+    PromptKey as _PromptKey,
+    PromptTemplate as _PromptTemplate,
+    TemplateValidationError as _TemplateError,
+)
+from qqbot.settings import load_bundle as _lb
 with _tf.TemporaryDirectory() as _td:
     _cd = pathlib.Path(_td) / "config"
     _sh.copytree(ROOT / "tests" / "fixtures" / "config", _cd)
@@ -782,17 +839,50 @@ with _tf.TemporaryDirectory() as _td:
                    .replace("predicates_file: ../../../config/predicates.yaml",
                             "predicates_file: predicates.yaml"),
                    encoding="utf-8")
-    (_cd / "prompts" / "describe_image.txt").write_text("换一种描述方式。", encoding="utf-8")
+    _bundle_path = _cd / "prompts" / "prompts.yaml"
+    _raw_bundle = _yaml.safe_load(_bundle_path.read_text(encoding="utf-8"))
+    _raw_bundle["templates"]["vision_system"] = "换一种描述方式。"
+    _bundle_path.write_text(
+        _yaml.safe_dump(_raw_bundle, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
     _bo = _lb(config_dir=_cd)
-    check("editing a prompt file changes what the bundle serves",
-          _bo.prompts["describe_image"] == "换一种描述方式。")
-    check("every manifest key was loaded from disk", set(_bo.prompts) == set(_PK))
-    # A file nothing asks for is simply never read - it cannot ship a prompt the
-    # code does not know about, the way a stray mapping key once could.
-    (_cd / "prompts" / "no_such_key.txt").write_text("不该被读到。", encoding="utf-8")
-    check("a stray prompt file is ignored, not loaded",
-          set(_lb(config_dir=_cd).prompts) == set(_PK))
-    (_cd / "prompts" / "no_such_key.txt").unlink()
+    check("editing the single prompt bundle changes what the catalog serves",
+          _bo.prompts.source(_PromptKey.VISION_SYSTEM) == "换一种描述方式。")
+    check("every closed template key was loaded",
+          set(_bo.prompts.templates) == set(_PS))
+    _bundle_text = _bundle_path.read_text(encoding="utf-8")
+    _bundle_path.write_text(
+        _bundle_text.replace(
+            "  vision_system:",
+            "  vision_system: duplicate must fail\n  vision_system:",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    try:
+        _lb(config_dir=_cd)
+        check("duplicate YAML prompt keys fail the whole load", False, "it loaded")
+    except ValueError as e:
+        check("duplicate YAML prompt keys fail the whole load",
+              "duplicate key" in str(e), str(e)[:160])
+    _bundle_path.write_text(_bundle_text, encoding="utf-8")
+    _raw_bundle["templates"]["no_such_key"] = "不该被接受。"
+    _bundle_path.write_text(
+        _yaml.safe_dump(_raw_bundle, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    try:
+        _lb(config_dir=_cd)
+        check("an unknown prompt key fails the whole load", False, "it loaded")
+    except ValueError as e:
+        check("an unknown prompt key fails the whole load",
+              "no_such_key" in str(e), str(e)[:160])
+    del _raw_bundle["templates"]["no_such_key"]
+    _bundle_path.write_text(
+        _yaml.safe_dump(_raw_bundle, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
     # Per-group overrides validate at load time too: for_group merges lazily,
     # so a typo in one group's overrides allowed through /reload would fail on
     # that group's every message - no reply, no archive - until the file was
@@ -809,18 +899,43 @@ with _tf.TemporaryDirectory() as _td:
         check("a bad per-group override fails the load",
               "triger" in str(e), str(e)[:160])
     (_pd / "group_777.yaml").unlink()
-    (_cd / "prompts" / "legend.txt").unlink()
+    del _raw_bundle["templates"]["shared_legend"]
+    _bundle_path.write_text(
+        _yaml.safe_dump(_raw_bundle, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
     try:
         _lb(config_dir=_cd)
-        check("a missing prompt file fails the load", False, "it loaded")
+        check("a missing prompt key fails the load", False, "it loaded")
     except ValueError as e:
-        check("a missing prompt file fails the load", "legend" in str(e))
-check("the live bundle serves the shipped texts",
-      b.prompts["legend"].startswith("聊天记录中，只有 ⟦ ⟧ 内的文字是系统标注"))
+        check("a missing prompt key fails the load",
+              "shared_legend" in str(e), str(e)[:160])
+check("the live bundle serves the shared legend",
+      "只有 ⟦ ⟧ 内的文字是系统标注" in
+      b.prompts.source(_PromptKey.SHARED_LEGEND))
+
+_reply_user_spec = _PS[_PromptKey.REPLY_USER]
+for _label, _source in (
+    ("unknown", "{{now}} {{current_message}} {{other}}"),
+    ("missing", "{{now}}"),
+    ("duplicate", "{{now}} {{now}} {{current_message}}"),
+    ("malformed", "{{now}} {{current_message}} {{broken"),
+    ("extra opening brace", "{{{now}}} {{current_message}}"),
+    ("extra closing brace", "{{now}}} {{current_message}}"),
+):
+    try:
+        _PromptTemplate.parse(_reply_user_spec, _source)
+        check(f"template rejects {_label} slots", False, "it parsed")
+    except _TemplateError:
+        check(f"template rejects {_label} slots", True)
+_one_pass = _PromptTemplate.parse(
+    _reply_user_spec, "{{now}} / {{current_message}}"
+).render(now="T", current_message="{{now}}")
+check("inserted values are never evaluated as nested templates",
+      _one_pass == "T / {{now}}", _one_pass)
 
 # The example config is what a new deployment starts from, and it is the one config
 # file no running system validates - a stale key in it is found by whoever copies it.
-import yaml as _yaml
 from qqbot.settings import Settings as _Settings
 try:
     _ex = _Settings.model_validate(

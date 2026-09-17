@@ -28,6 +28,8 @@ from ..util import why
 
 log = logging.getLogger("qqbot.numbers")
 
+BOT_DISPLAY_NUMBER = 0
+
 
 class MemberNumbers:
     """The numbering of one prompt: person -> number, and back to accounts."""
@@ -69,13 +71,17 @@ class MemberNumbers:
         for account, person in found.items():
             self.teach(account, person)
 
-    def number(self, account: str, *, spoke: bool = False) -> int:
-        """This account's number, assigned on first sight; 0 for the bot and for
-        no account at all. `spoke` marks the account as the one to @ for its
-        person, since the latest speaker is the account in current use."""
+    def number(self, account: str, *, spoke: bool = False) -> int | None:
+        """Assign and return this account's display number.
+
+        Zero is the bot's reserved display identity, positive values are people,
+        and ``None`` is the only representation of an absent account.
+        """
         account = str(account or "")
-        if not account or account == self._self:
-            return 0
+        if not account:
+            return None
+        if account == self._self:
+            return BOT_DISPLAY_NUMBER
         # Pinned on first sight: a person learned about this account later must not
         # move it to another number once one has been shown.
         person = self._person.setdefault(account, ("account", account))
@@ -90,18 +96,25 @@ class MemberNumbers:
             self._latest[n] = account
         return n
 
-    def known(self, account: str) -> int:
-        """This account's number if it already has one, else 0. Never assigns."""
-        person = self._person.get(str(account or ""), ("account", str(account or "")))
-        return self._number.get(person, 0)
+    def known(self, account: str) -> int | None:
+        """Return an existing display number without assigning one."""
+        account = str(account or "")
+        if not account:
+            return None
+        if account == self._self:
+            return BOT_DISPLAY_NUMBER
+        person = self._person.get(account, ("account", account))
+        return self._number.get(person)
 
     def account(self, n: int) -> str | None:
         """The account to address for number `n`: the one that spoke last in the
         conversation, else the first one numbered. None for a number not shown."""
-        if n not in self._accounts:
+        if n <= BOT_DISPLAY_NUMBER or n not in self._accounts:
             return None
         return self._latest.get(n) or self._accounts[n][0]
 
     def accounts(self, n: int) -> list[str]:
         """Every account shown under number `n`."""
+        if n <= BOT_DISPLAY_NUMBER:
+            return []
         return list(self._accounts.get(n, ()))

@@ -58,6 +58,18 @@ bad_code = cand(CandidateType.FACT, account=7, predicate="plays", object="x",
 check("a code that is not on the roster is dropped",
       v.check(bad_code).reason is RejectReason.UNKNOWN_ENTITY,
       "答不上来的模型会编一个编号")
+zero_code = cand(CandidateType.FACT, account=0, predicate="plays", object="x",
+                 quote="我最近在玩鸣潮")
+check("reserved bot zero is never a fact subject",
+      v.check(zero_code).reason is RejectReason.UNKNOWN_ENTITY)
+zero_participant = cand(
+    CandidateType.EPISODE,
+    summary="机器人完成了一件事",
+    participants=[0],
+    quote="我最近在玩鸣潮",
+)
+check("reserved bot zero is never an episode participant",
+      v.check(zero_participant).reason is RejectReason.UNKNOWN_ENTITY)
 
 made_up = cand(CandidateType.FACT, account=1, predicate="plays", object="原神",
                quote="我最近在玩原神")

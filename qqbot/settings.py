@@ -17,6 +17,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from . import util
+from .prompting import PromptCatalog
 
 log = logging.getLogger("qqbot.settings")
 
@@ -24,32 +25,6 @@ log = logging.getLogger("qqbot.settings")
 class RestartRequired(ValueError):
     """A validated reload changes resources owned by the running process."""
 
-
-#: Every prompt the system may read, by key. The texts are data: each key is a
-#: `<key>.txt` under `prompts_dir`, edited without touching code and re-read on
-#: /reload. This manifest is the only list of them - the filename is the key, so
-#: a misspelled name is a missing file and fails the load rather than shipping a
-#: prompt nobody reads. Each text's role and how they compose is described in
-#: config/prompts/README.md.
-PROMPT_KEYS = frozenset({
-    # how the reply model speaks: through the send tool, and nothing else
-    "send_rules",
-    # transcript legend, shared by reply and extraction; plus each side's addendum
-    "legend", "legend_reply_note", "extract_legend_note",
-    # the reply path's standing rules
-    "identity_rules", "credibility_rules", "private_rules",
-    # tone_rules is the shared discernment core (what counts as said-in-earnest);
-    # extraction appends what not to record, and the reply path's consequence -
-    # play along - lives in send_rules. One judgment, stated once.
-    "tone_rules", "tone_extract_note",
-    "reply_final",
-    # the rest of the extraction rulebook
-    "extract",
-    # media and tools
-    "describe_image",
-    "tool_web_search", "tool_search_history", "tool_recall_events",
-    "tool_read_url", "tool_open_images", "tool_send_message",
-})
 
 CONFIG_DIR = Path(os.getenv("CONFIG_DIR", "/app/config"))
 DEFAULT_PERSONA_KEY = "default"
@@ -488,10 +463,34 @@ class PredicateCfg(_M):
     predicate in front of the model.
     """
 
-    #: How the fact reads in Chinese. `{}` marks where the object goes for a
+    #: How the fact reads in Chinese. `{{object}}` marks where the object goes for a
     #: predicate that does not read verb-first, the way an allergy does; without it
     #: the object simply follows the verb.
     verb: str = Field(min_length=1)
+
+    @field_validator("verb")
+    @classmethod
+    def _closed_object_slot(cls, value: str) -> str:
+        """Allow only one non-executable object slot in configurable wording."""
+
+        slot = "{{object}}"
+        if value.count(slot) > 1:
+            raise ValueError("predicate verb may contain {{object}} at most once")
+        rest = value.replace(slot, "")
+        if "{{" in rest or "}}" in rest or "{" in rest or "}" in rest:
+            raise ValueError(
+                "predicate verb supports only the optional {{object}} slot"
+            )
+        return value
+
+    def render(self, object_value: str) -> str:
+        """Insert one object without interpreting any syntax it contains."""
+
+        slot = "{{object}}"
+        if slot in self.verb:
+            return self.verb.replace(slot, object_value)
+        return f"{self.verb}{object_value}"
+
     #: single: a person holds one at a time, and a new value closes the old one
     #: (which is what makes "he moved" expressible). multi: they sit side by side,
     #: each ageing on its own evidence.
@@ -550,11 +549,6 @@ class PredicateTable(_M):
                     f"{name} and {p.opposite} disagree about being opposites")
         return table
 
-
-#: Where the rendered predicate table is dropped into the extraction prompt. A plain
-#: token rather than a format field: the prompt is Chinese prose full of braces-free
-#: punctuation, and str.format would trip over any brace somebody typed.
-PREDICATE_SLOT = "{{谓词表}}"
 
 #: Names the person table may not use. `note` is what an owner typed by hand, and the
 #: model must have no way to write over it; `topic` and `term` are about the group
@@ -627,7 +621,7 @@ class Settings(_M):
     # -- files: paths relative to the config directory (absolute allowed) ----
     personas_dir: str = "personas"
     agreement: AgreementCfg
-    #: Where the prompt texts live, one `<key>.txt` per entry in PROMPT_KEYS.
+    #: Directory containing the single strictly validated prompts.yaml bundle.
     prompts_dir: str = "prompts"
     #: What may be recorded about a person, one entry per predicate.
     predicates_file: str = "predicates.yaml"
@@ -739,7 +733,7 @@ class ConfigBundle:
     """One disk read: global defaults, every persona, and a cache of merged per-group Settings."""
 
     def __init__(self, raw_settings: dict, personas: dict[str, Persona],
-                 prompts: dict[str, str] | None = None,
+                 prompts: PromptCatalog | None = None,
                  agreement_text: str = "",
                  predicates: PredicateTable | None = None):
         self._raw = raw_settings
@@ -748,9 +742,8 @@ class ConfigBundle:
         #: What may be recorded about a person, from predicates_file. Read through
         #: `predicates()`; empty only for a bundle built outside load_bundle.
         self.predicates: PredicateTable = predicates or PredicateTable(person={})
-        #: Model-facing text by key, loaded from the prompt files. Read through
-        #: ptext(); empty only for a bundle built outside load_bundle.
-        self.prompts: dict[str, str] = prompts or {}
+        #: Strict model-facing templates, loaded and validated as one catalog.
+        self.prompts = prompts or PromptCatalog.empty()
         #: The user agreement's full text, loaded from agreement.file at the
         #: same moment as everything else - /reload swaps it atomically with
         #: the version number it belongs to. Empty only for a bundle built
@@ -781,8 +774,7 @@ class ConfigBundle:
 
     def startup_fingerprint(self) -> dict[str, object]:
         fingerprint = _startup_settings(self.default)
-        for key in ("extract", "extract_legend_note", "tone_extract_note", "legend"):
-            fingerprint[f"prompts.{key}"] = self.prompts.get(key, "")
+        fingerprint.update(self.prompts.restart_fingerprint())
         fingerprint["predicates"] = repr(self.predicates.model_dump())
         return fingerprint
 
@@ -858,21 +850,10 @@ def load_bundle(config_dir: Path | None = None) -> ConfigBundle:
             key = stem[len("group_"):] if stem.startswith("group_") else stem
             personas[key] = Persona.model_validate(_read_yaml(path))
 
-    # Prompts are data: one file per manifest key, named by the key. Each must
-    # exist and be non-empty - a missing one would silently blank an
-    # instruction. A test config points prompts_dir at the real texts instead
-    # of copying every file into fixtures.
+    # Prompt wording is customizable, but its role, lifecycle and slot surface are
+    # code-owned. The whole catalog validates before a reload can swap it in.
     prompt_dir = _resolve(root, settings.prompts_dir)
-    prompts: dict[str, str] = {}
-    for key in sorted(PROMPT_KEYS):
-        ppath = prompt_dir / f"{key}.txt"
-        try:
-            body = ppath.read_text(encoding="utf-8-sig").strip()
-        except OSError as e:
-            raise ValueError(f"prompt file unreadable: {key}: {ppath}: {e}") from None
-        if not body:
-            raise ValueError(f"prompt file is empty: {key}: {ppath}")
-        prompts[key] = body
+    prompts = PromptCatalog.load(prompt_dir)
 
     # The predicate table is mandatory too: without it the extractor would offer
     # the model an empty enum and every fact would be rejected, silently and all
@@ -885,11 +866,6 @@ def load_bundle(config_dir: Path | None = None) -> ConfigBundle:
         raise ValueError(f"predicate file unreadable: {ppath}: {e}") from None
     if not predicates.person:
         raise ValueError(f"predicate file lists no predicates: {ppath}")
-    if PREDICATE_SLOT not in prompts["extract"]:
-        raise ValueError(
-            f"the extract prompt must carry {PREDICATE_SLOT}, "
-            "where the predicate table is rendered")
-
     # The agreement text follows its configured path, loaded with everything
     # else so /reload swaps text and version together. Mandatory like the
     # prompts: a missing or empty file fails the load, never a placeholder.
@@ -924,15 +900,10 @@ def config() -> ConfigBundle:
     return _bundle
 
 
-def ptext(key: str) -> str:
-    """The model-facing text registered under this key.
+def prompt_catalog() -> PromptCatalog:
+    """The atomically loaded, strictly validated prompt template bundle."""
 
-    Loaded from config/prompts/<key>.txt - the file is the source of truth. Read at
-    use time on purpose: /reload swaps the bundle, and a call site that captured the
-    string at import would keep the old wording forever. The extraction prompt is the
-    one composition frozen earlier (worker construction).
-    """
-    return config().prompts[key]
+    return config().prompts
 
 
 def reload_config() -> ConfigBundle:

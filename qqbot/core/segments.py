@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING
@@ -31,6 +32,66 @@ log = logging.getLogger("qqbot.media")
 
 #: Segment types already reported, so an unknown one logs once rather than per message.
 _SEEN_UNKNOWN: set[str] = set()
+
+
+def at_mentions(
+    segments: list,
+    *,
+    self_id: str = "",
+    self_name: str = "",
+) -> list[tuple[str, str]]:
+    """Direct @ targets as (account, displayed name), in message order."""
+
+    out: list[tuple[str, str]] = []
+    for segment in segments:
+        if not isinstance(segment, dict) or segment.get("type") != "at":
+            continue
+        data = segment.get("data")
+        if not isinstance(data, dict):
+            continue
+        account = str(data.get("qq") or "")
+        if not account or account == "all":
+            continue
+        label = defang(str(data.get("name") or "")).strip()
+        if not label and self_id and account == self_id:
+            label = defang(self_name).strip()
+        out.append((account, label))
+    return out
+
+
+def number_at_mentions(
+    text: str,
+    mentions: list[tuple[str, str]],
+    number_for: Callable[[str], int | None],
+) -> str:
+    """Add prompt-local member numbers to the corresponding visible @ tokens."""
+
+    cursor = 0
+    for account, label in mentions:
+        candidates = [f"@{label}"] if label else []
+        candidates.append(f"@{account}")
+        found = next(
+            (
+                (pos, pos + len(candidate))
+                for candidate in candidates
+                if (pos := text.find(candidate, cursor)) >= 0
+            ),
+            None,
+        )
+        if found is None:
+            # A missing segment label cannot be matched safely after its account was
+            # resolved to a display name. Guessing "the next @" can mark member-typed
+            # text as a verified structured mention, which is worse than omitting a
+            # number until a labelled segment is available.
+            continue
+        start, end = found
+        number = number_for(account)
+        if number is not None:
+            marker = sysmark(str(number))
+            text = text[:end] + marker + text[end:]
+            end += len(marker)
+        cursor = end
+    return text
 
 _MD5 = re.compile(r"([0-9a-fA-F]{32})")
 
@@ -336,9 +397,12 @@ class _Walk:
     for each record inside a record.
     """
 
-    def __init__(self, pm: ParsedMessage, self_id: str, limits: PromptCfg) -> None:
+    def __init__(
+        self, pm: ParsedMessage, self_id: str, limits: PromptCfg, self_name: str = ""
+    ) -> None:
         self.pm = pm
         self.self_id = self_id
+        self.self_name = defang(self_name).strip() or "机器人"
         self.limits = limits
         self.slot = 0
         self.lines_left = limits.forward_lines
@@ -375,7 +439,8 @@ class _Walk:
                     parts.append("@全体成员")
                 elif qq == self.self_id and not nested:
                     pm.at_bot = True
-                    parts.append("@我")
+                    name = defang(str(data.get("name") or "")).strip() or self.self_name
+                    parts.append(f"@{name}")
                 elif nested:
                     # Somebody @-ed inside a forwarded conversation: named for
                     # readability, but neither an address to the bot nor a person
@@ -532,14 +597,24 @@ def _own_len(parts: list) -> int:
                for p in parts if not isinstance(p, ForwardBlock))
 
 
-def parse_segments(segments: list[dict], self_id: str,
-                   limits: PromptCfg | None = None) -> ParsedMessage:
+def parse_segments(
+    segments: list[dict],
+    self_id: str,
+    limits: PromptCfg | None = None,
+    *,
+    self_name: str = "",
+) -> ParsedMessage:
     """Synchronous, allocation-only. Anything needing an API call becomes a Ref.
 
     `limits` bounds how much of a forwarded record is rendered; the default
     config applies when none is given."""
     pm = ParsedMessage()
-    _Walk(pm, self_id, limits or config().default.prompt).parse(segments, pm.parts, depth=0)
+    _Walk(
+        pm,
+        self_id,
+        limits or config().default.prompt,
+        self_name,
+    ).parse(segments, pm.parts, depth=0)
     return pm
 
 

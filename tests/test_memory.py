@@ -12,6 +12,7 @@ that is an entity, an episode reachable by participant - are enforced by SQL.
 """
 import os
 import pathlib
+import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -149,6 +150,26 @@ async def say(uid, name, text, mid, gid=G):
     await settle(mid)
 
 
+async def say_at(uid, name, target, target_name, text, mid, gid=G):
+    segments = [
+        {"type": "at", "data": {"qq": target, "name": target_name}},
+        {"type": "text", "data": {"text": text}},
+    ]
+    await ingestor().ingest(
+        GroupMessage(
+            message_id=mid,
+            group_id=gid,
+            sender=Sender(user_id=uid, card=name),
+            segments=segments,
+            self_id="999",
+            occurred_at=now_local(),
+            plain_text=f"@{target_name} {text}",
+        ),
+        at_accounts=[target],
+    )
+    await settle(mid)
+
+
 async def main():
     set_providers(Providers(text=FakeText(), vision=Unused(), asr=Unused(),
                             embedding=_EMBED, search=Unused()))
@@ -159,6 +180,7 @@ async def main():
     await say("u2", "小北", "老周你那个切片做完没", "e2")
     await say("u1", "董自豪", "切片就是把采样切成小段再重排", "e3")
     await say("u2", "小北", "这个群是做音乐的", "e4")
+    await say_at("u2", "小北", "u3", "李芳", "帮忙看看", "e-at")
 
     w = MemoryWorker(config().default, worker_id="e2e")
     # The drain floor would skip these four messages (a handful is not worth a
@@ -270,7 +292,7 @@ async def main():
     # this it re-read the same conversation every batch and worded the answer differently
     # each time, which storage could only read as a new fact overturning the old one.
     check("the extractor is shown what is already recorded",
-          "已经记过的" in LAST_PROMPT[-1] and "topic" in LAST_PROMPT[-1],
+          "topic" in LAST_PROMPT[-1] and "plays = 鸣潮" in LAST_PROMPT[-1],
           LAST_PROMPT[-1][:120])
 
     # -- where each kind landed ---------------------------------------------
@@ -335,8 +357,16 @@ async def main():
         """SELECT id, platform_user_id, occurred_at, payload, plain_text FROM raw_event
             WHERE group_id=$1 AND event_type='message' ORDER BY occurred_at""", G))
     _own0 = [ln for ln in lines if ln.own]
+    _mention_number = re.search(r"李芳⟦(\d+)⟧", _roster)
+    check("a mentioned non-speaker enters the extraction roster and keeps identity",
+          _mention_number is not None
+          and any(
+              f"@李芳⟦{_mention_number.group(1)}⟧" in line.text
+              for line in lines
+          ),
+          f"{_roster} / {[line.text for line in lines]}")
     check("the bot's own line is in the transcript, marked as its own",
-          len(_own0) == 1 and "小X⟦你⟧: 我也在玩鸣潮" in _own0[0].text,
+          len(_own0) == 1 and "小X⟦0⟧: 我也在玩鸣潮" in _own0[0].text,
           str([ln.text for ln in lines]))
     from qqbot.services import ExtractionInput as _EI0
     _probe = _EI0(group_id=G, transcript="", roster=_roster, account_codes=_codes,
@@ -485,7 +515,7 @@ async def main():
     _codes3, _roster3, _lines3 = await w._render(G, _rows3)
     _own = [ln for ln in _lines3 if ln.own]
     check("the bot's own line renders marked, codeless and off the roster",
-          any("小X⟦你⟧: 切片记得用新采样" in ln.text for ln in _own)
+          any("小X⟦0⟧: 切片记得用新采样" in ln.text for ln in _own)
           and "小X" not in _roster3, str(_own))
     _inp3 = _EI(group_id=G, transcript="\n".join(ln.text for ln in _lines3),
                 roster=_roster3, account_codes=_codes3, lines=tuple(_lines3),
@@ -810,8 +840,14 @@ async def main():
     from qqbot.services import ExtractionInput as _EIovr, MemoryExtractor as _MEovr
     _covr = config().default.model_copy(deep=True)
     _covr.capabilities.text.extract.model = "flash-probe"
-    await _MEovr(_covr, legend="x").extract(_EIovr(
-        group_id=G, transcript="", roster="", account_codes={}, lines=(), batch_size=0))
+    await _MEovr(_covr).extract(_EIovr(
+        group_id=G,
+        transcript="⟦09-18 00:00⟧ 成员⟦1⟧: 测试",
+        roster="成员⟦1⟧",
+        account_codes={},
+        lines=(),
+        batch_size=0,
+    ))
     check("the extract model override moves extraction alone",
           SEEN_MODELS[-1] == "flash-probe" and SEEN_MODELS[0] == _txt.model,
           f"first={SEEN_MODELS[0]} last={SEEN_MODELS[-1]}")

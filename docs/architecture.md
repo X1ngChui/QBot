@@ -167,9 +167,10 @@ carries them.
 | `recall_events` | Vector search over this group's episodes. Each recalled episode is framed by its neighbours in group time. |
 | `open_images` | Fetches picture originals by their number in the transcript, several per call, and hands them to the model as file blocks. |
 
-The tools' descriptions are prompt files and are written to overlap as little as
-possible: the outside world, the group's own words, past events by meaning, one page,
-and pixels.
+All model-facing wording lives in one `config/prompts/prompts.yaml` bundle. Tool
+descriptions remain separate logical templates because each maps one-to-one to a
+code-owned schema, but they are generated, validated, reloaded and reviewed with the
+rest of the family as one atomic document.
 
 ### Output
 
@@ -183,6 +184,13 @@ before sending. The stripper counts what it removed, and the daily report shows 
 counters: every hit is a marker the model wrote and the stripper caught.
 
 ## Prompt assembly
+
+Prompt wording is a single versioned YAML bundle with a closed code-owned template
+contract (`qqbot/prompting/templates.py`). The only syntax is a declared, one-pass
+`{{ascii_slot}}`; unknown, missing, duplicate and malformed slots fail the entire load.
+Inserted values are never evaluated as templates. Two explicit partials—the transcript
+legend and conversational pragmatics—are shared between reply and extraction; every
+other rule belongs to one complete role template.
 
 The prompt is ordered from most stable to least, so that a provider's prefix cache is
 hit as often as possible:
@@ -228,9 +236,9 @@ Markers in use:
 | --- | --- |
 | `#N ⟦MM-dd HH:mm⟧` | Line number and send time |
 | `⟦回复 #N⟧` | This message quotes line N |
-| `名字⟦N⟧` | Member number: who this is, within this one prompt |
+| `名字⟦0⟧` | The bot's reserved display identity; never a legal tool target |
+| `名字⟦N⟧`, N > 0 | Prompt-local member/account identity |
 | `⟦拥有者⟧` | The speaker is one of the bot's owners |
-| `⟦你⟧` | The bot's own line (extraction transcript and search results) |
 | `⟦图片N:描述⟧`, `⟦语音:转写⟧` | Media, with the archived description or transcript |
 | `⟦转发的聊天记录 N条⟧` | A forwarded record, rendered as an indented block |
 | `⟦依据:…⟧`, `⟦检索记录⟧` | Provenance of a bot reply and the retrieval trace that fed it |
@@ -238,8 +246,11 @@ Markers in use:
 ### Member numbers
 
 Two members sharing a display name is ordinary, so every person a prompt shows wears a
-member number behind their name (`qqbot/core/member_numbers.py`). The number belongs to
-a person: accounts merged into one person share it. The numbers follow the roster. The
+member number behind their name (`qqbot/core/member_numbers.py`). Zero is reserved for
+the bot's display identity; humans receive positive numbers, while `None` is the only
+absence/unknown sentinel. Zero never resolves through `at`, contact, speaker, extraction
+account or episode participant fields. A positive number belongs to a person: accounts
+merged into one person share it. The numbers follow the roster. The
 roster lists everyone who has appeared in the group, whether or not anything is known
 about them, ordered by first appearance, and is numbered in that order, so a newcomer
 joins at the end and nobody else's number moves. The roster is therefore also where the
@@ -251,7 +262,9 @@ roster, the window, `search_history` results and the tool arguments that name pe
 so the model @-s and filters by the number it read.
 
 Numbers are never stored. The archive, retrieval traces and provenance markers hold
-names only. Members' own @-mentions stay in their text as names.
+names only. A real platform mention of the bot renders as `@name⟦0⟧`; member-typed
+`@我` remains ordinary text. Members' other @-mentions keep their account identity and
+receive the target's prompt-local positive number during projection.
 
 The bot's own messages are rendered in the history as the `send_message` calls that sent
 them (text, @-ed member numbers and replied-to line number as arguments), each followed
@@ -426,10 +439,12 @@ line.
 overrides of any setting. Settings are validated with pydantic and unknown keys are
 rejected. New groups need no configuration.
 
-Prompts are data: every instruction text the model reads is its own file under
-`config/prompts/`, keyed by name in a manifest in code. A missing or empty file fails
-the load. Marker formats, section headings and one-line mechanical notices stay in
-code, because code both produces and parses them.
+Prompts are data: every runtime prompt template lives in one versioned
+`config/prompts/prompts.yaml` bundle. A closed contract in
+`qqbot/prompting/templates.py` owns the template keys, roles, reload scopes and exact
+`{{slot}}` sets. Loading is atomic and rejects missing, extra, duplicate or malformed
+slots before any template becomes active. Marker formats that application code produces
+remain code-owned; their shared explanation has one source in the bundle.
 
 ## Design decisions
 

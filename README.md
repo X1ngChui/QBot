@@ -117,7 +117,7 @@ Behaviour lives in `config/`, credentials in `.env`, runtime state in the databa
 | `config/personas/default.yaml` | The default persona: name, system prompt, group knowledge |
 | `config/personas/group_<id>.yaml` | Per-group persona and overrides of any setting |
 | `config/predicates.yaml` | What may be recorded about a person |
-| `config/prompts/*.txt` | Every instruction text the model reads |
+| `config/prompts/prompts.yaml` | Versioned bundle containing every runtime prompt template |
 | `config/agreement.txt` | The user agreement shown by `/terms` |
 
 `/reload` applies reloadable edits atomically. If a process-owned setting changed, it

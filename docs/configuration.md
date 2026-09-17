@@ -44,8 +44,8 @@ A successful reload therefore means every accepted edit is live.
 Restart-scoped values are reported by exact path and include:
 
 - Provider identity, endpoint, credential and concurrency settings.
-- The resolved extraction model policy, extraction/shared prompt files and predicate table,
-  because the memory worker freezes them at construction.
+- The resolved extraction model policy, restart-scoped prompt templates and predicate
+  table, because the memory worker freezes them at construction.
 - Local ASR model path, CPU threads and queue capacity.
 - The complete embedding, database, memory and scheduler blocks.
 - The configured timezone.
@@ -63,7 +63,7 @@ migration directly: `llm` → `capabilities`, `backend` → `provider`, `base_ur
 | `owners` | QQ numbers, as strings, of the people who hold the operator console and receive the daily report. A persona may override the list for its group, but the commands that affect every group at once (`/merge`, `/split`, `/reload`, `/debug`, `/log`) answer only to this default list. |
 | `timezone` | IANA name. Governs the clock line in the prompt, the cron jobs, the daily report and the day boundary the budget resets on. |
 | `personas_dir` | Directory of persona files, relative to `config/`. |
-| `prompts_dir` | Directory of prompt files. |
+| `prompts_dir` | Directory containing the versioned `prompts.yaml` template bundle. |
 | `predicates_file` | The predicate table. |
 
 ### `trigger`
@@ -260,10 +260,12 @@ categories).
 
 ## Prompts
 
-Every instruction text the model reads is a file under `config/prompts/`, one per key
-in the manifest in `qqbot/settings.py`. A missing or empty file fails the load. See
-[config/prompts/README.md](../config/prompts/README.md) for what each file does and how
-to change one safely.
+All runtime prompt wording lives in the single versioned
+`config/prompts/prompts.yaml` bundle. The closed manifest in
+`qqbot/prompting/templates.py` defines each logical template's role, reload scope and
+exact slots; the whole bundle is rejected atomically if any key or slot is missing,
+extra or malformed. See [config/prompts/README.md](../config/prompts/README.md) for the
+contract and safe generation workflow.
 
 ## Agreement
 

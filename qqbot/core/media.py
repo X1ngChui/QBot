@@ -49,11 +49,12 @@ from pathlib import Path
 import httpx
 
 from ..db import repo
+from ..prompting import PromptKey
 from ..providers import providers
 from ..providers.base import retire
 from ..providers.contracts import StoredImage
 from ..services import UnknownAccount
-from ..settings import Settings, VisionCfg, config, ptext
+from ..settings import Settings, VisionCfg, config, prompt_catalog
 from ..util import defang, sysmark, why
 from .botapi import BotApi
 from .budget import BUDGET
@@ -538,7 +539,7 @@ class MediaProcessor:
             desc = await providers().vision.describe(
                 data,
                 cfg=vcfg,
-                prompt=ptext("describe_image"),
+                prompt=prompt_catalog().render(PromptKey.VISION_SYSTEM),
                 mime=_mime(data, ref.file),
                 group_id=group_id,
             )

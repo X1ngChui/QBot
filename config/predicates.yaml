@@ -7,7 +7,7 @@
 # enter the system without saying what it means and where its boundary runs.
 #
 # Fields
-#   verb         how the fact reads in Chinese. `{}` marks where the object goes for
+#   verb         how the fact reads in Chinese. `{{object}}` marks where the object goes for
 #                anything that does not read verb-first; without it the object simply
 #                follows the verb.
 #   cardinality  single - one at a time, a new value closes the old one (so "he moved"
@@ -193,7 +193,7 @@ person:
   handle_on:
     # The object carries both halves, so it is the whole phrase and there is no verb
     # in front of it: it renders as "<platform>: <id>" rather than as a sentence about it.
-    verb: "{}"
+    verb: "{{object}}"
     cardinality: multi
     decay: stable
     kind: attribute
@@ -225,7 +225,7 @@ person:
     kind: relation
     rule: 所属的组织、社团或战队。就职单位用 works_at，学校用 studies_at。
   allergic_to:
-    verb: 对{}过敏
+    verb: 对{{object}}过敏
     cardinality: multi
     decay: stable
     kind: attribute

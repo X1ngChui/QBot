@@ -200,7 +200,9 @@ async def generate(
     people = MemberNumbers(self_id=str(bot.self_id))
     prompt.teach_roster(people, profiles)
     await people.learn(
-        [m.user_id for m in shown] + [a for m in window if m.is_bot for a, _ in m.at]
+        [m.user_id for m in shown]
+        + [a for m in window if m.is_bot for a, _ in m.at]
+        + [a for m in shown if not m.is_bot for a, _ in m.mentions]
     )
     prompt.number_people(people, profiles, window, msg)
 
