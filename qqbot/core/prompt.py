@@ -42,12 +42,14 @@ _PROV_TAIL = re.compile(
 #: Section headings. The blocks below answer different questions and carry different
 #: authority; without a marked boundary they read as one undifferentiated wall, and the
 #: model weighs a guess it wrote last week the same as a fact the platform just returned.
-H_PERSONA = "【你的身份】"
-H_LEGEND = "【消息标记说明】"
-H_GROUP = "【本群背景】"
-H_RULES = "【信息解读规则】"
-H_PRIVATE = "【不写进回复的内容】"
+H_SEND = "【怎样发言】"
+H_LEGEND = "【消息记录读法】"
+H_IDENTITY = "【成员与编号】"
+H_CREDIBILITY = "【信息与检索】"
+H_PRIVATE = "【不说出去的内容】"
 H_TONE = "【群聊语用】"
+H_PERSONA = "【你的身份】"
+H_GROUP = "【本群背景】"
 H_WHO = "【群成员名册】"
 
 
@@ -130,7 +132,7 @@ def _guessed_block(profiles: list[dict], people: MemberNumbers) -> str:
             continue
         n, shown = _name(p, people)
         lines.append((n, f"- {shown}。{card}"))
-    return _block("未确认（你自行归纳的印象，不要直接复述）：", lines)
+    return _block("未确认（你自行归纳的印象，可能有误或已过时）：", lines)
 
 
 def build_system(
@@ -142,14 +144,17 @@ def build_system(
     # Constants lead, so every group shares this opening span instead of each paying for
     # its own. They also have to live here rather than in each persona: a bot that does not
     # know the picture marker is its own eyesight will deny seeing an image it is holding
-    # the description of.
+    # the description of. How the model speaks comes first of all: everything after it is
+    # something to read, and the send tool is the one thing it does.
     # Text comes through ptext at call time: config/prompts/*.txt is the source of
     # truth, /reload applies.
     blocks = [
+        H_SEND + "\n" + ptext("send_rules"),
         H_LEGEND + "\n" + ptext("legend") + "\n\n" + ptext("legend_reply_note"),
-        H_RULES + "\n" + ptext("identity_rules") + "\n\n" + ptext("credibility_rules"),
+        H_IDENTITY + "\n" + ptext("identity_rules"),
+        H_CREDIBILITY + "\n" + ptext("credibility_rules"),
         H_PRIVATE + "\n" + ptext("private_rules"),
-        H_TONE + "\n" + ptext("tone_rules") + "\n\n" + ptext("tone_reply_note"),
+        H_TONE + "\n" + ptext("tone_rules"),
         H_PERSONA + "\n" + persona.system_prompt.strip(),
     ]
 

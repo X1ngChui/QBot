@@ -26,14 +26,16 @@ log = logging.getLogger("qqbot.settings")
 #: prompt nobody reads. Each text's role and how they compose is described in
 #: config/prompts/README.md.
 PROMPT_KEYS = frozenset({
+    # how the reply model speaks: through the send tool, and nothing else
+    "send_rules",
     # transcript legend, shared by reply and extraction; plus each side's addendum
     "legend", "legend_reply_note", "extract_legend_note",
-    # the reply path's standing rules (identity and credibility share one heading)
-    "identity_rules", "credibility_rules",
+    # the reply path's standing rules
+    "identity_rules", "credibility_rules", "private_rules",
     # tone_rules is the shared discernment core (what counts as said-in-earnest);
-    # each path appends its own consequence note - reply: how to play along,
-    # extract: what not to record. One judgment, stated once.
-    "private_rules", "tone_rules", "tone_reply_note", "tone_extract_note",
+    # extraction appends what not to record, and the reply path's consequence -
+    # play along - lives in send_rules. One judgment, stated once.
+    "tone_rules", "tone_extract_note",
     "reply_final",
     # the rest of the extraction rulebook
     "extract",

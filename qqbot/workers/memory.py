@@ -64,7 +64,7 @@ def transcript_legend() -> str:
     does not need: these markers are annotations this system wrote, not things a
     member typed - without it the model records that the group can send pictures.
     """
-    return ptext("legend") + "\n\n" + ptext("extract_legend_note")
+    return "【消息记录读法】\n" + ptext("legend") + "\n\n" + ptext("extract_legend_note")
 
 
 # Fact lifetimes come from the predicate class tables in memory_extractor - the kind of

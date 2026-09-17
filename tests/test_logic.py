@@ -625,7 +625,7 @@ with _tf.TemporaryDirectory() as _td:
     except ValueError as e:
         check("a missing prompt file fails the load", "legend" in str(e))
 check("the live bundle serves the shipped texts",
-      b.prompts["legend"].startswith("【系统括号原则】"))
+      b.prompts["legend"].startswith("聊天记录中，⟦ ⟧ 内是系统标注"))
 
 # The example config is what a new deployment starts from, and it is the one config
 # file no running system validates - a stale key in it is found by whoever copies it.

@@ -314,7 +314,11 @@ async def main():
 
     sys_prompt = [c for c in LLM_CALLS if c["kind"] == "reply"][0]["messages"][0]["content"]
     check("global constants lead the prompt, so every group shares that span",
-          sys_prompt.startswith("【消息标记说明】"), sys_prompt[:24])
+          sys_prompt.startswith(prompt_mod.H_SEND), sys_prompt[:24])
+    # The one thing the model does comes before everything it reads: its words reach
+    # the group only through the send tool.
+    check("and the first of them is how to speak",
+          "唯一方式是调用 send_message" in sys_prompt[:200], sys_prompt[:200])
     # Without this the bot denies seeing an image while holding its description - it does
     # not know that the picture marker is its own eyesight rather than something a person
     # typed.
@@ -325,9 +329,9 @@ async def main():
     # nickname read as one person renaming himself, and it said so out loud. The system
     # knows better on both counts, and now says so.
     check("the prompt says identity is judged by member number, not by name",
-          "判断是否同一个人只看编号，不看昵称" in sys_prompt)
+          "判断是谁只看编号，不看昵称" in sys_prompt)
     check("and that a rename is only a rename when it was recorded",
-          "断言该账号改过或没改过名" in sys_prompt,
+          "不能据此断言没改过名" in sys_prompt,
           sys_prompt[sys_prompt.find("曾用名"):][:120])
     # A name the account displayed and a name the group calls him are different claims,
     # and the prompt has to say so or the second gets reported as the first.
@@ -336,18 +340,18 @@ async def main():
     # These hold with or without a roster, so they ship apart from the lists: this group
     # has no members configured and still gets them.
     check("reading rules ship whether or not anyone is configured",
-          "【信息解读规则】" in sys_prompt)
+          prompt_mod.H_CREDIBILITY in sys_prompt)
     # Account, name and person are three layers. The code is certain only about accounts:
     # one person can hold several, so declaring two accounts to be different people states
     # something unknown in the same confident voice as something known.
     check("the rules separate account from person",
-          "一个人可持有多个账号" in sys_prompt
-          and "不得断言二者一定不属于同一人" in sys_prompt)
+          "多个账号共用一个编号" in sys_prompt
+          and "也不断言他们一定不是同一个人" in sys_prompt)
     check("and stop short of what is not known",
-          "身份确认能力止于成员编号" in sys_prompt
-          and "未告知的信息即为未知信息" in sys_prompt)
+          "系统没告诉你的身份关系" in sys_prompt
+          and "明确说不知道，不猜" in sys_prompt)
     check("the persona follows the constants",
-          sys_prompt.index("【信息解读规则】") < sys_prompt.index("【你的身份】"))
+          sys_prompt.index(prompt_mod.H_CREDIBILITY) < sys_prompt.index(prompt_mod.H_PERSONA))
     # The whole point of a code-supplied fact is that it is certain. That is worth nothing
     # unless the certain lines are marked apart from the guessed ones - the model had been
     # repeating its own inferences back as if someone had told it.
@@ -371,7 +375,9 @@ async def main():
 
     check("the sections are marked",
           all(h in sys_prompt for h in
-              (prompt_mod.H_PERSONA, prompt_mod.H_LEGEND, prompt_mod.H_RULES)))
+              (prompt_mod.H_SEND, prompt_mod.H_LEGEND, prompt_mod.H_IDENTITY,
+               prompt_mod.H_CREDIBILITY, prompt_mod.H_PRIVATE, prompt_mod.H_TONE,
+               prompt_mod.H_PERSONA)))
     check("and says not to deny having them", "不要声称看不到图" in sys_prompt)
     from qqbot.settings import ptext as _ptext
     _LEG = _ptext("legend")
@@ -936,7 +942,9 @@ async def main():
             {"time": _t12 - 60, "sender": {"nickname": "阿花"},
              "message": [{"type": "text", "data": {"text": "内嵌第一条"}}]},
             {"time": _t12 - 30, "sender": {"nickname": "阿花"},
-             "message": [{"type": "image", "data": {"file": "f" * 32 + ".png",
+             # A key of its own: "f" * 32 is the picture an earlier check gave an
+             # over-long description, and reusing it would cut this message short.
+             "message": [{"type": "image", "data": {"file": "e" * 32 + ".png",
                                                      "url": "http://x/fwd.png"}}]},
         ]}),
         Seg("text", {"text": "小X 里面的图是啥"}),
@@ -951,8 +959,7 @@ async def main():
           len(_fw_line.image_refs) == 1 and _fw_line.image_refs[0].nested,
           str(_fw_line.image_refs))
     check("and its marker is numbered in the prompt",
-          "⟦图片" in tail_i and any(ch.isdigit() for ch in tail_i.split("⟦图片")[-1][:3]),
-          tail_i[-200:])
+          re.search(r"阿花: ⟦图片\d+", tail_i) is not None, tail_i[-200:])
 
     # The trigger reads the text as it arrived, never the resolved form: a forwarded
     # conversation that merely *mentions* the bot's name inside is nothing anybody
@@ -1037,7 +1044,7 @@ async def main():
           _sys.index("已确认（系统记录的名字") < _sys.index("未确认（你自行归纳的印象"))
     # Stable first: a daily card rewrite must not also invalidate the constants above it.
     check("constants sit above everything that changes",
-          _sys.index("【信息解读规则】") < _sys.index("【群成员名册】"))
+          _sys.index(prompt_mod.H_CREDIBILITY) < _sys.index(prompt_mod.H_WHO))
 
     # A renamed account keeps the name it used to go by. That is not a column any more -
     # a group card is one alias among several, and changing it only adds another - which
@@ -1126,17 +1133,18 @@ async def main():
     # message" and "reply to one of the messages" are the same sentence in Chinese, and
     # the model answered whichever thread in the history looked livelier - leaving the
     # person who had actually addressed it with no answer.
-    check("and the tail says which message to answer",
-          "只回复「刚收到的消息」下面的那一条" in _tail and "背景" in _tail,
-          _tail[-140:])
+    check("and the tail says which message to answer, and that only a send reaches the group",
+          "下面是刚收到的消息" in _tail and "回应这条消息" in _tail
+          and "send_message" in _tail, _tail[-140:])
     # And says it without pointing two ways at once: the messages are introduced as being
     # below, so the instruction must not then refer to them as being above.
     check("and refers to it by description, not by direction",
           "上面这条" not in _tail, _tail[-140:])
     # The exception matters as much as the rule. Being asked to answer something raised
     # earlier is ordinary, and a flat ban on the history would refuse it.
+    # The exception lives with the rule, in the fixed rules that open the prompt.
     check("while still allowing a question the message points at",
-          "除非这条刚收到的消息明确要你代答" in _tail, _tail[-140:])
+          "除非刚收到的消息要你代答" in prompt_mod.build_system(persona_k, [], []))
     check("but never in the cached system block",
           "老周答应周末把切片做完" not in prompt_mod.build_system(persona_k, [], []))
 
@@ -1567,7 +1575,7 @@ async def main():
     check("bare text is told it was not sent, and the next round's send goes out",
           ok_told and len(bot.sent) == n_bare + 1 and bot.sent[-1][1] == "明天多云"
           and _told[-2] == {"role": "assistant", "content": "明天多云"}
-          and "群里看不到" in _told[-1]["content"], str(_told[-2:]))
+          and "没有发到群里" in _told[-1]["content"], str(_told[-2:]))
     _use(_bare)
     n_bare = len(bot.sent)
     ok_bare = await _eng.respond(

@@ -16,9 +16,15 @@ OBSERVE cases carry no assertions; their replies are printed for human eyes. Eve
 case also prints whom the reply @-ed and which line it replied to, and a case can
 assert on those choices ("send_checks") as well as on the text.
 
+Tool discipline is counted apart from the verdicts: every reply round that ends in
+bare text instead of a tool call is tallied per case. The engine tells such a round
+it sent nothing and gives it one more, so a case can PASS with a bare round behind
+it; the tally is what shows how often the prompt fails to make the send tool the
+way to speak. `--repeat N` runs every case N times, for a rate worth comparing.
+
 Usage (workstation, test DB up, real keys in .env):
     docker start qbot-pgtest
-    .venv/Scripts/python.exe scripts/eval_replies.py
+    .venv/Scripts/python.exe scripts/eval_replies.py [--repeat N]
 """
 
 import asyncio
@@ -51,7 +57,7 @@ from qqbot.core.state import ChatMsg, GroupState
 from qqbot.db import close_pool, init_pool, pool
 from qqbot.gateway.ingest import ingestor
 from qqbot.gateway.onebot import GroupMessage, Sender
-from qqbot.providers import build_default, providers, set_providers
+from qqbot.providers import Kind, build_default, providers, set_providers
 from qqbot.settings import config
 from qqbot.util import fmt_when, now_local, sysmark
 
@@ -425,8 +431,30 @@ async def run_case(case, cfg, persona, bot) -> tuple[str, str]:
     return "PASS", raw
 
 
+def _count_bare_rounds(tally: dict) -> None:
+    """Wrap the text backend so every reply round is counted, and every one that
+    ends without a tool call is charged to the case running at the time."""
+    text = providers().text
+    chat = text.chat
+
+    async def counted(messages, **kw):
+        res = await chat(messages, **kw)
+        if kw.get("kind") == Kind.REPLY:
+            tally["rounds"] += 1
+            if not res.tool_calls:
+                tally["bare"].append(tally["case"])
+        return res
+
+    text.chat = counted
+
+
 async def main() -> int:
+    repeat = 1
+    if "--repeat" in sys.argv:
+        repeat = max(1, int(sys.argv[sys.argv.index("--repeat") + 1]))
     set_providers(build_default())
+    tally = {"rounds": 0, "bare": [], "case": ""}
+    _count_bare_rounds(tally)
     await init_pool()
     await pool().execute("DELETE FROM cost_ledger WHERE group_id=$1", int(GROUP))
 
@@ -434,19 +462,25 @@ async def main() -> int:
     cfg, persona = config().for_group(GROUP)
     bot = EvalBot()
     failures = 0
-    for case in CASES + [forward_case(), await picture_case(cfg)]:
-        verdict, raw = await run_case(case, cfg, persona, bot)
-        if verdict.startswith("FAIL"):
-            failures += 1
-        print(f"[{verdict:>8}] {case['name']}  ({case['why']})")
-        # Printed whole, and line by line: what a reply looks like laid out is half of
-        # what an eyeball case is for, and a repr cut at 120 characters shows neither.
-        for line in (raw or "<沉默>").splitlines() or ["<空>"]:
-            print(f"           | {line}")
+    for _ in range(repeat):
+        for case in CASES + [forward_case(), await picture_case(cfg)]:
+            tally["case"] = case["name"]
+            verdict, raw = await run_case(case, cfg, persona, bot)
+            if verdict.startswith("FAIL"):
+                failures += 1
+            print(f"[{verdict:>8}] {case['name']}  ({case['why']})")
+            # Printed whole, and line by line: what a reply looks like laid out is half
+            # of what an eyeball case is for, and a repr cut at 120 characters shows
+            # neither.
+            for line in (raw or "<沉默>").splitlines() or ["<空>"]:
+                print(f"           | {line}")
 
     spent = await pool().fetchval(
         "SELECT COALESCE(sum(cny),0) FROM cost_ledger WHERE group_id=$1", int(GROUP))
-    print(f"\nspend this run: CNY {float(spent):.4f} (booked to the test ledger)")
+    bare = tally["bare"]
+    print(f"\nbare-text rounds: {len(bare)} of {tally['rounds']} reply rounds"
+          + (f" ({', '.join(sorted(set(bare)))})" if bare else ""))
+    print(f"spend this run: CNY {float(spent):.4f} (booked to the test ledger)")
     await close_pool()
     print("RESULT:", "FAIL" if failures else "ok",
           f"({failures} failing case(s))" if failures else "")

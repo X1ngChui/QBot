@@ -60,18 +60,18 @@ def send_def() -> dict:
                 "properties": {
                     "text": {
                         "type": "string",
-                        "description": "正文，纯文本，只写要说的话",
+                        "description": "正文，纯文本，只写要说的话。",
                     },
                     "at": {
                         "type": "array",
                         "items": {"type": "integer"},
                         "description": "要 @ 的成员编号列表，取自名字后的 ⟦N⟧；"
-                                       "不 @ 任何人时省略",
+                                       "不 @ 任何人时省略。",
                     },
                     "reply": {
                         "type": "integer",
-                        "description": "要回复（引用）的发言编号，取自行首 #N 的 N；"
-                                       "不回复某条发言时省略",
+                        "description": "要回复（引用）的发言编号，取自行首 #N；"
+                                       "不回复某条发言时省略。",
                     },
                 },
                 "required": ["text"],

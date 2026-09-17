@@ -49,9 +49,9 @@ log = logging.getLogger("qqbot.engine")
 #: already answered - and what the wrap-up round is told. Mechanical one-line
 #: notices, so they live in code, not in the prompt registry.
 QUOTA_NOTE = "（检索额度已用完，这个查询没有执行。）"
-OVERFLOW_NOTE = ("（本轮工具调用次数已达上限，这个查询没有执行；"
-                 "先用已有结果作答，如需再查请下一轮再发。）")
-REPEAT_NOTE = "（这个查询刚执行过，结果就在上面。换个关键词，或用已有资料回答。）"
+OVERFLOW_NOTE = ("（本轮工具调用次数已达上限，这个调用没有执行；"
+                 "可先用已有结果，如需再查请下一轮再调用。）")
+REPEAT_NOTE = "（这个查询刚执行过，结果就在上面。换个检索词，或用已有结果。）"
 WRAP_UP_NOTE = ("（本次回复的额度已用完，不能再执行任何检索或查看；"
                 "请只依据上文已有的材料，直接用 send_message 发出回复，"
                 "不要提及额度或系统限制。）")
@@ -60,8 +60,8 @@ WRAP_UP_NOTE = ("（本次回复的额度已用完，不能再执行任何检索
 SEND_UNREADABLE_NOTE = "（send_message 的参数无法解析，没有发出。请重新调用。）"
 SEND_EMPTY_NOTE = "（send_message 的正文为空，没有发出。请写好正文后重新调用。）"
 #: What a round that ended in bare text is told before its one more round.
-UNSENT_NOTE = ("（你上一条回复没有通过 send_message 发出，群里看不到。请直接调用 "
-               "send_message 发送这条回复；不要输出解释、道歉或其他文字。）")
+UNSENT_NOTE = ("（你刚才输出的文字没有发到群里，因为没有调用 send_message；"
+               "请直接调用 send_message 把要说的话发出，不要再输出其他文字。）")
 
 #: The most accounts one message may @. A reply that @-s half the group is a
 #: prompt injection's idea of fun, not an answer.

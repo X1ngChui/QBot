@@ -171,7 +171,7 @@ The prompt is ordered from most stable to least, so that a provider's prefix cac
 hit as often as possible:
 
 ```text
-constant rules (transcript legend, identity and credibility rules, private rules, tone)
+constant rules (how to speak, transcript legend, identity, credibility and retrieval, privacy, tone)
 -> persona
 -> group knowledge
 -> member roster: everyone who has appeared, numbered, with confirmed facts (stable order)
