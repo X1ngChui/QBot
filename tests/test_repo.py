@@ -15,8 +15,9 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("CONFIG_DIR", str(ROOT / "tests" / "fixtures" / "config"))
-os.environ.setdefault("DATABASE_URL", "postgresql://qqbot@127.0.0.1:15432/qqbot")
-os.environ.setdefault("DATABASE_PASSWORD", "testpw")
+from _db import configure_test_database
+
+configure_test_database()
 import asyncio
 import itertools
 
@@ -131,31 +132,40 @@ async def main():
     # The upload half can land before the describing half, and neither may clobber the
     # other: a row with only a file_id reads as an undescribed picture, and the later
     # description fills the same row in.
-    await repo.image_cache_set_file("k2", "file-api-abc")
+    await repo.image_cache_set_file("k2", "file-api-abc", provider="deepseek")
     check("a file_id alone is not a description hit",
           await repo.image_cache_get("k2") is None)
     await repo.image_cache_put("k2", "[图片:占位测试]")
     check("the description fills the same row",
           await repo.image_cache_get("k2") == "[图片:占位测试]")
     check("and the file_id survives it",
-          await repo.image_cache_file("k2") == "file-api-abc")
+          await repo.image_cache_file("k2", provider="deepseek") == "file-api-abc")
+    check(
+        "a file handle never crosses provider identity",
+        await repo.image_cache_file("k2", provider="openai_responses") is None,
+    )
     # The backend expires files, so an id is only trusted while young: one older
     # than the window (or stamped before the upload time was recorded) reads as
     # absent and the picture is uploaded again.
     from datetime import timedelta as _td_f
-    check("a fresh file_id is trusted inside the age window",
-          await repo.image_cache_file("k2", max_age=_td_f(days=1)) == "file-api-abc")
+    check(
+        "a fresh file_id is trusted inside the age window",
+        await repo.image_cache_file(
+            "k2", provider="deepseek", max_age=_td_f(days=1)
+        )
+        == "file-api-abc",
+    )
     await pool().execute(
         "UPDATE image_cache SET file_uploaded_at = now() - interval '2 days' WHERE key='k2'")
     check("an old file_id reads as absent",
-          await repo.image_cache_file("k2", max_age=_td_f(days=1)) is None)
+          await repo.image_cache_file("k2", provider="deepseek", max_age=_td_f(days=1)) is None)
     await pool().execute("UPDATE image_cache SET file_uploaded_at = NULL WHERE key='k2'")
     check("an unstamped file_id reads as absent too",
-          await repo.image_cache_file("k2", max_age=_td_f(days=1)) is None)
+          await repo.image_cache_file("k2", provider="deepseek", max_age=_td_f(days=1)) is None)
     check("and without an age it is still returned as a hint",
-          await repo.image_cache_file("k2") == "file-api-abc")
+          await repo.image_cache_file("k2", provider="deepseek") == "file-api-abc")
     check("a picture never uploaded has no file_id",
-          await repo.image_cache_file("k1") is None)
+          await repo.image_cache_file("k1", provider="deepseek") is None)
 
     # -- group_state and the blocklist --------------------------------------
     # Typed columns and a proper relation. The blocklist was an array column for a day,
@@ -253,7 +263,7 @@ async def main():
     from qqbot.settings import config as _config
 
     _os.environ.setdefault("SEARCH_API_KEY", "tvly-test-key")
-    scfg = _config().default.llm.search.model_copy(deep=True)
+    scfg = _config().default.capabilities.search.model_copy(deep=True)
     seen_reqs = []
 
     def _fake_tavily(req):
@@ -297,8 +307,17 @@ async def main():
     # the vendor counts - metered by calls, the real 1000 would be gone at ~500
     # while the meter read half-full, and every search past that would fail as a
     # transport error instead of the clean quota silence.
-    scfg.monthly_quota = 100
     scfg.depth = "advanced"
+    scfg.monthly_quota = 2
+    try:
+        await ts.search("只剩一个 credit", cfg=scfg, group_id=str(G1))
+        check("an advanced search is refused when only one credit remains", False,
+              "it searched")
+    except QuotaExhausted:
+        check("an advanced search is refused when only one credit remains", True)
+    check("credit-aware refusal never reaches the vendor", len(seen_reqs) == 1)
+
+    scfg.monthly_quota = 100
     await ts.search("深度搜一次", cfg=scfg, group_id=str(G1))
     check("an advanced search books two credits",
           await repo.month_calls("search", "tavily") == 3,
@@ -306,56 +325,133 @@ async def main():
 
     # Page extraction rides the same allowance: same key, same proxy, same meter,
     # same refusal at the ceiling.
-    text = await ts.extract("https://a.example/page", cfg=scfg, group_id=str(G1))
+    text = await ts.read_page("https://a.example/page", cfg=scfg, group_id=str(G1))
     check("extract returns the page text normalised", text == "正文 开头", repr(text))
     check("and debits the shared allowance",
           await repo.month_calls("search", "tavily") == 4,
           str(await repo.month_calls("search", "tavily")))
     scfg.monthly_quota = 4
     try:
-        await ts.extract("https://a.example/page", cfg=scfg, group_id=str(G1))
+        await ts.read_page("https://a.example/page", cfg=scfg, group_id=str(G1))
         check("extract refuses at the allowance", False, "it extracted")
     except QuotaExhausted:
         check("extract refuses at the allowance", True)
     await ts.aclose()
 
-    # -- a timed-out attempt still books its spend ---------------------------
-    # Usage travels in the stream's final chunk, which a timeout never reads; the
-    # vendor billed the prompt and everything generated up to the cut all the same.
-    # This was the one spending path that systematically understated, in a design
-    # whose every other guess deliberately leans high.
-    from qqbot.providers.openai_compat import OpenAICompatChat
+    # -- Responses failures and served-model billing -------------------------
+    # Exercise the real executor/session and replace only the network transport.
+    from qqbot.providers.contracts import (
+        CallContext,
+        CallPurpose,
+        GenerationPolicy,
+        Message,
+        ModelFailure,
+        ModelRequest,
+        ReasoningEffort,
+        Role,
+    )
+    from qqbot.providers.openai_responses import OpenAIResponses
+    from qqbot.providers.openai_transport import TerminalResponse
 
-    class TimingOut(OpenAICompatChat):
-        async def _stream_once(self, *a, **kw):
-            raise TimeoutError
+    class FakeTransport:
+        def __init__(self, *steps):
+            self.steps = list(steps)
+            self.calls = 0
 
-    tcfg = _config().default.llm.text.model_copy(deep=True)
-    tcfg.retries = 0
+        async def complete(self, request, **kwargs):
+            del request, kwargs
+            self.calls += 1
+            step = self.steps.pop(0)
+            if isinstance(step, BaseException):
+                raise step
+            return TerminalResponse(step, str(step.get("status") or "completed"))
+
+        async def aclose(self):
+            pass
+
+    tcfg = _config().default.capabilities.text.model_copy(deep=True)
+
+    async def model_call(transport, *, retries=0, max_tokens=None):
+        model = OpenAIResponses(tcfg)
+        model._executor._transport = transport
+        request = ModelRequest(
+            prompt=(Message(Role.USER, "你好"),),
+            tools=(),
+            policy=GenerationPolicy(
+                model=tcfg.model,
+                reasoning=ReasoningEffort.OFF,
+                timeout_sec=tcfg.timeout_sec,
+                retries=retries,
+                max_output_tokens=max_tokens,
+            ),
+            context=CallContext(CallPurpose.REPLY, str(G1)),
+        )
+        try:
+            async with model.open_session(request) as session:
+                return await session.start()
+        finally:
+            await model.aclose()
+
     before_to = await repo.day_cost(day)
     try:
-        await TimingOut().chat([{"role": "user", "content": "你好"}],
-                               cfg=tcfg, max_tokens=100, kind="reply",
-                               group_id=str(G1))
-        check("a timed-out chat still raises", False, "it returned")
-    except TimeoutError:
-        check("a timed-out chat still raises", True)
+        await model_call(FakeTransport(TimeoutError()), max_tokens=100)
+        check("a timed-out response still raises", False, "it returned")
+    except ModelFailure:
+        check("a timed-out response still raises", True)
     after_to = await repo.day_cost(day)
     check("and its estimated spend reaches the ledger", after_to > before_to,
           f"{before_to:.6f} -> {after_to:.6f}")
 
-    # -- the ledger names the model that actually served -------------------
-    # A vendor may retire an id and route it to a successor billed at another
-    # rate. Booking the requested name would price the call from a table entry
-    # that no longer describes it, in either direction.
-    from qqbot.providers.base import ChatResult as _CR
+    transient_transport = FakeTransport(
+        {
+            "model": "transient-model",
+            "status": "failed",
+            "output": [],
+            "error": {"code": "server_error", "message": "try again"},
+            "usage": {"input_tokens": 2, "output_tokens": 1},
+        },
+        {
+            "model": "transient-model",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "recovered"}],
+            }],
+            "usage": {"input_tokens": 2, "output_tokens": 1},
+        },
+    )
+    recovered = await model_call(transient_transport, retries=1)
+    check("a retryable terminal failure follows the configured retry loop",
+          transient_transport.calls == 2 and recovered.text == "recovered",
+          f"calls={transient_transport.calls} text={recovered.text!r}")
 
-    class Routed(OpenAICompatChat):
-        async def _stream_once(self, *a, **kw):
-            return _CR(model="served-elsewhere", text="好", in_miss=10, out=5)
+    before_failed = await repo.day_cost(day)
+    try:
+        await model_call(FakeTransport({
+            "model": "failed-no-usage",
+            "status": "failed",
+            "output": [],
+            "error": {"code": "invalid_request_error", "message": "bad request"},
+        }), max_tokens=10)
+        check("a non-retryable failed response still raises", False, "it returned")
+    except ModelFailure:
+        check("a non-retryable failed response still raises", True)
+    check("a failed response without usage is conservatively booked",
+          await repo.day_cost(day) > before_failed)
 
-    await Routed().chat([{"role": "user", "content": "你好"}], cfg=tcfg,
-                        kind="reply", group_id=str(G1))
+    await model_call(FakeTransport({
+        "model": "served-elsewhere",
+        "status": "completed",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "好"}],
+        }],
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+    }))
     _models = {r["model"] for r in await repo.day_breakdown(day)}
     check("a routed call books under the model that served it",
           "served-elsewhere" in _models, str(sorted(_models)))

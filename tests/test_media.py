@@ -6,8 +6,9 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("CONFIG_DIR", str(ROOT / "tests" / "fixtures" / "config"))
-os.environ.setdefault("DATABASE_URL", "postgresql://qqbot@127.0.0.1:15432/qqbot")
-os.environ.setdefault("DATABASE_PASSWORD", "testpw")
+from _db import configure_test_database
+
+configure_test_database()
 import asyncio
 
 
@@ -381,16 +382,10 @@ async def main():
           _res_v.get(0) == "⟦语音:明天一起去吃饭⟧", repr(_res_v))
     MEDIA._local = _local_saved
 
-    # The daily cap gates spending, not transcription: a zero-rate backend (the
-    # in-process one) keeps transcribing after the budget is gone, a priced one
-    # stays deferred. Pin both directions, with the cap forced to "exceeded".
+    # Local ASR is CPU work, not provider spending. Even with the CNY budget forced
+    # to exhausted, transcription continues; its own per-group gate and bounded
+    # global recognizer queue are the admission controls.
     from qqbot.core import media as _media_mod
-
-    class PricedAsr(CapturingAsr):
-        name = "priced"
-
-        def rate_for(self, model):
-            return _Rate("second", per_unit=0.001)
 
     async def _true(cap):
         return True
@@ -400,14 +395,8 @@ async def main():
     MEDIA._asr_windows.clear()
     _vout = await MEDIA.transcribe(_AR(slot=0, file="free.amr"), bot=VoiceBot(),
                                    group_id="g10", cfg=cfg)
-    check("a free ASR backend transcribes straight through an exhausted budget",
+    check("local ASR transcribes straight through an exhausted CNY budget",
           _vout == "⟦语音:明天一起去吃饭⟧", repr(_vout))
-    set_providers(Providers(text=_real.text, vision=FakeVision(),
-                            asr=PricedAsr(), embedding=_EMBED, search=_real.search))
-    _vout = await MEDIA.transcribe(_AR(slot=0, file="paid.amr"), bot=VoiceBot(),
-                                   group_id="g10", cfg=cfg)
-    check("a priced ASR backend still defers on an exhausted budget",
-          _vout is None, repr(_vout))
     _media_mod.BUDGET.exceeded = _budget_saved
     set_providers(Providers(text=_real.text, vision=FakeVision(),
                             asr=_prev_asr, embedding=_EMBED, search=_real.search))
@@ -443,7 +432,7 @@ async def main():
     check("sherpa rate is zero in every direction",
           _sherpa.rate_for("sense-voice").units(300.0) == 0.0)
     try:
-        await _sherpa.transcribe(b"\x02#!SILK_V3", cfg=cfg.llm.asr, fmt="amr")
+        await _sherpa.transcribe(b"\x02#!SILK_V3", cfg=cfg.capabilities.asr, fmt="amr")
         check("sherpa refuses non-wav input", False, "no exception")
     except ValueError:
         check("sherpa refuses non-wav input", True)
@@ -451,19 +440,19 @@ async def main():
     # size cap
     base = len(VISION_CALLS)
     big = ImageRef(slot=0, key="b" * 32, url="http://x",
-                   size=int(cfg.llm.vision.max_image_mb * 1024 * 1024) + 1)
+                   size=int(cfg.capabilities.vision.max_image_mb * 1024 * 1024) + 1)
     out = await MEDIA.describe_image(big, bot=bot, group_id="g", cfg=cfg)
     check("oversized image gets a terminal bare marker",
           out == "⟦图片⟧" and not isinstance(out, Unsettled), repr(out))
     check("oversized image costs nothing", len(VISION_CALLS) == base)
-    _w = MEDIA._img_window("g", cfg.llm.vision.max_images_per_min)
+    _w = MEDIA._img_window("g", cfg.capabilities.vision.max_images_per_min)
     _n = len(_w._hits) if hasattr(_w, "_hits") else None
     await MEDIA.describe_image(big, bot=bot, group_id="g", cfg=cfg)
     check("oversized image spends no rate-window slot",
           _n is None or len(_w._hits) == _n, str(_n))
 
     # per-minute image cap
-    cfg.llm.vision.max_images_per_min = 2
+    cfg.capabilities.vision.max_images_per_min = 2
     MEDIA._img_windows.clear()
     outs = []
     for i in range(4):
@@ -475,7 +464,7 @@ async def main():
     # unknown-key image (no md5 in the file field) still works, just uncacheable
     r = ImageRef(slot=0, key=None, url="http://x")
     MEDIA._img_windows.clear()
-    cfg.llm.vision.max_images_per_min = 6
+    cfg.capabilities.vision.max_images_per_min = 6
     out = await MEDIA.describe_image(r, bot=bot, group_id="g3", cfg=cfg)
     check("keyless image still described", out is not None, str(out))
 

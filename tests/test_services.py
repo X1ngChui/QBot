@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 os.environ.setdefault("CONFIG_DIR", str(ROOT / "tests" / "fixtures" / "config"))
 
 from qqbot.domain.memory import Candidate, CandidateType, RejectReason
+from qqbot.providers.contracts import ToolCall, ToolCallId
 from qqbot.services import Validator
 from qqbot.services.memory_extractor import (
     ExtractionInput, MemoryExtractor, SourceLine, line_body, predicate_names, tools,
@@ -129,7 +130,7 @@ check("and different names are not",
 
 # ---- the tool definitions -------------------------------------------------
 TOOL_DEFS = tools()
-by_name = {t["function"]["name"]: t["function"] for t in TOOL_DEFS}
+by_name = {tool.name: tool for tool in TOOL_DEFS}
 check("the model is offered exactly these tools",
       set(by_name) == {"record_alias", "record_fact", "record_group_term",
                        "record_group_topic", "record_episode"},
@@ -138,30 +139,36 @@ check("the model is offered exactly these tools",
 # something plausible from something somebody said.
 for name, fn in by_name.items():
     check(f"{name} requires a verbatim quote",
-          "quote" in set(fn["parameters"]["required"]),
-          str(set(fn["parameters"]["required"])))
+          "quote" in set(fn.parameters["required"]),
+          str(set(fn.parameters["required"])))
 # A record about a person names them by code, never by nickname: two people in one group
 # sharing a name is ordinary, and a record filed under the wrong one stays wrong.
 for name in ("record_alias", "record_fact"):
     check(f"{name} names an account by code",
-          "account" in set(by_name[name]["parameters"]["required"]))
+          "account" in set(by_name[name].parameters["required"]))
 # A record about the group names nobody, so it must not ask for an account at all -
 # otherwise the model invents one to fill the field.
 for name in ("record_group_term", "record_group_topic"):
     check(f"{name} names nobody",
-          "account" not in by_name[name]["parameters"]["properties"],
-          str(set(by_name[name]["parameters"]["properties"])))
+          "account" not in by_name[name].parameters["properties"],
+          str(set(by_name[name].parameters["properties"])))
 # An episode is found by who took part in it before anything looks at the text, so the
 # participants are the field that has to be right.
 check("record_episode names its participants by code",
-      by_name["record_episode"]["parameters"]["properties"]["participants"]["items"]
+      by_name["record_episode"].parameters["properties"]["participants"]["items"]
       == {"type": "integer"})
 # There is deliberately no tool for an in-joke. It cannot be checked, the model will
 # always find one, and once written down it gets used in a reply, archived, and read back
 # by the next pass as evidence that the group still says it.
 check("and nothing offers to record a joke",
-      not any("梗" in json.dumps(t, ensure_ascii=False) for t in TOOL_DEFS))
-pred_enum = by_name["record_fact"]["parameters"]["properties"]["predicate"]["enum"]
+      not any(
+          "梗" in json.dumps(
+              {"name": tool.name, "description": tool.description, "parameters": tool.parameters},
+              ensure_ascii=False,
+          )
+          for tool in TOOL_DEFS
+      ))
+pred_enum = by_name["record_fact"].parameters["properties"]["predicate"]["enum"]
 check("the predicate is an enum in the tool definition itself",
       set(pred_enum) == set(predicate_names()),
       "the model cannot produce a value outside it, which beats checking afterwards")
@@ -243,7 +250,11 @@ inp = ExtractionInput(group_id=1, transcript="\n".join(LINES),
 
 
 def call(name, **args):
-    return {"function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
+    return ToolCall(
+        ToolCallId("extract-call"),
+        name,
+        json.dumps(args, ensure_ascii=False),
+    )
 
 
 parsed = MemoryExtractor._to_candidate(
@@ -276,7 +287,7 @@ check("a quote found in two messages has no source, rather than the first",
       _twice.source_of("老周你又来了") is None)
 check("arguments that are JSON but not an object are dropped",
       MemoryExtractor._to_candidate(
-          {"function": {"name": "record_fact", "arguments": "[1, 2]"}}, inp) is None)
+          ToolCall(ToolCallId("bad-args"), "record_fact", "[1, 2]"), inp) is None)
 
 group = MemoryExtractor._to_candidate(
     call("record_group_term", term="切片", meaning="把采样切成小段再重排",
@@ -293,7 +304,7 @@ check("and the two group tools are distinguishable afterwards",
 
 check("arguments that are not JSON are dropped",
       MemoryExtractor._to_candidate(
-          {"function": {"name": "record_fact", "arguments": "{坏掉"}}, inp) is None)
+          ToolCall(ToolCallId("bad-json"), "record_fact", "{坏掉"), inp) is None)
 check("an unknown tool is dropped",
       MemoryExtractor._to_candidate(call("drop_table", x=1), inp) is None)
 

@@ -61,7 +61,9 @@ should simply be deleted.
 
 **Providers stay behind the abstraction.** Vendor-specific behaviour goes in the
 backend's subclass under `qqbot/providers/`. Code above that layer speaks in
-capabilities and neutral message blocks.
+Responses input/output items and neutral media blocks. Preserve complete ordered output
+inside one tool loop; do not reconstruct it from visible text and function calls or
+persist reasoning into diagnostics, chat history or memory.
 
 **Lint.** `ruff.toml` selects correctness rules and unambiguous modernisations. Import
 sorting is off on purpose; imports are grouped by meaning.

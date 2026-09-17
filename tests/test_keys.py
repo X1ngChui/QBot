@@ -71,32 +71,34 @@ def main() -> int:
     clear("BOMENV_API_KEY")
 
     # 7. shipped config: names describe capabilities, never platforms
-    cfg = load_bundle().default.llm
-    names = [cfg.text.api_key_env, cfg.vision.api_key_env, cfg.asr.api_key_env,
-             cfg.search.api_key_env]
-    # Since the vision migration, text and vision run on one account (one platform
-    # serves both), while ASR keeps its own; search is a third party entirely.
+    cfg = load_bundle().default.capabilities
+    names = [cfg.text.credential_env, cfg.vision.credential_env,
+             cfg.search.credential_env, cfg.embedding.credential_env]
     check("text and vision share one name by default",
-          cfg.text.api_key_env == cfg.vision.api_key_env == "TEXT_API_KEY",
-          f"{cfg.text.api_key_env} / {cfg.vision.api_key_env}")
-    check("asr and search have their own",
-          len({cfg.text.api_key_env, cfg.asr.api_key_env, cfg.search.api_key_env}) == 3,
-          " / ".join(names))
+          cfg.text.credential_env == cfg.vision.credential_env == "TEXT_API_KEY",
+          f"{cfg.text.credential_env} / {cfg.vision.credential_env}")
+    check(
+        "local ASR has no provider connection settings",
+        not hasattr(cfg.asr, "provider")
+        and not hasattr(cfg.asr, "endpoint")
+        and not hasattr(cfg.asr, "credential_env"),
+    )
     VENDORS = ("deepseek", "dashscope", "bailian", "zhipu", "openai", "qwen", "aliyun",
                "bigmodel", "anthropic", "gemini", "tavily")
     leaked = [n for n in names if any(v in n.lower() for v in VENDORS)]
     check("no credential name mentions a platform", not leaked, str(leaked))
 
-    # 8. the split is reachable from YAML alone
+    # 8. Network capabilities can still move credentials independently.
     split = load_bundle()
-    split.default.llm.asr.api_key_env = "ASR_API_KEY"
-    os.environ["ASR_API_KEY"] = "asr-only-key"
-    os.environ[split.default.llm.vision.api_key_env] = "shared-key"
-    vkey = util.read_api_key(split.default.llm.vision.api_key_env)
-    akey = util.read_api_key(split.default.llm.asr.api_key_env)
-    check("split config yields two different keys", vkey == "shared-key" and akey == "asr-only-key",
-          f"vision={vkey!r} asr={akey!r}")
-    clear("ASR_API_KEY", split.default.llm.vision.api_key_env)
+    split.default.capabilities.vision.credential_env = "VISION_API_KEY"
+    os.environ["VISION_API_KEY"] = "vision-only-key"
+    os.environ[split.default.capabilities.text.credential_env] = "text-key"
+    vkey = util.read_api_key(split.default.capabilities.vision.credential_env)
+    tkey = util.read_api_key(split.default.capabilities.text.credential_env)
+    check("split config yields two different network keys",
+          vkey == "vision-only-key" and tkey == "text-key",
+          f"vision={vkey!r} text={tkey!r}")
+    clear("VISION_API_KEY", split.default.capabilities.text.credential_env)
 
     print()
     print("FAILED:", fails if fails else "none")

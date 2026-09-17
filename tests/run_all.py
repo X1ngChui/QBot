@@ -17,6 +17,7 @@ SCRIPTS = [
     "test_backends.py",
     "test_repo.py",
     "test_media.py",
+    "test_sherpa.py",
     "test_pipeline.py",
 ]
 

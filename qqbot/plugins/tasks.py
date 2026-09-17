@@ -126,6 +126,12 @@ async def nightly() -> None:
     await _drain_wait(
         queue, timedelta(minutes=sched.decay_drain_min), "decay")
 
+    try:
+        if n := await repo.evidence_prune():
+            log.info("pruned %d expired reply evidence memos", n)
+    except Exception:
+        log.exception("reply evidence pruning failed")
+
     # The paid and destructive stages are behind the waits; these two are
     # plain local work and each guards itself.
     try:
@@ -257,7 +263,7 @@ async def daily_report() -> None:
     lines.append(f"图片缓存 {img['n']} 条，累计命中 {img['hits']} 次{refused}")
 
     used = await repo.month_calls(Kind.SEARCH, providers().search.name)
-    lines.append(f"搜索额度 本月 {used}/{cfg.llm.search.monthly_quota}")
+    lines.append(f"搜索额度 本月 {used}/{cfg.capabilities.search.monthly_quota}")
 
     # The memory queue, because a stuck worker has no other symptom. Nothing goes
     # missing and nothing errors in the group - the bot simply stops learning, and the

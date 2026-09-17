@@ -24,8 +24,10 @@ import uuid
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("CONFIG_DIR", str(ROOT / "config"))
-os.environ["DATABASE_URL"] = "postgresql://qqbot@127.0.0.1:15432/qqbot"
-os.environ["DATABASE_PASSWORD"] = "testpw"
+sys.path.insert(0, str(ROOT / "tests"))
+from _db import assert_disposable_database, configure_test_database
+
+configure_test_database()
 
 if not (ROOT / ".env").exists():
     sys.exit("eval makes real model calls and needs credentials: "
@@ -170,6 +172,7 @@ def main_checks(cands: list) -> list[tuple[str, bool, str]]:
 async def main() -> int:
     set_providers(build_default())
     await init_pool()
+    await assert_disposable_database()
 
     from qqbot.core.budget import BUDGET
     spent0 = await BUDGET.spent_today()

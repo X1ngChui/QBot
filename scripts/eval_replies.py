@@ -39,8 +39,10 @@ from datetime import timedelta
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("CONFIG_DIR", str(ROOT / "config"))
-os.environ["DATABASE_URL"] = "postgresql://qqbot@127.0.0.1:15432/qqbot"
-os.environ["DATABASE_PASSWORD"] = "testpw"
+sys.path.insert(0, str(ROOT / "tests"))
+from _db import assert_disposable_database, configure_test_database
+
+configure_test_database()
 
 # Real credentials, straight from the deployment's .env; never printed.
 if not (ROOT / ".env").exists():
@@ -57,7 +59,9 @@ from qqbot.core.state import ChatMsg, GroupState
 from qqbot.db import close_pool, init_pool, pool
 from qqbot.gateway.ingest import ingestor
 from qqbot.gateway.onebot import GroupMessage, Sender
-from qqbot.providers import Kind, build_default, providers, set_providers
+from qqbot.providers import build_default, providers, set_providers
+from qqbot.providers.base import TextSession
+from qqbot.providers.contracts import CallPurpose, ModelTurn, SessionDirective, ToolResult
 from qqbot.settings import config
 from qqbot.util import fmt_when, now_local, sysmark
 
@@ -342,11 +346,20 @@ async def picture_case(cfg) -> dict:
     only through the tool, since nothing is attached.
     """
     data = _two_colour_png()
-    fid = await providers().text.upload(data, cfg=cfg.llm.text, mime="image/png")
+    store = providers().text.attachments
+    if store is None:
+        raise RuntimeError("configured reply provider has no attachment store")
+    stored = await store.store(data, "image/png")
     poster = ChatMsg(
         msg_id="pic-1", user_id="u2", nickname="小北",
         text="看看这个 " + sysmark("图片"), ts=now_local() - timedelta(minutes=2),
-        image_refs=[ImageRef(key="eval-two-colour", file_id=fid)],
+        image_refs=[
+            ImageRef(
+                key="eval-two-colour",
+                file_id=stored.handle,
+                file_provider=stored.provider,
+            )
+        ],
     )
     return {
         "name": "picture_read",
@@ -402,18 +415,18 @@ async def run_case(case, cfg, persona, bot) -> tuple[str, str]:
         bot=bot, st=st, cfg=cfg, persona=persona, msg=case["trigger"])
     raw = reply.text if reply is not None else ""
     prov = reply.provenance if reply is not None else ""
-    trace = reply.trace if reply is not None else ""
+    evidence = reply.evidence.render() if reply is not None and reply.evidence else ""
     if reply is not None:
         print(f"           send| at={reply.at} reply_to={reply.reply_to}")
     if case["checks"] is None:
         return "OBSERVE", raw
     cleaned = clean_reply(raw)
-    # Loop checks read the tool loop's own record (provenance and trace), not
+    # Loop checks read the tool loop's own record (provenance and evidence), not
     # the reply text: whether the model reached for a tool at all. Failing one
     # is a straight FAIL - there is no output guard that can strip in a search
     # that never happened.
     loop_fail = [label for label, ok in case.get("loop_checks", ())
-                 if not ok(prov, trace)]
+                 if not ok(prov, evidence)]
     send_fail = [label for label, ok in case.get("send_checks", ())
                  if reply is None or not ok(reply)]
     clean_fail = ([label for label, ok in case["checks"] if not ok(cleaned)]
@@ -423,8 +436,8 @@ async def run_case(case, cfg, persona, bot) -> tuple[str, str]:
         # A failing case prints what the tool loop actually did: whether the
         # model searched at all, with which words, and what came back is
         # exactly the difference between "did not look" and "looked badly".
-        for ln in (trace or "（无检索轨迹——一次工具都没调）").splitlines():
-            print(f"           trace| {ln[:110]}")
+        for ln in (evidence or "（无检索记录——一次工具都没调）").splitlines():
+            print(f"           evidence| {ln[:110]}")
         return "FAIL(" + ",".join(clean_fail) + ")", raw
     if raw_fail:
         return "GUARDED(" + ",".join(raw_fail) + ")", raw
@@ -432,20 +445,46 @@ async def run_case(case, cfg, persona, bot) -> tuple[str, str]:
 
 
 def _count_bare_rounds(tally: dict) -> None:
-    """Wrap the text backend so every reply round is counted, and every one that
-    ends without a tool call is charged to the case running at the time."""
+    """Count reply turns that terminate without any tool call."""
+
     text = providers().text
-    chat = text.chat
+    open_session = text.open_session
 
-    async def counted(messages, **kw):
-        res = await chat(messages, **kw)
-        if kw.get("kind") == Kind.REPLY:
-            tally["rounds"] += 1
-            if not res.tool_calls:
-                tally["bare"].append(tally["case"])
-        return res
+    class CountingSession(TextSession):
+        def __init__(self, inner: TextSession, *, count: bool) -> None:
+            self._inner = inner
+            self._count = count
 
-    text.chat = counted
+        def _record(self, turn: ModelTurn) -> ModelTurn:
+            if self._count:
+                tally["rounds"] += 1
+                if not turn.tool_calls:
+                    tally["bare"].append(tally["case"])
+            return turn
+
+        async def start(self) -> ModelTurn:
+            return self._record(await self._inner.start())
+
+        async def continue_with(
+            self,
+            results: tuple[ToolResult, ...],
+            *,
+            directive: SessionDirective | None = None,
+        ) -> ModelTurn:
+            return self._record(
+                await self._inner.continue_with(results, directive=directive)
+            )
+
+        async def aclose(self) -> None:
+            await self._inner.aclose()
+
+    def counted(request):
+        return CountingSession(
+            open_session(request),
+            count=request.context.purpose is CallPurpose.REPLY,
+        )
+
+    text.open_session = counted
 
 
 async def main() -> int:
@@ -456,6 +495,7 @@ async def main() -> int:
     tally = {"rounds": 0, "bare": [], "case": ""}
     _count_bare_rounds(tally)
     await init_pool()
+    await assert_disposable_database()
     await pool().execute("DELETE FROM cost_ledger WHERE group_id=$1", int(GROUP))
 
     await seed_archive()

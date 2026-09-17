@@ -90,6 +90,7 @@ class ImageRef(Ref):
     #: model that reads it is the one that holds it. What a chat message's file block
     #: carries; None until then, or when the backend keeps no files.
     file_id: str | None = None
+    file_provider: str | None = None
     size: int | None = None
     #: Inside a forwarded chat record rather than posted here. Such a picture is
     #: filed (free) so open_images can show it, and reuses a description already

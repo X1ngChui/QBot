@@ -6,8 +6,9 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("CONFIG_DIR", str(ROOT / "tests" / "fixtures" / "config"))
-os.environ.setdefault("DATABASE_URL", "postgresql://qqbot@127.0.0.1:15432/qqbot")
-os.environ.setdefault("DATABASE_PASSWORD", "testpw")
+from _db import configure_test_database
+
+configure_test_database()
 import asyncio
 import itertools
 import re
@@ -17,7 +18,7 @@ import types
 from qqbot.db import init_pool, close_pool, pool
 from qqbot.settings import config
 from _db import reset
-from _stubs import FakeEmbedding
+from _stubs import FakeEmbedding, LegacyTextSession, function_call, response
 
 #: One stub for every bundle in this suite.
 _EMBED = FakeEmbedding()
@@ -25,9 +26,10 @@ from qqbot.core import prompt as prompt_mod
 from qqbot.core.budget import BUDGET
 from qqbot.core.pipeline import GATEWAY
 from qqbot.core.state import REGISTRY, ChatMsg as _CM0
-from qqbot.providers import (AsrModel, ChatResult, Providers, SearchEngine,
-                             TextModel, VisionModel, set_providers)
+from qqbot.providers import (AsrModel, Providers, SearchEngine, TextModel,
+                             VisionModel, set_providers)
 from qqbot.providers.base import QuotaExhausted, Rate
+from qqbot.providers.contracts import StoredImage
 from qqbot.util import now_local as _nl0, today_local as _today
 
 fails = []
@@ -53,17 +55,31 @@ _TAIL_LINE = re.compile(r"下面是刚收到的消息：\n#(\d+) ⟦[^⟧]*⟧ [
 def send_to_asker(messages, text):
     """The send call a well-behaved model makes: the text, replying to the message
     being answered and @-ing its sender, both named by the numbers the prompt shows."""
-    import json as _json
-    args = {"text": text}
+    content = [{"type": "text", "data": {"text": text}}]
     for m in reversed(messages):
         found = (_TAIL_LINE.search(m["content"])
                  if m.get("role") == "user" and isinstance(m.get("content"), str) else None)
         if found:
-            args.update(reply=int(found.group(1)), at=[int(found.group(2))])
+            content[:0] = [
+                {"type": "reply", "data": {"line": int(found.group(1))}},
+                {"type": "at", "data": {"member": int(found.group(2))}},
+            ]
             break
-    return [{"id": f"send-{len(LLM_CALLS)}", "type": "function",
-             "function": {"name": "send_message",
-                          "arguments": _json.dumps(args, ensure_ascii=False)}}]
+    return [
+        function_call(
+            "send_message",
+            {"content": content},
+            call_id=f"send-{len(LLM_CALLS)}",
+        )
+    ]
+
+
+class FakeAttachments:
+    async def store(self, data, media_type):
+        return StoredImage("fake-light", f"file-api-fake{len(data)}")
+
+    async def aclose(self):
+        pass
 
 
 class FakeText(TextModel):
@@ -77,9 +93,12 @@ class FakeText(TextModel):
     def rate_for(self, model):
         return self.RATE
 
-    async def chat(self, messages, *, cfg, tools=None,
-                   max_tokens=None, effort=None, kind="reply", group_id=None):
-        LLM_CALLS.append({"kind": kind, "messages": messages, "tools": tools,
+    def open_session(self, request):
+        return LegacyTextSession(self, request)
+
+    async def respond(self, input, *, cfg, tools=None,
+                      max_tokens=None, effort=None, kind="reply", group_id=None):
+        LLM_CALLS.append({"kind": kind, "input": input, "tools": tools,
                           "effort": effort, "max_tokens": max_tokens,
                           "grade": cfg.reasoning_effort, "timeout": cfg.timeout_sec})
         # No production path overrides the grade at the call: each use of the text
@@ -97,16 +116,11 @@ class FakeText(TextModel):
                             cny=self.rate_for(self.MODEL).tokens(100, 10, 20),
                             in_hit=100, in_miss=10, out=20, group_id=group_id)
         if kind == "reply" and tools:
-            return ChatResult(text="", model=self.MODEL, in_hit=100, in_miss=10, out=20,
-                              tool_calls=send_to_asker(messages, text))
-        return ChatResult(text=text, model=self.MODEL, in_hit=100, in_miss=10, out=20)
+            return response(model=self.MODEL, in_hit=100, in_miss=10, out=20,
+                            tool_calls=send_to_asker(input, text))
+        return response(text=text, model=self.MODEL, in_hit=100, in_miss=10, out=20)
 
-    keeps_files = True
-
-    async def upload(self, data, *, cfg, mime="image/jpeg"):
-        # The model that reads the picture is the one that holds it, so the id
-        # comes from here - the same place a multimodal backend puts it.
-        return f"file-api-fake{len(data)}"
+    attachments = FakeAttachments()
 
     async def aclose(self):
         pass
@@ -312,7 +326,9 @@ async def main():
     check("every reply is offered the tools - there is one model and no tier",
           all(c["tools"] for c in LLM_CALLS if c["kind"] == "reply"))
 
-    sys_prompt = [c for c in LLM_CALLS if c["kind"] == "reply"][0]["messages"][0]["content"]
+    first_reply = [c for c in LLM_CALLS if c["kind"] == "reply"][0]
+    sys_prompt = first_reply["input"][0]["content"]
+    developer_prompt = first_reply["input"][1]["content"]
     check("global constants lead the prompt, so every group shares that span",
           sys_prompt.startswith(prompt_mod.H_SEND), sys_prompt[:24])
     # The one thing the model does comes before everything it reads: its words reach
@@ -331,12 +347,12 @@ async def main():
     check("the prompt says identity is judged by member number, not by name",
           "判断是谁只看编号，不看昵称" in sys_prompt)
     check("and that a rename is only a rename when it was recorded",
-          "不能据此断言没改过名" in sys_prompt,
+          "不能据此断言对方从未改名" in sys_prompt,
           sys_prompt[sys_prompt.find("曾用名"):][:120])
     # A name the account displayed and a name the group calls him are different claims,
     # and the prompt has to say so or the second gets reported as the first.
     check("and that a registered alias is not a name he used to display",
-          "不要说成「他以前叫」" in sys_prompt)
+          "不要把别名说成「他以前叫」" in sys_prompt)
     # These hold with or without a roster, so they ship apart from the lists: this group
     # has no members configured and still gets them.
     check("reading rules ship whether or not anyone is configured",
@@ -350,8 +366,9 @@ async def main():
     check("and stop short of what is not known",
           "系统没告诉你的身份关系" in sys_prompt
           and "明确说不知道，不猜" in sys_prompt)
-    check("the persona follows the constants",
-          sys_prompt.index(prompt_mod.H_CREDIBILITY) < sys_prompt.index(prompt_mod.H_PERSONA))
+    check("the group-scoped persona follows global policy as developer context",
+          prompt_mod.H_PERSONA in developer_prompt
+          and prompt_mod.H_PERSONA not in sys_prompt)
     # The whole point of a code-supplied fact is that it is certain. That is worth nothing
     # unless the certain lines are marked apart from the guessed ones - the model had been
     # repeating its own inferences back as if someone had told it.
@@ -360,25 +377,25 @@ async def main():
     # A transcript is not a document. Every prompt was written as if it meant what it said,
     # which is how a member's throwaway boast about their ancestry became a recorded trait.
     check("the reply path is told how a group chat reads",
-          prompt_mod.H_TONE in sys_prompt and "不能按字面当真" in sys_prompt)
+          prompt_mod.H_TONE in sys_prompt and "不只看字面" in sys_prompt)
     check("and told not to correct a joke",
-          "不要一本正经地解释或纠正" in sys_prompt)
+          "不要无故上纲上线或一本正经纠正" in sys_prompt)
     from qqbot.services import MemoryExtractor
     from qqbot.workers.memory import transcript_legend
     _CP = MemoryExtractor(cfg, legend=transcript_legend()).prompt
     check("the memory path gets the same reading, minus the part about speaking",
-          "不能按字面当真" in _CP and "不要一本正经地解释或纠正" not in _CP)
+          "不只看字面" in _CP and "不要无故上纲上线" not in _CP)
     # One discernment, two consequences: the judgment half is the shared
     # tone_rules, and extraction's own note says what not to record.
     check("with its own instruction for what to do with a joke",
           "没有被当真的话不产生任何候选" in _CP)
 
-    check("the sections are marked",
+    check("the authority sections are marked",
           all(h in sys_prompt for h in
               (prompt_mod.H_SEND, prompt_mod.H_LEGEND, prompt_mod.H_IDENTITY,
-               prompt_mod.H_CREDIBILITY, prompt_mod.H_PRIVATE, prompt_mod.H_TONE,
-               prompt_mod.H_PERSONA)))
-    check("and says not to deny having them", "不要声称看不到图" in sys_prompt)
+               prompt_mod.H_CREDIBILITY, prompt_mod.H_PRIVATE, prompt_mod.H_TONE))
+          and prompt_mod.H_PERSONA in developer_prompt)
+    check("and says to use visible media directly", "应直接使用" in sys_prompt)
     from qqbot.settings import ptext as _ptext
     _LEG = _ptext("legend")
     check("one legend, shared by the reply and memory paths",
@@ -393,7 +410,7 @@ async def main():
     check("@ mention replies even with the at segment stripped", len(bot.sent) == n_at + 1,
           str(bot.sent[n_at:]))
     at_call = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]
-    check("prompt shows the bot was addressed", "@我" in at_call["messages"][-1]["content"])
+    check("prompt shows the bot was addressed", "@我" in at_call["input"][-1]["content"])
 
     # 1c. Owner recognition. The prompt only ever carries a display name, so without a
     # tag derived from the account id the bot cannot tell who its owner is the moment
@@ -402,12 +419,12 @@ async def main():
     await REGISTRY.get("123")
     await GATEWAY.handle(bot, FakeEvent("在吗", to_me=True, user_id="u9", nickname="随便改的名字"))
     await drain()
-    own_tail = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["messages"][-1]["content"]
+    own_tail = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["input"][-1]["content"]
     check("owner is tagged in the prompt, behind the member number",
           re.search(r"随便改的名字⟦\d+⟧⟦拥有者⟧", own_tail), own_tail[-90:])
     await GATEWAY.handle(bot, FakeEvent("在吗", to_me=True, user_id="u1", nickname="阿强"))
     await drain()
-    plain_tail = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["messages"][-1]["content"]
+    plain_tail = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["input"][-1]["content"]
     check("a non-owner is not tagged", "阿强（拥有者）" not in plain_tail)
     cfg.owners = []
 
@@ -460,7 +477,7 @@ async def main():
           f"{len(bot.sent) - n2} replies")
     check("and the reply quotes exactly that fragment",
           bot.quoted[-1] == str(ev6.message_id), f"quoted {bot.quoted[-1]}")
-    tail6 = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["messages"][-1]["content"]
+    tail6 = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["input"][-1]["content"]
     check("the slice ends at the addressed message - later fragments stay out",
           "小X 你看" in tail6 and "怎么样" not in tail6, tail6[-80:])
 
@@ -514,7 +531,7 @@ async def main():
     await REGISTRY.get("123")
     await GATEWAY.handle(bot, FakeEvent("小X 显卡现在多少钱"))
     await drain()
-    msgs = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["messages"]
+    msgs = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["input"]
     check("the message being answered is in the tail", "显卡现在多少钱" in msgs[-1]["content"])
     check("and not in the cached system block", "显卡现在多少钱" not in msgs[0]["content"])
 
@@ -653,9 +670,13 @@ async def main():
     check("a question about it pays nothing more",
           len(VISION_SEEN) == 1, str(VISION_SEEN))
     hist = "\n".join(
-        m["content"] if isinstance(m["content"], str)
-        else " ".join(b["text"] for b in m["content"] or () if b.get("type") == "text")
-        for m in [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["messages"])
+        content if isinstance((content := m.get("content")), str)
+        else " ".join(
+            b.get("text", "") for b in content or ()
+            if isinstance(b, dict) and b.get("type") in ("text", "input_text")
+        )
+        for m in [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["input"]
+    )
     check("and the description lands in the history, where the question points",
           "橘猫" in hist and "群里的阿明 ⟦图片⟧" not in hist, hist[-200:])
     backfilled = await pool().fetchval(
@@ -685,7 +706,7 @@ async def main():
     await drain(2.0)
     check("a picture that draws a reply is understood", len(VISION_SEEN) == 2,
           str(VISION_SEEN))
-    tail_i = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["messages"][-1]["content"]
+    tail_i = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["input"][-1]["content"]
     # Nothing is pushed: the tail stays text, the description line carries a number,
     # and the model opens the original by that number if it wants the pixels.
     check("the tail stays plain text - no original is pushed",
@@ -825,14 +846,12 @@ async def main():
     # number rather than asking a second model to look. Free - bytes and an upload -
     # and it answers with a content array carrying the file block, which is what lets
     # the picture arrive as the answer to the call instead of a turn appended behind it.
-    import json as _json
     from qqbot.core.segments import ImageRef as _IRef
     from qqbot.core.tools import Attachment, ToolCtx, execute as _texec
     URL_CONTENT_CHARS = config().default.retrieval.url_content_chars
 
     def _tcall(name, **kw):
-        return {"id": "t1", "function": {
-            "name": name, "arguments": _json.dumps(kw, ensure_ascii=False)}}
+        return function_call(name, kw, call_id="t1")
 
     set_providers(Providers(text=FakeText(), vision=SeeingVision(),
                             asr=UnusedAsr(), embedding=_EMBED, search=UnusedSearch()))
@@ -843,26 +862,27 @@ async def main():
     out_i = await _texec(_tcall("open_images", ns=[4]), cfg=cfg, group_id="123", ctx=_ictx)
     check("open_images hands back the original as a picture part",
           isinstance(out_i, Attachment)
-          and any(b.get("type") == "image" for b in out_i.parts), str(out_i.parts))
+          and any(isinstance(part, StoredImage) for part in out_i.parts), str(out_i.parts))
     check("and costs no model call - it is a fetch, not a second opinion",
           len(VISION_SEEN) == _seen0, str(len(VISION_SEEN) - _seen0))
+    from qqbot.providers.contracts import Message as _Message, Role as _Role, TextPart as _TextPart
+    _content = out_i.content()
     check("the tool message labels the picture with its number, then the text",
-          [b["type"] for b in out_i.content()] == ["text", "image", "text"]
-          and out_i.content()[0]["text"] == "图片4：", str(out_i.content()))
-    # The neutral part never reaches a vendor: each backend renders it into its own
-    # wire shape on the way out, and they really do differ - DeepSeek takes a flat
-    # file_id and rejects the nesting OpenAI documents.
-    from qqbot.providers.deepseek import DeepSeekChat as _DSC
-    from qqbot.providers.openai_compat import OpenAICompatChat as _OAC
-    _neutral = [{"role": "user", "content": out_i.content()}]
-    check("the picture part is translated per backend, not shipped as written",
-          _OAC()._wire(_neutral)[0]["content"][1]
-          == {"type": "file", "file": {"file_id": "file-api-fake2048"}}
-          and _DSC()._wire(_neutral)[0]["content"][1]
-          == {"type": "file", "file_id": "file-api-fake2048"},
-          str(_DSC()._wire(_neutral)[0]["content"][1]))
-    check("and the caller's own messages are left as they were",
-          _neutral[0]["content"][1] == {"type": "image", "id": "file-api-fake2048"})
+          [type(part) for part in _content] == [_TextPart, StoredImage, _TextPart]
+          and _content[0].text == "图片4：", str(_content))
+    # The neutral part never reaches a vendor: the codec renders it at the adapter edge.
+    from qqbot.providers.openai_responses import ResponsesCodec as _ResponsesCodec
+    _neutral = (_Message(
+        _Role.USER,
+        (_TextPart("图片4："), StoredImage("openai_responses", "file-api-fake2048")),
+    ),)
+    _wired = _ResponsesCodec().encode_items(_neutral)
+    check("the picture part is translated to a Responses input image",
+          _wired[0]["content"][1]
+          == {"type": "input_image", "file_id": "file-api-fake2048"},
+          str(_wired[0]["content"][1]))
+    check("and the caller's neutral value is unchanged",
+          isinstance(_neutral[0].content[1], StoredImage))
     # Several at once: a question is often about a set, and one round per picture
     # would spend the loop's bound on fetching. Unknown numbers are reported beside
     # the ones that came back, not instead of them.
@@ -873,7 +893,8 @@ async def main():
                          ctx=_ictx)
     check("open_images fetches several pictures in one call",
           isinstance(out_m, Attachment)
-          and [b["type"] for b in out_m.content()] == ["text", "image", "text", "image", "text"]
+          and [type(part) for part in out_m.content()]
+          == [_TextPart, StoredImage, _TextPart, StoredImage, _TextPart]
           and "图片5：" in str(out_m.content()) and "99" in str(out_m), str(out_m.content()))
     check("a number outside the prompt is answered, not crashed",
           "99" in await _texec(_tcall("open_images", ns=[99]),
@@ -884,19 +905,21 @@ async def main():
     # "null", "[]" and "42" are valid JSON: a degenerate argument string must get
     # the same in-band answer as an unparsable one, not crash the whole reply.
     out_n = await _texec(
-        {"id": "t2", "function": {"name": "web_search", "arguments": "null"}},
+        function_call("web_search", "null", call_id="t2"),
         cfg=cfg, group_id="123", ctx=_ictx)
     check("non-object tool arguments are answered in-band",
           out_n.startswith("（工具参数解析失败"), repr(out_n))
 
-    # read_url: page text through the search backend's extract, capped before it
+    # read_url: page text through the optional page-reader capability, capped before it
     # reaches the prompt - pages are unbounded, replies are not.
     class ReadingSearch(UnusedSearch):
-        async def extract(self, url, *, cfg, group_id=None):
+        async def read_page(self, url, *, cfg, group_id=None):
             return "页 " * 4000
 
+    reading_search = ReadingSearch()
     set_providers(Providers(text=FakeText(), vision=SeeingVision(),
-                            asr=UnusedAsr(), embedding=_EMBED, search=ReadingSearch()))
+                            asr=UnusedAsr(), embedding=_EMBED,
+                            search=reading_search, page_reader=reading_search))
     out_u = await _texec(_tcall("read_url", url="https://a.example/x"),
                          cfg=cfg, group_id="123")
     check("read_url returns page text capped at the limit",
@@ -922,7 +945,7 @@ async def main():
         Seg("text", {"text": "小X 这个怎么说"}),
     ], reply_id=555, reply_from="24680"))
     await drain(2.0)
-    tail_r = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["messages"][-1]["content"]
+    tail_r = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["input"][-1]["content"]
     # Message 555 is not one the bot has seen, so the quote is reported as unavailable
     # rather than fetched: text on screen belonging to no visible line is the ambiguity
     # numbering replaced.
@@ -950,7 +973,7 @@ async def main():
         Seg("text", {"text": "小X 里面的图是啥"}),
     ]))
     await drain(2.0)
-    tail_i = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["messages"][-1]["content"]
+    tail_i = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["input"][-1]["content"]
     check("an inline forward renders as an indented block without a fetch",
           "内嵌第一条" in tail_i and "\n  ⟦" in tail_i, tail_i[-200:])
     _fw_line = next(m for m in reversed((await REGISTRY.get("123")).recent)
@@ -1134,7 +1157,7 @@ async def main():
     # the model answered whichever thread in the history looked livelier - leaving the
     # person who had actually addressed it with no answer.
     check("and the tail says which message to answer, and that only a send reaches the group",
-          "下面是刚收到的消息" in _tail and "回应这条消息" in _tail
+          "下面是刚收到的消息" in _tail and "只回应下面刚收到的消息" in _tail
           and "send_message" in _tail, _tail[-140:])
     # And says it without pointing two ways at once: the messages are introduced as being
     # below, so the instruction must not then refer to them as being above.
@@ -1144,7 +1167,7 @@ async def main():
     # earlier is ordinary, and a flat ban on the history would refuse it.
     # The exception lives with the rule, in the fixed rules that open the prompt.
     check("while still allowing a question the message points at",
-          "除非刚收到的消息要你代答" in prompt_mod.build_system(persona_k, [], []))
+          "除非刚收到的消息明确要求你代答" in prompt_mod.build_system(persona_k, [], []))
     check("but never in the cached system block",
           "老周答应周末把切片做完" not in prompt_mod.build_system(persona_k, [], []))
 
@@ -1237,27 +1260,36 @@ async def main():
             pass
 
     def _tc(q):
-        return {"id": f"t{len(LLM_CALLS)}", "type": "function",
-                "function": {"name": "web_search",
-                             "arguments": _j14.dumps({"query": q})}}
+        return function_call("web_search", {"query": q},
+                             call_id=f"t{len(LLM_CALLS)}")
 
-    def _send(**args):
-        return {"id": f"s{len(LLM_CALLS)}", "type": "function",
-                "function": {"name": "send_message",
-                             "arguments": _j14.dumps(args, ensure_ascii=False)}}
+    def _send(*, text="", at=None, reply=None):
+        content = []
+        if reply is not None:
+            content.append({"type": "reply", "data": {"line": reply}})
+        content.extend(
+            {"type": "at", "data": {"member": member}}
+            for member in (at or ())
+        )
+        content.append({"type": "text", "data": {"text": text}})
+        return function_call(
+            "send_message",
+            {"content": content},
+            call_id=f"s{len(LLM_CALLS)}",
+        )
 
     def _names(tools):
-        return [t["function"]["name"] for t in tools or ()]
+        return [t["name"] for t in tools or ()]
 
     class ScriptedText(FakeText):
         """Asks for searches on every round - the same word twice, plus a fresh one -
         so only a limit can end the reply. Offered nothing but the send tool, it
         sends."""
 
-        async def chat(self, messages, *, cfg, tools=None,
-                       max_tokens=None, effort=None, kind="reply",
-                       group_id=None):
-            LLM_CALLS.append({"kind": kind, "messages": messages,
+        async def respond(self, input, *, cfg, tools=None,
+                          max_tokens=None, effort=None, kind="reply",
+                          group_id=None):
+            LLM_CALLS.append({"kind": kind, "input": input,
                               "tools": tools, "effort": effort,
                               "max_tokens": max_tokens,
                               "grade": cfg.reasoning_effort,
@@ -1265,10 +1297,11 @@ async def main():
             await BUDGET.record(kind=kind, model=self.MODEL, cny=ROUND_CHARGE,
                                 group_id=group_id)
             if _names(tools) == ["send_message"]:   # the wrap-up round
-                return ChatResult(text="", model=self.MODEL,
-                                  tool_calls=[_send(text="就查到这些了")])
-            return ChatResult(text="", model=self.MODEL,
-                              tool_calls=[_tc("话题A"), _tc("话题A"), _tc(f"话题{len(LLM_CALLS)}")])
+                return response(model=self.MODEL,
+                                tool_calls=[_send(text="就查到这些了")])
+            return response(model=self.MODEL,
+                            tool_calls=[_tc("话题A"), _tc("话题A"),
+                                        _tc(f"话题{len(LLM_CALLS)}")])
 
     set_providers(Providers(text=ScriptedText(), vision=UnusedVision(),
                             asr=UnusedAsr(), embedding=_EMBED, search=CountingSearch()))
@@ -1291,14 +1324,14 @@ async def main():
           str(_names(LLM_CALLS[n_llm]["tools"])))
     check("the wrap-up round is told the allowance is gone",
           any("额度已用完" in (m.get("content") or "")
-              for m in LLM_CALLS[-1]["messages"] if m.get("role") == "user"))
+              for m in LLM_CALLS[-1]["input"] if m.get("role") == "user"))
     check("free searches are not gated by the reply's purse",
           len(CountingSearch.calls) == 2,
           f"{len(CountingSearch.calls)} calls: {CountingSearch.calls}")
     check("a repeated identical call is not re-executed",
           CountingSearch.calls.count("话题A") == 1, str(CountingSearch.calls))
-    tool_texts = [m.get("content") or "" for m in LLM_CALLS[-1]["messages"]
-                  if m.get("role") == "tool"]
+    tool_texts = [m.get("output") or "" for m in LLM_CALLS[-1]["input"]
+                  if m.get("type") == "function_call_output"]
     check("the model is told about the duplicate in words",
           any("刚执行过" in t for t in tool_texts))
     check("the unexecuted request got its placeholder result",
@@ -1332,6 +1365,87 @@ async def main():
     check("and the unaffordable round's tools were never executed",
           len(EndlessSearch.calls) == 2, str(EndlessSearch.calls))
 
+    from qqbot.core import tools as _loop_tools
+    _real_execute = _loop_tools.execute
+    _mid_batch_calls: list[str] = []
+
+    async def _spending_execute(call, **kwargs):
+        _mid_batch_calls.append(call.name)
+        await BUDGET.record(kind="search", model="paid-tool", cny=0.06,
+                            group_id=kwargs.get("group_id"))
+        return "result"
+
+    _loop_tools.execute = _spending_execute
+    try:
+        from qqbot.core import agent as _agent
+        from qqbot.core.member_numbers import MemberNumbers as _MemberNumbers
+        _mid_run = _agent.AgentRun(
+            model=FakeText(),
+            request=_agent.request_for_reply((), cfg, group_id="123"),
+            cfg=cfg,
+            state=st13,
+            tool_context=_loop_tools.ToolCtx(),
+            people=_MemberNumbers(self_id=str(bot.self_id)),
+            lines={},
+        )
+        with BUDGET.scope(0.05) as _mid_spend:
+            _mid_answers, _mid_hit = await _mid_run._execute_round(
+                (
+                    function_call("recall_events", {"question": "first"}, call_id="mid-1"),
+                    function_call("recall_events", {"question": "second"}, call_id="mid-2"),
+                ),
+                send_notes={},
+                spend=_mid_spend,
+            )
+    finally:
+        _loop_tools.execute = _real_execute
+    check("a paid tool exhausting the scope blocks later calls in the same batch",
+          _mid_batch_calls == ["recall_events"] and _mid_hit
+          and "没有执行" in str(_mid_answers[1].output),
+          f"{_mid_batch_calls} {_mid_answers}")
+
+    _parallel_active = 0
+    _parallel_peak = 0
+    _parallel_release = asyncio.Event()
+
+    async def _parallel_execute(call, **_kwargs):
+        nonlocal _parallel_active, _parallel_peak
+        _parallel_active += 1
+        _parallel_peak = max(_parallel_peak, _parallel_active)
+        if _parallel_active == 2:
+            _parallel_release.set()
+        await asyncio.wait_for(_parallel_release.wait(), timeout=1)
+        _parallel_active -= 1
+        return "result"
+
+    _loop_tools.execute = _parallel_execute
+    try:
+        _parallel_run = _agent.AgentRun(
+            model=FakeText(),
+            request=_agent.request_for_reply((), cfg, group_id="123"),
+            cfg=cfg,
+            state=st13,
+            tool_context=_loop_tools.ToolCtx(),
+            people=_MemberNumbers(self_id=str(bot.self_id)),
+            lines={},
+        )
+        with BUDGET.scope(1) as _parallel_spend:
+            _parallel_answers, _ = await _parallel_run._execute_round(
+                (
+                    function_call("web_search", {"query": "first"}, call_id="par-1"),
+                    function_call("read_url", {"url": "https://example.invalid"},
+                                  call_id="par-2"),
+                ),
+                send_notes={},
+                spend=_parallel_spend,
+            )
+    finally:
+        _loop_tools.execute = _real_execute
+    check("independent free tools in one model turn execute concurrently",
+          _parallel_peak == 2
+          and [answer.output for answer in _parallel_answers] == ["result", "result"],
+          f"peak={_parallel_peak} answers={_parallel_answers}")
+
     # The per-round cap: the scripted round asks for three calls; capped at two,
     # the third is answered with the overflow note and never reaches the backend.
     class CappedSearch(EndlessSearch):
@@ -1345,8 +1459,8 @@ async def main():
         msg=_CM0(msg_id="loop3", user_id="u1", nickname="阿强",
                  text="再查一次", ts=_nl0()))
     cfg.retrieval.max_tool_calls_per_round = _cap0
-    _tool_texts3 = [m.get("content") or "" for m in LLM_CALLS[-1]["messages"]
-                    if m.get("role") == "tool"]
+    _tool_texts3 = [m.get("output") or "" for m in LLM_CALLS[-1]["input"]
+                    if m.get("type") == "function_call_output"]
     check("a call past the per-round cap is answered with the overflow note",
           any("次数已达上限" in t for t in _tool_texts3), str(_tool_texts3)[:200])
     check("and was never executed",
@@ -1359,35 +1473,60 @@ async def main():
     # unmarked lines as improvised off the context.
     from qqbot.core.engine import _provenance as _pvfn
     from qqbot.core.output import clean_reply as _cr
+    _weather = _agent.ToolExecution("web_search", {"query": "明天 天气"}, "1. T C", True)
     check("provenance names the tool and the query",
-          _pvfn([("web_search", {"query": "明天 天气"}, "1. T C")], cfg)
-          == "⟦依据:搜索“明天 天气”⟧",
-          _pvfn([("web_search", {"query": "明天 天气"}, "1. T C")], cfg))
-    check("no tools means no marker", _pvfn([], cfg) == "")
-    from qqbot.core.engine import _trace as _trfn
-    check("no tools means no trace either", _trfn([], cfg) == "")
-    check("a trace keeps no member numbers: they belong to one render",
-          _trfn([("search_history", {"query": "改锥"},
-                  "⟦09-01 10:00⟧ 张伟⟦3⟧: 改锥在我这")], cfg)
-          == "⟦检索记录⟧\n查档“改锥”：[09-01 10:00] 张伟: 改锥在我这",
-          _trfn([("search_history", {"query": "改锥"},
-                  "⟦09-01 10:00⟧ 张伟⟦3⟧: 改锥在我这")], cfg))
+          _pvfn((_weather,), cfg) == "⟦依据:搜索“明天 天气”⟧",
+          _pvfn((_weather,), cfg))
+    check("no tools means no marker", _pvfn((), cfg) == "")
+    from qqbot.core.engine import _evidence_memo as _memo_fn
+    check("no tools means no evidence memo", _memo_fn((), cfg) is None)
+    _history_execution = _agent.ToolExecution(
+        "search_history",
+        {"query": "改锥"},
+        "⟦09-01 10:00⟧ 张伟⟦3⟧: 改锥在我这",
+        True,
+    )
+    _memo = _memo_fn((_history_execution,), cfg)
+    check(
+        "evidence keeps no prompt-local member numbers",
+        _memo is not None
+        and _memo.render()
+        == "⟦检索记录⟧\n查档“改锥”：[09-01 10:00] 张伟: 改锥在我这",
+        _memo.render() if _memo else "none",
+    )
+    _page_memo = _memo_fn(
+        (
+            _agent.ToolExecution(
+                "read_url",
+                {"url": "https://user:secret@example.invalid/page?token=hidden#part"},
+                "正文",
+                True,
+            ),
+        ),
+        cfg,
+    )
+    check(
+        "evidence strips URL credentials, queries and fragments",
+        _page_memo is not None
+        and "https://example.invalid/page" in _page_memo.render()
+        and all(word not in _page_memo.render() for word in ("secret", "hidden", "part")),
+        _page_memo.render() if _page_memo else "none",
+    )
 
     class Scripted(FakeText):
-        """Answers each round from a script: a list of ChatResult makers, one per
-        round, the last repeated."""
+        """Answers each round from a script of neutral ModelTurn makers."""
 
         script: list = []
 
-        async def chat(self, messages, *, cfg, tools=None, max_tokens=None,
-                       effort=None, kind="reply", group_id=None):
-            LLM_CALLS.append({"kind": kind, "messages": list(messages), "tools": tools,
+        async def respond(self, input, *, cfg, tools=None, max_tokens=None,
+                          effort=None, kind="reply", group_id=None):
+            LLM_CALLS.append({"kind": kind, "input": list(input), "tools": tools,
                               "effort": effort, "max_tokens": max_tokens,
                               "grade": cfg.reasoning_effort,
                               "timeout": cfg.timeout_sec})
             n = sum(1 for c in LLM_CALLS[self.start:] if c["kind"] == "reply") - 1
             step = self.script[min(n, len(self.script) - 1)]
-            return step(messages)
+            return step(input)
 
     def _use(*steps):
         text_model = Scripted()
@@ -1398,7 +1537,7 @@ async def main():
                                 search=EndlessSearch()))
 
     def _calls(*calls):
-        return lambda _m: ChatResult(text="", model="fake-light", tool_calls=list(calls))
+        return lambda _input: response(model="fake-light", tool_calls=list(calls))
 
     cfg.budget.per_reply_cny = 0.30
     _use(_calls(_tc("明天 天气")), _calls(_send(text="明天多云")))
@@ -1448,10 +1587,10 @@ async def main():
 
     _seen: dict = {}
 
-    def _look_then_send(messages):
-        _seen["prompt"] = _prompt_text(messages)
-        return ChatResult(text="", model="fake-light", tool_calls=[
-            _send(text="@李芳⟦2⟧ 你好呀", at=[2, 99], reply=2)])
+    def _look_then_send(input):
+        _seen["prompt"] = _prompt_text(input)
+        return response(model="fake-light", tool_calls=[
+            _send(text="@李芳 你好呀", at=[2], reply=2)])
 
     _use(_look_then_send)
     n_sent = len(bot.sent)
@@ -1470,7 +1609,7 @@ async def main():
           bot.sent[-1][1] == "你好呀", repr(bot.sent[-1]))
     _s_line = st_s.recent[-1]
     check("the window keeps whom it @-ed and which line it replied to",
-          _s_line.is_bot and _s_line.text == "你好呀"
+          _s_line.is_bot and _s_line.text == "@李芳 你好呀"
           and _s_line.at == [("u62", "李芳")] and _s_line.reply_to == "s-w2",
           repr(_s_line))
     _s_row = await pool().fetchrow(
@@ -1489,8 +1628,9 @@ async def main():
     _re = _GS14(group_id="5601")
     await _re.load_history(self_id="999", owners=set())
     _back = next((m for m in _re.recent if m.msg_id == _s_line.msg_id), None)
-    check("a rebuilt window reads the @ back out of the archive",
-          _back is not None and _back.text == "你好呀" and _back.at == [("u62", "李芳")],
+    check("a rebuilt window preserves the structured display and addressee",
+          _back is not None and _back.text == "@李芳 你好呀"
+          and _back.at == [("u62", "李芳")],
           repr(_back))
     # A line archived before the @ was stored as a segment opens with "@asker" and
     # replies to the asker's message; the rebuild recovers the account from that.
@@ -1500,9 +1640,10 @@ async def main():
         message_id="legacy-q", group_id=5602, sender=_S14(user_id="u1", card="阿强"),
         segments=[{"type": "text", "data": {"text": "小X 几点了"}}], self_id="999",
         occurred_at=_nl0(), plain_text="小X 几点了"))
-    await _ing14().record_own_reply(group_id=5602, self_id="999", message_id="legacy-a",
-                                    text="@阿强 三点半", at=_nl0(), name="小X",
-                                    reply_to="legacy-q")
+    await _ing14().ingest(_GM14(
+        message_id="legacy-a", group_id=5602, sender=_S14(user_id="999", nickname="小X"),
+        segments=[{"type": "text", "data": {"text": "@阿强 三点半"}}], self_id="999",
+        occurred_at=_nl0(), plain_text="@阿强 三点半", reply_to_message_id="legacy-q"))
     _old = _GS14(group_id="5602")
     await _old.load_history(self_id="999", owners=set())
     _old_line = next((m for m in _old.recent if m.msg_id == "legacy-a"), None)
@@ -1518,38 +1659,66 @@ async def main():
     st_s.add(_follow)
     await _eng.generate(bot=bot, st=st_s, cfg=cfg, persona=_persona, msg=_follow,
                         window=[_w1, _w2, _ask, _s_line])
-    _hist = LLM_CALLS[-1]["messages"]
-    _own = [m for m in _hist if m.get("role") == "assistant" and m.get("tool_calls")]
+    _hist = LLM_CALLS[-1]["input"]
+    _own = [m for m in _hist if m.get("type") == "function_call"]
     check("the bot's past message is rendered as its send call",
           len(_own) == 1
-          and _j14.loads(_own[0]["tool_calls"][0]["function"]["arguments"])
-          == {"text": "你好呀", "at": [2], "reply": 2},
+          and _j14.loads(_own[0]["arguments"])
+          == {"content": [
+              {"type": "reply", "data": {"line": 2}},
+              {"type": "at", "data": {"member": 2}},
+              {"type": "text", "data": {"text": " 你好呀"}},
+          ]},
           repr(_own))
-    _own_result = next((m for m in _hist if m.get("role") == "tool"), {})
+    _own_result = next((m for m in _hist if m.get("type") == "function_call_output"), {})
     check("followed by its result, carrying the line's number",
-          _own_result.get("tool_call_id") == _own[0]["tool_calls"][0]["id"]
-          and str(_own_result.get("content", "")).startswith("已发送：#4 "),
+          _own_result.get("call_id") == _own[0]["call_id"]
+          and str(_own_result.get("output", "")).startswith("已发送：#4 "),
           repr(_own_result))
 
-    # A member number the prompt never showed, or a line number it never showed,
-    # costs the @ or the reply and nothing else: the words still go out.
-    _use(_calls(_send(text="好的", at=[42], reply=77)))
+    # A member or line number outside the frozen prompt snapshot invalidates the
+    # send. The model gets one correction result and may retry without pretending
+    # that a requested control segment was silently delivered.
+    _use(
+        _calls(_send(text="好的", at=[42], reply=77)),
+        _calls(_send(text="好的")),
+    )
     ok_u = await _eng.respond(bot=bot, st=st_s, cfg=cfg, persona=_persona, msg=_follow,
                               window=[_w1, _w2, _ask])
-    check("unknown numbers are dropped and the text still goes out",
+    _u_tools = [m.get("output") for m in LLM_CALLS[-1]["input"]
+                if m.get("type") == "function_call_output"]
+    check("unknown snapshot numbers are rejected before a corrected send",
           ok_u and bot.sent[-1][1] == "好的" and bot.ats[-1] is None
-          and bot.quoted[-1] is None, f"{bot.sent[-1:]} {bot.ats[-1:]} {bot.quoted[-1:]}")
+          and bot.quoted[-1] is None and any("无效" in str(t) for t in _u_tools),
+          f"{bot.sent[-1:]} {_u_tools}")
 
     # A send that cannot be sent is answered like a failed tool, and the model sends
     # again on the next round.
     _use(_calls(_send(text="  ")), _calls(_send(text="重新发一遍", at=[3])))
     ok_e = await _eng.respond(bot=bot, st=st_s, cfg=cfg, persona=_persona, msg=_follow,
                               window=[_w1, _w2, _ask])
-    _e_tools = [m.get("content") for m in LLM_CALLS[-1]["messages"] if m.get("role") == "tool"]
+    _e_tools = [m.get("output") for m in LLM_CALLS[-1]["input"]
+                if m.get("type") == "function_call_output"]
     check("an empty send is refused in words and the next round sends",
           ok_e and bot.sent[-1][1] == "重新发一遍" and bot.ats[-1] == "u1"
-          and any("正文为空" in str(t) for t in _e_tools),
+          and any("没有可发送的内容" in str(t) for t in _e_tools),
           f"{bot.sent[-1:]} {_e_tools}")
+
+    _use(_calls(
+        function_call("send_message", {"content": []}, call_id="bad-send"),
+        function_call(
+            "send_message",
+            {"content": [{"type": "text", "data": {"text": "同轮有效"}}]},
+            call_id="good-send",
+        ),
+    ))
+    n_multi_send = len(LLM_CALLS)
+    ok_multi_send = await _eng.respond(
+        bot=bot, st=st_s, cfg=cfg, persona=_persona, msg=_follow,
+        window=[_w1, _w2, _ask])
+    check("a valid later send in the same response is not hidden by an invalid first send",
+          ok_multi_send and bot.sent[-1][1] == "同轮有效"
+          and len(LLM_CALLS) == n_multi_send + 1, str(bot.sent[-1:]))
 
     # A send ends the reply: a search asked for in the same round never runs.
     EndlessSearch.calls.clear()
@@ -1562,9 +1731,9 @@ async def main():
 
     # The send tool is the only way out: a round that writes its reply out as bare
     # text sends nothing, and no further round is spent on it.
-    _use(lambda _m: ChatResult(text="明天多云", model="fake-light"),
-         lambda m: ChatResult(text="", model="fake-light",
-                              tool_calls=send_to_asker(m, "明天多云")))
+    _use(lambda _m: response(text="明天多云", model="fake-light"),
+         lambda m: response(model="fake-light",
+                            tool_calls=send_to_asker(m, "明天多云")))
     n_bare, n_calls = len(bot.sent), len(LLM_CALLS)
     ok_bare = await _eng.respond(
         bot=bot, st=st_pv, cfg=cfg, persona=config().for_group("123")[1],
@@ -1574,7 +1743,7 @@ async def main():
           not ok_bare and len(bot.sent) == n_bare and len(LLM_CALLS) == n_calls + 1,
           f"{bot.sent[n_bare:]} {len(LLM_CALLS) - n_calls} round(s)")
 
-    _use(lambda m: ChatResult(text="", model="fake-light",
+    _use(lambda m: response(model="fake-light",
                               tool_calls=send_to_asker(m, "@阿强 明天多云")))
     ok_at = await _eng.respond(
         bot=bot, st=st_pv, cfg=cfg, persona=config().for_group("123")[1],
@@ -1584,7 +1753,7 @@ async def main():
           ok_at and bot.sent[-1][1] == "明天多云" and bot.ats[-1] == "u1"
           and bot.quoted[-1] == "pv-at", str(bot.sent[-1:]))
     check("the window remembers the answer with its addressee",
-          st_pv.recent[-1].is_bot and st_pv.recent[-1].text == "明天多云"
+          st_pv.recent[-1].is_bot and st_pv.recent[-1].text == "@阿强 明天多云"
           and st_pv.recent[-1].at == [("u1", "阿强")],
           repr(st_pv.recent[-1]))
     _at_row = await pool().fetchval(
@@ -1632,18 +1801,21 @@ async def main():
           _cr("⟦回复 #2⟧ #3 阿强: 都别吵了") == "都别吵了",
           repr(_cr("⟦回复 #2⟧ #3 阿强: 都别吵了")))
 
-    # The trajectory lives in reply_trace and nowhere else: the deque holds only
-    # conversation, and prompt assembly queries the table for the window's replies
-    # and seats each entry with the send call it fed - which also covers the
-    # restart case with no re-seating logic at all.
-    _expected_trace = "⟦检索记录⟧\n搜索“明天 天气”：1. T C"
-    check("the trajectory persists in its own table",
-          await pool().fetchval(
-              "SELECT content FROM reply_trace WHERE reply_event_id=$1",
-              _pv_line.msg_id) == _expected_trace,
-          str(await pool().fetchval(
-              "SELECT content FROM reply_trace WHERE reply_event_id=$1",
-              _pv_line.msg_id)))
+    # Evidence lives in structured, expiring storage rather than in the conversation
+    # deque. Prompt assembly renders it immediately before the send call it supported.
+    _expected_evidence = "⟦检索记录⟧\n搜索“明天 天气”：1. T C"
+    _memo_row = await pool().fetchrow(
+        "SELECT content, memo, expires_at FROM reply_trace WHERE reply_event_id=$1",
+        _pv_line.msg_id,
+    )
+    check(
+        "new reply evidence is structured and versioned",
+        _memo_row["content"] == ""
+        and _memo_row["memo"]["schema"] == 1
+        and _memo_row["memo"]["items"][0]["source"] == "web_search"
+        and _memo_row["expires_at"] is not None,
+        repr(dict(_memo_row)),
+    )
     check("and the deque holds only conversation",
           not any(m.text.startswith("⟦检索记录⟧") for m in st_pv.recent))
     _use(_calls(_send(text="后天也多云")))
@@ -1651,18 +1823,37 @@ async def main():
         bot=bot, st=st_pv, cfg=cfg, persona=config().for_group("123")[1],
         msg=_CM0(msg_id="pv2", user_id="u1", nickname="阿强",
                  text="后天呢", ts=_nl0()))
-    _msgs2 = list(LLM_CALLS[-1]["messages"])
+    _msgs2 = list(LLM_CALLS[-1]["input"])
     _ri = next((i for i, m in enumerate(_msgs2)
-                if m.get("role") == "tool"
-                and "⟦依据:搜索“明天 天气”⟧" in str(m.get("content"))), None)
-    check("assembly seats the stored trace with the send call it fed",
-          _ri is not None and _msgs2[_ri - 1].get("role") == "assistant"
-          and _msgs2[_ri - 1].get("content") == _expected_trace
-          and _msgs2[_ri - 1]["tool_calls"][0]["function"]["name"] == "send_message",
-          str(_msgs2[_ri - 1] if _ri else _msgs2[-3:])[:200])
-    check("an imitated trace marker line never reaches the group",
+                if m.get("type") == "function_call_output"
+                and "⟦依据:搜索“明天 天气”⟧" in str(m.get("output"))), None)
+    check("assembly seats rendered evidence with the send call it fed",
+          _ri is not None and _msgs2[_ri - 1].get("type") == "function_call"
+          and _msgs2[_ri - 1]["name"] == "send_message"
+          and _msgs2[_ri - 2].get("role") == "assistant"
+          and _msgs2[_ri - 2].get("content") == _expected_evidence,
+          str(_msgs2[_ri - 2:_ri + 1] if _ri else _msgs2[-3:])[:200])
+    check("an imitated evidence marker line never reaches the group",
           _cr("⟦检索记录⟧\n搜索“x”：y\n好的") == "搜索“x”：y\n好的",
           repr(_cr("⟦检索记录⟧\n搜索“x”：y\n好的")))
+    await pool().execute(
+        """INSERT INTO reply_trace (group_id, reply_event_id, content)
+           VALUES (123, 'legacy-evidence', '⟦检索记录⟧\n旧格式')"""
+    )
+    check(
+        "legacy schema-v0 evidence remains readable during migration",
+        (await _repo.evidence_for(123, ["legacy-evidence"]))
+        == {"legacy-evidence": "⟦检索记录⟧\n旧格式"},
+    )
+    await pool().execute(
+        "UPDATE reply_trace SET expires_at=NOW() - INTERVAL '1 second' "
+        "WHERE reply_event_id=$1",
+        _pv_line.msg_id,
+    )
+    check(
+        "expired evidence degrades to absence",
+        await _repo.evidence_for(123, [_pv_line.msg_id]) == {},
+    )
     set_providers(providers_bundle)
 
     # 15. the per-group blocklist, end to end. Blocked means unanswered and
@@ -1978,7 +2169,7 @@ async def main():
     # Each use of the text model brings its own settings: extraction reads a whole
     # chunk of transcript, so it carries a grade and a patience the reply path would
     # never grant, and neither is a call-site exception.
-    _txtcfg = config().default.llm.text
+    _txtcfg = config().default.capabilities.text
     check("extraction and replies each run on their own configured settings",
           all(c["grade"] == _txtcfg.extract.reasoning_effort
               and c["timeout"] == _txtcfg.extract.timeout_sec

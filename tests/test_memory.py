@@ -17,18 +17,18 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("CONFIG_DIR", str(ROOT / "tests" / "fixtures" / "config"))
-os.environ.setdefault("DATABASE_URL", "postgresql://qqbot@127.0.0.1:15432/qqbot")
-os.environ.setdefault("DATABASE_PASSWORD", "testpw")
+from _db import configure_test_database
+
+configure_test_database()
 
 import asyncio
-import json
 
 from qqbot.core import retrieval
 from qqbot.db import close_pool, init_pool, pool
 from qqbot.gateway.ingest import ingestor
 from qqbot.repositories.event import EventRepository
 from qqbot.gateway.onebot import GroupMessage, Sender
-from qqbot.providers import (AsrModel, ChatResult, Providers, SearchEngine, TextModel,
+from qqbot.providers import (AsrModel, Providers, SearchEngine, TextModel,
                              VisionModel, set_providers)
 from qqbot.providers.base import Rate
 from qqbot.settings import config
@@ -41,7 +41,7 @@ from qqbot.workers.memory import MemoryWorker
 #: The extraction chunk width, from config - the tests build batches around it.
 WINDOW = config().default.memory.extract_window
 from _db import reset
-from _stubs import FakeEmbedding
+from _stubs import FakeEmbedding, LegacyTextSession, function_call, response
 
 #: One stub for every bundle in this suite.
 _EMBED = FakeEmbedding()
@@ -65,8 +65,7 @@ def check(name, cond, detail=""):
 
 
 def tool(name, **args):
-    return {"id": f"c{len(CALLS)}", "type": "function",
-            "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
+    return function_call(name, args, call_id=f"c{len(CALLS)}")
 
 
 class FakeText(TextModel):
@@ -75,11 +74,14 @@ class FakeText(TextModel):
     def rate_for(self, model):
         return Rate("Mtoken", in_hit=0.02, in_miss=1.0, out=2.0)
 
-    async def chat(self, messages, *, cfg, tools=None,
-                   max_tokens=None, effort=None, kind="reply", group_id=None):
+    def open_session(self, request):
+        return LegacyTextSession(self, request)
+
+    async def respond(self, input, *, cfg, tools=None,
+                      max_tokens=None, effort=None, kind="reply", group_id=None):
         CALLS.append(kind)
         SEEN_MODELS.append(cfg.model)
-        LAST_PROMPT.append(messages[-1]["content"])
+        LAST_PROMPT.append(input[-1]["content"])
         if kind == "extract":
             SEEN_EXTRACT_CFG.append(
                 (cfg.model, cfg.reasoning_effort, cfg.timeout_sec))
@@ -87,7 +89,7 @@ class FakeText(TextModel):
         # its settings in its own config, so a caller that needs different ones
         # passes a different config.
         assert effort is None, "the grade belongs to the config, not the call"
-        return ChatResult(text="", model=self.MODEL, tool_calls=[
+        return response(model=self.MODEL, tool_calls=[
             tool("record_alias", alias="老周", account=1, kind="nickname",
                  quote="老周你那个切片做完没"),
             tool("record_fact", account=1, predicate="plays", object="鸣潮",
@@ -374,7 +376,7 @@ async def main():
     from qqbot.core import tools as tools_mod
 
     def _call(name, **args):
-        return {"function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
+        return function_call(name, args, call_id="tool-call")
 
     got = await tools_mod.execute(_call("recall_events", question="切片的约定"),
                                   cfg=config().default, group_id=str(G))
@@ -696,7 +698,7 @@ async def main():
     # and the batch - a whole quiet evening, in the idle-flush case - would be
     # skipped forever.
     class FailingText(FakeText):
-        async def chat(self, messages, **kw):
+        async def respond(self, input, **kw):
             raise RuntimeError("model down")
 
     await say("u1", "董自豪", "水位线在失败后不能动", "wm1")
@@ -798,7 +800,7 @@ async def main():
     # path's. The grade and timeout hold for every extraction above; the model
     # override is probed here, last, because it adds an extract call the counting
     # assertions above must not see.
-    _txt = config().default.llm.text
+    _txt = config().default.capabilities.text
     check("extraction carries its own grade and timeout, not the reply path's",
           SEEN_EXTRACT_CFG
           and all(g == _txt.extract.reasoning_effort and t == _txt.extract.timeout_sec
@@ -807,7 +809,7 @@ async def main():
           str(SEEN_EXTRACT_CFG[:2]))
     from qqbot.services import ExtractionInput as _EIovr, MemoryExtractor as _MEovr
     _covr = config().default.model_copy(deep=True)
-    _covr.llm.text.extract.model = "flash-probe"
+    _covr.capabilities.text.extract.model = "flash-probe"
     await _MEovr(_covr, legend="x").extract(_EIovr(
         group_id=G, transcript="", roster="", account_codes={}, lines=(), batch_size=0))
     check("the extract model override moves extraction alone",

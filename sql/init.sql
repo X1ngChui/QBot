@@ -303,20 +303,30 @@ CREATE UNIQUE INDEX IF NOT EXISTS job_pending_once
 
 -- ---------------------------------------------------------------- runtime
 
--- The bot's own working notes: which lookups fed one reply, digested. Not the
--- group's memory - nothing here was said in the group - so it lives beside
--- raw_event rather than inside it, and search_history / extraction never read it.
--- The window rebuild re-seats each entry in front of the reply it fed. Kept
--- forever, like L0: rows are small and disk is not the constraint.
+-- The bot's bounded evidence memo for one reply. It is not group memory and is never
+-- searched or extracted. `content` remains for schema-v0 rows; schema-v1 writes only
+-- `memo`. Every row expires because evidence is follow-up context, not an archive.
 CREATE TABLE IF NOT EXISTS reply_trace (
     id             UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     group_id       BIGINT      NOT NULL,
     reply_event_id VARCHAR(64) NOT NULL,
-    content        TEXT        NOT NULL,
+    content        TEXT        NOT NULL DEFAULT '',
+    memo           JSONB,
+    expires_at     TIMESTAMPTZ,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE reply_trace ADD COLUMN IF NOT EXISTS memo JSONB;
+ALTER TABLE reply_trace ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+ALTER TABLE reply_trace ALTER COLUMN content SET DEFAULT '';
+-- Give legacy text rows one final compatibility window rather than retaining them forever.
+UPDATE reply_trace
+   SET expires_at = created_at + INTERVAL '30 days'
+ WHERE memo IS NULL AND expires_at IS NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS reply_trace_reply
     ON reply_trace (group_id, reply_event_id);
+CREATE INDEX IF NOT EXISTS reply_trace_expiry
+    ON reply_trace (expires_at)
+    WHERE expires_at IS NOT NULL;
 
 -- Budget and usage, aggregated per day, group, kind and causing account: one
 -- authoritative billing shape.
@@ -394,12 +404,13 @@ CREATE TABLE IF NOT EXISTS image_cache (
     -- Where the reply model's backend filed the original picture (Files API), and
     -- when. The open_images tool hands the id to the model so it reads the pixels;
     -- NULL when never uploaded. The backend drops files after its own retention, so
-    -- an id older than llm.vision.file_max_age_days is treated as gone and the
-    -- picture is uploaded again rather than cited by a dead id.
+    -- an id older than capabilities.vision.file_max_age_days, or issued by another
+    -- provider, is treated as gone and uploaded again.
     file_id     VARCHAR(64),
+    file_provider VARCHAR(32),
     file_uploaded_at TIMESTAMPTZ,
     -- When the description was written, which is not when the row was last used.
-    -- The describing path treats one older than llm.vision.description_ttl_days as
+    -- The describing path treats one older than capabilities.vision.description_ttl_days as
     -- a miss and pays to write a fresh one: models improve, and a vendor can put a
     -- better model behind an unchanged id, so age is the only thing that tracks
     -- description quality from here. NULL only while there is no description (the
@@ -416,3 +427,4 @@ CREATE TABLE IF NOT EXISTS image_cache (
     CONSTRAINT image_cache_described_stamped
         CHECK (description = '' OR described_at IS NOT NULL)
 );
+ALTER TABLE image_cache ADD COLUMN IF NOT EXISTS file_provider VARCHAR(32);

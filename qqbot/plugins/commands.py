@@ -370,9 +370,8 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
         cfg, _ = bundle.for_group(gid)
         register_nicknames(cfg.trigger.nicknames)
     register_nicknames(bundle.default.trigger.nicknames)
-    # The contract's edge - cron and timezone edits are accepted here but only take
-    # effect at the next restart - is documented in /help reload, not repeated in
-    # every acknowledgement.
+    # A successful reload means every accepted field is live. Restart-scoped
+    # changes are rejected above with the exact paths that require a restart.
     await _finish(matcher, f"配置已重载：{len(bundle.personas)} 份人设。")
 
 
@@ -509,7 +508,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
         f"预算　　¥{spent:.3f} / ¥{cfg.budget.daily_cny_cap:.2f}",
         f"回复　　{_calls(rows, Kind.REPLY)} 次",
         f"搜索　　今日 {_calls(rows, Kind.SEARCH)} 次　本月 "
-        f"{month_search}/{cfg.llm.search.monthly_quota}",
+        f"{month_search}/{cfg.capabilities.search.monthly_quota}",
         f"记忆　　待归纳 {backlog} 条",
         f"媒体　　识图 {_calls(rows, Kind.VISION)} 次　转写 {_calls(rows, Kind.ASR)} 次",
     ]

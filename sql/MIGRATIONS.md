@@ -15,6 +15,32 @@ docker exec qbot-postgres-1 psql -U qqbot -d qqbot -c "<statement>"
 Types mirror `init.sql`. Where an entry says to run a block from `init.sql`, copy it
 verbatim: some `ON CONFLICT` clauses depend on the unique index that follows the table.
 
+## 2026-09-17 — provider-scoped image file handles
+
+```sql
+ALTER TABLE image_cache ADD COLUMN IF NOT EXISTS file_provider VARCHAR(32);
+```
+
+Existing handles intentionally keep a null provider and are uploaded again on first use;
+a file id issued by one provider must never be sent to another.
+
+## 2026-09-17 — structured, expiring reply evidence
+
+```sql
+ALTER TABLE reply_trace ADD COLUMN IF NOT EXISTS memo JSONB;
+ALTER TABLE reply_trace ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+ALTER TABLE reply_trace ALTER COLUMN content SET DEFAULT '';
+UPDATE reply_trace
+   SET expires_at = created_at + INTERVAL '30 days'
+ WHERE memo IS NULL AND expires_at IS NULL;
+CREATE INDEX IF NOT EXISTS reply_trace_expiry
+    ON reply_trace (expires_at)
+    WHERE expires_at IS NOT NULL;
+```
+
+The table name stays stable for a low-risk migration. New writes use only versioned JSON;
+legacy text remains readable until its assigned expiry, then the nightly sweep removes it.
+
 ## 2026-09-17 — member numbers replace namesake serials
 
 ```sql

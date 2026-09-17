@@ -77,7 +77,7 @@ def read_secret(env_name: str, fallback_env: str | None = None) -> str:
 def read_api_key(name: str) -> str:
     """Resolve one capability's key from the name its config section points at.
 
-    Each provider names its own key (llm.<capability>.api_key_env), so capabilities that
+    Each provider names its own key (capabilities.<capability>.credential_env), so capabilities that
     happen to share a key today can be split later by editing YAML alone. Resolution
     order for a name like MEDIA_API_KEY:
 

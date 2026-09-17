@@ -207,16 +207,22 @@ CATALOG: tuple[Command, ...] = (
 /debug 轮数　捕获接下来 N 轮模型调用（最多 50）
 /debug off　 关闭
 
-把每轮发给模型的完整消息与其原始回复写入服务器 logs/debug/ 目录，
+把每轮的 provider-neutral prompt 与完成结果写入服务器 logs/debug/ 目录，
 一轮一个 JSON 文件，捕获满即自动关闭；重启也会关闭。
-用于排查模型行为异常：直接看模型当时读到了什么，而不是事后推断。
+不包含模型推理、provider 原始响应或 response id。
+用于排查模型行为异常：直接看 Agent 当时可见的内容，而不是事后推断。
 捕获覆盖所有群，仅默认配置里的拥有者可用；/log、/reload 同此。
 
 示例：/debug 5"""),
-    Command("/reload", "重载配置与人设",
-            "重新读取配置、人设、提示词、谓词表与用户协议，无需重启。若新配置有误，则继续使用原配置。\n"
-            "定时任务的改动（含其时区）需重启生效；改动代码不能靠它生效，需重建镜像。\n\n"
-            "示例：/reload"),
+    Command(
+        "/reload",
+        "重载配置与人设",
+        "重新读取可热更新的配置、人设、回复提示词与用户协议。若校验失败，或改动了 "
+        "provider、端点、凭据、并发、ASR/数据库/worker/定时任务等启动态字段，则整次拒绝并继续"
+        "使用原配置；成功即表示所有改动均已生效。\n"
+        "改动代码仍需重建镜像。\n\n"
+        "示例：/reload",
+    ),
 )
 
 #: What the gateway routes away from the reply pipeline.

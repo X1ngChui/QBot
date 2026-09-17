@@ -15,11 +15,11 @@ gateway:
 trigger:
   nicknames: ["小X", "小x", "X酱"]
 
-llm:
+capabilities:
   text:
-    backend: openai_compat
-    base_url: https://example.invalid/v1
-    api_key_env: TEXT_API_KEY
+    provider: openai_responses
+    endpoint: https://example.invalid/v1
+    credential_env: TEXT_API_KEY
     model: test-light
     max_concurrency: 3
     timeout_sec: 30
@@ -28,31 +28,30 @@ llm:
       reasoning_effort: low
       timeout_sec: 120
   vision:
-    backend: openai_compat
-    base_url: https://example.invalid/v1
-    api_key_env: MEDIA_API_KEY
+    provider: openai_responses
+    endpoint: https://example.invalid/v1
+    credential_env: MEDIA_API_KEY
     model: test-vision
     max_images_per_min: 6
     max_image_mb: 8
     timeout_sec: 30
   asr:
-    backend: openai_compat
-    base_url: https://example.invalid/v1
-    api_key_env: MEDIA_API_KEY
-    model: test-asr
+    model_dir: tests/fixtures/models/asr
+    threads: 2
+    queue_capacity: 8
     max_audio_sec: 300
-    timeout_sec: 60
+    max_clips_per_min: 20
   embedding:
-    backend: dashscope
-    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-    api_key_env: MEDIA_API_KEY
+    provider: dashscope
+    endpoint: https://dashscope.aliyuncs.com/compatible-mode/v1
+    credential_env: MEDIA_API_KEY
     model: text-embedding-v4
     dimensions: 2048
     timeout_sec: 60
   search:
-    backend: tavily
-    base_url: https://api.tavily.com
-    api_key_env: SEARCH_API_KEY
+    provider: tavily
+    endpoint: https://api.tavily.com
+    credential_env: SEARCH_API_KEY
     count: 5
     depth: basic
     monthly_quota: 1000

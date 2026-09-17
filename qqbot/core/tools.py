@@ -20,12 +20,14 @@ from luqum.parser import parser as _luqum_parser
 from ..db import pool, repo
 from ..providers import providers
 from ..providers.base import QuotaExhausted
+from ..providers.contracts import StoredImage, TextPart, ToolCall, ToolSpec
 from ..settings import RetrievalCfg, Settings, config, ptext
 from ..util import defang, display_name, fmt_when, merge_overlapping, sysmark, why
 from . import retrieval
 from .botapi import BotApi
 from .media import MEDIA
 from .member_numbers import MemberNumbers
+from .segments import FACE_NAMES
 
 log = logging.getLogger("qqbot.tools")
 
@@ -47,154 +49,210 @@ class ToolCtx:
     people: MemberNumbers | None = None
 
 
-def send_def() -> dict:
-    """The send tool: the only way a reply reaches the group. Every parameter but
-    the text is optional; with none of them the message goes out plain."""
+def _tool(name: str, parameters: dict) -> ToolSpec:
+    """One typed tool contract whose model-facing description lives in prompts."""
+
+    description = ptext(f"tool_{name}")
+    if name == SEND:
+        catalog = "、".join(f"{face_id}={label}" for face_id, label in FACE_NAMES.items())
+        description = description.replace("{{FACE_CATALOG}}", catalog)
+    return ToolSpec(
+        name=name,
+        description=description,
+        parameters=parameters,
+    )
+
+
+def _segment(kind: str, properties: dict, required: list[str] | None = None) -> dict:
+    """One closed nested message-segment schema."""
+
     return {
-        "type": "function",
-        "function": {
-            "name": SEND,
-            "description": ptext("tool_send_message"),
-            "parameters": {
+        "type": "object",
+        "properties": {
+            "type": {"type": "string", "enum": [kind]},
+            "data": {
                 "type": "object",
-                "properties": {
-                    "text": {
-                        "type": "string",
-                        "description": "正文，纯文本，只写要说的话。",
-                    },
-                    "at": {
-                        "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "要 @ 的成员编号列表，取自名字后的 ⟦N⟧；"
-                                       "不 @ 任何人时省略。",
-                    },
-                    "reply": {
-                        "type": "integer",
-                        "description": "要回复（引用）的发言编号，取自行首 #N；"
-                                       "不回复某条发言时省略。",
-                    },
-                },
-                "required": ["text"],
+                "properties": properties,
+                "required": required or list(properties),
+                "additionalProperties": False,
             },
         },
+        "required": ["type", "data"],
+        "additionalProperties": False,
     }
 
 
-def tool_defs(cfg: Settings | None = None) -> list[dict]:
-    """The tool definitions, built fresh so a /reload'ed description applies.
-
-    The schemas stay in code - they are the contract the executor matches on -
-    while the descriptions, which are prompts, come from the registry. `cfg` is
-    the group's own settings, so a limit the description states is the one the
-    executor enforces for that group. The send tool leads: it is the one every
-    reply ends with.
-    """
-    rcfg = (cfg or config().default).retrieval
+def _send_segments() -> list[dict]:
+    text = _segment("text", {"text": {"type": "string"}})
+    at = _segment(
+        "at",
+        {"member": {"type": "integer", "description": "成员名字后的 ⟦N⟧ 编号"}},
+    )
+    reply = _segment(
+        "reply",
+        {"line": {"type": "integer", "description": "发言行首的 #N 编号"}},
+    )
+    face = _segment("face", {"id": {"type": "integer", "minimum": 0}})
+    empty = [_segment(kind, {}, []) for kind in ("dice", "rps")]
+    member_contact = _segment(
+        "contact_member",
+        {"member": {"type": "integer", "description": "要推荐的成员编号"}},
+    )
+    group_contact = _segment("contact_group", {}, [])
+    music = _segment(
+        "music",
+        {
+            "platform": {
+                "type": "string",
+                "enum": ["qq", "163", "kugou", "kuwo", "migu"],
+            },
+            "id": {"type": "string"},
+        },
+    )
+    custom_music = _segment(
+        "music_custom",
+        {
+            "url": {"type": "string"},
+            "audio": {"type": "string"},
+            "title": {"type": "string"},
+            "image": {"type": "string"},
+            "singer": {"type": "string"},
+        },
+        ["url", "audio", "title", "image"],
+    )
+    json_card = _segment(
+        "json",
+        {"payload": {"type": "object", "additionalProperties": True}},
+    )
     return [
-        send_def(),
-        {
-            "type": "function",
-            "function": {
-                "name": "web_search",
-                "description": ptext("tool_web_search"),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "搜索关键词，尽量短"}
-                    },
-                    "required": ["query"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "search_history",
-                "description": ptext("tool_search_history"),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "检索式。空格分开的词都要命中（AND）；"
-                                           "OR 表示任一命中，-词 表示排除，括号分组，"
-                                           "引号内是含空格的原文片段。"
-                                           "例：(打印机 OR 打印) -复印",
-                        },
-                        "speaker": {
-                            "type": "integer",
-                            "description": "只看这位成员说的话，填成员编号（名字后的 ⟦N⟧）；"
-                                           "不填则不限发言人",
-                        },
-                        "speaker_name": {
-                            "type": "string",
-                            "description": "要找的人在上文中没有编号时，按昵称只看其发言；"
-                                           "有编号时用 speaker",
-                        },
-                        "days": {
-                            "type": "integer",
-                            "description": "只看最近这些天；不填则不限时间",
-                        },
-                    },
-                    "required": ["query"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "read_url",
-                "description": ptext("tool_read_url"),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "url": {
-                            "type": "string",
-                            "description": "要读取的网页地址，须以 http:// 或 https:// 开头",
-                        }
-                    },
-                    "required": ["url"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "open_images",
-                "description": ptext("tool_open_images"),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "ns": {
-                            "type": "array",
-                            "items": {"type": "integer"},
-                            "description": "要查看的图片编号列表，取自转写里 ⟦图片N:…⟧、"
-                                           "⟦表情N:…⟧ 或 ⟦图片N⟧ 的 N；一次最多 "
-                                           f"{rcfg.open_images_max} 张",
-                        },
-                    },
-                    "required": ["ns"],
-                },
-            },
-        },
-        {
-            "type": "function",
-            "function": {
-                "name": "recall_events",
-                "description": ptext("tool_recall_events"),
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "question": {
-                            "type": "string",
-                            "description": "一句话描述要找的事",
-                        }
-                    },
-                    "required": ["question"],
-                },
-            },
-        },
+        text,
+        at,
+        reply,
+        face,
+        *empty,
+        member_contact,
+        group_contact,
+        music,
+        custom_music,
+        json_card,
     ]
+
+
+def send_def() -> ToolSpec:
+    """The only egress from the agent: an ordered, closed QQ segment sequence."""
+
+    return _tool(
+        SEND,
+        {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "array",
+                    "items": {"anyOf": _send_segments()},
+                    "minItems": 1,
+                    "maxItems": 32,
+                    "description": "按发送顺序排列的 QQ 消息段；@ 可插在任意位置。",
+                },
+            },
+            "required": ["content"],
+            "additionalProperties": False,
+        },
+    )
+
+
+def tool_defs(cfg: Settings | None = None) -> tuple[ToolSpec, ...]:
+    """Build typed tool contracts after each prompt/config reload."""
+
+    rcfg = (cfg or config().default).retrieval
+    return (
+        send_def(),
+        _tool(
+            "web_search",
+            {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索关键词，尽量短"}
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        ),
+        _tool(
+            "search_history",
+            {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "检索式。空格分开的词都要命中（AND）；"
+                        "OR 表示任一命中，-词 表示排除，括号分组，"
+                        "引号内是含空格的原文片段。例：(打印机 OR 打印) -复印",
+                    },
+                    "speaker": {
+                        "type": "integer",
+                        "description": "只看这位成员说的话，填成员编号（名字后的 ⟦N⟧）；"
+                        "不填则不限发言人",
+                    },
+                    "speaker_name": {
+                        "type": "string",
+                        "description": "要找的人在上文中没有编号时，按昵称只看其发言；"
+                        "有编号时用 speaker",
+                    },
+                    "days": {
+                        "type": "integer",
+                        "description": "只看最近这些天；不填则不限时间",
+                    },
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        ),
+        _tool(
+            "read_url",
+            {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "要读取的网页地址，须以 http:// 或 https:// 开头",
+                    }
+                },
+                "required": ["url"],
+                "additionalProperties": False,
+            },
+        ),
+        _tool(
+            "open_images",
+            {
+                "type": "object",
+                "properties": {
+                    "ns": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "要查看的图片编号列表，取自转写里 ⟦图片N:…⟧、"
+                        "⟦表情N:…⟧ 或 ⟦图片N⟧ 的 N；一次最多 "
+                        f"{rcfg.open_images_max} 张",
+                    }
+                },
+                "required": ["ns"],
+                "additionalProperties": False,
+            },
+        ),
+        _tool(
+            "recall_events",
+            {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "一句话描述要找的事",
+                    }
+                },
+                "required": ["question"],
+                "additionalProperties": False,
+            },
+        ),
+    )
 
 
 def _like(word: str) -> str:
@@ -481,32 +539,21 @@ class Failure(str):
     __slots__ = ()
 
 
-class Attachment(str):
-    """A tool answer that hands the model pictures rather than describing them.
+@dataclass(frozen=True, slots=True)
+class Attachment:
+    """A textual tool answer accompanied by provider-neutral image parts."""
 
-    Still a string - what it says is what everything downstream reads, so the
-    provenance marker and the trajectory digest need no special case - but it
-    carries the content parts that go into the tool message ahead of that text:
-    each picture's number as a text part, then its file block, so the model can
-    tell which number it is looking at. The vendor accepts a content array on a
-    tool message, so the pictures arrive as the answer to the call rather than
-    as a separate turn appended behind it.
-    """
+    text: str
+    parts: tuple[TextPart | StoredImage, ...]
 
-    __slots__ = ("parts",)
+    def content(self) -> tuple[TextPart | StoredImage, ...]:
+        return (*self.parts, TextPart(self.text))
 
-    def __new__(cls, text: str, parts: list[dict]):
-        s = super().__new__(cls, text)
-        s.parts = parts
-        return s
-
-    def content(self) -> list[dict]:
-        """This answer as the tool message's content."""
-        return [*self.parts, {"type": "text", "text": str(self)}]
+    def __str__(self) -> str:
+        return self.text
 
 
-
-def verified(out: str) -> bool:
+def verified(out: str | Attachment) -> bool:
     """Whether a tool answer represents work that actually obtained something.
     The provenance marker excludes failed calls: it certifies that the reply was
     checked, and an answer improvised after a failed lookup is exactly the guess
@@ -541,22 +588,20 @@ def number(v: object) -> int | None:
 
 
 def _days(v: object) -> int | None:
-    """The `days` argument as a positive int, or None for none. Digit strings
-    are read (a common way models send integers); bools and non-positive values
-    mean no filter."""
-    if isinstance(v, bool):
-        return None
-    if isinstance(v, str) and v.strip().isdigit():
-        v = int(v.strip())
-    if isinstance(v, int) and v > 0:
-        return min(v, _MAX_DAYS)
-    return None
+    """The `days` argument as a bounded positive integer, or None."""
+    n = number(v)
+    return min(n, _MAX_DAYS) if n is not None else None
 
 
-async def execute(call: dict, *, cfg: Settings, group_id: str,
-                  ctx: ToolCtx | None = None) -> str:
-    name = call.get("function", {}).get("name")
-    raw_args = call.get("function", {}).get("arguments") or "{}"
+async def execute(
+    call: ToolCall,
+    *,
+    cfg: Settings,
+    group_id: str,
+    ctx: ToolCtx | None = None,
+) -> str | Attachment:
+    name = call.name
+    raw_args = call.arguments or "{}"
     try:
         args = json.loads(raw_args)
     except json.JSONDecodeError:
@@ -579,7 +624,7 @@ async def execute(call: dict, *, cfg: Settings, group_id: str,
                 or not all(isinstance(x, int) and not isinstance(x, bool) for x in ns)):
             return Failure("（需要图片编号列表。）")
         wanted = list(dict.fromkeys(ns))[:cfg.retrieval.open_images_max]
-        parts: list[dict] = []
+        parts: list[TextPart | StoredImage] = []
         shown: list[int] = []
         unknown: list[int] = []
         gone: list[int] = []
@@ -603,7 +648,7 @@ async def execute(call: dict, *, cfg: Settings, group_id: str,
             if not fid:
                 gone.append(n)
                 continue
-            parts += [{"type": "text", "text": f"图片{n}："}, {"type": "image", "id": fid}]
+            parts += [TextPart(f"图片{n}："), fid]
             shown.append(n)
 
         def nums(xs: list[int]) -> str:
@@ -617,19 +662,21 @@ async def execute(call: dict, *, cfg: Settings, group_id: str,
         if not shown:
             return Failure("（" + "；".join(notes) + "。）")
         text = f"（以上是图片 {nums(shown)} 的原图。" + ("".join(f"{n}。" for n in notes)) + "）"
-        return Attachment(text, parts)
+        return Attachment(text, tuple(parts))
 
     if name == "read_url":
         url = _text(args, "url")
         if not url.startswith(("http://", "https://")):
             return Failure("（需要一个 http/https 网址）")
+        reader = providers().page_reader
+        if reader is None:
+            return Failure("（当前搜索服务不支持读取网页）")
         try:
-            text = await providers().search.extract(
-                url, cfg=cfg.llm.search, group_id=group_id)
+            text = await reader.read_page(
+                url, cfg=cfg.capabilities.search, group_id=group_id
+            )
         except QuotaExhausted:
             raise
-        except NotImplementedError:
-            return Failure("（当前搜索后端不支持读取网页）")
         except Exception as e:
             log.warning("read_url failed: %s", why(e))
             return Failure("（网页读取失败）")
@@ -695,7 +742,9 @@ async def execute(call: dict, *, cfg: Settings, group_id: str,
     # while a transport failure stays a tool answer, because a broken network is an
     # error to talk around, not a limit to respect.
     try:
-        items = await providers().search.search(query, cfg=cfg.llm.search, group_id=group_id)
+        items = await providers().search.search(
+            query, cfg=cfg.capabilities.search, group_id=group_id
+        )
     except QuotaExhausted:
         raise
     except Exception as e:

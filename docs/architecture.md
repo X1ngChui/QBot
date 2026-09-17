@@ -26,19 +26,37 @@ missing one fails `docker compose up` rather than the first API call.
 The code deals in five capabilities and never names a vendor outside the providers
 package:
 
-| Capability | Used for | Default backend |
+| Capability | Used for | Default provider |
 | --- | --- | --- |
-| text | Replies, memory extraction, file upload for pictures | DeepSeek |
+| text | Replies, memory extraction, attachment storage for pictures | DeepSeek |
 | vision | One-line picture descriptions for the archive | DeepSeek |
-| asr | Voice transcription | sherpa-onnx with SenseVoice, in-process on the CPU |
+| asr | Voice transcription | sherpa-onnx with SenseVoice, fixed in-process CPU service |
 | embedding | Vectors for episode recall | DashScope `text-embedding-v4` |
-| search | Web search and page reading | Tavily |
+| search | Web search | Tavily |
+| page reader | Optional readable-page extraction | Tavily, sharing the search runtime |
 
-Each backend is a subclass of the capability's abstract base class in
-`qqbot/providers/base.py`. Platform differences (how cache hits are reported, how to
-disable deliberation, how a picture is attached) live in the subclass, so the layers
-above it stay vendor-neutral. `qqbot/providers/registry.py` maps the `backend` name in
-configuration to the class. Adding a backend is one subclass plus one registry entry.
+Lifecycle-bearing capabilities implement the abstract contracts in
+`qqbot/providers/base.py`; narrow collaborators such as attachment storage and page
+reading are protocols. Upper layers receive the `Providers` composition root and never
+see vendor wire objects, response ids or SDK exceptions.
+
+Text and vision use Responses end to end. One task-local `TextSession` owns the ordered
+replay for one addressed message; function results carry exact `call_id` values, and the
+session cannot branch or continue after completion. DeepSeek is stateless, so its codec
+replays the complete sequence locally. Prompt chunks remain independently reconstructible:
+response lineage is never shared across messages, persisted, or attached to a group.
+Reasoning items needed for same-session replay remain inside the provider adapter and are
+excluded from debug files, archives, evidence and structured memory.
+
+Responses transport, provider codec, pricing and task-local session strategy are composed
+rather than inherited through a vendor class tree. Configuration chooses a closed
+`provider` value; adapters own role mapping, reasoning parameters, cache accounting and
+attachment representation. There is no Chat Completions fallback and no hosted ASR path.
+
+Each Responses call emits privacy-safe cache telemetry containing only a random run id,
+provider/model, initial-or-continuation phase, replay strategy, stable-prefix hash,
+history count, token counts, estimated flag, charge, latency and status. It never logs
+prompt text, query text, tool output, reasoning content, response id or credential.
 
 Price tables live in the backend classes. An unknown model bills at the most expensive
 known tier and logs a warning, so a renamed model trips the budget early rather than
@@ -97,12 +115,13 @@ The engine is an agent loop bounded by money rather than by a round count:
 with budget.scope(per_reply_cny):
     loop:
         call the model with every tool offered
+        reject a failed, incomplete or unterminated response before any tool can run
         a send_message call -> return it (other calls in the same round are not run)
-        no tool calls, only text -> tell the model it was not sent (once), else silence
-        per-reply cap already spent -> one final round offered only send_message
-        execute the tool calls (a repeated identical call is answered in words, not re-run)
-        monthly search allowance exhausted -> the same final round
-        append results as tool messages
+        no function calls, only text -> log it and end in silence
+        append every output item unchanged (reasoning included only in this task)
+        execute or refuse every function call and append one output with its call_id
+        per-reply cap spent or monthly search allowance exhausted -> one final round
+            offered only send_message
 ```
 
 The first round always runs. A cap that trips mid-reply does not discard the reply:
@@ -280,7 +299,7 @@ Nineteen tables in `sql/init.sql`, layered:
 | Facts | `memory_fact`, `memory_fact_evidence`, `memory_candidate` | Temporal facts about persons and groups, their evidence, and the model's proposals awaiting validation. |
 | Episodes | `episode`, `episode_participant`, `episode_event` | Summaries of stretches of conversation, with participants. |
 | Index and queue | `embedding_index`, `memory_job` | Vectors, kept apart from what they index; the background job queue. |
-| Operations | `reply_trace`, `cost_ledger`, `group_state`, `group_blocklist`, `user_agreement`, `image_cache` | Retrieval traces, spending, per-group switches and watermarks, blocks, consent, picture descriptions and file ids. |
+| Operations | `reply_trace`, `cost_ledger`, `group_state`, `group_blocklist`, `user_agreement`, `image_cache` | Expiring structured reply evidence, spending, per-group switches and watermarks, blocks, consent, picture descriptions and file ids. |
 
 Every table that carries a `group_id` indexes it first, and no retrieval path crosses
 groups. The identity graph (which accounts form one person) is the one deliberately
@@ -342,13 +361,18 @@ The extraction watermark (`group_state.last_extract_at`) records what was actual
 read and never moves backwards. `/relearn` pulls it back exactly one window and forces
 past the drain floor.
 
-### Retrieval traces
+### Reply evidence
 
-What each reply looked up, with result digests, is stored in `reply_trace`, one row
-per reply. Prompt assembly seats each trace directly before the reply it fed, so the
-model can see what its earlier answers rested on. Traces are the bot's working notes,
-not the group's memory: they are never archived in `raw_event` and are invisible to
-search and extraction.
+Each reply's retrieval work becomes a versioned `EvidenceMemo`: a closed source kind,
+a bounded sanitized request summary, verified/unconfirmed outcome, bounded defanged
+digest, and explicit creation/expiry times. It contains no provider response, reasoning,
+response id, prompt-local member number or full page. The physical `reply_trace` table
+name remains for migration compatibility; schema-v0 text rows are read until expiry,
+while every new row writes only structured JSON.
+
+Prompt assembly renders unexpired evidence immediately before the send call it supported.
+The memo is working context for nearby follow-ups, not group memory: it is absent from
+`raw_event`, search and extraction, and the nightly pipeline deletes expired rows.
 
 ## Budget
 
@@ -362,10 +386,10 @@ Two levels, both in `qqbot/core/budget.py`:
   own priced spend into it. The gate reads money already spent, never a forecast, so a
   model the price table does not know cannot silently disable the tools.
 
-The monthly search allowance (`llm.search.monthly_quota`) is metered from the ledger's
+The monthly search allowance (`capabilities.search.monthly_quota`) is metered from the ledger's
 calendar-month call count in the vendor's own unit; an advanced-depth search books two,
 and page reads debit the same pool. Both caps are global: a per-group override of either
-is ignored with a warning.
+is rejected when the configuration bundle is loaded.
 
 Attribution is task-local and feeds `/top` only. A reply's entire spend, including the
 transcriptions, picture looks and searches it forces, is booked to the member who
@@ -378,7 +402,7 @@ is still booked to the ledger at zero.
 ## Concurrency
 
 One reply task per addressed message. A global semaphore at the provider layer
-(`llm.text.max_concurrency`) bounds concurrent model calls. Background work rides the
+(`capabilities.text.max_concurrency`) bounds concurrent model calls. Background work rides the
 database job queue (`FOR UPDATE SKIP LOCKED`, leases, and a partial unique index that
 keeps one pending job per type and group). Extraction jobs hold a lease long enough
 that a deploy overlapping a drain cannot run it twice.

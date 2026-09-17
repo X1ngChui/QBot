@@ -129,6 +129,40 @@ ep = Episode(group_id=111, summary="讨论了买哪把键盘",
              event_ids=(uuid.uuid4(),))
 check("事件挂着原始消息作为凭据", len(ep.event_ids) == 1)
 
+from datetime import UTC, datetime, timedelta
+from qqbot.domain.evidence import (
+    EvidenceItem,
+    EvidenceMemo,
+    EvidenceOutcome,
+    EvidenceSource,
+)
+
+_evidence_now = datetime.now(UTC)
+_evidence = EvidenceMemo(
+    items=(
+        EvidenceItem(
+            source=EvidenceSource.HISTORY,
+            request="虚构查询",
+            outcome=EvidenceOutcome.VERIFIED,
+            digest="虚构结果",
+        ),
+    ),
+    created_at=_evidence_now,
+    expires_at=_evidence_now + timedelta(days=30),
+)
+_evidence_roundtrip = EvidenceMemo.from_dict(_evidence.to_dict())
+check("evidence memo round-trips through versioned JSON", _evidence_roundtrip == _evidence)
+try:
+    EvidenceMemo(items=(), created_at=_evidence_now, expires_at=_evidence_now)
+    check("an invalid evidence memo cannot be constructed", False, "accepted")
+except ValueError:
+    check("an invalid evidence memo cannot be constructed", True)
+check(
+    "evidence has a stable prompt projection",
+    _evidence.render() == "⟦检索记录⟧\n查档“虚构查询”：虚构结果",
+    _evidence.render(),
+)
+
 print()
 print("FAILED:", fails if fails else "none")
 sys.exit(1 if fails else 0)

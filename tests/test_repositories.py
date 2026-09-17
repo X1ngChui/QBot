@@ -15,8 +15,9 @@ import uuid
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("CONFIG_DIR", str(ROOT / "tests" / "fixtures" / "config"))
-os.environ.setdefault("DATABASE_URL", "postgresql://qqbot@127.0.0.1:15432/qqbot")
-os.environ.setdefault("DATABASE_PASSWORD", "testpw")
+from _db import configure_test_database
+
+configure_test_database()
 
 from qqbot.db import close_pool, init_pool, pool
 from qqbot.domain.identity import (

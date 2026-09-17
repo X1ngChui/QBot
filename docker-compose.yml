@@ -78,9 +78,12 @@ services:
       - HOST=0.0.0.0
       - PORT=8080
       # Credentials come from .env, named after the capability they serve, never after
-      # a platform: which platform answers is decided in config/settings.yaml. The
-      # :?-form makes a missing entry fail the `up`, not the first API call hours in.
-      - TEXT_API_KEY=${TEXT_API_KEY:?set TEXT_API_KEY in .env}
+      # a platform: which platform answers is decided in config/settings.yaml. Keys
+      # that no configured local backend can replace use :? so a missing entry fails
+      # `up`; text is checked by the selected capability below.
+      # Text may be a keyless local backend; capability-aware startup/preflight checks
+      # credentials for every selected hosted backend.
+      - TEXT_API_KEY=${TEXT_API_KEY:-}
       - MEDIA_API_KEY=${MEDIA_API_KEY:?set MEDIA_API_KEY in .env}
       - SEARCH_API_KEY=${SEARCH_API_KEY:?set SEARCH_API_KEY in .env}
     volumes:

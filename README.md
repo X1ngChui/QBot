@@ -48,7 +48,9 @@ The bot deals in five capabilities: text, vision, speech recognition, embedding 
 web search. Which provider serves each capability, with which model and credential,
 is declared in `config/settings.yaml`. The defaults use DeepSeek for text and vision,
 sherpa-onnx with SenseVoice in-process for speech recognition, Alibaba DashScope for
-embeddings, and Tavily for search. Adding a provider means writing one subclass and
+embeddings, and Tavily for search. Text and vision backends speak the Responses API;
+tool calls, results and reasoning continuation stay local to each reply task rather than
+using a provider-side conversation. Adding a provider means writing one subclass and
 registering it.
 
 Read [docs/architecture.md](docs/architecture.md) for the full picture.
@@ -118,8 +120,9 @@ Behaviour lives in `config/`, credentials in `.env`, runtime state in the databa
 | `config/prompts/*.txt` | Every instruction text the model reads |
 | `config/agreement.txt` | The user agreement shown by `/terms` |
 
-Most settings apply on `/reload`; a few need a restart. The reference is in
-[docs/configuration.md](docs/configuration.md).
+`/reload` applies reloadable edits atomically. If a process-owned setting changed, it
+rejects the whole candidate and reports which paths require a restart. The reference is
+in [docs/configuration.md](docs/configuration.md).
 
 ## Commands
 

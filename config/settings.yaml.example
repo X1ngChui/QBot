@@ -4,14 +4,12 @@
 # Per-group overrides go in config/personas/group_<gid>.yaml under `overrides`.
 # Two things this file does not say per line:
 #
-#   /reload vs restart. Most of this applies the moment /reload succeeds, because it
-#   is read at the point of use. These do not, and need a restart: every cron and
-#   misfire_grace_sec (registered with the scheduler at startup), the whole database
-#   block (the pool is built once), the whole memory block and llm.text.extract (the
-#   memory worker resolves them when it is constructed, so a reload cannot change a
-#   batch already being read), and llm.text.max_concurrency (the semaphore would lose
-#   outstanding permits if resized under load - the log says so when it notices).
-#   Editing timezone reloads fine everywhere except the already-registered crons.
+#   /reload vs restart. A reload is atomic: it either applies every edit or leaves the
+#   running bundle untouched. Process-owned resources require restart, including timezone,
+#   provider/endpoint/credential/concurrency fields, local ASR resources, database, memory,
+#   scheduler fields, extraction prompts and predicate definitions. /reload reports the
+#   exact paths that prevented it. Other policy, prompt and persona edits take effect when
+#   /reload succeeds.
 #
 #   Settings that wait on another setting are marked where they appear. A knob whose
 #   gate is shut does nothing at all - it is not doing a smaller version of its job.
@@ -37,9 +35,9 @@ trigger:
   # If it ever gets annoying, keep only the unambiguous names - @ still works.
   nicknames: ["小X", "小叉", "叉子"]
 
-# The deadlines and the shutdown wait below are read from this top-level section
-# only: they size clients and registries shared by every group, so a persona
-# override of them is ignored. media_wait_sec and max_msg_len honour overrides.
+# The shared gateway controls below are read from the top-level section only. A persona
+# override of one is rejected; media_wait_sec and max_msg_len remain group policy and may
+# be overridden.
 gateway:
   dedup_ttl_sec: 300
   max_msg_len: 2000
@@ -70,31 +68,30 @@ gateway:
 # (text / vision / asr / embedding / search) and never learns who serves them, so
 # retargeting one is an edit here and nothing else.
 #
-# `backend` picks the implementation class (providers/registry.py). Everything peculiar to
-# a platform - how it reports prompt-cache hits, how to tell it not to deliberate, what
-# extra fields its requests need - lives in that class, so this file stays declarative.
+# `provider` is a closed value checked by the schema. Everything peculiar to a platform -
+# prompt-cache accounting, reasoning controls and request extras - lives in its adapter, so
+# upper layers only see capabilities and this file stays declarative.
 #
-# api_key_env names a credential, it does not hold one; the value comes from .env
+# credential_env names a credential, it does not hold one; the value comes from .env
 # (docker-compose injects it - see .env.example). text and vision share TEXT_API_KEY
 # because one account serves both. Splitting them: new entry in .env and compose,
-# new name here. A backend that runs in-process (the ASR default) names no
-# credential at all.
-llm:
+# new name here. A provider that runs in-process (local ASR) names no credential.
+capabilities:
   # Retries for the plain-HTTP backends (embedding, search, file upload); the chat
   # backends use text.retries. And the longest a vendor's Retry-After may hold any
   # call - a vendor asking for minutes is asking the wrong client.
   http_retries: 2
   retry_after_cap_sec: 30
   text:
-    backend: deepseek
-    base_url: https://api.deepseek.com
-    api_key_env: TEXT_API_KEY
+    provider: deepseek
+    endpoint: https://api.deepseek.com
+    credential_env: TEXT_API_KEY
     model: deepseek-flash
     # "low" keeps sanity-check thinking without paying the full deliberation
     # habit at output prices.
     reasoning_effort: low
-    # RESTART: the semaphore is built once - resizing it under load would lose
-    # outstanding permits, so a change is logged and applied at the next start.
+    # RESTART: the semaphore is built once. A reload that changes this field is
+    # rejected atomically; restart to resize it without losing outstanding permits.
     max_concurrency: 3
     timeout_sec: 30
     retries: 2
@@ -104,9 +101,9 @@ llm:
     # account, and a second copy of an endpoint is how one goes stale.
     # Anything left out follows the reply settings above.
     extract:
-    # RESTART: the extractor resolves these when the worker is constructed, so a
-    # /reload never changes a batch mid-read. Any field left out inherits the reply
-    # setting above it.
+    # RESTART: the extractor freezes the resolved policy when its worker is built.
+    # A reload that changes it is rejected atomically. Any field left out inherits
+    # the reply setting above it.
       # The one place a cheaper tier can measurably do the reply model's work,
       # because extraction is schema-guarded and eval-covered. Empty = the
       # reply model. Change this or the grade below, then re-run
@@ -125,9 +122,9 @@ llm:
   # but a separate capability all the same: descriptions are written at arrival for
   # every picture, including in groups the bot never answers in.
   vision:
-    backend: deepseek
-    base_url: https://api.deepseek.com
-    api_key_env: TEXT_API_KEY
+    provider: deepseek
+    endpoint: https://api.deepseek.com
+    credential_env: TEXT_API_KEY
     model: deepseek-flash
     # Deliberation grade for the describing call: "low" buys meme-reading
     # judgement for a fraction of the vendor default's cost; "off" disables it.
@@ -152,30 +149,19 @@ llm:
     max_image_mb: 8
     timeout_sec: 30
   asr:
-    # In-process CPU transcription. GATE: on this backend there is no endpoint and
-    # no credential, so base_url and api_key_env are absent on purpose, model is
-    # only a ledger label, and model_dir is read by sherpa alone. Needs the
-    # model bundle on disk first: run scripts/fetch_asr_model.sh once on the
-    # deploy host (models/ is mounted into the container read-only).
-    backend: sherpa
-    model: sense-voice          # ledger label, not an API model id
+    # Fixed in-process SenseVoice CPU service. Download the model bundle once
+    # with scripts/fetch_asr_model.sh; models/ is mounted read-only.
+    # model_dir, threads, and queue_capacity require a restart.
     model_dir: /app/models/asr/sense-voice
     threads: 2
+    queue_capacity: 8
     max_audio_sec: 300
-    # Arrival-time transcription needs its own pace gate, like pictures'
-    # max_images_per_min. With the free backend this is a CPU guard; for a
-    # paid one (below) it is what stands before the daily cap, so lower it.
+    # Per-group admission guard in front of the global CPU queue.
     max_clips_per_min: 20
-    timeout_sec: 60   # read by the API backends only; sherpa decodes in-process with no deadline
-    # API alternative (per-second billing, MEDIA_API_KEY):
-    #   backend: dashscope
-    #   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-    #   model: qwen3-asr-flash
-    #   max_clips_per_min: 6
   embedding:
-    backend: dashscope
-    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-    api_key_env: MEDIA_API_KEY
+    provider: dashscope
+    endpoint: https://dashscope.aliyuncs.com/compatible-mode/v1
+    credential_env: MEDIA_API_KEY
     # Both are load-bearing beyond this file. dimensions must match the VECTOR(n)
     # column in sql/init.sql - a mismatch fails every insert. And vectors are stored
     # under the model that produced them and only ever searched under the current
@@ -185,12 +171,12 @@ llm:
     dimensions: 2048
     timeout_sec: 60
   search:
-    backend: tavily
-    base_url: https://api.tavily.com
-    api_key_env: SEARCH_API_KEY
+    provider: tavily
+    endpoint: https://api.tavily.com
+    credential_env: SEARCH_API_KEY
     count: 5
     depth: basic              # 1 credit; "advanced" costs 2
-    # A total over every group, like the daily cap: a persona override is ignored.
+    # One total over every group. A persona override is rejected.
     monthly_quota: 1000       # the free tier; at it search refuses, nothing bills
     # HTTP proxy for the search client only; model traffic stays direct. Empty
     # means direct. A proxy running on the deploy host is reached at the docker
@@ -204,8 +190,8 @@ budget:
   # timezone above.
   # Only paid backends answer to it: free ones (sherpa transcription) pass
   # straight through, so their pace gates are the only thing holding them.
-  # A total over every group against one shared ledger; a persona override of
-  # it is ignored (see _without_backends in settings.py).
+  # A total over every group against one shared ledger. A persona override is
+  # rejected because it cannot divide the process-wide ledger.
   daily_cny_cap: 3.0
   # What one reply may spend, in CNY, tool loop included. Money is the only
   # constraint: free tools run without limit, paid rounds account against this
@@ -231,10 +217,11 @@ prompt:
   forward_lines: 20
   forward_depth: 3
   forward_chars: 1500
-  # How much of the trajectory entry kept beside each of the bot's own replies
-  # survives: characters of each tool result, and of the whole entry.
-  trace_result_chars: 1200
-  trace_total_chars: 4000
+  # Bounded evidence retained beside one reply for nearby follow-ups. It is structured,
+  # rendered only when rebuilding a prompt, and deleted after the retention window.
+  evidence_result_chars: 1200
+  evidence_total_chars: 4000
+  evidence_ttl_days: 30
   # The provenance marker on the bot's own archived lines: how many tool uses it
   # names and how much of each query survives - a record of what an answer rested
   # on, not a replay.
@@ -274,10 +261,10 @@ retrieval:
 
 # How much the memory pipeline reads, and how fast it lets go. The model that runs
 # extraction is not here - it belongs to the capability doing the work
-# (llm.text.extract); this is the machinery around it.
+# (capabilities.text.extract); this is the machinery around it.
 memory:
-  # RESTART: the memory worker resolves this whole block when it is constructed, so
-  # a /reload cannot change a batch already being read. Edits apply at the next start.
+  # RESTART: the memory worker freezes this whole block at construction. A reload
+  # that changes it is rejected atomically; restart to apply the edit.
   # Messages one extraction chunk holds at most. /relearn's watermark reset keeps
   # exactly this many unread, so the two move together.
   extract_window: 120
@@ -300,9 +287,8 @@ memory:
   job_lease_min: 30
 
 schedule:
-  # RESTART: both crons and misfire_grace_sec are handed to the scheduler at startup.
-  # /reload validates them and accepts the file, but the jobs keep their old triggers
-  # until the next start. Everything else in this block is read when the night runs.
+  # RESTART: the scheduler owns this whole block. A reload that changes any field
+  # is rejected atomically; restart to register the new values.
   # The whole night is one pipeline in dependency order - extraction drain,
   # decay, pg_dump, napcat cache sweep - with a queue-drain wait between
   # stages (tasks.nightly). The report fires the moment the ledger day

@@ -22,7 +22,18 @@ from dataclasses import dataclass, field
 
 from ..domain.identity import AliasType
 from ..domain.memory import Candidate, CandidateType
-from ..providers import Kind, providers
+from ..providers import providers
+from ..providers.contracts import (
+    CallContext,
+    CallPurpose,
+    GenerationPolicy,
+    Message,
+    ModelRequest,
+    ReasoningEffort,
+    Role,
+    ToolCall,
+    ToolSpec,
+)
 from ..settings import PREDICATE_SLOT, Settings, config, ptext
 from ..util import SYS_R
 
@@ -80,10 +91,16 @@ def rules_block() -> str:
 
 #: Deliberately without `note`: that predicate belongs to what an owner typed, and the
 #: model must have no way to write over it.
-ALIAS_KINDS = tuple(t.value for t in (
-    AliasType.NICKNAME, AliasType.SHORT_NAME, AliasType.JOKE_NAME,
-    AliasType.TITLE, AliasType.RELATIONSHIP_NAME,
-))
+ALIAS_KINDS = tuple(
+    t.value
+    for t in (
+        AliasType.NICKNAME,
+        AliasType.SHORT_NAME,
+        AliasType.JOKE_NAME,
+        AliasType.TITLE,
+        AliasType.RELATIONSHIP_NAME,
+    )
+)
 
 #: What may be recorded about the group itself, as opposed to about anyone in it. Two
 #: kinds, and the omissions are the point.
@@ -118,131 +135,130 @@ def decay_classes() -> tuple[tuple[str, ...], tuple[str, ...]]:
     return stable, tuple(n for n, p in table.items() if p.decay == "fast")
 
 
-def tools() -> list[dict]:
+def tools() -> tuple[ToolSpec, ...]:
     """The tool definitions, built fresh so an edited predicate table applies.
 
     The predicate enum comes from the same entries the prompt block is rendered
     from: the model cannot be offered a name it was given no meaning for.
     """
-    return [
+    definitions = [
         {
             "type": "function",
-            "function": {
-                "name": "record_alias",
-                "description": "记录一个称呼：群里用某个名字指代某个账号。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "alias": {"type": "string", "description": "被使用的称呼原文"},
-                        "account": {
-                            "type": "integer",
-                            "description": "被指代账号的编号，取自「本群账号」列表",
-                        },
-                        "kind": {
-                            "type": "string",
-                            "enum": list(ALIAS_KINDS),
-                            "description": "nickname 常用称呼；short_name 由昵称简化而来；"
-                                           "joke_name 玩笑性质的称呼；title 头衔或职务；"
-                                           "relationship_name 按关系叫的（如「师兄」）",
-                        },
-                        "quote": {"type": "string",
-                                  "description": "记录中逐字存在的一句，作为依据"},
+            "strict": False,
+            "name": "record_alias",
+            "description": "记录一个称呼：群里用某个名字指代某个账号。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "alias": {"type": "string", "description": "被使用的称呼原文"},
+                    "account": {
+                        "type": "integer",
+                        "description": "被指代账号的编号，取自「本群账号」列表",
                     },
-                    "required": ["alias", "account", "kind", "quote"],
+                    "kind": {
+                        "type": "string",
+                        "enum": list(ALIAS_KINDS),
+                        "description": "nickname 常用称呼；short_name 由昵称简化而来；"
+                        "joke_name 玩笑性质的称呼；title 头衔或职务；"
+                        "relationship_name 按关系叫的（如「师兄」）",
+                    },
+                    "quote": {"type": "string", "description": "记录中逐字存在的一句，作为依据"},
                 },
+                "required": ["alias", "account", "kind", "quote"],
             },
         },
         {
             "type": "function",
-            "function": {
-                "name": "record_fact",
-                "description": "记录一条关于某个账号的稳定事实。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "account": {
-                            "type": "integer",
-                            "description": "主语账号的编号，取自「本群账号」列表",
-                        },
-                        "predicate": {"type": "string", "enum": list(predicate_names())},
-                        "object": {
-                            "type": "string",
-                            "description": "宾语，只写值本身。举例：lives_in 写「杭州」，"
-                                           "works_as 写「实习生」，works_at 写「某某券商」。"
-                                           "不加括号注解、补充说明或时间限定，"
-                                           "也不要把职位和单位写进同一个值",
-                        },
-                        "quote": {"type": "string",
-                                  "description": "记录中逐字存在的一句，作为依据"},
+            "strict": False,
+            "name": "record_fact",
+            "description": "记录一条关于某个账号的稳定事实。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "account": {
+                        "type": "integer",
+                        "description": "主语账号的编号，取自「本群账号」列表",
                     },
-                    "required": ["account", "predicate", "object", "quote"],
+                    "predicate": {"type": "string", "enum": list(predicate_names())},
+                    "object": {
+                        "type": "string",
+                        "description": "宾语，只写值本身。举例：lives_in 写「杭州」，"
+                        "works_as 写「实习生」，works_at 写「某某券商」。"
+                        "不加括号注解、补充说明或时间限定，"
+                        "也不要把职位和单位写进同一个值",
+                    },
+                    "quote": {"type": "string", "description": "记录中逐字存在的一句，作为依据"},
                 },
+                "required": ["account", "predicate", "object", "quote"],
             },
         },
         {
             "type": "function",
-            "function": {
-                "name": "record_group_term",
-                "description": "记录本群一个术语、缩写或行话的含义。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "term": {"type": "string", "description": "这个词本身，原文照抄"},
-                        "meaning": {
-                            "type": "string",
-                            "description": "它在本群指什么，一句话说清",
-                        },
-                        "quote": {"type": "string",
-                                  "description": "记录中逐字存在的一句，作为依据"},
+            "strict": False,
+            "name": "record_group_term",
+            "description": "记录本群一个术语、缩写或行话的含义。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "term": {"type": "string", "description": "这个词本身，原文照抄"},
+                    "meaning": {
+                        "type": "string",
+                        "description": "它在本群指什么，一句话说清",
                     },
-                    "required": ["term", "meaning", "quote"],
+                    "quote": {"type": "string", "description": "记录中逐字存在的一句，作为依据"},
                 },
+                "required": ["term", "meaning", "quote"],
             },
         },
         {
             "type": "function",
-            "function": {
-                "name": "record_group_topic",
-                "description": "记录本群是干什么的。一个群只有一条。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "topic": {"type": "string", "description": "本群的性质与主题，一句话"},
-                        "quote": {"type": "string",
-                                  "description": "记录中逐字存在的一句，作为依据"},
-                    },
-                    "required": ["topic", "quote"],
+            "strict": False,
+            "name": "record_group_topic",
+            "description": "记录本群是干什么的。一个群只有一条。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {"type": "string", "description": "本群的性质与主题，一句话"},
+                    "quote": {"type": "string", "description": "记录中逐字存在的一句，作为依据"},
                 },
+                "required": ["topic", "quote"],
             },
         },
         {
             "type": "function",
-            "function": {
-                "name": "record_episode",
-                "description": "记录一件本群发生过的、以后可能被提起的事。",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "summary": {
-                            "type": "string",
-                            "description": "这件事是什么，一到两句话，写清谁做了什么；"
-                                           "只写记录里有的，不要补充没提到的细节",
-                        },
-                        "participants": {
-                            "type": "array",
-                            "items": {"type": "integer"},
-                            "description": "参与者的账号编号，取自「本群账号」列表；"
-                                           "只填能确认的人，指不准的宁可不填；"
-                                           "一个都指不出就不要调用",
-                        },
-                        "quote": {"type": "string",
-                                  "description": "记录中逐字存在的一句，作为依据"},
+            "strict": False,
+            "name": "record_episode",
+            "description": "记录一件本群发生过的、以后可能被提起的事。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "这件事是什么，一到两句话，写清谁做了什么；"
+                        "只写记录里有的，不要补充没提到的细节",
                     },
-                    "required": ["summary", "participants", "quote"],
+                    "participants": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "参与者的账号编号，取自「本群账号」列表；"
+                        "只填能确认的人，指不准的宁可不填；"
+                        "一个都指不出就不要调用",
+                    },
+                    "quote": {"type": "string", "description": "记录中逐字存在的一句，作为依据"},
                 },
+                "required": ["summary", "participants", "quote"],
             },
         },
     ]
+    return tuple(
+        ToolSpec(
+            name=item["name"],
+            description=item["description"],
+            parameters=item["parameters"],
+            strict=bool(item.get("strict", False)),
+        )
+        for item in definitions
+    )
 
 
 def line_body(line: str) -> str:
@@ -353,15 +369,19 @@ class MemoryExtractor:
         # rather than mid-batch. tone_rules is the discernment core shared with the
         # reply path - what counts as said-in-earnest is one judgment, stated once -
         # followed by this path's consequence note (what not to record).
-        base = (ptext("extract").replace(PREDICATE_SLOT, rules_block())
-                + "\n\n【群聊语用】\n"
-                + ptext("tone_rules") + "\n\n" + ptext("tone_extract_note"))
+        base = (
+            ptext("extract").replace(PREDICATE_SLOT, rules_block())
+            + "\n\n【群聊语用】\n"
+            + ptext("tone_rules")
+            + "\n\n"
+            + ptext("tone_extract_note")
+        )
         self._prompt = (base + "\n\n" + legend.strip()) if legend.strip() else base
         # Extraction's own model, grade and timeout on the reply backend's wiring:
-        # same endpoint, same key, its own price tier and its own patience.
-        # Resolved once - like the prompt above, a /reload applies from the next
-        # restart, never mid-batch.
-        self._llm = cfg.llm.text.for_extract()
+        # same endpoint, same key, its own price tier and its own patience. The
+        # resolved policy is frozen here; a reload changing it is rejected until
+        # restart.
+        self._text_cfg = cfg.capabilities.text.for_extract()
 
     @property
     def prompt(self) -> str:
@@ -372,58 +392,68 @@ class MemoryExtractor:
     async def extract(self, inp: ExtractionInput) -> list[Candidate]:
         """One call reads the whole batch. Returns candidates; writes and validates
         nothing."""
-        res = await providers().text.chat(
-            [
-                {"role": "system", "content": self._prompt},
-                # Ordered by how often each part changes, as everywhere else: the accounts
-                # and what is already known move once a day, the transcript every batch.
-                {"role": "user", "content": "\n\n".join(p for p in (
-                    f"你的名字：{inp.self_names}" if inp.self_names else "",
-                    f"本群账号：\n{inp.roster}",
-                    f"【已经记过的】\n{inp.known}" if inp.known else "",
-                    f"群聊记录：\n{inp.transcript}",
-                ) if p)},
-            ],
-            # Model, grade and timeout all come from this one config: extraction is
-            # a use of the text capability with its own settings, not the reply
-            # path's settings with exceptions bolted on at the call.
-            cfg=self._llm,
+        request = ModelRequest(
+            prompt=(
+                Message(Role.SYSTEM, self._prompt),
+                Message(
+                    Role.USER,
+                    "\n\n".join(
+                        part
+                        for part in (
+                            f"你的名字：{inp.self_names}" if inp.self_names else "",
+                            f"本群账号：\n{inp.roster}",
+                            f"【已经记过的】\n{inp.known}" if inp.known else "",
+                            f"群聊记录：\n{inp.transcript}",
+                        )
+                        if part
+                    ),
+                ),
+            ),
             tools=tools(),
-            kind=Kind.EXTRACT,
-            group_id=str(inp.group_id),
+            policy=GenerationPolicy(
+                model=self._text_cfg.model,
+                reasoning=ReasoningEffort(self._text_cfg.reasoning_effort),
+                timeout_sec=self._text_cfg.timeout_sec,
+                retries=self._text_cfg.retries,
+            ),
+            context=CallContext(CallPurpose.EXTRACT, str(inp.group_id)),
         )
-        return [c for tc in res.tool_calls
-                if (c := self._to_candidate(tc, inp)) is not None]
+        async with providers().text.open_session(request) as session:
+            turn = await session.start()
+        return [
+            candidate
+            for call in turn.tool_calls
+            if (candidate := self._to_candidate(call, inp)) is not None
+        ]
 
     @staticmethod
-    def _to_candidate(call: dict, inp: ExtractionInput) -> Candidate | None:
-        fn = (call.get("function") or {})
-        name = fn.get("name")
+    def _to_candidate(call: ToolCall, inp: ExtractionInput) -> Candidate | None:
+        name = call.name
         try:
-            args = json.loads(fn.get("arguments") or "{}")
+            args = json.loads(call.arguments or "{}")
         except json.JSONDecodeError:
             log.warning("group %s: tool arguments were not JSON, dropped", inp.group_id)
             return None
         if not isinstance(args, dict):
             # Valid JSON but not an object - a bare list or string. One such call
             # must not take the whole batch down after the read was paid for.
-            log.warning("group %s: tool arguments were not an object, dropped",
-                        inp.group_id)
+            log.warning("group %s: tool arguments were not an object, dropped", inp.group_id)
             return None
 
-        kind = {"record_alias": CandidateType.ALIAS,
-                "record_fact": CandidateType.FACT,
-                "record_group_term": CandidateType.GROUP_FACT,
-                "record_group_topic": CandidateType.GROUP_FACT,
-                "record_episode": CandidateType.EPISODE}.get(name)
+        kind = {
+            "record_alias": CandidateType.ALIAS,
+            "record_fact": CandidateType.FACT,
+            "record_group_term": CandidateType.GROUP_FACT,
+            "record_group_topic": CandidateType.GROUP_FACT,
+            "record_episode": CandidateType.EPISODE,
+        }.get(name)
         if kind is None:
             log.warning("group %s: unknown tool %r, dropped", inp.group_id, name)
             return None
         if kind is CandidateType.GROUP_FACT:
             # Which tool it was is what tells the two group predicates apart; the payload
             # alone cannot, and the consolidator needs to know.
-            args = args | {"kind": GROUP_TERM if name == "record_group_term"
-                           else GROUP_TOPIC}
+            args = args | {"kind": GROUP_TERM if name == "record_group_term" else GROUP_TOPIC}
 
         return Candidate(
             candidate_type=kind,

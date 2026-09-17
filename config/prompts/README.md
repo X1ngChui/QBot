@@ -12,23 +12,32 @@ marker means changing the code and the prompt that explains it together.
 
 ## How the files compose
 
-The reply prompt's system message is a sequence of blocks, each under a heading written
-in code (`qqbot/core/prompt.py`), in this order:
+The reply request uses three authority layers. Within each layer, blocks remain ordered
+from most stable to most volatile so prefix caching can reuse the longest safe prefix.
 
 ```text
-【怎样发言】        send_rules
-【消息记录读法】    legend + legend_reply_note
-【成员与编号】      identity_rules
-【信息与检索】      credibility_rules
-【不说出去的内容】  private_rules
-【群聊语用】        tone_rules
-【你的身份】        the group's persona
-【本群背景】        group knowledge
-【群成员名册】      the roster
+system
+  【怎样发言】        send_rules
+  【消息记录读法】    legend + legend_reply_note
+  【成员与编号】      identity_rules
+  【信息与检索】      credibility_rules
+  【不说出去的内容】  private_rules
+  【群聊语用】        tone_rules
+
+developer
+  【你的身份】        the group's persona
+  【本群背景】        fixed background + learned background
+  【群成员名册】      confirmed roster + unconfirmed summaries
+
+user
+  conversation history
+  current clock + the newly received message + reply_final
 ```
 
-The rule blocks come first and are identical for every group. The history follows, then
-one last user message: the current time, the message just received, and `reply_final`.
+The global policy is identical across groups. Group context changes less often than
+conversation history, and the current clock and message always remain at the tail. On
+DeepSeek, the provider codec maps the developer item to the closest supported wire role;
+the domain prompt and all upper layers retain the separation.
 
 The extraction prompt:
 
@@ -62,7 +71,7 @@ for both.
 | `extract` | extraction | The full rulebook for memory extraction: what counts as a fact, the predicate list rendered from `predicates.yaml`, quoting rules, the bot's own names, events, and what never becomes a record. Tightly coupled to the tool schemas the validator enforces. |
 | `extract_legend_note` | extraction | Markers are transcription artefacts, not group knowledge; descriptions, forwards and cards are not the sender's words, voice transcripts are; lines tagged `⟦你⟧` yield nothing; `⟦N⟧` here numbers accounts, and names them in the tools. |
 | `describe_image` | vision | The one- or two-sentence archival description of a picture. |
-| `tool_send_message` | reply | The only way to the group; calling it ends the reply; what `text`, `at` and `reply` do, and that with neither `at` nor `reply` the message is plain. |
+| `tool_send_message` | reply | The ordered `content` array and every supported closed message-segment variant; exact origins of member/line numbers and rich-card parameters; arbitrary-position mentions; atomic validation and corrected retry; fictional JSON examples. |
 | `tool_web_search`, `tool_read_url` | reply | The outside world: when to search, and reading one page. |
 | `tool_search_history` | reply | The query syntax, how to phrase and widen a search that comes back empty, and the shape of the answer. |
 | `tool_recall_events` | reply | Past events by meaning, and how recalled events are framed in time. |
@@ -80,9 +89,11 @@ Personas and group knowledge are not prompt files; they live in `config/personas
 
 ## Changing a prompt
 
-1. Edit the file.
-2. Run the matching evaluation against the real model:
-   `scripts/eval_replies.py` for the reply family, `scripts/eval_extract.py` for the
-   extraction family (see [docs/operations.md](../../docs/operations.md)). Each run
-   costs a few cents.
-3. `/reload` for reply-path files; restart for extraction-path files.
+1. Edit the related files as one family and render the combined role layout.
+2. Run `scripts/review_prompts.py`; it requires the configured text provider to be
+   DeepSeek and reviews only shipped prompts plus fictional sample context.
+3. Run the matching behavioral evaluation: `scripts/eval_replies.py` for the reply
+   family or `scripts/eval_extract.py` for extraction (see
+   [docs/operations.md](../../docs/operations.md)). Each run costs a few cents.
+4. `/reload` for reply-path files. Extraction-path prompt changes make `/reload`
+   reject the candidate atomically; restart to apply them.

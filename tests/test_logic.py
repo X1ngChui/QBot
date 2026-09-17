@@ -6,8 +6,9 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("CONFIG_DIR", str(ROOT / "tests" / "fixtures" / "config"))
-os.environ.setdefault("DATABASE_URL", "postgresql://qqbot@127.0.0.1:15432/qqbot")
-os.environ.setdefault("DATABASE_PASSWORD", "testpw")
+from _db import configure_test_database
+
+configure_test_database()
 
 
 from qqbot.settings import config
@@ -121,22 +122,28 @@ check("arming zero disarms", _dbg.arm(0) == 0 and _dbg.armed() == 0)
 _dbg.arm(2)
 
 
-class _Res:
-    text = "好的"
-    tool_calls = []
-    model = "fake"
+from qqbot.providers.contracts import (
+    Message as _DbgMessage,
+    ModelTurn as _DbgTurn,
+    Role as _DbgRole,
+)
 
-
-_dbg.capture("777", 0, [{"role": "user", "content": "喂"}], _Res())
+_dbg.capture(
+    "777",
+    0,
+    (_DbgMessage(_DbgRole.USER, "喂"),),
+    _DbgTurn(text="好的", model="fake"),
+)
 check("a captured round decrements the tap", _dbg.armed() == 1)
 _caps = list(pathlib.Path(_dbg_dir, "debug").glob("reply-777-*.json"))
 check("and writes one JSON file per round", len(_caps) == 1, str(_caps))
 _cap = _json.loads(_caps[0].read_text(encoding="utf-8"))
-check("with the exact request and response inside",
-      _cap["messages"][0]["content"] == "喂" and _cap["text"] == "好的", str(_cap))
-_dbg.capture("777", 1, [object()], object())   # unserializable-ish: must not raise
+check("with the neutral request and response and no reasoning field",
+      _cap["prompt"][0]["content"] == "喂" and _cap["turn"]["text"] == "好的"
+      and "reasoning" not in _cap["turn"], str(_cap))
+_dbg.capture("777", 1, (object(),), object())   # invalid contract values must not raise
 check("a capture failure never raises and still disarms", _dbg.armed() == 0)
-_dbg.capture("777", 2, [], _Res())
+_dbg.capture("777", 2, (), _DbgTurn(text="ignored"))
 check("an exhausted tap writes nothing",
       len(list(pathlib.Path(_dbg_dir, "debug").glob("*.json"))) <= 2)
 del os.environ["LOG_DIR"]
@@ -296,18 +303,29 @@ _qn, _qm = prompt.numbered([_qa, _qb, _qc])
 _qp = _MN(self_id="999")
 prompt.number_people(_qp, [], [_qa, _qb, _qc], None)
 _qh = prompt.render_history([_qa, _qb, _qc], _qn, _qm, people=_qp)
-_qcall = (_qh[1].get("tool_calls") or [{}])[0].get("function") or {}
+from qqbot.providers.contracts import (
+    Message as _PromptMessage,
+    ToolCall as _PromptCall,
+    ToolResult as _PromptResult,
+)
+_qcall = _qh[1] if isinstance(_qh[1], _PromptCall) else None
 check("the bot's own line renders as its send call",
-      _qh[1]["role"] == "assistant" and _qcall.get("name") == "send_message"
-      and json.loads(_qcall.get("arguments") or "{}")
-      == {"text": "在的", "at": [1], "reply": 1}, repr(_qh[1]))
+      _qcall is not None and _qcall.name == "send_message"
+      and json.loads(_qcall.arguments or "{}")
+      == {"content": [
+          {"type": "reply", "data": {"line": 1}},
+          {"type": "at", "data": {"member": 1}},
+          {"type": "text", "data": {"text": "在的"}},
+      ]}, repr(_qh[1]))
+_qresult = _qh[2] if isinstance(_qh[2], _PromptResult) else None
 check("and its result carries the line number, the time and the provenance",
-      _qh[2]["role"] == "tool"
-      and _qh[2]["tool_call_id"] == _qh[1]["tool_calls"][0]["id"]
-      and _qh[2]["content"].startswith("已发送：#2 ⟦")
-      and _qh[2]["content"].endswith("⟦依据:搜索“在不在”⟧"), repr(_qh[2]))
+      _qresult is not None and _qcall is not None
+      and _qresult.call_id == _qcall.call_id
+      and str(_qresult.output).startswith("已发送：#2 ⟦")
+      and str(_qresult.output).endswith("⟦依据:搜索“在不在”⟧"), repr(_qh[2]))
 check("a member's line keeps its quote mark and wears its member number",
-      "阿花⟦2⟧: ⟦回复 #1⟧" in _qh[3]["content"], repr(_qh[3]["content"]))
+      isinstance(_qh[3], _PromptMessage)
+      and "阿花⟦2⟧: ⟦回复 #1⟧" in _qh[3].content, repr(_qh[3]))
 
 # A message the adapter replays across a restart must not enter the window twice:
 # the pipeline's dedup set is process-local, and load_history - triggered by that
@@ -328,12 +346,20 @@ msgs = prompt.assemble(
     persona=persona, cfg=cfg, st=st, msg=asked,
     profiles=[{"user_id": "u1", "nickname": "阿强", "persona_card": "爱打游戏"}],
 )
-check("system first", msgs[0]["role"] == "system")
-check("persona in system", "小X" in msgs[0]["content"])
-check("profile in system", "爱打游戏" in msgs[0]["content"])
-check("history in the middle", all(m["role"] in ("user", "assistant") for m in msgs[1:-1]))
-tail = msgs[-1]["content"]
-check("tail is last user msg", msgs[-1]["role"] == "user")
+check("system first", isinstance(msgs[0], _PromptMessage) and msgs[0].role is _DbgRole.SYSTEM)
+check("global policy stays in system", "【怎样发言】" in msgs[0].content)
+check("group context follows as developer",
+      isinstance(msgs[1], _PromptMessage) and msgs[1].role is _DbgRole.DEVELOPER)
+check("persona in developer", "小X" in msgs[1].content)
+check("profile in developer", "爱打游戏" in msgs[1].content)
+check(
+    "history follows both authority layers",
+    all(isinstance(item, _PromptMessage) and item.role in (_DbgRole.USER, _DbgRole.ASSISTANT)
+        for item in msgs[2:-1]),
+)
+tail = msgs[-1].content
+check("tail is last user msg", isinstance(msgs[-1], _PromptMessage)
+      and msgs[-1].role is _DbgRole.USER)
 check("current msg in tail", "小X你在吗" in tail)
 
 # The clock. A model has no time of its own, so it has to be told - but it must sit past
@@ -341,7 +367,7 @@ check("current msg in tail", "小X你在吗" in tail)
 # prefix cache on every call.
 from qqbot import util as _util
 check("current time is in the prompt", "当前时间：" in tail, tail[:40])
-check("clock is NOT in the cached system block", "当前时间：" not in msgs[0]["content"])
+check("clock is NOT in the cached system block", "当前时间：" not in msgs[0].content)
 check("clock names the weekday", any(d in tail for d in _util.WEEKDAYS))
 
 # timezone is configurable, and a typo must not take the bot down
@@ -488,9 +514,9 @@ check("a line whose markers outnumber its pictures stays unnumbered",
       "⟦图片1:" not in _pf.render(seq=1, pic_nums=[1]), _pf.render(seq=1, pic_nums=[1]))
 _mn = prompt.assemble(persona=persona, cfg=cfg, st=st, msg=asked, profiles=[])
 check("every prompt message is a plain string - pictures are opened, never pushed",
-      all(isinstance(m["content"], str) for m in _mn))
+      all(isinstance(item, _PromptMessage) and isinstance(item.content, str) for item in _mn))
 check("the legend tells the model to open pictures by number",
-      "open_images" in _mn[0]["content"])
+      isinstance(_mn[0], _PromptMessage) and "open_images" in _mn[0].content)
 
 # ---- forwarded chat records: delivered inline, rendered as an indented block
 # The protocol side sends a forwarded record's entries inside the segment, nested
@@ -567,6 +593,171 @@ _fw5 = parse_segments(_outer, "999", limits=_onlyfirst)
 check("a picture in an unrendered entry is not registered",
       _fw5.pictures == [] and "⟦图片⟧" not in _fw5.render(), _fw5.render())
 
+# ---- ordered outbound QQ segments -----------------------------------------
+from qqbot.core.agent import parse_send as _parse_send
+from qqbot.core.tools import send_def as _send_def
+from qqbot.core.outbound import (
+    AtSegment as _OutAt,
+    ContactSegment as _OutContact,
+    CustomMusicSegment as _OutCustomMusic,
+    DiceSegment as _OutDice,
+    FaceSegment as _OutFace,
+    JsonCardSegment as _OutJson,
+    MarketFaceSegment as _OutMarketFace,
+    MusicSegment as _OutMusic,
+    ReplySegment as _OutReply,
+    RpsSegment as _OutRps,
+    TextSegment as _OutText,
+    to_onebot as _to_onebot,
+)
+from qqbot.providers.contracts import ToolCallId as _OutCallId
+
+_send_spec = _send_def()
+_send_description = _send_spec.description
+check("send tool expands the fixed QQ face catalog",
+      "14=微笑" in _send_description and "326=生气" in _send_description
+      and "{{FACE_CATALOG}}" not in _send_description,
+      _send_description[-200:])
+_send_contract = json.dumps(_send_spec.parameters, ensure_ascii=False)
+check("send tool does not expose market faces to the model",
+      "mface" not in _send_description and "商城表情" not in _send_description
+      and "mface" not in _send_contract)
+
+_out_people = _MN(self_id="bot")
+_out_people.number("member-a", spoke=True)
+_out_people.number("member-b", spoke=True)
+_out_line = ChatMsg(
+    msg_id="line-7",
+    user_id="member-a",
+    nickname="甲",
+    text="问题",
+    ts=now_local(),
+)
+
+
+def _out_call(content):
+    return _PromptCall(
+        _OutCallId("send-test"),
+        "send_message",
+        json.dumps({"content": content}, ensure_ascii=False),
+    )
+
+
+_out_content = [
+    {"type": "text", "data": {"text": "请"}},
+    {"type": "at", "data": {"member": 2}},
+    {"type": "text", "data": {"text": "看这里"}},
+    {"type": "face", "data": {"id": 14}},
+    {"type": "dice", "data": {}},
+    {"type": "rps", "data": {}},
+    {"type": "mface", "data": {
+        "package_id": "pkg", "emoji_id": "emoji", "key": "key", "summary": "[测试表情]",
+    }},
+    {"type": "contact_member", "data": {"member": 1}},
+    {"type": "contact_group", "data": {}},
+    {"type": "music", "data": {"platform": "qq", "id": "42"}},
+    {"type": "music_custom", "data": {
+        "url": "https://example.invalid/song",
+        "audio": "https://example.invalid/song.mp3",
+        "title": "测试曲",
+        "image": "https://example.invalid/cover.jpg",
+        "singer": "测试歌手",
+    }},
+    {"type": "json", "data": {"payload": {"app": "test", "version": 1}}},
+    {"type": "reply", "data": {"line": 7}},
+]
+_out_reply, _out_note = _parse_send(
+    _out_call(_out_content),
+    people=_out_people,
+    lines={7: _out_line},
+    group_id="123",
+)
+check("ordered send parses every supported scalar-only segment", _out_reply is not None,
+      _out_note)
+_out_types = tuple(type(segment) for segment in _out_reply.segments)
+check("an @ keeps its arbitrary position",
+      _out_types[:3] == (_OutText, _OutAt, _OutText), str(_out_types))
+check("special segments remain closed typed variants",
+      all(kind in _out_types for kind in (
+          _OutFace, _OutDice, _OutRps, _OutMarketFace, _OutContact,
+          _OutMusic, _OutCustomMusic, _OutJson, _OutReply,
+      )), str(_out_types))
+_out_wire = [_to_onebot(segment) for segment in _out_reply.segments]
+check("typed variants project to literal OneBot nested segments",
+      [segment["type"] for segment in _out_wire]
+      == ["text", "at", "text", "face", "dice", "rps", "mface", "contact",
+          "contact", "music", "music", "json", "reply"], str(_out_wire))
+check("member and message numbers resolve against this snapshot",
+      _out_wire[1]["data"]["qq"] == "member-b"
+      and _out_wire[-1]["data"]["id"] == "line-7")
+
+_repeated, _ = _parse_send(
+    _out_call([
+        {"type": "at", "data": {"member": 1}},
+        {"type": "text", "data": {"text": "和"}},
+        {"type": "at", "data": {"member": 1}},
+        {"type": "text", "data": {"text": "都来"}},
+    ]),
+    people=_out_people,
+    lines={7: _out_line},
+    group_id="123",
+)
+check("repeated mentions are preserved rather than deduplicated",
+      _repeated is not None
+      and [segment.account for segment in _repeated.segments if isinstance(segment, _OutAt)]
+      == ["member-a", "member-a"])
+_invalid_member, _ = _parse_send(
+    _out_call([
+        {"type": "at", "data": {"member": 99}},
+        {"type": "text", "data": {"text": "不会偷发"}},
+    ]),
+    people=_out_people,
+    lines={7: _out_line},
+    group_id="123",
+)
+check("an unknown member number rejects the entire send", _invalid_member is None)
+_invalid_line, _ = _parse_send(
+    _out_call([
+        {"type": "reply", "data": {"line": 99}},
+        {"type": "text", "data": {"text": "不会偷发"}},
+    ]),
+    people=_out_people,
+    lines={7: _out_line},
+    group_id="123",
+)
+check("an unknown line number rejects the entire send", _invalid_line is None)
+_unsupported, _ = _parse_send(
+    _out_call([{"type": "xml", "data": {"data": "<msg/>"}}]),
+    people=_out_people,
+    lines={7: _out_line},
+    group_id="123",
+)
+check("unsupported raw segment kinds cannot cross the closed schema", _unsupported is None)
+
+_out_history = ChatMsg(
+    msg_id="sent-1",
+    user_id="bot",
+    nickname="小X",
+    text="请@乙看这里",
+    ts=now_local(),
+    is_bot=True,
+    outbound=_out_reply.segments,
+)
+_out_nums = {"line-7": 7, "sent-1": 8}
+_out_first = prompt.own_line(
+    _out_history,
+    nums=_out_nums,
+    people=_out_people,
+)[0]
+_out_second = prompt.own_line(
+    _out_history,
+    nums=_out_nums,
+    people=_out_people,
+)[0]
+check("structured history replay is byte-stable",
+      isinstance(_out_first, _PromptCall) and isinstance(_out_second, _PromptCall)
+      and _out_first.arguments == _out_second.arguments)
+
 # Prompts are data: <prompts_dir>/<key>.txt is the source of truth and the manifest in
 # settings.py is the only list of keys. The filename IS the key, so there is no mapping
 # to drift: a misspelled name is a missing file, and a missing file fails the load
@@ -625,7 +816,7 @@ with _tf.TemporaryDirectory() as _td:
     except ValueError as e:
         check("a missing prompt file fails the load", "legend" in str(e))
 check("the live bundle serves the shipped texts",
-      b.prompts["legend"].startswith("聊天记录中，⟦ ⟧ 内是系统标注"))
+      b.prompts["legend"].startswith("聊天记录中，只有 ⟦ ⟧ 内的文字是系统标注"))
 
 # The example config is what a new deployment starts from, and it is the one config
 # file no running system validates - a stale key in it is found by whoever copies it.
@@ -635,7 +826,7 @@ try:
     _ex = _Settings.model_validate(
         _yaml.safe_load((ROOT / "config" / "settings.yaml.example").read_text("utf-8")))
     check("the shipped example config still validates", True,
-          f"text model {_ex.llm.text.model}")
+          f"text model {_ex.capabilities.text.model}")
 except Exception as _e:
     check("the shipped example config still validates", False, str(_e)[:200])
 

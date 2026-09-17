@@ -51,7 +51,7 @@ import httpx
 from ..db import repo
 from ..providers import providers
 from ..providers.base import retire
-from ..providers.openai_compat import never_billed
+from ..providers.contracts import StoredImage
 from ..services import UnknownAccount
 from ..settings import Settings, VisionCfg, config, ptext
 from ..util import defang, sysmark, why
@@ -139,6 +139,7 @@ class Unsettled(str):
     rate window could never be described afterwards, money and quota available.
     """
 
+
 #: Markers for "this backend will never describe this picture", as opposed to a transient
 #: failure worth retrying. Matched on the message because the wording is the backend's own
 #: and the ABC deliberately does not model provider error taxonomies.
@@ -207,8 +208,8 @@ class MediaProcessor:
         still for the whole of it.
         """
         return await asyncio.wait_for(
-            bot.call_api(api, **params),
-            timeout=config().default.gateway.protocol_call_timeout_sec)
+            bot.call_api(api, **params), timeout=config().default.gateway.protocol_call_timeout_sec
+        )
 
     @staticmethod
     async def _flight(registry: dict[str, asyncio.Task], key: str, start):
@@ -242,8 +243,7 @@ class MediaProcessor:
         return self._window(self._asr_windows, group_id, limit)
 
     @staticmethod
-    def _window(table: dict[str, SlidingWindow], group_id: str,
-                limit: int) -> SlidingWindow:
+    def _window(table: dict[str, SlidingWindow], group_id: str, limit: int) -> SlidingWindow:
         w = table.get(group_id)
         if w is None:
             w = SlidingWindow(limit)
@@ -333,8 +333,10 @@ class MediaProcessor:
         # The cap is part of the key: a flight started under one group's
         # max_image_mb must not hand its oversize verdict to a group with a wider one.
         return await self._flight(
-            self._fetching, f"{key}:{max_bytes}",
-            lambda: self._bytes_once(ref, bot=bot, max_bytes=max_bytes))
+            self._fetching,
+            f"{key}:{max_bytes}",
+            lambda: self._bytes_once(ref, bot=bot, max_bytes=max_bytes),
+        )
 
     async def _bytes_once(self, ref: ImageRef, *, bot, max_bytes: int) -> bytes | None:
         key = ref.key or ref.file or ref.url or ""
@@ -345,7 +347,7 @@ class MediaProcessor:
             log.debug("picture %s recently unreadable, not retried", key[:40])
             return None
         data = None
-        for link in (self._links(ref.url) if ref.url else []):
+        for link in self._links(ref.url) if ref.url else []:
             data = await self._fetch(link, max_bytes)
             if data is not None:
                 break
@@ -361,11 +363,14 @@ class MediaProcessor:
             log.info("picture over the size cap, skipped")
         elif data is None:
             if key:
-                self._unreadable = {k: t for k, t in self._unreadable.items()
-                                    if now - t < hold}
+                self._unreadable = {k: t for k, t in self._unreadable.items() if now - t < hold}
                 self._unreadable[key] = now
-            log.warning("picture unreadable by every route (link=%s file=%s), "
-                        "not retried for %ds", bool(ref.url), bool(ref.file), hold)
+            log.warning(
+                "picture unreadable by every route (link=%s file=%s), not retried for %ds",
+                bool(ref.url),
+                bool(ref.file),
+                hold,
+            )
         return data
 
     @staticmethod
@@ -383,8 +388,9 @@ class MediaProcessor:
         """
         return await repo.image_cache_get(ref.key) if ref.key else None
 
-    async def resolve_picture(self, ref: ImageRef, *, bot: BotApi, group_id: str,
-                              cfg: Settings) -> str | None:
+    async def resolve_picture(
+        self, ref: ImageRef, *, bot: BotApi, group_id: str, cfg: Settings
+    ) -> str | None:
         """Everything one picture gets on arrival: filed with the reply model's
         backend (free), then described - unless it is only forwarded, in which
         case a description already paid for is all it may have.
@@ -394,7 +400,7 @@ class MediaProcessor:
         already described, with nothing to file, costs no download at all.
         """
         data: object = _UNFETCHED
-        max_bytes = int(cfg.llm.vision.max_image_mb * 1024 * 1024)
+        max_bytes = int(cfg.capabilities.vision.max_image_mb * 1024 * 1024)
 
         async def fetch() -> bytes | None:
             nonlocal data
@@ -405,14 +411,14 @@ class MediaProcessor:
         await self.ensure_uploaded(ref, bot=bot, group_id=group_id, cfg=cfg, fetch=fetch)
         if ref.nested:
             return await self.cached(ref)
-        return await self.describe_image(ref, bot=bot, group_id=group_id, cfg=cfg,
-                                         fetch=fetch)
+        return await self.describe_image(ref, bot=bot, group_id=group_id, cfg=cfg, fetch=fetch)
 
-    async def ensure_uploaded(self, ref: ImageRef, *, bot: BotApi, group_id: str,
-                              cfg: Settings, fetch=None) -> str | None:
-        """File this picture with the reply model's backend, once, and remember where.
+    async def ensure_uploaded(
+        self, ref: ImageRef, *, bot: BotApi, group_id: str, cfg: Settings, fetch=None
+    ) -> StoredImage | None:
+        """File this picture with the reply model's attachment store, once.
 
-        The upload itself is free and the id is what lets open_images put the
+        The upload itself is free and the opaque handle lets open_images put the
         original pixels in front of the model. Runs on arrival, while the message's
         download link is still fresh; the id lands both on the ref (for this
         process) and in image_cache (for reposts and for the message's later turns
@@ -422,18 +428,24 @@ class MediaProcessor:
         `fetch` is the arrival pass's shared byte closure; without one the bytes
         are fetched here.
         """
-        if ref.file_id:
-            return ref.file_id
-        if not ref.key or not providers().text.keeps_files:
+        text_model = providers().text
+        store = text_model.attachments
+        if ref.file_id and ref.file_provider == text_model.name:
+            return StoredImage(text_model.name, ref.file_id)
+        if not ref.key or store is None:
             return None
         # Only an id young enough to still exist at the backend: a dead one fails
         # the whole request it rides in, and re-uploading is free.
         cached = await repo.image_cache_file(
-            ref.key, max_age=timedelta(days=cfg.llm.vision.file_max_age_days))
+            ref.key,
+            provider=text_model.name,
+            max_age=timedelta(days=cfg.capabilities.vision.file_max_age_days),
+        )
         if cached:
             ref.file_id = cached
-            return cached
-        vcfg = cfg.llm.vision
+            ref.file_provider = text_model.name
+            return StoredImage(text_model.name, cached)
+        vcfg = cfg.capabilities.vision
         max_bytes = int(vcfg.max_image_mb * 1024 * 1024)
         if ref.size and ref.size > max_bytes:
             return None
@@ -441,20 +453,20 @@ class MediaProcessor:
         if not data:
             return None
         try:
-            # Through the text capability: it is the model that will be handed the
-            # file block, so it is the one that has to resolve the id.
-            fid = await providers().text.upload(data, cfg=cfg.llm.text,
-                                                mime=_mime(data, ref.file))
+            stored = await store.store(data, _mime(data, ref.file))
         except Exception as e:
             log.warning("image upload failed: %s", why(e))
             return None
-        if fid:
-            ref.file_id = fid
-            await repo.image_cache_set_file(ref.key, fid)
-        return fid
+        ref.file_id = stored.handle
+        ref.file_provider = stored.provider
+        await repo.image_cache_set_file(
+            ref.key, stored.handle, provider=stored.provider
+        )
+        return stored
 
-    async def describe_image(self, ref: ImageRef, *, bot: BotApi, group_id: str,
-                             cfg: Settings, fetch=None) -> str | None:
+    async def describe_image(
+        self, ref: ImageRef, *, bot: BotApi, group_id: str, cfg: Settings, fetch=None
+    ) -> str | None:
         """Describe a picture, whether it arrived as a photo or as a sticker.
 
         Single-flight per picture: a deliberating describe runs 10-20s, and in that
@@ -468,20 +480,21 @@ class MediaProcessor:
         category rather than saying what is drawn - and the joke in a sticker is the
         drawing. This is affordable because stickers repeat: the cache keys on emoji_id,
         so each distinct sticker is described once and every later use is free until
-        that description ages out (llm.vision.description_ttl_days). The summary stays
+        that description ages out (capabilities.vision.description_ttl_days). The summary stays
         as the fallback for when the image cannot be fetched.
         """
         if not ref.key:
-            return await self._describe_once(ref, bot=bot, group_id=group_id, cfg=cfg,
-                                             fetch=fetch)
+            return await self._describe_once(ref, bot=bot, group_id=group_id, cfg=cfg, fetch=fetch)
         return await self._flight(
-            self._describing, ref.key,
-            lambda: self._describe_once(ref, bot=bot, group_id=group_id, cfg=cfg,
-                                        fetch=fetch))
+            self._describing,
+            ref.key,
+            lambda: self._describe_once(ref, bot=bot, group_id=group_id, cfg=cfg, fetch=fetch),
+        )
 
-    async def _describe_once(self, ref: ImageRef, *, bot: BotApi, group_id: str,
-                             cfg: Settings, fetch=None) -> str | None:
-        vcfg = cfg.llm.vision
+    async def _describe_once(
+        self, ref: ImageRef, *, bot: BotApi, group_id: str, cfg: Settings, fetch=None
+    ) -> str | None:
+        vcfg = cfg.capabilities.vision
         label = "表情" if ref.sticker else "图片"
         # ref.summary was defanged at segment parse; the wrap is system-authored.
         fallback = sysmark(f"{label}:{ref.summary}") if ref.summary else None
@@ -523,8 +536,12 @@ class MediaProcessor:
 
         try:
             desc = await providers().vision.describe(
-                data, cfg=vcfg, prompt=ptext("describe_image"),
-                mime=_mime(data, ref.file), group_id=group_id)
+                data,
+                cfg=vcfg,
+                prompt=ptext("describe_image"),
+                mime=_mime(data, ref.file),
+                group_id=group_id,
+            )
         except Exception as e:
             if _is_refusal(e):
                 # The backend looked and declined - its content filter, not a fault here.
@@ -550,8 +567,9 @@ class MediaProcessor:
             await repo.image_cache_put(ref.key, desc)
         return desc
 
-    async def transcribe(self, ref: AudioRef, *, bot: BotApi, group_id: str,
-                         cfg: Settings) -> str | None:
+    async def transcribe(
+        self, ref: AudioRef, *, bot: BotApi, group_id: str, cfg: Settings
+    ) -> str | None:
         """Single-flight per clip, like describe_image per picture: with pending
         kept alive across turns, a slow ASR call (timeout 60s) can outlive the 25s
         paid wait, and the next turn's backlog pass would otherwise start - and
@@ -562,25 +580,23 @@ class MediaProcessor:
         if not key:
             return await self._transcribe_once(ref, bot=bot, group_id=group_id, cfg=cfg)
         return await self._flight(
-            self._transcribing, key,
-            lambda: self._transcribe_once(ref, bot=bot, group_id=group_id, cfg=cfg))
+            self._transcribing,
+            key,
+            lambda: self._transcribe_once(ref, bot=bot, group_id=group_id, cfg=cfg),
+        )
 
-    async def _transcribe_once(self, ref: AudioRef, *, bot: BotApi, group_id: str,
-                               cfg: Settings) -> str | None:
-        acfg = cfg.llm.asr
+    async def _transcribe_once(
+        self, ref: AudioRef, *, bot: BotApi, group_id: str, cfg: Settings
+    ) -> str | None:
+        acfg = cfg.capabilities.asr
         # This path runs on arrival, with no reply-side gate above it, so the
         # per-minute window and the daily cap are asked here. None keeps the slot
         # unsettled, so a reply-path settle can retry later.
         if not self._asr_window(group_id, acfg.max_clips_per_min).take():
             log.info("voice transcription rate limited, deferred (%s)", group_id)
             return None
-        # The daily cap guards spending, so a backend whose rate is zero (the
-        # in-process one) transcribes right through it: a group that exhausted
-        # the budget on replies should not also get a degraded archive for free
-        # audio. The per-minute gate above still applies - it paces CPU now.
-        if (providers().asr.rate_for(acfg.model).units(1.0) > 0
-                and await BUDGET.exceeded(cfg.budget.daily_cny_cap)):
-            return None
+        # Local ASR spends no provider money. The per-group window above and the
+        # recognizer's bounded global queue are its admission controls.
         # Never the stored file, never the CDN link: both hold QQ's native SILK v3
         # whatever the ".amr" suffix claims (magic '#!SILK_V3'), and SILK bytes labelled
         # amr get a polite empty transcript from the ASR backend - a perfectly clear
@@ -616,26 +632,17 @@ class MediaProcessor:
 
         try:
             text = await providers().asr.transcribe(
-                data, cfg=acfg, fmt="wav", seconds=_audio_seconds(len(data)),
+                data,
+                cfg=acfg,
+                fmt="wav",
+                seconds=_audio_seconds(len(data)),
                 group_id=group_id,
             )
         except Exception as e:
-            if never_billed(e) or providers().asr.rate_for(acfg.model).units(1.0) == 0:
-                # The request provably cost nothing (never sent, refused before
-                # processing, or a backend that bills nothing at all), so the
-                # one-paid-attempt rule below does not apply: a network blip, or a
-                # model bundle missing until the next deploy, must not abandon a
-                # clip a free retry would rescue.
-                log.warning("ASR call failed before billing, retryable: %s", why(e))
-                return None
-            # Terminal, not retryable: a failed attempt may already have billed the
-            # clip's full duration (the vendor charges per second on arrival), and
-            # with no result cache every later turn's retry would bill it again -
-            # a 60s clip against a slow backend re-charging on every reply until
-            # the message evicts. One paid attempt per clip; the fetch failures
-            # above stay retryable because retrying them is free.
-            log.warning("ASR call failed, clip abandoned: %s", why(e))
-            return sysmark("语音")
+            # Local failures are never billable. Keep the slot unsettled so a later
+            # backlog pass may retry after overload or a transient decoder failure.
+            log.warning("local ASR failed, retryable: %s", why(e))
+            return None
         # defang the transcription: it is the speaker's words, machine-transcribed,
         # and spoken text is as member-controlled as typed text.
         return sysmark(f"语音:{defang(text)}") if text else sysmark("语音:没听清")
@@ -684,8 +691,7 @@ class MediaProcessor:
         self_id = str(getattr(bot, "self_id", ""))
 
         async def one(ref: Ref):
-            return await ref.resolve(self, bot=bot, group_id=group_id, cfg=cfg,
-                                     self_id=self_id)
+            return await ref.resolve(self, bot=bot, group_id=group_id, cfg=cfg, self_id=self_id)
 
         results = await asyncio.gather(*(one(r) for r in pm.refs), return_exceptions=True)
         out: dict[int, str] = {}
@@ -709,7 +715,8 @@ class MediaProcessor:
         """
         return all(
             r.slot in resolved and not isinstance(resolved[r.slot], Unsettled)
-            for r in pm.refs if not r.free
+            for r in pm.refs
+            if not r.free
         )
 
 

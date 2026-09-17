@@ -89,8 +89,8 @@ def _transcript(lines: list[SourceLine]) -> str:
 class MemoryWorker:
     def __init__(self, cfg: Settings, *, worker_id: str | None = None) -> None:
         self._cfg = cfg
-        #: The memory mechanism's own settings, read once at construction like the
-        #: extractor's prompt: /reload applies from the next restart, never mid-batch.
+        #: The memory mechanism's settings and extraction prompt are frozen at
+        #: construction. A reload changing either is rejected until restart.
         self._m = cfg.memory
         # Process-unique by default: the job queue's locked_by guards compare this
         # id, and during a deploy overlap two processes sharing a fixed name could
@@ -575,7 +575,7 @@ class MemoryWorker:
         if len(todo) == EMBED_PAGE:
             await self._queue.submit(JobType.EMBED, {"group_id": group_id})
         vecs = await self._embed.embed(
-            [summary for _, summary in todo], cfg=self._cfg.llm.embedding,
+            [summary for _, summary in todo], cfg=self._cfg.capabilities.embedding,
             group_id=str(group_id))
         # strict: the vectors are paired with the episodes by position, so a backend
         # that answered with a different number of them would file each summary under

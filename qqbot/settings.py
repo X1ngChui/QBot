@@ -11,14 +11,20 @@ import copy
 import logging
 import os
 from pathlib import Path
-from typing import Any, ClassVar, Literal
+from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from . import util
 
 log = logging.getLogger("qqbot.settings")
+
+
+class RestartRequired(ValueError):
+    """A validated reload changes resources owned by the running process."""
+
+
 #: Every prompt the system may read, by key. The texts are data: each key is a
 #: `<key>.txt` under `prompts_dir`, edited without touching code and re-read on
 #: /reload. This manifest is the only list of them - the filename is the key, so
@@ -51,6 +57,25 @@ DEFAULT_PERSONA_KEY = "default"
 
 class _M(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_legacy_keys(cls, value: Any) -> Any:
+        """Fail old configuration names with a direct migration instruction."""
+
+        if not isinstance(value, dict):
+            return value
+        migrations = {
+            "llm": "capabilities",
+            "backend": "provider",
+            "base_url": "endpoint",
+            "api_key_env": "credential_env",
+        }
+        found = [(old, migrations[old]) for old in migrations if old in value]
+        if found:
+            changes = ", ".join(f"{old} -> {new}" for old, new in found)
+            raise ValueError(f"obsolete configuration key(s): {changes}")
+        return value
 
 
 #: How hard a model may think before answering. "off" disables deliberation; the
@@ -113,14 +138,12 @@ class PromptCfg(_M):
     forward_lines: int = Field(20, ge=1)
     forward_depth: int = Field(3, ge=1)
     forward_chars: int = Field(1500, ge=100)
-    #: How much of the trajectory entry kept beside each of the bot's own replies
-    #: survives: characters of each tool result, and of the whole entry. A digest
-    #: for follow-ups on the same topic, not a replay - the tools are still there
-    #: when more is needed. Sized so the digest reaches the answer: a search result
-    #: opens with the conversation around its first hit, and a couple of hundred
-    #: characters recorded only the chatter leading up to what was found.
-    trace_result_chars: int = Field(1200, ge=100)
-    trace_total_chars: int = Field(4000, ge=500)
+    #: Bounds on the structured evidence memo kept beside a reply. Each digest and the
+    #: whole rendered memo are capped independently; the memo expires because it exists
+    #: only to support nearby follow-ups, not as another archive.
+    evidence_result_chars: int = Field(1200, ge=100)
+    evidence_total_chars: int = Field(4000, ge=500)
+    evidence_ttl_days: int = Field(30, ge=1)
     #: Caps on the provenance marker appended to the bot's own archived line: how
     #: many tool uses it names, and how much of each query survives. A record, not
     #: a transcript - enough for a later turn to see what an answer rested on. The
@@ -128,6 +151,14 @@ class PromptCfg(_M):
     #: reads as a different search); it only guards against a runaway string.
     provenance_items: int = Field(4, ge=1)
     provenance_query_chars: int = Field(80, ge=20)
+
+    @model_validator(mode="after")
+    def _coherent_evidence_bounds(self) -> PromptCfg:
+        if self.evidence_total_chars < self.evidence_result_chars:
+            raise ValueError(
+                "evidence_total_chars must be at least evidence_result_chars"
+            )
+        return self
 
 
 class TriggerCfg(_M):
@@ -140,41 +171,12 @@ class TriggerCfg(_M):
     nicknames: list[str] = Field(default_factory=list)
 
 
-# One section per capability, each carrying its own endpoint, model and credential name
-# so it can be moved independently: five capabilities, each swappable, and no automatic
-# fallback between them.
-#
-# Defaults name capabilities, never vendors: which platform serves a capability is a
-# deployment fact that belongs in the YAML values, not in the schema. base_url and model
-# have no defaults at all for the same reason - settings.yaml must state them, so nobody
-# ends up silently talking to whatever the code happened to assume.
-#
-# `backend` picks the implementation class (see providers/registry.py). Backend quirks -
-# how usage is reported, how to ask it not to deliberate, what extra fields a request
-# needs - belong in that class, not in config.
-class _BackendCfg(_M):
-    """A capability section: its `backend` must name a class the registry lists.
-
-    Checked at load rather than at construction, because the bundle is built once at
-    startup: a name misspelled in an edit would pass /reload and fail the next restart,
-    days later, as a boot error far from its cause.
-    """
-
-    #: Which registry table the name is looked up in; each section names its own.
-    capability: ClassVar[str] = ""
-
-    @field_validator("backend", check_fields=False)
-    @classmethod
-    def _known_backend(cls, v: str) -> str:
-        # Imported here, not at module scope: the registry imports this module for
-        # the config classes, and the tables are the single list of known names.
-        from .providers import registry
-        table = getattr(registry, f"{cls.capability.upper()}_BACKENDS")
-        if v not in table:
-            raise ValueError(
-                f"unknown {cls.capability} backend {v!r}; "
-                f"available: {', '.join(sorted(table))}")
-        return v
+# One section per capability, each carrying its own provider connection. Provider names
+# are closed at validation time; transport quirks belong to the provider adapter rather
+# than to YAML. The supported providers currently share the same connection shape, so
+# Literal discriminators are clearer than parallel union classes with identical fields.
+class _ProviderCfg(_M):
+    """Common marker for externally configured provider capabilities."""
 
 
 class TextUseCfg(_M):
@@ -192,18 +194,16 @@ class TextUseCfg(_M):
     timeout_sec: float | None = Field(None, gt=0)
 
 
-class TextCfg(_BackendCfg):
-    capability = "text"
-    backend: str = "openai_compat"
-    base_url: str
-    api_key_env: str = "TEXT_API_KEY"
+class TextCfg(_ProviderCfg):
+    provider: Literal["deepseek", "openai_responses", "local"]
+    endpoint: str
+    credential_env: str = "TEXT_API_KEY"
     model: str
     #: How hard replies may think. Other uses of this model carry their own grade:
-    #: extraction below, describing in llm.vision.
+    #: extraction below, describing in capabilities.vision.
     reasoning_effort: Effort = "off"
-    #: Applied at startup only: the semaphore is built once, and resizing it under
-    #: load would lose the permits already handed out. A change is logged and takes
-    #: effect at the next start.
+    #: Applied at startup only: the semaphore is built once. A reload changing it
+    #: is rejected atomically; restart to resize without losing outstanding permits.
     max_concurrency: int = Field(3, ge=1)
     timeout_sec: float = Field(30.0, gt=0)
     retries: int = Field(2, ge=0)
@@ -229,11 +229,10 @@ class TextCfg(_BackendCfg):
         })
 
 
-class VisionCfg(_BackendCfg):
-    capability = "vision"
-    backend: str = "openai_compat"
-    base_url: str
-    api_key_env: str = "TEXT_API_KEY"
+class VisionCfg(_ProviderCfg):
+    provider: Literal["deepseek", "openai_responses", "local"]
+    endpoint: str
+    credential_env: str = "TEXT_API_KEY"
     model: str
     #: Deliberation grade for the describing call. "low" keeps sanity-check thinking
     #: (what a meme actually shows) at a fraction of "high"'s thought-token bill.
@@ -262,33 +261,20 @@ class VisionCfg(_BackendCfg):
     timeout_sec: float = Field(30.0, gt=0)
 
 
-class AsrCfg(_BackendCfg):
-    capability = "asr"
-    backend: str = "openai_compat"
-    #: Empty is valid for in-process backends (sherpa), which have no endpoint;
-    #: the API-backed ones fail their first call without it, loudly enough.
-    base_url: str = ""
-    api_key_env: str = "MEDIA_API_KEY"
-    model: str
-    #: For the sherpa backend only: directory holding the ONNX bundle
-    #: (model.int8.onnx + tokens.txt), as seen from inside the container.
-    model_dir: str = ""
-    #: CPU threads for in-process decoding. Clips are short and rare; two threads
-    #: keep a clip under a second without contending with the event loop's core.
+class AsrCfg(_M):
+    """Fixed in-process SenseVoice CPU resources and admission policy."""
+
+    model_dir: str
     threads: int = Field(2, ge=1)
+    queue_capacity: int = Field(8, ge=1)
     max_audio_sec: int = Field(300, ge=1)
-    #: Transcription happens on arrival, so a burst of long clips spends real
-    #: money before the daily cap can matter - the same reason pictures carry
-    #: max_images_per_min. Clips are rarer, so the same number is generous.
     max_clips_per_min: int = Field(6, ge=1)
-    timeout_sec: float = Field(60.0, gt=0)
 
 
-class SearchCfg(_BackendCfg):
-    capability = "search"
-    backend: str
-    base_url: str
-    api_key_env: str = "SEARCH_API_KEY"
+class SearchCfg(_ProviderCfg):
+    provider: Literal["tavily"]
+    endpoint: str
+    credential_env: str = "SEARCH_API_KEY"
     #: Results per search; the vendor takes at most 20.
     count: int = Field(5, ge=1, le=20)
     #: Result depth the vendor is asked for; "basic" is one credit, "advanced" two.
@@ -305,11 +291,10 @@ class SearchCfg(_BackendCfg):
     timeout_sec: float = Field(20.0, gt=0)
 
 
-class EmbeddingCfg(_BackendCfg):
-    capability = "embedding"
-    backend: str = "dashscope"
-    base_url: str
-    api_key_env: str = "MEDIA_API_KEY"
+class EmbeddingCfg(_ProviderCfg):
+    provider: Literal["dashscope"]
+    endpoint: str
+    credential_env: str = "MEDIA_API_KEY"
     #: Both reach past this file. `dimensions` must equal the VECTOR(n) column in
     #: sql/init.sql or every insert fails, and vectors are stored under the model
     #: that produced them and searched under the current one - so changing `model`
@@ -320,7 +305,7 @@ class EmbeddingCfg(_BackendCfg):
     timeout_sec: float = Field(60.0, gt=0)
 
 
-class LlmCfg(_M):
+class CapabilitiesCfg(_M):
     text: TextCfg
     vision: VisionCfg
     asr: AsrCfg
@@ -400,7 +385,7 @@ class MemoryCfg(_M):
     """How much the memory pipeline reads, and how fast it lets go.
 
     Model settings for the extraction call are not here - they belong to the text
-    capability that runs it (llm.text.extract). This is the machinery around it.
+    capability that runs it (capabilities.text.extract). This is the machinery around it.
 
     Read once, when the worker is constructed: a /reload cannot change a batch that
     is already being read, so edits here apply at the next restart.
@@ -436,10 +421,8 @@ class MemoryCfg(_M):
 
 
 class ScheduleCfg(_M):
-    #: The two crons and misfire_grace_sec below are handed to the scheduler at
-    #: startup: /reload validates them and accepts the file, but the registered jobs
-    #: keep their old triggers (and their old timezone) until the next restart. The
-    #: rest of this class is read when the night actually runs.
+    #: The scheduler owns this complete block. A reload changing any field is
+    #: rejected atomically; restart registers the replacement values.
     #:
     #: The nightly pipeline: extraction drain, then decay, then backup, then the
     #: NapCat cache sweep - one trigger, stages run in order (tasks.nightly). One
@@ -633,7 +616,7 @@ class Settings(_M):
     timezone: str = "Asia/Shanghai"
     trigger: TriggerCfg = Field(default_factory=TriggerCfg)
     gateway: GatewayCfg = Field(default_factory=GatewayCfg)
-    llm: LlmCfg
+    capabilities: CapabilitiesCfg
     budget: BudgetCfg = Field(default_factory=BudgetCfg)
     prompt: PromptCfg = Field(default_factory=PromptCfg)
     retrieval: RetrievalCfg = Field(default_factory=RetrievalCfg)
@@ -648,6 +631,40 @@ class Settings(_M):
     prompts_dir: str = "prompts"
     #: What may be recorded about a person, one entry per predicate.
     predicates_file: str = "predicates.yaml"
+
+
+def _startup_settings(settings: Settings) -> dict[str, object]:
+    """Values captured by process-owned clients, workers, pools and schedulers."""
+
+    capabilities = settings.capabilities
+    extract = capabilities.text.for_extract()
+    return {
+        "timezone": settings.timezone,
+        "capabilities.text.provider": capabilities.text.provider,
+        "capabilities.text.endpoint": capabilities.text.endpoint,
+        "capabilities.text.credential_env": capabilities.text.credential_env,
+        "capabilities.text.max_concurrency": capabilities.text.max_concurrency,
+        "capabilities.text.extract.model": extract.model,
+        "capabilities.text.extract.reasoning_effort": extract.reasoning_effort,
+        "capabilities.text.extract.timeout_sec": extract.timeout_sec,
+        "capabilities.text.extract.retries": extract.retries,
+        "capabilities.vision.provider": capabilities.vision.provider,
+        "capabilities.vision.endpoint": capabilities.vision.endpoint,
+        "capabilities.vision.credential_env": capabilities.vision.credential_env,
+        "capabilities.asr.model_dir": capabilities.asr.model_dir,
+        "capabilities.asr.threads": capabilities.asr.threads,
+        "capabilities.asr.queue_capacity": capabilities.asr.queue_capacity,
+        "capabilities.embedding": tuple(
+            sorted(capabilities.embedding.model_dump().items())
+        ),
+        "capabilities.search.provider": capabilities.search.provider,
+        "capabilities.search.endpoint": capabilities.search.endpoint,
+        "capabilities.search.credential_env": capabilities.search.credential_env,
+        "capabilities.search.proxy": capabilities.search.proxy,
+        "database": tuple(sorted(settings.database.model_dump().items())),
+        "memory": repr(settings.memory.model_dump()),
+        "schedule": repr(settings.schedule.model_dump()),
+    }
 
 
 class Persona(_M):
@@ -756,50 +773,69 @@ class ConfigBundle:
         if cached is None:
             if persona.overrides:
                 cached = Settings.model_validate(
-                    _deep_merge(self._raw, self._without_backends(group_id, persona.overrides)))
+                    _deep_merge(self._raw, self._validate_overrides(group_id, persona.overrides)))
             else:
                 cached = self.default
             self._merged[group_id] = cached
         return cached, persona
 
-    @staticmethod
-    def _without_backends(group_id: str, overrides: dict) -> dict:
-        """A group's overrides with the keys no group may change dropped, and logged.
+    def startup_fingerprint(self) -> dict[str, object]:
+        fingerprint = _startup_settings(self.default)
+        for key in ("extract", "extract_legend_note", "tone_extract_note", "legend"):
+            fingerprint[f"prompts.{key}"] = self.prompts.get(key, "")
+        fingerprint["predicates"] = repr(self.predicates.model_dump())
+        return fingerprint
 
-        The backend classes are built once at startup from the top-level config;
-        a group may repoint endpoint and model (passed per call) but cannot change
-        which class serves it. The daily cap and the monthly search allowance are
-        totals over every group, compared against one shared ledger: a group's
-        own number there would let it keep spending after the rest went quiet.
-        Left in, any of these would read back from the group's merged settings
-        as though it applied.
-        """
-        out = overrides
-        llm = overrides.get("llm")
-        if isinstance(llm, dict):
-            touched = [cap for cap, sec in llm.items()
-                       if isinstance(sec, dict) and "backend" in sec]
-            if touched:
-                log.warning("group %s overrides llm.%s.backend: backends are chosen "
-                            "once at startup from the top-level config, override "
-                            "ignored", group_id, "/".join(touched))
-                out = copy.deepcopy(out)
-                for cap in touched:
-                    del out["llm"][cap]["backend"]
-        for path in (("budget", "daily_cny_cap"), ("llm", "search", "monthly_quota")):
-            node = out
-            for key in path[:-1]:
-                node = node.get(key) if isinstance(node, dict) else None
-            if isinstance(node, dict) and path[-1] in node:
-                log.warning("group %s overrides %s: a total over every group, "
-                            "override ignored", group_id, ".".join(path))
-                if out is overrides:
-                    out = copy.deepcopy(overrides)
-                node = out
-                for key in path[:-1]:
-                    node = node[key]
-                del node[path[-1]]
-        return out
+    @staticmethod
+    def _validate_overrides(group_id: str, overrides: dict) -> dict:
+        """Reject group-local values whose runtime owner is process-global."""
+
+        forbidden = (
+            ("gateway", "dedup_ttl_sec"),
+            ("gateway", "member_cache_ttl_sec"),
+            ("gateway", "protocol_call_timeout_sec"),
+            ("gateway", "media_http_timeout_sec"),
+            ("gateway", "unreadable_retry_sec"),
+            ("gateway", "shutdown_wait_sec"),
+            ("capabilities", "http_retries"),
+            ("capabilities", "retry_after_cap_sec"),
+            ("capabilities", "text", "provider"),
+            ("capabilities", "text", "endpoint"),
+            ("capabilities", "text", "credential_env"),
+            ("capabilities", "text", "max_concurrency"),
+            ("capabilities", "text", "extract"),
+            ("capabilities", "vision", "provider"),
+            ("capabilities", "vision", "endpoint"),
+            ("capabilities", "vision", "credential_env"),
+            ("capabilities", "asr", "model_dir"),
+            ("capabilities", "asr", "threads"),
+            ("capabilities", "asr", "queue_capacity"),
+            ("capabilities", "embedding"),
+            ("capabilities", "search", "provider"),
+            ("capabilities", "search", "endpoint"),
+            ("capabilities", "search", "credential_env"),
+            ("capabilities", "search", "proxy"),
+            ("capabilities", "search", "monthly_quota"),
+            ("budget", "daily_cny_cap"),
+            ("database",),
+            ("schedule",),
+            ("timezone",),
+        )
+        touched: list[str] = []
+        for path in forbidden:
+            node: object = overrides
+            for key in path:
+                if not isinstance(node, dict) or key not in node:
+                    break
+                node = node[key]
+            else:
+                touched.append(".".join(path))
+        if touched:
+            raise ValueError(
+                f"group {group_id} overrides process-global settings: "
+                + ", ".join(touched)
+            )
+        return overrides
 
 
 def _resolve(root: Path, p: str) -> Path:
@@ -874,10 +910,6 @@ def load_bundle(config_dir: Path | None = None) -> ConfigBundle:
     _ = bundle.default
     for gid in personas:
         bundle.for_group(gid)
-    # The zone follows the config wherever config is loaded - workers and tests
-    # included, not only the app entrypoint. Set here rather than by each caller,
-    # because a process that forgot ran on the fallback zone silently.
-    util.set_timezone(bundle.default.timezone)
     return bundle
 
 
@@ -888,6 +920,7 @@ def config() -> ConfigBundle:
     global _bundle
     if _bundle is None:
         _bundle = load_bundle()
+        util.set_timezone(_bundle.default.timezone)
     return _bundle
 
 
@@ -903,9 +936,20 @@ def ptext(key: str) -> str:
 
 
 def reload_config() -> ConfigBundle:
-    """Swap the global singleton. On validation failure the old config is kept and the
-    error propagates."""
+    """Atomically apply a fully reloadable bundle or reject it unchanged."""
+
     global _bundle
     fresh = load_bundle()
+    current = config()
+    before = current.startup_fingerprint()
+    after = fresh.startup_fingerprint()
+    changed = sorted(
+        path
+        for path in before.keys() | after.keys()
+        if before.get(path) != after.get(path)
+    )
+    if changed:
+        raise RestartRequired("restart required for: " + ", ".join(changed))
+    util.set_timezone(fresh.default.timezone)
     _bundle = fresh
     return fresh

@@ -22,6 +22,7 @@ uses it - model traffic stays direct.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 import httpx
@@ -48,6 +49,7 @@ class TavilySearch(SearchEngine):
         #: clients, so a /reload that changes either the proxy or the timeout
         #: rebuilds it. The endpoint is not part of it: it is named per request.
         self._id: tuple[float, str] | None = None
+        self._quota_lock = asyncio.Lock()
 
     def rate_for(self, model: str) -> Rate:
         return _FREE
@@ -57,9 +59,7 @@ class TavilySearch(SearchEngine):
         if self._client is None or self._id != ident:
             if self._client is not None:
                 retire(self._client.aclose())
-            self._client = httpx.AsyncClient(
-                timeout=cfg.timeout_sec, proxy=cfg.proxy or None
-            )
+            self._client = httpx.AsyncClient(timeout=cfg.timeout_sec, proxy=cfg.proxy or None)
             self._id = ident
         return self._client
 
@@ -69,7 +69,7 @@ class TavilySearch(SearchEngine):
             self._client = None
             self._id = None
 
-    async def _admit(self, cfg: SearchCfg) -> str:
+    async def _admit(self, cfg: SearchCfg, credits: int) -> str:
         """Read the meter and resolve the key; the credential a call may go out with.
 
         The meter is read before the vendor is called, so a call past the monthly
@@ -78,40 +78,59 @@ class TavilySearch(SearchEngine):
         previous backend do not eat this one's allowance.
         """
         used = await repo.month_calls(Kind.SEARCH, self.name)
-        if used >= cfg.monthly_quota:
-            raise QuotaExhausted(
-                f"search allowance used up: {used}/{cfg.monthly_quota} this month")
-        return require_key(cfg.api_key_env, "search")
+        if used + credits > cfg.monthly_quota:
+            raise QuotaExhausted(f"search allowance used up: {used}/{cfg.monthly_quota} this month")
+        return require_key(cfg.credential_env, "search")
 
     async def _post(self, cfg: SearchCfg, key: str, path: str, body: dict) -> httpx.Response:
         async def once() -> httpx.Response:
             r = await self._http(cfg).post(
-                f"{cfg.base_url.rstrip('/')}{path}",
-                headers={"Authorization": f"Bearer {key}"}, json=body,
+                f"{cfg.endpoint.rstrip('/')}{path}",
+                headers={"Authorization": f"Bearer {key}"},
+                json=body,
             )
             r.raise_for_status()
             return r
 
         return await with_retry(once, what=f"search {path}")
 
+    async def _credited_post(
+        self,
+        cfg: SearchCfg,
+        *,
+        path: str,
+        body: dict,
+        credits: int,
+        group_id: str | None,
+    ) -> httpx.Response:
+        """Admit, execute, and book one request against the shared credit meter."""
+        async with self._quota_lock:
+            key = await self._admit(cfg, credits)
+            response = await self._post(cfg, key, path, body)
+            # Booked even at zero cost: calls are the vendor-credit meter.
+            await BUDGET.record(
+                kind=Kind.SEARCH,
+                model=self.name,
+                cny=0.0,
+                group_id=group_id,
+                calls=credits,
+            )
+        return response
+
     async def search(
         self, query: str, *, cfg: SearchCfg, group_id: str | None = None
     ) -> list[dict]:
-        key = await self._admit(cfg)
-        r = await self._post(cfg, key, "/search", {
-            "query": query,
-            "search_depth": cfg.depth,
-            "max_results": cfg.count,
-        })
-        # Booked even at zero cost: the calls figure is what advances the quota
-        # meter above - in the vendor's own unit. Tavily debits credits, not calls,
-        # and advanced depth costs two; metered by calls, the real 1000 would be
-        # gone at ~500 while the meter read half-full, and from then on every
-        # search would fail as a transport error instead of the clean quota
-        # silence.
-        await BUDGET.record(
-            kind=Kind.SEARCH, model=self.name, cny=0.0, group_id=group_id,
-            calls=2 if cfg.depth == "advanced" else 1,
+        credits = 2 if cfg.depth == "advanced" else 1
+        r = await self._credited_post(
+            cfg,
+            path="/search",
+            body={
+                "query": query,
+                "search_depth": cfg.depth,
+                "max_results": cfg.count,
+            },
+            credits=credits,
+            group_id=group_id,
         )
         items = r.json().get("results") or []
         return [
@@ -123,7 +142,7 @@ class TavilySearch(SearchEngine):
             for it in items[: cfg.count]
         ]
 
-    async def extract(
+    async def read_page(
         self, url: str, *, cfg: SearchCfg, group_id: str | None = None
     ) -> str:
         """One page's readable text, off the same monthly allowance as search.
@@ -134,10 +153,12 @@ class TavilySearch(SearchEngine):
         reused. Booked pessimistically at one credit per call - under-counting a
         shared pool is how the vendor starts refusing while the meter reads full.
         """
-        key = await self._admit(cfg)
-        r = await self._post(cfg, key, "/extract", {"urls": [url], "extract_depth": "basic"})
-        await BUDGET.record(
-            kind=Kind.SEARCH, model=self.name, cny=0.0, group_id=group_id, calls=1,
+        r = await self._credited_post(
+            cfg,
+            path="/extract",
+            body={"urls": [url], "extract_depth": "basic"},
+            credits=1,
+            group_id=group_id,
         )
         results = r.json().get("results") or []
         text = (results[0].get("raw_content") or "") if results else ""

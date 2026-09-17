@@ -88,7 +88,7 @@ Global owners only.
 
 | Command | Usage |
 | --- | --- |
-| `/reload` | Re-reads settings, personas, prompts, predicates and the agreement. An invalid configuration is rejected and the old one stays. Cron changes need a restart; code changes need a rebuild. |
-| `/debug N` | Captures the next N model rounds (at most 50) from every group into `logs/debug/`, one JSON file per round with the full request and raw response. Turns itself off when done or on restart. `/debug` shows the state, `/debug off` stops it. |
+| `/reload` | Re-reads settings, personas, prompts, predicates and the agreement. Invalid candidates and any change to a restart-scoped field are rejected atomically; the active bundle stays untouched and exact restart paths are reported. Code changes need a rebuild. |
+| `/debug N` | Captures the next N model rounds (at most 50) from every group into `logs/debug/`, one JSON file per round with provider-neutral prompt items and completed turn data. Provider wire items, reasoning, response ids and credentials never enter the capture. Turns itself off when done or on restart. `/debug` shows the state, `/debug off` stops it. |
 | `/log` | The last 15 lines of the application log. |
 | `/log N` | The last N lines, at most 60. |

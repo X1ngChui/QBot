@@ -74,6 +74,7 @@ class Ingestor:
         self, *, group_id: int, self_id: str, message_id: str, text: str,
         at: datetime, name: str = "", reply_to: str = "",
         addressees: list[tuple[str, str]] | None = None,
+        segments: list[dict] | None = None,
     ) -> uuid.UUID:
         """Write down what the bot itself said.
 
@@ -95,17 +96,38 @@ class Ingestor:
         learned, and giving it an entity would put it in its own roster.
         """
         addressees = [(qq, who) for qq, who in addressees or () if qq]
-        read = " ".join([*(f"@{who}" for _, who in addressees), text]).strip()
+        if segments is None:
+            read = " ".join([*(f"@{who}" for _, who in addressees), text]).strip()
+            segments = [
+                *(
+                    {"type": "at", "data": {"qq": qq, "name": who}}
+                    for qq, who in addressees
+                ),
+                {"type": "text", "data": {"text": text}},
+            ]
+        else:
+            read = text.strip()
+            names = dict(addressees)
+            segments = [
+                {
+                    **segment,
+                    "data": {
+                        **(segment.get("data") or {}),
+                        "name": names.get(str((segment.get("data") or {}).get("qq") or ""), ""),
+                    },
+                }
+                if segment.get("type") == "at" else segment
+                for segment in segments
+            ]
         return await self._record(GroupMessage(
             message_id=message_id,
             group_id=group_id,
             sender=Sender(user_id=self_id, nickname=name),
-            segments=[*({"type": "at", "data": {"qq": qq, "name": who}}
-                        for qq, who in addressees),
-                      {"type": "text", "data": {"text": text}}],
+            segments=segments,
             self_id=self_id,
             occurred_at=at,
             plain_text=read,
+            outbound_schema=1,
             # The quote pointer travels into the payload the same way a member's
             # does, so the restart-rebuilt window renders the line identically.
             reply_to_message_id=reply_to or None,

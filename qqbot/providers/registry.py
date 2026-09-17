@@ -1,84 +1,71 @@
-"""Which backend serves which capability, chosen by name from config.
+"""Composition root for configured capabilities.
 
-Adding a backend is: write the subclass, add one line to the table below, name it in
-settings.yaml. Nothing else in the codebase changes - that is the whole point of the ABCs
-in `base`.
-
-Selection happens once at startup from the top-level config. Per-group persona overrides
-can retarget endpoint and model (those are passed per call), but not the backend class;
-a group that tries is logged and ignored.
+Provider identity is selected once at startup. Calls receive only reloadable generation
+policy; endpoint, credentials, clients and concurrency stay owned by the built capability.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
-from ..settings import Settings
-from .base import (
-    AsrModel, EmbeddingModel, Providers, SearchEngine, TextModel, VisionModel,
-)
-from .dashscope import DashScopeAsr
-from .deepseek import DeepSeekChat, DeepSeekVision
+from ..settings import Settings, TextCfg, VisionCfg
+from .base import EmbeddingModel, Providers, SearchEngine, TextModel, VisionModel
+from .deepseek import deepseek_text, deepseek_vision
 from .embedding import DashScopeEmbedding
-from .local import LocalChat
-from .openai_compat import OpenAICompatAsr, OpenAICompatChat, OpenAICompatVision
+from .local import local_text, local_vision
+from .openai_responses import OpenAIResponses, openai_vision
 from .sherpa import SherpaAsr
 from .tavily import TavilySearch
 
 log = logging.getLogger("qqbot.providers")
 
-TEXT_BACKENDS: dict[str, type[TextModel]] = {
-    "deepseek": DeepSeekChat,
-    "openai_compat": OpenAICompatChat,
-    # Self-hosted endpoint (the NPU/CPU toy): generic protocol, zero rates.
-    "local": LocalChat,
+TextBuilder = Callable[[TextCfg], TextModel]
+VisionBuilder = Callable[[VisionCfg], VisionModel]
+
+TEXT_PROVIDERS: dict[str, TextBuilder] = {
+    "deepseek": deepseek_text,
+    "openai_responses": OpenAIResponses,
+    "local": local_text,
 }
-
-VISION_BACKENDS: dict[str, type[VisionModel]] = {
-    "deepseek": DeepSeekVision,
-    "openai_compat": OpenAICompatVision,
+VISION_PROVIDERS: dict[str, VisionBuilder] = {
+    "deepseek": deepseek_vision,
+    "openai_responses": openai_vision,
+    "local": local_vision,
 }
-
-ASR_BACKENDS: dict[str, type[AsrModel]] = {
-    "dashscope": DashScopeAsr,
-    "openai_compat": OpenAICompatAsr,
-    # In-process sherpa-onnx (SenseVoice): CPU decoding, zero rates.
-    "sherpa": SherpaAsr,
-}
-
-#: Its own block, never borrowed from another capability's: a capability that can move
-#: platforms independently needs wiring that names it. Sharing one silently drags
-#: embedding onto whatever endpoint the other capability moves to, and every reply
-#: needing recall dies there on a 404.
-EMBEDDING_BACKENDS: dict[str, type[EmbeddingModel]] = {
-    "dashscope": DashScopeEmbedding,
-}
-
-SEARCH_BACKENDS: dict[str, type[SearchEngine]] = {
-    "tavily": TavilySearch,
-}
+EMBEDDING_PROVIDERS: dict[str, type[EmbeddingModel]] = {"dashscope": DashScopeEmbedding}
+SEARCH_PROVIDERS: dict[str, type[SearchEngine]] = {"tavily": TavilySearch}
 
 
-def _pick(table: dict, name: str, capability: str):
-    # Looked up first and constructed outside the check, so a KeyError raised
-    # inside a backend's own __init__ is not reported as an unknown name.
-    cls = table.get(name)
-    if cls is None:
+def _builder(table: dict[str, Callable], name: str, capability: str) -> Callable:
+    build = table.get(name)
+    if build is None:
         raise RuntimeError(
-            f"unknown {capability} backend {name!r}; "
-            f"available: {', '.join(sorted(table))}"
+            f"unknown {capability} provider {name!r}; available: {', '.join(sorted(table))}"
         )
-    return cls()
+    return build
+
+
+def _instance(table: dict[str, type], name: str, capability: str):
+    return _builder(table, name, capability)()
 
 
 def build(settings: Settings) -> Providers:
-    llm = settings.llm
+    capabilities = settings.capabilities
+    search = _instance(SEARCH_PROVIDERS, capabilities.search.provider, "search")
     bundle = Providers(
-        text=_pick(TEXT_BACKENDS, llm.text.backend, "text"),
-        vision=_pick(VISION_BACKENDS, llm.vision.backend, "vision"),
-        asr=_pick(ASR_BACKENDS, llm.asr.backend, "asr"),
-        embedding=_pick(EMBEDDING_BACKENDS, llm.embedding.backend, "embedding"),
-        search=_pick(SEARCH_BACKENDS, llm.search.backend, "search"),
+        text=_builder(
+            TEXT_PROVIDERS, capabilities.text.provider, "text"
+        )(capabilities.text),
+        vision=_builder(
+            VISION_PROVIDERS, capabilities.vision.provider, "vision"
+        )(capabilities.vision),
+        asr=SherpaAsr(),
+        embedding=_instance(
+            EMBEDDING_PROVIDERS, capabilities.embedding.provider, "embedding"
+        ),
+        search=search,
+        page_reader=search,
     )
     log.info("providers: %s", bundle.describe())
     return bundle

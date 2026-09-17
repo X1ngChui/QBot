@@ -5,8 +5,8 @@ Run it inside the bot container after the keys are in place:
     docker compose run --rm bot python scripts/preflight.py
 
 Checks, in order: the database answers, every key the config names resolves, and each
-capability makes one real minimal call - text, vision (inline base64), ASR, search,
-embedding.
+capability makes a real minimal request - text performs a function-call round trip, then
+vision (inline base64), ASR, search and embedding each make one call.
 Each call takes the production path, proxy included: search goes through the
 configured proxy exactly as it will at runtime, everything else direct.
 """
@@ -21,7 +21,18 @@ import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from qqbot.providers import Kind, providers
+from qqbot.providers import providers
+from qqbot.providers.contracts import (
+    CallContext,
+    CallPurpose,
+    GenerationPolicy,
+    Message,
+    ModelRequest,
+    ReasoningEffort,
+    Role,
+    ToolResult,
+    ToolSpec,
+)
 from qqbot.settings import config
 from qqbot.util import read_api_key
 
@@ -81,6 +92,8 @@ async def check_db() -> None:
 
     try:
         await init_pool()
+        from qqbot.db.repo import ensure_schema
+        await ensure_schema()
         ver = await pool().fetchval("SELECT version()")
         tables = await pool().fetchval(
             "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'"
@@ -91,38 +104,66 @@ async def check_db() -> None:
 
 
 async def check_text() -> None:
-    cfg = config().default.llm.text
+    cfg = config().default.capabilities.text
     label = f"text ({cfg.model})"
     try:
-        res = await providers().text.chat(
-            [{"role": "user", "content": "只回复两个字：收到"}],
-            cfg=cfg,
-            max_tokens=512,
-            effort="off",
-            kind=Kind.PREFLIGHT,
+        tool = ToolSpec(
+            name="preflight_echo",
+            description="Call this tool once before answering.",
+            parameters={"type": "object", "properties": {}, "required": []},
         )
-        think = f" reasoning={res.reasoning}" if res.reasoning else ""
-        record(label, bool(res.text),
-               f"{res.text!r} in={res.in_hit}+{res.in_miss} out={res.out}{think}")
+        policy = GenerationPolicy(
+            model=cfg.model,
+            reasoning=ReasoningEffort.OFF,
+            timeout_sec=cfg.timeout_sec,
+            retries=cfg.retries,
+            max_output_tokens=512,
+        )
+        request = ModelRequest(
+            prompt=(
+                Message(Role.USER, "Call preflight_echo, then report its result."),
+            ),
+            tools=(tool,),
+            policy=policy,
+            context=CallContext(CallPurpose.PREFLIGHT),
+        )
+        async with providers().text.open_session(request) as session:
+            first = await session.start()
+            calls = first.tool_calls
+            if len(calls) != 1 or calls[0].name != "preflight_echo":
+                raise RuntimeError("model did not produce the preflight function call")
+            result = await session.continue_with(
+                (ToolResult(calls[0].call_id, "received"),)
+            )
+        reasoning = first.usage.reasoning + result.usage.reasoning
+        think = f" reasoning={reasoning}" if reasoning else ""
+        record(
+            label,
+            bool(result.text),
+            f"tool round-trip, {result.text!r} "
+            f"in={first.usage.input_cached + result.usage.input_cached}+"
+            f"{first.usage.input_uncached + result.usage.input_uncached} "
+            f"out={first.usage.output + result.usage.output}{think}",
+        )
     except Exception as e:
         record(label, False, repr(e))
 
 
 async def check_vision() -> None:
-    cfg = config().default.llm.vision
+    cfg = config().default.capabilities.vision
     label = f"vision, base64 inline ({cfg.model})"
     try:
         from qqbot.settings import ptext
         desc = await providers().vision.describe(
             TEST_PNG, cfg=cfg, prompt=ptext("describe_image"), mime="image/png")
-        record(label, True, repr(desc[:40]))
+        record(label, bool(desc), repr(desc[:40]))
     except Exception as e:
         record(label, False, repr(e))
 
 
 async def check_asr() -> None:
-    cfg = config().default.llm.asr
-    label = f"ASR, base64 inline ({cfg.model})"
+    cfg = config().default.capabilities.asr
+    label = "ASR, local CPU SenseVoice"
     try:
         text = await providers().asr.transcribe(silence_wav(), cfg=cfg, fmt="wav", seconds=0.4)
         record(label, True, repr(text[:40]))
@@ -131,8 +172,8 @@ async def check_asr() -> None:
 
 
 async def check_search() -> None:
-    cfg = config().default.llm.search
-    label = f"search ({cfg.backend})"
+    cfg = config().default.capabilities.search
+    label = f"search ({cfg.provider})"
     try:
         items = await providers().search.search("今天天气", cfg=cfg)
         record(label, bool(items), f"{len(items)} results, count={cfg.count}")
@@ -144,8 +185,8 @@ async def check_embedding() -> None:
     """Checked on its own config block, one real call: a wrong embedding endpoint
     otherwise surfaces days later as episode recall quietly degrading, never as
     a boot failure."""
-    cfg = config().default.llm.embedding
-    label = f"embedding ({cfg.backend})"
+    cfg = config().default.capabilities.embedding
+    label = f"embedding ({cfg.provider})"
     try:
         vecs = await providers().embedding.embed(["预检"], cfg=cfg)
         record(label, bool(vecs) and len(vecs[0]) == cfg.dimensions,
@@ -157,19 +198,18 @@ async def check_embedding() -> None:
 def check_keys() -> None:
     """Check the key each capability actually points at, not a hardcoded list - two
     capabilities may share one name or not, and only the config knows."""
-    llm = config().default.llm
+    capabilities = config().default.capabilities
     p = providers()
-    record("backends selected", True, p.describe())
+    record("providers selected", True, p.describe())
     seen: dict[str, str] = {}
-    for label, name, backend in (
-        ("text", llm.text.api_key_env, p.text),
-        ("vision", llm.vision.api_key_env, p.vision),
-        ("asr", llm.asr.api_key_env, p.asr),
-        ("search", llm.search.api_key_env, p.search),
-        ("embedding", llm.embedding.api_key_env, p.embedding),
+    for label, name, provider in (
+        ("text", capabilities.text.credential_env, p.text),
+        ("vision", capabilities.vision.credential_env, p.vision),
+        ("search", capabilities.search.credential_env, p.search),
+        ("embedding", capabilities.embedding.credential_env, p.embedding),
     ):
-        if not backend.needs_key:
-            record(f"{label} key not needed ({backend.name})", True)
+        if not provider.needs_key:
+            record(f"{label} key not needed ({provider.name})", True)
             continue
         key = read_api_key(name)
         shared = f", shared with {seen[name]}" if name in seen else ""
@@ -190,6 +230,7 @@ async def main() -> int:
         return 1
 
     check_keys()
+    await providers().asr.start(config().default.capabilities.asr)
     await check_db()
     await check_text()
     await check_vision()

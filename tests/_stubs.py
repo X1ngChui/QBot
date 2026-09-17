@@ -1,25 +1,165 @@
-"""Stand-ins the DB-backed suites share.
+"""Shared test doubles for provider-neutral model capabilities."""
 
-Kept apart from `_db.py`, which is about the database. What is here is the one capability
-every suite has to supply now that the reply path will not start without it.
-"""
+from __future__ import annotations
 
 import hashlib
+import json
+from types import SimpleNamespace
 
-from qqbot.providers.base import EmbeddingModel, Rate
+from qqbot.providers.base import EmbeddingModel, Rate, TextSession
+from qqbot.providers.contracts import (
+    Message,
+    ModelTurn,
+    PromptItem,
+    SessionDirective,
+    TextPart,
+    ToolCall,
+    ToolCallId,
+    ToolResult,
+    ToolSpec,
+)
+
+
+def function_call(
+    name: str,
+    arguments: dict | str,
+    *,
+    call_id: str = "call-1",
+    status: str | None = "completed",
+) -> ToolCall:
+    """Build one completed neutral function call for a fake model."""
+
+    del status
+    raw = arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False)
+    return ToolCall(ToolCallId(call_id), name, raw)
+
+
+def response(
+    *,
+    text: str = "",
+    tool_calls: list[ToolCall] | tuple[ToolCall, ...] | None = None,
+    model: str = "",
+    in_hit: int = 0,
+    in_miss: int = 0,
+    out: int = 0,
+    reasoning: int = 0,
+    cny: float = 0.0,
+    status: str = "completed",
+) -> ModelTurn:
+    """Build a completed neutral turn."""
+
+    del status
+    from qqbot.providers.contracts import ModelUsage
+
+    return ModelTurn(
+        text=text,
+        tool_calls=tuple(tool_calls or ()),
+        model=model,
+        usage=ModelUsage(in_hit, in_miss, out, reasoning, cny),
+    )
+
+
+def legacy_item(item: PromptItem) -> dict:
+    """Readable wire-like shape retained only for existing test assertions."""
+
+    if isinstance(item, Message):
+        content = item.content
+        if isinstance(content, tuple):
+            content = [
+                {"type": "input_text", "text": part.text}
+                if isinstance(part, TextPart)
+                else {"type": "input_image"}
+                for part in content
+            ]
+        return {"role": item.role.value, "content": content}
+    if isinstance(item, ToolCall):
+        return {
+            "type": "function_call",
+            "call_id": str(item.call_id),
+            "name": item.name,
+            "arguments": item.arguments,
+        }
+    return {
+        "type": "function_call_output",
+        "call_id": str(item.call_id),
+        "output": item.output,
+    }
+
+
+def legacy_tool(tool: ToolSpec) -> dict:
+    return {
+        "type": "function",
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": tool.parameters,
+        "strict": tool.strict,
+    }
+
+
+class LegacyTextSession(TextSession):
+    """Drive an old-style test callback through the new task-local session API."""
+
+    def __init__(self, model, request) -> None:
+        self._model = model
+        self._request = request
+        self._items = list(request.prompt)
+        self._tools = request.tools
+        self._policy = request.policy
+        self._last: ModelTurn | None = None
+        self._closed = False
+
+    async def _call(self) -> ModelTurn:
+        if self._closed:
+            raise RuntimeError("test session is closed")
+        cfg = SimpleNamespace(
+            model=self._policy.model,
+            reasoning_effort=self._policy.reasoning.value,
+            timeout_sec=self._policy.timeout_sec,
+            retries=self._policy.retries,
+        )
+        turn = await self._model.respond(
+            [legacy_item(item) for item in self._items],
+            cfg=cfg,
+            tools=[legacy_tool(tool) for tool in self._tools],
+            max_tokens=self._policy.max_output_tokens,
+            effort=None,
+            kind=self._request.context.purpose.value,
+            group_id=self._request.context.group_id,
+        )
+        self._last = turn
+        return turn
+
+    async def start(self) -> ModelTurn:
+        if self._last is not None:
+            raise RuntimeError("test session already started")
+        return await self._call()
+
+    async def continue_with(
+        self,
+        results: tuple[ToolResult, ...],
+        *,
+        directive: SessionDirective | None = None,
+    ) -> ModelTurn:
+        if self._last is None:
+            raise RuntimeError("test session has not started")
+        self._items.extend(self._last.tool_calls)
+        self._items.extend(results)
+        if directive is not None:
+            self._items.extend(directive.prompt)
+            if directive.tools is not None:
+                self._tools = directive.tools
+            if directive.policy is not None:
+                self._policy = directive.policy
+        return await self._call()
+
+    async def aclose(self) -> None:
+        self._closed = True
 
 
 class FakeEmbedding(EmbeddingModel):
-    """Answers, so the vector path runs rather than being skipped.
-
-    The real one is a paid network call. What the suites check is that the chain asks for
-    a vector and reads one back - which nothing checked while the reply path was built
-    without a backend at all and quietly ranked by importance instead.
-    """
+    """A deterministic vector backend used by the DB-backed suites."""
 
     name = "fake-embed"
-    #: The column is fixed at this width, so a stub answering with anything else fails at
-    #: the insert rather than somewhere further downstream.
     DIMS = 2048
     EMBED_CALLS = 0
 
@@ -32,17 +172,11 @@ class FakeEmbedding(EmbeddingModel):
 
     async def embed(self, texts, *, cfg=None, group_id=None):
         type(self).EMBED_CALLS += len(texts)
-        # Deterministic across processes, which the first version was not: it used the
-        # built-in hash(), which is salted per process, so the vector geometry changed
-        # from run to run and retrieval checks flickered against the search layer's
-        # distance ceiling. md5 is stable. The shared base keeps any two texts inside
-        # that ceiling - what these suites test is the plumbing, not the geometry - while
-        # the per-text perturbation keeps distinct texts distinct.
-        out = []
-        for t in texts:
-            h = hashlib.md5(t.encode("utf-8")).digest()
-            out.append([1.0 + h[i % 16] / 1275.0 for i in range(self.DIMS)])
-        return out
+        vectors = []
+        for text in texts:
+            digest = hashlib.md5(text.encode("utf-8")).digest()
+            vectors.append([1.0 + digest[index % 16] / 1275.0 for index in range(self.DIMS)])
+        return vectors
 
     async def aclose(self):
         pass

@@ -99,6 +99,9 @@ class GroupMessage:
     #: usually absent from `segments`.
     reply_to_message_id: str | None = None
     reply_to_user_id: str | None = None
+    #: Versioned only for bot-authored outbound segment projections. Inbound and
+    #: legacy rows stay at zero and retain their historical reconstruction rules.
+    outbound_schema: int = 0
     #: Also decided by the adapter: a leading or trailing @bot is removed and flagged.
     to_me: bool = False
     raw: dict = field(default_factory=dict, repr=False)
@@ -165,4 +168,5 @@ class GroupMessage:
             "segments": self.segments,
             "reply_to": self.reply_to_message_id,
             "to_me": self.to_me,
+            "outbound_schema": self.outbound_schema,
         }

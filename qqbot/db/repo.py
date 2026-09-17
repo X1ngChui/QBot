@@ -10,6 +10,7 @@ from __future__ import annotations
 import uuid
 from datetime import date, timedelta
 
+from ..domain.evidence import EvidenceMemo
 from ..settings import config
 from ..util import now_local, today_local, tz_sql
 from .pool import pool
@@ -68,12 +69,15 @@ async def ensure_schema() -> None:
                ('raw_event','plain_text'),
                ('group_state','first_seen_at'),
                ('image_cache','file_id'),
+               ('image_cache','file_provider'),
                ('image_cache','file_uploaded_at'),
                ('image_cache','described_at'),
                ('image_cache','refused'),
                ('cost_ledger','day'),
                ('cost_ledger','user_id'),
                ('group_blocklist','blocked_until'),
+               ('reply_trace','memo'),
+               ('reply_trace','expires_at'),
                ('user_agreement','version')
            ) AS c(tbl, col)
            LEFT JOIN information_schema.columns i
@@ -134,11 +138,11 @@ async def ensure_schema() -> None:
         """SELECT atttypmod FROM pg_attribute
             WHERE attrelid = 'embedding_index'::regclass AND attname = 'embedding'""",
     )
-    want_dims = config().default.llm.embedding.dimensions
+    want_dims = config().default.capabilities.embedding.dimensions
     if width != want_dims:
         raise RuntimeError(
             f"embedding_index.embedding is VECTOR({width}) but "
-            f"llm.embedding.dimensions is {want_dims}; the column and the backend "
+            f"capabilities.embedding.dimensions is {want_dims}; the column and the backend "
             "must agree, or every vector insert fails")
 
 
@@ -212,14 +216,20 @@ async def image_cache_put(key: str, description: str, *, refused: bool = False) 
     )
 
 
-async def image_cache_file(key: str, *, max_age: timedelta | None = None) -> str | None:
-    """Where this picture was filed with the model that reads it, if it was uploaded
-    within `max_age`. The backend expires files, and a dead id fails the whole
-    request it rides in, so an id past the age (or one stored before its upload
-    time was recorded) is reported as absent and the caller uploads again."""
+async def image_cache_file(
+    key: str,
+    *,
+    provider: str,
+    max_age: timedelta | None = None,
+) -> str | None:
+    """Return a fresh file handle issued by this exact provider, if any."""
+
     row = await pool().fetchrow(
-        "SELECT file_id, file_uploaded_at FROM image_cache WHERE key=$1", key)
-    if not row or not row["file_id"]:
+        """SELECT file_id, file_provider, file_uploaded_at
+             FROM image_cache WHERE key=$1""",
+        key,
+    )
+    if not row or not row["file_id"] or row["file_provider"] != provider:
         return None
     if max_age is not None:
         at = row["file_uploaded_at"]
@@ -228,15 +238,17 @@ async def image_cache_file(key: str, *, max_age: timedelta | None = None) -> str
     return row["file_id"]
 
 
-async def image_cache_set_file(key: str, file_id: str) -> None:
+async def image_cache_set_file(key: str, file_id: str, *, provider: str) -> None:
     await pool().execute(
-        """INSERT INTO image_cache (key, file_id, file_uploaded_at)
-           VALUES ($1,$2,now())
+        """INSERT INTO image_cache (key, file_id, file_provider, file_uploaded_at)
+           VALUES ($1,$2,$3,now())
            ON CONFLICT (key) DO UPDATE
-             SET file_id = EXCLUDED.file_id, file_uploaded_at = now(),
-                 last_seen = now()""",
+             SET file_id = EXCLUDED.file_id,
+                 file_provider = EXCLUDED.file_provider,
+                 file_uploaded_at = now(), last_seen = now()""",
         key,
         file_id,
+        provider,
     )
 
 
@@ -487,31 +499,57 @@ async def muted_groups() -> list[int]:
     return [r["group_id"] for r in rows]
 
 
-# -- reply_trace ------------------------------------------------------------
+# -- reply evidence ----------------------------------------------------------
 
 
-async def trace_add(group_id: int, reply_event_id: str, content: str) -> None:
-    """File one reply's trajectory digest. Idempotent per reply: a replayed write is
-    the same note."""
+async def evidence_add(group_id: int, reply_event_id: str, memo: EvidenceMemo) -> None:
+    """Store one structured memo; a replayed reply keeps its original evidence."""
+
     await pool().execute(
-        """INSERT INTO reply_trace (group_id, reply_event_id, content)
-           VALUES ($1,$2,$3)
+        """INSERT INTO reply_trace
+               (group_id, reply_event_id, content, memo, expires_at)
+           VALUES ($1,$2,'',$3,$4)
            ON CONFLICT (group_id, reply_event_id) DO NOTHING""",
-        group_id, reply_event_id, content,
+        group_id,
+        reply_event_id,
+        memo.to_dict(),
+        memo.expires_at,
     )
 
 
-async def traces_for(group_id: int, reply_event_ids: list[str]) -> dict[str, str]:
-    """The stored trajectories for these replies, for the window rebuild to re-seat
-    each one in front of the reply it fed."""
+async def evidence_for(group_id: int, reply_event_ids: list[str]) -> dict[str, str]:
+    """Render unexpired structured memos and legacy v0 text for prompt replay."""
+
     if not reply_event_ids:
         return {}
     rows = await pool().fetch(
-        """SELECT reply_event_id, content FROM reply_trace
-            WHERE group_id=$1 AND reply_event_id = ANY($2::text[])""",
-        group_id, reply_event_ids,
+        """SELECT reply_event_id, content, memo FROM reply_trace
+            WHERE group_id=$1 AND reply_event_id = ANY($2::text[])
+              AND (expires_at IS NULL OR expires_at > NOW())""",
+        group_id,
+        reply_event_ids,
     )
-    return {r["reply_event_id"]: r["content"] for r in rows}
+    rendered: dict[str, str] = {}
+    for row in rows:
+        if row["memo"] is not None:
+            try:
+                content = EvidenceMemo.from_dict(row["memo"]).render()
+            except (TypeError, ValueError):
+                continue
+        else:
+            content = row["content"]
+        if content:
+            rendered[row["reply_event_id"]] = content
+    return rendered
+
+
+async def evidence_prune() -> int:
+    """Delete expired evidence in one bounded nightly database operation."""
+
+    result = await pool().execute(
+        "DELETE FROM reply_trace WHERE expires_at IS NOT NULL AND expires_at <= NOW()"
+    )
+    return int(result.rpartition(" ")[2])
 
 
 # -- cost_ledger ------------------------------------------------------------

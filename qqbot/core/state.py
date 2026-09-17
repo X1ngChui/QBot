@@ -17,6 +17,7 @@ from datetime import datetime
 from ..db import repo
 from ..settings import config
 from ..util import SYS_L, SYS_R, display_name, fmt_when, now_local, sysmark, why
+from .outbound import OutboundSegment, from_onebot
 from .segments import parse_segments
 
 log = logging.getLogger("qqbot.state")
@@ -48,6 +49,9 @@ class ChatMsg:
     #: the number it wears in that render; members' own @-mentions stay in their
     #: text as names.
     at: list[tuple[str, str]] = field(default_factory=list)
+    #: Exact ordered segments for the bot's own structured replies. Member messages
+    #: remain empty because their parsed media references have a different purpose.
+    outbound: tuple[OutboundSegment, ...] = ()
     #: The parsed message, kept only while it still holds a picture or voice clip nobody
     #: has paid to understand. People post a picture and ask about it in the *next*
     #: message, by which time this one has been processed and its refs would otherwise be
@@ -112,6 +116,18 @@ class ChatMsg:
         return f"{head}{when}{self.nickname}{no}{tag}: {body}"
 
 
+def _addressees(segments: list) -> list[tuple[str, str]]:
+    at = [
+        (
+            str((segment.get("data") or {}).get("qq") or ""),
+            str((segment.get("data") or {}).get("name") or ""),
+        )
+        for segment in segments
+        if isinstance(segment, dict) and segment.get("type") == "at"
+    ]
+    return [(qq, name) for qq, name in at if qq]
+
+
 def _split_addressees(segments: list, text: str) -> tuple[list[tuple[str, str]], str]:
     """(whom it @-ed, body) for one of the bot's own archived messages.
 
@@ -120,10 +136,7 @@ def _split_addressees(segments: list, text: str) -> tuple[list[tuple[str, str]],
     in order. A line whose text does not open that way (archived before the at
     segments were stored) keeps its text whole.
     """
-    at = [(str((s.get("data") or {}).get("qq") or ""),
-           str((s.get("data") or {}).get("name") or ""))
-          for s in segments if isinstance(s, dict) and s.get("type") == "at"]
-    at = [(qq, name) for qq, name in at if qq]
+    at = _addressees(segments)
     rest = text
     for _, name in at:
         opening = f"@{name}"
@@ -293,13 +306,17 @@ class GroupState:
             segs = payload.get("segments") or []
             is_bot = uid == self_id
             at: list[tuple[str, str]] = []
+            outbound: tuple[OutboundSegment, ...] = ()
             if is_bot:
-                # The bot's own line was archived as the group read it, "@name "
-                # openings included; the at segments say whom, and the opening
-                # comes off so the text is the body the reply carried.
-                at, text = _split_addressees(segs, text)
-                if not at and (asker := _asker(msgs, payload.get("reply_to"), text)):
-                    at, text = [asker], text[len(asker[1]) + 1:].lstrip(" ")
+                if payload.get("outbound_schema") == 1:
+                    outbound = from_onebot(segs)
+                    at = _addressees(segs)
+                else:
+                    # Schema-v0 rows encoded addressees in the opening text. Keep
+                    # this explicit migration path until those rows age out.
+                    at, text = _split_addressees(segs, text)
+                    if not at and (asker := _asker(msgs, payload.get("reply_to"), text)):
+                        at, text = [asker], text[len(asker[1]) + 1:].lstrip(" ")
                 refs = []
             else:
                 refs = parse_segments(segs, self_id, limits=limits).pictures if segs else []
@@ -314,6 +331,7 @@ class GroupState:
                 reply_to=payload.get("reply_to") or None,
                 image_refs=refs,
                 at=at,
+                outbound=outbound,
             ))
         archived = {m.msg_id for m in msgs}
         live = [m for m in self.recent if m.msg_id not in archived]

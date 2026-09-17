@@ -84,18 +84,21 @@ The dump carries the extensions and every table. The bot verifies the schema at 
 
 ## Rollback
 
-`deploy.sh` tags the previously running image `qbot-bot:rollback` before every build.
-On the host:
+`deploy.sh` tags the previously running image `qbot-bot:rollback` and copies the
+previous mounted configuration to `.config.rollback` before every build. On the host:
 
 ```bash
 cd /opt/docker/qbot
+find config -mindepth 1 -delete
+cp -a .config.rollback/. config/
 docker tag qbot-bot:rollback qbot-bot:latest
 docker compose up -d --no-build bot
 ```
 
-The tag holds one step of history and is overwritten on every deploy. The source tree
-on the host still holds the new version; fix forward from the repository as soon as
-possible, or the next build reproduces the problem.
+Both snapshots hold one step of history and are overwritten on every deploy. Restoring
+the configuration contents in place preserves the bind-mounted directory inode. The
+source tree on the host still holds the new version; fix forward from the repository as
+soon as possible, or the next build reproduces the problem.
 
 ## Schema changes
 
@@ -120,9 +123,10 @@ the code expects, and refuses to start until it does.
 ## Debugging a reply
 
 `/debug N` writes the next N model rounds to `logs/debug/`, one JSON file per round with
-the full request messages and the raw response, so you can see what the model was
-actually shown instead of inferring it. Capture stops by itself when N is reached or on
-restart.
+the request, visible output, function calls, status and model. Reasoning items are
+removed from both replayed input and output before the file is written; they exist only
+in memory for the active Responses tool loop. Capture stops by itself when N is reached
+or on restart.
 
 `scripts/dump_memory.sql` prints one group's current memory (facts about the group,
 facts about people, episodes, pending jobs):
@@ -145,17 +149,21 @@ Routine operation is meant to be: read the report, adjust the configuration.
 
 ## Behavioural evaluations
 
-Two scripts run the real model against fixed scenarios. They cost a few cents per run
-and are deliberately not part of the test suite. Run them before and after any change
-to a prompt file, a model, or a reasoning grade.
+Three scripts use the real DeepSeek model and cost a few cents per run. They are
+intentionally outside the test suite. After prompt edits, run the structural review and
+the matching behavioral evaluation; run both evaluations after model or reasoning changes.
 
 ```bash
 docker start qbot-pgtest             # the test database; see tests/README.md
+.venv/bin/python scripts/review_prompts.py
 .venv/bin/python scripts/eval_replies.py
 .venv/bin/python scripts/eval_extract.py
 ```
 
-Both need real credentials in `.env` at the repository root.
+All three need real credentials in `.env` at the repository root. `review_prompts.py`
+refuses non-DeepSeek text providers and sends only the shipped prompt family plus a
+fictional developer-role sample; it reports contradictions, duplication, unclear tool
+contracts and authority leaks.
 
 `eval_replies.py` checks the reply path: no transcript markers reproduced, no self-@,
 injected instructions ignored, no prompt leakage, and tool initiative (a question only

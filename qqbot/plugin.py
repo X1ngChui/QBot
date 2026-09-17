@@ -69,6 +69,7 @@ async def _startup() -> None:
     # answers. What was picked is logged by build() itself, so a /reload's rebuild
     # says so too.
     set_providers(build_default())
+    await providers().asr.start(bundle.default.capabilities.asr)
 
     nickname.initialize()
     nickname.register(bundle.default.trigger.nicknames)

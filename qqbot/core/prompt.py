@@ -22,9 +22,25 @@ from __future__ import annotations
 import json
 import re
 
+from ..providers.contracts import Message, PromptItem, Role, ToolCall, ToolCallId, ToolResult
 from ..settings import Persona, Settings, ptext
 from ..util import SYS_L, SYS_R, defang, describe_now, fmt_when, sysmark
 from .member_numbers import MemberNumbers
+from .outbound import (
+    AtSegment,
+    ContactKind,
+    ContactSegment,
+    CustomMusicSegment,
+    DiceSegment,
+    FaceSegment,
+    JsonCardSegment,
+    MarketFaceSegment,
+    MusicSegment,
+    OutboundSegment,
+    ReplySegment,
+    RpsSegment,
+    TextSegment,
+)
 from .state import ChatMsg, GroupState
 from .tools import SEND
 #: The provenance marker at the end of one of the bot's own archived lines.
@@ -36,8 +52,8 @@ _PROV_TAIL = re.compile(
 # eviction chunk are config (prompt.window_chunks, prompt.evict_chunk), and the
 # window is their product so the multiple holds by construction. They serve context
 # and the cache rather than cost - a prefix token is ~1/30 price, so a wider window
-# is nearly free per call while every slide is the miss that costs. Trajectories are
-# fetched from reply_trace at assembly and do not consume the count.
+# is nearly free per call while every slide is the miss that costs. Evidence memos are
+# fetched by reply id at assembly and do not consume the count.
 
 #: Section headings. The blocks below answer different questions and carry different
 #: authority; without a marked boundary they read as one undifferentiated wall, and the
@@ -135,19 +151,9 @@ def _guessed_block(profiles: list[dict], people: MemberNumbers) -> str:
     return _block("未确认（你自行归纳的印象，可能有误或已过时）：", lines)
 
 
-def build_system(
-    persona: Persona,
-    profiles: list[dict],
-    group_facts: list[str] | None = None,
-    people: MemberNumbers | None = None,
-) -> str:
-    # Constants lead, so every group shares this opening span instead of each paying for
-    # its own. They also have to live here rather than in each persona: a bot that does not
-    # know the picture marker is its own eyesight will deny seeing an image it is holding
-    # the description of. How the model speaks comes first of all: everything after it is
-    # something to read, and the send tool is the one thing it does.
-    # Text comes through ptext at call time: config/prompts/*.txt is the source of
-    # truth, /reload applies.
+def build_policy() -> str:
+    """Cross-group invariants with the highest, cache-stable authority."""
+
     blocks = [
         H_SEND + "\n" + ptext("send_rules"),
         H_LEGEND + "\n" + ptext("legend") + "\n\n" + ptext("legend_reply_note"),
@@ -155,17 +161,25 @@ def build_system(
         H_CREDIBILITY + "\n" + ptext("credibility_rules"),
         H_PRIVATE + "\n" + ptext("private_rules"),
         H_TONE + "\n" + ptext("tone_rules"),
-        H_PERSONA + "\n" + persona.system_prompt.strip(),
     ]
+    return "\n\n".join(blocks)
+
+
+def build_developer(
+    persona: Persona,
+    profiles: list[dict],
+    group_facts: list[str] | None = None,
+    people: MemberNumbers | None = None,
+) -> str:
+    """Group-scoped identity and context below global policy authority."""
+
+    blocks = [H_PERSONA + "\n" + persona.system_prompt.strip()]
 
     # Split by origin, exactly like the identity block below. The hand-written half is a
     # statement; the card is the bot's own summary read back, and running them together
-    # would present a guess in the voice of a fact - and a summary can be flatly
-    # wrong, up to inventing a member outright. The
-    # hand-written half is served first: it was typed deliberately, and it is what
-    # corrects the other half when that goes wrong.
+    # would present a guess in the voice of a fact.
     fixed = persona.group_knowledge.strip()
-    learned = "\n".join(f"- {f}" for f in (group_facts or []))
+    learned = "\n".join(f"- {fact}" for fact in (group_facts or []))
     if fixed or learned:
         parts = []
         if fixed:
@@ -174,22 +188,28 @@ def build_system(
             parts.append("未确认（你自行归纳的印象，可能有误或已过时）：\n" + learned)
         blocks.append(H_GROUP + "\n" + "\n\n".join(parts))
 
-    # Identity, split by how the system came to know each part. What code can offer that
-    # reading the transcript cannot is certainty, and that is worth nothing unless the
-    # certain lines are marked as such - otherwise a nickname the bot guessed last week
-    # carries the same weight as a rename the platform reported. Everything outside the
-    # certain block comes from the model's own summarising, which is what makes this
-    # adaptive - it follows the group rather than a config file someone has to edit.
     if people is None:
         people = MemberNumbers()
         number_people(people, profiles, [], None)
     known = _known_block(profiles, people)
     guessed = _guessed_block(profiles, people)
-    parts = [x for x in (known, guessed) if x]
+    parts = [part for part in (known, guessed) if part]
     if parts:
         blocks.append(H_WHO + "\n" + "\n\n".join(parts))
+    return "\n\n".join(block for block in blocks if block)
 
-    return "\n\n".join(x for x in blocks if x)
+
+def build_system(
+    persona: Persona,
+    profiles: list[dict],
+    group_facts: list[str] | None = None,
+    people: MemberNumbers | None = None,
+) -> str:
+    """Combined reading retained for diagnostics and extraction-adjacent tests."""
+
+    return "\n\n".join(
+        (build_policy(), build_developer(persona, profiles, group_facts, people))
+    )
 
 
 def history_window(st: GroupState, msg: ChatMsg | None,
@@ -321,8 +341,69 @@ def _call_id(msg_id: str) -> str:
     return SEND + "_" + re.sub(r"[^A-Za-z0-9_-]", "_", msg_id)
 
 
-def own_line(m: ChatMsg, *, nums: dict[str, int], people: MemberNumbers | None,
-             trace: str = "") -> list[dict]:
+def _segment_arg(
+    segment: OutboundSegment,
+    *,
+    nums: dict[str, int],
+    people: MemberNumbers | None,
+) -> dict | None:
+    """One archived outbound segment in the model-facing send schema."""
+
+    match segment:
+        case TextSegment(text):
+            return {"type": "text", "data": {"text": text}}
+        case AtSegment(account):
+            number = people.number(account) if people is not None else 0
+            return {"type": "at", "data": {"member": number}} if number else None
+        case ReplySegment(message_id):
+            return (
+                {"type": "reply", "data": {"line": nums[message_id]}}
+                if message_id in nums else None
+            )
+        case FaceSegment(face_id):
+            return {"type": "face", "data": {"id": face_id}}
+        case MarketFaceSegment(package_id, emoji_id, key, summary):
+            data = {"package_id": package_id, "emoji_id": emoji_id, "key": key}
+            if summary:
+                data["summary"] = summary
+            return {"type": "mface", "data": data}
+        case DiceSegment():
+            return {"type": "dice", "data": {}}
+        case RpsSegment():
+            return {"type": "rps", "data": {}}
+        case ContactSegment(ContactKind.MEMBER, target_id):
+            number = people.number(target_id) if people is not None else 0
+            return (
+                {"type": "contact_member", "data": {"member": number}}
+                if number else None
+            )
+        case ContactSegment():
+            return {"type": "contact_group", "data": {}}
+        case MusicSegment(platform, track_id):
+            return {
+                "type": "music",
+                "data": {"platform": platform.value, "id": track_id},
+            }
+        case CustomMusicSegment(url, audio, title, image, singer):
+            data = {"url": url, "audio": audio, "title": title, "image": image}
+            if singer:
+                data["singer"] = singer
+            return {"type": "music_custom", "data": data}
+        case JsonCardSegment(data):
+            try:
+                payload = json.loads(data)
+            except json.JSONDecodeError:
+                return None
+            return {"type": "json", "data": {"payload": payload}}
+
+
+def own_line(
+    m: ChatMsg,
+    *,
+    nums: dict[str, int],
+    people: MemberNumbers | None,
+    evidence: str = "",
+) -> list[PromptItem]:
     """One of the bot's own messages, as the send call that sent it and its result.
 
     The model sends every reply through the send tool, so its past messages are
@@ -332,37 +413,60 @@ def own_line(m: ChatMsg, *, nums: dict[str, int], people: MemberNumbers | None,
     shape it should produce, rather than a transcript line - numbers, stamps,
     brackets - that it would copy into the text.
 
-    A stored trajectory rides as the content of the same assistant message: what
-    was looked up, then what was sent. Its bytes come straight from the immutable
-    reply_trace row, which keeps the rendering stable between turns.
+    A rendered evidence memo rides immediately before the send call it supported. It is
+    reconstructed from bounded structured storage and remains separate from the archive.
     """
     body = m.text
     prov = ""
     if found := _PROV_TAIL.search(body):
         prov, body = found.group(1), body[:found.start()]
-    args: dict = {"text": body}
-    ats = [people.number(a) if people is not None else 0 for a, _ in m.at]
-    if ats := [n for n in ats if n]:
-        args["at"] = ats
-    if m.reply_to and (q := nums.get(m.reply_to)):
-        args["reply"] = q
-    cid = _call_id(m.msg_id)
+    if m.outbound:
+        content = [
+            item
+            for segment in m.outbound
+            if (item := _segment_arg(segment, nums=nums, people=people)) is not None
+        ]
+        # Command replies were historically archived with reply metadata but without
+        # an explicit reply segment. Preserve that relation during the transition.
+        if (
+            m.reply_to
+            and m.reply_to in nums
+            and not any(item["type"] == "reply" for item in content)
+        ):
+            content.insert(0, {"type": "reply", "data": {"line": nums[m.reply_to]}})
+        args: dict = {"content": content}
+    else:
+        # Legacy rows without structured segments use the former flat contract.
+        content = [{"type": "text", "data": {"text": body}}]
+        for account, _ in m.at:
+            number = people.number(account) if people is not None else 0
+            if number:
+                content.insert(-1, {"type": "at", "data": {"member": number}})
+        if m.reply_to and (line := nums.get(m.reply_to)):
+            content.insert(0, {"type": "reply", "data": {"line": line}})
+        args = {"content": content}
+    call_id = ToolCallId(_call_id(m.msg_id))
     result = f"已发送：#{nums.get(m.msg_id, 0)} {sysmark(fmt_when(m.ts))}"
-    return [
-        {"role": "assistant", "content": trace or None,
-         "tool_calls": [{"id": cid, "type": "function",
-                         "function": {"name": SEND,
-                                      "arguments": json.dumps(args, ensure_ascii=False)}}]},
-        {"role": "tool", "tool_call_id": cid,
-         "content": f"{result} {prov}" if prov else result},
-    ]
+    out: list[PromptItem] = []
+    if evidence:
+        out.append(Message(Role.ASSISTANT, evidence))
+    out.extend(
+        [
+            ToolCall(call_id, SEND, json.dumps(args, ensure_ascii=False)),
+            ToolResult(call_id, f"{result} {prov}" if prov else result),
+        ]
+    )
+    return out
 
 
-def render_history(window: list[ChatMsg], nums: dict[str, int],
-                   marks: dict[str, str],
-                   traces: dict[str, str] | None = None,
-                   pics: dict[str, list[int]] | None = None,
-                   people: MemberNumbers | None = None) -> list[dict]:
+def render_history(
+    window: list[ChatMsg],
+    nums: dict[str, int],
+    marks: dict[str, str],
+    evidence: dict[str, str] | None = None,
+    pics: dict[str, list[int]] | None = None,
+    people: MemberNumbers | None = None,
+) -> list[PromptItem]:
     """The window as chat messages: one user message per member line, one send
     call and its result per line the bot sent (see own_line).
 
@@ -372,18 +476,24 @@ def render_history(window: list[ChatMsg], nums: dict[str, int],
     turns, and the prefix cache is never spent on a picture that a newer one pushed
     off a rail.
     """
-    traces = traces or {}
+    evidence = evidence or {}
     pics = pics or {}
-    out: list[dict] = []
+    out: list[PromptItem] = []
     for m in window:
         if m.is_bot:
-            out.extend(own_line(m, nums=nums, people=people,
-                                trace=traces.get(m.msg_id, "")))
+            out.extend(
+                own_line(
+                    m,
+                    nums=nums,
+                    people=people,
+                    evidence=evidence.get(m.msg_id, ""),
+                )
+            )
             continue
         line = m.render(seq=nums.get(m.msg_id, 0), quote=marks.get(m.msg_id, ""),
                         pic_nums=pics.get(m.msg_id),
                         member_no=people.number(m.user_id) if people is not None else 0)
-        out.append({"role": "user", "content": line})
+        out.append(Message(Role.USER, line))
     return out
 
 
@@ -428,13 +538,13 @@ def assemble(
     msg: ChatMsg,
     profiles: list[dict],
     group_facts: list[str] | None = None,
-    traces: dict[str, str] | None = None,
+    evidence: dict[str, str] | None = None,
     window: list[ChatMsg] | None = None,
     nums: dict[str, int] | None = None,
     marks: dict[str, str] | None = None,
     pics: dict[str, list[int]] | None = None,
     people: MemberNumbers | None = None,
-) -> list[dict]:
+) -> tuple[PromptItem, ...]:
     # One pass over the window for both halves: the marks have to agree across the cache
     # boundary, since a quote in the message being answered points at a numbered line
     # above it. A caller that also runs the tool loop MUST pass its own computation
@@ -449,14 +559,18 @@ def assemble(
     if people is None:
         people = MemberNumbers()
         number_people(people, profiles, window, msg)
-    messages = [
-        {
-            "role": "system",
-            "content": build_system(persona, profiles, group_facts, people),
-        }
+    messages: list[PromptItem] = [
+        Message(Role.SYSTEM, build_policy()),
+        Message(
+            Role.DEVELOPER,
+            build_developer(persona, profiles, group_facts, people),
+        ),
     ]
-    messages.extend(render_history(window, nums, marks, traces, pics, people))
-    messages.append({"role": "user",
-                     "content": build_tail(msg=msg, nums=nums, marks=marks, pics=pics,
-                                           people=people)})
-    return messages
+    messages.extend(render_history(window, nums, marks, evidence, pics, people))
+    messages.append(
+        Message(
+            Role.USER,
+            build_tail(msg=msg, nums=nums, marks=marks, pics=pics, people=people),
+        )
+    )
+    return tuple(messages)

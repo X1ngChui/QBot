@@ -13,7 +13,7 @@ Read by Docker Compose. A missing credential fails `docker compose up`.
 | --- | --- |
 | `PG_PASSWORD` | PostgreSQL password, used only between the containers |
 | `TEXT_API_KEY` | The text and vision backends (one account serves both by default) |
-| `MEDIA_API_KEY` | The embedding backend, and API-based speech backends if configured |
+| `MEDIA_API_KEY` | The embedding provider |
 | `SEARCH_API_KEY` | The search backend |
 | `NAPCAT_ACCOUNT` | The QQ number NapCat logs in as. Leave empty for the first login, then set it so restarts reuse the saved session. |
 | `REGISTRY` | Docker registry mirror, default `docker.io` |
@@ -21,7 +21,7 @@ Read by Docker Compose. A missing credential fails `docker compose up`.
 
 Credential variables are named after the capability they serve, not the vendor. Which
 vendor serves a capability is decided in `settings.yaml`, where each capability names
-its variable with `api_key_env`. To split text and vision across two accounts, add a
+its variable with `credential_env`. To split text and vision across two accounts, add a
 variable here and in `docker-compose.yml`, then name it in the vision block.
 
 The bot container also reads `DATABASE_URL`, `DATABASE_PASSWORD`, `CONFIG_DIR`,
@@ -31,24 +31,30 @@ them; you only touch them when running outside Docker.
 ## `config/settings.yaml`
 
 Validated with pydantic. Unknown keys are rejected, so a typo fails the load instead of
-silently doing nothing. Every value here can be overridden per group in a persona file
-except where noted.
+silently doing nothing. Persona files may override task-local policy; shared runtime,
+resource and accounting fields are rejected explicitly as listed below.
 
 ### Applying changes
 
-`/reload` re-reads the settings, the personas, the prompts, the predicates and the
-agreement. If the new configuration is invalid the old one stays in force. The
-following need a restart:
+`/reload` first validates the entire candidate bundle, then compares every value owned by
+long-lived process resources. If validation fails or any restart-scoped value changed, the
+whole reload is rejected and the active bundle—including its timezone—remains untouched.
+A successful reload therefore means every accepted edit is live.
 
-- `schedule.nightly_cron`, `schedule.report_cron`, `schedule.misfire_grace_sec`: the
-  jobs are registered with the scheduler at startup.
-- The whole `database` block: the connection pool is built once.
-- The whole `memory` block and `llm.text.extract`: the memory worker resolves them when
-  it is constructed.
-- `llm.text.max_concurrency`: the semaphore is built once.
-- `timezone`, for the already-registered cron jobs only.
+Restart-scoped values are reported by exact path and include:
+
+- Provider identity, endpoint, credential and concurrency settings.
+- The resolved extraction model policy, extraction/shared prompt files and predicate table,
+  because the memory worker freezes them at construction.
+- Local ASR model path, CPU threads and queue capacity.
+- The complete embedding, database, memory and scheduler blocks.
+- The configured timezone.
 
 Changing code never takes effect through `/reload`; the image must be rebuilt.
+
+The current schema deliberately does not dual-read retired names. Validation reports the
+migration directly: `llm` → `capabilities`, `backend` → `provider`, `base_url` →
+`endpoint`, and `api_key_env` → `credential_env`.
 
 ### Top level
 
@@ -68,8 +74,8 @@ Changing code never takes effect through `/reload`; the image must be rebuilt.
 
 ### `gateway`
 
-The deadlines and the shutdown wait are read from the top-level file only, because
-they size clients shared by every group.
+The shared gateway controls are read from the top-level file only. A persona override is
+rejected rather than ignored; `media_wait_sec` and `max_msg_len` remain group-local policy.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -82,70 +88,71 @@ they size clients shared by every group.
 | `unreadable_retry_sec` | 600 | How long a picture no route could read is left alone before another attempt |
 | `shutdown_wait_sec` | 5 | How long shutdown waits for in-flight archive writes |
 
-### `llm`
+### `capabilities`
 
-Five capabilities, each with its own backend, endpoint, model and credential name.
-`backend` selects the implementation class from `qqbot/providers/registry.py` and can
-only be set in the top-level file. A group may override endpoint, model and grades.
+Five capabilities are configured independently. `provider` is a closed schema value, not
+an arbitrary registry string. The provider adapter hides platform-specific request and
+response behavior; core code sees only capability contracts. Group personas may override
+reloadable policy, but cannot replace process-owned providers, connections or local
+resources.
 
 | Key | Meaning |
 | --- | --- |
 | `http_retries` | Retries for the plain-HTTP backends (embedding, search, file upload) |
 | `retry_after_cap_sec` | The longest a vendor's `Retry-After` header may hold a call |
 
-**`llm.text`** — replies and memory extraction.
+**`capabilities.text`** — replies and memory extraction.
 
 | Key | Meaning |
 | --- | --- |
-| `backend`, `base_url`, `api_key_env`, `model` | The account and the reply model |
-| `reasoning_effort` | `off`, `low`, `high` or `max`, translated into the backend's own parameter. Thinking bills at output price. |
+| `provider`, `endpoint`, `credential_env`, `model` | The account and reply model. `deepseek`, `openai_responses` and `local` all use a Responses endpoint; there is no Chat Completions fallback. |
+| `reasoning_effort` | `off`, `low`, `high` or `max`, translated into the backend's own Responses parameter. Thinking bills at output price. |
 | `max_concurrency` | Concurrent model calls across every group (restart) |
 | `timeout_sec`, `retries` | Per call |
-| `extract.model`, `extract.reasoning_effort`, `extract.timeout_sec` | Extraction's own model, grade and deadline on the same account; empty model means the reply model. Restart to apply. |
+| `extract.model`, `extract.reasoning_effort`, `extract.timeout_sec` | Extraction's process-owned model, grade and deadline on the same account; empty model means the reply model. Persona overrides are rejected; restart to apply. |
 
-**`llm.vision`** — picture descriptions for the archive.
+**`capabilities.vision`** — picture descriptions for the archive. The backend must expose the
+Responses image-input shape as well as text responses.
 
 | Key | Meaning |
 | --- | --- |
-| `backend`, `base_url`, `api_key_env`, `model`, `reasoning_effort`, `timeout_sec` | As above |
+| `provider`, `endpoint`, `credential_env`, `model`, `reasoning_effort`, `timeout_sec` | As above |
 | `description_ttl_days` | How long a stored description stays current; past it, a reposted picture is described again. 0 disables expiry. |
 | `file_max_age_days` | How long an uploaded original is trusted to still exist at the backend; past it `open_images` uploads again. Keep it under the backend's retention. |
 | `max_images_per_min` | Pace gate for description calls |
 | `max_image_mb` | Largest picture handled |
 
-**`llm.asr`** — voice transcription. The default backend `sherpa` runs in-process and
-has no endpoint or credential.
+**`capabilities.asr`** — fixed in-process SenseVoice CPU transcription. It has no
+provider selector, endpoint, credential, remote model, request timeout or billing mode.
 
 | Key | Meaning |
 | --- | --- |
-| `backend` | `sherpa` (in-process), `dashscope` or `openai_compat` |
-| `model` | For `sherpa`, only a label in the ledger |
-| `model_dir` | The model bundle fetched by `scripts/fetch_asr_model.sh` (sherpa only) |
-| `threads` | CPU threads (sherpa only) |
-| `max_audio_sec` | Longest clip transcribed |
-| `max_clips_per_min` | Pace gate; a CPU guard for the free backend, a spending guard for a paid one |
-| `timeout_sec` | API backends only |
+| `model_dir` | Model bundle fetched by `scripts/fetch_asr_model.sh` (restart) |
+| `threads` | Native recognizer CPU threads (restart) |
+| `queue_capacity` | Global bounded FIFO admission queue (restart) |
+| `max_audio_sec` | Longest clip accepted |
+| `max_clips_per_min` | Per-group admission guard in front of the global queue |
 
-**`llm.embedding`** — vectors for episode recall.
+**`capabilities.embedding`** — vectors for episode recall.
 
 | Key | Meaning |
 | --- | --- |
 | `model`, `dimensions` | `dimensions` must match the `VECTOR(n)` column in `sql/init.sql`. Vectors are stored under the model that produced them and searched only under the current one, so changing the model hides existing vectors until the nightly pass rebuilds them. |
 
-**`llm.search`** — web search and page reading.
+**`capabilities.search`** — web search and page reading.
 
 | Key | Meaning |
 | --- | --- |
 | `count` | Results per search, at most 20 |
 | `depth` | `basic` (one credit) or `advanced` (two) |
-| `monthly_quota` | Credits per calendar month over every group. A persona override is ignored. |
+| `monthly_quota` | Credits per calendar month over every group. A persona override is rejected. |
 | `proxy` | HTTP proxy for the search client only; empty means direct |
 
 ### `budget`
 
 | Key | Meaning |
 | --- | --- |
-| `daily_cny_cap` | Daily spend over every group. At the cap the bot stops answering until the day rolls over. A persona override is ignored. |
+| `daily_cny_cap` | Daily spend over every group. At the cap the bot stops answering until the day rolls over. A persona override is rejected. |
 | `per_reply_cny` | What one reply may spend, tool loop included. Reaching it ends the tool loop with one final round answered from what was already fetched. |
 
 ### `prompt`
@@ -156,7 +163,7 @@ Counts, not tokens.
 | --- | --- |
 | `window_chunks`, `evict_chunk` | The history window holds `window_chunks × evict_chunk` messages and evicts a whole chunk at a time |
 | `forward_lines`, `forward_depth`, `forward_chars` | How much of a forwarded chat record is rendered |
-| `trace_result_chars`, `trace_total_chars` | How much of the retrieval trace beside each bot reply survives |
+| `evidence_result_chars`, `evidence_total_chars`, `evidence_ttl_days` | Per-item bound, total bound and retention for structured evidence supporting nearby follow-ups |
 | `provenance_items`, `provenance_query_chars` | The provenance marker on the bot's archived lines |
 
 ### `retrieval`
@@ -226,7 +233,7 @@ applies to one group and states only what differs; everything else is inherited.
 | `system_prompt` | The persona text. Replaces the default entirely. |
 | `system_prompt_extra` | Paragraphs appended to the inherited `system_prompt` |
 | `group_knowledge` | Standing facts about the group: what it is for, its jargon, its running jokes. Shown to the model every turn and to the extractor as established fact. Leave empty rather than writing notes to yourself. |
-| `overrides` | Any subtree of `settings.yaml`. Backends and the two global caps cannot be overridden. |
+| `overrides` | A task-local policy subtree of `settings.yaml`. Shared gateway/retry controls, providers and connections, local resources, scheduler/database state, timezone and global accounting caps are rejected. |
 
 The prompt bodies are Chinese because that is what the model reads. Tone, length and
 formatting are constrained here; the code only strips Markdown from the output.

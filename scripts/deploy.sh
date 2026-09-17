@@ -39,7 +39,9 @@ PAYLOAD=(qqbot scripts config sql bot.py requirements.txt Dockerfile docker-comp
 # config/ is NOT in this list: it is bind-mounted into the running container, and
 # rm -rf would orphan the mounted inode - if the build then failed, the old container
 # would keep running against an empty /app/config until someone recreated it. Its
-# *contents* are replaced instead, which the mount survives.
+# *contents* are replaced instead, which the mount survives. The previous contents are
+# copied to .config.rollback first, because rolling the image back without its matching
+# configuration can leave the old process unable to start.
 REPLACE=(qqbot scripts sql)
 FILES=(bot.py requirements.txt Dockerfile docker-compose.yml .dockerignore)
 
@@ -49,8 +51,9 @@ echo "==> sending $(git rev-parse --short HEAD 2>/dev/null || echo 'working tree
 # transfer or extract that dies leaves a server that still builds what it ran before.
 tar czf - --exclude=__pycache__ "${PAYLOAD[@]}" | "${SSH[@]}" "cat > '$REMOTE/.deploy.tar.gz'"
 "${SSH[@]}" "cd '$REMOTE' && rm -rf .deploy.new && mkdir .deploy.new && tar xzf .deploy.tar.gz -C .deploy.new && rm -f .deploy.tar.gz \
+  && mkdir -p config && rm -rf .config.rollback && cp -a config .config.rollback \
   && rm -rf ${REPLACE[*]} && for d in ${REPLACE[*]}; do mv .deploy.new/\$d .; done \
-  && mkdir -p config && find config -mindepth 1 -delete && cp -a .deploy.new/config/. config/ \
+  && find config -mindepth 1 -delete && cp -a .deploy.new/config/. config/ \
   && for f in ${FILES[*]}; do mv -f .deploy.new/\$f .; done && rm -rf .deploy.new"
 
 echo "==> rebuilding"

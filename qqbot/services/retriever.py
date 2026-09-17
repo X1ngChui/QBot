@@ -53,7 +53,7 @@ class Retriever:
         again.
         """
         [qv] = await self._embed.embed(
-            [question], cfg=config().default.llm.embedding, group_id=str(group_id))
+            [question], cfg=config().default.capabilities.embedding, group_id=str(group_id))
         near = await self._vec.search(
             group_id=group_id, object_type="episode", embedding=qv, limit=limit,
         )

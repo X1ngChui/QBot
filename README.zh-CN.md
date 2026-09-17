@@ -39,7 +39,7 @@ QQ  <->  NapCat (OneBot v11)  <-- 反向 WebSocket -->  bot  <-- asyncpg -->  Po
 bot 只认五种能力：文本、视觉、语音识别、向量化、网页搜索。每种能力由哪个服务商、
 哪个模型、哪个凭证提供，在 `config/settings.yaml` 中声明。默认配置使用 DeepSeek 提供
 文本与视觉，进程内的 sherpa-onnx + SenseVoice 做语音识别，阿里云 DashScope 做向量化，
-Tavily 做搜索。新增服务商只需写一个子类并注册。
+Tavily 做搜索。文本与视觉后端使用 Responses API；工具调用、工具结果和推理续接由每条回复任务在本地维护，不依赖服务商侧会话。新增服务商只需写一个子类并注册。
 
 完整说明见 [docs/architecture.md](docs/architecture.md)。
 

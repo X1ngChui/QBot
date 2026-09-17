@@ -49,7 +49,7 @@ class DashScopeEmbedding(EmbeddingModel):
                     source="bailian price list, rechecked 2026-08-27")
 
     def _client(self, cfg: EmbeddingCfg) -> httpx.AsyncClient:
-        ident = (cfg.base_url, cfg.timeout_sec)
+        ident = (cfg.endpoint, cfg.timeout_sec)
         if self._http is None or self._id != ident:
             if self._http is not None:
                 retire(self._http.aclose())
@@ -60,8 +60,8 @@ class DashScopeEmbedding(EmbeddingModel):
     async def embed(self, texts: Sequence[str], *, cfg: EmbeddingCfg,
                     group_id: str | None = None) -> list[list[float]]:
         out: list[list[float]] = []
-        key = require_key(cfg.api_key_env, "embedding")
-        base = cfg.base_url.rstrip("/")
+        key = require_key(cfg.credential_env, "embedding")
+        base = cfg.endpoint.rstrip("/")
         for i in range(0, len(texts), BATCH):
             chunk = list(texts[i:i + BATCH])
 

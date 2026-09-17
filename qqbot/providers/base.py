@@ -3,10 +3,9 @@
 The layer above depends on *what* it needs - text, vision, ASR, search - never on who
 provides it. Nothing in this file names a vendor.
 
-These are ABCs rather than protocols on purpose: backends differ in more than their URL,
-and every one of those differences should be forced into a named subclass instead of
-accumulating as flags in shared code. Subclassing makes the contract explicit, and an
-incomplete backend fails at construction rather than at the first live call.
+Lifecycle-bearing capabilities are ABCs: they own clients, concurrency or native
+resources, and an incomplete implementation should fail at construction. Narrow
+collaborators with no independent lifecycle, such as PageReader, use Protocol instead.
 
 One capability may be repointed at another platform without touching the others.
 There is no automatic fallback between backends: a silent downgrade would answer
@@ -20,40 +19,27 @@ import logging
 import random
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Protocol
 from email.utils import parsedate_to_datetime
-from enum import StrEnum
 
 import httpx
 
-from ..settings import AsrCfg, EmbeddingCfg, SearchCfg, TextCfg, VisionCfg, config
+from ..settings import AsrCfg, EmbeddingCfg, SearchCfg, VisionCfg, config
 from ..util import why
+from .contracts import (
+    AttachmentStore,
+    CallPurpose,
+    ModelRequest,
+    ModelTurn,
+    SessionDirective,
+    ToolResult,
+)
 
 log = logging.getLogger("qqbot.providers")
 
-
-class Kind(StrEnum):
-    """What a billed call was for. Stored as the string, so rows already written keep
-    working, and the enum is what code is allowed to name: the ledger's writers and its
-    readers share one vocabulary that cannot silently drift apart.
-    """
-
-    REPLY = "reply"
-    #: The launch checklist's one real call per capability (scripts/preflight.py).
-    #: Its own kind so a check run never reads as a reply in /stats.
-    PREFLIGHT = "preflight"
-    #: Reading a batch of transcript into memory candidates. Its own kind because it is
-    #: the one recurring cost that scales with how much the group talks rather than with
-    #: how often the bot answers, and the two need to be readable apart.
-    EXTRACT = "extract"
-    SEARCH = "search"
-    VISION = "vision"
-    ASR = "asr"
-    #: Vector projections. Cheap per call, but a paid capability that never reached
-    #: the ledger read exactly like a quiet day - the daily cap, /stats and the
-    #: report all measure only what is booked.
-    EMBED = "embed"
+Kind = CallPurpose
 
 
 #: Strong references to in-flight retirement tasks: asyncio holds tasks weakly,
@@ -116,7 +102,8 @@ def backoff_delay(attempt: int, *, retry_after: float | None = None,
     delay = 0.5 * 2 ** (attempt - 1)
     if retry_after is not None:
         delay = max(delay, retry_after)
-    delay = min(delay, cap if cap is not None else config().default.llm.retry_after_cap_sec)
+    ceiling = cap if cap is not None else config().default.capabilities.retry_after_cap_sec
+    delay = min(delay, ceiling)
     return delay + random.uniform(0.0, 0.25 * delay)
 
 
@@ -144,7 +131,7 @@ async def with_retry[T](
     status rule to see it. Anything else propagates on the first attempt.
     """
     if retries is None:
-        retries = config().default.llm.http_retries
+        retries = config().default.capabilities.http_retries
     attempt = 0
     while True:
         try:
@@ -178,7 +165,7 @@ class Rate:
     """What one unit of a capability costs, in CNY.
 
     Prices belong to the backend that charges them, not to a shared table: only
-    DeepSeekChat knows what DeepSeek bills, and only the search backend knows what a
+    DeepSeekText knows what DeepSeek bills, and only the search backend knows what a
     call against its allowance is worth. The upper layer never sees a vendor - it asks
     the capability for a Rate and multiplies.
 
@@ -200,28 +187,35 @@ class Rate:
         return n * self.per_unit
 
 
-@dataclass
-class ChatResult:
-    """What a text model returns, normalised across backends.
+class TextSession(ABC):
+    """One linear model run, owned by exactly one agent task."""
 
-    Token counts feed the budget gate. `out` is what bills; `reasoning` is the share of it
-    a deliberating backend spent thinking, broken out only so the cost is visible. Backends
-    that do not deliberate leave it at zero.
-    """
+    @abstractmethod
+    async def start(self) -> ModelTurn:
+        """Produce the first completed turn."""
 
-    text: str = ""
-    tool_calls: list[dict] = field(default_factory=list)
-    model: str = ""
-    in_hit: int = 0
-    in_miss: int = 0
-    out: int = 0
-    reasoning: int = 0
-    finish_reason: str = ""
-    cny: float = 0.0
+    @abstractmethod
+    async def continue_with(
+        self,
+        results: tuple[ToolResult, ...],
+        *,
+        directive: SessionDirective | None = None,
+    ) -> ModelTurn:
+        """Continue after one result per call.
 
-    @property
-    def truncated(self) -> bool:
-        return self.finish_reason == "length"
+        A directive appends neutral instructions and may narrow tools or policy for
+        a send-only wrap-up. Provider replay state remains private to the session.
+        """
+
+    @abstractmethod
+    async def aclose(self) -> None:
+        """Release task-local state. Safe to call after completion or failure."""
+
+    async def __aenter__(self) -> TextSession:
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.aclose()
 
 
 class Capability(ABC):
@@ -253,53 +247,15 @@ class Capability(ABC):
 
 
 class TextModel(Capability):
-    """Group replies, arbitration, summaries and profile rewrites."""
+    """A factory for isolated, task-local model sessions."""
 
     @abstractmethod
-    async def chat(
-        self,
-        messages: list[dict],
-        *,
-        cfg: TextCfg,
-        tools: list[dict] | None = None,
-        max_tokens: int | None = None,
-        effort: str | None = None,
-        kind: Kind = Kind.REPLY,
-        group_id: str | None = None,
-    ) -> ChatResult:
-        """Run one completion. Model, deliberation grade and timeout come from `cfg`,
-        so a caller with different needs passes a different config rather than a pile
-        of exceptions.
+    def open_session(self, request: ModelRequest) -> TextSession:
+        """Create a fresh session; it must not share continuation state."""
 
-        `kind` is what the call is booked as, and it is the enum: a purpose the
-        ledger's readers do not know about is a purpose /stats cannot show.
-
-        `effort` overrides cfg.reasoning_effort for the one call, and exists for
-        diagnostics that must pin a grade regardless of configuration. A request,
-        not a guarantee: backends that cannot deliberate ignore it, and no caller
-        may depend on it for correctness - only for cost, latency and depth.
-        """
-
-    #: Whether upload() files anything. Read before a picture's bytes are fetched
-    #: for filing, so a backend that keeps no files costs no download either.
-    keeps_files: bool = False
-
-    async def upload(
-        self, data: bytes, *, cfg: TextCfg, mime: str = "image/jpeg",
-    ) -> str | None:
-        """Store a picture with this backend and return an id its messages can carry.
-
-        On the text capability rather than on vision, because the model that reads the
-        file block is the one that has to be able to resolve the id. Filed through
-        vision, the two would have to share an account for a picture to arrive at
-        all - and config invites splitting them, giving each capability its own
-        endpoint and credential.
-
-        Not abstract: keeping files is a backend feature, not part of the contract.
-        None means this backend keeps none, and the caller then leaves originals out
-        of the prompt and lets the description line stand alone.
-        """
-        return None
+    #: Optional provider-owned storage used by open_images. The core sees only an
+    #: opaque StoredImage and never a vendor file identifier or expiry rule.
+    attachments: AttachmentStore | None = None
 
 
 class VisionModel(Capability):
@@ -326,6 +282,9 @@ class VisionModel(Capability):
 
 class AsrModel(Capability):
     """Speech to text. Inline bytes, for the same reason as VisionModel."""
+
+    async def start(self, cfg: AsrCfg) -> None:
+        """Load restart-scoped resources before the gateway accepts messages."""
 
     @abstractmethod
     async def transcribe(
@@ -362,20 +321,19 @@ class SearchEngine(Capability):
     ) -> list[dict]:
         """Return at most cfg.count results, each normalised to {title, link, content}."""
 
-    async def extract(
+
+class PageReader(Protocol):
+    """Optional narrow capability for extracting readable text from one URL."""
+
+    async def read_page(
         self, url: str, *, cfg: SearchCfg, group_id: str | None = None
     ) -> str:
-        """The readable text of one page, or "" when the page yields none.
-
-        Not abstract: a search backend without page extraction is still a search
-        backend, and the tool layer answers "unavailable" for it. Shares the search
-        allowance where the vendor meters both from one pool."""
-        raise NotImplementedError(f"{self.name} cannot read pages")
+        """Return readable page text, or an empty string when none is available."""
 
 
 @dataclass
 class Providers:
-    """The five capabilities, injected as one bundle.
+    """Lifecycle capabilities plus explicitly injected optional collaborators.
 
     Tests hand over fakes; a different backend is a different object here. Neither case
     touches the code that uses them. Every capability belongs in the bundle: one wired
@@ -388,11 +346,15 @@ class Providers:
     asr: AsrModel
     embedding: EmbeddingModel
     search: SearchEngine
+    page_reader: PageReader | None = None
 
     async def aclose(self) -> None:
-        """Close all five, even if one refuses: a backend that raises on the way out
-        must not leave the others holding their connections."""
+        """Close every lifecycle capability, once, even when one close fails."""
+        seen: set[int] = set()
         for cap in (self.text, self.vision, self.asr, self.embedding, self.search):
+            if id(cap) in seen:
+                continue
+            seen.add(id(cap))
             try:
                 await cap.aclose()
             except Exception:
