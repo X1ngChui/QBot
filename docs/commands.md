@@ -12,8 +12,7 @@ detail. Anything the reader may not run is ignored without a reply.
 
 | Level | Who | What |
 | --- | --- | --- |
-| Owner | Accounts in `owners` (the group's persona may override the list) | The whole console |
-| Global owner | Accounts in the top-level `owners` list only | Additionally the commands whose effect spans every group |
+| Owner | Accounts in the global `owners` list | The whole console, including commands whose effects span groups |
 | Member (self) | Anyone who has accepted the agreement | `/who`, `/note`, `/alias`, `/forget` against their own record |
 | Member | Anyone who has accepted the agreement | The read-only `/card`, `/stats`, `/top`, `/groupstats` |
 | Anyone | Before accepting the agreement | `/agree`, `/terms` |
@@ -55,7 +54,7 @@ QQ group's own admin role is never consulted.
 
 ### Identity
 
-Global owners only. These rewrite the identity graph, which spans every group.
+Owners only. These rewrite the identity graph, which spans every group.
 
 | Command | Usage |
 | --- | --- |
@@ -84,7 +83,7 @@ Global owners only. These rewrite the identity graph, which spans every group.
 
 ### Maintenance
 
-Global owners only.
+Owners only.
 
 | Command | Usage |
 | --- | --- |

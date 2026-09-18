@@ -361,8 +361,6 @@ class MemoryExtractor:
         self._prompts = prompt_catalog()
         self._prompt = self._prompts.render(
             PromptKey.EXTRACT_SYSTEM,
-            shared_legend=self._prompts.source(PromptKey.SHARED_LEGEND),
-            shared_pragmatics=self._prompts.source(PromptKey.SHARED_PRAGMATICS),
             predicate_table=rules_block(),
         )
         # Extraction's own model, grade and timeout on the reply backend's wiring:

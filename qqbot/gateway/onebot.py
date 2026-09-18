@@ -10,29 +10,21 @@ be there and whose types vary (group_id is sometimes int, sometimes str). Lettin
 consumer getattr its own way spreads "does this field exist" across ten places. It is
 answered once here, and everything downstream sees settled types.
 
-It doubles as the anti-corruption layer for everything behind the gateway: domain and
-services never learn what OneBot is. The reply path is the exception - core.pipeline
-reads the live event itself (segments, sender, to_me, reply), because the adapter's
-preprocessing only exists there; a platform field change can therefore touch both
-parsers, and the nickname and timestamp fallbacks here and in pipeline.handle are
-deliberately kept in step.
+It doubles as the anti-corruption layer for everything behind the gateway: live adapter
+state is captured here once, and domain and services never learn what OneBot is. Content
+parsing remains a separate concern, but it receives detached segment values from this
+envelope rather than reading the event again.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Self
 
+from ..domain.archive import AuthorKind
 from ..util import defang, now_local, scrub_nul, tz
-
-
-class AuthorKind(StrEnum):
-    """Who authored an archived message, independent of identity records."""
-
-    MEMBER = "member"
-    BOT = "bot"
 
 
 class Role(StrEnum):
@@ -105,35 +97,26 @@ class GroupMessage:
     #: The adapter lifts the reply segment out, resolves it, and puts it here - so it is
     #: usually absent from `segments`.
     reply_to_message_id: str | None = None
-    reply_to_user_id: str | None = None
     #: Versioned only for bot-authored outbound segment projections. Inbound and
     #: legacy rows stay at zero and retain their historical reconstruction rules.
     outbound_schema: int = 0
     author_kind: AuthorKind = AuthorKind.MEMBER
     #: Also decided by the adapter: a leading or trailing @bot is removed and flagged.
     to_me: bool = False
-    raw: dict = field(default_factory=dict, repr=False)
 
     @classmethod
-    def from_event(
-        cls, event: Any, segments: list[dict], self_id: str, *, plain_text: str = "",
-    ) -> Self:
-        """Take the values off a NoneBot event object.
+    def from_event(cls, event: Any, self_id: str) -> Self:
+        """Capture one adapter event into settled, detached values exactly once."""
 
-        Only fields the adapter guarantees are read directly; reply and to_me are
-        products of its preprocessing and are read with getattr, because another adapter
-        version may not have them.
-
-        The segments are stored verbatim, so this is the one place a NUL can be
-        taken out of them before the archive write refuses the whole message.
-        """
         reply = getattr(event, "reply", None)
-        # The event's own epoch timestamp, when it carries one: messages queued
-        # through a NapCat outage are delivered late, and stamping arrival would
-        # date an evening's backlog at reconnect time - in the transcript the model
-        # reads, in extraction's evidence dates, and in the archive's ordering
-        # against the bot's own replies.
         when = getattr(event, "time", 0) or 0
+        segments = [
+            {
+                "type": str(getattr(segment, "type", "") or ""),
+                "data": dict(getattr(segment, "data", {}) or {}),
+            }
+            for segment in event.get_message()
+        ]
         return cls(
             message_id=str(event.message_id),
             group_id=int(event.group_id),
@@ -145,17 +128,38 @@ class GroupMessage:
             self_id=str(self_id),
             occurred_at=(datetime.fromtimestamp(when, tz()) if when else now_local()),
             sub_type=str(getattr(event, "sub_type", "normal") or "normal"),
-            plain_text=plain_text.replace("\x00", ""),
             reply_to_message_id=(
                 str(getattr(reply, "message_id", "") or "") or None
-                if reply is not None else None
-            ),
-            reply_to_user_id=(
-                str(getattr(getattr(reply, "sender", None), "user_id", "") or "") or None
-                if reply is not None else None
+                if reply is not None
+                else None
             ),
             to_me=bool(getattr(event, "to_me", False)),
         )
+
+    def with_bot_mention(self, display_name: str) -> Self:
+        """Restore the structured self-at an adapter may have removed."""
+
+        shown = defang(display_name).strip() or "机器人"
+        segments = [
+            {"type": item.get("type"), "data": dict(item.get("data") or {})}
+            for item in self.segments
+            if isinstance(item, dict)
+        ]
+        self_mentions = [
+            item
+            for item in segments
+            if item.get("type") == "at"
+            and str((item.get("data") or {}).get("qq") or "") == self.self_id
+        ]
+        if self.to_me and not self_mentions:
+            item = {"type": "at", "data": {"qq": self.self_id, "name": shown}}
+            segments.insert(0, item)
+            self_mentions = [item]
+        for item in self_mentions:
+            data = item["data"]
+            if not data.get("name"):
+                data["name"] = shown
+        return replace(self, segments=segments)
 
     def as_payload(self) -> dict:
         """The shape stored in raw_event.payload. The segments are kept verbatim, so a

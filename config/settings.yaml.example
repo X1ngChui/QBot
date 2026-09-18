@@ -1,7 +1,8 @@
 # Copy to settings.yaml, then make it yours: owners, nicknames, models. The real
 # settings.yaml stays out of version control (it names real accounts); everything
 # structural about the file is documented here.
-# Per-group overrides go in config/personas/group_<gid>.yaml under `overrides`.
+# Persona files in config/personas/group_<gid>.yaml may vary only the bot's identity
+# and standing group context; behavior and resource settings in this file are global.
 # Two things this file does not say per line:
 #
 #   /reload vs restart. A reload is atomic: it either applies every edit or leaves the
@@ -35,12 +36,13 @@ trigger:
   # If it ever gets annoying, keep only the unambiguous names - @ still works.
   nicknames: ["小X", "小叉", "叉子"]
 
-# The shared gateway controls below are read from the top-level section only. A persona
-# override of one is rejected; media_wait_sec and max_msg_len remain group policy and may
-# be overridden.
+# Gateway controls are global. Persona files cannot override them.
 gateway:
   dedup_ttl_sec: 300
   max_msg_len: 2000
+  # Independent QQ messages one send_message tool call may submit. They are delivered
+  # in order; each message has its own segment and text limits.
+  max_messages_per_reply: 4
   # How long a reply waits for a picture or voice clip to be understood before
   # building the prompt without it. The work is never cancelled - it lands for the
   # next turn either way - so this only decides whether the person waits or the
@@ -176,7 +178,7 @@ capabilities:
     credential_env: SEARCH_API_KEY
     count: 5
     depth: basic              # 1 credit; "advanced" costs 2
-    # One total over every group. A persona override is rejected.
+    # One total over every group.
     monthly_quota: 1000       # the free tier; at it search refuses, nothing bills
     # HTTP proxy for the search client only; model traffic stays direct. Empty
     # means direct. A proxy running on the deploy host is reached at the docker
@@ -190,8 +192,7 @@ budget:
   # timezone above.
   # Only paid backends answer to it: free ones (sherpa transcription) pass
   # straight through, so their pace gates are the only thing holding them.
-  # A total over every group against one shared ledger. A persona override is
-  # rejected because it cannot divide the process-wide ledger.
+  # A total over every group against one shared ledger.
   daily_cny_cap: 3.0
   # What one reply may spend, in CNY, tool loop included. Money is the only
   # constraint: free tools run without limit, paid rounds account against this
@@ -222,11 +223,8 @@ prompt:
   evidence_result_chars: 1200
   evidence_total_chars: 4000
   evidence_ttl_days: 30
-  # The provenance marker on the bot's own archived lines: how many tool uses it
-  # names and how much of each query survives - a record of what an answer rested
-  # on, not a replay.
-  provenance_items: 4
-  provenance_query_chars: 80
+  # Sanitized request summary retained in each evidence item.
+  evidence_request_chars: 80
 
 retrieval:
   # Lines of surrounding conversation around each search_history hit, each way.

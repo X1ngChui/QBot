@@ -22,10 +22,11 @@ from __future__ import annotations
 import json
 import re
 
-from ..prompting import PromptKey
+from ..prompting import PromptCatalog, PromptKey
 from ..providers.contracts import Message, PromptItem, Role, ToolCall, ToolCallId, ToolResult
 from ..settings import Persona, Settings, prompt_catalog
-from ..util import SYS_L, SYS_R, defang, describe_now, fmt_when, sysmark
+from ..util import defang, describe_now, fmt_when, sysmark
+from .archive import without_legacy_provenance
 from .member_numbers import MemberNumbers
 from .outbound import (
     AtSegment,
@@ -35,7 +36,6 @@ from .outbound import (
     DiceSegment,
     FaceSegment,
     JsonCardSegment,
-    MarketFaceSegment,
     MusicSegment,
     OutboundSegment,
     ReplySegment,
@@ -44,9 +44,6 @@ from .outbound import (
 )
 from .state import ChatMsg, GroupState
 from .tools import SEND
-#: The provenance marker at the end of one of the bot's own archived lines.
-_PROV_TAIL = re.compile(
-    rf"\s*({re.escape(SYS_L)}依据[:：][^{re.escape(SYS_R)}]*{re.escape(SYS_R)})\s*$")
 
 # The history window is a message count, not a token budget: money bounds what a
 # reply may spend, and every other block is rendered whole. The count and its
@@ -154,15 +151,10 @@ def _guessed_block(profiles: list[dict], people: MemberNumbers) -> str:
     return _block("未确认（你自行归纳的印象，可能有误或已过时）：", lines)
 
 
-def build_policy() -> str:
+def build_policy(prompts: PromptCatalog | None = None) -> str:
     """Cross-group invariants with the highest, cache-stable authority."""
 
-    prompts = prompt_catalog()
-    return prompts.render(
-        PromptKey.REPLY_SYSTEM,
-        shared_legend=prompts.source(PromptKey.SHARED_LEGEND),
-        shared_pragmatics=prompts.source(PromptKey.SHARED_PRAGMATICS),
-    )
+    return (prompts or prompt_catalog()).render(PromptKey.REPLY_SYSTEM)
 
 
 def build_developer(
@@ -170,6 +162,8 @@ def build_developer(
     profiles: list[dict],
     group_facts: list[str] | None = None,
     people: MemberNumbers | None = None,
+    *,
+    prompts: PromptCatalog | None = None,
 ) -> str:
     """Group-scoped identity and context below global policy authority."""
 
@@ -198,7 +192,7 @@ def build_developer(
     roster_block = (
         H_WHO + "\n" + "\n\n".join(roster_parts) if roster_parts else ""
     )
-    return prompt_catalog().render(
+    return (prompts or prompt_catalog()).render(
         PromptKey.REPLY_DEVELOPER,
         persona=persona_block,
         group_context=group_block,
@@ -211,11 +205,22 @@ def build_system(
     profiles: list[dict],
     group_facts: list[str] | None = None,
     people: MemberNumbers | None = None,
+    *,
+    prompts: PromptCatalog | None = None,
 ) -> str:
     """Combined reading retained for diagnostics and extraction-adjacent tests."""
 
     return "\n\n".join(
-        (build_policy(), build_developer(persona, profiles, group_facts, people))
+        (
+            build_policy(prompts),
+            build_developer(
+                persona,
+                profiles,
+                group_facts,
+                people,
+                prompts=prompts,
+            ),
+        )
     )
 
 
@@ -375,11 +380,6 @@ def _segment_arg(
             )
         case FaceSegment(face_id):
             return {"type": "face", "data": {"id": face_id}}
-        case MarketFaceSegment(package_id, emoji_id, key, summary):
-            data = {"package_id": package_id, "emoji_id": emoji_id, "key": key}
-            if summary:
-                data["summary"] = summary
-            return {"type": "mface", "data": data}
         case DiceSegment():
             return {"type": "dice", "data": {}}
         case RpsSegment():
@@ -422,18 +422,16 @@ def own_line(
 
     The model sends every reply through the send tool, so its past messages are
     shown in exactly that form: the text, whom it @-ed and which line it replied to
-    as arguments, then a tool result carrying the line number, the send time and the
-    provenance marker. Shown this way, what the model reads of its own output is the
-    shape it should produce, rather than a transcript line - numbers, stamps,
-    brackets - that it would copy into the text.
+    as arguments, then a tool result carrying the line number and send time. Shown this
+    way, what the model reads of its own output is the shape it should produce, rather
+    than a transcript line - numbers, stamps, brackets - that it would copy into text.
 
     A rendered evidence memo rides immediately before the send call it supported. It is
     reconstructed from bounded structured storage and remains separate from the archive.
+    Any retired permanent provenance tail is removed from legacy archive text and never
+    projected back into the prompt.
     """
-    body = m.text
-    prov = ""
-    if found := _PROV_TAIL.search(body):
-        prov, body = found.group(1), body[:found.start()]
+    body = without_legacy_provenance(m.text)
     if m.outbound:
         content = [
             item
@@ -448,9 +446,9 @@ def own_line(
             and not any(item["type"] == "reply" for item in content)
         ):
             content.insert(0, {"type": "reply", "data": {"line": nums[m.reply_to]}})
-        args: dict = {"content": content}
+        args: dict = {"messages": [{"content": content}]}
     else:
-        # Legacy rows without structured segments use the former flat contract.
+        # Legacy rows without structured segments still project into the current contract.
         content = [{"type": "text", "data": {"text": body}}]
         for account, _ in m.at:
             number = people.number(account) if people is not None else None
@@ -458,7 +456,7 @@ def own_line(
                 content.insert(-1, {"type": "at", "data": {"member": number}})
         if m.reply_to and (line := nums.get(m.reply_to)):
             content.insert(0, {"type": "reply", "data": {"line": line}})
-        args = {"content": content}
+        args = {"messages": [{"content": content}]}
     call_id = ToolCallId(_call_id(m.msg_id))
     result = f"已发送：#{nums.get(m.msg_id, 0)} {sysmark(fmt_when(m.ts))}"
     out: list[PromptItem] = []
@@ -467,7 +465,7 @@ def own_line(
     out.extend(
         [
             ToolCall(call_id, SEND, json.dumps(args, ensure_ascii=False)),
-            ToolResult(call_id, f"{result} {prov}" if prov else result),
+            ToolResult(call_id, result),
         ]
     )
     return out

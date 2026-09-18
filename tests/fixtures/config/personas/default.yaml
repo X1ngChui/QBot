@@ -7,5 +7,3 @@ system_prompt: |
 
 group_knowledge: |
   测试群。
-
-overrides: {}

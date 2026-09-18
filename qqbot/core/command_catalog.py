@@ -236,19 +236,13 @@ def find(name: str) -> Command | None:
     return _BY_NAME.get((name or "").strip().lstrip("/").lower())
 
 
-def help_text(*, owner: bool = True, global_owner: bool | None = None) -> str:
+def help_text(*, owner: bool = True) -> str:
     """The listing: one line each, and how to get more.
 
-    A reader's listing shows only what that reader can run - the rest must not
-    be advertised to whoever cannot run it. `global_owner` is whether the reader
-    is on the default owner list (the group-override owners are not); it
-    defaults to `owner`.
+    A reader's listing shows only what that reader can run; the rest must not be
+    advertised to whoever cannot run it.
     """
-    if global_owner is None:
-        global_owner = owner
-    shown = [c for c in CATALOG
-             if c.self_serve or c.member
-             or (global_owner if c.global_only else owner)]
+    shown = [c for c in CATALOG if c.self_serve or c.member or owner]
     width = max(len(c.name) for c in shown)
     lines = ["可用指令："]
     lines.extend(f"{c.name.ljust(width)}  {c.what}" for c in shown)

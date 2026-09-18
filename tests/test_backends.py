@@ -45,7 +45,10 @@ from qqbot.settings import (
     AsrCfg,
     ConfigBundle,
     EmbeddingCfg,
+    Persona,
     RestartRequired,
+    SETTING_CONTRACTS,
+    SettingScope,
     Settings,
     TextCfg,
     load_bundle,
@@ -137,48 +140,60 @@ def config_checks(settings: Settings) -> None:
         ),
         str(legacy),
     )
+    group_bundle = ConfigBundle(
+        settings.model_dump(),
+        {"42": Persona(name="Different")},
+    )
+    group_settings, group_persona = group_bundle.for_group("42")
     check(
-        "group overrides cannot rebuild process-owned providers",
+        "group personas cannot replace global settings",
+        group_settings is group_bundle.default and group_persona.name == "Different",
+    )
+    check(
+        "persona schema rejects setting overrides",
         raises(
             ValueError,
-            lambda: ConfigBundle._validate_overrides(
-                "42", {"capabilities": {"text": {"endpoint": "elsewhere"}}}
+            lambda: Persona.model_validate(
+                {"name": "Different", "overrides": {"gateway": {"media_wait_sec": 1}}}
             ),
         )
         is not None,
-    )
-    check(
-        "group overrides cannot silently change shared runtime policy",
-        raises(
-            ValueError,
-            lambda: ConfigBundle._validate_overrides(
-                "42", {"gateway": {"member_cache_ttl_sec": 1}}
-            ),
-        )
-        is not None,
-    )
-    check(
-        "group overrides cannot replace the process-owned extraction policy",
-        raises(
-            ValueError,
-            lambda: ConfigBundle._validate_overrides(
-                "42", {"capabilities": {"text": {"extract": {"model": "other"}}}}
-            ),
-        )
-        is not None,
-    )
-    check(
-        "group overrides can change task-local policy",
-        ConfigBundle._validate_overrides(
-            "42", {"gateway": {"media_wait_sec": 1}}
-        )
-        == {"gateway": {"media_wait_sec": 1}},
     )
 
     import qqbot.settings as settings_module
     from qqbot import util
 
     current = ConfigBundle(settings.model_dump(), {})
+    process_names = {
+        contract.name
+        for contract in SETTING_CONTRACTS
+        if contract.scope is SettingScope.PROCESS_RESTART
+    }
+    current_fingerprint = current.startup_fingerprint()
+    check(
+        "every process setting contract contributes to the restart fingerprint",
+        process_names <= current_fingerprint.keys(),
+        str(sorted(process_names - current_fingerprint.keys())),
+    )
+    check(
+        "global-reloadable contracts stay out of the restart fingerprint",
+        not {
+            contract.name
+            for contract in SETTING_CONTRACTS
+            if contract.scope is SettingScope.GLOBAL_RELOADABLE
+        }
+        & current_fingerprint.keys(),
+    )
+    inherited = settings.model_copy(deep=True)
+    inherited.capabilities.text.model += "-new"
+    inherited_fingerprint = ConfigBundle(
+        inherited.model_dump(), {}
+    ).startup_fingerprint()
+    check(
+        "resolved extraction inheritance participates in restart detection",
+        current_fingerprint["capabilities.text.extract"]
+        != inherited_fingerprint["capabilities.text.extract"],
+    )
     changed = settings.model_copy(deep=True)
     changed.capabilities.text.endpoint = "https://restart.invalid"
     fresh = ConfigBundle(changed.model_dump(), {})

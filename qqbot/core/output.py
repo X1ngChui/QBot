@@ -69,10 +69,9 @@ _LINE_NO = re.compile(
 #: form is what a member's imitation looks like after defang, and quoting a
 #: member is content.
 _TS_ONLY = re.compile(rf"^\s*{_L}\d{{2}}-\d{{2}} \d{{2}}:\d{{2}}{_R}\s*", re.M)
-#: The provenance marker the engine appends to the bot's own archived lines. The
-#: history is an example the model may follow, and a reply that imitates it would
-#: leak a system annotation into the group. Nobody writes the bracketed form by
-#: hand, so this one is stripped wherever it appears.
+#: The retired permanent evidence marker found on legacy archived lines. A model may
+#: still imitate syntax it saw in old context or untrusted content, so the output guard
+#: strips the reserved form wherever it appears.
 _PROV = re.compile(rf"\s*{_L}依据[:：][^{_R}]*{_R}")
 #: A line imitating the trajectory-entry marker. Whole lines carrying it are
 #: dropped: the marker is system-written and must never reach the group, while the

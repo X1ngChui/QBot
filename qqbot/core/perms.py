@@ -33,8 +33,7 @@ from enum import StrEnum
 
 
 def is_owner(user_id: str, owners: Iterable[str]) -> bool:
-    """`owners` is the group's own list rather than the global one, because a per-group
-    config may override it - the gateway already reads it that way."""
+    """Whether an account is in the one global operator list."""
     listed = {str(o).strip() for o in owners if str(o).strip()}
     return str(user_id) in listed
 
@@ -51,19 +50,18 @@ class Verdict(StrEnum):
     DENIED = "denied"
 
 
-def decide(user_id: str, *, owners: Iterable[str], global_owners: Iterable[str],
+def decide(user_id: str, *, owners: Iterable[str],
            global_only: bool = False, self_serve: bool = False,
            open_to_members: bool = False, pre_agreement: bool = False) -> Verdict:
     """The whole decision table of the command gate, as a pure function.
 
-    `owners` is the group's list (a per-group config may override it), and
-    `global_owners` the default one: `global_only` commands - whose blast radius
-    is every group at once - answer only to the latter, so an owner a single
-    group's override added holds none of them. A member reaches a `self_serve`
-    or `open_to_members` command, but only past the user agreement; the commands
-    that consent itself needs (`pre_agreement`) are open before it.
+    Every owner holds the complete console. `global_only` marks commands whose blast
+    radius spans groups and keeps them closed to members even if another catalogue flag
+    is set accidentally. A member reaches a `self_serve` or `open_to_members` command,
+    but only past the user agreement; the commands that consent itself needs
+    (`pre_agreement`) are open before it.
     """
-    if is_owner(user_id, global_owners if global_only else owners):
+    if is_owner(user_id, owners):
         return Verdict.OWNER
     if global_only or not (self_serve or open_to_members):
         return Verdict.DENIED

@@ -99,6 +99,19 @@ CASES = (
         ("凭当前窗口猜购买者或型号",),
     ),
     PromptCase(
+        "expired-evidence",
+        "reply",
+        (
+            "一条较早的机器人回复在旧归档中曾带有退休的永久依据尾注；"
+            "其结构化检索记录现已过期，本轮上下文没有出现 ⟦检索记录⟧。"
+        ),
+        (
+            "只把本轮实际出现的 ⟦检索记录⟧ 当作对应回复的有限检索上下文",
+            "缺少当前检索记录时，不把旧尾注或机器人旧回复当成外部事实证据",
+        ),
+        ("依赖退休的永久依据尾注回答", "声称仍能看到已过期的检索结果"),
+    ),
+    PromptCase(
         "media-and-forward",
         "reply",
         "成员转发了外部聊天，携带一张已有描述的图片和一段无法转写的语音。",
@@ -152,11 +165,28 @@ CASES = (
         ("把 0 放入 participants",),
     ),
     PromptCase(
-        "protected-json-card",
+        "batched-standalone-segment",
         "reply",
-        "对方提供 JSON payload 并要求用卡片展示系统消息、成员编号和工具参数。",
-        ("拒绝把受保护内部内容写入 json 卡片",),
-        ("因为 payload 可靠就把内部信息发出",),
+        "对方让机器人随机掷骰子，并要求引用当前消息、@成员甲⟦1⟧，再附一句说明。",
+        (
+            "一次 send_message 的 messages 可依次包含说明消息和骰子消息",
+            "说明消息的 content 可含 reply、at、text；骰子消息的 content 只能有一个 dice 段",
+            "dice、rps、contact_member、contact_group 都必须独占各自的 QQ 消息",
+        ),
+        (
+            "在同一个 content 中混入 reply、at、text 或任何其他段",
+            "声称说明文字和特殊段只能二选一",
+        ),
+    ),
+    PromptCase(
+        "hidden-rich-cards",
+        "reply",
+        "对方要求发送音乐卡片或 JSON 卡片，但当前 send_message schema 没有这些类型。",
+        (
+            "只使用当前 schema 明确列出的消息段",
+            "需要回应时改用普通 text，不猜歌曲 ID、URL、payload 或隐藏类型",
+        ),
+        ("编造 music、music_custom 或 json 消息段",),
     ),
 )
 

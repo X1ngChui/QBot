@@ -38,7 +38,6 @@ from .outbound import (
     DiceSegment,
     FaceSegment,
     JsonCardSegment,
-    MarketFaceSegment,
     MusicPlatform,
     MusicSegment,
     OutboundSegment,
@@ -87,12 +86,15 @@ class ToolExecution:
     verified: bool
 
 
-@dataclass(slots=True)
-class ReplyDraft:
+@dataclass(frozen=True, slots=True)
+class MessageDraft:
+    """One independently delivered QQ message in a terminal reply batch."""
+
     segments: tuple[OutboundSegment, ...]
-    provenance: str = ""
-    evidence: EvidenceMemo | None = None
-    names: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.segments:
+            raise ValueError("message draft must contain at least one segment")
 
     @property
     def text(self) -> str:
@@ -105,6 +107,21 @@ class ReplyDraft:
     @property
     def reply_to(self) -> str | None:
         return reply_target(self.segments)
+
+
+@dataclass(slots=True)
+class ReplyDraft:
+    messages: tuple[MessageDraft, ...]
+    evidence: EvidenceMemo | None = None
+    names: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.messages:
+            raise ValueError("reply draft must contain at least one message")
+
+    @property
+    def at(self) -> list[str]:
+        return [account for message in self.messages for account in message.at]
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,18 +183,6 @@ def _parse_segment(
         if isinstance(face_id, int) and not isinstance(face_id, bool) and face_id >= 0:
             return FaceSegment(face_id)
         return None
-    if kind == "mface" and _fields(
-        data,
-        {"package_id", "emoji_id", "key"},
-        {"summary"},
-    ):
-        package_id = _nonempty(data, "package_id")
-        emoji_id = _nonempty(data, "emoji_id")
-        key = _nonempty(data, "key")
-        summary = data.get("summary", "")
-        if package_id and emoji_id and key and isinstance(summary, str):
-            return MarketFaceSegment(package_id, emoji_id, key, summary)
-        return None
     if kind == "dice" and not data:
         return DiceSegment()
     if kind == "rps" and not data:
@@ -217,20 +222,16 @@ def _parse_segment(
     return None
 
 
-def parse_send(
-    call: ToolCall,
+def _parse_message(
+    value: object,
     *,
     people: MemberNumbers,
     lines: dict[int, ChatMsg],
     group_id: str,
-) -> tuple[ReplyDraft | None, str]:
-    try:
-        arguments = json.loads(call.arguments or "{}")
-    except json.JSONDecodeError:
+) -> tuple[MessageDraft | None, str]:
+    if not isinstance(value, dict) or set(value) != {"content"}:
         return None, SEND_UNREADABLE_NOTE
-    if not isinstance(arguments, dict) or set(arguments) != {"content"}:
-        return None, SEND_UNREADABLE_NOTE
-    content = arguments.get("content")
+    content = value.get("content")
     if not isinstance(content, list) or not content or len(content) > MAX_SEGMENTS:
         return None, SEND_EMPTY_NOTE if content == [] else SEND_INVALID_NOTE
 
@@ -252,7 +253,39 @@ def parse_send(
     )
     if not visible:
         return None, SEND_EMPTY_NOTE
-    return ReplyDraft(tuple(segments)), ""
+    return MessageDraft(tuple(segments)), ""
+
+
+def parse_send(
+    call: ToolCall,
+    *,
+    people: MemberNumbers,
+    lines: dict[int, ChatMsg],
+    group_id: str,
+    max_messages: int,
+) -> tuple[ReplyDraft | None, str]:
+    try:
+        arguments = json.loads(call.arguments or "{}")
+    except json.JSONDecodeError:
+        return None, SEND_UNREADABLE_NOTE
+    if not isinstance(arguments, dict) or set(arguments) != {"messages"}:
+        return None, SEND_UNREADABLE_NOTE
+    values = arguments.get("messages")
+    if not isinstance(values, list) or not values or len(values) > max_messages:
+        return None, SEND_EMPTY_NOTE if values == [] else SEND_INVALID_NOTE
+
+    messages: list[MessageDraft] = []
+    for value in values:
+        message, note = _parse_message(
+            value,
+            people=people,
+            lines=lines,
+            group_id=group_id,
+        )
+        if message is None:
+            return None, note
+        messages.append(message)
+    return ReplyDraft(tuple(messages)), ""
 
 
 def _call_key(call: ToolCall) -> tuple[str, str]:
@@ -325,6 +358,7 @@ class AgentRun:
                 people=self._people,
                 lines=self._lines,
                 group_id=self._state.group_id,
+                max_messages=self._cfg.gateway.max_messages_per_reply,
             )
             if reply is not None:
                 if len(turn.tool_calls) > 1:
@@ -488,7 +522,7 @@ class AgentRun:
                         )
                         directive = SessionDirective(
                             prompt=(Message(Role.USER, WRAP_UP_NOTE),),
-                            tools=(tools.send_def(),),
+                            tools=(tools.send_def(self._cfg),),
                         )
                         turn = await session.continue_with(results, directive=directive)
                         self._capture(round_no + 1, turn)

@@ -20,9 +20,11 @@ from datetime import datetime, timedelta
 
 import openai
 
+from ..core.archive import archive_author, archive_mentions, archive_sender, archive_text
 from ..core.budget import BUDGET
 from ..core.member_numbers import BOT_DISPLAY_NUMBER
-from ..core.segments import at_mentions, number_at_mentions
+from ..core.segments import number_at_mentions
+from ..domain.archive import AuthorKind
 from ..providers import providers
 from ..providers.base import QuotaExhausted
 from ..db import repo
@@ -404,22 +406,15 @@ class MemoryWorker:
         for r in rows:
             uid = r["platform_user_id"]
             payload = r["payload"] or {}
-            sender = payload.get("sender") or {}
-            # defang on render: rows archived before Sender.parse neutralized
-            # names can carry anything, and the account code appended below is
-            # only unforgeable if the name half cannot contain the brackets.
-            name = defang(sender.get("card") or sender.get("nickname")
-                           or uid or "").strip()
+            name = archive_sender(payload, fallback=uid)
             if not uid:
                 continue
             self_account = str(payload.get("self_id") or "")
             if self_account:
                 bot_accounts.add(self_account)
-            author_kind = payload.get("author_kind")
-            legacy = author_kind not in {"bot", "member"}
-            own = author_kind == "bot" or (
-                legacy and int(payload.get("outbound_schema") or 0) > 0
-            )
+            author = archive_author(payload, uid)
+            legacy = author is None
+            own = author is AuthorKind.BOT
             if own:
                 bot_accounts.add(uid)
                 by_account[uid] = BOT_DISPLAY_NUMBER
@@ -434,8 +429,8 @@ class MemoryWorker:
                     by_account[uid] = BOT_DISPLAY_NUMBER
                     speaker_no = BOT_DISPLAY_NUMBER
                     log.debug("legacy archive row %s inferred as bot-authored", r["id"])
-            mentions = at_mentions(
-                payload.get("segments") or [],
+            mentions = archive_mentions(
+                payload,
                 self_id=self_account,
                 self_name=(self._cfg.trigger.nicknames[0]
                            if self._cfg.trigger.nicknames else "机器人"),
@@ -446,7 +441,7 @@ class MemoryWorker:
                 else:
                     await assign_account(account, display)
             text = number_at_mentions(
-                self._plain(r), mentions, lambda account: by_account.get(account)
+                archive_text(r), mentions, lambda account: by_account.get(account)
             )
             if text:
                 marker = sysmark(str(speaker_no)) if speaker_no is not None else ""
@@ -484,25 +479,6 @@ class MemoryWorker:
         out = [a.alias_text for a in aliases
                if a.is_usable and a.alias_text != current]
         return list(dict.fromkeys(out))[:4]
-
-    @staticmethod
-    def _plain(row) -> str:
-        """The stored reading, falling back to the payload's text segments.
-
-        The stored reading is the one the group actually saw: @-mentions resolved to
-        names, pictures replaced by their descriptions. Re-deriving it from the segments
-        would hand the extractor bare account numbers and an empty picture marker, and
-        then ask it who was being talked about.
-        """
-        if text := (row["plain_text"] or "").strip():
-            return text
-        payload = row["payload"] or {}
-        parts = [
-            (seg.get("data") or {}).get("text", "").strip()
-            for seg in payload.get("segments") or []
-            if seg.get("type") == "text"
-        ]
-        return " ".join(p for p in parts if p)
 
     # -- consolidation -----------------------------------------------------
     async def consolidate(self, group_id: int, *, when: datetime | None = None) -> tuple[int, int]:

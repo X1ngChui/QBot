@@ -18,17 +18,19 @@ from luqum.exceptions import ParseError as _LuqumParseError
 from luqum.parser import parser as _luqum_parser
 
 from ..db import pool, repo
+from ..domain.archive import AuthorKind
 from ..prompting import PromptKey, tool_prompt_key
 from ..providers import providers
 from ..providers.base import QuotaExhausted
 from ..providers.contracts import StoredImage, TextPart, ToolCall, ToolSpec
 from ..settings import RetrievalCfg, Settings, config, prompt_catalog
-from ..util import defang, display_name, fmt_when, merge_overlapping, sysmark, why
+from ..util import defang, fmt_when, merge_overlapping, sysmark, why
 from . import retrieval
+from .archive import archive_author, archive_mentions, archive_sender, archive_text
 from .botapi import BotApi
 from .media import MEDIA
 from .member_numbers import BOT_DISPLAY_NUMBER, MemberNumbers
-from .segments import FACE_NAMES, at_mentions, number_at_mentions
+from .segments import FACE_NAMES, number_at_mentions
 
 log = logging.getLogger("qqbot.tools")
 
@@ -50,15 +52,22 @@ class ToolCtx:
     people: MemberNumbers | None = None
 
 
-def _tool(name: str, parameters: dict) -> ToolSpec:
+def _tool(
+    name: str,
+    parameters: dict,
+    *,
+    cfg: Settings | None = None,
+) -> ToolSpec:
     """One typed tool contract whose model-facing description lives in prompts."""
 
     key = tool_prompt_key(name)
     values = {}
     if key is PromptKey.TOOL_SEND_MESSAGE:
+        settings = cfg or config().default
         values["face_catalog"] = "、".join(
             f"{face_id}={label}" for face_id, label in FACE_NAMES.items()
         )
+        values["message_limit"] = str(settings.gateway.max_messages_per_reply)
     description = prompt_catalog().render(key, values)
     return ToolSpec(
         name=name,
@@ -103,31 +112,6 @@ def _send_segments() -> list[dict]:
         {"member": {"type": "integer", "description": "要推荐的成员编号"}},
     )
     group_contact = _segment("contact_group", {}, [])
-    music = _segment(
-        "music",
-        {
-            "platform": {
-                "type": "string",
-                "enum": ["qq", "163", "kugou", "kuwo", "migu"],
-            },
-            "id": {"type": "string"},
-        },
-    )
-    custom_music = _segment(
-        "music_custom",
-        {
-            "url": {"type": "string"},
-            "audio": {"type": "string"},
-            "title": {"type": "string"},
-            "image": {"type": "string"},
-            "singer": {"type": "string"},
-        },
-        ["url", "audio", "title", "image"],
-    )
-    json_card = _segment(
-        "json",
-        {"payload": {"type": "object", "additionalProperties": True}},
-    )
     return [
         text,
         at,
@@ -136,31 +120,41 @@ def _send_segments() -> list[dict]:
         *empty,
         member_contact,
         group_contact,
-        music,
-        custom_music,
-        json_card,
     ]
 
 
-def send_def() -> ToolSpec:
-    """The only egress from the agent: an ordered, closed QQ segment sequence."""
+def send_def(cfg: Settings | None = None) -> ToolSpec:
+    """The only egress from the agent: a bounded sequence of QQ messages."""
 
+    settings = cfg or config().default
+    content = {
+        "type": "array",
+        "items": {"anyOf": _send_segments()},
+        "minItems": 1,
+        "maxItems": 32,
+        "description": "按发送顺序排列的 QQ 消息段；@ 可插在任意位置。",
+    }
     return _tool(
         SEND,
         {
             "type": "object",
             "properties": {
-                "content": {
+                "messages": {
                     "type": "array",
-                    "items": {"anyOf": _send_segments()},
+                    "items": {
+                        "type": "object",
+                        "properties": {"content": content},
+                        "required": ["content"],
+                        "additionalProperties": False,
+                    },
                     "minItems": 1,
-                    "maxItems": 32,
-                    "description": "按发送顺序排列的 QQ 消息段；@ 可插在任意位置。",
+                    "maxItems": settings.gateway.max_messages_per_reply,
                 },
             },
-            "required": ["content"],
+            "required": ["messages"],
             "additionalProperties": False,
         },
+        cfg=settings,
     )
 
 
@@ -169,7 +163,7 @@ def tool_defs(cfg: Settings | None = None) -> tuple[ToolSpec, ...]:
 
     rcfg = (cfg or config().default).retrieval
     return (
-        send_def(),
+        send_def(cfg),
         _tool(
             "web_search",
             {
@@ -378,8 +372,8 @@ async def search_history(group_id: int, query: str, *, speaker: int | None = Non
     """
     # One read of the retrieval settings for the whole call, so how many hits are
     # fetched and how much context is rendered cannot come from two different
-    # configs if /reload lands in between. The tool loop passes the group's own
-    # section, so a per-group override applies; a bare call reads the default.
+    # configs if /reload lands in between. The tool loop passes the task's global
+    # settings snapshot; a bare call reads the current default.
     rcfg = rcfg or config().default.retrieval
     # Parse and compile under one roof: the subset check lives in the compile
     # walk, and a rejected feature must answer in words exactly like a syntax
@@ -437,13 +431,6 @@ async def search_history(group_id: int, query: str, *, speaker: int | None = Non
     return text
 
 
-def _who(r) -> str:
-    """The archived speaker's bare display name. Defanged on render: rows filed
-    before names were neutralized at ingest can carry anything."""
-    sender = (r["payload"] or {}).get("sender") or {}
-    return display_name(sender.get("card"), sender.get("nickname"), "成员")
-
-
 async def _learn(people: MemberNumbers | None, rows: list) -> None:
     """Load every displayed speaker and structured @ target before numbering."""
     if people is None:
@@ -457,7 +444,7 @@ async def _learn(people: MemberNumbers | None, rows: list) -> None:
         row_self = str(payload.get("self_id") or "")
         accounts.extend(
             account
-            for account, _ in at_mentions(payload.get("segments") or [])
+            for account, _ in archive_mentions(payload)
             if account != row_self
         )
     await people.learn(accounts)
@@ -472,19 +459,17 @@ def _history_line(r, people: MemberNumbers | None, self_id: str | None) -> str:
     uid = str(r["platform_user_id"] or "")
     payload = r["payload"] or {}
     row_self = str(payload.get("self_id") or "")
-    author_kind = payload.get("author_kind")
-    is_bot = author_kind == "bot" or row_self == uid or (
-        author_kind not in {"bot", "member"} and bool(self_id) and uid == self_id
-    )
-    who = _who(r)
+    author = archive_author(payload, uid, current_self_id=self_id or "")
+    is_bot = author is AuthorKind.BOT
+    who = archive_sender(payload)
     if is_bot:
         who += sysmark(str(BOT_DISPLAY_NUMBER))
     elif people is not None:
         n = people.number(uid)
         if n is not None:
             who += sysmark(str(n))
-    text = (r["plain_text"] or "").strip()
-    mentions = at_mentions(payload.get("segments") or [])
+    text = archive_text(r)
+    mentions = archive_mentions(payload)
     if mentions:
         def mention_number(account: str) -> int | None:
             if row_self and account == row_self:
@@ -565,8 +550,8 @@ class Failure(str):
     an unreachable target. Rendered to the model verbatim like any other answer;
     the *type* is the out-of-band verdict, the way media.Unsettled carries one,
     so no reader has to recognise the wording. A no-result search is NOT a
-    Failure on purpose - searching and finding nothing is verification work, and
-    the provenance marker may certify it."""
+    Failure on purpose—searching and finding nothing is still completed verification
+    work, and the structured evidence memo may record that bounded outcome."""
     __slots__ = ()
 
 
@@ -586,9 +571,10 @@ class Attachment:
 
 def verified(out: str | Attachment) -> bool:
     """Whether a tool answer represents work that actually obtained something.
-    The provenance marker excludes failed calls: it certifies that the reply was
-    checked, and an answer improvised after a failed lookup is exactly the guess
-    it must not certify."""
+
+    Structured evidence excludes failed calls: an answer improvised after a failed lookup
+    must not be recorded as a verified result.
+    """
     return not isinstance(out, Failure)
 
 

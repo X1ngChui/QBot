@@ -14,9 +14,9 @@ newcomer joins at the end. Anybody a prompt shows who is not in the roster yet -
 first message still being archived, an account only a search turned up - is
 numbered after it, in the order they appear.
 
-Numbers are never stored. Anything frozen - the archive, the reply trace, the
-provenance marker - holds names only, because a number means something only inside
-the one render that assigned it.
+Numbers are never stored. Anything frozen—the archive and structured evidence—holds
+stable account data or names only, because a number means something only inside the one
+render that assigned it.
 """
 
 from __future__ import annotations

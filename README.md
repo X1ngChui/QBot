@@ -115,7 +115,7 @@ Behaviour lives in `config/`, credentials in `.env`, runtime state in the databa
 | `.env` | Credentials and infrastructure settings read by Docker Compose |
 | `config/settings.yaml` | Global settings: owners, trigger, providers, budget, prompt window, memory, schedule |
 | `config/personas/default.yaml` | The default persona: name, system prompt, group knowledge |
-| `config/personas/group_<id>.yaml` | Per-group persona and overrides of any setting |
+| `config/personas/group_<id>.yaml` | Per-group persona: identity, prompt additions and standing context |
 | `config/predicates.yaml` | What may be recorded about a person |
 | `config/prompts/prompts.yaml` | Versioned bundle containing every runtime prompt template |
 | `config/agreement.txt` | The user agreement shown by `/terms` |

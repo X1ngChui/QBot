@@ -27,7 +27,8 @@ from datetime import datetime
 from ..db import pool
 from ..repositories import IdentityRepository
 from ..services import IdentityResolver
-from .onebot import AuthorKind, GroupMessage, Sender
+from ..domain.archive import AuthorKind
+from .onebot import GroupMessage, Sender
 
 log = logging.getLogger("qqbot.ingest")
 

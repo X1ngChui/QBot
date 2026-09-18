@@ -1,15 +1,17 @@
 """Configuration loading and validation.
 
-Two layers: settings.yaml defaults, overridden per group by personas/group_*.yaml.
+Settings are global. Persona files may vary only model-facing identity and group context.
 Pydantic validates; /reload re-reads from disk and swaps the global singleton atomically
 (readers never take a lock).
 """
 
 from __future__ import annotations
 
-import copy
 import logging
 import os
+from collections.abc import Callable
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
 
@@ -65,6 +67,9 @@ class GatewayCfg(_M):
     #: reserve a 200-character margin under it for their own framing, so the floor
     #: keeps them a usable width.
     max_msg_len: int = Field(2000, ge=400)
+    #: How many independent QQ messages one terminal send_message call may submit.
+    #: Each is validated and length-bounded separately, then delivered in order.
+    max_messages_per_reply: int = Field(4, ge=1)
     #: How long a reply waits for a picture or a voice clip to be understood before
     #: building the prompt without it. The work is never cancelled - it lands for the
     #: next turn either way - so this only decides whether the person waits or the
@@ -119,13 +124,10 @@ class PromptCfg(_M):
     evidence_result_chars: int = Field(1200, ge=100)
     evidence_total_chars: int = Field(4000, ge=500)
     evidence_ttl_days: int = Field(30, ge=1)
-    #: Caps on the provenance marker appended to the bot's own archived line: how
-    #: many tool uses it names, and how much of each query survives. A record, not
-    #: a transcript - enough for a later turn to see what an answer rested on. The
-    #: query cap is set where a boolean expression survives whole (cut in half it
-    #: reads as a different search); it only guards against a runaway string.
-    provenance_items: int = Field(4, ge=1)
-    provenance_query_chars: int = Field(80, ge=20)
+    #: Maximum length of the sanitized request summary inside one evidence item.
+    #: Long enough to keep a boolean search expression whole; a cut expression reads
+    #: as a different search.
+    evidence_request_chars: int = Field(80, ge=20)
 
     @model_validator(mode="after")
     def _coherent_evidence_bounds(self) -> PromptCfg:
@@ -627,47 +629,163 @@ class Settings(_M):
     predicates_file: str = "predicates.yaml"
 
 
+class SettingScope(StrEnum):
+    """When a global setting change can take effect."""
+
+    GLOBAL_RELOADABLE = "global_reloadable"
+    PROCESS_RESTART = "process_restart"
+
+
+@dataclass(frozen=True, slots=True)
+class SettingContract:
+    """One global setting path and the lifecycle of its runtime owner."""
+
+    path: tuple[str, ...]
+    scope: SettingScope
+    fingerprint: Callable[[Settings], object] | None = None
+
+    @property
+    def name(self) -> str:
+        return ".".join(self.path)
+
+    def value(self, settings: Settings) -> object:
+        if self.fingerprint is not None:
+            return self.fingerprint(settings)
+        value: object = settings
+        for part in self.path:
+            value = getattr(value, part)
+        if isinstance(value, BaseModel):
+            return value.model_dump(mode="json")
+        return value
+
+
+def _extract_policy(settings: Settings) -> object:
+    """Resolved worker policy, including values inherited from reply settings."""
+
+    cfg = settings.capabilities.text.for_extract()
+    return {
+        "model": cfg.model,
+        "reasoning_effort": cfg.reasoning_effort,
+        "timeout_sec": cfg.timeout_sec,
+        "retries": cfg.retries,
+    }
+
+
+SETTING_CONTRACTS = (
+    SettingContract(("timezone",), SettingScope.PROCESS_RESTART),
+    SettingContract(
+        ("capabilities", "text", "provider"), SettingScope.PROCESS_RESTART
+    ),
+    SettingContract(
+        ("capabilities", "text", "endpoint"), SettingScope.PROCESS_RESTART
+    ),
+    SettingContract(
+        ("capabilities", "text", "credential_env"), SettingScope.PROCESS_RESTART
+    ),
+    SettingContract(
+        ("capabilities", "text", "max_concurrency"),
+        SettingScope.PROCESS_RESTART,
+    ),
+    SettingContract(
+        ("capabilities", "text", "extract"),
+        SettingScope.PROCESS_RESTART,
+        _extract_policy,
+    ),
+    SettingContract(
+        ("capabilities", "vision", "provider"), SettingScope.PROCESS_RESTART
+    ),
+    SettingContract(
+        ("capabilities", "vision", "endpoint"), SettingScope.PROCESS_RESTART
+    ),
+    SettingContract(
+        ("capabilities", "vision", "credential_env"),
+        SettingScope.PROCESS_RESTART,
+    ),
+    SettingContract(
+        ("capabilities", "asr", "model_dir"), SettingScope.PROCESS_RESTART
+    ),
+    SettingContract(
+        ("capabilities", "asr", "threads"), SettingScope.PROCESS_RESTART
+    ),
+    SettingContract(
+        ("capabilities", "asr", "queue_capacity"),
+        SettingScope.PROCESS_RESTART,
+    ),
+    SettingContract(("capabilities", "embedding"), SettingScope.PROCESS_RESTART),
+    SettingContract(
+        ("capabilities", "search", "provider"), SettingScope.PROCESS_RESTART
+    ),
+    SettingContract(
+        ("capabilities", "search", "endpoint"), SettingScope.PROCESS_RESTART
+    ),
+    SettingContract(
+        ("capabilities", "search", "credential_env"),
+        SettingScope.PROCESS_RESTART,
+    ),
+    SettingContract(
+        ("capabilities", "search", "proxy"), SettingScope.PROCESS_RESTART
+    ),
+    SettingContract(("database",), SettingScope.PROCESS_RESTART),
+    SettingContract(("memory",), SettingScope.PROCESS_RESTART),
+    SettingContract(("schedule",), SettingScope.PROCESS_RESTART),
+    SettingContract(
+        ("gateway", "dedup_ttl_sec"), SettingScope.GLOBAL_RELOADABLE
+    ),
+    SettingContract(
+        ("gateway", "max_messages_per_reply"), SettingScope.GLOBAL_RELOADABLE
+    ),
+    SettingContract(
+        ("gateway", "member_cache_ttl_sec"), SettingScope.GLOBAL_RELOADABLE
+    ),
+    SettingContract(
+        ("gateway", "protocol_call_timeout_sec"),
+        SettingScope.GLOBAL_RELOADABLE,
+    ),
+    SettingContract(
+        ("gateway", "media_http_timeout_sec"), SettingScope.GLOBAL_RELOADABLE
+    ),
+    SettingContract(
+        ("gateway", "unreadable_retry_sec"), SettingScope.GLOBAL_RELOADABLE
+    ),
+    SettingContract(
+        ("gateway", "shutdown_wait_sec"), SettingScope.GLOBAL_RELOADABLE
+    ),
+    SettingContract(
+        ("capabilities", "http_retries"), SettingScope.GLOBAL_RELOADABLE
+    ),
+    SettingContract(
+        ("capabilities", "retry_after_cap_sec"),
+        SettingScope.GLOBAL_RELOADABLE,
+    ),
+    SettingContract(
+        ("capabilities", "search", "monthly_quota"),
+        SettingScope.GLOBAL_RELOADABLE,
+    ),
+    SettingContract(
+        ("budget", "daily_cny_cap"), SettingScope.GLOBAL_RELOADABLE
+    ),
+    SettingContract(("personas_dir",), SettingScope.GLOBAL_RELOADABLE),
+    SettingContract(("agreement", "file"), SettingScope.GLOBAL_RELOADABLE),
+    SettingContract(("prompts_dir",), SettingScope.GLOBAL_RELOADABLE),
+    SettingContract(("predicates_file",), SettingScope.GLOBAL_RELOADABLE),
+)
+
+
 def _startup_settings(settings: Settings) -> dict[str, object]:
     """Values captured by process-owned clients, workers, pools and schedulers."""
 
-    capabilities = settings.capabilities
-    extract = capabilities.text.for_extract()
     return {
-        "timezone": settings.timezone,
-        "capabilities.text.provider": capabilities.text.provider,
-        "capabilities.text.endpoint": capabilities.text.endpoint,
-        "capabilities.text.credential_env": capabilities.text.credential_env,
-        "capabilities.text.max_concurrency": capabilities.text.max_concurrency,
-        "capabilities.text.extract.model": extract.model,
-        "capabilities.text.extract.reasoning_effort": extract.reasoning_effort,
-        "capabilities.text.extract.timeout_sec": extract.timeout_sec,
-        "capabilities.text.extract.retries": extract.retries,
-        "capabilities.vision.provider": capabilities.vision.provider,
-        "capabilities.vision.endpoint": capabilities.vision.endpoint,
-        "capabilities.vision.credential_env": capabilities.vision.credential_env,
-        "capabilities.asr.model_dir": capabilities.asr.model_dir,
-        "capabilities.asr.threads": capabilities.asr.threads,
-        "capabilities.asr.queue_capacity": capabilities.asr.queue_capacity,
-        "capabilities.embedding": tuple(
-            sorted(capabilities.embedding.model_dump().items())
-        ),
-        "capabilities.search.provider": capabilities.search.provider,
-        "capabilities.search.endpoint": capabilities.search.endpoint,
-        "capabilities.search.credential_env": capabilities.search.credential_env,
-        "capabilities.search.proxy": capabilities.search.proxy,
-        "database": tuple(sorted(settings.database.model_dump().items())),
-        "memory": repr(settings.memory.model_dump()),
-        "schedule": repr(settings.schedule.model_dump()),
+        contract.name: contract.value(settings)
+        for contract in SETTING_CONTRACTS
+        if contract.scope is SettingScope.PROCESS_RESTART
     }
 
 
 class Persona(_M):
-    """A group's character.
+    """A group's model-facing identity and standing context.
 
     A group file states only what differs from default.yaml; anything it leaves out is
-    inherited. That keeps the shared parts - how it talks, how it reads speaker names,
-    who its owner is - in one place instead of N copies that drift apart as they are
-    edited.
+    inherited. Settings are deliberately absent: behavior and resource policy are global.
 
     `system_prompt_extra` exists because sharing happens *inside* the prompt, not only
     between fields: the base prompt is inherited and the group's own paragraphs are
@@ -679,7 +797,6 @@ class Persona(_M):
     system_prompt: str = ""
     system_prompt_extra: str = ""
     group_knowledge: str = ""
-    overrides: dict[str, Any] = Field(default_factory=dict)
 
 
 def _merge_persona(base: Persona, override: Persona | None) -> Persona:
@@ -711,16 +828,6 @@ def _merge_persona(base: Persona, override: Persona | None) -> Persona:
     return merged
 
 
-def _deep_merge(base: dict, patch: dict) -> dict:
-    out = copy.deepcopy(base)
-    for k, v in patch.items():
-        if isinstance(v, dict) and isinstance(out.get(k), dict):
-            out[k] = _deep_merge(out[k], v)
-        else:
-            out[k] = copy.deepcopy(v)
-    return out
-
-
 def _read_yaml(path: Path) -> dict:
     with path.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
@@ -730,13 +837,12 @@ def _read_yaml(path: Path) -> dict:
 
 
 class ConfigBundle:
-    """One disk read: global defaults, every persona, and a cache of merged per-group Settings."""
+    """One disk read: global settings, every persona, and shared prompt resources."""
 
     def __init__(self, raw_settings: dict, personas: dict[str, Persona],
                  prompts: PromptCatalog | None = None,
                  agreement_text: str = "",
                  predicates: PredicateTable | None = None):
-        self._raw = raw_settings
         self.default = Settings.model_validate(raw_settings)
         self.personas = personas
         #: What may be recorded about a person, from predicates_file. Read through
@@ -749,7 +855,6 @@ class ConfigBundle:
         #: the version number it belongs to. Empty only for a bundle built
         #: outside load_bundle.
         self.agreement_text: str = agreement_text
-        self._merged: dict[str, Settings] = {}
         self._resolved_personas: dict[str, Persona] = {}
 
     def persona_for(self, group_id: str) -> Persona:
@@ -761,73 +866,13 @@ class ConfigBundle:
         return cached
 
     def for_group(self, group_id: str) -> tuple[Settings, Persona]:
-        persona = self.persona_for(group_id)
-        cached = self._merged.get(group_id)
-        if cached is None:
-            if persona.overrides:
-                cached = Settings.model_validate(
-                    _deep_merge(self._raw, self._validate_overrides(group_id, persona.overrides)))
-            else:
-                cached = self.default
-            self._merged[group_id] = cached
-        return cached, persona
+        return self.default, self.persona_for(group_id)
 
     def startup_fingerprint(self) -> dict[str, object]:
         fingerprint = _startup_settings(self.default)
         fingerprint.update(self.prompts.restart_fingerprint())
         fingerprint["predicates"] = repr(self.predicates.model_dump())
         return fingerprint
-
-    @staticmethod
-    def _validate_overrides(group_id: str, overrides: dict) -> dict:
-        """Reject group-local values whose runtime owner is process-global."""
-
-        forbidden = (
-            ("gateway", "dedup_ttl_sec"),
-            ("gateway", "member_cache_ttl_sec"),
-            ("gateway", "protocol_call_timeout_sec"),
-            ("gateway", "media_http_timeout_sec"),
-            ("gateway", "unreadable_retry_sec"),
-            ("gateway", "shutdown_wait_sec"),
-            ("capabilities", "http_retries"),
-            ("capabilities", "retry_after_cap_sec"),
-            ("capabilities", "text", "provider"),
-            ("capabilities", "text", "endpoint"),
-            ("capabilities", "text", "credential_env"),
-            ("capabilities", "text", "max_concurrency"),
-            ("capabilities", "text", "extract"),
-            ("capabilities", "vision", "provider"),
-            ("capabilities", "vision", "endpoint"),
-            ("capabilities", "vision", "credential_env"),
-            ("capabilities", "asr", "model_dir"),
-            ("capabilities", "asr", "threads"),
-            ("capabilities", "asr", "queue_capacity"),
-            ("capabilities", "embedding"),
-            ("capabilities", "search", "provider"),
-            ("capabilities", "search", "endpoint"),
-            ("capabilities", "search", "credential_env"),
-            ("capabilities", "search", "proxy"),
-            ("capabilities", "search", "monthly_quota"),
-            ("budget", "daily_cny_cap"),
-            ("database",),
-            ("schedule",),
-            ("timezone",),
-        )
-        touched: list[str] = []
-        for path in forbidden:
-            node: object = overrides
-            for key in path:
-                if not isinstance(node, dict) or key not in node:
-                    break
-                node = node[key]
-            else:
-                touched.append(".".join(path))
-        if touched:
-            raise ValueError(
-                f"group {group_id} overrides process-global settings: "
-                + ", ".join(touched)
-            )
-        return overrides
 
 
 def _resolve(root: Path, p: str) -> Path:
@@ -878,14 +923,9 @@ def load_bundle(config_dir: Path | None = None) -> ConfigBundle:
         raise ValueError(f"agreement file is empty: {apath}")
 
     bundle = ConfigBundle(raw, personas, prompts, agreement_text, predicates)
-    # Validate eagerly: a bad config should blow up at startup / reload, not on the
-    # first incoming message. Every group's merged overrides included, because
-    # for_group merges lazily: a typo in one group's overrides would otherwise pass
-    # /reload and then fail on that group's every message - no reply, no archive -
-    # until the file was fixed. Warming the merge cache here is a free side effect.
-    _ = bundle.default
-    for gid in personas:
-        bundle.for_group(gid)
+    # Resolve every configured persona before a reload can swap in the bundle.
+    for group_id in personas:
+        bundle.persona_for(group_id)
     return bundle
 
 

@@ -31,15 +31,16 @@ them; you only touch them when running outside Docker.
 ## `config/settings.yaml`
 
 Validated with pydantic. Unknown keys are rejected, so a typo fails the load instead of
-silently doing nothing. Persona files may override task-local policy; shared runtime,
-resource and accounting fields are rejected explicitly as listed below.
+silently doing nothing. Every setting is global. Per-group files contain only persona identity
+and standing context.
 
 ### Applying changes
 
 `/reload` first validates the entire candidate bundle, then compares every value owned by
-long-lived process resources. If validation fails or any restart-scoped value changed, the
-whole reload is rejected and the active bundle—including its timezone—remains untouched.
-A successful reload therefore means every accepted edit is live.
+long-lived process resources. The code-owned setting contract decides which global paths require
+a restart. If validation fails or any restart-scoped value changed, the whole reload is rejected
+and the active bundle—including its timezone—remains untouched. A successful reload therefore
+means every accepted edit is live.
 
 Restart-scoped values are reported by exact path and include:
 
@@ -60,7 +61,7 @@ migration directly: `llm` → `capabilities`, `backend` → `provider`, `base_ur
 
 | Key | Meaning |
 | --- | --- |
-| `owners` | QQ numbers, as strings, of the people who hold the operator console and receive the daily report. A persona may override the list for its group, but the commands that affect every group at once (`/merge`, `/split`, `/reload`, `/debug`, `/log`) answer only to this default list. |
+| `owners` | QQ numbers, as strings, of the people who hold the operator console and receive the daily report. |
 | `timezone` | IANA name. Governs the clock line in the prompt, the cron jobs, the daily report and the day boundary the budget resets on. |
 | `personas_dir` | Directory of persona files, relative to `config/`. |
 | `prompts_dir` | Directory containing the versioned `prompts.yaml` template bundle. |
@@ -74,13 +75,13 @@ migration directly: `llm` → `capabilities`, `backend` → `provider`, `base_ur
 
 ### `gateway`
 
-The shared gateway controls are read from the top-level file only. A persona override is
-rejected rather than ignored; `media_wait_sec` and `max_msg_len` remain group-local policy.
+All gateway controls are global.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `dedup_ttl_sec` | 300 | How long a platform message id is remembered for deduplication |
-| `max_msg_len` | 2000 | Longest reply sent to the group |
+| `max_msg_len` | 2000 | Longest text content in each QQ message |
+| `max_messages_per_reply` | 4 | Independent QQ messages allowed in one terminal `send_message` call; delivered in order |
 | `media_wait_sec` | 25 | How long a reply waits for a picture or clip to be understood before building the prompt without it |
 | `member_cache_ttl_sec` | 1800 | How long a fetched member list is reused |
 | `protocol_call_timeout_sec` | 10 | Deadline for NapCat media calls |
@@ -92,9 +93,7 @@ rejected rather than ignored; `media_wait_sec` and `max_msg_len` remain group-lo
 
 Five capabilities are configured independently. `provider` is a closed schema value, not
 an arbitrary registry string. The provider adapter hides platform-specific request and
-response behavior; core code sees only capability contracts. Group personas may override
-reloadable policy, but cannot replace process-owned providers, connections or local
-resources.
+response behavior; core code sees only capability contracts.
 
 | Key | Meaning |
 | --- | --- |
@@ -109,7 +108,7 @@ resources.
 | `reasoning_effort` | `off`, `low`, `high` or `max`, translated into the backend's own Responses parameter. Thinking bills at output price. |
 | `max_concurrency` | Concurrent model calls across every group (restart) |
 | `timeout_sec`, `retries` | Per call |
-| `extract.model`, `extract.reasoning_effort`, `extract.timeout_sec` | Extraction's process-owned model, grade and deadline on the same account; empty model means the reply model. Persona overrides are rejected; restart to apply. |
+| `extract.model`, `extract.reasoning_effort`, `extract.timeout_sec` | Extraction's process-owned model, grade and deadline on the same account; empty model means the reply model. Restart to apply. |
 
 **`capabilities.vision`** — picture descriptions for the archive. The backend must expose the
 Responses image-input shape as well as text responses.
@@ -145,14 +144,14 @@ provider selector, endpoint, credential, remote model, request timeout or billin
 | --- | --- |
 | `count` | Results per search, at most 20 |
 | `depth` | `basic` (one credit) or `advanced` (two) |
-| `monthly_quota` | Credits per calendar month over every group. A persona override is rejected. |
+| `monthly_quota` | Credits per calendar month over every group. |
 | `proxy` | HTTP proxy for the search client only; empty means direct |
 
 ### `budget`
 
 | Key | Meaning |
 | --- | --- |
-| `daily_cny_cap` | Daily spend over every group. At the cap the bot stops answering until the day rolls over. A persona override is rejected. |
+| `daily_cny_cap` | Daily spend over every group. At the cap the bot stops answering until the day rolls over. |
 | `per_reply_cny` | What one reply may spend, tool loop included. Reaching it ends the tool loop with one final round answered from what was already fetched. |
 
 ### `prompt`
@@ -164,7 +163,7 @@ Counts, not tokens.
 | `window_chunks`, `evict_chunk` | The history window holds `window_chunks × evict_chunk` messages and evicts a whole chunk at a time |
 | `forward_lines`, `forward_depth`, `forward_chars` | How much of a forwarded chat record is rendered |
 | `evidence_result_chars`, `evidence_total_chars`, `evidence_ttl_days` | Per-item bound, total bound and retention for structured evidence supporting nearby follow-ups |
-| `provenance_items`, `provenance_query_chars` | The provenance marker on the bot's archived lines |
+| `evidence_request_chars` | Bound on the sanitized request summary stored in each evidence item |
 
 ### `retrieval`
 
@@ -233,7 +232,6 @@ applies to one group and states only what differs; everything else is inherited.
 | `system_prompt` | The persona text. Replaces the default entirely. |
 | `system_prompt_extra` | Paragraphs appended to the inherited `system_prompt` |
 | `group_knowledge` | Standing facts about the group: what it is for, its jargon, its running jokes. Shown to the model every turn and to the extractor as established fact. Leave empty rather than writing notes to yourself. |
-| `overrides` | A task-local policy subtree of `settings.yaml`. Shared gateway/retry controls, providers and connections, local resources, scheduler/database state, timezone and global accounting caps are rejected. |
 
 The prompt bodies are Chinese because that is what the model reads. Tone, length and
 formatting are constrained here; the code only strips Markdown from the output.
@@ -246,7 +244,7 @@ accepts exactly these names, and the roster is rendered with these verbs.
 
 | Field | Meaning |
 | --- | --- |
-| `verb` | How the fact reads in Chinese; `{}` marks where the object goes if not verb-first |
+| `verb` | How the fact reads in Chinese; optional `{{object}}` marks where the object goes if not verb-first |
 | `cardinality` | `single` (a new value closes the old one) or `multi` |
 | `decay` | `stable`, `default` or `fast`, mapped to `half_life_days` |
 | `kind` | `attribute`, `preference` or `relation` |

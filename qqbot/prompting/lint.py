@@ -21,9 +21,16 @@ def lint_catalog(catalog: PromptCatalog, cfg: Settings) -> list[str]:
         errors.append("shared_legend does not define the reserved bot number ⟦0⟧")
     if "mface" in joined or "商城表情" in joined:
         errors.append("the model-facing prompt bundle exposes mface")
+    if "⟦依据:" in joined or "⟦依据：" in joined:
+        errors.append("the prompt bundle trusts the retired permanent evidence marker")
 
-    send = send_def()
-    segment_schemas = send.parameters["properties"]["content"]["items"]["anyOf"]
+    send = send_def(cfg)
+    message_schema = send.parameters["properties"]["messages"]
+    if message_schema.get("maxItems") != cfg.gateway.max_messages_per_reply:
+        errors.append("send message batch limit differs from global configuration")
+    segment_schemas = (
+        message_schema["items"]["properties"]["content"]["items"]["anyOf"]
+    )
     segment_types = {
         schema["properties"]["type"]["enum"][0] for schema in segment_schemas
     }
@@ -38,9 +45,6 @@ def lint_catalog(catalog: PromptCatalog, cfg: Settings) -> list[str]:
         "rps",
         "contact_member",
         "contact_group",
-        "music",
-        "music_custom",
-        "json",
     }
     if segment_types != expected_segments:
         errors.append(
@@ -53,9 +57,22 @@ def lint_catalog(catalog: PromptCatalog, cfg: Settings) -> list[str]:
         face_catalog="、".join(
             f"{face_id}={label}" for face_id, label in FACE_NAMES.items()
         ),
+        message_limit=str(cfg.gateway.max_messages_per_reply),
     )
-    if "{{face_catalog}}" in rendered_send:
-        errors.append("tool_send_message left face_catalog unresolved")
+    if "{{face_catalog}}" in rendered_send or "{{message_limit}}" in rendered_send:
+        errors.append("tool_send_message left a dynamic slot unresolved")
+    hidden_segments = ("music", "music_custom", "json")
+    exposed_hidden = [name for name in hidden_segments if name in rendered_send]
+    if exposed_hidden:
+        errors.append(
+            "tool_send_message exposes hidden historical segment type(s): "
+            + ", ".join(exposed_hidden)
+        )
+    standalone_segments = ("dice", "rps", "contact_member", "contact_group")
+    if not all(name in rendered_send for name in standalone_segments):
+        errors.append("tool_send_message omits a parameter-only segment type")
+    if not any(word in rendered_send for word in ("单独", "独占", "唯一消息段")):
+        errors.append("tool_send_message does not state the standalone segment rule")
     if not all(f"{face_id}={label}" in rendered_send for face_id, label in FACE_NAMES.items()):
         errors.append("tool_send_message does not expose the complete fixed face catalog")
 

@@ -6,7 +6,7 @@ not scan arbitrary text files and does not accept a user-editable role manifest.
 
 - the closed logical template keys;
 - each template's model role and reload lifecycle;
-- the exact allowed slots and whether a slot may be empty;
+- the exact allowed slots, whether a slot may be empty, and any code-owned partial source;
 - one-pass, non-executable `{{ascii_slot}}` rendering.
 
 A load or `/reload` accepts the complete bundle or rejects it unchanged. Unknown,
@@ -30,9 +30,10 @@ Although all wording is stored together, role and lifecycle boundaries remain ty
 | `vision_system` | Standalone image description instruction | none |
 | `tool_*` | One model-facing description per code-owned tool schema | only `tool_send_message` has `face_catalog` |
 
-`shared_legend` and `shared_pragmatics` are the only reusable partials. They are
-inserted into two independent model calls by code. Other behavior must be stated once
-in the complete template that owns it rather than split into addenda.
+`shared_legend` and `shared_pragmatics` are the only reusable partials. Their source slots
+are declared by the code-owned contract and injected by `PromptCatalog`; runtime callers
+cannot omit or replace them. Other behavior must be stated once in the complete template
+that owns it rather than split into addenda.
 
 ## Ownership
 

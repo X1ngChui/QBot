@@ -93,15 +93,8 @@ async def _gate(matcher: Matcher, event: GroupMessageEvent,
     anyone who cannot run a command it does not exist, and answering "you are
     not allowed" is how they find out that it does.
 
-    Reads the *group's* owner list: a per-group config may override it, and the gateway
-    reads it the same way - taking them from two places would let an override move who
-    the bot addresses as owner without moving who may command it.
-
-    `global_only` restricts to the default (all-group) owner list. It is for the
-    commands whose blast radius is every group at once - /merge and /split rewrite
-    the platform-global identity graph, /reload swaps every group's config, /debug
-    captures every group's model rounds, /log reads the global log - so an owner a
-    single group's override added must not hold any of them.
+    Reads the one global owner list. `global_only` marks commands whose effects span
+    every group; members stay barred from them even if another catalogue flag is set.
 
     event.sender.role is deliberately not consulted. Running the QQ group is not running
     the bot.
@@ -111,8 +104,7 @@ async def _gate(matcher: Matcher, event: GroupMessageEvent,
     # wrapper only supplies the owner lists and, when the verdict asks for it,
     # whether the member has accepted the user agreement.
     verdict = perms.decide(
-        uid, owners=config().for_group(gid)[0].owners,
-        global_owners=config().default.owners, global_only=global_only,
+        uid, owners=config().default.owners, global_only=global_only,
         self_serve=self_serve, open_to_members=open_to_members,
         pre_agreement=pre_agreement)
     if verdict is perms.Verdict.OWNER:
@@ -344,9 +336,8 @@ def _validation_summary(e: ValidationError) -> str:
 
 @reload_cmd.handle()
 async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
-    # global_only: the reload lands on every group at once, so an owner a single
-    # group's override added must not hold the trigger. Same for /debug and /log -
-    # the tap captures every group's model rounds and the log tail is global.
+    # The reload lands on every group at once. The same scope marker is used for
+    # /debug and /log, whose tap and log tail are also process-global.
     await _gate(matcher, event, global_only=True)
     try:
         bundle = reload_config()
@@ -857,10 +848,9 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     accounts = await directory().accounts_of_person(winner)
     spread: list[tuple[int, datetime | None]] = []
     if str(event.self_id) not in accounts:
-        def shielded(gid: int) -> bool:
+        def shielded(_gid: int) -> bool:
             # The same two refusals /block makes, per group: never the owner.
-            return any(perms.is_owner(a, config().for_group(str(gid))[0].owners)
-                       for a in accounts)
+            return any(perms.is_owner(a, config().default.owners) for a in accounts)
         spread = await directory().blocks_after_merge(winner, shielded=shielded)
     for gid, until in spread:
         if (st := REGISTRY.loaded(str(gid))) is not None:
@@ -974,16 +964,13 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     directory of what is being hidden.
     """
     owner = await _gate(matcher, event, self_serve=True)
-    # The global-only commands answer the default owner list alone, so an
-    # owner a single group's override added must not see them advertised.
-    global_owner = owner and perms.is_owner(str(event.user_id), config().default.owners)
     wanted = _strip_cmd(event.get_plaintext(), "help")
     if not wanted:
-        await _finish(matcher, _fit(command_catalog.help_text(
-            owner=owner, global_owner=global_owner), gid=str(event.group_id)))
+        await _finish(matcher, _fit(command_catalog.help_text(owner=owner),
+                                    gid=str(event.group_id)))
 
     cmd = command_catalog.find(wanted)
     if cmd is None or not (owner or cmd.self_serve or cmd.member) or (
-            cmd.global_only and not global_owner):
+            cmd.global_only and not owner):
         await _finish(matcher, f"没有「{wanted}」这条指令。发送 /help 查看全部。")
     await _finish(matcher, _fit(command_catalog.detail_text(cmd), gid=str(event.group_id)))

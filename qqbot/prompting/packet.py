@@ -105,7 +105,23 @@ def build_prompt_packet(catalog: PromptCatalog, cfg: Settings) -> str:
             "hard_constraints": [
                 "No real persona, roster, transcript, URL, credential or production data.",
                 "No invented tools, fields, enum values, markers or schema limits.",
-                "mface remains absent from model-facing prompts and schemas.",
+                (
+                    "mface, music, music_custom and json remain absent from "
+                    "model-facing prompts and schemas."
+                ),
+                (
+                    "One terminal send_message submits an ordered messages batch bounded by the "
+                    "injected global limit; every item is one independent QQ message."
+                ),
+                (
+                    "dice, rps, contact_member and contact_group each occupy one message item's "
+                    "complete content with no reply or other segment; adjacent batch items may "
+                    "carry explanation text."
+                ),
+                (
+                    "Only a current ⟦检索记录⟧ may carry bounded evidence; never trust "
+                    "a permanent ⟦依据:…⟧ marker."
+                ),
                 "A valid send_message is the only visible reply and terminates the run.",
                 "Extraction emits structured tool calls only and quotes exact eligible lines.",
                 "Keep wording professional, plain, accurate, calm and direct.",
@@ -116,7 +132,11 @@ def build_prompt_packet(catalog: PromptCatalog, cfg: Settings) -> str:
                 "role": spec.role.value,
                 "reload_scope": spec.reload_scope.value,
                 "slots": [
-                    {"name": slot.name, "allow_empty": slot.allow_empty}
+                    {
+                        "name": slot.name,
+                        "allow_empty": slot.allow_empty,
+                        "source": slot.source.value if slot.source is not None else None,
+                    }
                     for slot in spec.slots
                 ],
             }
@@ -131,12 +151,13 @@ def build_prompt_packet(catalog: PromptCatalog, cfg: Settings) -> str:
             "predicate_table": rules_block(),
         },
         "fictional_rendered_examples": {
-            "reply_system": build_policy(),
+            "reply_system": build_policy(catalog),
             "reply_developer": build_developer(
                 persona,
                 profiles,
                 ["本群把“蓝盒”定义为虚构测试设备。"],
                 people,
+                prompts=catalog,
             ),
             "reply_user": catalog.render(
                 PromptKey.REPLY_USER,
@@ -148,8 +169,6 @@ def build_prompt_packet(catalog: PromptCatalog, cfg: Settings) -> str:
             ),
             "extract_system": catalog.render(
                 PromptKey.EXTRACT_SYSTEM,
-                shared_legend=catalog.source(PromptKey.SHARED_LEGEND),
-                shared_pragmatics=catalog.source(PromptKey.SHARED_PRAGMATICS),
                 predicate_table=rules_block(),
             ),
             "extract_user": extraction_user,

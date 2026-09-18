@@ -745,7 +745,9 @@ class ResponsesVisionModel(VisionModel):
             reasoning=ReasoningEffort(cfg.reasoning_effort),
             timeout_sec=cfg.timeout_sec,
             retries=0,
-            max_output_tokens=1000,
+            # Reasoning tokens share this ceiling with the short visible description.
+            # Low-effort vision can still consume more than 1k before emitting text.
+            max_output_tokens=4096,
         )
         items = (
             Message(

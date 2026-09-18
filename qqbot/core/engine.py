@@ -3,17 +3,17 @@
 There is no provider fallback and no downgrade, so any failure means the bot says
 nothing.
 
-A reply is a call to the send tool (tools.SEND): the text, whom to @ and which
-line to reply to are arguments the model fills in, and every one but the text is
-optional - with none, the message goes out plain. The call is the only way out:
-a round that ends in bare text sends nothing, and the reply ends there.
+A reply is one terminal call to the send tool (tools.SEND). The call carries an ordered
+batch of independent QQ messages; each message holds the text, whom to @ and which line to
+reply to as closed segments. The call is the only way out: a round that ends in bare text
+sends nothing, and the reply ends there.
 
-Money is what bounds the tool loop - no round count, no per-tool quota. Free tools
-run as often as they like; what bounds them is that the rounds carrying them are
-paid model calls, billed into the scope opened around this reply. Once that scope
-is spent the searching stops and one wrap-up round, offered only the send tool,
-answers from what was already fetched: a mid-reply limit ends the spending, not
-the speech. Only the daily cap, checked before anything is spent, means silence.
+Money normally bounds the tool loop; a high round-count tripwire exists only for a
+backend that bills zero. Free tools themselves cost nothing, but the model rounds carrying
+them are paid and booked into the scope around this reply. Once that scope is spent,
+searching stops and one wrap-up round, offered only the send tool, answers from what was
+already fetched: a mid-reply limit ends the spending, not the speech. Only the daily cap,
+checked before anything is spent, means silence.
 """
 
 from __future__ import annotations
@@ -21,7 +21,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import uuid
 from collections.abc import Callable, Coroutine
+from dataclasses import dataclass
 from datetime import timedelta
 from urllib.parse import urlsplit, urlunsplit
 
@@ -30,7 +32,7 @@ from ..domain.evidence import EvidenceItem, EvidenceMemo, EvidenceOutcome, Evide
 from ..gateway.ingest import ingestor
 from ..providers import providers
 from ..settings import Persona, Settings
-from ..util import SYS_L, SYS_R, defang, now_local, sysmark, why
+from ..util import SYS_L, SYS_R, defang, now_local, why
 from . import agent, prompt, retrieval, tools
 from .botapi import BotApi
 from .member_numbers import MemberNumbers
@@ -49,8 +51,6 @@ from .state import ChatMsg, GroupState
 
 log = logging.getLogger("qqbot.engine")
 
-#: How each query tool reads in the provenance marker.
-TOOL_VERB = {"web_search": "搜索", "search_history": "查档", "recall_events": "回忆"}
 TOOL_SOURCE = {
     "web_search": EvidenceSource.WEB_SEARCH,
     "search_history": EvidenceSource.HISTORY,
@@ -65,42 +65,6 @@ _MEMBER_NO = re.compile(rf"{re.escape(SYS_L)}\d{{1,9}}{re.escape(SYS_R)}")
 
 
 Reply = agent.ReplyDraft
-
-
-def _provenance(executed: tuple[agent.ToolExecution, ...], cfg: Settings) -> str:
-    """The provenance marker for a reply that used tools - what this answer rested on.
-
-    Appended to the archived/history form of the bot's own line, never to what the
-    group is sent. It lets a later turn distinguish a searched answer from an
-    unverified synthesis without replaying the evidence memo.
-    """
-    parts: list[str] = []
-    for execution in executed:
-        name, args = execution.name, execution.arguments
-        if not execution.verified:
-            # A failed or empty-handed call earned no badge: the marker is what
-            # tells a later turn this line may be cited without re-checking, and
-            # an answer improvised after a failed search is exactly the guess it
-            # must not exempt. The evidence memo still records the attempt honestly.
-            continue
-        if name == "read_url":
-            parts.append("读了网页")
-        elif name == "open_images":
-            # No number: numbering is per-render and shifts on every eviction, while
-            # this marker is frozen into the archive - a stale one would point at
-            # whatever picture sits there next week. That a picture was looked at is
-            # the part that stays true.
-            parts.append("看了图")
-        elif name in TOOL_VERB:
-            q = str(args.get("query") or args.get("question") or "").strip()
-            parts.append(f"{TOOL_VERB[name]}“{q[: cfg.prompt.provenance_query_chars]}”")
-    if not parts:
-        return ""
-    cap = cfg.prompt.provenance_items
-    shown, extra = parts[:cap], len(parts) - cap
-    # defang the queries: they are model-written, and a model echoing chat can
-    # echo anything. The wrap itself is the reserved pair.
-    return sysmark("依据:" + defang("、".join(shown)) + ("等" if extra > 0 else ""))
 
 
 def _safe_url_summary(value: object) -> str:
@@ -135,7 +99,7 @@ def _evidence_memo(
         else:
             request = str(args.get("query") or args.get("question") or "")
         request = defang(" ".join(request.split()))[
-            : cfg.prompt.provenance_query_chars
+            : cfg.prompt.evidence_request_chars
         ]
         digest = defang(" ".join(_MEMBER_NO.sub("", execution.output or "").split()))
         digest = digest[: cfg.prompt.evidence_result_chars]
@@ -240,7 +204,6 @@ async def generate(
     reply = outcome.reply
     if reply is None:
         return None
-    reply.provenance = _provenance(outcome.executed, cfg)
     reply.evidence = _evidence_memo(outcome.executed, cfg)
     reply.names = {account: names[account] for account in reply.at if account in names}
     return reply
@@ -299,6 +262,67 @@ def _clean_outbound(
     return tuple(out)
 
 
+@dataclass(frozen=True, slots=True)
+class _DeliveredMessage:
+    msg_id: str
+    text: str
+    segments: tuple[OutboundSegment, ...]
+    reply_to: str
+    addressees: tuple[tuple[str, str], ...]
+
+
+async def _deliver_one(
+    bot: BotApi,
+    *,
+    group_id: str,
+    segments: tuple[OutboundSegment, ...],
+    names: dict[str, str],
+) -> _DeliveredMessage | None:
+    """Deliver one message, retrying a rejected reply segment once."""
+
+    reply_to = reply_target(segments) or ""
+    sent_segments = segments
+    try:
+        sent = await bot.send_group_msg(
+            group_id=int(group_id),
+            message=[to_onebot(segment) for segment in segments],
+        )
+    except Exception as exc:
+        # A quoted message can be recalled between generation and delivery. Retry only
+        # a known protocol refusal and preserve every non-reply segment in order.
+        if not reply_to or type(exc).__name__ != "ActionFailed":
+            log.warning("group %s: send failed: %s", group_id, why(exc))
+            return None
+        log.warning(
+            "group %s: send with a reply segment failed (%s), retrying without it",
+            group_id,
+            why(exc),
+        )
+        reply_to = ""
+        sent_segments = without_replies(segments)
+        try:
+            sent = await bot.send_group_msg(
+                group_id=int(group_id),
+                message=[to_onebot(segment) for segment in sent_segments],
+            )
+        except Exception as retry_exc:
+            log.warning("group %s: send failed: %s", group_id, why(retry_exc))
+            return None
+
+    addressees = tuple(
+        (segment.account, names[segment.account])
+        for segment in sent_segments
+        if isinstance(segment, AtSegment)
+    )
+    return _DeliveredMessage(
+        msg_id=str((sent or {}).get("message_id") or f"self-{uuid.uuid4().hex}"),
+        text=display_text(sent_segments, names=names),
+        segments=sent_segments,
+        reply_to=reply_to,
+        addressees=addressees,
+    )
+
+
 async def respond(
     *,
     bot: BotApi,
@@ -309,9 +333,12 @@ async def respond(
     window: list[ChatMsg] | None = None,
     track: Callable[[Coroutine], asyncio.Task] | None = None,
 ) -> bool:
-    """One reply, sent. `track` registers the record of a delivered reply with
-    whoever waits out loose work at shutdown, so the pool is not closed under
-    it; without one the record runs as a bare task."""
+    """Generate and deliver one terminal reply batch.
+
+    `track` registers each delivered message's record task with whoever waits out loose
+    work at shutdown, so the pool is not closed under it. Without one, the record runs
+    as a bare task.
+    """
     try:
         reply = await generate(bot=bot, st=st, cfg=cfg, persona=persona, msg=msg, window=window)
     except Exception as e:
@@ -333,77 +360,70 @@ async def respond(
         account: live.get(account) or reply.names.get(account) or "成员"
         for account in accounts
     }
-    segments = _clean_outbound(
-        reply.segments,
-        names=names,
-        max_text_chars=cfg.gateway.max_msg_len,
+    messages = tuple(
+        _clean_outbound(
+            message.segments,
+            names=names,
+            max_text_chars=cfg.gateway.max_msg_len,
+        )
+        for message in reply.messages
     )
-    rendered = display_text(segments, names=names)
-    if not rendered:
-        log.warning("group %s: structured reply was empty after cleaning", st.group_id)
+    if any(not display_text(segments, names=names) for segments in messages):
+        log.warning(
+            "group %s: reply batch contained an empty message after cleaning",
+            st.group_id,
+        )
         return False
 
-    # Segments are created from closed domain variants. Text is always a literal text
-    # segment, so it cannot smuggle an at, reply or rich-card control into the send.
-    message = [to_onebot(segment) for segment in segments]
-    reply_to = reply_target(segments) or ""
-    sent_segments = segments
-    try:
-        sent = await bot.send_group_msg(group_id=int(st.group_id), message=message)
-    except Exception as e:
-        # A quoted message can be recalled between generation and delivery. Retry only
-        # a known protocol refusal and remove every reply segment without changing the
-        # order of the remaining content.
-        if not reply_to or type(e).__name__ != "ActionFailed":
-            log.warning("group %s: send failed: %s", st.group_id, why(e))
-            return False
-        log.warning(
-            "group %s: send with a reply segment failed (%s), retrying without it",
-            st.group_id,
-            why(e),
-        )
-        reply_to = ""
-        sent_segments = without_replies(segments)
-        try:
-            sent = await bot.send_group_msg(
-                group_id=int(st.group_id),
-                message=[to_onebot(segment) for segment in sent_segments],
+    delivered_count = 0
+    async with st.delivery_lock:
+        for index, segments in enumerate(messages):
+            delivered = await _deliver_one(
+                bot,
+                group_id=st.group_id,
+                segments=segments,
+                names=names,
             )
-        except Exception as e2:
-            log.warning("group %s: send failed: %s", st.group_id, why(e2))
-            return False
+            if delivered is None:
+                log.warning(
+                    "group %s: reply batch stopped after %d/%d messages",
+                    st.group_id,
+                    delivered_count,
+                    len(messages),
+                )
+                break
 
-    addressees = [
-        (segment.account, names[segment.account])
-        for segment in sent_segments
-        if isinstance(segment, AtSegment)
-    ]
-    rendered = display_text(sent_segments, names=names)
-    kept = f"{rendered} {reply.provenance}" if reply.provenance else rendered
-    msg_id = str((sent or {}).get("message_id") or f"self-{now_local().timestamp()}")
-    # The message is visible now; recording is shielded so shutdown cannot leave the
-    # archive with only the member side of this exchange.
-    record = _record(
-        bot,
-        st,
-        persona,
-        msg_id=msg_id,
-        text=kept,
-        segments=sent_segments,
-        evidence=reply.evidence,
-        reply_to=reply_to,
-        addressees=addressees,
-    )
-    await asyncio.shield(track(record) if track else asyncio.create_task(record))
-    log.info(
-        "group %s: replied (%d text chars, %d segments, %d @, %s)",
-        st.group_id,
-        sum(len(segment.text) for segment in sent_segments if isinstance(segment, TextSegment)),
-        len(sent_segments),
-        len(addressees),
-        "replying" if reply_to else "not replying",
-    )
-    return True
+            # The message is visible now; record it before attempting the next batch
+            # item. Evidence belongs to the first delivered message only.
+            record = _record(
+                bot,
+                st,
+                persona,
+                msg_id=delivered.msg_id,
+                text=delivered.text,
+                segments=delivered.segments,
+                evidence=reply.evidence if delivered_count == 0 else None,
+                reply_to=delivered.reply_to,
+                addressees=delivered.addressees,
+            )
+            await asyncio.shield(track(record) if track else asyncio.create_task(record))
+            delivered_count += 1
+            log.info(
+                "group %s: replied %d/%d (%d text chars, %d segments, %d @, %s)",
+                st.group_id,
+                index + 1,
+                len(messages),
+                sum(
+                    len(segment.text)
+                    for segment in delivered.segments
+                    if isinstance(segment, TextSegment)
+                ),
+                len(delivered.segments),
+                len(delivered.addressees),
+                "replying" if delivered.reply_to else "not replying",
+            )
+
+    return delivered_count > 0
 
 
 def _expected(e: BaseException) -> bool:
@@ -424,7 +444,7 @@ async def _record(
     segments: tuple[OutboundSegment, ...],
     evidence: EvidenceMemo | None,
     reply_to: str,
-    addressees: list[tuple[str, str]],
+    addressees: tuple[tuple[str, str], ...],
 ) -> None:
     """Archive the bot's line and its separately retained evidence memo."""
     now = now_local()
@@ -460,7 +480,7 @@ async def _record(
             at=now,
             name=persona.name,
             reply_to=reply_to,
-            addressees=addressees,
+            addressees=list(addressees),
         )
     except Exception:
         log.exception("failed to archive the bot's own reply in group %s", st.group_id)

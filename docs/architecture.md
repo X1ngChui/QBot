@@ -134,24 +134,39 @@ backend that bills zero.
 
 ### Sending
 
-A reply is a call to `send_message`. Its parameters follow the OneBot message segments
-it becomes:
+A reply is one terminal call to `send_message`. Its `messages` array contains an ordered,
+globally bounded sequence of independent QQ messages. Each item's `content` is an ordered
+sequence of closed NapCat-style segments, so an `at` or `reply` can appear exactly where it
+belongs rather than being hoisted into a parallel field:
 
-| Parameter | Segment | Meaning |
-| --- | --- | --- |
-| `text` | `text` | The body, plain text. Required. |
-| `at` | `at` | Member numbers to @, placed before the body in order. Optional. |
-| `reply` | `reply` | The line number of the message to reply to. Optional. |
+| Segment type | Meaning |
+| --- | --- |
+| `text` | Plain visible text |
+| `at` | A positive prompt-local member number |
+| `reply` | A prompt-local line number |
+| `face` | An id from the fixed QQ face catalog |
+| `dice`, `rps` | Parameter-free QQ game elements; each must be the only segment in its message item |
+| `contact_member`, `contact_group` | A member card or current group card; each must be the only segment in its message item |
 
-With neither `at` nor `reply` the message goes out plain. Whether to @ anyone and
-whether to reply to a line is the model's decision. A member number or line number the
-prompt never showed is dropped with a log line and the rest is sent; a call with no text
-is answered with a note and the loop continues, so the model can send again. At most
-five accounts are @-ed per message. Bare text is never sent: a round that ends without
-a tool call ends the reply in silence, with a warning in the log.
+Music cards and JSON cards remain implemented in the typed outbound/parser layer but are omitted
+from the model-facing schema and prompt, so restoring them later does not require rebuilding the
+feature. `mface` likewise retains historical decoding/display support while remaining absent from
+the model-facing contract because its identifiers are not a stable public catalog and may require
+purchase.
 
-If a send with a reply segment is refused by the platform (the replied-to message may
-have been recalled), it is retried once without the segment.
+The complete batch is parsed and validated before the first protocol call. A member or line number
+outside the frozen prompt snapshot, an invalid segment, an empty item or a batch above the global
+limit rejects the whole call; no prefix is sent. Bare assistant text is never sent: a round that
+ends without a tool call ends the reply in silence, with a warning in the log.
+
+After validation, messages are sent sequentially under a per-group delivery lock and each successful
+message is archived immediately as its own row. This lock does not cover model generation, so the
+one-task-per-addressed-message concurrency model remains intact. If a send with a reply segment is
+refused by the platform (the replied-to message may have been recalled), only that message is
+retried once without reply segments. Any unrecoverable failure stops the batch: delivered and
+archived messages remain, and later items are not attempted. Batch-level retrieval evidence is
+stored only beside the first delivered message. Historical bot rows project back to the model as
+one-message batches; the archive does not reconstruct an original batch id.
 
 ### Tools
 
@@ -189,8 +204,9 @@ Prompt wording is a single versioned YAML bundle with a closed code-owned templa
 contract (`qqbot/prompting/templates.py`). The only syntax is a declared, one-pass
 `{{ascii_slot}}`; unknown, missing, duplicate and malformed slots fail the entire load.
 Inserted values are never evaluated as templates. Two explicit partials—the transcript
-legend and conversational pragmatics—are shared between reply and extraction; every
-other rule belongs to one complete role template.
+legend and conversational pragmatics—are shared between reply and extraction. Their declared
+slot sources are injected by `PromptCatalog`; callers provide only dynamic values and cannot
+override a code-owned partial. Every other rule belongs to one complete role template.
 
 The prompt is ordered from most stable to least, so that a provider's prefix cache is
 hit as often as possible:
@@ -241,7 +257,7 @@ Markers in use:
 | `⟦拥有者⟧` | The speaker is one of the bot's owners |
 | `⟦图片N:描述⟧`, `⟦语音:转写⟧` | Media, with the archived description or transcript |
 | `⟦转发的聊天记录 N条⟧` | A forwarded record, rendered as an indented block |
-| `⟦依据:…⟧`, `⟦检索记录⟧` | Provenance of a bot reply and the retrieval trace that fed it |
+| `⟦检索记录⟧` | Bounded, expiring retrieval context for the historical send immediately following it |
 
 ### Member numbers
 
@@ -261,17 +277,18 @@ moving never renumbers anything above the history. The same numbering runs throu
 roster, the window, `search_history` results and the tool arguments that name people,
 so the model @-s and filters by the number it read.
 
-Numbers are never stored. The archive, retrieval traces and provenance markers hold
+Numbers are never stored. The archive and structured evidence hold stable account data or
 names only. A real platform mention of the bot renders as `@name⟦0⟧`; member-typed
 `@我` remains ordinary text. Members' other @-mentions keep their account identity and
 receive the target's prompt-local positive number during projection.
 
 The bot's own messages are rendered in the history as the `send_message` calls that sent
-them (text, @-ed member numbers and replied-to line number as arguments), each followed
-by a tool result carrying the message's line number, send time and provenance marker.
-What the model reads of its own output is the shape it is asked to produce. In the
-archive, the bot's line reads as the group saw it, `@name` openings included, with the
-@-ed accounts kept as `at` segments so a restart rebuilds the same window.
+them (ordered text and control segments), each followed by a tool result carrying only the
+message's line number and send time. Unexpired structured evidence, when present, is rendered
+as a separate assistant block immediately before that call. In the archive, the bot's line
+reads exactly as the group saw it, `@name` openings included, with the @-ed accounts kept as
+`at` segments so a restart rebuilds the same window. Retired permanent evidence tails on
+legacy rows are removed by the shared archive projection and never reach prompts or searches.
 
 ## Pictures and voice
 
@@ -296,8 +313,8 @@ numbered with the rest and can be opened, but are not described on their own acc
 **Voice is transcribed on arrival** by the in-process backend (sherpa-onnx with
 SenseVoice, two CPU threads, sub-second for a ten-second clip). It costs nothing, so it
 runs even on a day whose budget is exhausted; a per-minute gate stands in as a CPU
-guard. The transcript lands in the archived line like a picture description. API-based
-speech backends remain available in the registry.
+guard. The transcript lands in the archived line like a picture description. There is no
+hosted or API ASR path in the provider registry.
 
 ## Memory
 
@@ -380,8 +397,8 @@ Each reply's retrieval work becomes a versioned `EvidenceMemo`: a closed source 
 a bounded sanitized request summary, verified/unconfirmed outcome, bounded defanged
 digest, and explicit creation/expiry times. It contains no provider response, reasoning,
 response id, prompt-local member number or full page. The physical `reply_trace` table
-name remains for migration compatibility; schema-v0 text rows are read until expiry,
-while every new row writes only structured JSON.
+name and its schema-v0 text column remain for migration compatibility, but only unexpired,
+valid structured memos are prompt-visible; every new row writes only structured JSON.
 
 Prompt assembly renders unexpired evidence immediately before the send call it supported.
 The memo is working context for nearby follow-ups, not group memory: it is absent from
@@ -401,8 +418,7 @@ Two levels, both in `qqbot/core/budget.py`:
 
 The monthly search allowance (`capabilities.search.monthly_quota`) is metered from the ledger's
 calendar-month call count in the vendor's own unit; an advanced-depth search books two,
-and page reads debit the same pool. Both caps are global: a per-group override of either
-is rejected when the configuration bundle is loaded.
+and page reads debit the same pool. Both caps are global settings.
 
 Attribution is task-local and feeds `/top` only. A reply's entire spend, including the
 transcriptions, picture looks and searches it forces, is booked to the member who
@@ -415,7 +431,9 @@ is still booked to the ledger at zero.
 ## Concurrency
 
 One reply task per addressed message. A global semaphore at the provider layer
-(`capabilities.text.max_concurrency`) bounds concurrent model calls. Background work rides the
+(`capabilities.text.max_concurrency`) bounds concurrent model calls. A per-group delivery lock
+covers only the sequential protocol sends and immediate archive writes of one terminal message
+batch, preventing another concurrently generated reply from appearing between its items. Background work rides the
 database job queue (`FOR UPDATE SKIP LOCKED`, leases, and a partial unique index that
 keeps one pending job per type and group). Extraction jobs hold a lease long enough
 that a deploy overlapping a drain cannot run it twice.
@@ -435,9 +453,9 @@ line.
 ## Configuration model
 
 `config/settings.yaml` is global. `config/personas/default.yaml` is the default persona;
-`config/personas/group_<id>.yaml` states only what differs for that group, including
-overrides of any setting. Settings are validated with pydantic and unknown keys are
-rejected. New groups need no configuration.
+`config/personas/group_<id>.yaml` may vary only the bot's name, persona prompt and standing
+group context. Persona fields are inherited from the default, settings are not. Both schemas
+are validated with pydantic and unknown keys are rejected. New groups need no configuration.
 
 Prompts are data: every runtime prompt template lives in one versioned
 `config/prompts/prompts.yaml` bundle. A closed contract in

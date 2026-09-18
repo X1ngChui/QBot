@@ -8,6 +8,7 @@ blocklist, so a restart does not lose them.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from collections import deque
@@ -16,11 +17,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from ..db import repo
+from ..domain.archive import AuthorKind
 from ..settings import config
-from ..util import SYS_L, SYS_R, display_name, fmt_when, now_local, sysmark, why
+from ..util import SYS_L, SYS_R, fmt_when, now_local, sysmark, why
+from .archive import archive_author, archive_mentions, archive_sender, archive_text
 from .member_numbers import BOT_DISPLAY_NUMBER
 from .outbound import OutboundSegment, from_onebot
-from .segments import at_mentions, number_at_mentions, parse_segments
+from .segments import number_at_mentions, parse_segments
 
 log = logging.getLogger("qqbot.state")
 
@@ -176,7 +179,7 @@ def _asker(earlier: list[ChatMsg], reply_to: str | None,
 @dataclass
 class GroupState:
     group_id: str
-    #: Sized in __post_init__ from this group's prompt settings, never by hand: it has
+    #: Sized in __post_init__ from the global prompt settings, never by hand: it has
     #: to exceed the window so the window - with its chunked, cache-stable eviction -
     #: always binds first. A deque-bound window slides one message per turn and
     #: invalidates the prefix on every reply, which is the opposite of what the
@@ -195,6 +198,9 @@ class GroupState:
     blocked: dict[str, datetime | None] = field(default_factory=dict)
     loaded: bool = False
     history_loaded: bool = False
+    #: Keep all messages in one terminal reply batch adjacent. Generation remains
+    #: concurrent; only protocol delivery and immediate archival are serialized.
+    delivery_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     def __post_init__(self) -> None:
         self.recent = deque(self.recent, maxlen=self._capacity())
@@ -203,7 +209,7 @@ class GroupState:
         """Two chunks of headroom past the window: the anchor walks forward a chunk
         at a time, so the deque has to hold a full window plus what has not been
         evicted from in front of it yet."""
-        p = config().for_group(self.group_id)[0].prompt
+        p = config().default.prompt
         return p.evict_chunk * (p.window_chunks + 2)
 
     def add(self, msg: ChatMsg) -> bool:
@@ -305,21 +311,17 @@ class GroupState:
         msgs: list[ChatMsg] = []
         for r in rows:
             payload = r["payload"] or {}
-            text = (r["plain_text"] or "").strip()
+            text = archive_text(r)
             uid = (r["platform_user_id"] or "").strip()
             if not text or not uid:
                 continue
-            sender = payload.get("sender") or {}
+            name = archive_sender(payload)
             # The payload keeps the segments verbatim, so picture references survive
             # a restart: re-parsed here, they are what lets open_images hand over a
             # picture posted before the deploy. Parsing is pure and costs nothing.
             segs = payload.get("segments") or []
-            author_kind = payload.get("author_kind")
-            is_bot = author_kind == "bot" or (
-                str(payload.get("self_id") or "") == uid
-            ) or (
-                author_kind not in {"bot", "member"} and uid == self_id
-            )
+            author = archive_author(payload, uid, current_self_id=self_id)
+            is_bot = author is AuthorKind.BOT
             at: list[tuple[str, str]] = []
             mentions: list[tuple[str, str]] = []
             outbound: tuple[OutboundSegment, ...] = ()
@@ -346,19 +348,15 @@ class GroupState:
                     else None
                 )
                 refs = parsed.pictures if parsed is not None else []
-                mentions = (
-                    at_mentions(
-                        segs,
-                        self_id=str(payload.get("self_id") or self_id),
-                        self_name=config().persona_for(self.group_id).name,
-                    )
-                    if segs
-                    else []
+                mentions = archive_mentions(
+                    payload,
+                    self_id=str(payload.get("self_id") or self_id),
+                    self_name=config().persona_for(self.group_id).name,
                 )
             msgs.append(ChatMsg(
                 msg_id=str(r["platform_event_id"] or r["id"]),
                 user_id=uid,
-                nickname=display_name(sender.get("card"), sender.get("nickname"), "成员"),
+                nickname=name,
                 text=text,
                 ts=r["occurred_at"],
                 is_bot=is_bot,

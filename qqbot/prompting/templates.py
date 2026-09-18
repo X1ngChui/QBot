@@ -45,6 +45,7 @@ class ReloadScope(StrEnum):
 class SlotSpec:
     name: str
     allow_empty: bool = False
+    source: PromptKey | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,8 +68,13 @@ class TemplateValidationError(ValueError):
     """A template source or render value violates its closed contract."""
 
 
-def _slot(name: str, *, allow_empty: bool = False) -> SlotSpec:
-    return SlotSpec(name, allow_empty)
+def _slot(
+    name: str,
+    *,
+    allow_empty: bool = False,
+    source: PromptKey | None = None,
+) -> SlotSpec:
+    return SlotSpec(name, allow_empty, source)
 
 
 _SPECS = (
@@ -86,7 +92,10 @@ _SPECS = (
         PromptKey.REPLY_SYSTEM,
         PromptRole.SYSTEM,
         ReloadScope.RELOADABLE,
-        (_slot("shared_legend"), _slot("shared_pragmatics")),
+        (
+            _slot("shared_legend", source=PromptKey.SHARED_LEGEND),
+            _slot("shared_pragmatics", source=PromptKey.SHARED_PRAGMATICS),
+        ),
     ),
     TemplateSpec(
         PromptKey.REPLY_DEVELOPER,
@@ -109,8 +118,8 @@ _SPECS = (
         PromptRole.SYSTEM,
         ReloadScope.RESTART_REQUIRED,
         (
-            _slot("shared_legend"),
-            _slot("shared_pragmatics"),
+            _slot("shared_legend", source=PromptKey.SHARED_LEGEND),
+            _slot("shared_pragmatics", source=PromptKey.SHARED_PRAGMATICS),
             _slot("predicate_table"),
         ),
     ),
@@ -159,7 +168,7 @@ _SPECS = (
         PromptKey.TOOL_SEND_MESSAGE,
         PromptRole.TOOL,
         ReloadScope.RELOADABLE,
-        (_slot("face_catalog"),),
+        (_slot("face_catalog"), _slot("message_limit")),
     ),
 )
 
@@ -324,7 +333,26 @@ class PromptCatalog:
     def render(
         self, key: PromptKey, values: Mapping[str, str] | None = None, /, **kwargs: str
     ) -> str:
-        return self.templates[key].render(values, **kwargs)
+        supplied = dict(values or {})
+        duplicate = supplied.keys() & kwargs.keys()
+        if duplicate:
+            raise TemplateValidationError(
+                f"{self.templates[key].spec.path}: duplicate render value(s): "
+                + ", ".join(sorted(duplicate))
+            )
+        supplied.update(kwargs)
+        internal = {
+            slot.name: self.source(slot.source)
+            for slot in self.templates[key].spec.slots
+            if slot.source is not None
+        }
+        overlap = supplied.keys() & internal.keys()
+        if overlap:
+            raise TemplateValidationError(
+                f"{self.templates[key].spec.path}: code-owned slot(s) cannot be supplied: "
+                + ", ".join(sorted(overlap))
+            )
+        return self.templates[key].render(internal | supplied)
 
     def sources(self) -> dict[str, str]:
         return {key.value: self.source(key) for key in PROMPT_SPECS}

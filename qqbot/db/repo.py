@@ -518,26 +518,23 @@ async def evidence_add(group_id: int, reply_event_id: str, memo: EvidenceMemo) -
 
 
 async def evidence_for(group_id: int, reply_event_ids: list[str]) -> dict[str, str]:
-    """Render unexpired structured memos and legacy v0 text for prompt replay."""
+    """Render unexpired structured memos for prompt replay."""
 
     if not reply_event_ids:
         return {}
     rows = await pool().fetch(
-        """SELECT reply_event_id, content, memo FROM reply_trace
+        """SELECT reply_event_id, memo FROM reply_trace
             WHERE group_id=$1 AND reply_event_id = ANY($2::text[])
-              AND (expires_at IS NULL OR expires_at > NOW())""",
+              AND memo IS NOT NULL AND expires_at > NOW()""",
         group_id,
         reply_event_ids,
     )
     rendered: dict[str, str] = {}
     for row in rows:
-        if row["memo"] is not None:
-            try:
-                content = EvidenceMemo.from_dict(row["memo"]).render()
-            except (TypeError, ValueError):
-                continue
-        else:
-            content = row["content"]
+        try:
+            content = EvidenceMemo.from_dict(row["memo"]).render()
+        except (TypeError, ValueError):
+            continue
         if content:
             rendered[row["reply_event_id"]] = content
     return rendered

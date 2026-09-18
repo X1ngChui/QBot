@@ -68,7 +68,7 @@ def send_to_asker(messages, text):
     return [
         function_call(
             "send_message",
-            {"content": content},
+            {"messages": [{"content": content}]},
             call_id=f"send-{len(LLM_CALLS)}",
         )
     ]
@@ -1275,7 +1275,7 @@ async def main():
         content.append({"type": "text", "data": {"text": text}})
         return function_call(
             "send_message",
-            {"content": content},
+            {"messages": [{"content": content}]},
             call_id=f"s{len(LLM_CALLS)}",
         )
 
@@ -1316,7 +1316,7 @@ async def main():
     # the spending, and a wrap-up round answers from what rounds one and two already
     # fetched (the daily cap, checked before anything is spent, still means silence).
     check("a reply that hits the search allowance wraps up with an answer",
-          r1 is not None and r1.text == "就查到这些了", repr(r1))
+          r1 is not None and r1.messages[0].text == "就查到这些了", repr(r1))
     check("the wrap-up is one extra round, offered only the send tool",
           len(LLM_CALLS) - n_llm == 3 and _names(LLM_CALLS[-1]["tools"]) == ["send_message"],
           f"{len(LLM_CALLS) - n_llm} rounds, tools={_names(LLM_CALLS[-1]['tools'])}")
@@ -1360,7 +1360,7 @@ async def main():
         msg=_CM0(msg_id="loop2", user_id="u1", nickname="阿强",
                  text="再查个东西", ts=_nl0()))
     check("a reply that runs out of money wraps up the same way",
-          r2 is not None and r2.text == "就查到这些了" and len(LLM_CALLS) - n_llm2 == 3
+          r2 is not None and r2.messages[0].text == "就查到这些了" and len(LLM_CALLS) - n_llm2 == 3
           and _names(LLM_CALLS[-1]["tools"]) == ["send_message"],
           f"{r2!r}, {len(LLM_CALLS) - n_llm2} rounds")
     check("and the unaffordable round's tools were never executed",
@@ -1468,17 +1468,10 @@ async def main():
           all(not q.startswith("话题") or q == "话题A" for q in CappedSearch.calls),
           str(CappedSearch.calls))
 
-    # A reply that searched leaves its provenance on the archived line: what the
-    # group read carries no marker, what the bot remembers does. credibility_rules then
-    # lets a later turn cite the marked line instead of re-searching, and treats
-    # unmarked lines as improvised off the context.
-    from qqbot.core.engine import _provenance as _pvfn
+    # Tool results are retained only as bounded structured evidence. The visible reply,
+    # window and raw archive all keep exactly what the group read.
     from qqbot.core.output import clean_reply as _cr
     _weather = _agent.ToolExecution("web_search", {"query": "明天 天气"}, "1. T C", True)
-    check("provenance names the tool and the query",
-          _pvfn((_weather,), cfg) == "⟦依据:搜索“明天 天气”⟧",
-          _pvfn((_weather,), cfg))
-    check("no tools means no marker", _pvfn((), cfg) == "")
     from qqbot.core.engine import _evidence_memo as _memo_fn
     check("no tools means no evidence memo", _memo_fn((), cfg) is None)
     _history_execution = _agent.ToolExecution(
@@ -1553,14 +1546,14 @@ async def main():
           bot.quoted[-1] is None and bot.ats[-1] is None,
           f"{bot.quoted[-1]} {bot.ats[-1]}")
     _pv_line = st_pv.recent[-1]
-    check("but the window remembers what it rested on",
-          _pv_line.is_bot and _pv_line.text == "明天多云 ⟦依据:搜索“明天 天气”⟧"
+    check("the window keeps only the visible reply",
+          _pv_line.is_bot and _pv_line.text == "明天多云"
           and _pv_line.at == [] and _pv_line.reply_to is None,
           repr(_pv_line))
     _pv_row = await pool().fetchval(
         "SELECT plain_text FROM raw_event WHERE platform_event_id=$1", _pv_line.msg_id)
-    check("and so does the archive",
-          "⟦依据:搜索“明天 天气”⟧" in (_pv_row or ""), repr(_pv_row))
+    check("the archive also keeps only the visible reply",
+          _pv_row == "明天多云", repr(_pv_row))
 
     # The send tool: whom to @ and which line to reply to are the model's choice,
     # named by the numbers the prompt showed. Two members share a card here - the
@@ -1646,6 +1639,7 @@ async def main():
           repr(_back))
     # A line archived before the @ was stored as a segment opens with "@asker" and
     # replies to the asker's message; the rebuild recovers the account from that.
+    from qqbot.domain.archive import AuthorKind as _AK14
     from qqbot.gateway.ingest import ingestor as _ing14
     from qqbot.gateway.onebot import GroupMessage as _GM14, Sender as _S14
     await _ing14().ingest(_GM14(
@@ -1655,7 +1649,8 @@ async def main():
     await _ing14().ingest(_GM14(
         message_id="legacy-a", group_id=5602, sender=_S14(user_id="999", nickname="小X"),
         segments=[{"type": "text", "data": {"text": "@阿强 三点半"}}], self_id="999",
-        occurred_at=_nl0(), plain_text="@阿强 三点半", reply_to_message_id="legacy-q"))
+        occurred_at=_nl0(), plain_text="@阿强 三点半", reply_to_message_id="legacy-q",
+        author_kind=_AK14.BOT))
     _old = _GS14(group_id="5602")
     await _old.load_history(self_id="999", owners=set())
     _old_line = next((m for m in _old.recent if m.msg_id == "legacy-a"), None)
@@ -1676,11 +1671,11 @@ async def main():
     check("the bot's past message is rendered as its send call",
           len(_own) == 1
           and _j14.loads(_own[0]["arguments"])
-          == {"content": [
+          == {"messages": [{"content": [
               {"type": "reply", "data": {"line": 2}},
               {"type": "at", "data": {"member": 2}},
               {"type": "text", "data": {"text": " 你好呀"}},
-          ]},
+          ]}]},
           repr(_own))
     _own_result = next((m for m in _hist if m.get("type") == "function_call_output"), {})
     check("followed by its result, carrying the line's number",
@@ -1717,10 +1712,12 @@ async def main():
           f"{bot.sent[-1:]} {_e_tools}")
 
     _use(_calls(
-        function_call("send_message", {"content": []}, call_id="bad-send"),
+        function_call("send_message", {"messages": []}, call_id="bad-send"),
         function_call(
             "send_message",
-            {"content": [{"type": "text", "data": {"text": "同轮有效"}}]},
+            {"messages": [{"content": [
+                {"type": "text", "data": {"text": "同轮有效"}}
+            ]}]},
             call_id="good-send",
         ),
     ))
@@ -1836,14 +1833,23 @@ async def main():
         msg=_CM0(msg_id="pv2", user_id="u1", nickname="阿强",
                  text="后天呢", ts=_nl0()))
     _msgs2 = list(LLM_CALLS[-1]["input"])
-    _ri = next((i for i, m in enumerate(_msgs2)
-                if m.get("type") == "function_call_output"
-                and "⟦依据:搜索“明天 天气”⟧" in str(m.get("output"))), None)
+    _ri = next(
+        (
+            i
+            for i, m in enumerate(_msgs2)
+            if m.get("type") == "function_call_output"
+            and str(m.get("output", "")).startswith("已发送：")
+            and i > 0
+            and _msgs2[i - 1].get("type") == "function_call"
+            and "明天多云" in str(_msgs2[i - 1].get("arguments", ""))
+        ),
+        None,
+    )
     check("assembly seats rendered evidence with the send call it fed",
-          _ri is not None and _msgs2[_ri - 1].get("type") == "function_call"
-          and _msgs2[_ri - 1]["name"] == "send_message"
+          _ri is not None and _msgs2[_ri - 1].get("name") == "send_message"
           and _msgs2[_ri - 2].get("role") == "assistant"
-          and _msgs2[_ri - 2].get("content") == _expected_evidence,
+          and _msgs2[_ri - 2].get("content") == _expected_evidence
+          and "依据" not in str(_msgs2[_ri].get("output", "")),
           str(_msgs2[_ri - 2:_ri + 1] if _ri else _msgs2[-3:])[:200])
     check("an imitated evidence marker line never reaches the group",
           _cr("⟦检索记录⟧\n搜索“x”：y\n好的") == "搜索“x”：y\n好的",
@@ -1853,9 +1859,8 @@ async def main():
            VALUES (123, 'legacy-evidence', '⟦检索记录⟧\n旧格式')"""
     )
     check(
-        "legacy schema-v0 evidence remains readable during migration",
-        (await _repo.evidence_for(123, ["legacy-evidence"]))
-        == {"legacy-evidence": "⟦检索记录⟧\n旧格式"},
+        "legacy schema-v0 evidence is no longer prompt-visible",
+        await _repo.evidence_for(123, ["legacy-evidence"]) == {},
     )
     await pool().execute(
         "UPDATE reply_trace SET expires_at=NOW() - INTERVAL '1 second' "
@@ -2170,6 +2175,191 @@ async def main():
     got_cut2 = await _tools.search_history(123, "改锥", rcfg=_tiny)
     check("an over-long search answer is cut at a line and says so",
           "结果过长" in got_cut2 and len(got_cut2) < 1200, str(len(got_cut2)))
+
+    # 19. One terminal send call can deliver several independent QQ messages. The
+    # delivery lock keeps each batch contiguous while generation remains concurrent.
+    from datetime import timedelta as _td19
+    from qqbot.core.agent import MessageDraft as _MD19, ReplyDraft as _RD19
+    from qqbot.core.outbound import (
+        DiceSegment as _D19,
+        ReplySegment as _R19,
+        TextSegment as _T19,
+    )
+    from qqbot.domain.evidence import (
+        EvidenceItem as _EI19,
+        EvidenceMemo as _EM19,
+        EvidenceOutcome as _EO19,
+        EvidenceSource as _ES19,
+    )
+    from qqbot.db import repo as _repo19
+
+    _created19 = _nl0()
+    _memo19 = _EM19(
+        items=(_EI19(_ES19.WEB_SEARCH, "虚构查询", _EO19.VERIFIED, "虚构结果"),),
+        created_at=_created19,
+        expires_at=_created19 + _td19(days=1),
+    )
+
+    def _draft19(*texts, evidence=None):
+        return _RD19(
+            tuple(_MD19((_T19(text),)) for text in texts),
+            evidence=evidence,
+        )
+
+    _replies19 = {
+        "clean-empty": _draft19("C1", "** **"),
+        "partial": _draft19("P1", "P2", "P3", evidence=_memo19),
+        "retry": _RD19((
+            _MD19((_R19("recalled"), _T19("R1"))),
+            _MD19((_T19("R2"),)),
+        )),
+        "evidence": _RD19(
+            (_MD19((_T19("E1"),)), _MD19((_D19(),))),
+            evidence=_memo19,
+        ),
+        "A": _draft19("A1", "A2"),
+        "B": _draft19("B1", "B2"),
+    }
+    _original_generate19 = _eng.generate
+
+    async def _generate19(*, msg, **_kwargs):
+        return _replies19[msg.text]
+
+    class ActionFailed(Exception):
+        pass
+
+    class _BatchBot19(FakeBot):
+        def __init__(self):
+            super().__init__()
+            self.attempted = []
+            self.fail_text = None
+            self.fail_reply_text = None
+            self.failed_reply = False
+            self.message_ids = itertools.count(970001)
+
+        async def send_group_msg(self, *, group_id, message):
+            text = "".join(
+                segment["data"].get("text", "")
+                for segment in message
+                if segment["type"] == "text"
+            )
+            self.attempted.append(text)
+            await asyncio.sleep(0.01)
+            if text == self.fail_text:
+                raise RuntimeError("scripted refusal")
+            if (
+                text == self.fail_reply_text
+                and not self.failed_reply
+                and any(segment["type"] == "reply" for segment in message)
+            ):
+                self.failed_reply = True
+                raise ActionFailed("quoted message is gone")
+            await super().send_group_msg(group_id=group_id, message=message)
+            return {"message_id": next(self.message_ids)}
+
+    _batch_bot19 = _BatchBot19()
+    _batch_state19 = type(st_pv)(group_id="5701")
+    _batch_state19.loaded = _batch_state19.history_loaded = True
+    _eng.generate = _generate19
+    try:
+        _before_clean19 = len(_batch_bot19.attempted)
+        _clean_empty19 = await _eng.respond(
+            bot=_batch_bot19,
+            st=_batch_state19,
+            cfg=cfg,
+            persona=_persona,
+            msg=_CM0("batch-c", "u1", "阿强", "clean-empty", _nl0()),
+        )
+        check(
+            "the whole batch is cleaned before its first protocol send",
+            not _clean_empty19 and len(_batch_bot19.attempted) == _before_clean19,
+            repr(_batch_bot19.attempted[_before_clean19:]),
+        )
+
+        _batch_bot19.fail_text = "P2"
+        _partial19 = await _eng.respond(
+            bot=_batch_bot19,
+            st=_batch_state19,
+            cfg=cfg,
+            persona=_persona,
+            msg=_CM0("batch-p", "u1", "阿强", "partial", _nl0()),
+        )
+        check(
+            "an irrecoverable batch failure keeps the prefix and stops the suffix",
+            _partial19
+            and _batch_bot19.attempted[-2:] == ["P1", "P2"]
+            and [message.text for message in list(_batch_state19.recent)[-1:]] == ["P1"],
+            f"{_batch_bot19.attempted} {list(_batch_state19.recent)[-3:]}",
+        )
+        _partial_id19 = _batch_state19.recent[-1].msg_id
+        check(
+            "a delivered prefix is archived before the failed item",
+            await pool().fetchval(
+                "SELECT plain_text FROM raw_event WHERE platform_event_id=$1",
+                _partial_id19,
+            ) == "P1",
+        )
+
+        _batch_bot19.fail_text = None
+        _batch_bot19.fail_reply_text = "R1"
+        _retry19 = await _eng.respond(
+            bot=_batch_bot19,
+            st=_batch_state19,
+            cfg=cfg,
+            persona=_persona,
+            msg=_CM0("batch-r", "u1", "阿强", "retry", _nl0()),
+        )
+        _retry_lines19 = list(_batch_state19.recent)[-2:]
+        check(
+            "reply fallback retries only that item and continues the batch",
+            _retry19
+            and _batch_bot19.attempted[-3:] == ["R1", "R1", "R2"]
+            and [message.text for message in _retry_lines19] == ["R1", "R2"]
+            and _retry_lines19[0].reply_to is None,
+            f"{_batch_bot19.attempted[-3:]} {_retry_lines19}",
+        )
+        _batch_bot19.fail_reply_text = None
+
+        _evidence19 = await _eng.respond(
+            bot=_batch_bot19,
+            st=_batch_state19,
+            cfg=cfg,
+            persona=_persona,
+            msg=_CM0("batch-e", "u1", "阿强", "evidence", _nl0()),
+        )
+        _evidence_lines19 = list(_batch_state19.recent)[-2:]
+        _stored19 = await _repo19.evidence_for(
+            5701,
+            [message.msg_id for message in _evidence_lines19],
+        )
+        check(
+            "batch evidence is stored only on the first delivered message",
+            _evidence19
+            and [message.text for message in _evidence_lines19] == ["E1", "[骰子]"]
+            and list(_stored19) == [_evidence_lines19[0].msg_id],
+            repr(_stored19),
+        )
+
+        _before19 = len(_batch_bot19.attempted)
+        _results19 = await asyncio.gather(*(
+            _eng.respond(
+                bot=_batch_bot19,
+                st=_batch_state19,
+                cfg=cfg,
+                persona=_persona,
+                msg=_CM0(f"batch-{name}", "u1", "阿强", name, _nl0()),
+            )
+            for name in ("A", "B")
+        ))
+        _order19 = _batch_bot19.attempted[_before19:]
+        check(
+            "concurrent reply batches do not interleave their messages",
+            all(_results19)
+            and _order19 in (["A1", "A2", "B1", "B2"], ["B1", "B2", "A1", "A2"]),
+            repr(_order19),
+        )
+    finally:
+        _eng.generate = _original_generate19
 
     # Last, so every kind of memory write has actually happened by now. Reasoning
     # models bill deliberation as output, so a memory call must ask for a terse

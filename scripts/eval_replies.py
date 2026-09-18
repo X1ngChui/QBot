@@ -154,7 +154,8 @@ CASES = [
         "checks": NO_MARKERS[:1],
         "send_checks": [
             ("reaches the one who asked: replies to the question or @s its author",
-             lambda r: r.reply_to == "rl-q" or "u2" in r.at),
+             lambda r: any(message.reply_to == "rl-q" for message in r.messages)
+             or "u2" in r.at),
         ],
     },
     {
@@ -281,10 +282,10 @@ CASES = [
             ("names the actual buyer", lambda t: "王大锤" in t),
             ("cites the model only the archive holds", lambda t: "星梭" in t),
         ],
-        # Mechanism confirmation on top of the textual proof: the provenance
-        # marker only appears for a verified (non-empty) tool result.
+        # Mechanism confirmation on top of the textual proof: structured evidence
+        # contains only tool work that actually ran.
         "loop_checks": [
-            ("search_history actually ran", lambda prov, trace: "查档" in trace),
+            ("search_history actually ran", lambda evidence: "查档" in evidence),
         ],
     },
     {
@@ -307,7 +308,7 @@ CASES = [
             # The blank must be earned: the group's past was asked before
             # answering - by transcript search or episodic recall, either counts.
             ("the archive was consulted",
-             lambda prov, trace: "查档" in trace or "回忆" in trace),
+             lambda evidence: "查档" in evidence or "回忆" in evidence),
         ],
     },
 ]
@@ -372,7 +373,7 @@ async def picture_case(cfg) -> dict:
             ("names the right half blue", lambda t: "蓝" in t),
         ],
         "loop_checks": [
-            ("the picture was opened", lambda prov, trace: "看了图" in prov),
+            ("the picture was opened", lambda evidence: "看了图" in evidence),
         ],
     }
 
@@ -413,20 +414,22 @@ async def run_case(case, cfg, persona, bot) -> tuple[str, str]:
     st.add(case["trigger"])
     reply = await engine.generate(
         bot=bot, st=st, cfg=cfg, persona=persona, msg=case["trigger"])
-    raw = reply.text if reply is not None else ""
-    prov = reply.provenance if reply is not None else ""
+    raw = "\n".join(message.text for message in reply.messages) if reply is not None else ""
     evidence = reply.evidence.render() if reply is not None and reply.evidence else ""
     if reply is not None:
-        print(f"           send| at={reply.at} reply_to={reply.reply_to}")
+        for index, message in enumerate(reply.messages, 1):
+            print(
+                f"           send[{index}]| at={message.at} "
+                f"reply_to={message.reply_to} text={message.text!r}"
+            )
     if case["checks"] is None:
         return "OBSERVE", raw
     cleaned = clean_reply(raw)
-    # Loop checks read the tool loop's own record (provenance and evidence), not
-    # the reply text: whether the model reached for a tool at all. Failing one
-    # is a straight FAIL - there is no output guard that can strip in a search
-    # that never happened.
+    # Loop checks read the tool loop's structured evidence, not the reply text:
+    # whether the model reached for a tool at all. Failing one is a straight FAIL—
+    # there is no output guard that can strip in a search that never happened.
     loop_fail = [label for label, ok in case.get("loop_checks", ())
-                 if not ok(prov, evidence)]
+                 if not ok(evidence)]
     send_fail = [label for label, ok in case.get("send_checks", ())
                  if reply is None or not ok(reply)]
     clean_fail = ([label for label, ok in case["checks"] if not ok(cleaned)]

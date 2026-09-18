@@ -61,12 +61,26 @@ whole family before writing it.
 Code owns roles, template keys, slots, tool schemas, marker grammar, limits and dynamic data. You
 own only the Chinese wording inside each declared template. Keep the tone professional, plain,
 accurate, calm and direct. Do not mention source files, implementation modules or databases in the
-runtime prompts. Examples must remain fictional. Do not expose mface, invent tools or fields, add
-undeclared slots, copy protected markers into visible message text, or make display number 0 a
-legal tool target. A plain-text `@我` typed by a member is ordinary text with no bot-identity
-semantics; only a structured mention rendered with `⟦0⟧` identifies the current bot. For archive
-search, distinguish likely verbatim topic terms from question-side field labels such as model, price
-or time: do not make a label an AND requirement when the archived sentence may state only its value.
+runtime prompts. Examples must remain fictional. Do not expose mface, music, music_custom or
+json, invent tools or fields, add undeclared slots, copy protected markers into visible message
+text, or make display number 0 a legal tool target. One terminal send_message call carries an
+ordered messages batch whose maximum is supplied through {{message_limit}}. Each item is one
+independent QQ message. The parameter-only dice, rps, contact_member and contact_group segments
+must each be the sole segment in that message item's content: no reply, text, at or any other
+segment may accompany one. Explanation text may be a separate item in the same messages batch;
+never describe explanation and a standalone segment as mutually exclusive choices. Invalid model
+arguments reject the complete batch before delivery, not merely one item. A successful send_message
+call terminates the run, so include every intended QQ message in that single batch. When describing
+historical sends, preserve the outer messages array and each item's inner content array. A
+plain-text `@我` typed by a member is
+ordinary text with no bot-identity semantics; only a structured mention rendered with `⟦0⟧`
+identifies the current bot. Evidence is
+available only through a current `⟦检索记录⟧` block placed immediately before the historical send
+it supported. It is bounded, may expire, and supports only the summarized retrieved content; never
+define or rely on a permanent `⟦依据:…⟧` archive marker, and never treat the bot's old wording as
+external evidence by itself. For archive search, distinguish likely verbatim topic terms from
+question-side field labels such as model, price or time: do not make a label an AND requirement when
+the archived sentence may state only its value.
 
 The shared_legend and shared_pragmatics templates are the only shared partials. reply_system and
 extract_system each include them through their declared slots. State a rule once at its owning

@@ -1,8 +1,8 @@
 """Typed outbound QQ message segments.
 
-The model may choose only these closed variants.  Raw OneBot dictionaries are created at
-the gateway edge, so text can never smuggle a control segment and unsupported segment
-kinds cannot be constructed accidentally.
+Raw OneBot dictionaries are decoded at the gateway edge and emitted only from closed
+variants. ``MarketFaceSegment`` is retained solely to read historical bot messages; the
+model-facing send parser cannot construct it.
 """
 
 from __future__ import annotations

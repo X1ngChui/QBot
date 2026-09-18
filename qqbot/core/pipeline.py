@@ -134,66 +134,49 @@ class Gateway:
 
     # -- producer ---------------------------------------------------------
     async def handle(self, bot: BotApi, event) -> None:
-        group_id = str(event.group_id)
-        user_id = str(event.user_id)
+        inbound = GroupMessage.from_event(event, str(bot.self_id))
+        group_id = str(inbound.group_id)
         cfg, _persona = config().for_group(group_id)
+        self_name = (
+            config().persona_for(group_id).name
+            or (cfg.trigger.nicknames[0] if cfg.trigger.nicknames else "机器人")
+        )
+        inbound = inbound.with_bot_mention(self_name)
 
-        msg_id = str(event.message_id)
-        if self._dedup_set().seen(msg_id):
+        if self._dedup_set().seen(inbound.message_id):
             return
         try:
-            await self._admit(bot, event, group_id=group_id, user_id=user_id,
-                              msg_id=msg_id, cfg=cfg)
+            await self._admit(bot, inbound, cfg=cfg, self_name=self_name)
         except Exception:
             # Marked seen, then failed before the message reached the window or
             # the archive: give the mark back, or the adapter's replay of this
             # event is swallowed and the message is neither archived nor answered.
-            self._dedup_set().discard(msg_id)
+            self._dedup_set().discard(inbound.message_id)
             raise
 
-    async def _admit(self, bot: BotApi, event, *, group_id: str, user_id: str,
-                     msg_id: str, cfg: Settings) -> None:
+    async def _admit(
+        self,
+        bot: BotApi,
+        inbound: GroupMessage,
+        *,
+        cfg: Settings,
+        self_name: str,
+    ) -> None:
         """Everything handle() does under the dedup mark: parse, window, archive,
         decide. Split out so one guard covers the whole stretch - the parser and
         the history load can both raise, and either would otherwise leave the
         mark held on a message nothing was done with."""
+        group_id = str(inbound.group_id)
+        user_id = inbound.sender.user_id
+        msg_id = inbound.message_id
         st = await REGISTRY.get(group_id)
         # A blocked account is NOT dropped here: its messages arrive, archive and
         # feed memory like anyone's, so the window stays coherent around them - a
         # hole where a person used to be reads as broken context. The price is that
         # a blocked account still feeds memory; the one thing withheld is the reply,
         # at the dispatch gate.
-        segments = [
-            {"type": seg.type, "data": dict(seg.data)} for seg in event.get_message()
-        ]
-        self_id = str(bot.self_id)
-        self_name = (
-            config().persona_for(group_id).name
-            or (cfg.trigger.nicknames[0] if cfg.trigger.nicknames else "机器人")
-        )
-        # Some adapters remove a leading/trailing @bot and retain only ``to_me``.
-        # Restore a normal segment before parsing and archiving so live and rebuilt
-        # prompts project the same structured mention instead of a magic text token.
-        if getattr(event, "to_me", False) and not any(
-            isinstance(segment, dict)
-            and segment.get("type") == "at"
-            and str((segment.get("data") or {}).get("qq") or "") == self_id
-            for segment in segments
-        ):
-            segments.insert(
-                0,
-                {"type": "at", "data": {"qq": self_id, "name": self_name}},
-            )
-        for segment in segments:
-            if not isinstance(segment, dict) or segment.get("type") != "at":
-                continue
-            data = segment.get("data")
-            if (
-                isinstance(data, dict)
-                and str(data.get("qq") or "") == self_id
-                and not data.get("name")
-            ):
-                data["name"] = self_name
+        segments = inbound.segments
+        self_id = inbound.self_id
         parsed = parse_segments(
             segments,
             self_id,
@@ -201,12 +184,10 @@ class Gateway:
             self_name=self_name,
         )
 
-        # The adapter does the same to a quote: _check_reply resolves the reply segment,
-        # moves it to event.reply, and deletes it from the message - so parse_segments
-        # never sees one. Trust event.reply the same way to_me is trusted. (Tests cannot
-        # cover this: their events are built by hand and skip the adapter's preprocessing.)
-        if (reply := getattr(event, "reply", None)) is not None and not parsed.reply_to:
-            parsed.reply_to = str(getattr(reply, "message_id", "") or "") or None
+        # The adapter may lift the reply segment out of the message. The typed
+        # envelope retains that pointer so parsing and archiving agree.
+        if inbound.reply_to_message_id and not parsed.reply_to:
+            parsed.reply_to = inbound.reply_to_message_id
 
         text = parsed.render()
         # A command is answered by the command matchers, never by the reply
@@ -220,25 +201,17 @@ class Gateway:
             return
         text = cut_text(text, cfg.gateway.max_msg_len)
 
-        sender = event.sender
-        # The reply path reads the live event, not gateway.Sender - so it defangs
-        # here, in step with Sender.parse doing the same for the archived copy.
-        # A sender with neither card nor nickname is shown by the generic member
-        # word, never as the bare account number the prompt is told it will not see.
-        nickname = display_name(getattr(sender, "card", ""),
-                                getattr(sender, "nickname", ""), "成员")
-
-        # The event's own timestamp when it carries one, so the line's [MM-dd HH:mm]
-        # stamp and the archive's occurred_at agree - late-delivered messages after
-        # a NapCat outage would otherwise stamp as "now", and a restart-rebuilt
-        # window would re-stamp them differently than the live one did.
-        when = getattr(event, "time", 0) or 0
+        nickname = display_name(
+            inbound.sender.card,
+            inbound.sender.nickname,
+            "成员",
+        )
         msg = ChatMsg(
             msg_id=msg_id,
             user_id=user_id,
             nickname=nickname,
             text=text,
-            ts=datetime.fromtimestamp(when, tz()) if when else now_local(),
+            ts=inbound.occurred_at,
             is_owner=user_id in cfg.owners,
             reply_to=parsed.reply_to,
             # Kept beyond the describe: pending is unpaid work and gets cleared,
@@ -272,9 +245,13 @@ class Gateway:
             log.info("group %s: message %s replayed, already handled", group_id, msg_id)
             return
 
-        inbound = GroupMessage.from_event(event, segments, bot.self_id, plain_text=text)
+        archived = replace(
+            inbound,
+            plain_text=text,
+            reply_to_message_id=parsed.reply_to,
+        )
         archive_task = self._track(
-            self._archive(inbound, at_accounts=list(parsed.mentions))
+            self._archive(archived, at_accounts=list(parsed.mentions))
         )
 
         # Everything the message points at resolves now. The free lookups have to,
