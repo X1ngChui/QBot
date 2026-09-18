@@ -263,19 +263,21 @@ retrieval:
 memory:
   # RESTART: the memory worker freezes this whole block at construction. A reload
   # that changes it is rejected atomically; restart to apply the edit.
-  # Messages one extraction chunk holds at most. /relearn's watermark reset keeps
-  # exactly this many unread, so the two move together.
+  # Messages one extraction chunk holds at most.
   extract_window: 120
   # A full chunk is trimmed back to the last conversation gap of at least this many
   # minutes in its tail half, so batches end where conversations do.
   batch_gap_min: 30
   # Below this many unread messages a drain does not bother - a pass pays for the
-  # rules and the schemas before reading a line. /relearn forces past it.
+  # rules and the schemas before reading a line.
   drain_floor: 20
   # Passes one nightly drain may run, and how many recorded episodes the extractor
   # is reminded of so it recognises what it already wrote down.
   max_passes: 10
   known_episodes: 8
+  # Episodes older than this leave semantic recall. Their rows and source links stay
+  # as history, while their rebuildable vector projections are removed.
+  episode_ttl_days: 90
   # How long an unused name survives: one the model merely guessed at, and one it
   # marked as a joke. Most jokes are true for an afternoon.
   alias_unused_days: 30

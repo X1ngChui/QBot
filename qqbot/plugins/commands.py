@@ -194,7 +194,6 @@ alias_cmd = on_command("alias", **_CMD)
 forget_cmd = on_command("forget", **_CMD)
 merge_cmd = on_command("merge", **_CMD)
 split_cmd = on_command("split", **_CMD)
-relearn_cmd = on_command("relearn", **_CMD)
 log_cmd = on_command("log", **_CMD)
 debug_cmd = on_command("debug", **_CMD)
 help_cmd = on_command("help", **_CMD)
@@ -572,7 +571,7 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
     These are facts like any other - the group is an entity, and what it is for and what
     its words mean are facts about it. That is why they are numbered here and deleted
     with the same /forget that deletes a fact about a person, and why the extraction pass
-    that learns everything else (and /relearn) is what refreshes them.
+    that learns everything else is what refreshes them.
     """
     await _gate(matcher, event, open_to_members=True)
     gid = str(event.group_id)
@@ -883,23 +882,6 @@ async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
         await _finish(matcher, e.message)
         return
     await _finish(matcher, "已拆分。")
-
-
-@relearn_cmd.handle()
-async def _(matcher: Matcher, event: GroupMessageEvent) -> None:
-    """Ask for an extraction pass now rather than at tonight's drain.
-
-    Queued, not run inline: it is a paid model call, and holding the handler open on one
-    is long enough for QQ to time the reply out.
-    """
-    await _gate(matcher, event)
-    try:
-        await directory().relearn(int(event.group_id))
-    except Exception as e:
-        log.warning("group %s: /relearn failed: %s", event.group_id, why(e))
-        await _finish(matcher, "排入失败，详见日志。")
-        return
-    await _finish(matcher, "已排入归纳队列。")
 
 
 # -- diagnostics ------------------------------------------------------------

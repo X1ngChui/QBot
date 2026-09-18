@@ -50,7 +50,6 @@ QQ group's own admin role is never consulted.
 | --- | --- |
 | `/card` | What is known about the group itself: its topic and the meaning of its jargon. Same source and same decay as member records. |
 | `/forget N` | Deletes fact N from the group record. Owners only. |
-| `/relearn` | Re-reads the most recent extraction window of this group's chat now instead of waiting for the nightly run. Costs model calls; results land later. |
 
 ### Identity
 

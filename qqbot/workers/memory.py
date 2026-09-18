@@ -133,8 +133,7 @@ class MemoryWorker:
     async def _dispatch(self, job: Job) -> None:
         match job.job_type:
             case JobType.EXTRACT_MEMORY:
-                await self.extract(int(job.payload["group_id"]),
-                                   force=bool(job.payload.get("force")))
+                await self.extract(int(job.payload["group_id"]))
             case JobType.CONSOLIDATE:
                 await self.consolidate(int(job.payload["group_id"]))
             case JobType.EMBED:
@@ -272,16 +271,16 @@ class MemoryWorker:
             out += [f"- {defang(s)}" for s in seen[:self._m.known_episodes]]
         return "\n".join(out)
 
-    async def extract(self, group_id: int, *, force: bool = False) -> int:
+    async def extract(self, group_id: int) -> int:
         """Drain the unread transcript in gap-aligned chunks. One model call each.
 
         The nightly single event point (schedule.nightly_cron): the whole day is
         read here, oldest first, each chunk cut where a conversation ended. Two
         gates per pass, in the order that costs least to check: the day's budget,
-        then whether enough is unread to be worth a pass at all (memory.drain_floor;
-        `force` - /relearn - reads whatever there is). This is the only place that
-        knows a model call is about to happen, so it is the only place where
-        "nothing has been said since last time" can reliably stop one.
+        then whether enough is unread to be worth a pass at all (memory.drain_floor).
+        This is the only place that knows a model call is about to happen, so it is
+        the only place where "nothing has been said since last time" can reliably
+        stop one.
         """
         total = 0
         for _ in range(self._m.max_passes):
@@ -293,7 +292,7 @@ class MemoryWorker:
                 break
 
             unread, _newest = await self._events.unread_since_extract(group_id)
-            if not unread or (unread < self._m.drain_floor and not force):
+            if not unread or unread < self._m.drain_floor:
                 if not total:
                     log.info("group %s: %d unread, not worth a pass", group_id, unread)
                 break
@@ -501,8 +500,8 @@ class MemoryWorker:
             if not cands:
                 break
             # Anchor and size together name a batch: two batches can end at the
-            # same row with different widths (a failed nightly batch, then a
-            # /relearn), and the account codes are positions within one render.
+            # same row with different widths, and the account codes are positions
+            # within one render.
             batches: dict[tuple[uuid.UUID | None, int], list] = {}
             for c in cands:
                 batches.setdefault((c.batch_event_id, c.batch_size), []).append(c)
@@ -536,12 +535,12 @@ class MemoryWorker:
         return written, rejected
 
     # -- forgetting --------------------------------------------------------
-    async def decay(self, group_id: int) -> tuple[int, int]:
-        """Let go of what nothing has confirmed lately. Returns (facts, names).
+    async def decay(self, group_id: int) -> tuple[int, int, int]:
+        """Let go of what nothing has confirmed lately. Returns facts, names, episodes.
 
-        Free - it is one UPDATE each, no model call. It runs daily because the cost of
-        not running it is paid on every single reply: the roster sits in the system block,
-        so one stale line is re-read on every turn until somebody notices it by hand.
+        Free - each store uses set-based database operations and no model call. It runs
+        daily because stale facts sit in every reply prompt and stale episodes keep
+        participating in semantic recall until they are retired.
         """
         stable, fast = decay_classes()
         half = config().predicates.half_life_days
@@ -553,10 +552,14 @@ class MemoryWorker:
         names = await self._ids.decay_aliases(
             group_id, unused_days=self._m.alias_unused_days,
             joke_days=self._m.joke_unused_days)
-        if facts or names:
-            log.info("group %s: retired %d facts and %d unconfirmed names",
-                     group_id, facts, names)
-        return facts, names
+        episodes = await self._eps.decay(
+            group_id, ttl_days=self._m.episode_ttl_days)
+        if facts or names or episodes:
+            log.info(
+                "group %s: retired %d facts, %d unconfirmed names and %d episodes",
+                group_id, facts, names, episodes,
+            )
+        return facts, names, episodes
 
     # -- vectors -----------------------------------------------------------
     async def embed(self, group_id: int) -> int:
@@ -586,8 +589,9 @@ class MemoryWorker:
         # strict: the vectors are paired with the episodes by position, so a backend
         # that answered with a different number of them would file each summary under
         # somebody else's vector rather than fail.
+        stored = 0
         for (eid, _), v in zip(todo, vecs, strict=True):
-            await self._vec.put(group_id=group_id, object_type="episode",
-                                object_id=eid, embedding=v)
-        log.info("group %s: embedded %d episodes", group_id, len(todo))
-        return len(todo)
+            stored += await self._vec.put_episode(
+                group_id=group_id, episode_id=eid, embedding=v)
+        log.info("group %s: embedded %d episodes", group_id, stored)
+        return stored

@@ -121,7 +121,7 @@ docker compose up -d bot
 | `/merge`、`/split` | 声明两个账号是同一个人，或撤销 |
 | `/block`、`/unblock`、`/mute`、`/unmute` | 不再回复某个成员，或整个群 |
 | `/stats`、`/groupstats`、`/top` | 花费与用量 |
-| `/relearn`、`/reload`、`/debug`、`/log` | 维护 |
+| `/reload`、`/debug`、`/log` | 维护 |
 
 用法与权限见 [docs/commands.md](docs/commands.md)。
 

@@ -27,8 +27,8 @@ from ..db import pool
 from ..settings import RetrievalCfg, config
 from ..util import defang, merge_overlapping, sysmark
 from ..repositories import (
-    EpisodeRepository, EventRepository, IdentityRepository, JobQueue,
-    MemoryRepository, VectorRepository,
+    EpisodeRepository, EventRepository, IdentityRepository, MemoryRepository,
+    VectorRepository,
 )
 from ..providers import providers
 from ..services import Directory, IdentityResolver, Retriever
@@ -44,7 +44,6 @@ _DIRECTORY = Directory(
     ids=_IDS,
     memory=MemoryRepository(),
     events=EventRepository(),
-    jobs=JobQueue("commands"),
 )
 
 

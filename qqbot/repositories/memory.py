@@ -388,6 +388,33 @@ class EpisodeRepository:
                 )
             return ep
 
+    async def decay(self, group_id: int, *, ttl_days: float) -> int:
+        """Retire old episodes and discard their rebuildable vector projections.
+
+        The episode, participants and source-event links remain as the durable account of
+        what happened. Only live recall and its derived index expire. Updating and deleting
+        under one transaction also closes the race with an embed writer, which locks the
+        same episode row before adding a projection.
+        """
+        async with pool().acquire() as conn, conn.transaction():
+            rows = await conn.fetch(
+                """UPDATE episode
+                      SET status='expired', revision=revision+1
+                    WHERE group_id=$1 AND status='active'
+                      AND COALESCE(ended_at, started_at, created_at)
+                          < NOW() - ($2::float * INTERVAL '1 day')
+                RETURNING id""",
+                group_id, ttl_days,
+            )
+            ids = [row["id"] for row in rows]
+            if ids:
+                await conn.execute(
+                    """DELETE FROM embedding_index
+                        WHERE object_type='episode' AND object_id=ANY($1::uuid[])""",
+                    ids,
+                )
+        return len(rows)
+
     async def involving(
         self, group_id: int, entity_id: uuid.UUID, *, limit: int = 10
     ) -> list[Episode]:
@@ -428,6 +455,7 @@ class EpisodeRepository:
         rows = await pool().fetch(
             """SELECT h.id AS hit_id, n.* FROM unnest($2::uuid[]) AS h(id)
                  JOIN episode he ON he.id = h.id AND he.group_id=$1
+                                AND he.status='active'
                                 AND he.started_at IS NOT NULL
                 CROSS JOIN LATERAL (
                   (SELECT e.* FROM episode e

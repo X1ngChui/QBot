@@ -139,7 +139,7 @@ the agreement. Anything a member may not run is ignored without a reply.
 | `/merge`, `/split` | Declare that two accounts are one person, or undo it |
 | `/block`, `/unblock`, `/mute`, `/unmute` | Stop answering a member, or the whole group |
 | `/stats`, `/groupstats`, `/top` | Spending and usage |
-| `/relearn`, `/reload`, `/debug`, `/log` | Maintenance |
+| `/reload`, `/debug`, `/log` | Maintenance |
 
 See [docs/commands.md](docs/commands.md) for usage and permissions.
 

@@ -43,9 +43,9 @@ class Episode:
     title: str | None = None
     started_at: datetime | None = None
     ended_at: datetime | None = None
-    #: Whether this is worth bringing back up later. Recorded, not yet acted on:
-    #: episodes have no decay path today (aging by importance is the intended one,
-    #: left unbuilt until episode volume makes it worth a pass), so nothing reads this.
+    #: Whether this is worth bringing back up later. Extraction currently writes one
+    #: placeholder score for every episode, so fixed age - not this field - controls
+    #: retention until the extractor produces a meaningful importance judgement.
     importance: float = 0.0
     confidence: float = 0.0
     status: str = "active"

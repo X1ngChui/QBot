@@ -33,10 +33,7 @@ from qqbot.db import close_pool, init_pool, pool
 from qqbot.domain.memory import Fact, MemoryType
 from qqbot.gateway.ingest import ingestor
 from qqbot.gateway.onebot import GroupMessage, Sender
-from qqbot.repositories import (
-    EventRepository, IdentityRepository, JobQueue, MemoryRepository,
-)
-from qqbot.repositories.job import JobType
+from qqbot.repositories import EventRepository, IdentityRepository, MemoryRepository
 from qqbot.services import Directory, IdentityResolver, NameTaken, UnknownAccount
 from qqbot.util import now_local
 from _db import reset
@@ -215,13 +212,11 @@ def catalogue() -> None:
           {"/stats", "/groupstats"} <= set(PREFIXES))
     # The memory system writes into a prompt nobody sees, and a wrong record looks exactly
     # like a right one until the bot says something odd - so every store it keeps has a
-    # way to read it, to correct it, and to force a rebuild.
+    # way to read it and to correct it.
     check("every store the bot writes to can be read back",
           {"/card", "/who"} <= set(PREFIXES))
     check("and each has a way to correct it by hand",
           {"/note", "/alias", "/forget"} <= set(PREFIXES))
-    check("and one pass relearns all of it",
-          "/relearn" in set(PREFIXES) and "/recard" not in set(PREFIXES))
     # A wrong merge is the worst thing this system can do to itself, so the undo has to
     # exist as a command rather than as a database session.
     check("a merge can be undone from inside the group",
@@ -241,7 +236,6 @@ def catalogue() -> None:
           all(_resolves(c.name) == c.name and _resolves(c.name + " x") == c.name
               for c in CATALOG),
           str([c.name for c in CATALOG if _resolves(c.name + " x") != c.name]))
-    check("/relearn is not swallowed by /reload", _resolves("/relearn") == "/relearn")
     check("/groupstats is not swallowed by the /stats prefix",
           not "/groupstats".startswith("/stats"))
 
@@ -291,7 +285,7 @@ async def directory_service() -> None:
     mem = MemoryRepository()
     d = Directory(
         identity=IdentityResolver(ids), ids=ids, memory=mem,
-        events=EventRepository(), jobs=JobQueue("test"),
+        events=EventRepository(),
     )
 
     # -- reading ------------------------------------------------------------
@@ -607,17 +601,6 @@ async def directory_service() -> None:
           [c.user_id for c in await d.roster(GROUP)] == order)
     check("the bot's own account can be left out",
           "m1" not in [c.user_id for c in await d.roster(GROUP, exclude={"m1"})])
-
-    # -- relearn ------------------------------------------------------------
-    # Queued rather than run: it is a paid model call, and a handler waiting on one stays
-    # open long enough for the platform to time the reply out.
-    job_id = await d.relearn(GROUP)
-    claimed = await JobQueue("test-worker").claim()
-    check("relearn queues an extraction job for this group",
-          claimed is not None and claimed.id == job_id
-          and claimed.job_type is JobType.EXTRACT_MEMORY
-          and claimed.payload["group_id"] == GROUP,
-          str(claimed))
 
 
 async def main():

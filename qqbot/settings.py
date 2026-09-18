@@ -368,8 +368,7 @@ class MemoryCfg(_M):
     is already being read, so edits here apply at the next restart.
     """
 
-    #: Messages one extraction chunk holds at most. /relearn's watermark reset keeps
-    #: exactly this many unread, so the two move together.
+    #: Messages one extraction chunk holds at most.
     extract_window: int = Field(120, ge=10)
     #: A full chunk is trimmed back to the last conversation gap of at least this
     #: long in its tail half, so batch boundaries fall where conversations end
@@ -377,8 +376,7 @@ class MemoryCfg(_M):
     #: half-known ones.
     batch_gap_min: int = Field(30, ge=1)
     #: Below this many unread messages a drain does not bother: a pass pays for the
-    #: rules, the schemas and the known facts before reading a line. /relearn forces
-    #: past it.
+    #: rules, the schemas and the known facts before reading a line.
     drain_floor: int = Field(20, ge=0)
     #: Passes one nightly drain may run. It can bind before the budget does; a group
     #: sustaining more than this every day has outgrown the memory budget itself, and
@@ -387,6 +385,10 @@ class MemoryCfg(_M):
     #: How many already-recorded episodes the extractor is reminded of, so it
     #: recognises a conversation it has already written down.
     known_episodes: int = Field(8, ge=0)
+    #: How long an episode remains available to semantic recall. Importance is not a
+    #: lifetime signal yet: extraction writes the same placeholder score on every episode,
+    #: so retention stays a plain age until that score has real meaning.
+    episode_ttl_days: float = Field(90.0, gt=0)
     #: How long a name the model merely guessed at survives without being used again,
     #: and how long one it marked as a joke does. Most jokes are true for an afternoon.
     alias_unused_days: float = Field(30.0, gt=0)

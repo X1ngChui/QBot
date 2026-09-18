@@ -23,11 +23,9 @@ from ..domain.identity import (ALIAS_MAX_CHARS, Alias, AliasEvidence, AliasType,
                                EvidenceType, normalize)
 from ..domain.memory import Fact, MemoryType
 from ..repositories import (
-    EventRepository, IdentityRepository, JobQueue, MemoryRepository,
+    EventRepository, IdentityRepository, MemoryRepository,
 )
 from ..db import repo as db_repo
-from ..repositories.job import JobType
-from ..settings import config
 from ..util import now_local
 from .context_builder import NOTE, render_fact
 from .identity_resolver import IdentityResolver, UnknownAccount
@@ -218,9 +216,8 @@ class Directory:
         ids: IdentityRepository,
         memory: MemoryRepository,
         events: EventRepository,
-        jobs: JobQueue,
     ) -> None:
-        """Every collaborator is required, `jobs` included.
+        """Every collaborator is required.
 
         No optional collaborators backed by runtime None-checks: a check that fires at
         the moment somebody uses the feature is a check that ships broken. Required, a
@@ -230,7 +227,6 @@ class Directory:
         self._ids = ids
         self._memory = memory
         self._events = events
-        self._jobs = jobs
 
     # -- reads ------------------------------------------------------------
     async def roster(
@@ -563,42 +559,6 @@ class Directory:
         if len(await self._ids.accounts_of(acc.entity_id)) < 2:
             raise NotMerged(user_id)
         return await self._identity.split(user_id)
-
-    async def relearn(self, group_id: int) -> uuid.UUID | None:
-        """Ask for an extraction pass now instead of at the next batch boundary.
-
-        The watermark is reset first, because the worker refuses to pay for a batch
-        nobody has added to since the last pass - correct for every automatic trigger,
-        and exactly wrong for an owner explicitly asking for a re-read. Resetting makes
-        the recent window count as unread again, so whichever queued job runs (this one,
-        or a pending duplicate that swallowed it) does the work.
-
-        Queued rather than run inline: it is a paid model call, and a command that waits
-        on one holds the handler open long enough for QQ to time the reply out. The
-        worker reports what it found through the ordinary path.
-        """
-        # Pull back exactly one window, and force past the drain floor: an owner
-        # asking for a re-read gets one however few messages there are.
-        await db_repo.reset_extract_watermark(
-            group_id, keep=config().default.memory.extract_window)
-        jid = await self._jobs.submit(
-            JobType.EXTRACT_MEMORY, {"group_id": group_id, "force": True}, priority=2
-        )
-        if jid is None:
-            # A pending twin (the nightly job, or one in retry backoff) swallowed
-            # the submit - and with it the force flag, which must reach whichever
-            # job actually runs: without it a group under the drain floor answers
-            # the owner's explicit /relearn with "not worth a pass".
-            amended = await self._jobs.amend_pending(
-                JobType.EXTRACT_MEMORY, group_id, {"force": True})
-            if not amended:
-                # The twin was claimed between the collision and the amend, so it
-                # runs with whatever payload it had. It is no longer pending, so a
-                # fresh submit is legal - the dedup index covers pending rows only.
-                jid = await self._jobs.submit(
-                    JobType.EXTRACT_MEMORY, {"group_id": group_id, "force": True},
-                    priority=2)
-        return jid
 
     async def _display_of(self, group_id: int, entity_id: uuid.UUID, *,
                           excluding: str = "") -> str:

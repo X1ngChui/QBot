@@ -51,10 +51,8 @@ class JobQueue:
         """Queue one job. Returns None when an identical job is already pending.
 
         Deduplicated by a partial unique index on (job_type, group) over pending rows:
-        the same work queued twice is the same work, and the callers that can collide -
-        the nightly drain and an owner's /relearn, or a /relearn against a job still in
-        retry backoff - are exactly the ones that must not pay twice. The collapsed
-        caller's extra payload travels via amend_pending below.
+        the same work queued twice is the same work, so concurrent schedulers or a retry
+        cannot buy the same operation twice.
         """
         return await pool().fetchval(
             """INSERT INTO memory_job (job_type, payload, priority, available_at)
@@ -63,23 +61,6 @@ class JobQueue:
                RETURNING id""",
             job_type.value, payload, priority, delay or timedelta(0),
         )
-
-    async def amend_pending(self, job_type: JobType, group_id: int,
-                            patch: dict) -> bool:
-        """Merge extra payload into an already-pending twin.
-
-        For the caller whose submit was collapsed by the dedup index but whose
-        payload carried more than the twin's - /relearn's force flag must reach
-        whichever job actually runs, or the owner's explicit ask silently degrades
-        into the ordinary drain the pending job was queued for.
-        """
-        tag = await pool().execute(
-            """UPDATE memory_job SET payload = payload || $3::jsonb
-                WHERE status='pending' AND job_type=$1
-                  AND payload->>'group_id' = $2""",
-            job_type.value, str(group_id), patch,
-        )
-        return tag.endswith(" 1")
 
     async def claim(self, *, lease: timedelta = timedelta(minutes=10)) -> Job | None:
         """Take one job.

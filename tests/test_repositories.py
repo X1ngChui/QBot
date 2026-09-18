@@ -197,7 +197,8 @@ async def main() -> int:
     v1[0] = 1.0
     v2 = [0.0] * 2048
     v2[1] = 1.0
-    await vec.put(group_id=GROUP_A, object_type="episode", object_id=ep.id, embedding=v1)
+    check("活动事件可安全写入向量",
+          await vec.put_episode(group_id=GROUP_A, episode_id=ep.id, embedding=v1))
     near = await vec.search(group_id=GROUP_A, object_type="episode", embedding=v1)
     check("向量查得回自己", len(near) == 1 and near[0][0] == ep.id)
     far = await vec.search(group_id=GROUP_A, object_type="episode", embedding=v2)
@@ -211,6 +212,50 @@ async def main() -> int:
     check("能问出哪些事件还没算向量", [t[0] for t in todo] == [ep2.id], str(todo))
     check("换嵌入模型后旧向量不算数，全部待补",
           len(await VectorRepository("new-embed", 1).unembedded_episodes(GROUP_A)) == 2)
+
+    old = Episode(
+        group_id=GROUP_A,
+        summary="很久以前讨论过旧设备",
+        started_at=now - dt.timedelta(days=120),
+        ended_at=now - dt.timedelta(days=120),
+        participants=(Participant(entity_id=acc.entity_id),),
+        event_ids=(ev_id,),
+    )
+    await eps.add(old)
+    old_model = VectorRepository("old-embed", 1)
+    check("旧事件在过期前仍可建立所有模型的投影",
+          await vec.put_episode(group_id=GROUP_A, episode_id=old.id, embedding=v1)
+          and await old_model.put_episode(
+              group_id=GROUP_A, episode_id=old.id, embedding=v2))
+    check("别的群的衰减不碰它", await eps.decay(GROUP_B, ttl_days=90) == 0)
+    check("超过保留期的事件会退出活动记忆",
+          await eps.decay(GROUP_A, ttl_days=90) == 1)
+    old_row = await pool().fetchrow(
+        "SELECT status, revision FROM episode WHERE id=$1", old.id)
+    check("过期留下状态和修订记录",
+          old_row["status"] == "expired" and old_row["revision"] == 2,
+          str(dict(old_row)))
+    check("过期事件不再从任何活动读取路径返回",
+          old.id not in {e.id for e in await eps.involving(GROUP_A, acc.entity_id)}
+          and not await eps.by_ids(GROUP_A, [old.id])
+          and not await eps.around(GROUP_A, [old.id], 1))
+    check("过期事件不再等待向量补全",
+          old.id not in {eid for eid, _ in await vec.unembedded_episodes(GROUP_A)})
+    check("过期删除所有模型版本的派生向量",
+          await pool().fetchval(
+              "SELECT count(*) FROM embedding_index WHERE object_id=$1", old.id) == 0)
+    check("但事件参与者和原始证据仍然保留",
+          await pool().fetchval(
+              "SELECT count(*) FROM episode_participant WHERE episode_id=$1", old.id) == 1
+          and await pool().fetchval(
+              "SELECT count(*) FROM episode_event WHERE episode_id=$1", old.id) == 1)
+    check("晚到的嵌入不能复活过期事件向量",
+          not await vec.put_episode(group_id=GROUP_A, episode_id=old.id, embedding=v1)
+          and await pool().fetchval(
+              "SELECT count(*) FROM embedding_index WHERE object_id=$1", old.id) == 0)
+    check("新事件的向量不受旧事件衰减影响",
+          bool(await vec.search(
+              group_id=GROUP_A, object_type="episode", embedding=v1)))
 
     # ---- the job queue ----------------------------------------------------
     q = JobQueue("worker-1")
@@ -267,17 +312,6 @@ async def main() -> int:
     check("and the fresh twin still holds the pending slot",
           await pool().fetchval(
               "SELECT status FROM memory_job WHERE id=$1", twin_id) == "pending")
-
-    # /relearn's force flag must reach whichever job actually runs: a submit
-    # collapsed by the dedup index amends the pending twin instead of vanishing.
-    qa2 = JobQueue("amend")
-    await qa2.submit(JobType.EXTRACT_MEMORY, {"group_id": 77}, priority=9)
-    check("a collapsed submit can amend its pending twin",
-          await qa2.amend_pending(JobType.EXTRACT_MEMORY, 77, {"force": True}))
-    got2 = await qa2.claim()
-    check("and the flag rides the job that runs",
-          got2 is not None and got2.payload.get("force") is True,
-          str(got2 and got2.payload))
 
     await close_pool()
     print()

@@ -152,10 +152,6 @@ CATALOG: tuple[Command, ...] = (
 不带 @ 的群条目操作仍仅限拥有者。
 
 示例：/forget @小明 2""", self_serve=True),
-    Command("/relearn", "立即重新归纳",
-            "归纳通常在每天凌晨集中进行；此指令不等今晚，立即重读本群最近的\n"
-            "聊天记录（至多一窗）归纳一次。消耗模型调用，结果稍后生效，不即时返回。\n\n"
-            "示例：/relearn"),
     # Split because one screen mixing the two reads as if every number were this group's:
     # the budget and the call counts are shared across every group, while the spend and the
     # mute switch belong to this one alone.

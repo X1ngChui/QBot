@@ -222,18 +222,6 @@ async def main():
     n4, _ = await EventRepository().unread_since_extract(G3)
     check("and it never moves backwards", n4 == 0, str(n4))
 
-    # ...except for the one sanctioned reset: /relearn means "read it again", and the
-    # gate answering "nothing new" to that request would be the gate malfunctioning.
-    # The reset pulls back exactly one window and no further - extraction drains
-    # oldest-first from the watermark now, and a bare NULL would send the next
-    # drain through the entire archive at model prices.
-    from qqbot.settings import config as _cfgw
-    _EW = _cfgw().default.memory.extract_window
-    await repo.reset_extract_watermark(G3, keep=_EW)
-    n5, _ = await EventRepository().unread_since_extract(G3)
-    check("a reset makes the window count as unread again", n5 == 4, str(n5))
-    await repo.mark_extracted(G3, newest)
-
     # -- cost ledger --------------------------------------------------------
     day = today_local()
     await repo.ledger_add(group_id=str(G1), kind="reply", model="deepseek-v4-flash",

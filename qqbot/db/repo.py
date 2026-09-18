@@ -380,35 +380,6 @@ async def mark_extracted(group_id: int, upto) -> None:
     )
 
 
-async def reset_extract_watermark(group_id: int, *, keep: int) -> None:
-    """Pull the watermark back so exactly the newest `keep` messages count unread.
-
-    The deliberate exception to mark_extracted's never-backwards rule, in its own
-    function so the exception cannot be reached by accident: only /relearn calls it,
-    and /relearn's whole meaning is "read it again" - a gate that answers "nothing
-    new" to an owner asking for a re-read is the gate malfunctioning.
-
-    Pulled back *this far and no further*, because extraction now drains oldest-
-    first from the watermark: a bare NULL here would send the next drain through
-    the entire archive - a re-read of months at model prices, from one command.
-
-    Known, accepted race: a drain pass already in flight marks forward (GREATEST)
-    after this reset and re-advances the watermark, shrinking what the forced
-    re-read sees. Only reachable when /relearn lands mid-drain (around the
-    nightly cron or a retry window); the owner's remedy is the command again.
-    """
-    await pool().execute(
-        """UPDATE group_state
-              SET last_extract_at = (
-                      SELECT created_at FROM raw_event
-                       WHERE group_id=$1 AND event_type='message'
-                       ORDER BY created_at DESC OFFSET $2 LIMIT 1),
-                  updated_at = NOW()
-            WHERE group_id=$1""",
-        group_id, keep,
-    )
-
-
 async def note_group_seen(group_id: int) -> bool:
     """Record that this group exists. True only for the call that first saw it.
 

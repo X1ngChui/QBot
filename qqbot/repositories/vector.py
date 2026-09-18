@@ -29,20 +29,35 @@ class VectorRepository:
         self._model = model
         self._version = version
 
-    async def put(
-        self, *, group_id: int | None, object_type: str, object_id: uuid.UUID,
+    async def put_episode(
+        self, *, group_id: int, episode_id: uuid.UUID,
         embedding: Sequence[float],
-    ) -> None:
-        await pool().execute(
-            """INSERT INTO embedding_index
-                   (group_id, object_type, object_id, embedding,
-                    embedding_model, embedding_version)
-               VALUES ($1,$2,$3,$4::vector,$5,$6)
-               ON CONFLICT (object_type, object_id, embedding_model, embedding_version)
-               DO UPDATE SET embedding = EXCLUDED.embedding""",
-            group_id, object_type, object_id, _vec(embedding),
-            self._model, self._version,
-        )
+    ) -> bool:
+        """Index an episode only while it is active.
+
+        The row lock serializes this write with episode decay. If embedding wins, decay
+        deletes the projection after expiring the episode; if decay wins, this returns
+        false without recreating a stale vector.
+        """
+        async with pool().acquire() as conn, conn.transaction():
+            active = await conn.fetchval(
+                """SELECT TRUE FROM episode
+                    WHERE id=$1 AND group_id=$2 AND status='active'
+                    FOR UPDATE""",
+                episode_id, group_id,
+            )
+            if not active:
+                return False
+            await conn.execute(
+                """INSERT INTO embedding_index
+                       (group_id, object_type, object_id, embedding,
+                        embedding_model, embedding_version)
+                   VALUES ($1,'episode',$2,$3::vector,$4,$5)
+                   ON CONFLICT (object_type, object_id, embedding_model, embedding_version)
+                   DO UPDATE SET embedding = EXCLUDED.embedding""",
+                group_id, episode_id, _vec(embedding), self._model, self._version,
+            )
+            return True
 
     async def search(
         self, *, group_id: int, object_type: str, embedding: Sequence[float],

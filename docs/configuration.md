@@ -184,11 +184,12 @@ Restart to apply.
 
 | Key | Meaning |
 | --- | --- |
-| `extract_window` | Messages per extraction chunk; also how far `/relearn` rewinds |
+| `extract_window` | Messages per extraction chunk |
 | `batch_gap_min` | A full chunk is trimmed back to the last conversation gap of at least this many minutes |
 | `drain_floor` | Fewer unread messages than this are left for the next night |
 | `max_passes` | Chunks one nightly drain may process |
 | `known_episodes` | Recorded episodes the extractor is reminded of |
+| `episode_ttl_days` | Age after which an episode leaves semantic recall and loses its rebuildable vectors; provenance remains |
 | `alias_unused_days`, `joke_unused_days` | How long an unconfirmed name, or one marked as a joke, survives unused |
 | `job_lease_min` | How long a claimed job stays claimed |
 

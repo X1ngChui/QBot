@@ -363,8 +363,14 @@ Confidence is a Wilson lower bound over distinct source events, so one mention e
 about 0.27, three about 0.53 and eight about 0.75. Re-confirmation accumulates evidence
 in place. Facts decay by predicate class with half-lives of 90, 30 or 14 days, one
 half-life per supporting event, so what a group repeats stays and a passing remark
-fades. A decayed fact is superseded, never physically deleted; the archive is never
+fades. A decayed fact is expired, never physically deleted; the archive is never
 deleted at all.
+
+Episodes remain available to `recall_events` for `memory.episode_ttl_days` from the
+conversation time. The nightly decay then marks them expired while retaining their
+participant and source-event links. Their embedding rows are derived projections rather
+than evidence, so decay deletes them across model versions; an expired episode cannot be
+returned or re-embedded.
 
 ### Extraction
 
@@ -388,8 +394,7 @@ family, superseded values get a `valid_to`, confidence is recomputed from eviden
 and an incoming confidence only acts as a floor.
 
 The extraction watermark (`group_state.last_extract_at`) records what was actually
-read and never moves backwards. `/relearn` pulls it back exactly one window and forces
-past the drain floor.
+read and never moves backwards.
 
 ### Reply evidence
 

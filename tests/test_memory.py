@@ -182,12 +182,13 @@ async def main():
     await say("u2", "小北", "这个群是做音乐的", "e4")
     await say_at("u2", "小北", "u3", "李芳", "帮忙看看", "e-at")
 
-    w = MemoryWorker(config().default, worker_id="e2e")
-    # The drain floor would skip these four messages (a handful is not worth a
-    # pass); the tests force past it the way /relearn does.
+    threshold_worker = MemoryWorker(config().default, worker_id="floor")
     check("under the drain floor nothing is paid for",
-          await w.extract(G) == 0 and CALLS.count("extract") == 0)
-    n = await w.extract(G, force=True)
+          await threshold_worker.extract(G) == 0 and CALLS.count("extract") == 0)
+    test_cfg = config().default.model_copy(deep=True)
+    test_cfg.memory.drain_floor = 0
+    w = MemoryWorker(test_cfg, worker_id="e2e")
+    n = await w.extract(G)
     # Everything the batch is worth comes out of one call. Four kinds of record used to
     # mean three separate passes over the same transcript, two of which wrote prose.
     check("one call produces every kind of record", n == 6 and CALLS.count("extract") == 1,
@@ -212,15 +213,14 @@ async def main():
 
     # A pass costs a model call, so nothing new means nothing spent. This is the last
     # gate before the money: everything upstream of it sits in front of a queue, where a
-    # retry, a hand-triggered pass or two racing jobs can all arrive with the batch
-    # already read.
+    # retry or two racing jobs can all arrive with the batch already read.
     calls_before = CALLS.count("extract")
     check("a second pass with nothing new does not call the model",
-          await w.extract(G, force=True) == 0
+          await w.extract(G) == 0
           and CALLS.count("extract") == calls_before,
           f"{CALLS.count('extract') - calls_before} call(s)")
 
-    # The conversation partly repeats, and a forced pass runs again - the gate is
+    # The conversation partly repeats, and another pass runs again - the gate is
     # "nothing new", not "already ran once". Re-said because replay is now exact:
     # the batch is these three rows and only these, so a stub quote must actually
     # be in them to survive. The plays line is deliberately NOT re-said - the
@@ -232,7 +232,7 @@ async def main():
     await say("u1", "董自豪", "切片就是把采样切成小段再重排", "e7")
     await say("u2", "小北", "老周你那个切片做完没", "e6")
     await say("u2", "小北", "这个群是做音乐的", "e8")
-    n2 = await w.extract(G, force=True)
+    n2 = await w.extract(G)
     check("but new messages are enough to justify one",
           n2 > 0 and CALLS.count("extract") == calls_before + 1, str(n2))
     for i in range(WINDOW + 5):
@@ -668,17 +668,37 @@ async def main():
     # -- forgetting ----------------------------------------------------------
     # Nothing here is old enough to expire, which is the point: decay must not touch what
     # was just learned.
-    check("a fresh batch survives a decay pass", await w.decay(G) == (0, 0))
+    check("a fresh batch survives a decay pass", await w.decay(G) == (0, 0, 0))
     await pool().execute(
         "UPDATE memory_fact SET last_confirmed_at = NOW() - INTERVAL '400 days' "
         "WHERE group_id=$1", G)
     await pool().execute(
         "UPDATE alias SET last_used_at = NOW() - INTERVAL '400 days' WHERE group_id=$1", G)
-    gone_facts, gone_names = await w.decay(G)
+    await pool().execute(
+        """UPDATE episode
+              SET started_at=NOW() - INTERVAL '100 days',
+                  ended_at=NOW() - INTERVAL '100 days'
+            WHERE id=$1""",
+        ep["id"],
+    )
+    gone_facts, gone_names, gone_episodes = await w.decay(G)
     # Eight names, not three: platform cards now start as candidates until they endure a
     # second day, so a card worn once and never seen again is swept with the guesses.
     check("but what nothing has confirmed for a year is let go",
-          gone_facts == 7 and gone_names == 8, f"{gone_facts} facts, {gone_names} names")
+          gone_facts == 7 and gone_names == 8 and gone_episodes == 1,
+          f"{gone_facts} facts, {gone_names} names, {gone_episodes} episodes")
+    expired_ep = await pool().fetchrow(
+        "SELECT status, revision FROM episode WHERE id=$1", ep["id"])
+    check("an old episode leaves recall without losing its provenance",
+          expired_ep["status"] == "expired" and expired_ep["revision"] == 2
+          and await pool().fetchval(
+              "SELECT count(*) FROM episode_event WHERE episode_id=$1", ep["id"]) == 1
+          and await pool().fetchval(
+              "SELECT count(*) FROM episode_participant WHERE episode_id=$1", ep["id"]) == 2,
+          str(dict(expired_ep)))
+    check("episode decay removes its rebuildable vector",
+          await pool().fetchval(
+              "SELECT count(*) FROM embedding_index WHERE object_id=$1", ep["id"]) == 0)
     # A name that reached confirmed is not a guess any more, so it does not expire with
     # them: three people agreed on it, and their agreeing does not stop being true.
     kept = await pool().fetchval(
@@ -708,20 +728,6 @@ async def main():
     check("at forty days a current-state fact is gone and a stable one holds",
           left == {"plays": "expired", "lives_in": "active"}, str(left))
 
-    # /relearn's contract, last because it dirties the watermark: an owner asking for a
-    # re-read gets one even though nothing is new. The reset is what makes the gate
-    # answer yes; without it the request is silently swallowed by the nothing-unread
-    # skip (a regression this pins).
-    from qqbot.db import repo as _dbrepo
-    await w.extract(G, force=True)   # consume whatever the sections above left unread
-    _calls = CALLS.count("extract")
-    check("with nothing unread a fresh pass still refuses",
-          await w.extract(G, force=True) == 0 and CALLS.count("extract") == _calls)
-    await _dbrepo.reset_extract_watermark(int(G), keep=WINDOW)
-    await w.extract(G, force=True)
-    check("after a watermark reset the same window is read again",
-          CALLS.count("extract") >= _calls + 1)
-
     # -- a failed extraction leaves the batch unread --------------------------
     # The watermark lands only after the extractor returns. Moved before the paid
     # call, a timed-out extraction would meet a retry that finds nothing unread,
@@ -737,7 +743,7 @@ async def main():
     set_providers(Providers(text=FailingText(), vision=Unused(), asr=Unused(),
                             embedding=_EMBED, search=Unused()))
     try:
-        await w.extract(G, force=True)
+        await w.extract(G)
         crashed = False
     except RuntimeError:
         crashed = True
@@ -747,7 +753,7 @@ async def main():
           before > 0 and unread == before, f"{unread}/{before}")
     set_providers(Providers(text=FakeText(), vision=Unused(), asr=Unused(),
                             embedding=_EMBED, search=Unused()))
-    n_retry = await w.extract(G, force=True)
+    n_retry = await w.extract(G)
     unread, _ = await EventRepository().unread_since_extract(G)
     check("the retry reads the same batch and the mark then moves",
           n_retry > 0 and unread == 0, f"{n_retry} cands, {unread} unread")
@@ -798,7 +804,7 @@ async def main():
     check("a chunk that is one giant tie is taken whole, not trimmed to nothing",
           len(await w._next_unread(G2)) == WINDOW)
     _calls_t = CALLS.count("extract")
-    await w.extract(G2, force=True)
+    await w.extract(G2)
     unread_t, _ = await EventRepository().unread_since_extract(G2)
     check("and it drains in a single pass with nothing left behind",
           CALLS.count("extract") == _calls_t + 1 and unread_t == 0,
@@ -809,7 +815,7 @@ async def main():
     for i in range(WINDOW + 25):
         await say("t2", "阿强", f"第二天的第 {i} 句", f"d2-{i}", gid=G2)
     _calls_d = CALLS.count("extract")
-    await w.extract(G2, force=True)
+    await w.extract(G2)
     unread_d, _ = await EventRepository().unread_since_extract(G2)
     check("a backlog wider than one window drains in exactly two passes",
           CALLS.count("extract") == _calls_d + 2 and unread_d == 0,
