@@ -68,6 +68,10 @@ def wiring() -> None:
     for mod in ("commands", "tasks"):
         check(f"plugin.py imports plugins.{mod}, which is what registers it",
               mod in imported, str(sorted(imported)))
+    check("plugin registers and handles NapCat self-message events",
+          "Adapter.add_custom_model(NapCatGroupMessageSentEvent)" in src
+          and 'on("message_sent"' in src
+          and "event: NapCatGroupMessageSentEvent" in src)
 
 
 def _commands_source():

@@ -14,8 +14,8 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from nonebot import get_driver, on_message, on_notice, require
-from nonebot.adapters.onebot.v11 import Bot, GroupMessageEvent, NoticeEvent
+from nonebot import get_driver, on, on_message, on_notice, require
+from nonebot.adapters.onebot.v11 import Adapter, Bot, GroupMessageEvent, NoticeEvent
 from nonebot.plugin import PluginMetadata
 
 require("nonebot_plugin_apscheduler")
@@ -25,6 +25,7 @@ require("nonebot_plugin_apscheduler")
 from . import util
 from .core import errors, nickname
 from .core.pipeline import GATEWAY
+from .gateway.onebot import NapCatGroupMessageSentEvent
 from .core.media import MEDIA
 from .db import close_pool, init_pool
 from .workers import MemoryWorker
@@ -45,6 +46,12 @@ __plugin_meta__ = PluginMetadata(
 
 log = logging.getLogger("qqbot")
 driver = get_driver()
+
+# NapCat reports the account's own messages under the extension post_type
+# "message_sent". Register its full group-message shape before the reverse WebSocket
+# connects; otherwise the adapter falls back to a generic Event whose get_message()
+# deliberately raises and which on_message does not match.
+Adapter.add_custom_model(NapCatGroupMessageSentEvent)
 
 _worker_task: asyncio.Task | None = None
 
@@ -112,6 +119,17 @@ group_message = on_message(priority=10, block=False)
 
 @group_message.handle()
 async def _(bot: Bot, event: GroupMessageEvent) -> None:
+    await GATEWAY.handle(bot, event)
+
+
+# Self-authored messages are observations, not ordinary inbound commands. They use a
+# distinct matcher type because NoneBot's on_message matcher accepts only post_type
+# "message"; both routes converge immediately on the same gateway.
+group_message_sent = on("message_sent", priority=10, block=False)
+
+
+@group_message_sent.handle()
+async def _(bot: Bot, event: NapCatGroupMessageSentEvent) -> None:
     await GATEWAY.handle(bot, event)
 
 

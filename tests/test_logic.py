@@ -486,7 +486,10 @@ _util._TZ = _saved_tz
 # leave at the envelope: the rendered text through defang, the verbatim segments
 # through the event parser. Before this, one stray NUL cost the whole message its
 # place in the archive (three times in a month).
-from qqbot.gateway.onebot import GroupMessage as _GM
+from qqbot.gateway.onebot import (
+    GroupMessage as _GM,
+    NapCatGroupMessageSentEvent as _SentEvent,
+)
 check("defang drops NUL", _util.defang("a\x00b⟦c⟧") == "ab[c]", repr(_util.defang("a\x00b")))
 check("scrub_nul walks a nested structure",
       _util.scrub_nul({"a": ["x\x00", {"b": "\x00y"}], "n": 3})
@@ -540,6 +543,24 @@ check("top-level authorship classifies a reported self message",
       and _self_gm.sender.user_id == "999", repr(_self_gm))
 check("nested sender metadata cannot fabricate self authorship",
       _gm.author_kind is _EnvelopeAuthor.MEMBER and _gm.sender.user_id == "10001")
+_sent_event = _SentEvent.model_validate({
+    "time": 1789923561,
+    "self_id": 999,
+    "post_type": "message_sent",
+    "user_id": 999,
+    "message_type": "group",
+    "sub_type": "normal",
+    "message_id": 625907631,
+    "group_id": 12345,
+    "message": [{"type": "dice", "data": {"result": "2"}}],
+    "raw_message": "[CQ:dice,result=2]",
+    "font": 14,
+    "sender": {"user_id": 999, "nickname": "小X", "role": "member"},
+})
+_sent_gm = _GM.from_event(_sent_event, "999")
+check("NapCat message_sent keeps the ordinary group-message interface",
+      _sent_gm.author_kind is _EnvelopeAuthor.BOT
+      and _sent_gm.segments == [{"type": "dice", "data": {"result": "2"}}])
 
 # The per-line cut never leaves a marker half open: an unbalanced bracket in the
 # window is the one thing defang rules out everywhere else.

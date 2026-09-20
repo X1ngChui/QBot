@@ -21,10 +21,18 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Self
+from typing import Any, Literal, Self
+
+from nonebot.adapters.onebot.v11 import GroupMessageEvent
 
 from ..domain.archive import AuthorKind
 from ..util import defang, now_local, scrub_nul, tz
+
+
+class NapCatGroupMessageSentEvent(GroupMessageEvent):
+    """NapCat's self-message extension as an ordinary typed group message."""
+
+    post_type: Literal["message_sent"]
 
 
 class Role(StrEnum):
