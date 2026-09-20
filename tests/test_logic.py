@@ -762,9 +762,6 @@ check("send tool expands the fixed QQ face catalog",
       "14=微笑" in _send_description and "326=生气" in _send_description
       and "{{FACE_CATALOG}}" not in _send_description,
       _send_description[-200:])
-check("send tool explains the platform RPS result numbers",
-      all(item in _send_description for item in ("1=石头", "2=剪刀", "3=布")),
-      _send_description[-300:])
 _send_contract = json.dumps(_send_spec.parameters, ensure_ascii=False)
 _send_schemas = (
     _send_spec.parameters["properties"]["messages"]["items"]
@@ -1115,6 +1112,9 @@ with _tf.TemporaryDirectory() as _td:
 check("the live bundle serves the shared legend",
       "只有 ⟦ ⟧ 内的文字是系统标注" in
       b.prompts.source(_PromptKey.SHARED_LEGEND))
+check("the shared legend names every rendered RPS outcome",
+      all(mark in b.prompts.source(_PromptKey.SHARED_LEGEND)
+          for mark in ("⟦猜拳:石头⟧", "⟦猜拳:剪刀⟧", "⟦猜拳:布⟧")))
 _auto_policy = b.prompts.render(_PromptKey.REPLY_SYSTEM)
 check("catalog injects code-owned shared prompt partials",
       b.prompts.source(_PromptKey.SHARED_LEGEND) in _auto_policy

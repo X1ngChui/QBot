@@ -30,7 +30,7 @@ from .archive import archive_author, archive_mentions, archive_sender, archive_t
 from .botapi import BotApi
 from .media import MEDIA
 from .member_numbers import BOT_DISPLAY_NUMBER, MemberNumbers
-from .segments import FACE_NAMES, RPS_NAMES, number_at_mentions
+from .segments import FACE_NAMES, number_at_mentions
 
 log = logging.getLogger("qqbot.tools")
 
@@ -66,9 +66,6 @@ def _tool(
         settings = cfg or config().default
         values["face_catalog"] = "、".join(
             f"{face_id}={label}" for face_id, label in FACE_NAMES.items()
-        )
-        values["rps_result_map"] = "、".join(
-            f"{result}={name}" for result, name in RPS_NAMES.items()
         )
         values["message_limit"] = str(
             settings.tools.send_messages.max_messages_per_call

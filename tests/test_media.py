@@ -154,8 +154,10 @@ async def main():
     check("an unlisted one degrades to the bare marker",
           one({"type": "face", "data": {"id": "99999", "raw": {}}}) == "⟦表情⟧")
     check("dice shows the roll", one({"type": "dice", "data": {"result": "4"}}) == "⟦骰子:4点⟧")
-    check("rps maps 2 to scissors, not paper",
-          one({"type": "rps", "data": {"result": "2"}}) == "⟦猜拳:剪刀⟧")
+    check("rps maps QQ package order to paper, scissors, rock",
+          one({"type": "rps", "data": {"result": "1"}}) == "⟦猜拳:布⟧"
+          and one({"type": "rps", "data": {"result": "2"}}) == "⟦猜拳:剪刀⟧"
+          and one({"type": "rps", "data": {"result": "3"}}) == "⟦猜拳:石头⟧")
     # QQ keeps inventing segment types. Saying something beats dropping the message, and
     # the log line is how the next one gets noticed instead of silently vanishing.
     check("an unknown type still says something",

@@ -325,9 +325,8 @@ FACE_NAMES = {
     "324": "吃糖", "325": "惊吓", "326": "生气",
 }
 
-#: rps result is 1-3 for rock, scissors, paper - in that order, which is not the order the
-#: name suggests.
-RPS_NAMES = {"1": "石头", "2": "剪刀", "3": "布"}
+#: NapCat result ids follow QQ's package order: paper, scissors, rock.
+RPS_NAMES = {"1": "布", "2": "剪刀", "3": "石头"}
 
 _MD_IMAGE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 _MD_LINK = re.compile(r"\[([^\]]*)\]\([^)]*\)")
