@@ -762,6 +762,9 @@ check("send tool expands the fixed QQ face catalog",
       "14=微笑" in _send_description and "326=生气" in _send_description
       and "{{FACE_CATALOG}}" not in _send_description,
       _send_description[-200:])
+check("send tool explains the platform RPS result numbers",
+      all(item in _send_description for item in ("1=石头", "2=剪刀", "3=布")),
+      _send_description[-300:])
 _send_contract = json.dumps(_send_spec.parameters, ensure_ascii=False)
 _send_schemas = (
     _send_spec.parameters["properties"]["messages"]["items"]

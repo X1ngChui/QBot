@@ -334,7 +334,7 @@ templates:
     - reply：引用一条发言，line 必须是本次提示中该行开头的 #N；行号只属于本回复窗口。
     - face：QQ 系统表情。id 只从下面的固定目录中选择；没有合适的就用 text 表达，不要猜目录外的 ID。
       {{face_catalog}}
-    - dice、rps：分别发送随机骰子和猜拳表情，data 为空对象。
+    - dice、rps：分别发送随机骰子和猜拳表情，data 为空对象。rps 的平台结果编号固定为 {{rps_result_map}}。
     - contact_member：推荐一位成员，member 同样是该成员名字后的 ⟦N⟧。
     - contact_group：推荐当前群，data 为空对象。
 

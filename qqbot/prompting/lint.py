@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..core.segments import FACE_NAMES
+from ..core.segments import FACE_NAMES, RPS_NAMES
 from ..core.tools import send_def, tool_defs
 from ..services.memory_extractor import tools as extraction_tools
 from ..settings import Settings
@@ -61,8 +61,14 @@ def lint_catalog(catalog: PromptCatalog, cfg: Settings) -> list[str]:
             f"{face_id}={label}" for face_id, label in FACE_NAMES.items()
         ),
         message_limit=str(cfg.tools.send_messages.max_messages_per_call),
+        rps_result_map="、".join(
+            f"{result}={name}" for result, name in RPS_NAMES.items()
+        ),
     )
-    if "{{face_catalog}}" in rendered_send or "{{message_limit}}" in rendered_send:
+    if any(
+        slot in rendered_send
+        for slot in ("{{face_catalog}}", "{{message_limit}}", "{{rps_result_map}}")
+    ):
         errors.append("tool_send_messages left a dynamic slot unresolved")
     hidden_segments = ("music", "music_custom", "json")
     exposed_hidden = [name for name in hidden_segments if name in rendered_send]
@@ -78,6 +84,10 @@ def lint_catalog(catalog: PromptCatalog, cfg: Settings) -> list[str]:
         errors.append("tool_send_messages does not state the standalone segment rule")
     if not all(f"{face_id}={label}" in rendered_send for face_id, label in FACE_NAMES.items()):
         errors.append("tool_send_messages does not expose the complete fixed face catalog")
+    if not all(
+        f"{result}={name}" in rendered_send for result, name in RPS_NAMES.items()
+    ):
+        errors.append("tool_send_messages does not expose the complete RPS result map")
 
     reply_names = {tool.name for tool in tool_defs(cfg)}
     if reply_names != {

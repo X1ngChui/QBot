@@ -168,7 +168,11 @@ _SPECS = (
         PromptKey.TOOL_SEND_MESSAGES,
         PromptRole.TOOL,
         ReloadScope.RELOADABLE,
-        (_slot("face_catalog"), _slot("message_limit")),
+        (
+            _slot("face_catalog"),
+            _slot("message_limit"),
+            _slot("rps_result_map"),
+        ),
     ),
 )
 
