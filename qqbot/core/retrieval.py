@@ -24,7 +24,7 @@ import logging
 from datetime import UTC, datetime
 
 from ..db import pool
-from ..settings import RetrievalCfg, config
+from ..settings import RecallEventsToolCfg, config
 from ..util import defang, merge_overlapping, sysmark
 from ..repositories import (
     EpisodeRepository, EventRepository, IdentityRepository, MemoryRepository,
@@ -183,7 +183,7 @@ def _retriever() -> Retriever:
 
 
 async def episode_lookup(group_id: str, question: str,
-                         rcfg: RetrievalCfg | None = None) -> str:
+                         rcfg: RecallEventsToolCfg | None = None) -> str:
     """Episodic memory searched on demand, rendered. "" when nothing is close.
 
     On demand is the only way the past reaches a reply: a block pushed per turn
@@ -194,7 +194,7 @@ async def episode_lookup(group_id: str, question: str,
     about people the current turn does not contain.
 
     Each recalled episode comes framed by its neighbours in group time
-    (retrieval.episode_context each way): an episode summarises one stretch of
+    (tools.recall_events.context_episodes each way): an episode summarises one stretch of
     conversation, and what led to it or came of it is usually the adjacent
     stretch. Touching windows merge into one block, blocks are separated by an
     ellipsis line, and an undated episode stands alone.
@@ -209,7 +209,7 @@ async def episode_lookup(group_id: str, question: str,
         return (f"{sysmark(f'{e.started_at:%m-%d}')} {defang(e.summary)}"
                 if e.started_at else f"- {defang(e.summary)}")
 
-    ctx = max(0, (rcfg or config().default.retrieval).episode_context)
+    ctx = (rcfg or config().default.tools.recall_events).context_episodes
     windows = (await EpisodeRepository().around(
         int(group_id), [e.id for e in eps], ctx)) if ctx else {}
     if not windows:

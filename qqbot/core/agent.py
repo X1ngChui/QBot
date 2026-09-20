@@ -60,12 +60,12 @@ OVERFLOW_NOTE = (
 REPEAT_NOTE = "（这个查询刚执行过，结果就在上面。换个检索词，或用已有结果。）"
 WRAP_UP_NOTE = (
     "（本次回复的额度已用完，不能再执行任何检索或查看；"
-    "请只依据上文已有的材料，直接用 send_message 发出回复，"
+    "请只依据上文已有的材料，直接用 send_messages 发出回复，"
     "不要提及额度或系统限制。）"
 )
-SEND_UNREADABLE_NOTE = "（send_message 的参数无法解析，没有发出。请重新调用。）"
-SEND_EMPTY_NOTE = "（send_message 没有可发送的内容，没有发出。请重新调用。）"
-SEND_INVALID_NOTE = "（send_message 含有无效的消息段或编号，没有发出。请修正后重新调用。）"
+SEND_UNREADABLE_NOTE = "（send_messages 的参数无法解析，没有发出。请重新调用。）"
+SEND_EMPTY_NOTE = "（send_messages 没有可发送的内容，没有发出。请重新调用。）"
+SEND_INVALID_NOTE = "（send_messages 含有无效的消息段或编号，没有发出。请修正后重新调用。）"
 MAX_AT = 5
 MAX_SEGMENTS = 32
 MAX_JSON_CHARS = 16_384
@@ -358,7 +358,7 @@ class AgentRun:
                 people=self._people,
                 lines=self._lines,
                 group_id=self._state.group_id,
-                max_messages=self._cfg.gateway.max_messages_per_reply,
+                max_messages=self._cfg.tools.send_messages.max_messages_per_call,
             )
             if reply is not None:
                 if len(turn.tool_calls) > 1:
@@ -378,7 +378,7 @@ class AgentRun:
         send_notes: dict[ToolCallId, str],
         spend: Scope,
     ) -> tuple[tuple[ToolResult, ...], bool]:
-        cap = self._cfg.retrieval.max_tool_calls_per_round
+        cap = self._cfg.tools.max_calls_per_round
         quota_hit = asyncio.Event()
         if spend.exhausted:
             quota_hit.set()
@@ -481,7 +481,7 @@ class AgentRun:
         with BUDGET.scope(self._cfg.budget.per_reply_cny) as spend:
             async with self._model.open_session(self._request) as session:
                 turn = await session.start()
-                for round_no in range(self._cfg.retrieval.max_rounds):
+                for round_no in range(self._cfg.tools.max_rounds):
                     self._capture(round_no, turn)
                     if not turn.tool_calls:
                         if turn.text.strip():
@@ -542,7 +542,7 @@ class AgentRun:
             "group %s: %d tool rounds without running out of money - a backend "
             "is billing zero; giving up",
             self._state.group_id,
-            self._cfg.retrieval.max_rounds,
+            self._cfg.tools.max_rounds,
         )
         return self._finish(None)
 

@@ -26,6 +26,7 @@ from qqbot.db import init_pool, close_pool, pool
 from qqbot.db import repo
 from qqbot.gateway.ingest import ingestor
 from qqbot.repositories.event import EventRepository
+from qqbot.domain.archive import AuthorKind
 from qqbot.gateway.onebot import GroupMessage, Sender
 from qqbot.util import now_local, today_local
 from _db import reset
@@ -252,6 +253,7 @@ async def main():
 
     _os.environ.setdefault("SEARCH_API_KEY", "tvly-test-key")
     scfg = _config().default.capabilities.search.model_copy(deep=True)
+    search_options = _config().default.tools.web_search.model_copy(deep=True)
     seen_reqs = []
 
     def _fake_tavily(req):
@@ -269,7 +271,7 @@ async def main():
     ts._id = (scfg.timeout_sec, scfg.proxy)   # what _http() keys the cached client on
 
     spent_before = await repo.day_cost(day)
-    items = await ts.search("天气 上海", cfg=scfg, group_id=str(G1))
+    items = await ts.search("天气 上海", cfg=scfg, options=search_options, group_id=str(G1))
     req = seen_reqs[0]
     check("the request carries the key and the query",
           req.headers.get("authorization", "").startswith("Bearer tvly-")
@@ -285,7 +287,7 @@ async def main():
 
     scfg.monthly_quota = 1
     try:
-        await ts.search("再来一次", cfg=scfg, group_id=str(G1))
+        await ts.search("再来一次", cfg=scfg, options=search_options, group_id=str(G1))
         check("at the allowance the backend refuses", False, "it searched")
     except QuotaExhausted:
         check("at the allowance the backend refuses", True)
@@ -295,10 +297,10 @@ async def main():
     # the vendor counts - metered by calls, the real 1000 would be gone at ~500
     # while the meter read half-full, and every search past that would fail as a
     # transport error instead of the clean quota silence.
-    scfg.depth = "advanced"
+    search_options.depth = "advanced"
     scfg.monthly_quota = 2
     try:
-        await ts.search("只剩一个 credit", cfg=scfg, group_id=str(G1))
+        await ts.search("只剩一个 credit", cfg=scfg, options=search_options, group_id=str(G1))
         check("an advanced search is refused when only one credit remains", False,
               "it searched")
     except QuotaExhausted:
@@ -306,7 +308,7 @@ async def main():
     check("credit-aware refusal never reaches the vendor", len(seen_reqs) == 1)
 
     scfg.monthly_quota = 100
-    await ts.search("深度搜一次", cfg=scfg, group_id=str(G1))
+    await ts.search("深度搜一次", cfg=scfg, options=search_options, group_id=str(G1))
     check("an advanced search books two credits",
           await repo.month_calls("search", "tavily") == 3,
           str(await repo.month_calls("search", "tavily")))
@@ -454,8 +456,13 @@ async def main():
 
     await say(G1, "u1", "阿强", "昨天的图在这 https://x.example/cat.jpg")
     await say(G1, "u2", "阿花", "收到了")
-    await _ing().record_own_reply(group_id=G1, self_id="999", message_id="bot-r1",
-                                  text="我也看看", at=now_local(), name="小X")
+    await _ing().ingest(GroupMessage(
+        message_id="bot-r1", group_id=G1,
+        sender=Sender(user_id="999", nickname="小X"),
+        segments=[{"type": "text", "data": {"text": "我也看看"}}],
+        self_id="999", occurred_at=now_local(), plain_text="我也看看",
+        outbound_schema=1, author_kind=AuthorKind.BOT,
+    ))
 
     rows = await repo.recent_messages(G1, limit=50)
     _stamps = [r["occurred_at"] for r in rows]
@@ -479,25 +486,8 @@ async def main():
     await st.load_history(self_id="999", owners=set())
     check("loading twice does not double the window", len(st.recent) == n_before)
 
-    # Console output is on the record too: a /who card the model never saw made
-    # the very next question about it unanswerable - the one speaker in the room
-    # whose words vanished.
-    from qqbot.core.pipeline import note_console_reply
-    from qqbot.core.state import REGISTRY as _REG
-
-    _REG._groups[str(G1)] = st
-    await note_console_reply(group_id=G1, self_id="999",
-                             text="阿强：住在苏州；备注：只在周末上线", name="小X")
-    check("a command answer lands in the window as the bot's own line",
-          any(m.text.startswith("阿强：住在苏州") and m.is_bot for m in st.recent))
-    st_rebuilt = GroupState(group_id=str(G1))
-    await st_rebuilt.load_history(self_id="999", owners=set())
-    check("and survives into a rebuilt window",
-          any(m.text.startswith("阿强：住在苏州") and m.is_bot
-              for m in st_rebuilt.recent))
-    # A line that reached the window before the first chat message (a command's
-    # answer after a deploy) must not stand in for the whole archive: the rebuild
-    # merges behind it rather than skipping.
+    # A line that reached the window before the first chat message must not stand in
+    # for the whole archive: the rebuild merges behind it rather than skipping.
     from qqbot.core.state import ChatMsg as _CMsg
     st_early = GroupState(group_id=str(G1))
     st_early.add(_CMsg(msg_id="cmd-early", user_id="999", nickname="小X",
@@ -509,7 +499,6 @@ async def main():
           str(len(_ids_early)))
     check("and the early line stays newest, after the archived ones",
           _ids_early[-1] == "cmd-early")
-    _REG._groups.pop(str(G1), None)
 
     # -- the archive, searched ----------------------------------------------
     # The pull half of context: the prompt pushes a fixed window, and everything behind
@@ -530,7 +519,7 @@ async def main():
     # -- hits wrapped in their surroundings ----------------------------------
     # Chat is fragments: the line after the link is part of the story. Close
     # hits merge into one block; far-apart hits stay apart with an ellipsis
-    # line between them, and the window is exactly history_context each way.
+    # line between them, and the window is exactly context_lines each way.
     check("a hit carries the lines around it",
           "收到了" in hit and "我也看看" in hit, hit)
     await say(G1, "u1", "阿强", "上次说的螺丝刀在哪")
@@ -547,11 +536,11 @@ async def main():
     one = await search_history(G1, "麻辣香锅")
     check("adjacent hits merge into one block", "……" not in one
           and "麻辣香锅怎么样" in one and "麻辣香锅可以" in one, one)
-    _rcfg = _config().default.retrieval
-    _saved_ctx = _rcfg.history_context
-    _rcfg.history_context = 0
+    _rcfg = _config().default.tools.search_history
+    _saved_ctx = _rcfg.context_lines
+    _rcfg.context_lines = 0
     bare = await search_history(G1, "cat.jpg")
-    check("history_context 0 restores bare hits",
+    check("context_lines 0 restores bare hits",
           "cat.jpg" in bare and "收到了" not in bare, bare)
 
     # -- boolean queries ------------------------------------------------------
@@ -585,7 +574,7 @@ async def main():
           "检索式有误" in await search_history(G1, "(("))
     check("lucene features outside the boolean subset are refused in words",
           "检索式有误" in await search_history(G1, "标签:值"))
-    _rcfg.history_context = _saved_ctx
+    _rcfg.context_lines = _saved_ctx
 
     # -- schema self-check ---------------------------------------------------
     await repo.ensure_schema()

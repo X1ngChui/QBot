@@ -75,19 +75,43 @@ migration directly: `llm` → `capabilities`, `backend` → `provider`, `base_ur
 
 ### `gateway`
 
-All gateway controls are global.
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `dedup_ttl_sec` | 300 | Seconds a received event ID remains in the live replay filter |
+| `shutdown_wait_sec` | 5 | Seconds shutdown waits for in-flight archive and media writes |
+
+### `media`
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `dedup_ttl_sec` | 300 | How long a platform message id is remembered for deduplication |
-| `max_msg_len` | 2000 | Longest text content in each QQ message |
-| `max_messages_per_reply` | 4 | Independent QQ messages allowed in one terminal `send_message` call; delivered in order |
-| `media_wait_sec` | 25 | How long a reply waits for a picture or clip to be understood before building the prompt without it |
-| `member_cache_ttl_sec` | 1800 | How long a fetched member list is reused |
-| `protocol_call_timeout_sec` | 10 | Deadline for NapCat media calls |
-| `media_http_timeout_sec` | 20 | Deadline for downloading a picture or clip |
-| `unreadable_retry_sec` | 600 | How long a picture no route could read is left alone before another attempt |
-| `shutdown_wait_sec` | 5 | How long shutdown waits for in-flight archive writes |
+| `wait_sec` | 25 | Seconds a reply waits for pending media resolution |
+| `protocol_timeout_sec` | 10 | Seconds allowed for one NapCat media API call |
+| `http_timeout_sec` | 20 | Seconds allowed for one media download |
+| `unreadable_retry_sec` | 600 | Seconds before retrying media marked unreadable |
+
+### `members`
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `cache_ttl_sec` | 1800 | Seconds a fetched group member list remains fresh |
+
+### `tools`
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `max_calls_per_round` | 8 | Tool calls accepted from one model round |
+| `max_rounds` | 20 | Safety ceiling on model rounds in one tool loop |
+| `send_messages.max_messages_per_call` | 4 | Independent QQ messages allowed in one terminal call |
+| `send_messages.max_text_chars_per_message` | 2000 | Text characters allowed in each QQ message |
+| `web_search.count` | 5 | Results requested from one search |
+| `web_search.depth` | basic | Vendor search depth; `advanced` consumes two credits |
+| `search_history.context_lines` | 5 | Archive lines included before and after each hit |
+| `search_history.max_hits` | 8 | Matching archive messages returned by one search |
+| `search_history.max_query_terms` | 8 | Terms accepted in one search expression |
+| `search_history.max_result_chars` | 12000 | Characters returned by one search |
+| `recall_events.context_episodes` | 2 | Episodes included before and after each hit |
+| `read_url.max_content_chars` | 8000 | Page-text characters returned by one read |
+| `open_images.max_images` | 6 | Images accepted by one call |
 
 ### `capabilities`
 
@@ -142,8 +166,6 @@ provider selector, endpoint, credential, remote model, request timeout or billin
 
 | Key | Meaning |
 | --- | --- |
-| `count` | Results per search, at most 20 |
-| `depth` | `basic` (one credit) or `advanced` (two) |
 | `monthly_quota` | Credits per calendar month over every group. |
 | `proxy` | HTTP proxy for the search client only; empty means direct |
 
@@ -164,19 +186,6 @@ Counts, not tokens.
 | `forward_lines`, `forward_depth`, `forward_chars` | How much of a forwarded chat record is rendered |
 | `evidence_result_chars`, `evidence_total_chars`, `evidence_ttl_days` | Per-item bound, total bound and retention for structured evidence supporting nearby follow-ups |
 | `evidence_request_chars` | Bound on the sanitized request summary stored in each evidence item |
-
-### `retrieval`
-
-| Key | Meaning |
-| --- | --- |
-| `history_context` | Lines of surrounding conversation around each `search_history` hit, each way |
-| `episode_context` | Neighbouring episodes around each `recall_events` hit, each way |
-| `history_hits`, `max_query_terms` | Hits per search and terms per query expression |
-| `history_chars` | Longest `search_history` answer; a cut answer says so on its last line |
-| `url_content_chars` | Longest page text `read_url` returns |
-| `max_tool_calls_per_round` | Tool calls one model round may carry |
-| `open_images_max` | Pictures one `open_images` call may fetch |
-| `max_rounds` | Tripwire on the tool loop, only reachable with a backend that bills zero |
 
 ### `memory`
 

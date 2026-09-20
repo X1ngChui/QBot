@@ -29,7 +29,7 @@ import httpx
 
 from ..core.budget import BUDGET
 from ..db import repo
-from ..settings import SearchCfg
+from ..settings import SearchCfg, WebSearchToolCfg
 from ..util import require_key
 from .base import Kind, QuotaExhausted, Rate, SearchEngine, retire, with_retry
 
@@ -118,16 +118,21 @@ class TavilySearch(SearchEngine):
         return response
 
     async def search(
-        self, query: str, *, cfg: SearchCfg, group_id: str | None = None
+        self,
+        query: str,
+        *,
+        cfg: SearchCfg,
+        options: WebSearchToolCfg,
+        group_id: str | None = None,
     ) -> list[dict]:
-        credits = 2 if cfg.depth == "advanced" else 1
+        credits = 2 if options.depth == "advanced" else 1
         r = await self._credited_post(
             cfg,
             path="/search",
             body={
                 "query": query,
-                "search_depth": cfg.depth,
-                "max_results": cfg.count,
+                "search_depth": options.depth,
+                "max_results": options.count,
             },
             credits=credits,
             group_id=group_id,
@@ -139,7 +144,7 @@ class TavilySearch(SearchEngine):
                 "link": (it.get("url") or "").strip(),
                 "content": " ".join((it.get("content") or "").split()),
             }
-            for it in items[: cfg.count]
+            for it in items[: options.count]
         ]
 
     async def read_page(

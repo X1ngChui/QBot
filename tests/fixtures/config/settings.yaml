@@ -10,7 +10,14 @@ timezone: "Asia/Shanghai"
 
 gateway:
   dedup_ttl_sec: 300
-  max_msg_len: 2000
+
+tools:
+  send_messages:
+    max_messages_per_call: 4
+    max_text_chars_per_message: 2000
+  web_search:
+    count: 5
+    depth: basic
 
 trigger:
   nicknames: ["小X", "小x", "X酱"]
@@ -52,8 +59,6 @@ capabilities:
     provider: tavily
     endpoint: https://api.tavily.com
     credential_env: SEARCH_API_KEY
-    count: 5
-    depth: basic
     monthly_quota: 1000
     timeout_sec: 20
 

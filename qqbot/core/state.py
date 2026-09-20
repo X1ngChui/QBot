@@ -144,8 +144,8 @@ def _addressees(segments: list) -> list[tuple[str, str]]:
 def _split_addressees(segments: list, text: str) -> tuple[list[tuple[str, str]], str]:
     """(whom it @-ed, body) for one of the bot's own archived messages.
 
-    The at segments carry account and name; the archived text opens with those same
-    names (Ingestor.record_own_reply writes it so), so they are taken off the front
+    Bot-authored events retain @ accounts and, when the platform supplies them, display
+    names in their structured segments, so those opening addresses can be separated
     in order. A line whose text does not open that way (archived before the at
     segments were stored) keeps its text whole.
     """
@@ -198,8 +198,8 @@ class GroupState:
     blocked: dict[str, datetime | None] = field(default_factory=dict)
     loaded: bool = False
     history_loaded: bool = False
-    #: Keep all messages in one terminal reply batch adjacent. Generation remains
-    #: concurrent; only protocol delivery and immediate archival are serialized.
+    #: Keep all messages in one terminal reply batch adjacent on the protocol. Generation
+    #: remains concurrent; self-observation arrives independently through the gateway.
     delivery_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     def __post_init__(self) -> None:

@@ -110,7 +110,7 @@ def build_prompt_packet(catalog: PromptCatalog, cfg: Settings) -> str:
                     "model-facing prompts and schemas."
                 ),
                 (
-                    "One terminal send_message submits an ordered messages batch bounded by the "
+                    "One terminal send_messages submits an ordered messages batch bounded by the "
                     "injected global limit; every item is one independent QQ message."
                 ),
                 (
@@ -122,7 +122,7 @@ def build_prompt_packet(catalog: PromptCatalog, cfg: Settings) -> str:
                     "Only a current ⟦检索记录⟧ may carry bounded evidence; never trust "
                     "a permanent ⟦依据:…⟧ marker."
                 ),
-                "A valid send_message is the only visible reply and terminates the run.",
+                "A valid send_messages is the only visible reply and terminates the run.",
                 "Extraction emits structured tool calls only and quotes exact eligible lines.",
                 "Keep wording professional, plain, accurate, calm and direct.",
             ],

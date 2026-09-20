@@ -44,7 +44,9 @@ configuration files. Deploy from a clean checkout of the revision you mean to ru
    elsewhere). The WebUI token is printed in the logs on first start.
 2. After login NapCat writes `data/napcat/config/onebot11_<QQ>.json`. Merge the
    `websocketClients` entry from `napcat/onebot11.json.template` into it, keep
-   `messagePostFormat` as `array`, and `docker compose restart napcat`.
+   `messagePostFormat` as `array` and `reportSelfMessage` as `true`, then run
+   `docker compose restart napcat`. Self-message reporting is required because the
+   receive path is the canonical source for the bot's displayed messages.
 3. Set `NAPCAT_ACCOUNT` in `.env` to the QQ number so later restarts log in from the
    saved session without a scan.
 4. `docker compose logs bot` should show the adapter connecting.

@@ -382,7 +382,7 @@ def _card_text(raw: str) -> str:
         desc = defang(str(entry.get("desc") or entry.get("summary") or "").strip())
         if title or desc:
             # Whole: a card is a headline and a blurb, and the rendered line answers
-            # to gateway.max_msg_len like any other message.
+            # to the send tool's per-message text bound like any other message.
             body = f"{title}：{desc}" if title and desc else (title or desc)
             return sysmark(f"分享:{body}")
     return sysmark(f"分享:{prompt.strip()}") if prompt else sysmark("卡片消息")

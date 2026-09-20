@@ -49,7 +49,7 @@ from qqbot.providers.contracts import (
 )
 from qqbot.settings import config
 
-MODEL = "deepseek-flash"
+MODEL = "deepseek-v4-pro"
 WRITE_TOOL = "write_prompt_bundle"
 
 WRITER_REQUEST = """You are writing the complete Chinese prompt bundle for a QQ group-chat agent.
@@ -63,13 +63,13 @@ own only the Chinese wording inside each declared template. Keep the tone profes
 accurate, calm and direct. Do not mention source files, implementation modules or databases in the
 runtime prompts. Examples must remain fictional. Do not expose mface, music, music_custom or
 json, invent tools or fields, add undeclared slots, copy protected markers into visible message
-text, or make display number 0 a legal tool target. One terminal send_message call carries an
+text, or make display number 0 a legal tool target. One terminal send_messages call carries an
 ordered messages batch whose maximum is supplied through {{message_limit}}. Each item is one
 independent QQ message. The parameter-only dice, rps, contact_member and contact_group segments
 must each be the sole segment in that message item's content: no reply, text, at or any other
 segment may accompany one. Explanation text may be a separate item in the same messages batch;
 never describe explanation and a standalone segment as mutually exclusive choices. Invalid model
-arguments reject the complete batch before delivery, not merely one item. A successful send_message
+arguments reject the complete batch before delivery, not merely one item. A successful send_messages
 call terminates the run, so include every intended QQ message in that single batch. When describing
 historical sends, preserve the outer messages array and each item's inner content array. A
 plain-text `@我` typed by a member is

@@ -25,7 +25,7 @@ class PromptKey(StrEnum):
     TOOL_RECALL_EVENTS = "tool_recall_events"
     TOOL_READ_URL = "tool_read_url"
     TOOL_OPEN_IMAGES = "tool_open_images"
-    TOOL_SEND_MESSAGE = "tool_send_message"
+    TOOL_SEND_MESSAGES = "tool_send_messages"
 
 
 class PromptRole(StrEnum):
@@ -165,7 +165,7 @@ _SPECS = (
         ReloadScope.RELOADABLE,
     ),
     TemplateSpec(
-        PromptKey.TOOL_SEND_MESSAGE,
+        PromptKey.TOOL_SEND_MESSAGES,
         PromptRole.TOOL,
         ReloadScope.RELOADABLE,
         (_slot("face_catalog"), _slot("message_limit")),

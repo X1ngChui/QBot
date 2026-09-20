@@ -23,7 +23,7 @@ from ..prompting import PromptKey, tool_prompt_key
 from ..providers import providers
 from ..providers.base import QuotaExhausted
 from ..providers.contracts import StoredImage, TextPart, ToolCall, ToolSpec
-from ..settings import RetrievalCfg, Settings, config, prompt_catalog
+from ..settings import SearchHistoryToolCfg, Settings, config, prompt_catalog
 from ..util import defang, fmt_when, merge_overlapping, sysmark, why
 from . import retrieval
 from .archive import archive_author, archive_mentions, archive_sender, archive_text
@@ -37,7 +37,7 @@ log = logging.getLogger("qqbot.tools")
 #: The tool every reply is sent through. Not executed here: the engine reads its
 #: arguments and sends them (see engine.respond). Named, like its parameters, after
 #: the OneBot message it becomes: text, at and reply segments.
-SEND = "send_message"
+SEND = "send_messages"
 
 
 @dataclass
@@ -62,12 +62,14 @@ def _tool(
 
     key = tool_prompt_key(name)
     values = {}
-    if key is PromptKey.TOOL_SEND_MESSAGE:
+    if key is PromptKey.TOOL_SEND_MESSAGES:
         settings = cfg or config().default
         values["face_catalog"] = "、".join(
             f"{face_id}={label}" for face_id, label in FACE_NAMES.items()
         )
-        values["message_limit"] = str(settings.gateway.max_messages_per_reply)
+        values["message_limit"] = str(
+            settings.tools.send_messages.max_messages_per_call
+        )
     description = prompt_catalog().render(key, values)
     return ToolSpec(
         name=name,
@@ -148,7 +150,7 @@ def send_def(cfg: Settings | None = None) -> ToolSpec:
                         "additionalProperties": False,
                     },
                     "minItems": 1,
-                    "maxItems": settings.gateway.max_messages_per_reply,
+                    "maxItems": settings.tools.send_messages.max_messages_per_call,
                 },
             },
             "required": ["messages"],
@@ -161,7 +163,7 @@ def send_def(cfg: Settings | None = None) -> ToolSpec:
 def tool_defs(cfg: Settings | None = None) -> tuple[ToolSpec, ...]:
     """Build typed tool contracts after each prompt/config reload."""
 
-    rcfg = (cfg or config().default).retrieval
+    tcfg = (cfg or config().default).tools
     return (
         send_def(cfg),
         _tool(
@@ -229,7 +231,7 @@ def tool_defs(cfg: Settings | None = None) -> tuple[ToolSpec, ...]:
                         "items": {"type": "integer"},
                         "description": "要查看的图片编号列表，取自转写里 ⟦图片N:…⟧、"
                         "⟦表情N:…⟧ 或 ⟦图片N⟧ 的 N；一次最多 "
-                        f"{rcfg.open_images_max} 张",
+                        f"{tcfg.open_images.max_images} 张",
                     }
                 },
                 "required": ["ns"],
@@ -327,7 +329,8 @@ def _condition(node, params: list, offset: int) -> str:
 
 async def search_history(group_id: int, query: str, *, speaker: int | None = None,
                          speaker_name: str | None = None,
-                         days: int | None = None, rcfg: RetrievalCfg | None = None,
+                         days: int | None = None,
+                         rcfg: SearchHistoryToolCfg | None = None,
                          self_id: str | None = None,
                          people: MemberNumbers | None = None) -> str:
     """The archive, searched. Free - one SQL query, no model involved.
@@ -357,24 +360,22 @@ async def search_history(group_id: int, query: str, *, speaker: int | None = Non
     statement. `self_id` is the bot's account; without it, own lines render like
     anyone's.
 
-    Each hit comes wrapped in its surrounding lines (retrieval.history_context each
-    way): chat is written in fragments, and the matched line is routinely a bare
-    answer to the line above it. The filters pick the hits; the context is whatever
-    actually surrounds them - group notices included, since a recall or a mute is
-    often the very thing a line responds to. Windows that touch merge into one
-    block; blocks are separated by an ellipsis line.
+    Each hit comes wrapped in its surrounding lines
+    (tools.search_history.context_lines each way): chat is written in fragments,
+    and the matched line is routinely a bare answer to the line above it. The
+    filters pick the hits; the context is whatever actually surrounds them - group
+    notices included, since a recall or a mute is often the very thing a line responds
+    to. Windows that touch merge into one block; blocks are separated by an ellipsis.
 
-    Every matched message is returned whole: what a search is for is the substance
-    of what was said. The answer as a whole is bounded by retrieval.history_chars,
-    because hits times context lines times gateway.max_msg_len can outgrow the
-    model's context, where a request fails outright instead of degrading; a cut
-    answer says so on its last line.
+    Every matched message is returned whole. The answer is bounded by
+    tools.search_history.max_result_chars so disjoint context windows cannot outgrow
+    the model context; a cut answer says so on its last line.
     """
-    # One read of the retrieval settings for the whole call, so how many hits are
+    # One read of this tool's settings for the whole call, so how many hits are
     # fetched and how much context is rendered cannot come from two different
     # configs if /reload lands in between. The tool loop passes the task's global
     # settings snapshot; a bare call reads the current default.
-    rcfg = rcfg or config().default.retrieval
+    rcfg = rcfg or config().default.tools.search_history
     # Parse and compile under one roof: the subset check lives in the compile
     # walk, and a rejected feature must answer in words exactly like a syntax
     # error does. A Failure, not a plain answer: a search that never ran earns
@@ -407,7 +408,7 @@ async def search_history(group_id: int, query: str, *, speaker: int | None = Non
                    OR occurred_at >= NOW() - make_interval(days => $4))
               AND ($5::text[] IS NULL OR platform_user_id = ANY($5::text[]))
             ORDER BY occurred_at DESC, id DESC LIMIT $2""",
-        group_id, rcfg.history_hits,
+        group_id, rcfg.max_hits,
         _like(sp) if sp and uids is None else None,
         days if days and days > 0 else None,
         uids,
@@ -415,7 +416,7 @@ async def search_history(group_id: int, query: str, *, speaker: int | None = Non
     )
     if not rows:
         return "（存档里没有搜到）"
-    ctx = max(0, rcfg.history_context)
+    ctx = rcfg.context_lines
     if not ctx:
         shown = list(reversed(rows))
         await _learn(people, shown)
@@ -423,9 +424,9 @@ async def search_history(group_id: int, query: str, *, speaker: int | None = Non
     else:
         text = await _with_context(group_id, [r["id"] for r in rows], ctx, self_id,
                                    people)
-    if len(text) > rcfg.history_chars:
+    if len(text) > rcfg.max_result_chars:
         # Cut at a line boundary so no message is shown half-said.
-        head = text[:rcfg.history_chars]
+        head = text[:rcfg.max_result_chars]
         text = head[:head.rfind("\n")] if "\n" in head else head
         text += "\n（结果过长，后面的没有显示；请换更具体的检索式或缩小时间范围）"
     return text
@@ -496,8 +497,8 @@ async def _with_context(group_id: int, hit_ids: list, ctx: int,
     ties without meaning anything). A window is contiguous by construction, so
     two windows overlap exactly when they share a row: overlapping windows are
     merged into one block, and blocks render oldest first with an ellipsis line
-    between them. Worst case is retrieval.history_hits disjoint blocks of 2*ctx+1
-    lines.
+    between them. Worst case is tools.search_history.max_hits disjoint blocks of
+    2*ctx+1 lines.
     """
     nrows = await pool().fetch(
         """SELECT h.id AS hit, n.id, n.occurred_at, n.payload, n.plain_text,
@@ -640,7 +641,7 @@ async def execute(
         if (not isinstance(ns, list) or not ns
                 or not all(isinstance(x, int) and not isinstance(x, bool) for x in ns)):
             return Failure("（需要图片编号列表。）")
-        wanted = list(dict.fromkeys(ns))[:cfg.retrieval.open_images_max]
+        wanted = list(dict.fromkeys(ns))[:cfg.tools.open_images.max_images]
         parts: list[TextPart | StoredImage] = []
         shown: list[int] = []
         unknown: list[int] = []
@@ -706,7 +707,7 @@ async def execute(
         # context the request fails outright rather than degrading. A cut page is
         # told it was cut, or a sentence stopping mid-thought reads as the end of
         # the article.
-        cap = cfg.retrieval.url_content_chars
+        cap = cfg.tools.read_url.max_content_chars
         if len(body) > cap:
             return body[:cap] + "\n（网页正文过长，后面的没有读到）"
         return body
@@ -717,7 +718,7 @@ async def execute(
             return Failure("（问题为空）")
         try:
             found = await retrieval.episode_lookup(group_id, question,
-                                                   rcfg=cfg.retrieval)
+                                                   rcfg=cfg.tools.recall_events)
         except QuotaExhausted:
             # A limit, not a failure: it must reach the engine and drop the reply,
             # whichever tool's backend it comes from - only transport errors below
@@ -739,7 +740,7 @@ async def execute(
                 speaker=number(args.get("speaker")),
                 speaker_name=_text(args, "speaker_name") or None,
                 days=_days(args.get("days")),
-                rcfg=cfg.retrieval,
+                rcfg=cfg.tools.search_history,
                 self_id=str(getattr(ctx.bot, "self_id", "") or "") if ctx else None,
                 people=ctx.people if ctx else None,
             )
@@ -760,7 +761,10 @@ async def execute(
     # error to talk around, not a limit to respect.
     try:
         items = await providers().search.search(
-            query, cfg=cfg.capabilities.search, group_id=group_id
+            query,
+            cfg=cfg.capabilities.search,
+            options=cfg.tools.web_search,
+            group_id=group_id,
         )
     except QuotaExhausted:
         raise

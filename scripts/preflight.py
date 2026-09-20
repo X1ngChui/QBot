@@ -178,10 +178,13 @@ async def check_asr() -> None:
 
 async def check_search() -> None:
     cfg = config().default.capabilities.search
+    options = config().default.tools.web_search
     label = f"search ({cfg.provider})"
     try:
-        items = await providers().search.search("今天天气", cfg=cfg)
-        record(label, bool(items), f"{len(items)} results, count={cfg.count}")
+        items = await providers().search.search(
+            "今天天气", cfg=cfg, options=options
+        )
+        record(label, bool(items), f"{len(items)} results, count={options.count}")
     except Exception as e:
         record(label, False, repr(e))
 

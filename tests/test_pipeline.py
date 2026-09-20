@@ -67,7 +67,7 @@ def send_to_asker(messages, text):
             break
     return [
         function_call(
-            "send_message",
+            "send_messages",
             {"messages": [{"content": content}]},
             call_id=f"send-{len(LLM_CALLS)}",
         )
@@ -160,7 +160,7 @@ class UnusedSearch(SearchEngine):
     def rate_for(self, model):
         return Rate("call")
 
-    async def search(self, query, *, cfg, group_id=None):
+    async def search(self, query, *, cfg, options, group_id=None):
         raise AssertionError("search should not be reached in this test")
 
     async def aclose(self):
@@ -181,10 +181,10 @@ class FakeEvent:
     _ids = itertools.count(1000)
 
     def __init__(self, text=None, segments=None, user_id="u1", nickname="阿强", group_id=123,
-                 to_me=False, reply_id=None, reply_from=None):
+                 to_me=False, reply_id=None, reply_from=None, message_id=None):
         self.group_id = group_id
         self.user_id = user_id
-        self.message_id = next(self._ids)
+        self.message_id = message_id if message_id is not None else next(self._ids)
         self._segs = segments or [Seg("text", {"text": text})]
         # The onebot adapter removes a leading/trailing @me segment and reports it here
         # instead, so a real @ arrives with to_me=True and no at segment at all.
@@ -208,6 +208,7 @@ class FakeEvent:
 
 class FakeBot:
     self_id = "999"
+    _message_ids = itertools.count(90001)
 
     def __init__(self):
         self.sent = []
@@ -215,22 +216,43 @@ class FakeBot:
         self.ats = []
         self.member_list_calls = 0
         self.members = [
+            {"user_id": "u1", "card": "阿强", "nickname": "阿强"},
             {"user_id": 24680, "card": "群里的阿明", "nickname": "阿明"},
             {"user_id": 7, "card": "小南", "nickname": "dong"}]
 
     async def send_group_msg(self, *, group_id, message):
-        # The engine sends segment arrays; the tests assert on words, so keep the
-        # text flat here and remember separately which message each reply quoted
-        # and whom it @-ed.
+        # Delivery and self-observation are separate protocol events. The fake emits
+        # both so the production receive path, rather than the engine, owns state and
+        # archival in this end-to-end suite.
+        segments = list(message) if isinstance(message, list) else [
+            {"type": "text", "data": {"text": str(message)}}
+        ]
+        reply_id = next(
+            (s["data"]["id"] for s in segments if s["type"] == "reply"), None
+        )
         if isinstance(message, list):
-            self.quoted.append(next((s["data"]["id"] for s in message
-                                     if s["type"] == "reply"), None))
-            self.ats.append(next((s["data"]["qq"] for s in message
+            self.quoted.append(reply_id)
+            self.ats.append(next((s["data"]["qq"] for s in segments
                                   if s["type"] == "at"), None))
-            message = "".join(s["data"].get("text", "") for s in message
-                              if s["type"] == "text").lstrip()
-        self.sent.append((group_id, message))
-        return {"message_id": 90000 + len(self.sent)}
+            shown = "".join(s["data"].get("text", "") for s in segments
+                            if s["type"] == "text").lstrip()
+        else:
+            shown = str(message)
+        self.sent.append((group_id, shown))
+        message_id = next(self._message_ids)
+        reported = [Seg(s["type"], dict(s.get("data") or {}))
+                    for s in segments if s["type"] != "reply"]
+        await GATEWAY.handle(self, FakeEvent(
+            segments=reported,
+            user_id=str(self.self_id),
+            nickname="小X",
+            group_id=group_id,
+            reply_id=reply_id,
+            message_id=message_id,
+        ))
+        if GATEWAY._loose:
+            await asyncio.gather(*tuple(GATEWAY._loose))
+        return {"message_id": message_id}
 
     async def call_api(self, api, **kw):
         if api == "get_image":
@@ -300,10 +322,8 @@ async def main():
     check("direct mention replies", len(bot.sent) == 1, str(bot.sent))
     check("markdown stripped before send",
           bot.sent and "**" not in bot.sent[0][1], str(bot.sent[:1]))
-    # The protocol side is configured not to report the bot's own messages, so nothing
-    # else writes them down. Without this they lived only in the in-memory deque - and the
-    # group card, which is distilled from the archive, was summarising one side of a
-    # conversation.
+    # NapCat reports the bot's displayed message back through the same gateway, so the
+    # receive path owns the window and archive copy.
     own = await pool().fetch(
         """SELECT plain_text, payload FROM raw_event
             WHERE group_id=123 AND platform_user_id=$1""",
@@ -323,6 +343,33 @@ async def main():
           own and (own[0]["payload"] or {}).get("reply_to") == str(ev0.message_id),
           str((own[0]["payload"] or {}).get("reply_to")) if own else "no row")
 
+    _sent_before_self = len(bot.sent)
+    _calls_before_self = len(LLM_CALLS)
+    await GATEWAY.handle(bot, FakeEvent(
+        "/help", user_id=str(bot.self_id), nickname="小X", message_id=99001,
+    ))
+    await drain(0.05)
+    check("a command-shaped self event is observed without replying",
+          len(bot.sent) == _sent_before_self and len(LLM_CALLS) == _calls_before_self)
+    check("self-observation never creates a member identity for the bot",
+          await pool().fetchval(
+              "SELECT count(*) FROM identity_account WHERE platform_user_id=$1",
+              str(bot.self_id),
+          ) == 0)
+    await GATEWAY.handle(bot, FakeEvent(
+        segments=[Seg("dice", {"result": "4"})],
+        user_id=str(bot.self_id), nickname="小X", message_id=99002,
+    ))
+    await drain(0.05)
+    _dice_row = await pool().fetchrow(
+        "SELECT plain_text, payload FROM raw_event WHERE platform_event_id='99002'"
+    )
+    check("a reported self dice result reaches the window and archive",
+          (await REGISTRY.get("123")).recent[-1].text == "⟦骰子:4点⟧"
+          and _dice_row["plain_text"] == "⟦骰子:4点⟧"
+          and _dice_row["payload"]["segments"][0]["data"]["result"] == "4",
+          repr(dict(_dice_row) if _dice_row else None))
+
     check("every reply is offered the tools - there is one model and no tier",
           all(c["tools"] for c in LLM_CALLS if c["kind"] == "reply"))
 
@@ -334,7 +381,7 @@ async def main():
     # The one thing the model does comes before everything it reads: its words reach
     # the group only through the send tool.
     check("and the first of them is how to speak",
-          "唯一方式是调用 send_message" in sys_prompt[:200], sys_prompt[:200])
+          "唯一方式是调用 send_messages" in sys_prompt[:200], sys_prompt[:200])
     # Without this the bot denies seeing an image while holding its description - it does
     # not know that the picture marker is its own eyesight rather than something a person
     # typed.
@@ -783,8 +830,8 @@ async def main():
     # must also share it - one paid call, not two.
     # The wait is per-group config, so shorten the one this group resolves to.
     _cfg_media = config().for_group("123")[0]
-    _waits = _cfg_media.gateway.media_wait_sec
-    _cfg_media.gateway.media_wait_sec = 0.2
+    _waits = _cfg_media.media.wait_sec
+    _cfg_media.media.wait_sec = 0.2
 
     class SlowVision(SeeingVision):
         async def describe(self, data, *, cfg, prompt="", mime="image/jpeg", group_id=None):
@@ -815,13 +862,13 @@ async def main():
           "慢速描述完成" in (_slow_stored or ""), repr(_slow_stored))
     check("two sightings during the flight paid for one call",
           len(VISION_SEEN) == _slow_seen + 1, str(VISION_SEEN[_slow_seen:]))
-    _cfg_media.gateway.media_wait_sec = _waits
+    _cfg_media.media.wait_sec = _waits
 
     # A media patch must not undo the arrival truncation: pm.parts holds the full
     # original text, so an unbounded re-render would put the whole thing back into
     # the window and the archive - past the one per-line bound the no-token-budget
     # prompt layout relies on (a regression this pins).
-    _cap_len = cfg.gateway.max_msg_len
+    _cap_len = cfg.tools.send_messages.max_text_chars_per_message
 
     class LongVision(SeeingVision):
         async def describe(self, data, *, cfg, prompt="", mime="image/jpeg", group_id=None):
@@ -852,7 +899,7 @@ async def main():
     # the picture arrive as the answer to the call instead of a turn appended behind it.
     from qqbot.core.segments import ImageRef as _IRef
     from qqbot.core.tools import Attachment, ToolCtx, execute as _texec
-    URL_CONTENT_CHARS = config().default.retrieval.url_content_chars
+    URL_CONTENT_CHARS = config().default.tools.read_url.max_content_chars
 
     def _tcall(name, **kw):
         return function_call(name, kw, call_id="t1")
@@ -1249,7 +1296,7 @@ async def main():
         def rate_for(self, model):
             return Rate("call", per_unit=0.0)
 
-        async def search(self, query, *, cfg, group_id=None):
+        async def search(self, query, *, cfg, options, group_id=None):
             if len(self.calls) >= 2:
                 raise QuotaExhausted("out of allowance")
             self.calls.append(query)
@@ -1274,7 +1321,7 @@ async def main():
         )
         content.append({"type": "text", "data": {"text": text}})
         return function_call(
-            "send_message",
+            "send_messages",
             {"messages": [{"content": content}]},
             call_id=f"s{len(LLM_CALLS)}",
         )
@@ -1297,7 +1344,7 @@ async def main():
                               "timeout": cfg.timeout_sec})
             await BUDGET.record(kind=kind, model=self.MODEL, cny=ROUND_CHARGE,
                                 group_id=group_id)
-            if _names(tools) == ["send_message"]:   # the wrap-up round
+            if _names(tools) == ["send_messages"]:   # the wrap-up round
                 return response(model=self.MODEL,
                                 tool_calls=[_send(text="就查到这些了")])
             return response(model=self.MODEL,
@@ -1318,10 +1365,10 @@ async def main():
     check("a reply that hits the search allowance wraps up with an answer",
           r1 is not None and r1.messages[0].text == "就查到这些了", repr(r1))
     check("the wrap-up is one extra round, offered only the send tool",
-          len(LLM_CALLS) - n_llm == 3 and _names(LLM_CALLS[-1]["tools"]) == ["send_message"],
+          len(LLM_CALLS) - n_llm == 3 and _names(LLM_CALLS[-1]["tools"]) == ["send_messages"],
           f"{len(LLM_CALLS) - n_llm} rounds, tools={_names(LLM_CALLS[-1]['tools'])}")
     check("every ordinary round offers the send tool first",
-          _names(LLM_CALLS[n_llm]["tools"])[0] == "send_message",
+          _names(LLM_CALLS[n_llm]["tools"])[0] == "send_messages",
           str(_names(LLM_CALLS[n_llm]["tools"])))
     check("the wrap-up round is told the allowance is gone",
           any("额度已用完" in (m.get("content") or "")
@@ -1347,7 +1394,7 @@ async def main():
 
         calls = []
 
-        async def search(self, query, *, cfg, group_id=None):
+        async def search(self, query, *, cfg, options, group_id=None):
             self.calls.append(query)
             return [{"title": "T", "content": "C"}]
 
@@ -1361,7 +1408,7 @@ async def main():
                  text="再查个东西", ts=_nl0()))
     check("a reply that runs out of money wraps up the same way",
           r2 is not None and r2.messages[0].text == "就查到这些了" and len(LLM_CALLS) - n_llm2 == 3
-          and _names(LLM_CALLS[-1]["tools"]) == ["send_message"],
+          and _names(LLM_CALLS[-1]["tools"]) == ["send_messages"],
           f"{r2!r}, {len(LLM_CALLS) - n_llm2} rounds")
     check("and the unaffordable round's tools were never executed",
           len(EndlessSearch.calls) == 2, str(EndlessSearch.calls))
@@ -1452,14 +1499,14 @@ async def main():
     class CappedSearch(EndlessSearch):
         calls = []
 
-    _cap0, cfg.retrieval.max_tool_calls_per_round = cfg.retrieval.max_tool_calls_per_round, 2
+    _cap0, cfg.tools.max_calls_per_round = cfg.tools.max_calls_per_round, 2
     set_providers(Providers(text=ScriptedText(), vision=UnusedVision(),
                             asr=UnusedAsr(), embedding=_EMBED, search=CappedSearch()))
     await _eng.generate(
         bot=bot, st=st13, cfg=cfg, persona=config().for_group("123")[1],
         msg=_CM0(msg_id="loop3", user_id="u1", nickname="阿强",
                  text="再查一次", ts=_nl0()))
-    cfg.retrieval.max_tool_calls_per_round = _cap0
+    cfg.tools.max_calls_per_round = _cap0
     _tool_texts3 = [m.get("output") or "" for m in LLM_CALLS[-1]["input"]
                     if m.get("type") == "function_call_output"]
     check("a call past the per-round cap is answered with the overflow note",
@@ -1565,6 +1612,7 @@ async def main():
     _MEMpv.forget("123")
     st_s = type(st_pv)(group_id="5601")
     st_s.loaded = st_s.history_loaded = True
+    REGISTRY._groups["5601"] = st_s
     _w1 = _CM0(msg_id="s-w1", user_id="u61", nickname="李芳", text="我是第一个李芳",
                ts=_nl0())
     _w2 = _CM0(msg_id="s-w2", user_id="u62", nickname="李芳", text="我是第二个李芳",
@@ -1624,7 +1672,7 @@ async def main():
         else _s_row["payload"]
     check("the archive reads as the group read it, with the @ as a segment",
           _s_row["plain_text"] == "@李芳 你好呀"
-          and {"type": "at", "data": {"qq": "u62", "name": "李芳"}}
+          and {"type": "at", "data": {"qq": "u62"}}
           in _s_payload["segments"] and _s_payload["reply_to"] == "s-w2",
           repr(_s_row))
     # A restart rebuilds the same line from the archive: the @ comes back as data,
@@ -1635,7 +1683,7 @@ async def main():
     _back = next((m for m in _re.recent if m.msg_id == _s_line.msg_id), None)
     check("a rebuilt window preserves the structured display and addressee",
           _back is not None and _back.text == "@李芳 你好呀"
-          and _back.at == [("u62", "李芳")],
+          and [account for account, _ in _back.at] == ["u62"],
           repr(_back))
     # A line archived before the @ was stored as a segment opens with "@asker" and
     # replies to the asker's message; the rebuild recovers the account from that.
@@ -1712,9 +1760,9 @@ async def main():
           f"{bot.sent[-1:]} {_e_tools}")
 
     _use(_calls(
-        function_call("send_message", {"messages": []}, call_id="bad-send"),
+        function_call("send_messages", {"messages": []}, call_id="bad-send"),
         function_call(
-            "send_message",
+            "send_messages",
             {"messages": [{"content": [
                 {"type": "text", "data": {"text": "同轮有效"}}
             ]}]},
@@ -1846,7 +1894,7 @@ async def main():
         None,
     )
     check("assembly seats rendered evidence with the send call it fed",
-          _ri is not None and _msgs2[_ri - 1].get("name") == "send_message"
+          _ri is not None and _msgs2[_ri - 1].get("name") == "send_messages"
           and _msgs2[_ri - 2].get("role") == "assistant"
           and _msgs2[_ri - 2].get("content") == _expected_evidence
           and "依据" not in str(_msgs2[_ri].get("output", "")),
@@ -1949,18 +1997,13 @@ async def main():
           await pool().fetchval(
               "SELECT count(*) FROM raw_event WHERE platform_event_id=$1",
               str(ev16.message_id)) == 1)
-    # The pointer enters the record as a notice about the member, never as
-    # the bot's own words: a bot line reading "please accept the agreement"
-    # was read by the model as its answer to that question and repeated to a
-    # member who had just consented.
+    # The platform-reported pointer is observed like every other bot-authored line.
     st16 = await REGISTRY.get("123")
     _last16 = st16.recent[-1]
-    check("the pointer is transcribed as a notice about the member",
-          not _last16.is_bot and _last16.user_id == "newbie"
-          and "用户协议" in _last16.text and "/agree" not in _last16.text,
+    check("the agreement pointer returns through self-observation",
+          _last16.is_bot and _last16.user_id == str(bot.self_id)
+          and _agree.POINTER in _last16.text,
           f"{_last16.is_bot} {_last16.user_id} {_last16.text!r}")
-    check("and no bot line in the window carries the pointer",
-          not any(m.is_bot and _agree.POINTER in m.text for m in st16.recent))
     await GATEWAY.handle(bot, FakeEvent("小X 在吗", user_id="newbie",
                                         nickname="新人", to_me=True))
     await drain()
@@ -2140,8 +2183,8 @@ async def main():
     await seed(123, "u32", "张伟", text="改锥我根本没见过")
     # Bare-hit mode: the pin is about which lines are *hits* - with context on,
     # the other namesake's line would legitimately appear as surroundings.
-    _rcfg18 = config().default.retrieval
-    _ctx18, _rcfg18.history_context = _rcfg18.history_context, 0
+    _rcfg18 = config().default.tools.search_history
+    _ctx18, _rcfg18.context_lines = _rcfg18.context_lines, 0
     _p18b = _MN18(self_id="999")
     n31 = _p18b.number("u31", spoke=True)
     got = await _tools.search_history(123, "改锥", speaker=n31, people=_p18b)
@@ -2159,18 +2202,22 @@ async def main():
                                            people=_p18b)
     check("and with a name given, falls back to matching the name",
           "借给阿强" in got_name and "没见过" in got_name, got_name)
-    _rcfg18.history_context = _ctx18
+    _rcfg18.context_lines = _ctx18
     got_own = await _tools.search_history(123, "明天多云", self_id="999")
     check("the bot's own archived line wears the self tag in search results",
           "⟦0⟧: " in got_own, got_own)
     # The answer as a whole is bounded; a cut answer says so.
-    _chars18, _rcfg18.history_chars = _rcfg18.history_chars, 1000
-    _rcfg18.history_context = 0
+    _chars18, _rcfg18.max_result_chars = _rcfg18.max_result_chars, 1000
+    _rcfg18.context_lines = 0
     got_cut = await _tools.search_history(123, "改锥", rcfg=_rcfg18)
-    _rcfg18.history_chars, _rcfg18.history_context = _chars18, _ctx18
+    _rcfg18.max_result_chars, _rcfg18.context_lines = _chars18, _ctx18
     check("a short search answer is not cut", "结果过长" not in got_cut, got_cut[-60:])
-    from qqbot.settings import RetrievalCfg as _RC
-    _tiny = _RC(**{**_rcfg18.model_dump(), "history_chars": 1000, "history_context": 0})
+    from qqbot.settings import SearchHistoryToolCfg as _RC
+    _tiny = _RC(**{
+        **_rcfg18.model_dump(),
+        "max_result_chars": 1000,
+        "context_lines": 0,
+    })
     await seed(123, "u31", "张伟", text="改锥" + "很长的话" * 300)
     got_cut2 = await _tools.search_history(123, "改锥", rcfg=_tiny)
     check("an over-long search answer is cut at a line and says so",
@@ -2235,7 +2282,6 @@ async def main():
             self.fail_text = None
             self.fail_reply_text = None
             self.failed_reply = False
-            self.message_ids = itertools.count(970001)
 
         async def send_group_msg(self, *, group_id, message):
             text = "".join(
@@ -2254,12 +2300,12 @@ async def main():
             ):
                 self.failed_reply = True
                 raise ActionFailed("quoted message is gone")
-            await super().send_group_msg(group_id=group_id, message=message)
-            return {"message_id": next(self.message_ids)}
+            return await super().send_group_msg(group_id=group_id, message=message)
 
     _batch_bot19 = _BatchBot19()
     _batch_state19 = type(st_pv)(group_id="5701")
     _batch_state19.loaded = _batch_state19.history_loaded = True
+    REGISTRY._groups["5701"] = _batch_state19
     _eng.generate = _generate19
     try:
         _before_clean19 = len(_batch_bot19.attempted)
@@ -2335,7 +2381,7 @@ async def main():
         check(
             "batch evidence is stored only on the first delivered message",
             _evidence19
-            and [message.text for message in _evidence_lines19] == ["E1", "[骰子]"]
+            and [message.text for message in _evidence_lines19] == ["E1", "⟦骰子⟧"]
             and list(_stored19) == [_evidence_lines19[0].msg_id],
             repr(_stored19),
         )

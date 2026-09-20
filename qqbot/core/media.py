@@ -192,7 +192,7 @@ class MediaProcessor:
 
     def _client(self) -> httpx.AsyncClient:
         # Rebuilt when the deadline changes, so a /reload applies without a restart.
-        timeout = config().default.gateway.media_http_timeout_sec
+        timeout = config().default.media.http_timeout_sec
         if self._http is None or self._http_timeout != timeout:
             if self._http is not None:
                 retire(self._http.aclose())
@@ -202,14 +202,14 @@ class MediaProcessor:
 
     @staticmethod
     async def _call(bot: BotApi, api: str, **params):
-        """One protocol-side media call under gateway.protocol_call_timeout_sec.
+        """One protocol-side media call under media.protocol_timeout_sec.
 
         The protocol side's own deadline is half a minute, and a file the platform
         can no longer serve does not fail there, it hangs - a reply would stand
         still for the whole of it.
         """
         return await asyncio.wait_for(
-            bot.call_api(api, **params), timeout=config().default.gateway.protocol_call_timeout_sec
+            bot.call_api(api, **params), timeout=config().default.media.protocol_timeout_sec
         )
 
     @staticmethod
@@ -341,7 +341,7 @@ class MediaProcessor:
 
     async def _bytes_once(self, ref: ImageRef, *, bot, max_bytes: int) -> bytes | None:
         key = ref.key or ref.file or ref.url or ""
-        hold = config().default.gateway.unreadable_retry_sec
+        hold = config().default.media.unreadable_retry_sec
         now = time.monotonic()
         failed_at = self._unreadable.get(key) if key else None
         if failed_at is not None and now - failed_at < hold:

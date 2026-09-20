@@ -80,8 +80,10 @@ message arrives
  |- in the task: daily budget -> block list -> mute -> user agreement
  |- retrieval: member roster (everyone who has appeared, with known facts), group knowledge
  |- prompt assembly
- |- tool loop until the model calls send_message
- |- clean the text, send it with the @s and reply it asked for, archive the bot's own line
+ |- tool loop until the model calls send_messages
+ |- clean the text and deliver the @s, replies and content it requested
+ |- NapCat reports the displayed self message through the same receive path
+    -> mark it as bot-authored, window and archive it, never dispatch a reply
 ```
 
 Every message that addresses the bot gets its own task, running concurrently with any
@@ -116,17 +118,17 @@ with budget.scope(per_reply_cny):
     loop:
         call the model with every tool offered
         reject a failed, incomplete or unterminated response before any tool can run
-        a send_message call -> return it (other calls in the same round are not run)
+        a send_messages call -> return it (other calls in the same round are not run)
         no function calls, only text -> log it and end in silence
         append every output item unchanged (reasoning included only in this task)
         execute or refuse every function call and append one output with its call_id
         per-reply cap spent or monthly search allowance exhausted -> one final round
-            offered only send_message
+            offered only send_messages
 ```
 
 The first round always runs. A cap that trips mid-reply does not discard the reply:
 outstanding tool requests receive a placeholder result and one final round, offered only
-`send_message`, answers from what was already fetched, so the overshoot is exactly one
+`send_messages`, answers from what was already fetched, so the overshoot is exactly one
 round. A transport
 failure is reported to the model as a failure and the loop continues; a broken network
 is an error, not a limit. A configurable round cap exists only as a tripwire against a
@@ -134,7 +136,7 @@ backend that bills zero.
 
 ### Sending
 
-A reply is one terminal call to `send_message`. Its `messages` array contains an ordered,
+A reply is one terminal call to `send_messages`. Its `messages` array contains an ordered,
 globally bounded sequence of independent QQ messages. Each item's `content` is an ordered
 sequence of closed NapCat-style segments, so an `at` or `reply` can appear exactly where it
 belongs rather than being hoisted into a parallel field:
@@ -175,7 +177,7 @@ carries them.
 
 | Tool | What it does |
 | --- | --- |
-| `send_message` | Sends the reply and ends the loop (see above). |
+| `send_messages` | Sends the reply and ends the loop (see above). |
 | `web_search` | Web search through the configured search backend. Debits the monthly allowance. |
 | `read_url` | The readable text of one page, bounded in characters. Debits the same allowance. |
 | `search_history` | Boolean search over this group's archive. Lucene syntax parsed by luqum: space means AND, `OR`, `-` exclusion, parentheses, quoted phrases. Only the boolean subset is accepted; fields and ranges are refused in words. The query compiles to one parameterised `ILIKE` expression. Narrowable by speaker (a member number, or a display name for someone the prompt shows no number for) and by days. Each hit is returned with surrounding lines, touching windows merged, and the whole answer is bounded in characters with a note when cut. |
@@ -282,13 +284,17 @@ names only. A real platform mention of the bot renders as `@name⟦0⟧`; member
 `@我` remains ordinary text. Members' other @-mentions keep their account identity and
 receive the target's prompt-local positive number during projection.
 
-The bot's own messages are rendered in the history as the `send_message` calls that sent
-them (ordered text and control segments), each followed by a tool result carrying only the
-message's line number and send time. Unexpired structured evidence, when present, is rendered
-as a separate assistant block immediately before that call. In the archive, the bot's line
-reads exactly as the group saw it, `@name` openings included, with the @-ed accounts kept as
-`at` segments so a restart rebuilds the same window. Retired permanent evidence tails on
-legacy rows are removed by the shared archive projection and never reach prompts or searches.
+The bot's own messages are rendered in the history as the `send_messages` calls that
+requested them (ordered text and control segments). Each is followed by a tool result
+carrying the message's line number and send time; when QQ transformed the request, that
+result also states the platform-visible reading. Unexpired structured evidence, when
+present, is rendered as a separate assistant block immediately before that call. NapCat's
+reported self event is the only source for the live window and archive, so random dice and
+RPS results and other platform transformations are preserved without send-side lookups.
+In the archive, the bot's line reads exactly as the group saw it, `@name` openings
+included, with the @-ed accounts kept as `at` segments so a restart rebuilds the same
+window. Retired permanent evidence tails on legacy rows are removed by the shared archive
+projection and never reach prompts or searches.
 
 ## Pictures and voice
 

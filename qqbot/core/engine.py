@@ -18,18 +18,14 @@ checked before anything is spent, means silence.
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
-import uuid
-from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from datetime import timedelta
 from urllib.parse import urlsplit, urlunsplit
 
 from ..db import repo
 from ..domain.evidence import EvidenceItem, EvidenceMemo, EvidenceOutcome, EvidenceSource
-from ..gateway.ingest import ingestor
 from ..providers import providers
 from ..settings import Persona, Settings
 from ..util import SYS_L, SYS_R, defang, now_local, why
@@ -265,10 +261,8 @@ def _clean_outbound(
 @dataclass(frozen=True, slots=True)
 class _DeliveredMessage:
     msg_id: str
-    text: str
     segments: tuple[OutboundSegment, ...]
     reply_to: str
-    addressees: tuple[tuple[str, str], ...]
 
 
 async def _deliver_one(
@@ -276,7 +270,6 @@ async def _deliver_one(
     *,
     group_id: str,
     segments: tuple[OutboundSegment, ...],
-    names: dict[str, str],
 ) -> _DeliveredMessage | None:
     """Deliver one message, retrying a rejected reply segment once."""
 
@@ -309,17 +302,10 @@ async def _deliver_one(
             log.warning("group %s: send failed: %s", group_id, why(retry_exc))
             return None
 
-    addressees = tuple(
-        (segment.account, names[segment.account])
-        for segment in sent_segments
-        if isinstance(segment, AtSegment)
-    )
     return _DeliveredMessage(
-        msg_id=str((sent or {}).get("message_id") or f"self-{uuid.uuid4().hex}"),
-        text=display_text(sent_segments, names=names),
+        msg_id=str((sent or {}).get("message_id") or ""),
         segments=sent_segments,
         reply_to=reply_to,
-        addressees=addressees,
     )
 
 
@@ -331,14 +317,8 @@ async def respond(
     persona: Persona,
     msg: ChatMsg,
     window: list[ChatMsg] | None = None,
-    track: Callable[[Coroutine], asyncio.Task] | None = None,
 ) -> bool:
-    """Generate and deliver one terminal reply batch.
-
-    `track` registers each delivered message's record task with whoever waits out loose
-    work at shutdown, so the pool is not closed under it. Without one, the record runs
-    as a bare task.
-    """
+    """Generate and deliver one terminal reply batch."""
     try:
         reply = await generate(bot=bot, st=st, cfg=cfg, persona=persona, msg=msg, window=window)
     except Exception as e:
@@ -364,7 +344,7 @@ async def respond(
         _clean_outbound(
             message.segments,
             names=names,
-            max_text_chars=cfg.gateway.max_msg_len,
+            max_text_chars=cfg.tools.send_messages.max_text_chars_per_message,
         )
         for message in reply.messages
     )
@@ -376,13 +356,13 @@ async def respond(
         return False
 
     delivered_count = 0
+    evidence_msg_id = ""
     async with st.delivery_lock:
         for index, segments in enumerate(messages):
             delivered = await _deliver_one(
                 bot,
                 group_id=st.group_id,
                 segments=segments,
-                names=names,
             )
             if delivered is None:
                 log.warning(
@@ -393,23 +373,23 @@ async def respond(
                 )
                 break
 
-            # The message is visible now; record it before attempting the next batch
-            # item. Evidence belongs to the first delivered message only.
-            record = _record(
-                bot,
-                st,
-                persona,
-                msg_id=delivered.msg_id,
-                text=delivered.text,
-                segments=delivered.segments,
-                evidence=reply.evidence if delivered_count == 0 else None,
-                reply_to=delivered.reply_to,
-                addressees=delivered.addressees,
-            )
-            await asyncio.shield(track(record) if track else asyncio.create_task(record))
+            # Delivery acknowledgement and self-observation are independent. The
+            # reported event will add the canonical platform message to the window
+            # and archive; the send path retains only the ID needed by reply evidence.
+            if delivered_count == 0:
+                evidence_msg_id = delivered.msg_id
+                if not evidence_msg_id:
+                    log.warning(
+                        "group %s: first delivered message returned no message id; "
+                        "reply evidence cannot be attached",
+                        st.group_id,
+                    )
             delivered_count += 1
+            at_count = sum(
+                isinstance(segment, AtSegment) for segment in delivered.segments
+            )
             log.info(
-                "group %s: replied %d/%d (%d text chars, %d segments, %d @, %s)",
+                "group %s: delivered %d/%d (%d text chars, %d segments, %d @, %s)",
                 st.group_id,
                 index + 1,
                 len(messages),
@@ -419,9 +399,15 @@ async def respond(
                     if isinstance(segment, TextSegment)
                 ),
                 len(delivered.segments),
-                len(delivered.addressees),
+                at_count,
                 "replying" if delivered.reply_to else "not replying",
             )
+
+    if delivered_count and reply.evidence is not None and evidence_msg_id:
+        try:
+            await repo.evidence_add(int(st.group_id), evidence_msg_id, reply.evidence)
+        except Exception:
+            log.exception("failed to persist reply evidence in group %s", st.group_id)
 
     return delivered_count > 0
 
@@ -432,55 +418,3 @@ def _expected(e: BaseException) -> bool:
     importable without the SDK's error classes at hand."""
     names = {c.__name__ for c in type(e).__mro__}
     return bool(names & {"APIError", "HTTPError", "TimeoutError", "QuotaExhausted", "OSError"})
-
-
-async def _record(
-    bot: BotApi,
-    st: GroupState,
-    persona: Persona,
-    *,
-    msg_id: str,
-    text: str,
-    segments: tuple[OutboundSegment, ...],
-    evidence: EvidenceMemo | None,
-    reply_to: str,
-    addressees: tuple[tuple[str, str], ...],
-) -> None:
-    """Archive the bot's line and its separately retained evidence memo."""
-    now = now_local()
-    st.add(
-        ChatMsg(
-            msg_id=msg_id,
-            user_id=str(bot.self_id),
-            nickname=persona.name,
-            text=text,
-            ts=now,
-            is_bot=True,
-            reply_to=reply_to or None,
-            at=list(addressees),
-            outbound=segments,
-        )
-    )
-    if evidence is not None:
-        try:
-            await repo.evidence_add(int(st.group_id), msg_id, evidence)
-        except Exception:
-            log.exception("failed to persist reply evidence in group %s", st.group_id)
-    # Archive it like any other message. NapCat is configured not to report the bot's
-    # own messages, so nothing else ever writes them down - and the archive feeds both
-    # the restart-rebuilt history and the group card memory reads back, neither of which
-    # may hold only one side of a conversation.
-    try:
-        await ingestor().record_own_reply(
-            group_id=int(st.group_id),
-            self_id=str(bot.self_id),
-            message_id=msg_id,
-            text=text,
-            segments=[to_onebot(segment) for segment in segments],
-            at=now,
-            name=persona.name,
-            reply_to=reply_to,
-            addressees=list(addressees),
-        )
-    except Exception:
-        log.exception("failed to archive the bot's own reply in group %s", st.group_id)

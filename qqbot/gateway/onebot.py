@@ -110,6 +110,17 @@ class GroupMessage:
 
         reply = getattr(event, "reply", None)
         when = getattr(event, "time", 0) or 0
+        author_id = str(event.user_id)
+        author_kind = (
+            AuthorKind.BOT if author_id == str(self_id) else AuthorKind.MEMBER
+        )
+        sender = Sender.parse(
+            getattr(event.sender, "__dict__", None) or dict(event.sender or {}),
+            fallback_id=author_id,
+        )
+        # The top-level author is part of the event contract; nested sender metadata is
+        # descriptive and must not be able to disguise or fabricate self authorship.
+        sender = replace(sender, user_id=author_id)
         segments = [
             {
                 "type": str(getattr(segment, "type", "") or ""),
@@ -120,10 +131,7 @@ class GroupMessage:
         return cls(
             message_id=str(event.message_id),
             group_id=int(event.group_id),
-            sender=Sender.parse(
-                getattr(event.sender, "__dict__", None) or dict(event.sender or {}),
-                fallback_id=str(event.user_id),
-            ),
+            sender=sender,
             segments=scrub_nul(segments),
             self_id=str(self_id),
             occurred_at=(datetime.fromtimestamp(when, tz()) if when else now_local()),
@@ -133,6 +141,8 @@ class GroupMessage:
                 if reply is not None
                 else None
             ),
+            outbound_schema=1 if author_kind is AuthorKind.BOT else 0,
+            author_kind=author_kind,
             to_me=bool(getattr(event, "to_me", False)),
         )
 

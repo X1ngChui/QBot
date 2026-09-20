@@ -36,32 +36,60 @@ trigger:
   # If it ever gets annoying, keep only the unambiguous names - @ still works.
   nicknames: ["小X", "小叉", "叉子"]
 
-# Gateway controls are global. Persona files cannot override them.
+# OneBot event admission and shutdown behavior.
 gateway:
+  # Seconds a received event ID remains in the live replay filter.
   dedup_ttl_sec: 300
-  max_msg_len: 2000
-  # Independent QQ messages one send_message tool call may submit. They are delivered
-  # in order; each message has its own segment and text limits.
-  max_messages_per_reply: 4
-  # How long a reply waits for a picture or voice clip to be understood before
-  # building the prompt without it. The work is never cancelled - it lands for the
-  # next turn either way - so this only decides whether the person waits or the
-  # answer does.
-  media_wait_sec: 25
-  # How long the group's member list is reused before being fetched again.
-  member_cache_ttl_sec: 1800
-  # Deadline for the protocol side's media calls (get_image, get_record), under
-  # its own half-minute default: a file the platform can no longer serve does not
-  # fail there, it hangs.
-  protocol_call_timeout_sec: 10
-  # Deadline for downloading a picture or a clip from a link.
-  media_http_timeout_sec: 20
-  # How long a picture no route could read is left alone before another attempt.
-  unreadable_retry_sec: 600
-  # How long shutdown waits for in-flight archive writes and media patches.
+  # Seconds shutdown waits for in-flight archive writes and media patches.
   shutdown_wait_sec: 5
-  # There is no group allowlist: the account is a dedicated bot account, and a group is
-  # served from its first message.
+
+media:
+  # Seconds a reply waits for pending media resolution.
+  wait_sec: 25
+  # Seconds allowed for one NapCat media API call.
+  protocol_timeout_sec: 10
+  # Seconds allowed for one media download.
+  http_timeout_sec: 20
+  # Seconds before retrying media previously marked unreadable.
+  unreadable_retry_sec: 600
+
+members:
+  # Seconds a fetched group member list remains fresh.
+  cache_ttl_sec: 1800
+
+tools:
+  # Tool calls allowed in one model round.
+  max_calls_per_round: 8
+  # Maximum model rounds in one tool loop.
+  max_rounds: 20
+  send_messages:
+    # Independent QQ messages allowed in one terminal tool call.
+    max_messages_per_call: 4
+    # Text characters allowed in each QQ message.
+    max_text_chars_per_message: 2000
+  web_search:
+    # Results requested from one search.
+    count: 5
+    # Vendor search depth; advanced requests consume two credits.
+    depth: basic
+  search_history:
+    # Archive lines included before and after each hit.
+    context_lines: 5
+    # Matching archive messages returned by one search.
+    max_hits: 8
+    # Terms accepted in one search expression.
+    max_query_terms: 8
+    # Characters returned by one search.
+    max_result_chars: 12000
+  recall_events:
+    # Episodes included before and after each hit.
+    context_episodes: 2
+  read_url:
+    # Page-text characters returned by one read.
+    max_content_chars: 8000
+  open_images:
+    # Images accepted by one call.
+    max_images: 6
 
 # Five capabilities, each an independent provider with its own endpoint, model and
 # credential, and no automatic fallback between them.
@@ -176,8 +204,6 @@ capabilities:
     provider: tavily
     endpoint: https://api.tavily.com
     credential_env: SEARCH_API_KEY
-    count: 5
-    depth: basic              # 1 credit; "advanced" costs 2
     # One total over every group.
     monthly_quota: 1000       # the free tier; at it search refuses, nothing bills
     # HTTP proxy for the search client only; model traffic stays direct. Empty
@@ -214,7 +240,7 @@ prompt:
   # it: lines in all (nested records count towards the same total), how deep a
   # record inside a record is still expanded, and the characters the whole
   # block may take. Past any bound the rest is summarised as a count. Keep the
-  # character bound under gateway.max_msg_len.
+  # character bound under tools.send_messages.max_text_chars_per_message.
   forward_lines: 20
   forward_depth: 3
   forward_chars: 1500
@@ -225,37 +251,6 @@ prompt:
   evidence_ttl_days: 30
   # Sanitized request summary retained in each evidence item.
   evidence_request_chars: 80
-
-retrieval:
-  # Lines of surrounding conversation around each search_history hit, each way.
-  # Chat is fragments - a matched line is often a bare answer to the line above
-  # it. Costs only prompt tokens (~30/line, evicted next turn); 0 = bare hits.
-  history_context: 5
-  # Same idea for recall_events, in coarser units: episodes this many before and
-  # after each recalled one. An episode covers a whole stretch of conversation,
-  # so a couple either side frames the story. 0 = bare recall.
-  episode_context: 2
-  # How many archive hits one search returns, and how many terms one search
-  # expression may carry. Nothing is paginated: a model that wants more searches
-  # again with better words.
-  history_hits: 8
-  max_query_terms: 8
-  # How much of one page read_url hands the model. The one input with no bound of
-  # its own - past the model's context the request fails outright - and a cut page
-  # is told it was cut.
-  url_content_chars: 8000
-  # How many tool calls one round of the reply loop may carry - each result is
-  # appended to the prompt - and how many pictures one open_images call may fetch.
-  max_tool_calls_per_round: 8
-  open_images_max: 6
-  # How much of one search_history answer the model is handed: hits times context
-  # lines times the per-message bound can outgrow the model's context, where the
-  # request fails outright. A cut answer says so on its last line.
-  history_chars: 12000
-  # A tripwire on the tool loop, not a policy: money ends the loop, and only a
-  # backend billing zero could make it endless. Past this many rounds the reply
-  # is abandoned with an error in the log.
-  max_rounds: 20
 
 # How much the memory pipeline reads, and how fast it lets go. The model that runs
 # extraction is not here - it belongs to the capability doing the work

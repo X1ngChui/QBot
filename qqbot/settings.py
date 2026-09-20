@@ -62,35 +62,79 @@ Effort = Literal["off", "low", "high", "max"]
 
 
 class GatewayCfg(_M):
+    #: How long an event id remains in the live gateway's replay filter.
     dedup_ttl_sec: int = 300
-    #: Longest message text kept on arrival and sent as a reply. Command answers
-    #: reserve a 200-character margin under it for their own framing, so the floor
-    #: keeps them a usable width.
-    max_msg_len: int = Field(2000, ge=400)
-    #: How many independent QQ messages one terminal send_message call may submit.
-    #: Each is validated and length-bounded separately, then delivered in order.
-    max_messages_per_reply: int = Field(4, ge=1)
-    #: How long a reply waits for a picture or a voice clip to be understood before
-    #: building the prompt without it. The work is never cancelled - it lands for the
-    #: next turn either way - so this only decides whether the person waits or the
-    #: answer does.
-    media_wait_sec: float = 25.0
-    #: How long the group's member list is reused before being fetched again. Names
-    #: are read on every message, and the platform call is the expensive part.
-    member_cache_ttl_sec: int = 1800
-    #: Deadline for the protocol side's media calls (get_image, get_record),
-    #: under its own half-minute default. A picture the platform
-    #: can no longer serve does not fail there, it hangs - and a reply would stand
-    #: still for the whole of it.
-    protocol_call_timeout_sec: float = Field(10.0, gt=0)
-    #: Deadline for downloading a picture or a clip from a link.
-    media_http_timeout_sec: float = Field(20.0, gt=0)
-    #: How long a picture no route could read is left alone before another attempt:
-    #: one dead picture must not cost every reply that looks at it a full timeout.
-    unreadable_retry_sec: int = Field(600, ge=0)
     #: How long shutdown waits for in-flight archive writes and media patches. They
     #: are never cancelled, only waited for; a hung one must not hold a deploy.
     shutdown_wait_sec: float = Field(5.0, ge=0)
+
+
+class MediaCfg(_M):
+    """Timing and retry policy for media resolution."""
+
+    #: How long a reply waits for a picture or voice clip before building the
+    #: prompt without it. Resolution continues for the next turn either way.
+    wait_sec: float = 25.0
+    #: Deadline for protocol-side media calls such as get_image and get_record.
+    protocol_timeout_sec: float = Field(10.0, gt=0)
+    #: Deadline for downloading a picture or clip from a link.
+    http_timeout_sec: float = Field(20.0, gt=0)
+    #: How long an unreadable picture rests before another attempt.
+    unreadable_retry_sec: int = Field(600, ge=0)
+
+
+class MembersCfg(_M):
+    """Caching policy for platform member metadata."""
+
+    cache_ttl_sec: int = Field(1800, ge=0)
+
+
+class SendMessagesCfg(_M):
+    """Bounds enforced by the terminal send_messages tool."""
+
+    #: Independent QQ messages one terminal call may submit.
+    max_messages_per_call: int = Field(4, ge=1)
+    #: Text characters allowed in each QQ message.
+    max_text_chars_per_message: int = Field(2000, ge=400)
+
+
+class WebSearchToolCfg(_M):
+    #: Results requested from one search; Tavily accepts at most 20.
+    count: int = Field(5, ge=1, le=20)
+    #: Vendor search depth; advanced requests consume two credits instead of one.
+    depth: Literal["basic", "advanced"] = "basic"
+
+
+class SearchHistoryToolCfg(_M):
+    context_lines: int = Field(5, ge=0)
+    max_hits: int = Field(8, ge=1)
+    max_query_terms: int = Field(8, ge=1)
+    max_result_chars: int = Field(12000, ge=1000)
+
+
+class RecallEventsToolCfg(_M):
+    context_episodes: int = Field(2, ge=0)
+
+
+class ReadUrlToolCfg(_M):
+    max_content_chars: int = Field(8000, ge=500)
+
+
+class OpenImagesToolCfg(_M):
+    max_images: int = Field(6, ge=1)
+
+
+class ToolsCfg(_M):
+    #: Calls one model round may request before later calls are refused in-band.
+    max_calls_per_round: int = Field(8, ge=1)
+    #: Safety tripwire for a tool loop whose model backend reports no spend.
+    max_rounds: int = Field(20, ge=1)
+    send_messages: SendMessagesCfg = Field(default_factory=SendMessagesCfg)
+    web_search: WebSearchToolCfg = Field(default_factory=WebSearchToolCfg)
+    search_history: SearchHistoryToolCfg = Field(default_factory=SearchHistoryToolCfg)
+    recall_events: RecallEventsToolCfg = Field(default_factory=RecallEventsToolCfg)
+    read_url: ReadUrlToolCfg = Field(default_factory=ReadUrlToolCfg)
+    open_images: OpenImagesToolCfg = Field(default_factory=OpenImagesToolCfg)
 
 
 class PromptCfg(_M):
@@ -112,7 +156,8 @@ class PromptCfg(_M):
     #: it: lines in all (nested records count towards the same total), how deep a
     #: record inside a record is still expanded, and the characters the whole block
     #: may take. Past any of them the rest is summarised as a count. The character
-    #: bound must sit under gateway.max_msg_len, or the message's own cut would take
+    #: bound must sit under tools.send_messages.max_text_chars_per_message, or the
+    #: message's own cut would take
     #: the block's tail - and with it picture markers whose numbers were already
     #: handed out.
     forward_lines: int = Field(20, ge=1)
@@ -252,12 +297,6 @@ class SearchCfg(_ProviderCfg):
     provider: Literal["tavily"]
     endpoint: str
     credential_env: str = "SEARCH_API_KEY"
-    #: Results per search; the vendor takes at most 20.
-    count: int = Field(5, ge=1, le=20)
-    #: Result depth the vendor is asked for; "basic" is one credit, "advanced" two.
-    #: Closed on purpose: the credit booking keys on the exact word, and a
-    #: misspelling would be metered as basic while the vendor charged advanced.
-    depth: Literal["basic", "advanced"] = "basic"
     #: The free tier's credit allowance per calendar month. At it search refuses; there
     #: is no paid fallback.
     monthly_quota: int = Field(1000, ge=0)
@@ -312,50 +351,6 @@ class BudgetCfg(_M):
     #: what was already paid for. Only the daily cap, checked before anything is spent,
     #: means silence.
     per_reply_cny: float = Field(0.30, ge=0)
-
-
-class RetrievalCfg(_M):
-    #: Lines of surrounding conversation each search_history hit carries - this
-    #: many before and this many after, windows merged into one block when hits
-    #: sit close. Chat is written in fragments: the matched line is routinely a
-    #: bare answer to the line above it, and the archive has no other way to
-    #: read "around" a hit. Context is fetched by SQL, so the only cost is
-    #: prompt tokens (roughly thirty a line) in a result that evicts next turn.
-    #: 0 restores bare hits.
-    history_context: int = 5
-    #: Same idea for recall_events, in coarser units: episodes this many before
-    #: and after each recalled one, by group time order. An episode summarises a
-    #: whole stretch of conversation, so a couple either side already frames the
-    #: story ("what led to this, what came of it"); undated episodes stand
-    #: alone. 0 restores bare recall.
-    episode_context: int = 2
-    #: How many archive hits one search returns. A model that wants more searches
-    #: again with better words; nothing here is paginated.
-    history_hits: int = Field(8, ge=1)
-    #: Terms one search expression may carry. Past this the question wants splitting
-    #: into two searches - a query is a filter, not a program.
-    max_query_terms: int = Field(8, ge=1)
-    #: How much of one page read_url hands the model. The one input with no bound of
-    #: its own: a web page can be any size, and past the model's context the request
-    #: fails outright rather than degrading. A cut page is told it was cut.
-    url_content_chars: int = Field(8000, ge=500)
-    #: How many tool calls one round of the reply loop may carry. Each result is
-    #: appended to the prompt, and a round asking for thirty pages at once would
-    #: grow the next request past the model's context before money had a chance to
-    #: bind. The rest of the round is answered with a note.
-    max_tool_calls_per_round: int = Field(8, ge=1)
-    #: How many pictures one open_images call may fetch; each is a file block in the
-    #: next request.
-    open_images_max: int = Field(6, ge=1)
-    #: How much of one search_history answer the model is handed. Hits are bounded
-    #: by count and each line by gateway.max_msg_len, but their product can still
-    #: outgrow the model's context, where the request fails outright rather than
-    #: degrading. A cut answer is told it was cut.
-    history_chars: int = Field(12000, ge=1000)
-    #: A tripwire on the tool loop, not a policy: money ends the loop, and only a
-    #: backend reporting zero cost could make a money-bounded loop unbounded. Past
-    #: this many rounds the reply is abandoned with an error in the log.
-    max_rounds: int = Field(20, ge=1)
 
 
 class MemoryCfg(_M):
@@ -614,10 +609,12 @@ class Settings(_M):
     timezone: str = "Asia/Shanghai"
     trigger: TriggerCfg = Field(default_factory=TriggerCfg)
     gateway: GatewayCfg = Field(default_factory=GatewayCfg)
+    media: MediaCfg = Field(default_factory=MediaCfg)
+    members: MembersCfg = Field(default_factory=MembersCfg)
+    tools: ToolsCfg = Field(default_factory=ToolsCfg)
     capabilities: CapabilitiesCfg
     budget: BudgetCfg = Field(default_factory=BudgetCfg)
     prompt: PromptCfg = Field(default_factory=PromptCfg)
-    retrieval: RetrievalCfg = Field(default_factory=RetrievalCfg)
     memory: MemoryCfg = Field(default_factory=MemoryCfg)
     schedule: ScheduleCfg = Field(default_factory=ScheduleCfg)
     database: DatabaseCfg = Field(default_factory=DatabaseCfg)
@@ -734,20 +731,19 @@ SETTING_CONTRACTS = (
         ("gateway", "dedup_ttl_sec"), SettingScope.GLOBAL_RELOADABLE
     ),
     SettingContract(
-        ("gateway", "max_messages_per_reply"), SettingScope.GLOBAL_RELOADABLE
+        ("tools", "send_messages"), SettingScope.GLOBAL_RELOADABLE
     ),
     SettingContract(
-        ("gateway", "member_cache_ttl_sec"), SettingScope.GLOBAL_RELOADABLE
+        ("members", "cache_ttl_sec"), SettingScope.GLOBAL_RELOADABLE
     ),
     SettingContract(
-        ("gateway", "protocol_call_timeout_sec"),
-        SettingScope.GLOBAL_RELOADABLE,
+        ("media", "protocol_timeout_sec"), SettingScope.GLOBAL_RELOADABLE
     ),
     SettingContract(
-        ("gateway", "media_http_timeout_sec"), SettingScope.GLOBAL_RELOADABLE
+        ("media", "http_timeout_sec"), SettingScope.GLOBAL_RELOADABLE
     ),
     SettingContract(
-        ("gateway", "unreadable_retry_sec"), SettingScope.GLOBAL_RELOADABLE
+        ("media", "unreadable_retry_sec"), SettingScope.GLOBAL_RELOADABLE
     ),
     SettingContract(
         ("gateway", "shutdown_wait_sec"), SettingScope.GLOBAL_RELOADABLE

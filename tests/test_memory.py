@@ -28,6 +28,7 @@ from qqbot.core import retrieval
 from qqbot.db import close_pool, init_pool, pool
 from qqbot.gateway.ingest import ingestor
 from qqbot.repositories.event import EventRepository
+from qqbot.domain.archive import AuthorKind
 from qqbot.gateway.onebot import GroupMessage, Sender
 from qqbot.providers import (AsrModel, Providers, SearchEngine, TextModel,
                              VisionModel, set_providers)
@@ -122,7 +123,7 @@ class Unused(VisionModel, AsrModel, SearchEngine):
     async def transcribe(self, data, *, cfg, fmt="wav", seconds=None, group_id=None):
         raise AssertionError("not reached")
 
-    async def search(self, query, *, cfg, group_id=None):
+    async def search(self, query, *, cfg, options, group_id=None):
         raise AssertionError("not reached")
 
     async def aclose(self):
@@ -349,9 +350,13 @@ async def main():
     # gives the bot an entity, so it can never take a code) and out of
     # evidence (own=True lines are skipped by source_of, so a candidate
     # quoting one dies in validation).
-    await ingestor().record_own_reply(
-        group_id=G, self_id="999", message_id="b1", text="我也在玩鸣潮",
-        at=now_local(), name="小X")
+    await ingestor().ingest(GroupMessage(
+        message_id="b1", group_id=G,
+        sender=Sender(user_id="999", nickname="小X"),
+        segments=[{"type": "text", "data": {"text": "我也在玩鸣潮"}}],
+        self_id="999", occurred_at=now_local(), plain_text="我也在玩鸣潮",
+        outbound_schema=1, author_kind=AuthorKind.BOT,
+    ))
     await settle("b1")
     _codes, _roster, lines = await w._render(G, await pool().fetch(
         """SELECT id, platform_user_id, occurred_at, payload, plain_text FROM raw_event
@@ -450,12 +455,12 @@ async def main():
     # the word, and "what did X say about Y" needs the person, not the topic.
     # Bare-hit mode for the pin: with context on, the other speaker's line would
     # legitimately come back as the hit's surroundings.
-    _rcfg = config().default.retrieval
-    _ctx_saved, _rcfg.history_context = _rcfg.history_context, 0
+    _rcfg = config().default.tools.search_history
+    _ctx_saved, _rcfg.context_lines = _rcfg.context_lines, 0
     by_person = await tools_mod.execute(
         _call("search_history", query="切片", speaker_name="小北"),
         cfg=config().default, group_id=str(G))
-    _rcfg.history_context = _ctx_saved
+    _rcfg.context_lines = _ctx_saved
     check("a speaker filter keeps only that person's lines",
           "老周你那个切片做完没" in by_person and "采样切成小段" not in by_person,
           by_person)
@@ -505,9 +510,13 @@ async def main():
     from qqbot.gateway.ingest import ingestor as _ing2
     from qqbot.services import ExtractionInput as _EI
 
-    await _ing2().record_own_reply(group_id=G, self_id="999", message_id="own-1",
-                                   text="切片记得用新采样", at=now_local(),
-                                   name="小X")
+    await _ing2().ingest(GroupMessage(
+        message_id="own-1", group_id=G,
+        sender=Sender(user_id="999", nickname="小X"),
+        segments=[{"type": "text", "data": {"text": "切片记得用新采样"}}],
+        self_id="999", occurred_at=now_local(), plain_text="切片记得用新采样",
+        outbound_schema=1, author_kind=AuthorKind.BOT,
+    ))
     await settle("own-1")
     _rows3 = await pool().fetch(
         """SELECT id, platform_user_id, occurred_at, payload, plain_text FROM raw_event

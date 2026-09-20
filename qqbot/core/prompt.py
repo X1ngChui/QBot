@@ -41,6 +41,7 @@ from .outbound import (
     ReplySegment,
     RpsSegment,
     TextSegment,
+    display_text,
 )
 from .state import ChatMsg, GroupState
 from .tools import SEND
@@ -459,6 +460,13 @@ def own_line(
         args = {"messages": [{"content": content}]}
     call_id = ToolCallId(_call_id(m.msg_id))
     result = f"已发送：#{nums.get(m.msg_id, 0)} {sysmark(fmt_when(m.ts))}"
+    if m.outbound:
+        requested = display_text(m.outbound, names=dict(m.at))
+        if body and body != requested:
+            # Keep the call as the legal request, and report any platform-produced
+            # transformation separately. Random results are one case; this also
+            # covers future segment types whose displayed form is chosen by QQ.
+            result += f"\n平台显示：{body}"
     out: list[PromptItem] = []
     if evidence:
         out.append(Message(Role.ASSISTANT, evidence))

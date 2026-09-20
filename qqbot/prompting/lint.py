@@ -26,7 +26,10 @@ def lint_catalog(catalog: PromptCatalog, cfg: Settings) -> list[str]:
 
     send = send_def(cfg)
     message_schema = send.parameters["properties"]["messages"]
-    if message_schema.get("maxItems") != cfg.gateway.max_messages_per_reply:
+    if (
+        message_schema.get("maxItems")
+        != cfg.tools.send_messages.max_messages_per_call
+    ):
         errors.append("send message batch limit differs from global configuration")
     segment_schemas = (
         message_schema["items"]["properties"]["content"]["items"]["anyOf"]
@@ -53,32 +56,32 @@ def lint_catalog(catalog: PromptCatalog, cfg: Settings) -> list[str]:
         )
 
     rendered_send = catalog.render(
-        PromptKey.TOOL_SEND_MESSAGE,
+        PromptKey.TOOL_SEND_MESSAGES,
         face_catalog="、".join(
             f"{face_id}={label}" for face_id, label in FACE_NAMES.items()
         ),
-        message_limit=str(cfg.gateway.max_messages_per_reply),
+        message_limit=str(cfg.tools.send_messages.max_messages_per_call),
     )
     if "{{face_catalog}}" in rendered_send or "{{message_limit}}" in rendered_send:
-        errors.append("tool_send_message left a dynamic slot unresolved")
+        errors.append("tool_send_messages left a dynamic slot unresolved")
     hidden_segments = ("music", "music_custom", "json")
     exposed_hidden = [name for name in hidden_segments if name in rendered_send]
     if exposed_hidden:
         errors.append(
-            "tool_send_message exposes hidden historical segment type(s): "
+            "tool_send_messages exposes hidden historical segment type(s): "
             + ", ".join(exposed_hidden)
         )
     standalone_segments = ("dice", "rps", "contact_member", "contact_group")
     if not all(name in rendered_send for name in standalone_segments):
-        errors.append("tool_send_message omits a parameter-only segment type")
+        errors.append("tool_send_messages omits a parameter-only segment type")
     if not any(word in rendered_send for word in ("单独", "独占", "唯一消息段")):
-        errors.append("tool_send_message does not state the standalone segment rule")
+        errors.append("tool_send_messages does not state the standalone segment rule")
     if not all(f"{face_id}={label}" in rendered_send for face_id, label in FACE_NAMES.items()):
-        errors.append("tool_send_message does not expose the complete fixed face catalog")
+        errors.append("tool_send_messages does not expose the complete fixed face catalog")
 
     reply_names = {tool.name for tool in tool_defs(cfg)}
     if reply_names != {
-        "send_message",
+        "send_messages",
         "web_search",
         "search_history",
         "recall_events",

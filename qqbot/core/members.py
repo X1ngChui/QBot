@@ -36,7 +36,7 @@ class MemberDirectory:
         self._missing: dict[str, set[str]] = {}
 
     def _fresh(self, group_id: str) -> bool:
-        ttl = config().default.gateway.member_cache_ttl_sec
+        ttl = config().default.members.cache_ttl_sec
         return time.monotonic() - self._fetched.get(group_id, 0.0) < ttl
 
     async def _fetch(self, bot: BotApi, group_id: str, *, force: bool = False) -> None:

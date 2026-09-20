@@ -38,7 +38,7 @@ def check(name, cond, detail=""):
 
 # ---- config
 b = config()
-check("config loads", b.default.gateway.max_msg_len == 2000,
+check("config loads", b.default.tools.send_messages.max_text_chars_per_message == 2000,
       f"nicknames={b.default.trigger.nicknames}")
 check("persona loaded", "default" in b.personas, str(list(b.personas)))
 cfg, persona = b.for_group("12345")
@@ -352,7 +352,7 @@ from qqbot.providers.contracts import (
 )
 _qcall = _qh[1] if isinstance(_qh[1], _PromptCall) else None
 check("the bot's own line renders as its send call",
-      _qcall is not None and _qcall.name == "send_message"
+      _qcall is not None and _qcall.name == "send_messages"
       and json.loads(_qcall.arguments or "{}")
       == {"messages": [{"content": [
           {"type": "reply", "data": {"line": 1}},
@@ -368,6 +368,22 @@ check("and its result carries only the line number and time",
 check("a member's line keeps its quote mark and wears its member number",
       isinstance(_qh[3], _PromptMessage)
       and "阿花⟦2⟧: ⟦回复 #1⟧" in _qh[3].content, repr(_qh[3]))
+
+from qqbot.core.outbound import DiceSegment as _PromptDice
+_qd = ChatMsg(msg_id="q4", user_id="999", nickname="小X",
+              text="⟦骰子:4点⟧", ts=now_local(), is_bot=True,
+              outbound=(_PromptDice(),))
+_qd_items = prompt.own_line(_qd, nums={"q4": 4}, people=_qp)
+_qd_call, _qd_result = _qd_items[-2:]
+check("an observed random result stays out of the legal send arguments",
+      isinstance(_qd_call, _PromptCall)
+      and json.loads(_qd_call.arguments or "{}")
+      == {"messages": [{"content": [{"type": "dice", "data": {}}]}]},
+      repr(_qd_call))
+check("and the platform result is visible on the historical tool result",
+      isinstance(_qd_result, _PromptResult)
+      and "平台显示：⟦骰子:4点⟧" in str(_qd_result.output),
+      repr(_qd_result))
 
 from qqbot.core.archive import (
     archive_author as _archive_author,
@@ -509,6 +525,21 @@ check("an adapter-stripped self mention is restored on the detached envelope",
       and _gm_with_mention.segments[0] == {
           "type": "at", "data": {"qq": "999", "name": "小X"}
       })
+from qqbot.domain.archive import AuthorKind as _EnvelopeAuthor
+
+
+class _SelfEv(_Ev):
+    user_id = 999
+    sender = {"user_id": 10001, "nickname": "小X", "card": ""}
+
+
+_self_gm = _GM.from_event(_SelfEv(), "999")
+check("top-level authorship classifies a reported self message",
+      _self_gm.author_kind is _EnvelopeAuthor.BOT
+      and _self_gm.outbound_schema == 1
+      and _self_gm.sender.user_id == "999", repr(_self_gm))
+check("nested sender metadata cannot fabricate self authorship",
+      _gm.author_kind is _EnvelopeAuthor.MEMBER and _gm.sender.user_id == "10001")
 
 # The per-line cut never leaves a marker half open: an unbalanced bracket in the
 # window is the one thing defang rules out everywhere else.
@@ -746,7 +777,7 @@ _out_line = ChatMsg(
 def _out_call(content, *more):
     return _PromptCall(
         _OutCallId("send-test"),
-        "send_message",
+        "send_messages",
         json.dumps(
             {"messages": [{"content": item} for item in (content, *more)]},
             ensure_ascii=False,
@@ -1037,14 +1068,14 @@ with _tf.TemporaryDirectory() as _td:
     _pd = _cd / "personas"
     _pd.mkdir(exist_ok=True)
     (_pd / "group_777.yaml").write_text(
-        "system_prompt: 测试人设\ngateway:\n  max_msg_len: 1\n",
+        "system_prompt: 测试人设\ntools:\n  send_messages:\n    max_messages_per_call: 1\n",
         encoding="utf-8")
     try:
         _lb(config_dir=_cd)
         check("settings in a group persona fail the load", False, "it loaded")
     except Exception as e:
         check("settings in a group persona fail the load",
-              "gateway" in str(e), str(e)[:160])
+              "tools" in str(e), str(e)[:160])
     (_pd / "group_777.yaml").unlink()
     del _raw_bundle["templates"]["shared_legend"]
     _bundle_path.write_text(

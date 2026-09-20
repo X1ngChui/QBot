@@ -40,7 +40,7 @@ from qqbot.providers.contracts import (
 )
 from qqbot.settings import config
 
-REVIEW_MODEL = "deepseek-flash"
+REVIEW_MODEL = "deepseek-v4-pro"
 REVIEW_TOOL = "report_prompt_review"
 
 REVIEW_REQUEST = """Review this complete Chinese prompt-template bundle as an Agent and prompt
@@ -151,8 +151,8 @@ async def main() -> int:
         tools=(review_tool(),),
         policy=GenerationPolicy(
             model=REVIEW_MODEL,
-            reasoning=ReasoningEffort.OFF,
-            timeout_sec=max(text_cfg.timeout_sec, 180.0),
+            reasoning=ReasoningEffort.LOW,
+            timeout_sec=max(text_cfg.timeout_sec, 600.0),
             retries=text_cfg.retries,
             max_output_tokens=32000,
         ),

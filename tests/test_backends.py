@@ -154,7 +154,7 @@ def config_checks(settings: Settings) -> None:
         raises(
             ValueError,
             lambda: Persona.model_validate(
-                {"name": "Different", "overrides": {"gateway": {"media_wait_sec": 1}}}
+                {"name": "Different", "overrides": {"media": {"wait_sec": 1}}}
             ),
         )
         is not None,
@@ -214,7 +214,7 @@ def config_checks(settings: Settings) -> None:
             util.tz() == original_timezone,
         )
         hot = settings.model_copy(deep=True)
-        hot.gateway.max_msg_len += 1
+        hot.tools.send_messages.max_text_chars_per_message += 1
         hot_bundle = ConfigBundle(hot.model_dump(), {})
         settings_module.load_bundle = lambda: hot_bundle
         applied = settings_module.reload_config()

@@ -88,10 +88,32 @@ def registrations() -> None:
     """
     import ast
     tree = _commands_source()
-    shared = next((ast.literal_eval(node.value) for node in ast.walk(tree)
+    assign = next((node for node in ast.walk(tree)
                    if isinstance(node, ast.Assign)
                    and any(isinstance(t, ast.Name) and t.id == "_CMD" for t in node.targets)),
-                  {})
+                  None)
+    shared = {}
+    if assign is not None and isinstance(assign.value, ast.Dict):
+        shared = {
+            key.value: value.value
+            for key, value in zip(assign.value.keys, assign.value.values, strict=True)
+            if isinstance(key, ast.Constant) and isinstance(value, ast.Constant)
+        }
+    self_rule = bool(
+        assign is not None
+        and isinstance(assign.value, ast.Dict)
+        and any(
+            isinstance(key, ast.Constant)
+            and key.value == "rule"
+            and isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Name)
+            and value.func.id == "Rule"
+            and value.args
+            and isinstance(value.args[0], ast.Name)
+            and value.args[0].id == "_not_self"
+            for key, value in zip(assign.value.keys, assign.value.values, strict=True)
+        )
+    )
     calls = [node for node in ast.walk(tree)
              if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
              and node.func.id == "on_command"]
@@ -111,6 +133,7 @@ def registrations() -> None:
     check("every registration demands a break after the name",
           bool(calls) and all(demands_break(c) for c in calls),
           str([c.args[0].value for c in calls if not demands_break(c)]))
+    check("the shared command rule excludes self-authored events", self_rule)
 
 
 def reload_refusal() -> None:

@@ -28,11 +28,11 @@ from pathlib import Path
 
 from nonebot import on_command
 from nonebot.adapters.onebot.v11 import GroupMessageEvent
-from nonebot.matcher import Matcher, current_bot, current_event
+from nonebot.matcher import Matcher, current_bot
+from nonebot.rule import Rule
 from pydantic import ValidationError
 
 from ..core import agreement, command_catalog, debug, errors, perms
-from ..core.pipeline import note_console_reply
 from ..core.budget import BUDGET, hit_split
 from ..core.members import MEMBERS
 from ..core.nickname import register as register_nicknames
@@ -65,14 +65,14 @@ DROP = "-"
 def _fit(text: str, *, head: bool = True, gid: str | None = None) -> str:
     """Trim to what a single QQ message can carry, saying so rather than just stopping.
 
-    `gid` selects the group's own max_msg_len; without it the global default applies.
+    `gid` selects the group's send-tool text bound; without it the global default applies.
     Sizing by the wrong group's limit re-creates the silent send-side truncation this
     function exists to prevent.
     """
     cfg = config().for_group(gid)[0] if gid else config().default
     # Never below one: at zero the tail slice text[-0:] is the whole text, and a
     # negative limit silently drops the end instead of marking it.
-    limit = max(1, cfg.gateway.max_msg_len - OUT_MARGIN)
+    limit = max(1, cfg.tools.send_messages.max_text_chars_per_message - OUT_MARGIN)
     if len(text) <= limit:
         return text
     kept = text[:limit] if head else text[-limit:]
@@ -139,34 +139,19 @@ async def _own_accounts(event: GroupMessageEvent) -> list[str]:
 
 
 async def _finish(matcher: Matcher, message: str) -> None:
-    """Answer a command by quoting it and @-ing whoever sent it.
+    """Answer a command by quoting and addressing its sender.
 
-    Commands are open to members now, so several people can be talking to the
-    console at once - the same quote-plus-@ shape the chat path uses keeps
-    every answer visibly attached to its question. Refusals stay bare
-    matcher.finish(): an @ with nothing behind it would advertise exactly what
-    the silence hides.
-
-    send-then-finish rather than one finish call: the console's answers enter
-    the window and the archive like any other line the bot speaks (see
-    note_console_reply), and only send returns the platform message id that
-    makes a later quote of the answer resolvable. Recording failure never
-    unsends what the group already saw, so it only logs.
+    The resulting bot-authored event returns through the ordinary gateway, which
+    records exactly what QQ displayed rather than reconstructing it here.
     """
-    sent = await matcher.send(message, at_sender=True, reply_message=True)
-    try:
-        bot, event = current_bot.get(), current_event.get()
-        gid = str(getattr(event, "group_id", ""))
-        await note_console_reply(
-            group_id=gid, self_id=str(bot.self_id), text=message,
-            message_id=str((sent or {}).get("message_id") or ""),
-            reply_to=str(getattr(event, "message_id", "") or ""),
-            name=config().persona_for(gid).name,
-            addressee=(str(event.user_id),
-                       (await MEMBERS.name_of(bot, gid, str(event.user_id))) or "成员"))
-    except Exception as e:
-        log.warning("command reply not recorded: %s", why(e))
+    await matcher.send(message, at_sender=True, reply_message=True)
     await matcher.finish()
+
+
+async def _not_self(event: GroupMessageEvent) -> bool:
+    """Let self-authored command-shaped text continue to the observation path."""
+
+    return str(event.user_id) != str(event.self_id)
 
 
 # Every name is registered in its own right, and every registration demands a break
@@ -175,7 +160,12 @@ async def _finish(matcher: Matcher, message: str) -> None:
 # starts with, carrying the rest as its argument - /topology as /top, /cards as
 # /card, /whoami as /who - and block=True would keep it from the chat path as well.
 # With force_whitespace such a message matches no command at all.
-_CMD = {"block": True, "priority": 1, "force_whitespace": True}
+_CMD = {
+    "block": True,
+    "priority": 1,
+    "force_whitespace": True,
+    "rule": Rule(_not_self),
+}
 
 agree_cmd = on_command("agree", **_CMD)
 terms_cmd = on_command("terms", **_CMD)

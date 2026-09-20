@@ -15,7 +15,7 @@
         "enable": true,
         "name": "qqbot",
         "url": "ws://bot:8080/onebot/v11/ws",
-        "reportSelfMessage": false,
+        "reportSelfMessage": true,
         "messagePostFormat": "array",
         "token": "",
         "debug": false,

@@ -28,7 +28,7 @@ Although all wording is stored together, role and lifecycle boundaries remain ty
 | `extract_system` | Complete extraction policy | `shared_legend`, `shared_pragmatics`, `predicate_table` |
 | `extract_user` | One extraction batch | `bot_names`, `account_roster`, `known_memory`, `transcript` |
 | `vision_system` | Standalone image description instruction | none |
-| `tool_*` | One model-facing description per code-owned tool schema | only `tool_send_message` has `face_catalog` |
+| `tool_*` | One model-facing description per code-owned tool schema | only `tool_send_messages` has `face_catalog` |
 
 `shared_legend` and `shared_pragmatics` are the only reusable partials. Their source slots
 are declared by the code-owned contract and injected by `PromptCatalog`; runtime callers
@@ -73,7 +73,7 @@ Predicate prose and the extraction tool enum are derived from the same validated
 
 ## Writing and review
 
-`scripts/generate_prompts.py` gives `deepseek-flash` one complete fictional audit
+`scripts/generate_prompts.py` gives `deepseek-v4-pro` one complete fictional audit
 packet and exposes one `write_prompt_bundle` tool requiring every logical key. It does
 not support per-file targets. A mechanically invalid candidate may receive one
 complete-bundle correction; nothing is written until the full catalog passes local

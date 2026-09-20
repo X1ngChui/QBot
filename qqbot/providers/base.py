@@ -26,7 +26,14 @@ from email.utils import parsedate_to_datetime
 
 import httpx
 
-from ..settings import AsrCfg, EmbeddingCfg, SearchCfg, VisionCfg, config
+from ..settings import (
+    AsrCfg,
+    EmbeddingCfg,
+    SearchCfg,
+    VisionCfg,
+    WebSearchToolCfg,
+    config,
+)
 from ..util import why
 from .contracts import (
     AttachmentStore,
@@ -317,9 +324,14 @@ class SearchEngine(Capability):
 
     @abstractmethod
     async def search(
-        self, query: str, *, cfg: SearchCfg, group_id: str | None = None
+        self,
+        query: str,
+        *,
+        cfg: SearchCfg,
+        options: WebSearchToolCfg,
+        group_id: str | None = None,
     ) -> list[dict]:
-        """Return at most cfg.count results, each normalised to {title, link, content}."""
+        """Return normalised {title, link, content} results."""
 
 
 class PageReader(Protocol):

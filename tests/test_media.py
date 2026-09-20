@@ -262,8 +262,8 @@ async def main():
     # A picture the platform can no longer serve does not fail get_image, it hangs;
     # the fetch has its own short deadline, and the picture is then remembered as
     # unreadable so the next reply looking at it does not wait it out again.
-    _gw = config().default.gateway
-    _saved_to, _gw.protocol_call_timeout_sec = _gw.protocol_call_timeout_sec, 0.2
+    _media_cfg = config().default.media
+    _saved_to, _media_cfg.protocol_timeout_sec = _media_cfg.protocol_timeout_sec, 0.2
 
     class HangingBot:
         self_id = "999"
@@ -307,7 +307,7 @@ async def main():
           _got is OVERSIZE and "d" * 32 not in MEDIA._unreadable)
     MEDIA._unreadable.clear()
     MEDIA._fetch = _fetch3
-    _gw.protocol_call_timeout_sec = _saved_to
+    _media_cfg.protocol_timeout_sec = _saved_to
 
     check("mime sniffed from bytes beats the file name",
           _mime(b"GIF89a....", "x.image") == "image/gif"

@@ -21,11 +21,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import uuid
 from dataclasses import replace
 from datetime import datetime
 
 from ..db import repo
+from ..domain.archive import AuthorKind
 from ..gateway.ingest import ingestor
 from ..gateway.onebot import GroupMessage, Sender
 from ..settings import Settings, config
@@ -36,39 +36,12 @@ from .budget import BUDGET
 from .command_catalog import PREFIXES as COMMANDS
 from .media import MEDIA
 from .members import MEMBERS
+from .outbound import from_onebot
 from .ratelimit import DedupSet
 from .segments import ParsedMessage, at_mentions, parse_segments
 from .state import REGISTRY, ChatMsg
 
 log = logging.getLogger("qqbot.pipeline")
-
-
-async def note_console_reply(*, group_id: str | int, self_id: str, text: str,
-                             message_id: str = "", reply_to: str = "",
-                             name: str = "",
-                             addressee: tuple[str, str] | None = None) -> None:
-    """A command's answer, entered into the window and the archive like any
-    other line the bot speaks.
-
-    Off the record, /who's card or /stats' table would land in the group but reach
-    neither the window nor L0, and the next question about it ("what does that note
-    mean?") would meet a model that had never seen it - the one speaker in the room
-    whose words vanish. Both writes mirror the engine's own send path, the @ of
-    the asker included (`addressee` is their account and display name): it is
-    what the group read, and what tells a later turn whom the answer was for. A
-    missing platform id falls back to a synthetic one, which costs only the
-    quote-pointer render if someone replies to that exact message.
-    """
-    now = now_local()
-    mid = message_id or f"cmd-{uuid.uuid4().hex[:12]}"
-    at = [addressee] if addressee and addressee[0] else []
-    if (st := REGISTRY.loaded(str(group_id))) is not None:
-        st.add(ChatMsg(msg_id=mid, user_id=str(self_id), nickname=name,
-                       text=text, ts=now, is_bot=True, reply_to=reply_to or None,
-                       at=list(at)))
-    await ingestor().record_own_reply(
-        group_id=int(group_id), self_id=str(self_id), message_id=mid,
-        text=text, at=now, name=name, reply_to=reply_to, addressees=at)
 
 
 class Inbound:
@@ -143,7 +116,8 @@ class Gateway:
         )
         inbound = inbound.with_bot_mention(self_name)
 
-        if self._dedup_set().seen(inbound.message_id):
+        dedup_key = f"{inbound.group_id}:{inbound.message_id}"
+        if self._dedup_set().seen(dedup_key):
             return
         try:
             await self._admit(bot, inbound, cfg=cfg, self_name=self_name)
@@ -151,7 +125,7 @@ class Gateway:
             # Marked seen, then failed before the message reached the window or
             # the archive: give the mark back, or the adapter's replay of this
             # event is swallowed and the message is neither archived nor answered.
-            self._dedup_set().discard(inbound.message_id)
+            self._dedup_set().discard(dedup_key)
             raise
 
     async def _admit(
@@ -199,30 +173,42 @@ class Gateway:
         is_command = bool(text.strip()) and text.split(maxsplit=1)[0] in COMMANDS
         if not text and not parsed.refs:
             return
-        text = cut_text(text, cfg.gateway.max_msg_len)
+        text = cut_text(text, cfg.tools.send_messages.max_text_chars_per_message)
 
-        nickname = display_name(
-            inbound.sender.card,
-            inbound.sender.nickname,
-            "成员",
+        is_bot = inbound.author_kind is AuthorKind.BOT
+        nickname = (
+            self_name
+            if is_bot
+            else display_name(inbound.sender.card, inbound.sender.nickname, "成员")
         )
+        direct_mentions = at_mentions(
+            segments,
+            self_id=self_id,
+            self_name=self_name,
+        )
+        if is_bot and direct_mentions:
+            accounts = [account for account, _ in direct_mentions]
+            live_names = await MEMBERS.names_of(bot, group_id, accounts)
+            direct_mentions = [
+                (account, label or live_names.get(account) or "成员")
+                for account, label in direct_mentions
+            ]
         msg = ChatMsg(
             msg_id=msg_id,
             user_id=user_id,
             nickname=nickname,
             text=text,
             ts=inbound.occurred_at,
-            is_owner=user_id in cfg.owners,
+            is_bot=is_bot,
+            is_owner=not is_bot and user_id in cfg.owners,
             reply_to=parsed.reply_to,
             # Kept beyond the describe: pending is unpaid work and gets cleared,
             # but the references stay for the window's lifetime so open_images
             # can open any picture by number, forwarded ones included.
             image_refs=parsed.pictures,
-            mentions=at_mentions(
-                segments,
-                self_id=self_id,
-                self_name=self_name,
-            ),
+            mentions=[] if is_bot else direct_mentions,
+            at=direct_mentions if is_bot else [],
+            outbound=from_onebot(segments) if is_bot else (),
         )
 
         # Before this message joins the deque: after a restart the window is rebuilt from
@@ -265,6 +251,13 @@ class Gateway:
                 parsed, msg, bot=bot, group_id=group_id, cfg=cfg,
                 archive_task=archive_task,
             ))
+
+        # Reported self messages are the canonical record of what QQ displayed.
+        # They share parsing, windowing, media resolution and archival with every
+        # other message, then stop before commands, identity-driven dispatch and
+        # model generation so observation can never turn into self-reply.
+        if is_bot:
+            return
 
         if is_command:
             return
@@ -318,9 +311,8 @@ class Gateway:
         if actor == str(bot.self_id):
             # The bot as the event's subject - its message recalled, itself
             # added, removed or muted - is not transcribed: archiving would
-            # mint an identity entity for the bot (the invariant
-            # record_own_reply keeps), and a window rebuilt after a restart
-            # would re-read the line as one the bot spoke.
+            # mint a member identity for the bot, and a window rebuilt after a
+            # restart would re-read the line as one the bot spoke.
             return
         # Notices carry no message id; the dedup set and the archive's
         # platform key both need one stable per event, so it is synthesized
@@ -479,21 +471,11 @@ class Gateway:
                 and not await agreement.ok(group_id, who)):
             if agreement.should_prompt(group_id, who):
                 try:
-                    sent = await bot.send_group_msg(
+                    await bot.send_group_msg(
                         group_id=int(group_id),
                         message=[{"type": "at", "data": {"qq": who}},
                                  {"type": "text",
                                   "data": {"text": " " + agreement.POINTER}}])
-                    # On the record as a notice about the member, not as a line
-                    # the bot spoke: the model repeats what it reads as its own
-                    # earlier answer, and this one must not come back once the
-                    # member has consented. Filed under the platform id of the
-                    # sent message, so a quote of the pointer still resolves.
-                    mid = (str((sent or {}).get("message_id") or "")
-                           or f"consent-{uuid.uuid4().hex[:12]}")
-                    await self._transcribe(
-                        bot, group_id, actor=who, msg_id=mid, ts=now_local(),
-                        text=sysmark("被提示先同意用户协议"))
                 except Exception as e:
                     log.warning("group %s: agreement prompt failed: %s",
                                 group_id, why(e))
@@ -513,7 +495,6 @@ class Gateway:
             await engine.respond(
                 bot=bot, st=st, cfg=cfg, persona=persona,
                 msg=item.msg, window=window,
-                track=self._track,
             )
 
     async def _settle(self, item: Inbound, window: list[ChatMsg], group_id: str, *,
@@ -522,7 +503,7 @@ class Gateway:
         the prompt is built: the message being answered, and whatever is still
         unread in the history about to be sent - a question about a voice clip
         refers to the message before it, which was never worth paying for on its
-        own. Both sets start together and share one wait (gateway.media_wait_sec).
+        own. Both sets start together and share one wait (media.wait_sec).
 
         The tasks persist their own results (_resolve_and_patch), so this only
         waits: a task that finishes in time has already patched its message; one
@@ -532,7 +513,7 @@ class Gateway:
         tasks = self._settle_media(item, group_id, bot=bot, cfg=cfg, who=who)
         tasks += self._settle_backlog(window, group_id, bot=bot, cfg=cfg, who=who)
         if tasks:
-            await asyncio.wait(tasks, timeout=cfg.gateway.media_wait_sec)
+            await asyncio.wait(tasks, timeout=cfg.media.wait_sec)
         if item.media_task is not None and item.media_task.done():
             item.media_task = None
 
@@ -613,11 +594,13 @@ class Gateway:
             # markers no money can fix.
             msg.pending = None
         new_text = pm.render(resolved)
-        # The arrival path truncated once (gateway.max_msg_len); a patch must not
+        # The arrival path truncated once to the send tool's per-message text bound;
         # undo it. pm.parts holds the full original text, so an unbounded render
         # would put a 10k-char message back into the window and the archive - past
         # the one per-line bound the no-token-budget prompt layout relies on.
-        new_text = cut_text(new_text, cfg.gateway.max_msg_len)
+        new_text = cut_text(
+            new_text, cfg.tools.send_messages.max_text_chars_per_message
+        )
         if new_text and new_text != msg.text:
             msg.text = new_text
             await self._backfill(msg.msg_id, new_text, archive_task)

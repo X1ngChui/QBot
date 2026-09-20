@@ -22,13 +22,12 @@ import logging
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
 
 from ..db import pool
 from ..repositories import IdentityRepository
 from ..services import IdentityResolver
 from ..domain.archive import AuthorKind
-from .onebot import GroupMessage, Sender
+from .onebot import GroupMessage
 
 log = logging.getLogger("qqbot.ingest")
 
@@ -39,7 +38,7 @@ class Ingested:
     reporting them costs nothing."""
 
     raw_event_id: uuid.UUID
-    speaker_entity_id: uuid.UUID
+    speaker_entity_id: uuid.UUID | None
 
 
 class Ingestor:
@@ -51,6 +50,10 @@ class Ingestor:
     ) -> Ingested:
         """Archive one message and make sure everybody in it has an owner."""
         raw_id = await self._record(msg)
+        if msg.author_kind is AuthorKind.BOT:
+            # Self-observation is conversation context, never member identity or
+            # evidence. The reported event is still archived verbatim above.
+            return Ingested(raw_event_id=raw_id, speaker_entity_id=None)
 
         speaker = await self._identity.seen(
             msg.sender.user_id, group_id=msg.group_id, at=msg.occurred_at,
@@ -70,70 +73,6 @@ class Ingestor:
         # drain's job (schedule.nightly_cron), at off-peak prices and in
         # gap-aligned batches.
         return Ingested(raw_event_id=raw_id, speaker_entity_id=speaker.entity_id)
-
-    async def record_own_reply(
-        self, *, group_id: int, self_id: str, message_id: str, text: str,
-        at: datetime, name: str = "", reply_to: str = "",
-        addressees: list[tuple[str, str]] | None = None,
-        segments: list[dict] | None = None,
-    ) -> uuid.UUID:
-        """Write down what the bot itself said.
-
-        `text` is the body; `addressees` are the (account, display name) pairs the
-        message @-ed. The stored reading opens with an "@name" per addressee, the
-        way the group read it, and the at segments keep the accounts so the
-        restart-rebuilt window knows whom the message addressed.
-
-        NapCat is configured not to report the bot's own messages, so nothing else ever
-        writes them - and memory is read back out of the archive, so an archive without
-        them holds only one side of every conversation the bot took part in.
-
-        When extraction reads the archive these lines render marked as the bot's
-        own - readable for coherence, and excluded from evidence (see
-        MemoryWorker._render): what the bot said is never proof about the people
-        it said it to.
-
-        No identity is created for it. The bot is not a group member with a history to be
-        learned, and giving it an entity would put it in its own roster.
-        """
-        addressees = [(qq, who) for qq, who in addressees or () if qq]
-        if segments is None:
-            read = " ".join([*(f"@{who}" for _, who in addressees), text]).strip()
-            segments = [
-                *(
-                    {"type": "at", "data": {"qq": qq, "name": who}}
-                    for qq, who in addressees
-                ),
-                {"type": "text", "data": {"text": text}},
-            ]
-        else:
-            read = text.strip()
-            names = dict(addressees)
-            segments = [
-                {
-                    **segment,
-                    "data": {
-                        **(segment.get("data") or {}),
-                        "name": names.get(str((segment.get("data") or {}).get("qq") or ""), ""),
-                    },
-                }
-                if segment.get("type") == "at" else segment
-                for segment in segments
-            ]
-        return await self._record(GroupMessage(
-            message_id=message_id,
-            group_id=group_id,
-            sender=Sender(user_id=self_id, nickname=name),
-            segments=segments,
-            self_id=self_id,
-            occurred_at=at,
-            plain_text=read,
-            outbound_schema=1,
-            author_kind=AuthorKind.BOT,
-            # The quote pointer travels into the payload the same way a member's
-            # does, so the restart-rebuilt window renders the line identically.
-            reply_to_message_id=reply_to or None,
-        ))
 
     async def _record(self, msg: GroupMessage) -> uuid.UUID:
         """L0 is append-only. The unique index on the platform message id is what stops a
