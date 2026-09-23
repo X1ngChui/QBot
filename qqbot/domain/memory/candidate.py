@@ -19,6 +19,8 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
+from ..ids import GroupId
+
 
 class CandidateType(StrEnum):
     ALIAS = "alias"
@@ -43,22 +45,13 @@ class Candidate:
 
     candidate_type: CandidateType
     payload: dict[str, Any]
-    group_id: int | None = None
+    group_id: GroupId | None = None
     #: The message this record's quote came from. None when the quote matched no single
     #: message, which is itself the answer: the validator refuses it.
     source_event_id: uuid.UUID | None = None
-    #: The last message of the batch that produced this. Validation has to run against
-    #: the same batch the model read - the quote, the name and the term all have to appear
-    #: in it word for word - and validation happens later, in a separate job, by which
-    #: time "the recent messages" is a different set. This is what makes the batch
-    #: reproducible rather than approximately re-fetched.
-    batch_event_id: uuid.UUID | None = None
-    #: And how many rows that batch held. Batches are cut at conversation gaps, so
-    #: their length varies; without the count, replay could only guess a fixed
-    #: window ending at the anchor - a superset that would shift every account code
-    #: and misattribute records. Required (the store refuses NULL, and 0 would
-    #: replay an empty batch that rejects everything).
-    batch_size: int = field(kw_only=True)
+    #: The durable exact-event batch that produced this output. It is optional only
+    #: while pure validator tests construct candidates outside persistence.
+    extraction_id: uuid.UUID | None = None
     confidence: float | None = None
     status: CandidateStatus = CandidateStatus.PENDING
     reject_reason: str | None = None

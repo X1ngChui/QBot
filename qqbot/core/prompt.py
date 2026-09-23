@@ -22,27 +22,26 @@ from __future__ import annotations
 import json
 import re
 
+from pydantic import ValidationError
+
 from ..prompting import PromptCatalog, PromptKey
 from ..providers.contracts import Message, PromptItem, Role, ToolCall, ToolCallId, ToolResult
-from ..settings import Persona, Settings, prompt_catalog
+from ..settings import Persona, Settings, config, prompt_catalog
 from ..util import defang, describe_now, fmt_when, sysmark
-from .archive import without_legacy_provenance
 from .member_numbers import MemberNumbers
 from .outbound import (
     AtSegment,
     ContactKind,
     ContactSegment,
-    CustomMusicSegment,
     DiceSegment,
     FaceSegment,
-    JsonCardSegment,
-    MusicSegment,
-    OutboundSegment,
+    HistoricalSegment,
     ReplySegment,
     RpsSegment,
     TextSegment,
     display_text,
 )
+from .send_contract import send_arguments_model
 from .state import ChatMsg, GroupState
 from .tools import SEND
 
@@ -118,11 +117,9 @@ def _known_block(profiles: list[dict], people: MemberNumbers) -> str:
     for p in profiles:
         name = defang(p.get("nickname") or "")
         bits = []
-        if former := [defang(n) for n in (p.get("former_names") or [])
-                      if n and defang(n) != name]:
+        if former := [defang(n) for n in (p.get("former_names") or []) if n and defang(n) != name]:
             bits.append("曾用名：" + "、".join(former))
-        if aliases := [defang(n) for n in (p.get("aliases") or [])
-                       if n and defang(n) != name]:
+        if aliases := [defang(n) for n in (p.get("aliases") or []) if n and defang(n) != name]:
             bits.append("别名：" + "、".join(aliases))
         if note := defang(p.get("manual_note") or "").strip():
             bits.append(note)
@@ -190,9 +187,7 @@ def build_developer(
     known = _known_block(profiles, people)
     guessed = _guessed_block(profiles, people)
     roster_parts = [part for part in (known, guessed) if part]
-    roster_block = (
-        H_WHO + "\n" + "\n\n".join(roster_parts) if roster_parts else ""
-    )
+    roster_block = H_WHO + "\n" + "\n\n".join(roster_parts) if roster_parts else ""
     return (prompts or prompt_catalog()).render(
         PromptKey.REPLY_DEVELOPER,
         persona=persona_block,
@@ -225,8 +220,7 @@ def build_system(
     )
 
 
-def history_window(st: GroupState, msg: ChatMsg | None,
-                   cfg: Settings) -> list[ChatMsg]:
+def history_window(st: GroupState, msg: ChatMsg | None, cfg: Settings) -> list[ChatMsg]:
     """The messages that will actually appear in the prompt, oldest first: the
     context before `msg`, the message being answered (None for a bare render
     of the window).
@@ -283,7 +277,8 @@ def numbered(visible: list[ChatMsg]) -> tuple[dict[str, int], dict[str, str]]:
             continue
         quoted = by_id.get(m.reply_to)
         marks[m.msg_id] = (
-            sysmark(f"回复 #{nums[quoted.msg_id]}") if quoted is not None
+            sysmark(f"回复 #{nums[quoted.msg_id]}")
+            if quoted is not None
             else sysmark("回复更早的消息")
         )
     return nums, marks
@@ -326,8 +321,9 @@ def teach_roster(people: MemberNumbers, profiles: list[dict]) -> None:
             people.teach(account, p.get("entity_id") or p.get("user_id"))
 
 
-def number_people(people: MemberNumbers, profiles: list[dict],
-                  window: list[ChatMsg], msg: ChatMsg | None) -> None:
+def number_people(
+    people: MemberNumbers, profiles: list[dict], window: list[ChatMsg], msg: ChatMsg | None
+) -> None:
     """Assign member numbers in the order the prompt shows people.
 
     The roster first, in its own order (first appearance in the group), and the
@@ -357,7 +353,7 @@ def _call_id(msg_id: str) -> str:
 
 
 def _segment_arg(
-    segment: OutboundSegment,
+    segment: HistoricalSegment,
     *,
     nums: dict[str, int],
     people: MemberNumbers | None,
@@ -377,7 +373,8 @@ def _segment_arg(
         case ReplySegment(message_id):
             return (
                 {"type": "reply", "data": {"line": nums[message_id]}}
-                if message_id in nums else None
+                if message_id in nums
+                else None
             )
         case FaceSegment(face_id):
             return {"type": "face", "data": {"id": face_id}}
@@ -394,22 +391,53 @@ def _segment_arg(
             )
         case ContactSegment():
             return {"type": "contact_group", "data": {}}
-        case MusicSegment(platform, track_id):
-            return {
-                "type": "music",
-                "data": {"platform": platform.value, "id": track_id},
-            }
-        case CustomMusicSegment(url, audio, title, image, singer):
-            data = {"url": url, "audio": audio, "title": title, "image": image}
-            if singer:
-                data["singer"] = singer
-            return {"type": "music_custom", "data": data}
-        case JsonCardSegment(data):
-            try:
-                payload = json.loads(data)
-            except json.JSONDecodeError:
+        case _:
+            return None
+
+
+def _current_send_args(
+    m: ChatMsg,
+    *,
+    body: str,
+    nums: dict[str, int],
+    people: MemberNumbers | None,
+) -> dict | None:
+    """Project one archived line only when the current send contract can express it."""
+
+    content: list[dict] = []
+    if m.outbound:
+        for segment in m.outbound:
+            item = _segment_arg(segment, nums=nums, people=people)
+            if item is None:
                 return None
-            return {"type": "json", "data": {"payload": payload}}
+            content.append(item)
+        # Command replies were historically archived with reply metadata but without
+        # an explicit reply segment. Preserve that relation during the transition.
+        if (
+            m.reply_to
+            and m.reply_to in nums
+            and not any(item["type"] == "reply" for item in content)
+        ):
+            content.insert(0, {"type": "reply", "data": {"line": nums[m.reply_to]}})
+    else:
+        content.append({"type": "text", "data": {"text": body}})
+        for account, _ in m.at:
+            number = people.number(account) if people is not None else None
+            if number is not None and number > 0:
+                content.insert(-1, {"type": "at", "data": {"member": number}})
+        if m.reply_to and (line := nums.get(m.reply_to)):
+            content.insert(0, {"type": "reply", "data": {"line": line}})
+
+    raw = {"messages": [{"content": content}]}
+    cfg = config().default.tools.send_messages
+    try:
+        validated = send_arguments_model(
+            1,
+            cfg.max_text_chars_per_message,
+        ).model_validate(raw)
+    except ValidationError:
+        return None
+    return validated.model_dump()
 
 
 def own_line(
@@ -421,43 +449,24 @@ def own_line(
 ) -> list[PromptItem]:
     """One of the bot's own messages, as the send call that sent it and its result.
 
-    The model sends every reply through the send tool, so its past messages are
-    shown in exactly that form: the text, whom it @-ed and which line it replied to
-    as arguments, then a tool result carrying the line number and send time. Shown this
-    way, what the model reads of its own output is the shape it should produce, rather
-    than a transcript line - numbers, stamps, brackets - that it would copy into text.
+    Current, losslessly representable segments are shown as the send call that produced
+    them. Historical-only or no-longer-valid shapes are shown as a marked platform-text
+    projection instead, so old music, cards or market faces never teach hidden tool
+    parameters back to the model.
 
     A rendered evidence memo rides immediately before the send call it supported. It is
     reconstructed from bounded structured storage and remains separate from the archive.
-    Any retired permanent provenance tail is removed from legacy archive text and never
-    projected back into the prompt.
     """
-    body = without_legacy_provenance(m.text)
-    if m.outbound:
-        content = [
-            item
-            for segment in m.outbound
-            if (item := _segment_arg(segment, nums=nums, people=people)) is not None
-        ]
-        # Command replies were historically archived with reply metadata but without
-        # an explicit reply segment. Preserve that relation during the transition.
-        if (
-            m.reply_to
-            and m.reply_to in nums
-            and not any(item["type"] == "reply" for item in content)
-        ):
-            content.insert(0, {"type": "reply", "data": {"line": nums[m.reply_to]}})
-        args: dict = {"messages": [{"content": content}]}
-    else:
-        # Legacy rows without structured segments still project into the current contract.
-        content = [{"type": "text", "data": {"text": body}}]
-        for account, _ in m.at:
-            number = people.number(account) if people is not None else None
-            if number is not None and number > 0:
-                content.insert(-1, {"type": "at", "data": {"member": number}})
-        if m.reply_to and (line := nums.get(m.reply_to)):
-            content.insert(0, {"type": "reply", "data": {"line": line}})
-        args = {"messages": [{"content": content}]}
+    body = m.text
+    args = _current_send_args(m, body=body, nums=nums, people=people)
+    out: list[PromptItem] = []
+    if evidence:
+        out.append(Message(Role.ASSISTANT, evidence))
+    if args is None:
+        shown = body or display_text(m.outbound, names=dict(m.at))
+        out.append(Message(Role.ASSISTANT, f"平台显示：{shown}"))
+        return out
+
     call_id = ToolCallId(_call_id(m.msg_id))
     result = f"已发送：#{nums.get(m.msg_id, 0)} {sysmark(fmt_when(m.ts))}"
     if m.outbound:
@@ -467,9 +476,6 @@ def own_line(
             # transformation separately. Random results are one case; this also
             # covers future segment types whose displayed form is chosen by QQ.
             result += f"\n平台显示：{body}"
-    out: list[PromptItem] = []
-    if evidence:
-        out.append(Message(Role.ASSISTANT, evidence))
     out.extend(
         [
             ToolCall(call_id, SEND, json.dumps(args, ensure_ascii=False)),
@@ -521,11 +527,14 @@ def render_history(
     return out
 
 
-def build_tail(*, msg: ChatMsg,
-               nums: dict[str, int] | None = None,
-               marks: dict[str, str] | None = None,
-               pics: dict[str, list[int]] | None = None,
-               people: MemberNumbers | None = None) -> str:
+def build_tail(
+    *,
+    msg: ChatMsg,
+    nums: dict[str, int] | None = None,
+    marks: dict[str, str] | None = None,
+    pics: dict[str, list[int]] | None = None,
+    people: MemberNumbers | None = None,
+) -> str:
     """Everything after the cache boundary: the clock, then the current message.
 
     Nothing else is pushed here on purpose. Whatever sits in this tail is the

@@ -13,16 +13,19 @@ import asyncio
 
 
 from qqbot.db import init_pool, close_pool, pool, repo
+from qqbot.domain.ids import GroupId
 from qqbot.settings import config
 from _db import reset
 from _stubs import FakeEmbedding
 
 #: One stub for every bundle in this suite.
 _EMBED = FakeEmbedding()
-from qqbot.core.media import MEDIA, OVERSIZE, Unsettled, _mime
+from qqbot.core.media import MediaProcessor, OVERSIZE, Unsettled, _mime
+from qqbot.core.retrieval import build_directory
 from qqbot.core.segments import (AudioRef, ImageRef, ParsedMessage as _PMcls,
                                  parse_segments)
-from qqbot.providers import Providers, VisionModel, build_default, providers, set_providers
+from qqbot.providers import Providers, VisionModel
+from qqbot.providers.registry import build as build_providers
 from qqbot.providers.base import Rate
 
 fails = []
@@ -50,7 +53,7 @@ class FakeVision(VisionModel):
     def rate_for(self, model):
         return Rate("Mtoken", in_miss=1.2, out=7.2, source="fake")
 
-    async def describe(self, data, *, cfg, prompt="", mime="image/jpeg", group_id=None):
+    async def describe(self, data, *, prompt="", mime="image/jpeg", group_id=None):
         VISION_CALLS.append(len(data))
         return "一只橘猫在键盘上打滚"
 
@@ -58,9 +61,25 @@ class FakeVision(VisionModel):
         pass
 
 
-_real = build_default()
-set_providers(Providers(text=_real.text, vision=FakeVision(), asr=_real.asr,
-                        embedding=_EMBED, search=_real.search))
+_real = build_providers(config().default)
+_PROVIDERS = Providers(
+    text=_real.text,
+    vision=FakeVision(),
+    asr=_real.asr,
+    embedding=_EMBED,
+    search=_real.search,
+)
+MEDIA = MediaProcessor(config().default.media, _PROVIDERS, build_directory())
+
+
+def providers():
+    return _PROVIDERS
+
+
+def set_providers(bundle):
+    global _PROVIDERS
+    _PROVIDERS = bundle
+    MEDIA._providers = bundle
 
 
 class FakeBot:
@@ -90,13 +109,13 @@ async def main():
     # sticker is the drawing - so it is the fallback, not the answer.
     ref = ImageRef(slot=0, sticker=True, key="emoji-1",
               url="http://example/s.gif", summary="动画表情")
-    out = await MEDIA.describe_image(ref, bot=bot, group_id="g", cfg=cfg)
+    out = await MEDIA.describe_image(ref, bot=bot, group_id=GroupId("1"), cfg=cfg)
     check("a sticker is described, not just labelled",
           out == "⟦表情:一只橘猫在键盘上打滚⟧", str(out))
     check("and it keeps the sticker label", len(VISION_CALLS) == 1, str(VISION_CALLS))
     check("the description is cached under the sticker id",
           await repo.image_cache_get("emoji-1") == "⟦表情:一只橘猫在键盘上打滚⟧")
-    out = await MEDIA.describe_image(ref, bot=bot, group_id="g", cfg=cfg)
+    out = await MEDIA.describe_image(ref, bot=bot, group_id=GroupId("1"), cfg=cfg)
     check("a repeat sticker costs nothing - this is what makes it affordable",
           len(VISION_CALLS) == 1, str(VISION_CALLS))
 
@@ -104,7 +123,7 @@ async def main():
     _fetch, MEDIA._fetch = MEDIA._fetch, lambda url, max_bytes: asyncio.sleep(0, None)
     ref_gone = ImageRef(slot=0, sticker=True, key="emoji-2",
                    url="http://example/gone.gif", summary="动画表情")
-    out = await MEDIA.describe_image(ref_gone, bot=bot, group_id="g", cfg=cfg)
+    out = await MEDIA.describe_image(ref_gone, bot=bot, group_id=GroupId("1"), cfg=cfg)
     check("an unfetchable sticker falls back to its label", out == "⟦表情:动画表情⟧", str(out))
     MEDIA._fetch = _fetch
 
@@ -112,10 +131,10 @@ async def main():
     base = len(VISION_CALLS)
     key = "a" * 32
     ref = ImageRef(slot=0, key=key, url="http://example/img.jpg")
-    out1 = await MEDIA.describe_image(ref, bot=bot, group_id="g", cfg=cfg)
+    out1 = await MEDIA.describe_image(ref, bot=bot, group_id=GroupId("1"), cfg=cfg)
     check("first sight describes", out1 == "⟦图片:一只橘猫在键盘上打滚⟧", str(out1))
     check("first sight costs one vision call", len(VISION_CALLS) == base + 1, str(VISION_CALLS))
-    out2 = await MEDIA.describe_image(ref, bot=bot, group_id="g", cfg=cfg)
+    out2 = await MEDIA.describe_image(ref, bot=bot, group_id=GroupId("1"), cfg=cfg)
     check("second sight hits the cache", out2 == out1, str(out2))
     check("cache hit costs no vision call", len(VISION_CALLS) == base + 1, str(VISION_CALLS))
     hits = await pool().fetchval("SELECT hit_count FROM image_cache WHERE key=$1", key)
@@ -178,7 +197,7 @@ async def main():
         def rate_for(self, model):
             return Rate("Mtoken")
 
-        async def describe(self, data, *, cfg, prompt="", mime="image/jpeg", group_id=None):
+        async def describe(self, data, *, prompt="", mime="image/jpeg", group_id=None):
             VISION_CALLS.append(len(data))
             raise RuntimeError("400 data_inspection_failed: inappropriate content")
 
@@ -190,10 +209,10 @@ async def main():
                             asr=_real.asr, embedding=_EMBED, search=_real.search))
     ref_no = ImageRef(slot=0, key="c" * 32, url="http://example/nope.jpg")
     before = len(VISION_CALLS)
-    out = await MEDIA.describe_image(ref_no, bot=bot, group_id="g", cfg=cfg)
+    out = await MEDIA.describe_image(ref_no, bot=bot, group_id=GroupId("1"), cfg=cfg)
     check("a refused image is a terminal bare marker", out == "⟦图片⟧", str(out))
     check("and the refusal cost one call", len(VISION_CALLS) == before + 1)
-    out = await MEDIA.describe_image(ref_no, bot=bot, group_id="g", cfg=cfg)
+    out = await MEDIA.describe_image(ref_no, bot=bot, group_id=GroupId("1"), cfg=cfg)
     check("reposting it costs nothing more", len(VISION_CALLS) == before + 1,
           str(VISION_CALLS))
     check("the cached outcome still reads as not received",
@@ -230,7 +249,7 @@ async def main():
     seen0 = len(VISION_CALLS)
     ref_old = ImageRef(slot=0, key="d" * 32, url="http://example/expired.jpg",
                   file="ABCDEF.jpg")
-    out = await MEDIA.describe_image(ref_old, bot=RefreshingBot(), group_id="g", cfg=cfg)
+    out = await MEDIA.describe_image(ref_old, bot=RefreshingBot(), group_id=GroupId("1"), cfg=cfg)
     check("an expired link is refreshed rather than given up on",
           out == "⟦图片:一只橘猫在键盘上打滚⟧" and RefreshingBot.calls == 1, str(out))
     check("and the picture did reach the model", len(VISION_CALLS) == seen0 + 1)
@@ -264,8 +283,11 @@ async def main():
     # A picture the platform can no longer serve does not fail get_image, it hangs;
     # the fetch has its own short deadline, and the picture is then remembered as
     # unreadable so the next reply looking at it does not wait it out again.
-    _media_cfg = config().default.media
-    _saved_to, _media_cfg.protocol_timeout_sec = _media_cfg.protocol_timeout_sec, 0.2
+    _media_cfg = config().default.media.model_copy(
+        update={"protocol_timeout_sec": 0.2}
+    )
+    dead_media = MediaProcessor(_media_cfg, _PROVIDERS, build_directory())
+    dead_media._local = staticmethod(lambda path, max_bytes: None)
 
     class HangingBot:
         self_id = "999"
@@ -279,37 +301,35 @@ async def main():
     async def dead_link(url, max_bytes):
         return None
 
-    MEDIA._fetch = dead_link
+    dead_media._fetch = dead_link
     _dead = ImageRef(slot=0, key="f" * 32, url="http://example/gone.jpg", file="GONE.jpg")
     _t = asyncio.get_event_loop().time()
     check("a hanging get_image is given up on quickly",
-          await MEDIA._bytes(_dead, bot=HangingBot(), max_bytes=1 << 20) is None
+          await dead_media._bytes(_dead, bot=HangingBot(), max_bytes=1 << 20) is None
           and asyncio.get_event_loop().time() - _t < 2, str(HangingBot.calls))
-    await MEDIA._bytes(_dead, bot=HangingBot(), max_bytes=1 << 20)
+    await dead_media._bytes(_dead, bot=HangingBot(), max_bytes=1 << 20)
     check("and an unreadable picture is not retried for a while", HangingBot.calls == 1,
           str(HangingBot.calls))
     # Two readers at once share one flight: the second must not spend the
     # deadline again while the first is still finding out the picture is dead.
-    MEDIA._unreadable.clear()
+    dead_media._unreadable.clear()
     HangingBot.calls = 0
     _dead2 = ImageRef(slot=0, key="e" * 32, url="http://example/gone2.jpg", file="GONE2.jpg")
     _pair = await asyncio.gather(
-        MEDIA._bytes(_dead2, bot=HangingBot(), max_bytes=1 << 20),
-        MEDIA._bytes(_dead2, bot=HangingBot(), max_bytes=1 << 20))
+        dead_media._bytes(_dead2, bot=HangingBot(), max_bytes=1 << 20),
+        dead_media._bytes(_dead2, bot=HangingBot(), max_bytes=1 << 20))
     check("concurrent readers of one picture share a single fetch",
           HangingBot.calls == 1 and _pair == [None, None], str(HangingBot.calls))
-    check("the flight registry is empty once the fetch ends", not MEDIA._fetching)
+    check("the flight registry is empty once the fetch ends", not dead_media._fetching)
     # An oversize picture is a verdict, not a failure: it is not marked unreadable.
     async def too_big(url, max_bytes):
         return OVERSIZE
-    MEDIA._fetch = too_big
+    dead_media._fetch = too_big
     _big = ImageRef(slot=0, key="d" * 32, url="http://example/big.jpg", file="BIG.jpg")
-    _got = await MEDIA._bytes(_big, bot=HangingBot(), max_bytes=1 << 20)
+    _got = await dead_media._bytes(_big, bot=HangingBot(), max_bytes=1 << 20)
     check("an oversize picture answers the sentinel and is not marked unreadable",
-          _got is OVERSIZE and "d" * 32 not in MEDIA._unreadable)
-    MEDIA._unreadable.clear()
-    MEDIA._fetch = _fetch3
-    _media_cfg.protocol_timeout_sec = _saved_to
+          _got is OVERSIZE and "d" * 32 not in dead_media._unreadable)
+    await dead_media.close()
 
     check("mime sniffed from bytes beats the file name",
           _mime(b"GIF89a....", "x.image") == "image/gif"
@@ -344,7 +364,7 @@ async def main():
         def rate_for(self, model):
             return _Rate("second", per_unit=0.0)
 
-        async def transcribe(self, data, *, cfg, fmt="wav", seconds=None, group_id=None):
+        async def transcribe(self, data, *, fmt="wav", seconds=None, group_id=None):
             _asr_seen.update(data=data, fmt=fmt)
             return "明天一起去吃饭"
 
@@ -368,7 +388,7 @@ async def main():
                             asr=CapturingAsr(), embedding=_EMBED, search=_real.search))
     _vref = _AR(slot=0, file="v.amr",
                 url="http://cdn/v.amr")
-    _vout = await MEDIA.transcribe(_vref, bot=VoiceBot(), group_id="g9", cfg=cfg)
+    _vout = await MEDIA.transcribe(_vref, bot=VoiceBot(), group_id=GroupId("9009"), cfg=cfg)
     check("transcription goes through get_record even with a local file on offer",
           VoiceBot.record_calls == 1)
     check("what reaches the ASR backend is the transcoded WAV, never SILK",
@@ -379,7 +399,7 @@ async def main():
     # plus media_now must transcribe, so extraction reads text even in groups
     # the bot never answers.
     _pm_v = _PM([_AR(slot=0, file="v2.amr", url="http://cdn/v2.amr")])
-    _res_v = await MEDIA.resolve(_pm_v, bot=VoiceBot(), group_id="g9", cfg=cfg)
+    _res_v = await MEDIA.resolve(_pm_v, bot=VoiceBot(), group_id=GroupId("9009"), cfg=cfg)
     check("a voice clip transcribes on arrival, before any reply",
           _res_v.get(0) == "⟦语音:明天一起去吃饭⟧", repr(_res_v))
     MEDIA._local = _local_saved
@@ -396,7 +416,7 @@ async def main():
     _media_mod.BUDGET.exceeded = _true
     MEDIA._asr_windows.clear()
     _vout = await MEDIA.transcribe(_AR(slot=0, file="free.amr"), bot=VoiceBot(),
-                                   group_id="g10", cfg=cfg)
+                                   group_id=GroupId("9010"), cfg=cfg)
     check("local ASR transcribes straight through an exhausted CNY budget",
           _vout == "⟦语音:明天一起去吃饭⟧", repr(_vout))
     _media_mod.BUDGET.exceeded = _budget_saved
@@ -430,11 +450,11 @@ async def main():
     _samples, _rate = _pcm_from_wav(_stereo)
     check("wav parse: stereo folds to mono at the declared rate",
           len(_samples) == 160 and _rate == 24000, f"{len(_samples)}@{_rate}")
-    _sherpa = SherpaAsr()
+    _sherpa = SherpaAsr(cfg.capabilities.asr)
     check("sherpa rate is zero in every direction",
           _sherpa.rate_for("sense-voice").units(300.0) == 0.0)
     try:
-        await _sherpa.transcribe(b"\x02#!SILK_V3", cfg=cfg.capabilities.asr, fmt="amr")
+        await _sherpa.transcribe(b"\x02#!SILK_V3", fmt="amr")
         check("sherpa refuses non-wav input", False, "no exception")
     except ValueError:
         check("sherpa refuses non-wav input", True)
@@ -443,31 +463,40 @@ async def main():
     base = len(VISION_CALLS)
     big = ImageRef(slot=0, key="b" * 32, url="http://x",
                    size=int(cfg.capabilities.vision.max_image_mb * 1024 * 1024) + 1)
-    out = await MEDIA.describe_image(big, bot=bot, group_id="g", cfg=cfg)
+    out = await MEDIA.describe_image(big, bot=bot, group_id=GroupId("1"), cfg=cfg)
     check("oversized image gets a terminal bare marker",
           out == "⟦图片⟧" and not isinstance(out, Unsettled), repr(out))
     check("oversized image costs nothing", len(VISION_CALLS) == base)
-    _w = MEDIA._img_window("g", cfg.capabilities.vision.max_images_per_min)
+    _w = MEDIA._img_window(GroupId("1"), cfg.capabilities.vision.max_images_per_min)
     _n = len(_w._hits) if hasattr(_w, "_hits") else None
-    await MEDIA.describe_image(big, bot=bot, group_id="g", cfg=cfg)
+    await MEDIA.describe_image(big, bot=bot, group_id=GroupId("1"), cfg=cfg)
     check("oversized image spends no rate-window slot",
           _n is None or len(_w._hits) == _n, str(_n))
 
     # per-minute image cap
-    cfg.capabilities.vision.max_images_per_min = 2
+    limited_cfg = cfg.model_copy(update={
+        "capabilities": cfg.capabilities.model_copy(update={
+            "vision": cfg.capabilities.vision.model_copy(
+                update={"max_images_per_min": 2}
+            )
+        })
+    })
     MEDIA._img_windows.clear()
     outs = []
     for i in range(4):
         r = ImageRef(slot=0, key=f"{i:032d}", url="http://x")
-        outs.append(await MEDIA.describe_image(r, bot=bot, group_id="g2", cfg=cfg))
+        outs.append(
+            await MEDIA.describe_image(
+                r, bot=bot, group_id=GroupId("9002"), cfg=limited_cfg
+            )
+        )
     described = sum(1 for o in outs if o)
     check("image rate limit holds", described == 2, f"{described} described of 4")
 
     # unknown-key image (no md5 in the file field) still works, just uncacheable
     r = ImageRef(slot=0, key=None, url="http://x")
     MEDIA._img_windows.clear()
-    cfg.capabilities.vision.max_images_per_min = 6
-    out = await MEDIA.describe_image(r, bot=bot, group_id="g3", cfg=cfg)
+    out = await MEDIA.describe_image(r, bot=bot, group_id=GroupId("9003"), cfg=cfg)
     check("keyless image still described", out is not None, str(out))
 
     # segment parsing keeps text and media interleaved in order
@@ -491,7 +520,7 @@ async def main():
     from qqbot.core.state import ChatMsg as _CM, GroupState as _GS
     from qqbot.util import now_local as _now
 
-    st = _GS(group_id="5551")
+    st = _GS(group_id=GroupId("5551"))
     a = _CM(msg_id="m1", user_id="1", nickname="阿强", text="今天谁来收尾", ts=_now())
     b = _CM(msg_id="m2", user_id="", nickname="", text="我来吧，顺手的事", ts=_now(),
             is_bot=True)

@@ -21,7 +21,8 @@ import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from qqbot.providers import providers
+from qqbot.providers import Providers
+from qqbot.providers.registry import build as build_providers
 from qqbot.providers.contracts import (
     CallContext,
     CallPurpose,
@@ -35,6 +36,7 @@ from qqbot.providers.contracts import (
 )
 from qqbot.settings import config
 from qqbot.util import read_api_key
+
 
 def test_png(side: int = 64) -> bytes:
     """A real PNG, built here so the check needs no image library and no asset on disk.
@@ -53,8 +55,7 @@ def test_png(side: int = 64) -> bytes:
     # Every scanline is prefixed with filter byte 0.
     black, white = (0, 0, 0), (255, 255, 255)
     rows = b"".join(
-        bytes([0])
-        + bytes(v for x in range(side) for v in (black if (x + y) % 16 < 8 else white))
+        bytes([0]) + bytes(v for x in range(side) for v in (black if (x + y) % 16 < 8 else white))
         for y in range(side)
     )
     signature = bytes.fromhex("89504e470d0a1a0a")
@@ -93,6 +94,7 @@ async def check_db() -> None:
     try:
         await init_pool()
         from qqbot.db.repo import ensure_schema
+
         await ensure_schema()
         ver = await pool().fetchval("SELECT version()")
         tables = await pool().fetchval(
@@ -103,7 +105,7 @@ async def check_db() -> None:
         record("postgres", False, repr(e))
 
 
-async def check_text() -> None:
+async def check_text(capabilities: Providers) -> None:
     cfg = config().default.capabilities.text
     label = f"text ({cfg.model})"
     try:
@@ -120,21 +122,17 @@ async def check_text() -> None:
             max_output_tokens=512,
         )
         request = ModelRequest(
-            prompt=(
-                Message(Role.USER, "Call preflight_echo, then report its result."),
-            ),
+            prompt=(Message(Role.USER, "Call preflight_echo, then report its result."),),
             tools=(tool,),
             policy=policy,
             context=CallContext(CallPurpose.PREFLIGHT),
         )
-        async with providers().text.open_session(request) as session:
+        async with capabilities.text.open_session(request) as session:
             first = await session.start()
             calls = first.tool_calls
             if len(calls) != 1 or calls[0].name != "preflight_echo":
                 raise RuntimeError("model did not produce the preflight function call")
-            result = await session.continue_with(
-                (ToolResult(calls[0].call_id, "received"),)
-            )
+            result = await session.continue_with((ToolResult(calls[0].call_id, "received"),))
         reasoning = first.usage.reasoning + result.usage.reasoning
         think = f" reasoning={reasoning}" if reasoning else ""
         record(
@@ -149,15 +147,15 @@ async def check_text() -> None:
         record(label, False, repr(e))
 
 
-async def check_vision() -> None:
+async def check_vision(capabilities: Providers) -> None:
     cfg = config().default.capabilities.vision
     label = f"vision, base64 inline ({cfg.model})"
     try:
         from qqbot.prompting import PromptKey
         from qqbot.settings import prompt_catalog
-        desc = await providers().vision.describe(
+
+        desc = await capabilities.vision.describe(
             TEST_PNG,
-            cfg=cfg,
             prompt=prompt_catalog().render(PromptKey.VISION_SYSTEM),
             mime="image/png",
         )
@@ -166,55 +164,54 @@ async def check_vision() -> None:
         record(label, False, repr(e))
 
 
-async def check_asr() -> None:
-    cfg = config().default.capabilities.asr
+async def check_asr(capabilities: Providers) -> None:
     label = "ASR, local CPU SenseVoice"
     try:
-        text = await providers().asr.transcribe(silence_wav(), cfg=cfg, fmt="wav", seconds=0.4)
+        text = await capabilities.asr.transcribe(silence_wav(), fmt="wav", seconds=0.4)
         record(label, True, repr(text[:40]))
     except Exception as e:
         record(label, False, repr(e))
 
 
-async def check_search() -> None:
+async def check_search(capabilities: Providers) -> None:
     cfg = config().default.capabilities.search
     options = config().default.tools.web_search
     label = f"search ({cfg.provider})"
     try:
-        items = await providers().search.search(
-            "今天天气", cfg=cfg, options=options
-        )
+        items = await capabilities.search.search("今天天气", options=options)
         record(label, bool(items), f"{len(items)} results, count={options.count}")
     except Exception as e:
         record(label, False, repr(e))
 
 
-async def check_embedding() -> None:
+async def check_embedding(capabilities: Providers) -> None:
     """Checked on its own config block, one real call: a wrong embedding endpoint
     otherwise surfaces days later as episode recall quietly degrading, never as
     a boot failure."""
     cfg = config().default.capabilities.embedding
     label = f"embedding ({cfg.provider})"
     try:
-        vecs = await providers().embedding.embed(["预检"], cfg=cfg)
-        record(label, bool(vecs) and len(vecs[0]) == cfg.dimensions,
-               f"{cfg.model}, {len(vecs[0])} dims")
+        vecs = await capabilities.embedding.embed(["预检"])
+        record(
+            label,
+            bool(vecs) and len(vecs[0]) == cfg.dimensions,
+            f"{cfg.model}, {len(vecs[0])} dims",
+        )
     except Exception as e:
         record(label, False, repr(e))
 
 
-def check_keys() -> None:
+def check_keys(capabilities: Providers) -> None:
     """Check the key each capability actually points at, not a hardcoded list - two
     capabilities may share one name or not, and only the config knows."""
-    capabilities = config().default.capabilities
-    p = providers()
-    record("providers selected", True, p.describe())
+    settings = config().default.capabilities
+    record("providers selected", True, capabilities.describe())
     seen: dict[str, str] = {}
     for label, name, provider in (
-        ("text", capabilities.text.credential_env, p.text),
-        ("vision", capabilities.vision.credential_env, p.vision),
-        ("search", capabilities.search.credential_env, p.search),
-        ("embedding", capabilities.embedding.credential_env, p.embedding),
+        ("text", settings.text.credential_env, capabilities.text),
+        ("vision", settings.vision.credential_env, capabilities.vision),
+        ("search", settings.search.credential_env, capabilities.search),
+        ("embedding", settings.embedding.credential_env, capabilities.embedding),
     ):
         if not provider.needs_key:
             record(f"{label} key not needed ({provider.name})", True)
@@ -231,25 +228,27 @@ def check_keys() -> None:
 
 async def main() -> int:
     try:
-        config()
+        bundle = config()
         record("config parses", True)
     except Exception:
         record("config parses", False, traceback.format_exc(limit=1))
         return 1
 
-    check_keys()
-    await providers().asr.start(config().default.capabilities.asr)
-    await check_db()
-    await check_text()
-    await check_vision()
-    await check_asr()
-    await check_search()
-    await check_embedding()
+    capabilities = build_providers(bundle.default)
+    try:
+        check_keys(capabilities)
+        await capabilities.asr.start()
+        await check_db()
+        await check_text(capabilities)
+        await check_vision(capabilities)
+        await check_asr(capabilities)
+        await check_search(capabilities)
+        await check_embedding(capabilities)
+    finally:
+        from qqbot.db import close_pool
 
-    from qqbot.db import close_pool
-
-    await providers().aclose()
-    await close_pool()
+        await capabilities.aclose()
+        await close_pool()
 
     failed = [n for n, ok, _ in RESULTS if not ok]
     print()

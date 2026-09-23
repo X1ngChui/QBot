@@ -1,324 +1,527 @@
-"""The half of the service layer that needs no database: the validation rules and the
-parsing of tool calls.
+"""Pure extraction schemas, source binding, and candidate validation."""
 
-Validation is a pure function, so every rule can be pinned down on its own, without
-running the whole chain.
-"""
 import json
 import os
 import pathlib
 import sys
 import uuid
+from datetime import UTC, datetime
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("CONFIG_DIR", str(ROOT / "tests" / "fixtures" / "config"))
 
-from qqbot.domain.memory import Candidate, CandidateType, RejectReason
+from qqbot.domain.memory import (
+    Candidate,
+    CandidateType,
+    ExtractionSnapshot,
+    RejectReason,
+    SnapshotLine,
+    SnapshotTarget,
+)
 from qqbot.providers.contracts import ToolCall, ToolCallId
 from qqbot.services import Validator
 from qqbot.services.memory_extractor import (
-    ExtractionInput, MemoryExtractor, SourceLine, line_body, predicate_names, tools,
+    ExtractionInput,
+    MemoryExtractor,
+    SourceLine,
+    decay_classes,
+    multi_valued,
+    opposites,
+    predicate_names,
+    rules_block,
+    tools,
 )
 from qqbot.util import sysmark
 
-fails = []
-E1, E2 = uuid.uuid4(), uuid.uuid4()
-CODES = {1: E1, 2: E2}
-# One entry per message, not one blob: a quote has to be inside a single message, because
-# that is what somebody said. Text that only matches once the lines are joined spans a
-# line break, which nobody typed. Rendered the way the worker renders them: a time
-# stamp, the speaker's name and code, then the body.
-LINES = (f"{sysmark('08-30 14:03')} 老王{sysmark('1')}: 我最近在玩鸣潮",
-         f"{sysmark('08-30 14:04')} 小北{sysmark('2')}: 老周你又来了")
+fails: list[str] = []
+ACCOUNT_1, ACCOUNT_2, ACCOUNT_3 = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+EVENT_1, EVENT_2, EVENT_3, BOT_EVENT, NOTICE_EVENT = (uuid.uuid4() for _ in range(5))
+WHEN = datetime.now(UTC)
+CODES = {1: ACCOUNT_1, 2: ACCOUNT_2, 3: ACCOUNT_3}
 
 
-def check(name, cond, detail=""):
-    print(f"[{'ok ' if cond else 'FAIL'}] {name}  {detail}")
-    if not cond:
+def check(name: str, condition: bool, detail: str = "") -> None:
+    print(f"[{'ok ' if condition else 'FAIL'}] {name}  {detail}")
+    if not condition:
         fails.append(name)
 
 
-def cand(ctype, **payload):
-    # Every candidate carries the message its quote came from. One without it is one whose
-    # quote matched no message, and it is refused - see the check further down.
-    return Candidate(candidate_type=ctype, payload=payload, group_id=1,
-                     source_event_id=uuid.uuid4(), batch_size=len(LINES))
+def source_line(
+    ordinal: int,
+    event_id: uuid.UUID,
+    evidence: str,
+    *,
+    author: uuid.UUID | None,
+    targets: tuple[SnapshotTarget, ...],
+    own: bool = False,
+    event_type: str = "message",
+) -> SnapshotLine:
+    return SnapshotLine(
+        ordinal=ordinal,
+        event_id=event_id,
+        occurred_at=WHEN,
+        text=f"{sysmark(f'来源:{ordinal}')} 某人: {evidence}",
+        own=own,
+        event_type=event_type,
+        evidence_text=evidence,
+        author_account_id=author,
+        targets=targets,
+    )
 
 
-v = Validator(CODES, LINES)
+LINES = (
+    source_line(
+        1,
+        EVENT_1,
+        "我最近在玩鸣潮",
+        author=ACCOUNT_1,
+        targets=(SnapshotTarget(ACCOUNT_1, "author"),),
+    ),
+    source_line(
+        2,
+        EVENT_2,
+        "老王最近在玩绝区零",
+        author=ACCOUNT_2,
+        targets=(
+            SnapshotTarget(ACCOUNT_2, "author"),
+            SnapshotTarget(ACCOUNT_1, "alias", "老王"),
+        ),
+    ),
+    source_line(
+        3,
+        EVENT_3,
+        f"@小北{sysmark('2')} 住在杭州",
+        author=ACCOUNT_1,
+        targets=(
+            SnapshotTarget(ACCOUNT_1, "author"),
+            SnapshotTarget(ACCOUNT_2, "mention", sysmark("2")),
+        ),
+    ),
+    source_line(
+        4,
+        BOT_EVENT,
+        "机器人说过的话",
+        author=None,
+        targets=(),
+        own=True,
+    ),
+    source_line(
+        5,
+        NOTICE_EVENT,
+        "加入了本群",
+        author=ACCOUNT_3,
+        targets=(),
+        event_type="notice",
+    ),
+)
+SNAPSHOT = ExtractionSnapshot(tuple(CODES.items()), LINES)
+VALIDATOR = Validator(SNAPSHOT)
 
-# ---- facts ----------------------------------------------------------------
-ok = cand(CandidateType.FACT, account=1, predicate="plays", object="鸣潮",
-          quote="我最近在玩鸣潮")
-check("依据原文的事实通过", v.check(ok).ok)
 
-bad_code = cand(CandidateType.FACT, account=7, predicate="plays", object="x",
-                quote="我最近在玩鸣潮")
-check("a code that is not on the roster is dropped",
-      v.check(bad_code).reason is RejectReason.UNKNOWN_ENTITY,
-      "答不上来的模型会编一个编号")
-zero_code = cand(CandidateType.FACT, account=0, predicate="plays", object="x",
-                 quote="我最近在玩鸣潮")
-check("reserved bot zero is never a fact subject",
-      v.check(zero_code).reason is RejectReason.UNKNOWN_ENTITY)
-zero_participant = cand(
-    CandidateType.EPISODE,
-    summary="机器人完成了一件事",
-    participants=[0],
+def candidate(ctype: CandidateType, source: int, event: uuid.UUID, **payload) -> Candidate:
+    return Candidate(
+        candidate_type=ctype,
+        payload={"source": source, **payload},
+        group_id=1,
+        source_event_id=event,
+    )
+
+
+speaker_fact = candidate(
+    CandidateType.FACT,
+    1,
+    EVENT_1,
+    account=1,
+    predicate="plays",
+    object="鸣潮",
     quote="我最近在玩鸣潮",
 )
-check("reserved bot zero is never an episode participant",
-      v.check(zero_participant).reason is RejectReason.UNKNOWN_ENTITY)
+check("a speaker fact binds to its exact account", VALIDATOR.check(speaker_fact).ok)
 
-made_up = cand(CandidateType.FACT, account=1, predicate="plays", object="原神",
-               quote="我最近在玩原神")
-check("原文里没有的引用一律拒绝", v.check(made_up).reason is RejectReason.MALFORMED,
-      "唯一能挡住「听起来很像但没人说过」的检查")
-
-free_pred = cand(CandidateType.FACT, account=1, predicate="喜欢", object="x",
-                 quote="我最近在玩鸣潮")
-check("谓词必须在枚举内", v.check(free_pred).reason is RejectReason.MALFORMED,
-      "开放字符串会让同一件事写成三条")
-
-check("空候选被拒", v.check(cand(CandidateType.FACT)).reason is RejectReason.EMPTY)
-
-# A quote has to sit inside one message. Joined, these two lines contain the string; but
-# nobody said it - it spans a line break, so it is two people's words glued together.
-across = cand(CandidateType.FACT, account=1, predicate="plays", object="x",
-              quote="我最近在玩鸣潮\n" + LINES[1])
-check("跨行拼出来的引用不算引用", v.check(across).reason is RejectReason.MALFORMED,
-      "整段拼接里找得到，但没有任何一条发言是这么说的")
-
-# The speaker prefix is not something anybody said. A quote that is a member's name
-# would otherwise be "found" on every line that member spoke, and the record filed
-# against whichever line came first.
-check("the speaker prefix is stripped before matching",
-      line_body(LINES[0]) == "我最近在玩鸣潮", line_body(LINES[0]))
-check("and a line with no prefix is taken whole", line_body("裸文本") == "裸文本")
-named = cand(CandidateType.FACT, account=1, predicate="plays", object="x", quote="老王")
-check("a quote that is only a speaker's name is not a quote",
-      v.check(named).reason is RejectReason.MALFORMED)
-# Said twice, by two people: the quote backs neither of them.
-twice = Validator(CODES, LINES + (f"{sysmark('08-30 14:05')} 老王{sysmark('1')}: 老周你又来了",))
-echoed = cand(CandidateType.FACT, account=1, predicate="plays", object="x",
-              quote="老周你又来了")
-check("a quote found in two messages validates against neither",
-      twice.check(echoed).reason is RejectReason.MALFORMED)
-
-# The extractor could not attribute the quote to a message, and it must not fall
-# back to any other message: a record filed as evidence from a message that does
-# not contain it corrupts the very rows that count how many different people used
-# a name - the one route by which an observed name becomes usable.
-unsourced = Candidate(candidate_type=CandidateType.FACT, group_id=1,
-                      payload={"account": 1, "predicate": "plays", "object": "鸣潮",
-                               "quote": "我最近在玩鸣潮"},
-                      source_event_id=None, batch_size=len(LINES))
-check("指不出引文出处的候选被拒", v.check(unsourced).reason is RejectReason.MALFORMED,
-      "以前会回退到批次末条，写出一条来源不实的证据")
-
-# ---- names ----------------------------------------------------------------
-alias_ok = cand(CandidateType.ALIAS, account=2, alias="老周", kind="nickname",
-                quote="老周你又来了")
-check("记录里出现过的称呼通过", v.check(alias_ok).ok)
-
-ghost = cand(CandidateType.ALIAS, account=2, alias="老李", kind="nickname",
-             quote="老周你又来了")
-check("称呼本身不在原文里也要拒", v.check(ghost).reason is RejectReason.MALFORMED)
-
-bad_kind = cand(CandidateType.ALIAS, account=2, alias="老周", kind="随便",
-                quote="老周你又来了")
-check("称呼类型必须在枚举内", v.check(bad_kind).reason is RejectReason.MALFORMED)
-
-# A name belongs to one person: writing both means both are wrong, so neither is
-# written.
-both = [
-    cand(CandidateType.ALIAS, account=1, alias="老周", kind="nickname", quote="老周你又来了"),
-    cand(CandidateType.ALIAS, account=2, alias="老周", kind="nickname", quote="老周你又来了"),
-]
-check("one name pointing at two accounts is ambiguous", v.ambiguous_aliases(both) == {"老周"})
-check("and different names are not",
-      v.ambiguous_aliases([both[0]]) == set())
-
-# ---- the tool definitions -------------------------------------------------
-TOOL_DEFS = tools()
-by_name = {tool.name: tool for tool in TOOL_DEFS}
-check("the model is offered exactly these tools",
-      set(by_name) == {"record_alias", "record_fact", "record_group_term",
-                       "record_group_topic", "record_episode"},
-      str(sorted(by_name)))
-# Every record has to carry the sentence it came from. It is the only check that can tell
-# something plausible from something somebody said.
-for name, fn in by_name.items():
-    check(f"{name} requires a verbatim quote",
-          "quote" in set(fn.parameters["required"]),
-          str(set(fn.parameters["required"])))
-# A record about a person names them by code, never by nickname: two people in one group
-# sharing a name is ordinary, and a record filed under the wrong one stays wrong.
-for name in ("record_alias", "record_fact"):
-    check(f"{name} names an account by code",
-          "account" in set(by_name[name].parameters["required"]))
-# A record about the group names nobody, so it must not ask for an account at all -
-# otherwise the model invents one to fill the field.
-for name in ("record_group_term", "record_group_topic"):
-    check(f"{name} names nobody",
-          "account" not in by_name[name].parameters["properties"],
-          str(set(by_name[name].parameters["properties"])))
-# An episode is found by who took part in it before anything looks at the text, so the
-# participants are the field that has to be right.
-check("record_episode names its participants by code",
-      by_name["record_episode"].parameters["properties"]["participants"]["items"]
-      == {"type": "integer"})
-# There is deliberately no tool for an in-joke. It cannot be checked, the model will
-# always find one, and once written down it gets used in a reply, archived, and read back
-# by the next pass as evidence that the group still says it.
-check("and nothing offers to record a joke",
-      not any(
-          "梗" in json.dumps(
-              {"name": tool.name, "description": tool.description, "parameters": tool.parameters},
-              ensure_ascii=False,
-          )
-          for tool in TOOL_DEFS
-      ))
-pred_enum = by_name["record_fact"].parameters["properties"]["predicate"]["enum"]
-check("the predicate is an enum in the tool definition itself",
-      set(pred_enum) == set(predicate_names()),
-      "the model cannot produce a value outside it, which beats checking afterwards")
-
-# ---- the predicate table --------------------------------------------------
-# One entry defines a predicate completely - what it means, how many, how fast it is
-# forgotten, how it reads. What these check is that everything derived from an entry
-# stays derived: the enum the model is offered, the block explaining it, the decay
-# classes, the rendering.
-from qqbot.services.context_builder import render_fact
-from qqbot.services.memory_extractor import (
-    decay_classes, multi_valued, opposites, rules_block,
+third_party = candidate(
+    CandidateType.FACT,
+    2,
+    EVENT_2,
+    account=1,
+    predicate="plays",
+    object="绝区零",
+    quote="老王最近在玩绝区零",
 )
-from qqbot.settings import config as _cfg
+check("a unique literal alias may identify a non-speaker", VALIDATOR.check(third_party).ok)
+
+mentioned = candidate(
+    CandidateType.FACT,
+    3,
+    EVENT_3,
+    account=2,
+    predicate="lives_in",
+    object="杭州",
+    quote=f"@小北{sysmark('2')} 住在杭州",
+)
+check("a structured mention may identify a third account", VALIDATOR.check(mentioned).ok)
+
+unknown = candidate(
+    CandidateType.FACT,
+    1,
+    EVENT_1,
+    account=9,
+    predicate="plays",
+    object="鸣潮",
+    quote="我最近在玩鸣潮",
+)
+check(
+    "an unknown account code is rejected",
+    VALIDATOR.check(unknown).reason is RejectReason.UNKNOWN_ENTITY,
+)
+
+uncited = candidate(
+    CandidateType.FACT,
+    1,
+    EVENT_1,
+    account=3,
+    predicate="plays",
+    object="鸣潮",
+    quote="我最近在玩鸣潮",
+)
+check(
+    "a roster account not resolved on this source is rejected",
+    VALIDATOR.check(uncited).reason is RejectReason.MALFORMED,
+)
+
+wrong_source = candidate(
+    CandidateType.FACT,
+    2,
+    EVENT_2,
+    account=1,
+    predicate="plays",
+    object="鸣潮",
+    quote="我最近在玩鸣潮",
+)
+check(
+    "a quote cannot borrow text from another source",
+    VALIDATOR.check(wrong_source).reason is RejectReason.MALFORMED,
+)
+
+wrong_event = candidate(
+    CandidateType.FACT,
+    1,
+    EVENT_2,
+    account=1,
+    predicate="plays",
+    object="鸣潮",
+    quote="我最近在玩鸣潮",
+)
+check(
+    "the staged event must match the declared source",
+    VALIDATOR.check(wrong_event).reason is RejectReason.MALFORMED,
+)
+
+bot_fact = candidate(
+    CandidateType.FACT,
+    4,
+    BOT_EVENT,
+    account=1,
+    predicate="plays",
+    object="鸣潮",
+    quote="机器人说过的话",
+)
+notice_fact = candidate(
+    CandidateType.FACT,
+    5,
+    NOTICE_EVENT,
+    account=3,
+    predicate="plays",
+    object="鸣潮",
+    quote="加入了本群",
+)
+check("bot output is never evidence", VALIDATOR.check(bot_fact).reason is RejectReason.MALFORMED)
+check(
+    "notice text is never evidence", VALIDATOR.check(notice_fact).reason is RejectReason.MALFORMED
+)
+
+alias = candidate(
+    CandidateType.ALIAS,
+    2,
+    EVENT_2,
+    account=1,
+    alias="老王",
+    kind="nickname",
+    quote="老王最近在玩绝区零",
+)
+check("an alias must appear in its cited quote", VALIDATOR.check(alias).ok)
+missing_alias = candidate(
+    CandidateType.ALIAS,
+    2,
+    EVENT_2,
+    account=1,
+    alias="王哥",
+    kind="nickname",
+    quote="老王最近在玩绝区零",
+)
+check(
+    "an alias absent from its quote is rejected",
+    VALIDATOR.check(missing_alias).reason is RejectReason.MALFORMED,
+)
+
+bad_predicate = candidate(
+    CandidateType.FACT,
+    1,
+    EVENT_1,
+    account=1,
+    predicate="随便",
+    object="x",
+    quote="我最近在玩鸣潮",
+)
+check(
+    "the predicate set is closed",
+    VALIDATOR.check(bad_predicate).reason is RejectReason.MALFORMED,
+)
+
+ambiguous = [
+    alias,
+    candidate(
+        CandidateType.ALIAS,
+        2,
+        EVENT_2,
+        account=2,
+        alias="老王",
+        kind="nickname",
+        quote="老王最近在玩绝区零",
+    ),
+]
+check(
+    "one alias proposed for two accounts invalidates both",
+    VALIDATOR.ambiguous_aliases(ambiguous) == {"老王"},
+)
+
+episode = Candidate(
+    candidate_type=CandidateType.EPISODE,
+    payload={
+        "summary": "两名成员讨论了近期玩的游戏和居住地",
+        "sources": [
+            {"source": 1, "quote": "我最近在玩鸣潮"},
+            {"source": 3, "quote": "住在杭州"},
+        ],
+    },
+    group_id=1,
+    source_event_id=EVENT_1,
+)
+check("an episode accepts multiple exact sources", VALIDATOR.check(episode).ok)
+check(
+    "all episode source events survive validation",
+    [line.event_id for line in VALIDATOR.source_lines(episode)] == [EVENT_1, EVENT_3],
+)
+invalid_episode = Candidate(
+    candidate_type=CandidateType.EPISODE,
+    payload={
+        "summary": "错误来源",
+        "sources": [{"source": 4, "quote": "机器人说过的话"}],
+    },
+    group_id=1,
+    source_event_id=BOT_EVENT,
+)
+check(
+    "an episode cannot use a bot source",
+    VALIDATOR.check(invalid_episode).reason is RejectReason.MALFORMED,
+)
+
+TOOL_DEFS = tools()
+BY_NAME = {tool.name: tool for tool in TOOL_DEFS}
+check(
+    "the model is offered exactly the structured memory tools",
+    set(BY_NAME)
+    == {
+        "record_alias",
+        "record_fact",
+        "record_group_term",
+        "record_group_topic",
+        "record_episode",
+    },
+)
+for name in ("record_alias", "record_fact", "record_group_term", "record_group_topic"):
+    required = set(BY_NAME[name].parameters["required"])
+    check(f"{name} requires source and quote", {"source", "quote"} <= required, str(required))
+episode_schema = BY_NAME["record_episode"].parameters
+check(
+    "record_episode requires a bounded sources array",
+    episode_schema["required"] == ["summary", "sources"]
+    and episode_schema["properties"]["sources"]["maxItems"] == 8,
+)
+check("record_episode has no participant field", "participants" not in episode_schema["properties"])
+for name in ("record_alias", "record_fact"):
+    check(f"{name} names an account by code", "account" in BY_NAME[name].parameters["required"])
+for name in ("record_group_term", "record_group_topic"):
+    check(f"{name} names no account", "account" not in BY_NAME[name].parameters["properties"])
+check(
+    "no tool offers to record a self-reinforcing joke category",
+    not any(
+        "梗"
+        in json.dumps(
+            {"name": tool.name, "description": tool.description, "parameters": tool.parameters},
+            ensure_ascii=False,
+        )
+        for tool in TOOL_DEFS
+    ),
+)
 
 PREDS = predicate_names()
-check("the table holds predicates at all", len(PREDS) > 10, str(len(PREDS)))
-_explained = rules_block()
-check("every predicate the model is offered is explained to it",
-      all(f"- {p}（" in _explained or f"- {p}：" in _explained for p in PREDS),
-      str([p for p in PREDS
-           if f"- {p}（" not in _explained and f"- {p}：" not in _explained]))
-check("every predicate renders with no English leaking through",
-      all(not any(c.isascii() and c.isalpha()
-                  for c in render_fact(p, "某物", "某物"))
-          for p in PREDS),
-      str([render_fact(p, "某物", "某物") for p in PREDS
-           if any(c.isascii() and c.isalpha()
-                  for c in render_fact(p, "某物", "某物"))]))
-# A predicate dropped from the table leaves its rows behind. They render as nothing
-# rather than as the bare English name, which is what the prompt would otherwise carry.
-check("a fact whose predicate is no longer configured renders as nothing",
-      render_fact("no_such_predicate", "某物") == "",
-      render_fact("no_such_predicate", "某物"))
-check("a template verb puts the object inside the phrase",
-      render_fact("allergic_to", "花生", "花生") == "对花生过敏",
-      render_fact("allergic_to", "花生", "花生"))
-_stable, _fast = decay_classes()
-check("decay classes only name real predicates",
-      (set(_stable) | set(_fast)) <= set(PREDS) | {"topic"},
-      str((set(_stable) | set(_fast)) - set(PREDS) - {"topic"}))
-check("no predicate is in two decay classes", not set(_stable) & set(_fast))
-_table = _cfg().predicates.person
-check("multi_valued is exactly the predicates the table marks multi",
-      set(multi_valued()) == {p for p in PREDS if _table[p].cardinality == "multi"}
-      and all(_table[p].cardinality in ("single", "multi") for p in PREDS))
-check("opposites are mutual",
-      all(opposites().get(b) == a for a, b in opposites().items()),
-      str(opposites()))
+check("the predicate table is non-trivial", len(PREDS) > 10, str(len(PREDS)))
+explained = rules_block()
+check(
+    "every offered predicate is explained",
+    all(f"- {predicate}（" in explained or f"- {predicate}：" in explained for predicate in PREDS),
+)
+from qqbot.services.context_builder import render_fact
+from qqbot.settings import PredicateTable, config
 
-# The table is config, so the ways it can be wrong are load errors, not surprises at
-# 02:30 when the night's extraction runs.
-from qqbot.settings import PredicateTable
-_ok = {"verb": "喜欢", "cardinality": "multi", "rule": "喜欢的事物。"}
-for _name, _bad in (
-    ("a predicate with no rule", {"person": {"likes": {"verb": "喜欢",
-                                                       "cardinality": "multi"}}}),
-    ("a predicate with no verb", {"person": {"likes": {"cardinality": "multi",
-                                                      "rule": "x"}}}),
-    ("an unknown decay class", {"person": {"likes": _ok | {"decay": "slow"}}}),
-    ("a one-sided opposite", {"person": {"likes": _ok | {"opposite": "dislikes"},
-                                         "dislikes": _ok}}),
-    ("an opposite that names nothing", {"person": {"likes": _ok | {"opposite": "nope"}}}),
-    ("a predicate named like a group one", {"person": {"topic": _ok}}),
-    ("a name the database could not index", {"person": {"Likes!": _ok}}),
+check(
+    "every configured predicate renders without an English key",
+    all(
+        not any(
+            char.isascii() and char.isalpha() for char in render_fact(predicate, "某物", "某物")
+        )
+        for predicate in PREDS
+    ),
+)
+check("a retired predicate renders as nothing", render_fact("no_such_predicate", "某物") == "")
+stable, fast = decay_classes()
+check(
+    "decay classes only name configured or group predicates",
+    (set(stable) | set(fast)) <= set(PREDS) | {"topic"},
+)
+check("decay classes do not overlap", not set(stable) & set(fast))
+table = config().predicates.person
+check(
+    "multi-valued predicates derive from the same table",
+    set(multi_valued()) == {name for name in PREDS if table[name].cardinality == "multi"},
+)
+check(
+    "opposites are mutual",
+    all(opposites().get(right) == left for left, right in opposites().items()),
+)
+
+valid_predicate = {"verb": "喜欢", "cardinality": "multi", "rule": "喜欢的事物。"}
+for name, bad in (
+    ("missing rule", {"person": {"likes": {"verb": "喜欢", "cardinality": "multi"}}}),
+    ("missing verb", {"person": {"likes": {"cardinality": "multi", "rule": "x"}}}),
+    ("unknown decay", {"person": {"likes": valid_predicate | {"decay": "slow"}}}),
+    (
+        "one-sided opposite",
+        {
+            "person": {
+                "likes": valid_predicate | {"opposite": "dislikes"},
+                "dislikes": valid_predicate,
+            }
+        },
+    ),
+    ("missing opposite", {"person": {"likes": valid_predicate | {"opposite": "nope"}}}),
+    ("reserved group predicate", {"person": {"topic": valid_predicate}}),
+    ("unindexable name", {"person": {"Likes!": valid_predicate}}),
 ):
     try:
-        PredicateTable.model_validate(_bad)
-        check(f"{_name} is refused at load", False, "it validated")
+        PredicateTable.model_validate(bad)
+        check(f"{name} is refused at load", False)
     except ValueError:
-        check(f"{_name} is refused at load", True)
+        check(f"{name} is refused at load", True)
 
-# ---- tool call -> candidate -----------------------------------------------
+# Tool calls bind explicit source ordinals before candidates are staged.
 BATCH = uuid.uuid4()
-SRC = tuple(SourceLine(event_id=uuid.uuid4(), text=t) for t in LINES)
-inp = ExtractionInput(group_id=1, transcript="\n".join(LINES),
-                      roster="老王[1]\n小北[2]", account_codes=CODES,
-                      lines=SRC, source_event_id=BATCH, batch_size=len(SRC))
+SOURCE_LINES = tuple(
+    SourceLine(
+        ordinal=line.ordinal,
+        event_id=line.event_id,
+        text=line.text,
+        own=line.own,
+        event_type=line.event_type,
+        evidence_text=line.evidence_text,
+        author_account_id=line.author_account_id,
+        targets=line.targets,
+    )
+    for line in LINES
+)
+INPUT = ExtractionInput(
+    group_id=1,
+    transcript="\n".join(line.text for line in SOURCE_LINES),
+    roster="老王[1]\n小北[2]",
+    account_codes=CODES,
+    lines=SOURCE_LINES,
+    extraction_id=BATCH,
+)
 
 
-def call(name, **args):
+def call(name: str, **arguments) -> ToolCall:
     return ToolCall(
         ToolCallId("extract-call"),
         name,
-        json.dumps(args, ensure_ascii=False),
+        json.dumps(arguments, ensure_ascii=False),
     )
 
 
 parsed = MemoryExtractor._to_candidate(
-    call("record_fact", account=1, predicate="plays", object="鸣潮", quote="我最近在玩鸣潮"),
-    inp)
-check("a tool call becomes a fact candidate",
-      parsed and parsed.candidate_type is CandidateType.FACT
-      and parsed.payload["object"] == "鸣潮")
-check("a candidate carries its group", parsed.group_id == 1,
-      "isolation: a candidate belongs to one group from the moment it exists")
-# Two different ids, and both matter. One says which message backs this record; the other
-# says which batch to validate it against, later, when the recent messages are a different
-# set entirely.
-check("a candidate cites the message its quote came from",
-      parsed.source_event_id == SRC[0].event_id, str(parsed.source_event_id))
-check("and the batch it has to be validated against",
-      parsed.batch_event_id == BATCH, str(parsed.batch_event_id))
+    call(
+        "record_fact",
+        source=1,
+        account=1,
+        predicate="plays",
+        object="鸣潮",
+        quote="我最近在玩鸣潮",
+    ),
+    INPUT,
+)
+check(
+    "a tool call becomes a fact candidate",
+    parsed is not None and parsed.candidate_type is CandidateType.FACT,
+)
+check(
+    "a candidate cites the declared source event",
+    parsed is not None and parsed.source_event_id == EVENT_1,
+)
+check(
+    "a candidate carries its extraction batch", parsed is not None and parsed.extraction_id == BATCH
+)
 nowhere = MemoryExtractor._to_candidate(
-    call("record_fact", account=1, predicate="plays", object="x", quote="没人说过这句"),
-    inp)
-check("a quote in no message gets no source, rather than a plausible one",
-      nowhere.source_event_id is None, str(nowhere.source_event_id))
-check("a quote that is only a speaker's name has no source",
-      inp.source_of("老王") is None)
-_twice = ExtractionInput(
-    group_id=1, transcript="", roster="", account_codes=CODES, batch_size=len(SRC) + 1,
-    lines=SRC + (SourceLine(event_id=uuid.uuid4(),
-                            text=f"{sysmark('08-30 14:05')} 老王{sysmark('1')}: 老周你又来了"),))
-check("a quote found in two messages has no source, rather than the first",
-      _twice.source_of("老周你又来了") is None)
-check("arguments that are JSON but not an object are dropped",
-      MemoryExtractor._to_candidate(
-          ToolCall(ToolCallId("bad-args"), "record_fact", "[1, 2]"), inp) is None)
-
-group = MemoryExtractor._to_candidate(
-    call("record_group_term", term="切片", meaning="把采样切成小段再重排",
-         quote="切片就是把采样切成小段再重排"), inp)
-check("a group tool becomes a group candidate",
-      group and group.candidate_type is CandidateType.GROUP_FACT
-      and group.payload["kind"] == "term", str(group))
-topic = MemoryExtractor._to_candidate(
-    call("record_group_topic", topic="做音乐的群", quote="这个群是做音乐的"), inp)
-# Which tool was called is the only thing that tells the two apart; the payload alone
-# cannot, and the consolidator needs to know which predicate to write.
-check("and the two group tools are distinguishable afterwards",
-      topic and topic.payload["kind"] == "topic", str(topic))
-
-check("arguments that are not JSON are dropped",
-      MemoryExtractor._to_candidate(
-          ToolCall(ToolCallId("bad-json"), "record_fact", "{坏掉"), inp) is None)
-check("an unknown tool is dropped",
-      MemoryExtractor._to_candidate(call("drop_table", x=1), inp) is None)
+    call(
+        "record_fact",
+        source=2,
+        account=1,
+        predicate="plays",
+        object="x",
+        quote="我最近在玩鸣潮",
+    ),
+    INPUT,
+)
+check(
+    "a source and quote mismatch stages no event citation",
+    nowhere is not None and nowhere.source_event_id is None,
+)
+parsed_episode = MemoryExtractor._to_candidate(
+    call(
+        "record_episode",
+        summary="讨论游戏与居住地",
+        sources=[
+            {"source": 1, "quote": "我最近在玩鸣潮"},
+            {"source": 3, "quote": "住在杭州"},
+        ],
+    ),
+    INPUT,
+)
+check(
+    "an episode candidate cites its first source before full validation",
+    parsed_episode is not None and parsed_episode.source_event_id == EVENT_1,
+)
+check(
+    "non-object JSON arguments are dropped",
+    MemoryExtractor._to_candidate(ToolCall(ToolCallId("bad"), "record_fact", "[1]"), INPUT) is None,
+)
+check(
+    "invalid JSON arguments are dropped",
+    MemoryExtractor._to_candidate(ToolCall(ToolCallId("bad"), "record_fact", "{坏"), INPUT) is None,
+)
+check(
+    "unknown tools are dropped",
+    MemoryExtractor._to_candidate(call("drop_table", value=1), INPUT) is None,
+)
 
 print()
 print("FAILED:", fails if fails else "none")

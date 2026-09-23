@@ -26,17 +26,13 @@ def lint_catalog(catalog: PromptCatalog, cfg: Settings) -> list[str]:
 
     send = send_def(cfg)
     message_schema = send.parameters["properties"]["messages"]
-    if (
-        message_schema.get("maxItems")
-        != cfg.tools.send_messages.max_messages_per_call
-    ):
+    if message_schema.get("maxItems") != cfg.tools.send_messages.max_messages_per_call:
         errors.append("send message batch limit differs from global configuration")
-    segment_schemas = (
-        message_schema["items"]["properties"]["content"]["items"]["anyOf"]
+    segment_types = set(
+        send.parameters["$defs"]["SendMessageInput"]["properties"]["content"]["items"][
+            "discriminator"
+        ]["mapping"]
     )
-    segment_types = {
-        schema["properties"]["type"]["enum"][0] for schema in segment_schemas
-    }
     if "mface" in segment_types:
         errors.append("the model-facing send schema exposes mface")
     expected_segments = {
@@ -51,15 +47,12 @@ def lint_catalog(catalog: PromptCatalog, cfg: Settings) -> list[str]:
     }
     if segment_types != expected_segments:
         errors.append(
-            "send segment schema differs from the closed supported set: "
-            f"{sorted(segment_types)}"
+            f"send segment schema differs from the closed supported set: {sorted(segment_types)}"
         )
 
     rendered_send = catalog.render(
         PromptKey.TOOL_SEND_MESSAGES,
-        face_catalog="、".join(
-            f"{face_id}={label}" for face_id, label in FACE_NAMES.items()
-        ),
+        face_catalog="、".join(f"{face_id}={label}" for face_id, label in FACE_NAMES.items()),
         message_limit=str(cfg.tools.send_messages.max_messages_per_call),
     )
     if "{{face_catalog}}" in rendered_send or "{{message_limit}}" in rendered_send:

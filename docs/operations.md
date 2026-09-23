@@ -28,9 +28,11 @@ What it does:
    is included even though it is bind-mounted, and its contents are replaced in place
    so the mount survives. `.env`, `data/`, `models/`, `logs/` and `backups/` are never
    touched.
-2. Tags the currently running image `qbot-bot:rollback`.
-3. Runs `docker compose up -d --build bot`.
-4. Computes a content hash of `qqbot/`, `bot.py` and `scripts/` locally and inside the
+2. Tags the currently running image `qbot-bot:rollback`, then builds the replacement image.
+3. Runs `scripts/check_schema.py` in a one-shot container. A mismatch stops deployment
+   before the running container is replaced; the check never executes DDL.
+4. Starts the rebuilt bot only after the schema passes.
+5. Computes a content hash of `qqbot/`, `bot.py` and `scripts/` locally and inside the
    container and fails if they differ. `docker compose restart` never rebuilds an
    image, so this check is what proves the deployment took effect.
 
@@ -104,16 +106,30 @@ soon as possible, or the next build reproduces the problem.
 
 ## Schema changes
 
-`sql/init.sql` is the schema of a fresh database and only runs when `data/pg` is empty.
-On an existing database, apply the change by hand:
+`sql/init.sql` is the sole canonical schema and is intended for a fresh database. The
+repository deliberately has no migration runner, version ledger or historical conversion
+chain. Runtime startup, preflight and deployment only execute the read-only
+`scripts/check_schema.py` contract check.
 
-```bash
-docker exec qbot-postgres-1 psql -U qqbot -d qqbot -c "<statement>"
-```
+An existing installation is changed manually in a maintenance window:
 
-Record the statement in [sql/MIGRATIONS.md](../sql/MIGRATIONS.md). At boot the bot
-checks that the live schema has the tables, columns, unique indexes and vector width
-the code expects, and refuses to start until it does.
+1. Build the matching image without replacing the running container. A normal
+   `scripts/deploy.sh` does this and then stops at the expected schema mismatch.
+2. Stop the bot and create a new custom-format backup with `pg_dump -Fc` in `backups/`.
+   Verify that exact file with `pg_restore --list` and confirm it exceeds the backup
+   helper's minimum safety floor before changing any table.
+3. Apply a reviewed, installation-specific SQL transaction by hand. Convert rows only
+   when the mapping is unambiguous; discard obsolete early-project data instead of adding
+   compatibility columns, dual reads or runtime fallbacks.
+4. Run the matching image's `python scripts/check_schema.py`. Do not start the bot until
+   it reports that the database matches the canonical schema.
+5. Run `scripts/deploy.sh` again. It rebuilds, rechecks, starts the bot and verifies the
+   running source fingerprint.
+
+The manual SQL is an operational artifact, not a second schema authority. Review the
+result against `sql/init.sql`, and keep the verified pre-change dump until the new runtime
+has been exercised. Rolling code back across an incompatible schema boundary requires
+restoring that dump first.
 
 ## Logs
 
@@ -124,7 +140,7 @@ the code expects, and refuses to start until it does.
 
 ## Debugging a reply
 
-`/debug N` writes the next N model rounds to `logs/debug/`, one JSON file per round with
+`/debug start N` writes the next N model rounds to `logs/debug/`, one JSON file per round with
 the request, visible output, function calls, status and model. Reasoning items are
 removed from both replayed input and output before the file is written; they exist only
 in memory for the active Responses tool loop. Capture stops by itself when N is reached

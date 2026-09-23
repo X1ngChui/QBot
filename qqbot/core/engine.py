@@ -20,27 +20,26 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
 from datetime import timedelta
 from urllib.parse import urlsplit, urlunsplit
 
 from ..db import repo
 from ..domain.evidence import EvidenceItem, EvidenceMemo, EvidenceOutcome, EvidenceSource
-from ..providers import providers
+from ..providers.base import Providers
+from ..services import Directory
 from ..settings import Persona, Settings
 from ..util import SYS_L, SYS_R, defang, now_local, why
 from . import agent, prompt, retrieval, tools
 from .botapi import BotApi
+from .delivery import GroupDelivery
+from .media import MediaProcessor
 from .member_numbers import MemberNumbers
 from .members import MEMBERS
 from .outbound import (
     AtSegment,
-    OutboundSegment,
+    SendSegment,
     TextSegment,
     display_text,
-    reply_target,
-    to_onebot,
-    without_replies,
 )
 from .output import clean_reply
 from .state import ChatMsg, GroupState
@@ -76,9 +75,7 @@ def _safe_url_summary(value: object) -> str:
         return ""
 
 
-def _evidence_memo(
-    executed: tuple[agent.ToolExecution, ...], cfg: Settings
-) -> EvidenceMemo | None:
+def _evidence_memo(executed: tuple[agent.ToolExecution, ...], cfg: Settings) -> EvidenceMemo | None:
     """Build the bounded durable evidence for one reply's retrieval work."""
 
     items: list[EvidenceItem] = []
@@ -94,9 +91,7 @@ def _evidence_memo(
             request = ""
         else:
             request = str(args.get("query") or args.get("question") or "")
-        request = defang(" ".join(request.split()))[
-            : cfg.prompt.evidence_request_chars
-        ]
+        request = defang(" ".join(request.split()))[: cfg.prompt.evidence_request_chars]
         digest = defang(" ".join(_MEMBER_NO.sub("", execution.output or "").split()))
         digest = digest[: cfg.prompt.evidence_result_chars]
         size = len(request) + len(digest)
@@ -107,9 +102,7 @@ def _evidence_memo(
                 source=source,
                 request=request,
                 outcome=(
-                    EvidenceOutcome.VERIFIED
-                    if execution.verified
-                    else EvidenceOutcome.UNCONFIRMED
+                    EvidenceOutcome.VERIFIED if execution.verified else EvidenceOutcome.UNCONFIRMED
                 ),
                 digest=digest,
             )
@@ -132,6 +125,9 @@ async def generate(
     cfg: Settings,
     persona: Persona,
     msg: ChatMsg,
+    providers: Providers,
+    media: MediaProcessor,
+    directory: Directory,
     window: list[ChatMsg] | None = None,
 ) -> Reply | None:
     """The reply to `msg`, as the model asked for it to be sent; None for silence."""
@@ -139,7 +135,11 @@ async def generate(
     # does not leave the same person appearing under two names across the prompt.
     await MEMBERS.relabel(bot, st.group_id, list(st.recent))
 
-    profiles = await retrieval.gather(group_id=st.group_id, bot=bot)
+    profiles = await retrieval.gather(
+        group_id=st.group_id,
+        directory=directory,
+        bot=bot,
+    )
     # Episodic memory is not pushed here: what is injected uninvited sits right next
     # to the incoming message, and an elliptical question resolves against it instead
     # of against the conversation. The model pulls with recall_events instead.
@@ -166,10 +166,14 @@ async def generate(
     )
     prompt.number_people(people, profiles, window, msg)
 
-    ctx = tools.ToolCtx(bot=bot, by_pic=by_pic, people=people)
-    evidence = await repo.evidence_for(
-        int(st.group_id), [m.msg_id for m in window if m.is_bot]
+    ctx = tools.ToolCtx(
+        providers=providers,
+        media=media,
+        bot=bot,
+        by_pic=by_pic,
+        people=people,
     )
+    evidence = await repo.evidence_for(st.group_id, [m.msg_id for m in window if m.is_bot])
     messages = prompt.assemble(
         persona=persona,
         cfg=cfg,
@@ -188,7 +192,7 @@ async def generate(
     names.update({a: n for m in window if m.is_bot for a, n in m.at if n})
 
     run = agent.AgentRun(
-        model=providers().text,
+        model=providers.text,
         request=agent.request_for_reply(messages, cfg, group_id=st.group_id),
         cfg=cfg,
         state=st,
@@ -226,14 +230,14 @@ def _strip_addresses(text: str, names: list[str]) -> str:
 
 
 def _clean_outbound(
-    segments: tuple[OutboundSegment, ...],
+    segments: tuple[SendSegment, ...],
     *,
     names: dict[str, str],
     max_text_chars: int,
-) -> tuple[OutboundSegment, ...]:
+) -> tuple[SendSegment, ...]:
     """Clean and bound text parts without changing control-segment order."""
 
-    out: list[OutboundSegment] = []
+    out: list[SendSegment] = []
     pending_addresses: list[str] = []
     remaining = max_text_chars
     for segment in segments:
@@ -258,57 +262,6 @@ def _clean_outbound(
     return tuple(out)
 
 
-@dataclass(frozen=True, slots=True)
-class _DeliveredMessage:
-    msg_id: str
-    segments: tuple[OutboundSegment, ...]
-    reply_to: str
-
-
-async def _deliver_one(
-    bot: BotApi,
-    *,
-    group_id: str,
-    segments: tuple[OutboundSegment, ...],
-) -> _DeliveredMessage | None:
-    """Deliver one message, retrying a rejected reply segment once."""
-
-    reply_to = reply_target(segments) or ""
-    sent_segments = segments
-    try:
-        sent = await bot.send_group_msg(
-            group_id=int(group_id),
-            message=[to_onebot(segment) for segment in segments],
-        )
-    except Exception as exc:
-        # A quoted message can be recalled between generation and delivery. Retry only
-        # a known protocol refusal and preserve every non-reply segment in order.
-        if not reply_to or type(exc).__name__ != "ActionFailed":
-            log.warning("group %s: send failed: %s", group_id, why(exc))
-            return None
-        log.warning(
-            "group %s: send with a reply segment failed (%s), retrying without it",
-            group_id,
-            why(exc),
-        )
-        reply_to = ""
-        sent_segments = without_replies(segments)
-        try:
-            sent = await bot.send_group_msg(
-                group_id=int(group_id),
-                message=[to_onebot(segment) for segment in sent_segments],
-            )
-        except Exception as retry_exc:
-            log.warning("group %s: send failed: %s", group_id, why(retry_exc))
-            return None
-
-    return _DeliveredMessage(
-        msg_id=str((sent or {}).get("message_id") or ""),
-        segments=sent_segments,
-        reply_to=reply_to,
-    )
-
-
 async def respond(
     *,
     bot: BotApi,
@@ -316,11 +269,25 @@ async def respond(
     cfg: Settings,
     persona: Persona,
     msg: ChatMsg,
+    providers: Providers,
+    media: MediaProcessor,
+    delivery: GroupDelivery,
+    directory: Directory,
     window: list[ChatMsg] | None = None,
 ) -> bool:
     """Generate and deliver one terminal reply batch."""
     try:
-        reply = await generate(bot=bot, st=st, cfg=cfg, persona=persona, msg=msg, window=window)
+        reply = await generate(
+            bot=bot,
+            st=st,
+            cfg=cfg,
+            persona=persona,
+            msg=msg,
+            providers=providers,
+            media=media,
+            directory=directory,
+            window=window,
+        )
     except Exception as e:
         # A provider or transport failure is a one-line warning; anything else is
         # a fault in this code, and the traceback is the only way to find it.
@@ -337,8 +304,7 @@ async def respond(
     accounts = reply.at
     live = await MEMBERS.names_of(bot, st.group_id, accounts) if accounts else {}
     names = {
-        account: live.get(account) or reply.names.get(account) or "成员"
-        for account in accounts
+        account: live.get(account) or reply.names.get(account) or "成员" for account in accounts
     }
     messages = tuple(
         _clean_outbound(
@@ -355,61 +321,26 @@ async def respond(
         )
         return False
 
-    delivered_count = 0
-    evidence_msg_id = ""
-    async with st.delivery_lock:
-        for index, segments in enumerate(messages):
-            delivered = await _deliver_one(
-                bot,
-                group_id=st.group_id,
-                segments=segments,
-            )
-            if delivered is None:
-                log.warning(
-                    "group %s: reply batch stopped after %d/%d messages",
-                    st.group_id,
-                    delivered_count,
-                    len(messages),
-                )
-                break
+    delivered = await delivery.deliver(
+        bot,
+        group_id=st.group_id,
+        messages=messages,
+    )
+    evidence_msg_id = str(delivered[0].message_id or "") if delivered else ""
+    if delivered and not evidence_msg_id:
+        log.warning(
+            "group %s: first delivered message returned no message id; "
+            "reply evidence cannot be attached",
+            st.group_id,
+        )
 
-            # Delivery acknowledgement and self-observation are independent. The
-            # reported event will add the canonical platform message to the window
-            # and archive; the send path retains only the ID needed by reply evidence.
-            if delivered_count == 0:
-                evidence_msg_id = delivered.msg_id
-                if not evidence_msg_id:
-                    log.warning(
-                        "group %s: first delivered message returned no message id; "
-                        "reply evidence cannot be attached",
-                        st.group_id,
-                    )
-            delivered_count += 1
-            at_count = sum(
-                isinstance(segment, AtSegment) for segment in delivered.segments
-            )
-            log.info(
-                "group %s: delivered %d/%d (%d text chars, %d segments, %d @, %s)",
-                st.group_id,
-                index + 1,
-                len(messages),
-                sum(
-                    len(segment.text)
-                    for segment in delivered.segments
-                    if isinstance(segment, TextSegment)
-                ),
-                len(delivered.segments),
-                at_count,
-                "replying" if delivered.reply_to else "not replying",
-            )
-
-    if delivered_count and reply.evidence is not None and evidence_msg_id:
+    if delivered and reply.evidence is not None and evidence_msg_id:
         try:
-            await repo.evidence_add(int(st.group_id), evidence_msg_id, reply.evidence)
+            await repo.evidence_add(st.group_id, evidence_msg_id, reply.evidence)
         except Exception:
             log.exception("failed to persist reply evidence in group %s", st.group_id)
 
-    return delivered_count > 0
+    return bool(delivered)
 
 
 def _expected(e: BaseException) -> bool:

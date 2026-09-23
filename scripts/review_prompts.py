@@ -27,7 +27,7 @@ load_dotenv(ROOT / ".env")
 
 from qqbot.db import close_pool, init_pool
 from qqbot.prompting.packet import build_prompt_packet
-from qqbot.providers import build_default, providers, set_providers
+from qqbot.providers.registry import build as build_providers
 from qqbot.providers.contracts import (
     CallContext,
     CallPurpose,
@@ -124,10 +124,7 @@ def _validate_report(value) -> dict:
             item = finding[field]
             if not isinstance(item, str) or not item.strip() or len(item) > limit:
                 raise RuntimeError(f"review finding {index}.{field} is invalid")
-    if any(
-        not isinstance(item, str) or not item.strip() or len(item) > 300
-        for item in boundaries
-    ):
+    if any(not isinstance(item, str) or not item.strip() or len(item) > 300 for item in boundaries):
         raise RuntimeError("review verified_boundaries contains an invalid item")
     return value
 
@@ -139,10 +136,8 @@ async def main() -> int:
     cfg = bundle.default
     text_cfg = cfg.capabilities.text
     if text_cfg.provider != "deepseek":
-        raise RuntimeError(
-            f"prompt review requires DeepSeek, got {text_cfg.provider!r}"
-        )
-    set_providers(build_default())
+        raise RuntimeError(f"prompt review requires DeepSeek, got {text_cfg.provider!r}")
+    capabilities = build_providers(cfg)
     request = ModelRequest(
         prompt=(
             Message(Role.SYSTEM, REVIEW_REQUEST),
@@ -159,7 +154,7 @@ async def main() -> int:
         context=CallContext(CallPurpose.PREFLIGHT),
     )
     try:
-        async with providers().text.open_session(request) as session:
+        async with capabilities.text.open_session(request) as session:
             turn = await session.start()
         if len(turn.tool_calls) != 1 or turn.tool_calls[0].name != REVIEW_TOOL:
             raise RuntimeError("review expected exactly one report_prompt_review call")
@@ -171,7 +166,7 @@ async def main() -> int:
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
     finally:
-        await providers().aclose()
+        await capabilities.aclose()
         await close_pool()
 
 

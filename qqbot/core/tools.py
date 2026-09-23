@@ -18,18 +18,19 @@ from luqum.exceptions import ParseError as _LuqumParseError
 from luqum.parser import parser as _luqum_parser
 
 from ..db import pool, repo
-from ..domain.archive import AuthorKind
+from ..domain.archive import ArchivedMessage, AuthorKind
+from ..domain.ids import GroupId
 from ..prompting import PromptKey, tool_prompt_key
-from ..providers import providers
-from ..providers.base import QuotaExhausted
+from ..providers.base import Providers, QuotaExhausted
 from ..providers.contracts import StoredImage, TextPart, ToolCall, ToolSpec
+from ..repositories.archive import archive_columns, archived_message, archived_messages
 from ..settings import SearchHistoryToolCfg, Settings, config, prompt_catalog
 from ..util import defang, fmt_when, merge_overlapping, sysmark, why
 from . import retrieval
-from .archive import archive_author, archive_mentions, archive_sender, archive_text
 from .botapi import BotApi
-from .media import MEDIA
+from .media import MediaProcessor
 from .member_numbers import BOT_DISPLAY_NUMBER, MemberNumbers
+from .send_contract import send_arguments_model
 from .segments import FACE_NAMES, number_at_mentions
 
 log = logging.getLogger("qqbot.tools")
@@ -42,9 +43,10 @@ SEND = "send_messages"
 
 @dataclass
 class ToolCtx:
-    """What tool execution may reach beyond the database: the live protocol side,
-    and the maps from the numbers the prompt shows to what they name."""
+    """Runtime capabilities plus the prompt-local protocol and number maps."""
 
+    providers: Providers
+    media: MediaProcessor
     bot: BotApi | None = None
     #: Picture number -> (the message that posted it, its index in image_refs).
     by_pic: dict[int, tuple] = field(default_factory=dict)
@@ -67,9 +69,7 @@ def _tool(
         values["face_catalog"] = "、".join(
             f"{face_id}={label}" for face_id, label in FACE_NAMES.items()
         )
-        values["message_limit"] = str(
-            settings.tools.send_messages.max_messages_per_call
-        )
+        values["message_limit"] = str(settings.tools.send_messages.max_messages_per_call)
     description = prompt_catalog().render(key, values)
     return ToolSpec(
         name=name,
@@ -78,90 +78,19 @@ def _tool(
     )
 
 
-def _segment(kind: str, properties: dict, required: list[str] | None = None) -> dict:
-    """One closed nested message-segment schema."""
-
-    return {
-        "type": "object",
-        "properties": {
-            "type": {"type": "string", "enum": [kind]},
-            "data": {
-                "type": "object",
-                "properties": properties,
-                "required": required or list(properties),
-                "additionalProperties": False,
-            },
-        },
-        "required": ["type", "data"],
-        "additionalProperties": False,
-    }
-
-
-def _send_segments() -> list[dict]:
-    text = _segment("text", {"text": {"type": "string"}})
-    at = _segment(
-        "at",
-        {"member": {"type": "integer", "description": "成员名字后的 ⟦N⟧ 编号"}},
-    )
-    reply = _segment(
-        "reply",
-        {"line": {"type": "integer", "description": "发言行首的 #N 编号"}},
-    )
-    face = _segment("face", {"id": {"type": "integer", "minimum": 0}})
-    empty = [_segment(kind, {}, []) for kind in ("dice", "rps")]
-    member_contact = _segment(
-        "contact_member",
-        {"member": {"type": "integer", "description": "要推荐的成员编号"}},
-    )
-    group_contact = _segment("contact_group", {}, [])
-    return [
-        text,
-        at,
-        reply,
-        face,
-        *empty,
-        member_contact,
-        group_contact,
-    ]
-
-
 def send_def(cfg: Settings | None = None) -> ToolSpec:
     """The only egress from the agent: a bounded sequence of QQ messages."""
 
     settings = cfg or config().default
-    content = {
-        "type": "array",
-        "items": {"anyOf": _send_segments()},
-        "minItems": 1,
-        "maxItems": 32,
-        "description": "按发送顺序排列的 QQ 消息段；@ 可插在任意位置。",
-    }
-    return _tool(
-        SEND,
-        {
-            "type": "object",
-            "properties": {
-                "messages": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {"content": content},
-                        "required": ["content"],
-                        "additionalProperties": False,
-                    },
-                    "minItems": 1,
-                    "maxItems": settings.tools.send_messages.max_messages_per_call,
-                },
-            },
-            "required": ["messages"],
-            "additionalProperties": False,
-        },
-        cfg=settings,
+    model = send_arguments_model(
+        settings.tools.send_messages.max_messages_per_call,
+        settings.tools.send_messages.max_text_chars_per_message,
     )
+    return _tool(SEND, model.model_json_schema(), cfg=settings)
 
 
 def tool_defs(cfg: Settings | None = None) -> tuple[ToolSpec, ...]:
-    """Build typed tool contracts after each prompt/config reload."""
+    """Build typed tool contracts from the immutable startup configuration."""
 
     tcfg = (cfg or config().default).tools
     return (
@@ -170,9 +99,7 @@ def tool_defs(cfg: Settings | None = None) -> tuple[ToolSpec, ...]:
             "web_search",
             {
                 "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "搜索关键词，尽量短"}
-                },
+                "properties": {"query": {"type": "string", "description": "搜索关键词，尽量短"}},
                 "required": ["query"],
                 "additionalProperties": False,
             },
@@ -269,8 +196,9 @@ def _like(word: str) -> str:
 # parameterized ILIKE expression - member text reaches SQL only as ILIKE
 # parameters, never as SQL text.
 
-_QUERY_NORMALIZE = str.maketrans({"（": "(", "）": ")", "“": '"', "”": '"',
-                                  "「": '"', "」": '"', "'": '"'})
+_QUERY_NORMALIZE = str.maketrans(
+    {"（": "(", "）": ")", "“": '"', "”": '"', "「": '"', "」": '"', "'": '"'}
+)
 
 
 class QueryError(ValueError):
@@ -309,7 +237,7 @@ def _condition(node, params: list, offset: int) -> str:
         params.append(_like(node.value))
         return f"plain_text ILIKE ${offset + len(params)}"
     if isinstance(node, _lq.Phrase):
-        params.append(_like(node.value[1:-1]))       # value keeps its quotes
+        params.append(_like(node.value[1:-1]))  # value keeps its quotes
         return f"plain_text ILIKE ${offset + len(params)}"
     if isinstance(node, (_lq.Not, _lq.Prohibit)):
         return "NOT " + _condition(node.children[0], params, offset)
@@ -317,22 +245,25 @@ def _condition(node, params: list, offset: int) -> str:
         # A required term (+word) is what juxtaposition already means here.
         return _condition(node.children[0], params, offset)
     if isinstance(node, (_lq.AndOperation, _lq.UnknownOperation)):
-        return ("(" + " AND ".join(_condition(c, params, offset)
-                                   for c in node.children) + ")")
+        return "(" + " AND ".join(_condition(c, params, offset) for c in node.children) + ")"
     if isinstance(node, _lq.OrOperation):
-        return ("(" + " OR ".join(_condition(c, params, offset)
-                                  for c in node.children) + ")")
+        return "(" + " OR ".join(_condition(c, params, offset) for c in node.children) + ")"
     if isinstance(node, _lq.SearchField):
         raise QueryError("不支持「字段:值」写法，直接写关键词")
     raise QueryError(f"不支持的语法（{node.__class__.__name__}）")
 
 
-async def search_history(group_id: int, query: str, *, speaker: int | None = None,
-                         speaker_name: str | None = None,
-                         days: int | None = None,
-                         rcfg: SearchHistoryToolCfg | None = None,
-                         self_id: str | None = None,
-                         people: MemberNumbers | None = None) -> str:
+async def search_history(
+    group_id: GroupId,
+    query: str,
+    *,
+    speaker: int | None = None,
+    speaker_name: str | None = None,
+    days: int | None = None,
+    rcfg: SearchHistoryToolCfg | None = None,
+    self_id: str | None = None,
+    people: MemberNumbers | None = None,
+) -> str:
     """The archive, searched. Free - one SQL query, no model involved.
 
     The query is a boolean expression (_parse_query): juxtaposition is AND -
@@ -371,10 +302,8 @@ async def search_history(group_id: int, query: str, *, speaker: int | None = Non
     tools.search_history.max_result_chars so disjoint context windows cannot outgrow
     the model context; a cut answer says so on its last line.
     """
-    # One read of this tool's settings for the whole call, so how many hits are
-    # fetched and how much context is rendered cannot come from two different
-    # configs if /reload lands in between. The tool loop passes the task's global
-    # settings snapshot; a bare call reads the current default.
+    # Freeze one settings object for the entire call so all query and rendering bounds
+    # are visibly derived from the same startup configuration.
     rcfg = rcfg or config().default.tools.search_history
     # Parse and compile under one roof: the subset check lives in the compile
     # walk, and a rejected feature must answer in words exactly like a syntax
@@ -391,15 +320,15 @@ async def search_history(group_id: int, query: str, *, speaker: int | None = Non
         account = people.account(speaker) if people is not None else None
         if account is not None:
             # A number names a person, and a person may hold several accounts.
-            uids = await repo.accounts_sharing_person(account)
+            uids = await repo.linked_account_ids(account)
         elif not sp:
             return Failure(f"（记录里没有编号为 {speaker} 的成员）")
     # The condition string holds only this module's own connectives and ILIKE
     # placeholders numbered past the five fixed parameters; the member's words
     # travel in `terms`, never in SQL text.
     rows = await pool().fetch(
-        f"""SELECT id, occurred_at, payload, plain_text, platform_user_id FROM raw_event
-            WHERE group_id=$1 AND event_type='message'
+        f"""SELECT {archive_columns()} FROM raw_event
+            WHERE group_id=$1 AND event_type IN ('message','notice')
               AND {cond}
               AND ($3::text IS NULL
                    OR payload->'sender'->>'card' ILIKE $3
@@ -408,7 +337,8 @@ async def search_history(group_id: int, query: str, *, speaker: int | None = Non
                    OR occurred_at >= NOW() - make_interval(days => $4))
               AND ($5::text[] IS NULL OR platform_user_id = ANY($5::text[]))
             ORDER BY occurred_at DESC, id DESC LIMIT $2""",
-        group_id, rcfg.max_hits,
+        group_id.to_db(),
+        rcfg.max_hits,
         _like(sp) if sp and uids is None else None,
         days if days and days > 0 else None,
         uids,
@@ -416,64 +346,71 @@ async def search_history(group_id: int, query: str, *, speaker: int | None = Non
     )
     if not rows:
         return "（存档里没有搜到）"
+    messages = archived_messages(rows)
     ctx = rcfg.context_lines
     if not ctx:
-        shown = list(reversed(rows))
+        shown = list(reversed(messages))
         await _learn(people, shown)
         text = _render_lines(shown, people, self_id)
     else:
-        text = await _with_context(group_id, [r["id"] for r in rows], ctx, self_id,
-                                   people)
+        text = await _with_context(
+            group_id,
+            [message.raw_event_id for message in messages],
+            ctx,
+            self_id,
+            people,
+        )
     if len(text) > rcfg.max_result_chars:
         # Cut at a line boundary so no message is shown half-said.
-        head = text[:rcfg.max_result_chars]
-        text = head[:head.rfind("\n")] if "\n" in head else head
+        head = text[: rcfg.max_result_chars]
+        text = head[: head.rfind("\n")] if "\n" in head else head
         text += "\n（结果过长，后面的没有显示；请换更具体的检索式或缩小时间范围）"
     return text
 
 
-async def _learn(people: MemberNumbers | None, rows: list) -> None:
-    """Load every displayed speaker and structured @ target before numbering."""
+async def _learn(
+    people: MemberNumbers | None,
+    messages: list[ArchivedMessage],
+) -> None:
+    """Load every displayed speaker and structured at target before numbering."""
     if people is None:
         return
     accounts: list[str] = []
-    for row in rows:
-        uid = str(row["platform_user_id"] or "")
-        if uid:
-            accounts.append(uid)
-        payload = row["payload"] or {}
-        row_self = str(payload.get("self_id") or "")
-        accounts.extend(
-            account
-            for account, _ in archive_mentions(payload)
-            if account != row_self
-        )
+    for message in messages:
+        accounts.append(message.sender.account_id)
+        accounts.extend(account for account, _ in message.mentions if account != message.self_id)
     await people.learn(accounts)
 
 
-def _render_lines(rows: list, people: MemberNumbers | None, self_id: str | None) -> str:
-    """Archive rows as transcript lines, in the order given."""
-    return "\n".join(_history_line(r, people, self_id) for r in rows)
+def _render_lines(
+    messages: list[ArchivedMessage],
+    people: MemberNumbers | None,
+    self_id: str | None,
+) -> str:
+    """Canonical archived messages as transcript lines, in the order given."""
+    return "\n".join(_history_line(message, people, self_id) for message in messages)
 
 
-def _history_line(r, people: MemberNumbers | None, self_id: str | None) -> str:
-    uid = str(r["platform_user_id"] or "")
-    payload = r["payload"] or {}
-    row_self = str(payload.get("self_id") or "")
-    author = archive_author(payload, uid, current_self_id=self_id or "")
-    is_bot = author is AuthorKind.BOT
-    who = archive_sender(payload)
+def _history_line(
+    message: ArchivedMessage,
+    people: MemberNumbers | None,
+    self_id: str | None,
+) -> str:
+    uid = message.sender.account_id
+    is_bot = message.author_kind is AuthorKind.BOT
+    who = message.sender.display_name
     if is_bot:
         who += sysmark(str(BOT_DISPLAY_NUMBER))
     elif people is not None:
-        n = people.number(uid)
-        if n is not None:
-            who += sysmark(str(n))
-    text = archive_text(r)
-    mentions = archive_mentions(payload)
+        number = people.number(uid)
+        if number is not None:
+            who += sysmark(str(number))
+    text = message.text
+    mentions = message.mentions
     if mentions:
+
         def mention_number(account: str) -> int | None:
-            if row_self and account == row_self:
+            if message.self_id and account == message.self_id:
                 return BOT_DISPLAY_NUMBER
             if people is not None:
                 return people.number(account)
@@ -481,15 +418,19 @@ def _history_line(r, people: MemberNumbers | None, self_id: str | None) -> str:
                 return BOT_DISPLAY_NUMBER
             return None
 
-        text = number_at_mentions(text, mentions, mention_number)
+        text = number_at_mentions(text, list(mentions), mention_number)
     # fmt_when, not strftime on the raw value: asyncpg returns timestamptz in UTC,
     # and a UTC wall time here would disagree with every stamp in the history window.
-    return f"{sysmark(fmt_when(r['occurred_at']))} {who}: {text}"
+    return f"{sysmark(fmt_when(message.occurred_at))} {who}: {text}"
 
 
-async def _with_context(group_id: int, hit_ids: list, ctx: int,
-                        self_id: str | None = None,
-                        people: MemberNumbers | None = None) -> str:
+async def _with_context(
+    group_id: GroupId,
+    hit_ids: list,
+    ctx: int,
+    self_id: str | None = None,
+    people: MemberNumbers | None = None,
+) -> str:
     """The hits rendered inside their surrounding conversation.
 
     One query fetches, per hit, the ctx archive lines on either side of it (by
@@ -501,49 +442,51 @@ async def _with_context(group_id: int, hit_ids: list, ctx: int,
     2*ctx+1 lines.
     """
     nrows = await pool().fetch(
-        """SELECT h.id AS hit, n.id, n.occurred_at, n.payload, n.plain_text,
-                  n.platform_user_id
+        f"""SELECT h.id AS hit, {archive_columns("n")}
              FROM unnest($2::uuid[]) AS h(id)
              JOIN raw_event he ON he.id = h.id
             CROSS JOIN LATERAL (
-              (SELECT id, occurred_at, payload, plain_text, platform_user_id
-                 FROM raw_event
-                WHERE group_id=$1 AND event_type='message'
-                  AND (occurred_at, id) <= (he.occurred_at, he.id)
-                ORDER BY occurred_at DESC, id DESC LIMIT $3)
+              (SELECT {archive_columns("r")}
+                 FROM raw_event r
+                WHERE r.group_id=$1 AND r.event_type IN ('message','notice')
+                  AND (r.occurred_at, r.id) <= (he.occurred_at, he.id)
+                ORDER BY r.occurred_at DESC, r.id DESC LIMIT $3)
               UNION ALL
-              (SELECT id, occurred_at, payload, plain_text, platform_user_id
-                 FROM raw_event
-                WHERE group_id=$1 AND event_type='message'
-                  AND (occurred_at, id) > (he.occurred_at, he.id)
-                ORDER BY occurred_at ASC, id ASC LIMIT $4)
+              (SELECT {archive_columns("r")}
+                 FROM raw_event r
+                WHERE r.group_id=$1 AND r.event_type IN ('message','notice')
+                  AND (r.occurred_at, r.id) > (he.occurred_at, he.id)
+                ORDER BY r.occurred_at ASC, r.id ASC LIMIT $4)
             ) n""",
-        group_id, hit_ids, ctx + 1, ctx,
+        group_id.to_db(),
+        hit_ids,
+        ctx + 1,
+        ctx,
     )
-    by_id = {}
+    by_id: dict = {}
     windows: dict = {}
-    for r in nrows:
-        by_id[r["id"]] = r
-        windows.setdefault(r["hit"], set()).add(r["id"])
+    for row in nrows:
+        message = archived_message(row)
+        by_id[message.raw_event_id] = message
+        windows.setdefault(row["hit"], set()).add(message.raw_event_id)
     blocks = merge_overlapping(list(windows.values()))
-    def order(rid):
-        return by_id[rid]["occurred_at"], by_id[rid]["id"]
+
+    def order(raw_event_id):
+        message = by_id[raw_event_id]
+        return message.occurred_at, message.raw_event_id
 
     await _learn(people, list(by_id.values()))
     parts: list[str] = []
-    for b in sorted(blocks, key=lambda b: min(order(rid) for rid in b)):
-        rows = [by_id[rid] for rid in sorted(b, key=order)]
-        parts.append(_render_lines(rows, people, self_id))
+    for block in sorted(blocks, key=lambda item: min(order(rid) for rid in item)):
+        messages = [by_id[rid] for rid in sorted(block, key=order)]
+        parts.append(_render_lines(messages, people, self_id))
     return "\n……\n".join(parts)
 
 
 def render_results(items: list[dict]) -> str:
     if not items:
         return "（没搜到有用的结果）"
-    return "\n".join(
-        f"{i}. {it['title']}\n{it['content']}" for i, it in enumerate(items, 1)
-    )
-
+    return "\n".join(f"{i}. {it['title']}\n{it['content']}" for i, it in enumerate(items, 1))
 
 
 class Failure(str):
@@ -553,6 +496,7 @@ class Failure(str):
     so no reader has to recognise the wording. A no-result search is NOT a
     Failure on purpose—searching and finding nothing is still completed verification
     work, and the structured evidence memo may record that bounded outcome."""
+
     __slots__ = ()
 
 
@@ -604,7 +548,6 @@ def number(v: object) -> int | None:
     return v if isinstance(v, int) and v > 0 else None
 
 
-
 def _days(v: object) -> int | None:
     """The `days` argument as a bounded positive integer, or None."""
     n = number(v)
@@ -615,7 +558,7 @@ async def execute(
     call: ToolCall,
     *,
     cfg: Settings,
-    group_id: str,
+    group_id: GroupId,
     ctx: ToolCtx | None = None,
 ) -> str | Attachment:
     name = call.name
@@ -638,10 +581,13 @@ async def execute(
         # being compared, every picture in a forwarded record), and one round per
         # picture would spend the loop's bound on fetching.
         ns = args.get("ns")
-        if (not isinstance(ns, list) or not ns
-                or not all(isinstance(x, int) and not isinstance(x, bool) for x in ns)):
+        if (
+            not isinstance(ns, list)
+            or not ns
+            or not all(isinstance(x, int) and not isinstance(x, bool) for x in ns)
+        ):
             return Failure("（需要图片编号列表。）")
-        wanted = list(dict.fromkeys(ns))[:cfg.tools.open_images.max_images]
+        wanted = list(dict.fromkeys(ns))[: cfg.tools.open_images.max_images]
         parts: list[TextPart | StoredImage] = []
         shown: list[int] = []
         unknown: list[int] = []
@@ -656,8 +602,9 @@ async def execute(
             fid = None
             if idx < len(refs):
                 try:
-                    fid = await MEDIA.ensure_uploaded(
-                        refs[idx], bot=ctx.bot if ctx else None, group_id=group_id, cfg=cfg)
+                    fid = await ctx.media.ensure_uploaded(
+                        refs[idx], bot=ctx.bot, group_id=group_id, cfg=cfg
+                    )
                 except Exception as e:
                     # Answered in words like every other tool failure: an exception
                     # mid-loop would kill the whole reply, and "the picture could
@@ -686,13 +633,11 @@ async def execute(
         url = _text(args, "url")
         if not url.startswith(("http://", "https://")):
             return Failure("（需要一个 http/https 网址）")
-        reader = providers().page_reader
+        reader = ctx.providers.page_reader if ctx is not None else None
         if reader is None:
             return Failure("（当前搜索服务不支持读取网页）")
         try:
-            text = await reader.read_page(
-                url, cfg=cfg.capabilities.search, group_id=group_id
-            )
+            text = await reader.read_page(url, group_id=group_id)
         except QuotaExhausted:
             raise
         except Exception as e:
@@ -716,9 +661,15 @@ async def execute(
         question = _text(args, "question") or _text(args, "query")
         if not question:
             return Failure("（问题为空）")
+        if ctx is None:
+            return Failure("（记忆检索不可用）")
         try:
-            found = await retrieval.episode_lookup(group_id, question,
-                                                   rcfg=cfg.tools.recall_events)
+            found = await retrieval.episode_lookup(
+                group_id,
+                question,
+                embed=ctx.providers.embedding,
+                rcfg=cfg.tools.recall_events,
+            )
         except QuotaExhausted:
             # A limit, not a failure: it must reach the engine and drop the reply,
             # whichever tool's backend it comes from - only transport errors below
@@ -736,7 +687,8 @@ async def execute(
     if name == "search_history":
         try:
             return await search_history(
-                int(group_id), query,
+                group_id,
+                query,
                 speaker=number(args.get("speaker")),
                 speaker_name=_text(args, "speaker_name") or None,
                 days=_days(args.get("days")),
@@ -760,9 +712,10 @@ async def execute(
     # while a transport failure stays a tool answer, because a broken network is an
     # error to talk around, not a limit to respect.
     try:
-        items = await providers().search.search(
+        if ctx is None:
+            return Failure("（搜索服务不可用）")
+        items = await ctx.providers.search.search(
             query,
-            cfg=cfg.capabilities.search,
             options=cfg.tools.web_search,
             group_id=group_id,
         )

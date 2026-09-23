@@ -1,116 +1,51 @@
-"""The typed way in from OneBot v11 events.
-
-Fields were checked against the NapCat and OneBot v11 specifications rather than written
-from memory: a group message event carries message_id / group_id / user_id / sender /
-message / sub_type, and sender carries nickname, card, role (owner|admin|member), title
-and level.
-
-Why this layer exists: what the adapter hands over is a dict whose fields may or may not
-be there and whose types vary (group_id is sometimes int, sometimes str). Letting every
-consumer getattr its own way spreads "does this field exist" across ten places. It is
-answered once here, and everything downstream sees settled types.
-
-It doubles as the anti-corruption layer for everything behind the gateway: live adapter
-state is captured here once, and domain and services never learn what OneBot is. Content
-parsing remains a separate concern, but it receives detached segment values from this
-envelope rather than reading the event again.
-"""
+"""OneBot v11 normalization into detached application ingress values."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import datetime
-from enum import StrEnum
-from typing import Any, Literal, Self
-
-from nonebot.adapters.onebot.v11 import GroupMessageEvent
+from typing import Any, Self
 
 from ..domain.archive import AuthorKind
+from ..domain.ids import AccountId, GroupId, MessageId
+from ..domain.ingress import GroupRole, InboundEvent, InboundSender
 from ..util import defang, now_local, scrub_nul, tz
 
-
-class NapCatGroupMessageSentEvent(GroupMessageEvent):
-    """NapCat's self-message extension as an ordinary typed group message."""
-
-    post_type: Literal["message_sent"]
+Role = GroupRole
+Sender = InboundSender
 
 
-class Role(StrEnum):
-    """Rank inside the QQ group. Unrelated to what the bot allows - running the group is
-    not the same as running the bot."""
+def _sender(raw: dict | None, fallback_id: object = "") -> Sender:
+    """Normalize detached OneBot sender metadata."""
 
-    OWNER = "owner"
-    ADMIN = "admin"
-    MEMBER = "member"
-
-    @classmethod
-    def parse(cls, raw: Any) -> Role:
-        # Sender.role is declared optional: the attribute always exists but may be None,
-        # so a getattr default can never fire. Reading None as member is the safe way to
-        # be wrong.
-        try:
-            return cls(str(raw or "member"))
-        except ValueError:
-            return cls.MEMBER
+    raw = raw or {}
+    return Sender(
+        user_id=AccountId(raw.get("user_id") or fallback_id),
+        nickname=defang(str(raw.get("nickname") or "")),
+        card=defang(str(raw.get("card") or "")),
+        role=Role.parse(raw.get("role")),
+        title=defang(str(raw.get("title") or "")),
+    )
 
 
-@dataclass(frozen=True, slots=True)
-class Sender:
-    user_id: str
-    nickname: str = ""
-    card: str = ""
-    role: Role = Role.MEMBER
-    title: str = ""
+def _typed_text(segments: list[dict]) -> str:
+    """Keep only top-level text exactly as the sender typed it."""
 
-    @property
-    def display(self) -> str:
-        """The name the group sees. Group card first - that is how this person asks to be
-        addressed here."""
-        return (self.card or self.nickname or self.user_id).strip()
-
-    @classmethod
-    def parse(cls, raw: dict | None, fallback_id: str = "") -> Self:
-        # Names are member-chosen bytes headed for transcripts and the archive's
-        # sender payloads, so the system brackets are neutralized at the envelope -
-        # a card written to imitate a system tag arrives already harmless.
-        raw = raw or {}
-        return cls(
-            user_id=str(raw.get("user_id") or fallback_id or ""),
-            nickname=defang(str(raw.get("nickname") or "")),
-            card=defang(str(raw.get("card") or "")),
-            role=Role.parse(raw.get("role")),
-            title=defang(str(raw.get("title") or "")),
-        )
+    typed: list[str] = []
+    for segment in segments:
+        if segment.get("type") != "text":
+            continue
+        data = segment.get("data")
+        if not isinstance(data, dict):
+            continue
+        text = defang(str(data.get("text") or "")).strip()
+        if text:
+            typed.append(text)
+    return " ".join(typed)
 
 
-@dataclass(frozen=True, slots=True)
-class GroupMessage:
-    """One group message, with its fields settled.
-
-    `segments` is passed through untouched to segments.parse_segments - reading the
-    content is that layer's job; this one only opens the envelope.
-    """
-
-    message_id: str
-    group_id: int
-    sender: Sender
-    segments: list[dict]
-    self_id: str
-    occurred_at: datetime
-    sub_type: str = "normal"
-    #: The rendered text, as the prompt and the extractor will read it. Stored alongside
-    #: the segments rather than re-derived: parsing rules change, and a stored reading is
-    #: what lets an old event be replayed under the rules that were in force then.
-    plain_text: str = ""
-    #: The adapter lifts the reply segment out, resolves it, and puts it here - so it is
-    #: usually absent from `segments`.
-    reply_to_message_id: str | None = None
-    #: Versioned only for bot-authored outbound segment projections. Inbound and
-    #: legacy rows stay at zero and retain their historical reconstruction rules.
-    outbound_schema: int = 0
-    author_kind: AuthorKind = AuthorKind.MEMBER
-    #: Also decided by the adapter: a leading or trailing @bot is removed and flagged.
-    to_me: bool = False
+class GroupMessage(InboundEvent):
+    """Compatibility name for a normalized OneBot group-message event."""
 
     @classmethod
     def from_event(cls, event: Any, self_id: str) -> Self:
@@ -118,35 +53,36 @@ class GroupMessage:
 
         reply = getattr(event, "reply", None)
         when = getattr(event, "time", 0) or 0
-        author_id = str(event.user_id)
-        author_kind = (
-            AuthorKind.BOT if author_id == str(self_id) else AuthorKind.MEMBER
-        )
-        sender = Sender.parse(
+        normalized_self = AccountId(self_id)
+        author = AccountId(event.user_id)
+        author_kind = AuthorKind.BOT if author == normalized_self else AuthorKind.MEMBER
+        sender = _sender(
             getattr(event.sender, "__dict__", None) or dict(event.sender or {}),
-            fallback_id=author_id,
+            fallback_id=author,
         )
-        # The top-level author is part of the event contract; nested sender metadata is
-        # descriptive and must not be able to disguise or fabricate self authorship.
-        sender = replace(sender, user_id=author_id)
-        segments = [
-            {
-                "type": str(getattr(segment, "type", "") or ""),
-                "data": dict(getattr(segment, "data", {}) or {}),
-            }
-            for segment in event.get_message()
-        ]
+        # Top-level authorship is authoritative; nested sender metadata is descriptive.
+        sender = replace(sender, user_id=author)
+        segments = scrub_nul(
+            [
+                {
+                    "type": str(getattr(segment, "type", "") or ""),
+                    "data": dict(getattr(segment, "data", {}) or {}),
+                }
+                for segment in event.get_message()
+            ]
+        )
         return cls(
-            message_id=str(event.message_id),
-            group_id=int(event.group_id),
+            message_id=MessageId(event.message_id),
+            group_id=GroupId(event.group_id),
             sender=sender,
-            segments=scrub_nul(segments),
-            self_id=str(self_id),
+            segments=segments,
+            self_id=normalized_self,
             occurred_at=(datetime.fromtimestamp(when, tz()) if when else now_local()),
             sub_type=str(getattr(event, "sub_type", "normal") or "normal"),
+            typed_text=_typed_text(segments),
             reply_to_message_id=(
-                str(getattr(reply, "message_id", "") or "") or None
-                if reply is not None
+                MessageId(reply.message_id)
+                if reply is not None and str(getattr(reply, "message_id", "") or "").strip()
                 else None
             ),
             outbound_schema=1 if author_kind is AuthorKind.BOT else 0,
@@ -179,26 +115,39 @@ class GroupMessage:
                 data["name"] = shown
         return replace(self, segments=segments)
 
-    def as_payload(self) -> dict:
-        """The shape stored in raw_event.payload. The segments are kept verbatim, so a
-        change to the parsing rules can be replayed over old events.
 
-        The derived reading is deliberately absent: plain_text lives in its own column,
-        because it gets rewritten when a picture is later understood, and an updatable
-        field has no place inside a payload the schema calls append-only."""
-        return {
-            "message_id": self.message_id,
-            "sub_type": self.sub_type,
-            "sender": {
-                "user_id": self.sender.user_id,
-                "nickname": self.sender.nickname,
-                "card": self.sender.card,
-                "role": self.sender.role.value,
-            },
-            "segments": self.segments,
-            "reply_to": self.reply_to_message_id,
-            "to_me": self.to_me,
-            "outbound_schema": self.outbound_schema,
-            "author_kind": self.author_kind.value,
-            "self_id": self.self_id,
-        }
+def notice_from_event(
+    event: Any,
+    *,
+    self_id: object,
+    plain_text: str,
+) -> InboundEvent | None:
+    """Normalize one supported notice envelope after its text projection is chosen."""
+
+    try:
+        group_id = GroupId(getattr(event, "group_id", ""))
+        actor = AccountId(getattr(event, "user_id", ""))
+    except ValueError:
+        return None
+    when = int(getattr(event, "time", 0) or 0)
+    return InboundEvent(
+        message_id=notice_message_id(event, group_id, actor),
+        group_id=group_id,
+        sender=Sender(user_id=actor),
+        segments=[{"type": "text", "data": {"text": plain_text}}],
+        self_id=AccountId(self_id),
+        occurred_at=(datetime.fromtimestamp(when, tz()) if when else now_local()),
+        event_type="notice",
+        sub_type=str(getattr(event, "sub_type", "") or "notice"),
+        notice_type=str(getattr(event, "notice_type", "") or ""),
+        plain_text=plain_text,
+    )
+
+
+def notice_message_id(event: Any, group_id: GroupId, actor: AccountId) -> MessageId:
+    """Build the stable platform key for a supported notice at the adapter boundary."""
+
+    when = int(getattr(event, "time", 0) or 0)
+    mark = str(getattr(event, "message_id", "") or getattr(event, "target_id", "") or "")
+    base = f"notice-{getattr(event, 'notice_type', '')}-{group_id}-{actor}-{when}"
+    return MessageId(base + (f"-{mark}" if mark else ""))

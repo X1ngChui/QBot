@@ -8,29 +8,45 @@ from collections import deque
 
 from ..util import now_local
 
-_RING: deque[tuple[str, str, str]] = deque(maxlen=200)
+_RING: deque[tuple[str, str, str]] = deque()
 
 
 class RingHandler(logging.Handler):
+    def __init__(self, *, level: int, message_chars: int) -> None:
+        super().__init__(level=level)
+        self._message_chars = message_chars
+
     def emit(self, record: logging.LogRecord) -> None:
         try:
             _RING.append(
-                (now_local().strftime("%m-%d %H:%M"), record.name, record.getMessage()[:300])
+                (
+                    now_local().strftime("%m-%d %H:%M"),
+                    record.name,
+                    record.getMessage()[: self._message_chars],
+                )
             )
         except Exception:
             pass
 
 
-def install(level: int = logging.WARNING) -> None:
-    handler = RingHandler(level=level)
-    logging.getLogger("qqbot").addHandler(handler)
-    # A job function that raises escapes to APScheduler's own logger, not qqbot's.
-    # Unhooked, a failing backup or drain would never reach the daily report - the
-    # one place the ops loop actually reads.
-    logging.getLogger("apscheduler").addHandler(handler)
+def install(
+    level: int = logging.WARNING,
+    *,
+    entries: int,
+    message_chars: int,
+) -> None:
+    global _RING
+    _RING = deque(maxlen=entries)
+    handler = RingHandler(level=level, message_chars=message_chars)
+    for logger_name in ("qqbot", "apscheduler"):
+        logger = logging.getLogger(logger_name)
+        for existing in tuple(logger.handlers):
+            if isinstance(existing, RingHandler):
+                logger.removeHandler(existing)
+        logger.addHandler(handler)
 
 
-def recent(limit: int = 10) -> list[tuple[str, str, str]]:
+def recent(limit: int) -> list[tuple[str, str, str]]:
     return list(_RING)[-limit:]
 
 

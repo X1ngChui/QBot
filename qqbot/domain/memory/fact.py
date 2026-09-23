@@ -19,6 +19,8 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
+from ..ids import GroupId
+
 
 def earned_confidence(supports: int, contradicts: int = 0) -> float:
     """How much a fact has earned from its evidence: a Wilson lower bound.
@@ -108,13 +110,14 @@ class Fact:
     copy of the rule could drift with every test still green.
     """
 
-    subject_entity_id: uuid.UUID
+    subject_entity_id: uuid.UUID | None
     predicate: str
+    subject_account_id: uuid.UUID | None = None
     #: What distinguishes rows of a multi-valued predicate: the thing liked, the word
     #: defined. None for single-valued predicates, where the predicate alone is the key.
     object_key: str | None = None
     memory_type: MemoryType = MemoryType.ATTRIBUTE
-    group_id: int | None = None
+    group_id: GroupId | None = None
     object_entity_id: uuid.UUID | None = None
     object_value: Any = None
     confidence: float = 0.0
@@ -127,6 +130,7 @@ class Fact:
     id: uuid.UUID = field(default_factory=uuid.uuid4)
 
     def __post_init__(self) -> None:
+        if (self.subject_entity_id is None) == (self.subject_account_id is None):
+            raise ValueError("fact must have exactly one account or entity subject")
         if self.object_entity_id is None and self.object_value is None:
             raise ValueError(f"fact {self.predicate!r} has no object")
-

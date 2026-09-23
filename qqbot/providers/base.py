@@ -18,7 +18,7 @@ import asyncio
 import logging
 import random
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable, Coroutine, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
@@ -26,14 +26,8 @@ from email.utils import parsedate_to_datetime
 
 import httpx
 
-from ..settings import (
-    AsrCfg,
-    EmbeddingCfg,
-    SearchCfg,
-    VisionCfg,
-    WebSearchToolCfg,
-    config,
-)
+from ..domain.ids import GroupId
+from ..settings import WebSearchToolCfg
 from ..util import why
 from .contracts import (
     AttachmentStore,
@@ -49,31 +43,15 @@ log = logging.getLogger("qqbot.providers")
 Kind = CallPurpose
 
 
-#: Strong references to in-flight retirement tasks: asyncio holds tasks weakly,
-#: so a bare create_task can be collected mid-close and leak the pool it was
-#: closing.
-_RETIRING: set[asyncio.Task] = set()
+@dataclass(frozen=True, slots=True)
+class RetryPolicy:
+    """Fixed transport retry policy shared by plain-HTTP capabilities."""
 
-
-def retire(closing: Coroutine) -> None:
-    """Run a replaced client's close coroutine in the background.
-
-    For the lazily-rebuilt clients (endpoint or proxy changed under /reload):
-    the caller is mid-request and cannot await the old pool's close, but
-    dropping it unclosed leaks its connections for the process lifetime. No
-    running loop means a test context with nothing open.
-    """
-    try:
-        task = asyncio.get_running_loop().create_task(closing)
-    except RuntimeError:
-        closing.close()
-        return
-    _RETIRING.add(task)
-    task.add_done_callback(_RETIRING.discard)
+    retries: int
+    retry_after_cap_sec: float
 
 
 # -- retrying ---------------------------------------------------------------
-
 
 
 def retry_after_seconds(headers: Mapping[str, str]) -> float | None:
@@ -96,8 +74,7 @@ def retry_after_seconds(headers: Mapping[str, str]) -> float | None:
     return max(0.0, (when - datetime.now(UTC)).total_seconds())
 
 
-def backoff_delay(attempt: int, *, retry_after: float | None = None,
-                  cap: float | None = None) -> float:
+def backoff_delay(attempt: int, *, retry_after: float | None = None, cap: float) -> float:
     """How long to sleep before retry number `attempt` (1-based).
 
     The base schedule is short and doubling (0.5 s, 1 s, 2 s ...): a connection
@@ -109,8 +86,7 @@ def backoff_delay(attempt: int, *, retry_after: float | None = None,
     delay = 0.5 * 2 ** (attempt - 1)
     if retry_after is not None:
         delay = max(delay, retry_after)
-    ceiling = cap if cap is not None else config().default.capabilities.retry_after_cap_sec
-    delay = min(delay, ceiling)
+    delay = min(delay, cap)
     return delay + random.uniform(0.0, 0.25 * delay)
 
 
@@ -127,18 +103,12 @@ def _http_retryable(e: Exception) -> bool:
 
 
 async def with_retry[T](
-    fn: Callable[[], Awaitable[T]], *, what: str,
-    retries: int | None = None, retry_after_cap: float | None = None,
+    fn: Callable[[], Awaitable[T]],
+    *,
+    what: str,
+    policy: RetryPolicy,
 ) -> T:
-    """Run `fn` again on a transport error, a 429 or a 5xx, up to `retries` times.
-
-    For the backends that speak plain httpx rather than the OpenAI SDK, so that a
-    flaky proxy or a momentary rate limit costs a short sleep instead of the whole
-    call. `fn` must raise httpx.HTTPStatusError itself (raise_for_status) for the
-    status rule to see it. Anything else propagates on the first attempt.
-    """
-    if retries is None:
-        retries = config().default.capabilities.http_retries
+    """Retry transient plain-HTTP failures under one fixed startup policy."""
     attempt = 0
     while True:
         try:
@@ -147,13 +117,21 @@ async def with_retry[T](
             if not _http_retryable(e):
                 raise
             attempt += 1
-            if attempt > retries:
+            if attempt > policy.retries:
                 raise
-            wait = (retry_after_seconds(e.response.headers)
-                    if isinstance(e, httpx.HTTPStatusError) else None)
-            delay = backoff_delay(attempt, retry_after=wait, cap=retry_after_cap)
-            log.info("%s failed (%s), retry %d/%d in %.1fs", what, why(e),
-                     attempt, retries, delay)
+            wait = (
+                retry_after_seconds(e.response.headers)
+                if isinstance(e, httpx.HTTPStatusError)
+                else None
+            )
+            delay = backoff_delay(
+                attempt,
+                retry_after=wait,
+                cap=policy.retry_after_cap_sec,
+            )
+            log.info(
+                "%s failed (%s), retry %d/%d in %.1fs", what, why(e), attempt, policy.retries, delay
+            )
             await asyncio.sleep(delay)
 
 
@@ -274,10 +252,9 @@ class VisionModel(Capability):
         self,
         data: bytes,
         *,
-        cfg: VisionCfg,
         prompt: str,
         mime: str = "image/jpeg",
-        group_id: str | None = None,
+        group_id: GroupId | None = None,
     ) -> str:
         """Return one or two sentences describing the image, or "" if there is nothing.
 
@@ -290,18 +267,17 @@ class VisionModel(Capability):
 class AsrModel(Capability):
     """Speech to text. Inline bytes, for the same reason as VisionModel."""
 
-    async def start(self, cfg: AsrCfg) -> None:
-        """Load restart-scoped resources before the gateway accepts messages."""
+    async def start(self) -> None:
+        """Load fixed native resources before the gateway accepts messages."""
 
     @abstractmethod
     async def transcribe(
         self,
         data: bytes,
         *,
-        cfg: AsrCfg,
         fmt: str = "wav",
         seconds: float | None = None,
-        group_id: str | None = None,
+        group_id: GroupId | None = None,
     ) -> str:
         """Return the transcript, or "" if nothing was said."""
 
@@ -314,8 +290,7 @@ class EmbeddingModel(Capability):
     """
 
     @abstractmethod
-    async def embed(self, texts, *, cfg: EmbeddingCfg,
-                    group_id: str | None = None) -> list[list[float]]:
+    async def embed(self, texts, *, group_id: GroupId | None = None) -> list[list[float]]:
         """Vectors for these texts, in the order they were given."""
 
 
@@ -327,9 +302,8 @@ class SearchEngine(Capability):
         self,
         query: str,
         *,
-        cfg: SearchCfg,
         options: WebSearchToolCfg,
-        group_id: str | None = None,
+        group_id: GroupId | None = None,
     ) -> list[dict]:
         """Return normalised {title, link, content} results."""
 
@@ -337,9 +311,7 @@ class SearchEngine(Capability):
 class PageReader(Protocol):
     """Optional narrow capability for extracting readable text from one URL."""
 
-    async def read_page(
-        self, url: str, *, cfg: SearchCfg, group_id: str | None = None
-    ) -> str:
+    async def read_page(self, url: str, *, group_id: GroupId | None = None) -> str:
         """Return readable page text, or an empty string when none is available."""
 
 
@@ -349,8 +321,8 @@ class Providers:
 
     Tests hand over fakes; a different backend is a different object here. Neither case
     touches the code that uses them. Every capability belongs in the bundle: one wired
-    separately is one that shutdown, /reload and the startup log all have to be told
-    about by hand, and each of those is a place to forget it.
+    separately is one that shutdown and the startup log both have to know about by
+    hand, and each is a place to forget it.
     """
 
     text: TextModel

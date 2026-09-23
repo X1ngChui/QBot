@@ -14,11 +14,14 @@ from __future__ import annotations
 
 import logging
 
+from ..domain.ids import GroupId
 from ..domain.memory import Episode
 from ..providers.base import EmbeddingModel
-from ..settings import config
 from ..repositories import (
-    EpisodeRepository, IdentityRepository, MemoryRepository, VectorRepository,
+    EpisodeRepository,
+    IdentityRepository,
+    MemoryRepository,
+    VectorRepository,
 )
 
 log = logging.getLogger("qqbot.retrieve")
@@ -26,8 +29,12 @@ log = logging.getLogger("qqbot.retrieve")
 
 class Retriever:
     def __init__(
-        self, ids: IdentityRepository, mem: MemoryRepository,
-        eps: EpisodeRepository, vec: VectorRepository, embed: EmbeddingModel,
+        self,
+        ids: IdentityRepository,
+        mem: MemoryRepository,
+        eps: EpisodeRepository,
+        vec: VectorRepository,
+        embed: EmbeddingModel,
     ) -> None:
         """The vector backend is required.
 
@@ -42,19 +49,19 @@ class Retriever:
         self._embed = embed
 
     async def search_episodes(
-        self, group_id: int, question: str, *, limit: int = 5
+        self, group_id: GroupId, question: str, *, limit: int
     ) -> list[Episode]:
-        """Episodes by similarity alone, unfiltered by participant.
+        """Return group-scoped episodes ordered by semantic similarity.
 
-        A tool call asks what happened, whoever was in it - who promised what is
-        precisely a question about people the current turn need not contain, so
-        there is no participant filter here on purpose. Group isolation still
-        holds twice over: the vector search is group-scoped, and by_ids checks
-        again.
+        A question about an event may name someone absent from the current turn, so
+        identity is not a recall filter. Group isolation still holds twice: vector
+        search is group-scoped, and by_ids checks the group again.
         """
-        [qv] = await self._embed.embed(
-            [question], cfg=config().default.capabilities.embedding, group_id=str(group_id))
+        [qv] = await self._embed.embed([question], group_id=group_id)
         near = await self._vec.search(
-            group_id=group_id, object_type="episode", embedding=qv, limit=limit,
+            group_id=group_id,
+            object_type="episode",
+            embedding=qv,
+            limit=limit,
         )
         return await self._eps.by_ids(group_id, [eid for eid, _ in near])

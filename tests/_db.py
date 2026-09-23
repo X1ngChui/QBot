@@ -7,7 +7,6 @@ connection variables are never inherited.
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from urllib.parse import urlparse
 
 
@@ -16,16 +15,17 @@ DEFAULT_TEST_DATABASE_PASSWORD = "testpw"
 _ALLOWED_DATABASE = "qbot_test"
 _ALLOWED_USER = "qbot_test"
 _MARKER = "qbot-disposable-v1"
-_SCHEMA = Path(__file__).resolve().parent.parent / "sql" / "init.sql"
 
 
 def configure_test_database() -> str:
     """Install the explicit test DSN before importing database or settings modules."""
     url = os.environ.get("QBOT_TEST_DATABASE_URL", DEFAULT_TEST_DATABASE_URL)
     parsed = urlparse(url)
-    if (parsed.scheme not in ("postgresql", "postgres")
-            or parsed.path.lstrip("/") != _ALLOWED_DATABASE
-            or parsed.username != _ALLOWED_USER):
+    if (
+        parsed.scheme not in ("postgresql", "postgres")
+        or parsed.path.lstrip("/") != _ALLOWED_DATABASE
+        or parsed.username != _ALLOWED_USER
+    ):
         raise RuntimeError(
             "QBOT_TEST_DATABASE_URL must name database and user qbot_test; "
             "initialize it with tests/fixtures/test_db_marker.sql"
@@ -43,15 +43,12 @@ async def _assert_connection(conn) -> None:
         "SELECT current_database() AS database, current_user AS username"
     )
     actual = dict(identity)
-    if (actual["database"] != _ALLOWED_DATABASE
-            or actual["username"] != _ALLOWED_USER):
+    if actual["database"] != _ALLOWED_DATABASE or actual["username"] != _ALLOWED_USER:
         raise RuntimeError(
             "refusing destructive access to a non-test database: "
             f"database={actual['database']!r} user={actual['username']!r}"
         )
-    marker_table = await conn.fetchval(
-        "SELECT to_regclass('qbot_test_guard.identity')::text"
-    )
+    marker_table = await conn.fetchval("SELECT to_regclass('qbot_test_guard.identity')::text")
     if marker_table != "qbot_test_guard.identity":
         raise RuntimeError("refusing destructive access: disposable database marker is absent")
     marker = await conn.fetchval(
@@ -70,18 +67,16 @@ async def assert_disposable_database() -> None:
 
 
 async def reset() -> None:
-    """Truncate public tables after checking the same connection in one transaction."""
+    """Truncate canonical tables after checking the same guarded connection."""
     from qqbot.db import pool
+    from qqbot.db.repo import check_schema
+    from qqbot.settings import config
 
     async with pool().acquire() as conn, conn.transaction():
         await _assert_connection(conn)
-        # Keep a long-lived disposable container aligned with the checked-in schema.
-        # This runs only after the database/user/marker guard above; production can
-        # never reach it through an inherited DATABASE_URL.
-        await conn.execute(_SCHEMA.read_text(encoding="utf-8"))
-        rows = await conn.fetch(
-            "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
-        )
-        names = [r["tablename"] for r in rows]
+        dimensions = config().default.capabilities.embedding.dimensions
+        await check_schema(conn, schema="public", embedding_dimensions=dimensions)
+        rows = await conn.fetch("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
+        names = [row["tablename"] for row in rows]
         if names:
             await conn.execute("TRUNCATE " + ", ".join(names))

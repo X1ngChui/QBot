@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, NewType, Protocol
 
+from ..domain.ids import GroupId
+
 type JsonScalar = str | int | float | bool | None
 type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
 type JsonObject = Mapping[str, JsonValue]
@@ -149,7 +151,7 @@ class GenerationPolicy:
 @dataclass(frozen=True, slots=True)
 class CallContext:
     purpose: CallPurpose = CallPurpose.REPLY
-    group_id: str | None = None
+    group_id: GroupId | None = None
 
 
 @dataclass(frozen=True, slots=True)

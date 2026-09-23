@@ -62,7 +62,18 @@ echo "==> rebuilding"
 # be undone from the server alone - see README "Rollback" for the two commands. The
 # container is found through compose, so the project name is not assumed.
 "${SSH[@]}" "cd '$REMOTE' && cid=\$(docker compose ps -q bot 2>/dev/null); img=\$([ -n \"\$cid\" ] && docker inspect --format '{{.Image}}' \"\$cid\"); [ -n \"\$img\" ] && docker tag \"\$img\" qbot-bot:rollback || true"
-"${SSH[@]}" "cd '$REMOTE' && docker compose up -d --build bot"
+"${SSH[@]}" "cd '$REMOTE' && docker compose build bot"
+
+echo "==> checking database schema"
+if ! "${SSH[@]}" "cd '$REMOTE' && docker compose run --rm --no-deps bot python scripts/check_schema.py"; then
+    echo >&2
+    echo "DEPLOY STOPPED: the database schema does not match this image." >&2
+    echo "The running container was not replaced. Stop it only during the maintenance" >&2
+    echo "window, create and verify a fresh backup, apply the manual schema update," >&2
+    echo "run scripts/check_schema.py, then run this deployment again." >&2
+    exit 1
+fi
+"${SSH[@]}" "cd '$REMOTE' && docker compose up -d bot"
 
 echo "==> verifying"
 # Every path the Dockerfile COPYs code from - a stale bot.py or scripts/ must fail

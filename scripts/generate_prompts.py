@@ -34,7 +34,7 @@ from qqbot.db import close_pool, init_pool
 from qqbot.prompting import PROMPT_SPECS, PromptCatalog, TemplateValidationError
 from qqbot.prompting.lint import lint_catalog
 from qqbot.prompting.packet import build_prompt_packet
-from qqbot.providers import build_default, providers, set_providers
+from qqbot.providers.registry import build as build_providers
 from qqbot.providers.contracts import (
     CallContext,
     CallPurpose,
@@ -80,7 +80,9 @@ it supported. It is bounded, may expire, and supports only the summarized retrie
 define or rely on a permanent `⟦依据:…⟧` archive marker, and never treat the bot's old wording as
 external evidence by itself. For archive search, distinguish likely verbatim topic terms from
 question-side field labels such as model, price or time: do not make a label an AND requirement when
-the archived sentence may state only its value.
+the archived sentence may state only its value. Extraction candidates bind explicit source ordinals,
+verbatim eligible member-authored quotes and exact line-local account targets. Episodes cite every
+necessary source+quote pair and do not submit a model-generated identity list.
 
 The shared_legend and shared_pragmatics templates are the only shared partials. reply_system and
 extract_system each include them through their declared slots. State a rule once at its owning
@@ -108,9 +110,7 @@ def write_tool() -> ToolSpec:
         description="Write one complete replacement for every prompt template.",
         parameters={
             "type": "object",
-            "properties": {
-                key: {"type": "string", "minLength": 1} for key in keys
-            },
+            "properties": {key: {"type": "string", "minLength": 1} for key in keys},
             "required": keys,
             "additionalProperties": False,
         },
@@ -157,10 +157,8 @@ async def main() -> int:
     cfg = bundle.default
     text_cfg = cfg.capabilities.text
     if text_cfg.provider != "deepseek":
-        raise RuntimeError(
-            f"prompt generation requires DeepSeek, got {text_cfg.provider!r}"
-        )
-    set_providers(build_default())
+        raise RuntimeError(f"prompt generation requires DeepSeek, got {text_cfg.provider!r}")
+    capabilities = build_providers(cfg)
     request = ModelRequest(
         prompt=(
             Message(Role.SYSTEM, WRITER_REQUEST),
@@ -177,7 +175,7 @@ async def main() -> int:
         context=CallContext(CallPurpose.PREFLIGHT),
     )
     try:
-        async with providers().text.open_session(request) as session:
+        async with capabilities.text.open_session(request) as session:
             turn = await session.start()
             catalog, call_id, error = _candidate(turn, cfg)
             if catalog is None:
@@ -198,14 +196,12 @@ async def main() -> int:
                 )
                 catalog, _call_id, error = _candidate(turn, cfg)
                 if catalog is None:
-                    raise RuntimeError(
-                        f"corrected complete prompt bundle is invalid: {error}"
-                    )
+                    raise RuntimeError(f"corrected complete prompt bundle is invalid: {error}")
         _install(catalog)
         print(f"replaced complete {len(catalog.templates)}-template bundle with {MODEL}")
         return 0
     finally:
-        await providers().aclose()
+        await capabilities.aclose()
         await close_pool()
 
 

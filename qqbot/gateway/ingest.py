@@ -1,41 +1,22 @@
-"""The inbound chain: what happens when a group message arrives.
-
-    raw_event is written (L0)
-        +-- the speaker and everyone @-ed gets an owner (L1)
-
-There is deliberately no reference-resolution step in between: every mention this system
-receives is an @ or a quote, where the platform states the account outright, so there is
-nothing to resolve. The references that would need judgement - a bare name, a pronoun -
-are left alone, because deciding whether a name in a sentence means a member or
-somebody's colleague is interpretation, and this layer reproduces the conversation
-rather than interpreting it.
-
-The chain does only free work: write, look up, resolve. Paid extraction
-does not happen here at all - the nightly drain (schedule.nightly_cron) reads the day's
-transcript in one sitting, through the job queue so half-learned work survives the
-process stopping.
-"""
+"""Atomic append-once admission and member identity projection for inbound events."""
 
 from __future__ import annotations
 
-import logging
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from ..db import pool
-from ..repositories import IdentityRepository
-from ..services import IdentityResolver
-from ..domain.archive import AuthorKind
-from .onebot import GroupMessage
+import asyncpg
 
-log = logging.getLogger("qqbot.ingest")
+from ..db import pool
+from ..domain.archive import AuthorKind
+from ..domain.ingress import InboundEvent
+from ..services import IdentityResolver
 
 
 @dataclass(frozen=True, slots=True)
 class Ingested:
-    """What the inbound chain produced. Both fields are worked out on the way through, so
-    reporting them costs nothing."""
+    """The authoritative archive id and optional member entity created at admission."""
 
     raw_event_id: uuid.UUID
     speaker_entity_id: uuid.UUID | None
@@ -46,56 +27,65 @@ class Ingestor:
         self._identity = identity
 
     async def ingest(
-        self, msg: GroupMessage, *, at_accounts: Sequence[str] = (),
-    ) -> Ingested:
-        """Archive one message and make sure everybody in it has an owner."""
-        raw_id = await self._record(msg)
-        if msg.author_kind is AuthorKind.BOT:
-            # Self-observation is conversation context, never member identity or
-            # evidence. The reported event is still archived verbatim above.
-            return Ingested(raw_event_id=raw_id, speaker_entity_id=None)
+        self,
+        event: InboundEvent,
+        *,
+        at_accounts: Sequence[str] = (),
+    ) -> Ingested | None:
+        """Append once and atomically apply the event's required identity writes.
 
-        speaker = await self._identity.seen(
-            msg.sender.user_id, group_id=msg.group_id, at=msg.occurred_at,
-            card=msg.sender.card, nickname=msg.sender.nickname, raw_event_id=raw_id,
-        )
+        None means the platform key already exists. Callers must treat that conflict as
+        final admission denial and perform no window, media, command or reply effects.
+        """
 
-        # Everyone @-ed gets an owner too: they have not spoken yet, but they are already
-        # part of this conversation, and the next line saying "he's right" means them.
-        # The @ carries the account id outright, so there is nothing here to resolve.
-        for uid in dict.fromkeys(at_accounts):
-            if uid:
-                await self._identity.seen(
-                    uid, group_id=msg.group_id, at=msg.occurred_at, raw_event_id=raw_id,
-                )
+        async with pool().acquire() as conn, conn.transaction():
+            raw_id = await self._record(conn, event)
+            if raw_id is None:
+                return None
+            if event.author_kind is AuthorKind.BOT:
+                return Ingested(raw_event_id=raw_id, speaker_entity_id=None)
 
-        # The message path only writes. Reading the day's transcript is the nightly
-        # drain's job (schedule.nightly_cron), at off-peak prices and in
-        # gap-aligned batches.
-        return Ingested(raw_event_id=raw_id, speaker_entity_id=speaker.entity_id)
+            speaker = await self._identity.seen(
+                event.sender.user_id,
+                group_id=event.group_id,
+                at=event.occurred_at,
+                card=event.sender.card,
+                nickname=event.sender.nickname,
+                raw_event_id=raw_id,
+                _conn=conn,
+            )
+            for account in dict.fromkeys(at_accounts):
+                if account:
+                    await self._identity.seen(
+                        account,
+                        group_id=event.group_id,
+                        at=event.occurred_at,
+                        raw_event_id=raw_id,
+                        _conn=conn,
+                    )
+            return Ingested(raw_event_id=raw_id, speaker_entity_id=speaker.entity_id)
 
-    async def _record(self, msg: GroupMessage) -> uuid.UUID:
-        """L0 is append-only. The unique index on the platform message id is what stops a
-        replay after a reconnect from landing twice."""
-        return await pool().fetchval(
+    @staticmethod
+    async def _record(
+        conn: asyncpg.Connection,
+        event: InboundEvent,
+    ) -> uuid.UUID | None:
+        """Claim the platform event key without mutating an existing row."""
+
+        return await conn.fetchval(
             """INSERT INTO raw_event
                    (platform, event_type, group_id, platform_user_id,
-                    platform_event_id, occurred_at, payload, plain_text)
-               VALUES ('qq','message',$1,$2,$3,$4,$5,$6)
+                    platform_event_id, occurred_at, payload, plain_text, archive_schema)
+               VALUES ('qq',$1,$2,$3,$4,$5,$6,$7,1)
                ON CONFLICT (platform, platform_event_id)
                  WHERE platform_event_id IS NOT NULL
-                 DO UPDATE SET occurred_at = raw_event.occurred_at
+                 DO NOTHING
             RETURNING id""",
-            msg.group_id, msg.sender.user_id, msg.message_id,
-            msg.occurred_at, msg.as_payload(), msg.plain_text or None,
+            event.event_type,
+            event.group_id.to_db(),
+            event.sender.user_id,
+            event.message_id,
+            event.occurred_at,
+            event.as_payload(),
+            event.plain_text or None,
         )
-
-_INGESTOR: Ingestor | None = None
-
-
-def ingestor() -> Ingestor:
-    """The shared instance. Built lazily and once; every part of it is stateless."""
-    global _INGESTOR
-    if _INGESTOR is None:
-        _INGESTOR = Ingestor(identity=IdentityResolver(IdentityRepository()))
-    return _INGESTOR

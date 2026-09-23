@@ -12,15 +12,23 @@ complex is the temporal and scope semantics, and those read more clearly as SQL 
 are far easier to follow in an EXPLAIN.
 """
 
+from .archive import ArchiveRepository
 from .event import EventRepository
+from .extraction import ExtractionRepository
 from .identity import IdentityRepository
+from .identity_link import IdentityLinkRepository, LinkChallenge, LinkChallengeError
 from .job import JobQueue
 from .memory import EpisodeRepository, MemoryRepository
 from .vector import VectorRepository
 
 __all__ = [
+    "ArchiveRepository",
     "EventRepository",
+    "ExtractionRepository",
     "IdentityRepository",
+    "IdentityLinkRepository",
+    "LinkChallenge",
+    "LinkChallengeError",
     "JobQueue",
     "MemoryRepository",
     "EpisodeRepository",

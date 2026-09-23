@@ -33,9 +33,7 @@ def dsn(*, with_password: bool = True) -> str:
 
 
 async def _init_conn(conn: asyncpg.Connection) -> None:
-    await conn.set_type_codec(
-        "jsonb", encoder=json.dumps, decoder=json.loads, schema="pg_catalog"
-    )
+    await conn.set_type_codec("jsonb", encoder=json.dumps, decoder=json.loads, schema="pg_catalog")
 
 
 async def init_pool() -> asyncpg.Pool:
@@ -43,8 +41,11 @@ async def init_pool() -> asyncpg.Pool:
     db = config().default.database
     if _pool is None:
         _pool = await asyncpg.create_pool(
-            dsn(), min_size=db.pool_min, max_size=db.pool_max,
-            init=_init_conn, command_timeout=db.command_timeout_sec
+            dsn(),
+            min_size=db.pool_min,
+            max_size=db.pool_max,
+            init=_init_conn,
+            command_timeout=db.command_timeout_sec,
         )
         log.info("postgres pool ready")
     return _pool

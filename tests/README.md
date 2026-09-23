@@ -27,18 +27,21 @@ No QQ connection is needed. The runtime dependencies in `requirements.txt` are e
 | File | Needs a DB | Covers |
 | --- | --- | --- |
 | `test_domain.py` | no | The domain model: alias evidence and confirmation, fact validity windows, candidates, episodes |
+| `test_schema.py` | yes | Fresh installation of the sole canonical schema plus read-only compatibility and drift checks in a rolled-back isolated schema |
 | `test_logic.py` | no | Configuration merge, output cleaning, budget arithmetic, segment parsing, prompt ordering, history eviction, the permission table, the source-language guard |
 | `test_nickname.py` | no | Whole-word nickname matching and its boundary cases |
 | `test_keys.py` | no | Per-capability credential resolution |
 | `test_backends.py` | no | Backend selection, base-class enforcement, each backend's request and billing specifics |
 | `test_repositories.py` | yes | The repository layer: merge and split, alias scope, one current fact per predicate, group isolation, the job queue, vectors |
 | `test_services.py` | no | Validation rules and the parsing of tool calls |
-| `test_commands.py` | yes | The command catalogue, who may run what, and every operation the command handlers perform |
-| `test_repo.py` | yes | The archive, the image cache, the per-group switches, the cost ledger |
+| `test_delivery.py` | no | Typed group delivery, per-group serialization, platform ids and reply fallback |
+| `test_commands.py` | no | Role-independent command catalogue, authorization, strict syntax and typed handler operations |
+| `test_repo.py` | yes | Append-once archive admission, rollback, history reads, the image cache, per-group switches and the cost ledger |
 | `test_media.py` | yes | Every segment type QQ sends, cache hits, content refusals, size and rate caps |
 | `test_sherpa.py` | no | Local ASR startup, FIFO/backpressure, cancellation and shutdown lifecycle |
-| `test_pipeline.py` | yes | The whole pipeline with a fake protocol side and stubbed models: triggers, identity, memory, media, member numbers, the send tool |
-| `test_memory.py` | yes | The extraction chain end to end: one stubbed call, four record kinds, quote validation, the nightly drain, replay |
+| `test_runtime.py` | no | Runtime composition and teardown ordering plus per-message media ownership, sharing, retries and late patches |
+| `test_pipeline.py` | yes | The normalized archive-first gateway with a fake protocol side and stubbed models: replay admission, commands, notices, triggers, identity, media and replies |
+| `test_memory.py` | yes | Exact-event extraction end to end: durable/staged restart, concurrent provider exclusion, quote validation, atomic projection and rollback, embedding enqueue, and decay |
 
 ## Conventions
 
@@ -48,9 +51,8 @@ No QQ connection is needed. The runtime dependencies in `requirements.txt` are e
   ordinary `DATABASE_URL` / password variables rather than inheriting them. The only
   overrides are `QBOT_TEST_DATABASE_URL` and `QBOT_TEST_DATABASE_PASSWORD`; the URL must
   name the distinct `qbot_test` role and database, and the live connection must carry the
-  `qbot_test_guard` marker installed above before every schema sync or truncate. After the
-  guard passes, reset applies the checked-in `sql/init.sql` idempotently, so a long-lived
-  test container follows new columns and indexes without a manual migration.
+  `qbot_test_guard` marker installed above before any truncate. The disposable database is
+  recreated from `sql/init.sql` when the canonical schema changes; tests never upgrade it.
 - **Fixtures, not live config.** Behaviour tests read `tests/fixtures/config/`, so
   renaming the bot or adding a group cannot break them. `test_keys.py` and
   `test_backends.py` are the deliberate exceptions: they assert properties of the
@@ -58,11 +60,11 @@ No QQ connection is needed. The runtime dependencies in `requirements.txt` are e
 - **Language guard.** `test_logic.py` fails on Chinese in comments, docstrings, log
   messages or SQL under `qqbot/` and `tests/`. Chinese belongs only in strings the
   model or a group member reads.
-- **Import-time registration.** `qqbot/plugins/commands.py` and `tasks.py` register
-  handlers with NoneBot at import time and cannot be imported without a runtime.
-  Their tests parse the source instead: syntax, attribute resolution, the presence of
-  the permission gate in every handler, and agreement between the catalogue's
-  global-only set and the handlers.
+- **Import-time registration.** Command behavior is importable from
+  `qqbot/core/commands.py` and routed by the ordinary gateway after database admission;
+  `test_commands.py` executes its router and handlers directly. Scheduled job bodies live
+  in importable `qqbot/scheduled.py`; `qqbot/plugins/tasks.py` is only the thin APScheduler
+  registration adapter covered by the package-wide syntax and attribute guards.
 - **Port 15432**, not 5432, avoids the production/default PostgreSQL port and the Windows
   reserved port range. Safety comes from the distinct database, role and marker rather
   than from this port alone.

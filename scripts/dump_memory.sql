@@ -36,20 +36,26 @@ SELECT f.predicate, f.object_value::text AS 内容,
 \echo '===== 关于人 ====='
 SELECT COALESCE(
          (SELECT a.alias_text FROM alias a
-           WHERE a.target_entity_id = f.subject_entity_id
+           WHERE ((a.target_account_id = f.subject_account_id
+                    AND f.subject_account_id IS NOT NULL)
+               OR (a.target_entity_id = f.subject_entity_id
+                    AND f.subject_entity_id IS NOT NULL))
              AND (a.group_id = :gid OR a.group_id IS NULL)
              AND a.status = 'confirmed' AND a.valid_to IS NULL
            ORDER BY a.confidence DESC, a.alias_text LIMIT 1),
+         ia.platform_user_id,
          left(f.subject_entity_id::text, 8)) AS 谁,
+       CASE WHEN f.subject_account_id IS NULL THEN '关联集合' ELSE '精确账号' END AS 范围,
        f.predicate, f.object_value::text AS 内容,
        round(f.confidence::numeric, 2) AS 置信,
        (SELECT count(*) FROM memory_fact_evidence e
          WHERE e.fact_id = f.id AND e.relation = 'supports') AS 证据,
        to_char(f.last_confirmed_at, 'MM-DD') AS 最近确认
   FROM memory_fact f
-  JOIN entity en ON en.id = f.subject_entity_id
+  LEFT JOIN identity_account ia ON ia.id = f.subject_account_id
+  LEFT JOIN entity en ON en.id = f.subject_entity_id
  WHERE f.group_id = :gid AND f.status = 'active' AND f.valid_to IS NULL
-   AND en.entity_type = 'person'
+   AND (f.subject_account_id IS NOT NULL OR en.entity_type = 'person')
  ORDER BY 谁, f.predicate;
 
 \echo ''
@@ -73,7 +79,7 @@ SELECT a.alias_text AS 称呼, a.alias_type AS 来源, a.status AS 状态,
 SELECT to_char(ep.started_at, 'MM-DD') AS 日期, ep.episode_type AS 类型,
        ep.summary AS 摘要,
        round(ep.importance::numeric, 2) AS 重要度,
-       (SELECT count(*) FROM episode_participant p WHERE p.episode_id = ep.id) AS 参与人,
+       (SELECT count(*) FROM episode_event e WHERE e.episode_id = ep.id) AS 来源事件,
        (SELECT count(*) FROM embedding_index ix
          WHERE ix.object_id = ep.id AND ix.object_type = 'episode'
            AND ix.embedding_model = :'model') AS 有向量

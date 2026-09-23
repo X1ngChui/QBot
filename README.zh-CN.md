@@ -24,8 +24,7 @@ QBot 是一个参与 QQ 群聊的 AI 成员。被 @、被叫到名字或被引�
 - **一切按群。** 人设、群知识、记忆、屏蔽名单、静音开关、用户协议的同意状态都以群为
   作用域。
 - **同意机制。** 成员接受用户协议后才会得到回复；协议文本和版本由你掌握。
-- **群内运维控制台。** 查看和修正记忆、屏蔽或静音、查看用量、重载配置、捕获模型调用
-  以便排查。
+- **群内运维控制台。** 查看和修正记忆、屏蔽或静音、查看用量、捕获模型调用以便排查。
 
 ## 工作原理
 
@@ -99,29 +98,29 @@ docker compose up -d bot
 | `.env` | Docker Compose 读取的凭证与基础设施参数 |
 | `config/settings.yaml` | 全局设置：拥有者、触发、服务商、预算、提示词窗口、记忆、定时任务 |
 | `config/personas/default.yaml` | 默认人设：名字、系统提示、群知识 |
-| `config/personas/group_<群号>.yaml` | 单个群的人设以及对任意设置的覆盖 |
+| `config/personas/group_<群号>.yaml` | 单个群的人设：名字、提示词补充与固定群背景 |
 | `config/predicates.yaml` | 可以记录关于一个人的哪些内容 |
-| `config/prompts/*.txt` | 模型读到的全部指令文本 |
+| `config/prompts/prompts.yaml` | 模型读到的全部指令模板 |
 | `config/agreement.txt` | `/terms` 展示的用户协议 |
 
-多数设置发 `/reload` 即生效，少数需要重启。参考见
-[docs/configuration.md](docs/configuration.md)。
+完整配置会在启动时统一校验。设置、人设、提示词、谓词表或用户协议修改后，需要重启进程
+才能生效。参考见 [docs/configuration.md](docs/configuration.md)。
 
 ## 指令
 
-在群里以 `/` 开头输入。拥有者持有完整控制台；成员可以查看和修正自己的记录、查看只读
-统计、同意协议。成员无权使用的指令不会得到回复。
+指令对所有调用者只有一种含义，身份只决定是否有权执行。涉及人的指令默认作用于精确
+账号，只有显式 `--all` 才作用于当前关联账号集合。
 
 | 指令 | 用途 |
 | --- | --- |
-| `/help` | 列出你可用的指令 |
+| `/help` | 显示所有人共用的指令目录与权限标签 |
 | `/agree`、`/terms` | 同意或查看用户协议 |
-| `/who`、`/note`、`/alias`、`/forget` | 查看和修正关于某个成员的记录 |
-| `/card` | 关于本群本身的记录 |
-| `/merge`、`/split` | 声明两个账号是同一个人，或撤销 |
-| `/block`、`/unblock`、`/mute`、`/unmute` | 不再回复某个成员，或整个群 |
-| `/stats`、`/groupstats`、`/top` | 花费与用量 |
-| `/reload`、`/debug`、`/log` | 维护 |
+| `/who`、`/note`、`/alias`、`/forget` | 查看和修正精确账号或显式关联集合记录 |
+| `/link`、`/unlink` | 双端确认自己的关联账号，或剥离当前精确账号 |
+| `/card`、`/stats`、`/top` | 本群记录与用量 |
+| `/members`、`/merge`、`/split` | owner 查看目录和修复身份关系 |
+| `/block`、`/mute` | owner 管理回复屏蔽与群静音 |
+| `/debug`、`/log` | 维护 |
 
 用法与权限见 [docs/commands.md](docs/commands.md)。
 
@@ -139,9 +138,10 @@ python -m venv .venv
 .venv/bin/pip install -r requirements.txt -r requirements-dev.txt
 
 docker run -d --name qbot-pgtest \
-  -e POSTGRES_DB=qqbot -e POSTGRES_USER=qqbot -e POSTGRES_PASSWORD=testpw \
+  -e POSTGRES_DB=qbot_test -e POSTGRES_USER=qbot_test -e POSTGRES_PASSWORD=testpw \
   -p 15432:5432 \
-  -v "$PWD/sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro" \
+  -v "$PWD/sql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro" \
+  -v "$PWD/tests/fixtures/test_db_marker.sql:/docker-entrypoint-initdb.d/02-test-marker.sql:ro" \
   pgvector/pgvector:0.8.5-pg17
 
 .venv/bin/python tests/run_all.py        # 全部套件，然后 ruff
@@ -155,16 +155,18 @@ docker run -d --name qbot-pgtest \
 | 路径 | 内容 |
 | --- | --- |
 | `bot.py` | 入口；提供 OneBot 反向 WebSocket |
-| `qqbot/plugin.py` | NoneBot 插件装配与启动顺序 |
-| `qqbot/settings.py` | 配置模型、人设合并、`/reload` |
-| `qqbot/gateway/` | 入站消息处理：消息段、去重、存档 |
-| `qqbot/core/` | 触发、流水线、提示词组装、回复引擎、工具、媒体、预算、指令目录 |
-| `qqbot/domain/` | 记忆模型：身份、称呼、事实、情景、证据 |
+| `qqbot/plugin.py` | 薄 NoneBot 生命周期与事件适配层 |
+| `qqbot/runtime.py` | 进程级装配根与有序生命周期所有权 |
+| `qqbot/scheduled.py` | 不依赖框架的夜间与报告任务主体 |
+| `qqbot/settings.py` | 启动配置模型与人设合并 |
+| `qqbot/gateway/` | OneBot 归一化与数据库 append-once 准入 |
+| `qqbot/core/` | 入站路由、指令、投递、触发、提示词、工具、媒体和预算 |
+| `qqbot/domain/` | 类型化入站事件与记忆模型：身份、称呼、事实、情景、证据 |
 | `qqbot/repositories/` | 记忆模型的数据库访问 |
 | `qqbot/services/` | 抽取、校验、归并、成员目录 |
 | `qqbot/workers/` | 后台记忆工作器 |
 | `qqbot/providers/` | 服务商抽象，每个后端一个模块 |
-| `qqbot/plugins/` | 指令处理器与定时任务 |
+| `qqbot/plugins/` | 定时任务的薄注册适配层 |
 | `qqbot/db/` | 连接池、结构检查、存档与账本访问 |
 | `config/` | 配置模板、提示词、谓词表、用户协议 |
 | `sql/` | 数据库结构与结构变更记录 |

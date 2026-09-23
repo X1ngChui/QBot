@@ -21,6 +21,8 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 
+from ..ids import GroupId
+
 
 class AliasType(StrEnum):
     """Where a name came from.
@@ -210,11 +212,12 @@ class AliasEvidence:
 
 @dataclass(frozen=True, slots=True)
 class Alias:
-    """One name pointing at one person, within one scope."""
+    """One name pointing at one exact account or one linked holder."""
 
     alias_text: str
-    target_entity_id: uuid.UUID
-    group_id: int | None = None
+    target_entity_id: uuid.UUID | None
+    target_account_id: uuid.UUID | None = None
+    group_id: GroupId | None = None
     alias_type: AliasType = AliasType.NICKNAME
     confidence: float = 0.0
     status: AliasStatus = AliasStatus.CANDIDATE
@@ -222,6 +225,10 @@ class Alias:
     valid_to: datetime | None = None
     last_used_at: datetime | None = None
     id: uuid.UUID = field(default_factory=uuid.uuid4)
+
+    def __post_init__(self) -> None:
+        if (self.target_entity_id is None) == (self.target_account_id is None):
+            raise ValueError("alias must target exactly one account or holder")
 
     @property
     def normalized_text(self) -> str:
@@ -259,12 +266,10 @@ class Alias:
         manual = [e for e in evidence if e.evidence_type is EvidenceType.MANUAL]
         if manual:
             conf = manual[-1].weight
-            status = (AliasStatus.CONFIRMED if conf >= CONFIRM_THRESHOLD
-                      else AliasStatus.CANDIDATE)
+            status = AliasStatus.CONFIRMED if conf >= CONFIRM_THRESHOLD else AliasStatus.CANDIDATE
             return replace(self, confidence=conf, status=status)
         conf = fused_confidence(evidence)
-        status = (AliasStatus.CONFIRMED if conf >= CONFIRM_THRESHOLD
-                  else AliasStatus.CANDIDATE)
+        status = AliasStatus.CONFIRMED if conf >= CONFIRM_THRESHOLD else AliasStatus.CANDIDATE
         # Something already confirmed is not demoted by one weak sighting arriving later.
         if self.status is AliasStatus.CONFIRMED:
             status = AliasStatus.CONFIRMED

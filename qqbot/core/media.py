@@ -43,26 +43,33 @@ import logging
 import os
 import re
 import time
+import uuid
+import weakref
+from dataclasses import dataclass
 from datetime import timedelta
+from enum import StrEnum
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
 
 from ..db import repo
+from ..domain.ids import GroupId, MessageId
 from ..prompting import PromptKey
-from ..providers import providers
-from ..providers.base import retire
+from ..providers.base import Providers
 from ..providers.contracts import StoredImage
-from ..services import UnknownAccount
-from ..settings import Settings, VisionCfg, config, prompt_catalog
-from ..util import defang, sysmark, why
+from ..services import Directory, UnknownAccount
+from ..settings import MediaCfg, Settings, VisionCfg, prompt_catalog
+from ..util import cut_text, defang, sysmark, why
 from .botapi import BotApi
 from .budget import BUDGET
 from .members import MEMBERS
 from .output import strip_markdown
 from .ratelimit import SlidingWindow
-from .retrieval import directory
 from .segments import AtRef, AudioRef, ImageRef, ParsedMessage, Ref
+
+if TYPE_CHECKING:
+    from .state import ChatMsg
 
 log = logging.getLogger("qqbot.media")
 
@@ -134,8 +141,9 @@ class Unsettled(str):
     the pipeline the slot is not final: the describing call was rate limited, behind
     the daily cap, or failed transiently, and paying again later may well succeed.
     Terminal outcomes (a real description, a cached verdict, a backend refusal) come
-    back as plain str; MediaProcessor.settled is the reader, and ChatMsg.pending is
-    what hangs on the verdict. Without the distinction, a transient failure would
+    back as plain str; MediaProcessor.settled is the reader, and MediaTicket.state
+    keeps the retry verdict outside the conversation message. Without the
+    distinction, a transient failure would
     clear pending and become permanent: a burst of stickers that exhausts the
     rate window could never be described afterwards, money and quota available.
     """
@@ -170,11 +178,18 @@ def _ttl(vcfg: VisionCfg) -> timedelta | None:
 
 
 class MediaProcessor:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        cfg: MediaCfg,
+        providers: Providers,
+        directory: Directory,
+    ) -> None:
+        self._cfg = cfg
+        self._providers = providers
+        self._directory = directory
         self._http: httpx.AsyncClient | None = None
-        self._http_timeout: float | None = None
-        self._img_windows: dict[str, SlidingWindow] = {}
-        self._asr_windows: dict[str, SlidingWindow] = {}
+        self._img_windows: dict[GroupId, SlidingWindow] = {}
+        self._asr_windows: dict[GroupId, SlidingWindow] = {}
         #: Describe calls in the air, by image key - the single-flight registry.
         self._describing: dict[str, asyncio.Task] = {}
         #: And ASR calls in the air, by clip file id - same rule, dearer stakes:
@@ -191,17 +206,14 @@ class MediaProcessor:
         self._unreadable: dict[str, float] = {}
 
     def _client(self) -> httpx.AsyncClient:
-        # Rebuilt when the deadline changes, so a /reload applies without a restart.
-        timeout = config().default.media.http_timeout_sec
-        if self._http is None or self._http_timeout != timeout:
-            if self._http is not None:
-                retire(self._http.aclose())
-            self._http = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
-            self._http_timeout = timeout
+        if self._http is None:
+            self._http = httpx.AsyncClient(
+                timeout=self._cfg.http_timeout_sec,
+                follow_redirects=True,
+            )
         return self._http
 
-    @staticmethod
-    async def _call(bot: BotApi, api: str, **params):
+    async def _call(self, bot: BotApi, api: str, **params):
         """One protocol-side media call under media.protocol_timeout_sec.
 
         The protocol side's own deadline is half a minute, and a file the platform
@@ -209,7 +221,7 @@ class MediaProcessor:
         still for the whole of it.
         """
         return await asyncio.wait_for(
-            bot.call_api(api, **params), timeout=config().default.media.protocol_timeout_sec
+            bot.call_api(api, **params), timeout=self._cfg.protocol_timeout_sec
         )
 
     @staticmethod
@@ -232,19 +244,35 @@ class MediaProcessor:
         return await asyncio.shield(flight)
 
     async def close(self) -> None:
+        flights = {
+            task
+            for registry in (self._describing, self._transcribing, self._fetching)
+            for task in registry.values()
+            if not task.done()
+        }
+        for task in flights:
+            task.cancel()
+        if flights:
+            await asyncio.gather(*flights, return_exceptions=True)
+        self._describing.clear()
+        self._transcribing.clear()
+        self._fetching.clear()
         if self._http is not None:
             await self._http.aclose()
             self._http = None
-            self._http_timeout = None
 
-    def _img_window(self, group_id: str, limit: int) -> SlidingWindow:
+    def _img_window(self, group_id: GroupId, limit: int) -> SlidingWindow:
         return self._window(self._img_windows, group_id, limit)
 
-    def _asr_window(self, group_id: str, limit: int) -> SlidingWindow:
+    def _asr_window(self, group_id: GroupId, limit: int) -> SlidingWindow:
         return self._window(self._asr_windows, group_id, limit)
 
     @staticmethod
-    def _window(table: dict[str, SlidingWindow], group_id: str, limit: int) -> SlidingWindow:
+    def _window(
+        table: dict[GroupId, SlidingWindow],
+        group_id: GroupId,
+        limit: int,
+    ) -> SlidingWindow:
         w = table.get(group_id)
         if w is None:
             w = SlidingWindow(limit)
@@ -341,7 +369,7 @@ class MediaProcessor:
 
     async def _bytes_once(self, ref: ImageRef, *, bot, max_bytes: int) -> bytes | None:
         key = ref.key or ref.file or ref.url or ""
-        hold = config().default.media.unreadable_retry_sec
+        hold = self._cfg.unreadable_retry_sec
         now = time.monotonic()
         failed_at = self._unreadable.get(key) if key else None
         if failed_at is not None and now - failed_at < hold:
@@ -390,7 +418,7 @@ class MediaProcessor:
         return await repo.image_cache_get(ref.key) if ref.key else None
 
     async def resolve_picture(
-        self, ref: ImageRef, *, bot: BotApi, group_id: str, cfg: Settings
+        self, ref: ImageRef, *, bot: BotApi, group_id: GroupId, cfg: Settings
     ) -> str | None:
         """Everything one picture gets on arrival: filed with the reply model's
         backend (free), then described - unless it is only forwarded, in which
@@ -415,7 +443,7 @@ class MediaProcessor:
         return await self.describe_image(ref, bot=bot, group_id=group_id, cfg=cfg, fetch=fetch)
 
     async def ensure_uploaded(
-        self, ref: ImageRef, *, bot: BotApi, group_id: str, cfg: Settings, fetch=None
+        self, ref: ImageRef, *, bot: BotApi, group_id: GroupId, cfg: Settings, fetch=None
     ) -> StoredImage | None:
         """File this picture with the reply model's attachment store, once.
 
@@ -429,7 +457,7 @@ class MediaProcessor:
         `fetch` is the arrival pass's shared byte closure; without one the bytes
         are fetched here.
         """
-        text_model = providers().text
+        text_model = self._providers.text
         store = text_model.attachments
         if ref.file_id and ref.file_provider == text_model.name:
             return StoredImage(text_model.name, ref.file_id)
@@ -460,13 +488,11 @@ class MediaProcessor:
             return None
         ref.file_id = stored.handle
         ref.file_provider = stored.provider
-        await repo.image_cache_set_file(
-            ref.key, stored.handle, provider=stored.provider
-        )
+        await repo.image_cache_set_file(ref.key, stored.handle, provider=stored.provider)
         return stored
 
     async def describe_image(
-        self, ref: ImageRef, *, bot: BotApi, group_id: str, cfg: Settings, fetch=None
+        self, ref: ImageRef, *, bot: BotApi, group_id: GroupId, cfg: Settings, fetch=None
     ) -> str | None:
         """Describe a picture, whether it arrived as a photo or as a sticker.
 
@@ -493,7 +519,7 @@ class MediaProcessor:
         )
 
     async def _describe_once(
-        self, ref: ImageRef, *, bot: BotApi, group_id: str, cfg: Settings, fetch=None
+        self, ref: ImageRef, *, bot: BotApi, group_id: GroupId, cfg: Settings, fetch=None
     ) -> str | None:
         vcfg = cfg.capabilities.vision
         label = "表情" if ref.sticker else "图片"
@@ -517,7 +543,7 @@ class MediaProcessor:
             return final
 
         # Transient turn-aways return Unsettled: the same fallback text, but marked
-        # retryable so the pipeline keeps the message's pending work alive.
+        # retryable so the coordinator can retry the ticket for a later reply.
         retry_later = Unsettled(fallback) if fallback else None
 
         if not self._img_window(group_id, vcfg.max_images_per_min).take():
@@ -536,9 +562,8 @@ class MediaProcessor:
             return retry_later
 
         try:
-            desc = await providers().vision.describe(
+            desc = await self._providers.vision.describe(
                 data,
-                cfg=vcfg,
                 prompt=prompt_catalog().render(PromptKey.VISION_SYSTEM),
                 mime=_mime(data, ref.file),
                 group_id=group_id,
@@ -569,7 +594,7 @@ class MediaProcessor:
         return desc
 
     async def transcribe(
-        self, ref: AudioRef, *, bot: BotApi, group_id: str, cfg: Settings
+        self, ref: AudioRef, *, bot: BotApi, group_id: GroupId, cfg: Settings
     ) -> str | None:
         """Single-flight per clip, like describe_image per picture: with pending
         kept alive across turns, a slow ASR call (timeout 60s) can outlive the 25s
@@ -587,7 +612,7 @@ class MediaProcessor:
         )
 
     async def _transcribe_once(
-        self, ref: AudioRef, *, bot: BotApi, group_id: str, cfg: Settings
+        self, ref: AudioRef, *, bot: BotApi, group_id: GroupId, cfg: Settings
     ) -> str | None:
         acfg = cfg.capabilities.asr
         # This path runs on arrival, with no reply-side gate above it, so the
@@ -632,9 +657,8 @@ class MediaProcessor:
             return None
 
         try:
-            text = await providers().asr.transcribe(
+            text = await self._providers.asr.transcribe(
                 data,
-                cfg=acfg,
                 fmt="wav",
                 seconds=_audio_seconds(len(data)),
                 group_id=group_id,
@@ -648,7 +672,7 @@ class MediaProcessor:
         # and spoken text is as member-controlled as typed text.
         return sysmark(f"语音:{defang(text)}") if text else sysmark("语音:没听清")
 
-    async def name_for(self, ref: AtRef, *, bot: BotApi, group_id: str) -> str | None:
+    async def name_for(self, ref: AtRef, *, bot: BotApi, group_id: GroupId) -> str | None:
         """A bare QQ number tells the model nothing about who was addressed.
 
         The protocol side already knows every member's group card, so ask it for the whole
@@ -664,7 +688,7 @@ class MediaProcessor:
             # still be quoted in older messages. What the directory holds is every name
             # they were ever seen under, so the quote still reads as a person.
             try:
-                card = await directory().person(int(group_id), qq)
+                card = await self._directory.holder_card(group_id, qq)
                 name = card.display if card.display != qq else ""
             except (UnknownAccount, ValueError):
                 name = ""
@@ -675,7 +699,7 @@ class MediaProcessor:
         pm: ParsedMessage,
         *,
         bot,
-        group_id: str,
+        group_id: GroupId,
         cfg: Settings,
     ) -> dict[int, str]:
         """Every reference in one message, resolved: the free lookups (who was
@@ -707,7 +731,7 @@ class MediaProcessor:
     def settled(pm: ParsedMessage, resolved: dict[int, str]) -> bool:
         """Whether every paid slot in this message now holds a final answer.
 
-        The paid pass clears ChatMsg.pending on this verdict alone. A slot that is
+        The coordinator keeps a retryable ticket on this verdict alone. A slot that is
         missing (a voice clip that could not be fetched) or holds an Unsettled
         fallback is worth paying for again next turn; clearing pending regardless
         would make the first transient failure permanent. Retries stay cheap: the
@@ -721,4 +745,167 @@ class MediaProcessor:
         )
 
 
-MEDIA = MediaProcessor()
+class MediaStatus(StrEnum):
+    PENDING = "pending"
+    RETRYABLE = "retryable"
+    FINAL = "final"
+
+
+@dataclass(slots=True)
+class MediaTicket:
+    """One admitted message's media work, owned outside the chat transcript."""
+
+    raw_event_id: uuid.UUID
+    message_id: MessageId
+    parsed: ParsedMessage
+    message_ref: weakref.ReferenceType[ChatMsg]
+    bot: BotApi
+    group_id: GroupId
+    cfg: Settings
+    default_who: str
+    status: MediaStatus = MediaStatus.PENDING
+    task: asyncio.Task[None] | None = None
+
+
+class MediaCoordinator:
+    """Own per-message resolution, retries, patches, and shutdown draining."""
+
+    def __init__(self, processor: MediaProcessor) -> None:
+        self._processor = processor
+        self._tickets: dict[uuid.UUID, MediaTicket] = {}
+
+    def admit(
+        self,
+        raw_event_id: uuid.UUID,
+        parsed: ParsedMessage,
+        message: ChatMsg,
+        *,
+        bot: BotApi,
+        group_id: GroupId,
+        cfg: Settings,
+    ) -> MediaTicket:
+        """Start the arrival pass exactly once for one admitted raw event."""
+
+        current = self._tickets.get(raw_event_id)
+        if current is not None:
+            return current
+        ticket = MediaTicket(
+            raw_event_id=raw_event_id,
+            message_id=message.msg_id,
+            parsed=parsed,
+            message_ref=weakref.ref(message),
+            bot=bot,
+            group_id=group_id,
+            cfg=cfg,
+            default_who=str(message.user_id),
+        )
+        self._tickets[raw_event_id] = ticket
+        self._start(ticket, who=ticket.default_who)
+        return ticket
+
+    def ticket(self, raw_event_id: uuid.UUID) -> MediaTicket | None:
+        return self._tickets.get(raw_event_id)
+
+    @property
+    def processor(self) -> MediaProcessor:
+        return self._processor
+
+    def _start(self, ticket: MediaTicket, *, who: str | None) -> asyncio.Task[None] | None:
+        if ticket.status is MediaStatus.FINAL:
+            return None
+        if ticket.task is not None and not ticket.task.done():
+            return ticket.task
+        if ticket.message_ref() is None:
+            self._tickets.pop(ticket.raw_event_id, None)
+            return None
+        task = asyncio.create_task(self._resolve(ticket, who=who or ticket.default_who))
+        ticket.task = task
+
+        def finished(done: asyncio.Task[None]) -> None:
+            if ticket.task is done:
+                ticket.task = None
+            if ticket.status is MediaStatus.FINAL or ticket.message_ref() is None:
+                self._tickets.pop(ticket.raw_event_id, None)
+
+        task.add_done_callback(finished)
+        return task
+
+    async def _resolve(self, ticket: MediaTicket, *, who: str) -> None:
+        message = ticket.message_ref()
+        if message is None:
+            ticket.status = MediaStatus.FINAL
+            return
+        try:
+            with BUDGET.attribute(who):
+                resolved = await self._processor.resolve(
+                    ticket.parsed,
+                    bot=ticket.bot,
+                    group_id=ticket.group_id,
+                    cfg=ticket.cfg,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            ticket.status = MediaStatus.RETRYABLE
+            log.warning(
+                "group %s: media resolution failed: %s",
+                ticket.group_id,
+                why(exc),
+            )
+            return
+
+        ticket.status = (
+            MediaStatus.FINAL
+            if self._processor.settled(ticket.parsed, resolved)
+            else MediaStatus.RETRYABLE
+        )
+        new_text = cut_text(
+            ticket.parsed.render(resolved),
+            ticket.cfg.tools.send_messages.max_text_chars_per_message,
+        )
+        if new_text and new_text != message.text:
+            message.text = new_text
+            try:
+                await repo.backfill_plain_text(ticket.message_id, new_text)
+            except Exception:
+                log.exception("failed to backfill plain_text for %s", ticket.message_id)
+
+    async def settle(
+        self,
+        messages: list[ChatMsg],
+        *,
+        wait_sec: float,
+        who: str | None,
+        cfg: Settings | None = None,
+    ) -> None:
+        """Start retryable work in a frozen reply window and wait once, bounded."""
+
+        tasks: set[asyncio.Task[None]] = set()
+        for message in messages:
+            if message.raw_event_id is None or message.is_bot:
+                continue
+            ticket = self._tickets.get(message.raw_event_id)
+            if ticket is None:
+                continue
+            if cfg is not None:
+                ticket.cfg = cfg
+            if task := self._start(ticket, who=who):
+                tasks.add(task)
+        if tasks:
+            await asyncio.wait(tasks, timeout=wait_sec)
+
+    async def close(self, *, timeout: float) -> None:
+        """Drain admitted patch tasks, then cancel any that exceed shutdown's bound."""
+
+        tasks = {
+            ticket.task
+            for ticket in self._tickets.values()
+            if ticket.task is not None and not ticket.task.done()
+        }
+        if tasks:
+            _done, pending = await asyncio.wait(tasks, timeout=timeout)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        self._tickets.clear()

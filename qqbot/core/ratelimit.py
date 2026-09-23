@@ -1,8 +1,4 @@
-"""Sliding-window rate limiting and inbound dedup.
-
-The window backs the per-group image-describe cap (media.py); DedupSet drops
-the adapter's replayed events.
-"""
+"""Sliding-window rate limiting for media admission."""
 
 from __future__ import annotations
 
@@ -28,31 +24,3 @@ class SlidingWindow:
             return False
         self._hits.append(now)
         return True
-
-
-class DedupSet:
-    """Deduplicate by msg_id, evicting entries once the TTL passes."""
-
-    def __init__(self, ttl_sec: float) -> None:
-        self.ttl = ttl_sec
-        self._seen: dict[str, float] = {}
-        self._order: deque[str] = deque()
-
-    def seen(self, key: str) -> bool:
-        now = time.monotonic()
-        while self._order and now - self._seen.get(self._order[0], 0) > self.ttl:
-            old = self._order.popleft()
-            self._seen.pop(old, None)
-        if key in self._seen:
-            return True
-        self._seen[key] = now
-        self._order.append(key)
-        return False
-
-    def discard(self, key: str) -> None:
-        """Take a key back, so a replay gets another chance.
-
-        For the caller that marked a message seen and then failed before doing
-        anything with it: leaving the mark would swallow the adapter's replay, and
-        the message would be neither archived nor answered."""
-        self._seen.pop(key, None)

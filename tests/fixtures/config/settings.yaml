@@ -8,9 +8,6 @@
 owners: ["10000", "10001"]
 timezone: "Asia/Shanghai"
 
-gateway:
-  dedup_ttl_sec: 300
-
 tools:
   send_messages:
     max_messages_per_call: 4

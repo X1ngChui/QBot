@@ -20,12 +20,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TYPE_CHECKING
 
+from ..domain.ids import GroupId
 from ..settings import PromptCfg, Settings, config
 from ..util import defang, fmt_when, sysmark, tz
 from .botapi import BotApi
 
-if TYPE_CHECKING:                       # resolve() delegates to it; importing it here
-    from .media import MediaProcessor   # would be a cycle, and it is only an annotation
+if TYPE_CHECKING:  # resolve() delegates to it; importing it here
+    from .media import MediaProcessor  # would be a cycle, and it is only an annotation
 
 log = logging.getLogger("qqbot.media")
 
@@ -93,6 +94,7 @@ def number_at_mentions(
         cursor = end
     return text
 
+
 _MD5 = re.compile(r"([0-9a-fA-F]{32})")
 
 
@@ -117,8 +119,9 @@ class Ref:
         """What the model sees when this could not be resolved."""
         return sysmark("消息")
 
-    async def resolve(self, proc: MediaProcessor, *, bot: BotApi, group_id: str,
-                      cfg: Settings, self_id: str) -> str | None:
+    async def resolve(
+        self, proc: MediaProcessor, *, bot: BotApi, group_id: GroupId, cfg: Settings, self_id: str
+    ) -> str | None:
         """The text this stands for, or None if it cannot be had right now."""
         return None
 
@@ -132,8 +135,9 @@ class AtRef(Ref):
     def placeholder(self) -> str:
         return f"@{self.ident}"
 
-    async def resolve(self, proc: MediaProcessor, *, bot: BotApi, group_id: str,
-                      cfg: Settings, self_id: str) -> str | None:
+    async def resolve(
+        self, proc: MediaProcessor, *, bot: BotApi, group_id: GroupId, cfg: Settings, self_id: str
+    ) -> str | None:
         return await proc.name_for(self, bot=bot, group_id=group_id)
 
 
@@ -142,7 +146,7 @@ class ImageRef(Ref):
     """A picture or a sticker. `sticker` changes only the label."""
 
     free: bool = False
-    key: str | None = None       # mface emoji_id, or the image md5
+    key: str | None = None  # mface emoji_id, or the image md5
     sticker: bool = False
     url: str | None = None
     file: str | None = None
@@ -163,8 +167,9 @@ class ImageRef(Ref):
     def placeholder(self) -> str:
         return sysmark("图片")
 
-    async def resolve(self, proc: MediaProcessor, *, bot: BotApi, group_id: str,
-                      cfg: Settings, self_id: str) -> str | None:
+    async def resolve(
+        self, proc: MediaProcessor, *, bot: BotApi, group_id: GroupId, cfg: Settings, self_id: str
+    ) -> str | None:
         # Filing (free, and first, while the download link is freshest), then
         # describing with its own cache, rate limit and budget gate - or, for a
         # picture that is only forwarded, whatever description is already paid for.
@@ -183,14 +188,15 @@ class AudioRef(Ref):
     def placeholder(self) -> str:
         return sysmark("语音")
 
-    async def resolve(self, proc: MediaProcessor, *, bot: BotApi, group_id: str,
-                      cfg: Settings, self_id: str) -> str | None:
+    async def resolve(
+        self, proc: MediaProcessor, *, bot: BotApi, group_id: GroupId, cfg: Settings, self_id: str
+    ) -> str | None:
         return await proc.transcribe(self, bot=bot, group_id=group_id, cfg=cfg)
 
 
 @dataclass
 class ParsedMessage:
-    parts: list = field(default_factory=list)     # str | Ref
+    parts: list = field(default_factory=list)  # str | Ref
     refs: list[Ref] = field(default_factory=list)
     at_bot: bool = False
     reply_to: str | None = None
@@ -227,9 +233,9 @@ class ParsedMessage:
 class ForwardLine:
     """One entry of a forwarded chat record: who said it, when, and what."""
 
-    when: str                 # the rendered time stamp, or "" when the node had none
+    when: str  # the rendered time stamp, or "" when the node had none
     who: str
-    parts: list = field(default_factory=list)   # str | Ref | ForwardBlock
+    parts: list = field(default_factory=list)  # str | Ref | ForwardBlock
 
 
 @dataclass
@@ -296,33 +302,146 @@ def _join(parts: list, resolved: dict[int, str], *, depth: int) -> str:
 #: carries the tone the sender meant.
 #: Anything not listed falls back to the bare marker.
 FACE_NAMES = {
-    "0": "惊讶", "1": "撇嘴", "2": "色", "3": "发呆", "4": "得意", "5": "流泪",
-    "6": "害羞", "7": "闭嘴", "8": "睡", "9": "大哭", "10": "尴尬", "11": "发怒",
-    "12": "调皮", "13": "呲牙", "14": "微笑", "15": "难过", "16": "酷", "18": "抓狂",
-    "19": "吐", "20": "偷笑", "21": "可爱", "22": "白眼", "23": "傲慢", "25": "困",
-    "26": "惊恐", "27": "流汗", "28": "憨笑", "30": "奋斗", "32": "疑问", "33": "嘘",
-    "34": "晕", "36": "衰", "38": "敲打", "39": "再见", "46": "猪头", "49": "拥抱",
-    "63": "玫瑰", "64": "凋谢", "66": "爱心", "76": "赞", "77": "踩", "78": "握手",
-    "79": "胜利", "96": "冷汗", "97": "擦汗", "99": "鼓掌", "100": "糗大了",
-    "101": "坏笑", "104": "哈欠", "105": "鄙视", "106": "委屈", "107": "快哭了",
-    "108": "阴险", "109": "亲亲", "110": "吓", "111": "可怜", "116": "示爱",
-    "118": "抱拳", "120": "拳头", "121": "差劲", "122": "爱你", "123": "NO",
-    "124": "OK", "144": "喝彩", "147": "棒棒糖", "172": "眨眼睛", "173": "泪奔",
-    "174": "无奈", "175": "卖萌", "176": "小纠结", "177": "喷血", "178": "斜眼笑",
-    "179": "doge", "180": "惊喜", "182": "笑哭", "183": "我最美", "187": "幽灵",
-    "193": "大笑", "194": "不开心", "197": "冷漠", "198": "呃", "199": "好棒",
-    "200": "拜托", "201": "点赞", "202": "无聊", "203": "托脸", "204": "吃",
-    "205": "送花", "206": "害怕", "210": "飙泪", "211": "我不看", "212": "托腮",
-    "214": "啵啵", "222": "抱抱", "227": "拍手", "228": "恭喜", "229": "干杯",
-    "230": "嘲讽", "231": "哼", "232": "佛系", "234": "惊呆", "237": "偷看",
-    "239": "原谅", "241": "生日快乐", "262": "脑阔疼", "263": "沧桑", "264": "捂脸",
-    "265": "辣眼睛", "266": "哦哟", "267": "头秃", "268": "问号脸", "269": "暗中观察",
-    "270": "emm", "271": "吃瓜", "272": "呵呵哒", "273": "我酸了", "277": "汪汪",
-    "278": "汗", "281": "无眼笑", "282": "敬礼", "283": "狂笑", "284": "面无表情",
-    "285": "摸鱼", "287": "哦", "289": "睁眼", "290": "敲开心", "293": "摸锦鲤",
-    "294": "期待", "297": "拜谢", "299": "牛啊", "306": "牛气冲天", "307": "喵喵",
-    "314": "仔细分析", "315": "加油", "318": "崇拜", "319": "比心", "320": "庆祝",
-    "324": "吃糖", "325": "惊吓", "326": "生气",
+    "0": "惊讶",
+    "1": "撇嘴",
+    "2": "色",
+    "3": "发呆",
+    "4": "得意",
+    "5": "流泪",
+    "6": "害羞",
+    "7": "闭嘴",
+    "8": "睡",
+    "9": "大哭",
+    "10": "尴尬",
+    "11": "发怒",
+    "12": "调皮",
+    "13": "呲牙",
+    "14": "微笑",
+    "15": "难过",
+    "16": "酷",
+    "18": "抓狂",
+    "19": "吐",
+    "20": "偷笑",
+    "21": "可爱",
+    "22": "白眼",
+    "23": "傲慢",
+    "25": "困",
+    "26": "惊恐",
+    "27": "流汗",
+    "28": "憨笑",
+    "30": "奋斗",
+    "32": "疑问",
+    "33": "嘘",
+    "34": "晕",
+    "36": "衰",
+    "38": "敲打",
+    "39": "再见",
+    "46": "猪头",
+    "49": "拥抱",
+    "63": "玫瑰",
+    "64": "凋谢",
+    "66": "爱心",
+    "76": "赞",
+    "77": "踩",
+    "78": "握手",
+    "79": "胜利",
+    "96": "冷汗",
+    "97": "擦汗",
+    "99": "鼓掌",
+    "100": "糗大了",
+    "101": "坏笑",
+    "104": "哈欠",
+    "105": "鄙视",
+    "106": "委屈",
+    "107": "快哭了",
+    "108": "阴险",
+    "109": "亲亲",
+    "110": "吓",
+    "111": "可怜",
+    "116": "示爱",
+    "118": "抱拳",
+    "120": "拳头",
+    "121": "差劲",
+    "122": "爱你",
+    "123": "NO",
+    "124": "OK",
+    "144": "喝彩",
+    "147": "棒棒糖",
+    "172": "眨眼睛",
+    "173": "泪奔",
+    "174": "无奈",
+    "175": "卖萌",
+    "176": "小纠结",
+    "177": "喷血",
+    "178": "斜眼笑",
+    "179": "doge",
+    "180": "惊喜",
+    "182": "笑哭",
+    "183": "我最美",
+    "187": "幽灵",
+    "193": "大笑",
+    "194": "不开心",
+    "197": "冷漠",
+    "198": "呃",
+    "199": "好棒",
+    "200": "拜托",
+    "201": "点赞",
+    "202": "无聊",
+    "203": "托脸",
+    "204": "吃",
+    "205": "送花",
+    "206": "害怕",
+    "210": "飙泪",
+    "211": "我不看",
+    "212": "托腮",
+    "214": "啵啵",
+    "222": "抱抱",
+    "227": "拍手",
+    "228": "恭喜",
+    "229": "干杯",
+    "230": "嘲讽",
+    "231": "哼",
+    "232": "佛系",
+    "234": "惊呆",
+    "237": "偷看",
+    "239": "原谅",
+    "241": "生日快乐",
+    "262": "脑阔疼",
+    "263": "沧桑",
+    "264": "捂脸",
+    "265": "辣眼睛",
+    "266": "哦哟",
+    "267": "头秃",
+    "268": "问号脸",
+    "269": "暗中观察",
+    "270": "emm",
+    "271": "吃瓜",
+    "272": "呵呵哒",
+    "273": "我酸了",
+    "277": "汪汪",
+    "278": "汗",
+    "281": "无眼笑",
+    "282": "敬礼",
+    "283": "狂笑",
+    "284": "面无表情",
+    "285": "摸鱼",
+    "287": "哦",
+    "289": "睁眼",
+    "290": "敲开心",
+    "293": "摸锦鲤",
+    "294": "期待",
+    "297": "拜谢",
+    "299": "牛啊",
+    "306": "牛气冲天",
+    "307": "喵喵",
+    "314": "仔细分析",
+    "315": "加油",
+    "318": "崇拜",
+    "319": "比心",
+    "320": "庆祝",
+    "324": "吃糖",
+    "325": "惊吓",
+    "326": "生气",
 }
 
 #: NapCat result ids follow QQ's package order: paper, scissors, rock.
@@ -344,7 +463,7 @@ def _markdown_text(md: str) -> str:
     link at the top carrying a version number.
     """
     text = _MD_IMAGE.sub(sysmark("图片"), defang(md or ""))
-    text = _MD_LINK.sub(r"\1", text)      # keep the label, drop the target
+    text = _MD_LINK.sub(r"\1", text)  # keep the label, drop the target
     text = _MD_HEADING.sub("", text)
     text = _MD_QUOTE.sub("", text)
     text = _MD_BLANKS.sub("\n", text)
@@ -353,8 +472,8 @@ def _markdown_text(md: str) -> str:
 
 def _int_or_none(v) -> int | None:
     """A size field as an int, or None for anything a client did not send as one.
-    The parser has to be total: it runs while the message's dedup mark is held,
-    and an exception here would swallow the adapter's replay of the message."""
+    Parsing runs before database admission, so malformed optional metadata must degrade
+    rather than reject an otherwise valid event."""
     try:
         return int(v) or None
     except (TypeError, ValueError):
@@ -374,7 +493,7 @@ def _card_text(raw: str) -> str:
         return sysmark("卡片消息")
     prompt = defang(str(data.get("prompt") or "").strip())
     meta = data.get("meta")
-    for entry in (meta.values() if isinstance(meta, dict) else ()):
+    for entry in meta.values() if isinstance(meta, dict) else ():
         if not isinstance(entry, dict):
             continue
         title = defang(str(entry.get("title") or entry.get("tag") or "").strip())
@@ -465,8 +584,11 @@ class _Walk:
                 parts.append(sysmark(f"表情:{name}") if name else sysmark("表情"))
             elif stype == "mface":
                 self.add_ref(
-                    parts, ImageRef,
-                    sticker=True, nested=nested, free=nested,
+                    parts,
+                    ImageRef,
+                    sticker=True,
+                    nested=nested,
+                    free=nested,
                     key=str(data.get("emoji_id") or "") or None,
                     url=data.get("url"),
                     summary=defang(str(data.get("summary") or "")).strip("[]") or None,
@@ -475,8 +597,10 @@ class _Walk:
                 file_field = str(data.get("file") or "")
                 m = _MD5.search(file_field) or _MD5.search(str(data.get("file_id") or ""))
                 self.add_ref(
-                    parts, ImageRef,
-                    nested=nested, free=nested,
+                    parts,
+                    ImageRef,
+                    nested=nested,
+                    free=nested,
                     key=(m.group(1).lower() if m else None),
                     url=data.get("url"),
                     file=file_field or None,
@@ -490,7 +614,8 @@ class _Walk:
                     parts.append(sysmark("语音"))
                 else:
                     self.add_ref(
-                        parts, AudioRef,
+                        parts,
+                        AudioRef,
                         url=data.get("url"),
                         file=str(data.get("file") or "") or None,
                         size=_int_or_none(data.get("file_size")),
@@ -532,8 +657,11 @@ class _Walk:
                 if body:
                     parts.append(body)
             elif stype == "dice":
-                parts.append(sysmark(f"骰子:{defang(str(data.get('result')))}点")
-                             if data.get("result") else sysmark("骰子"))
+                parts.append(
+                    sysmark(f"骰子:{defang(str(data.get('result')))}点")
+                    if data.get("result")
+                    else sysmark("骰子")
+                )
             elif stype == "rps":
                 name = RPS_NAMES.get(str(data.get("result") or ""))
                 parts.append(sysmark(f"猜拳:{name}") if name else sysmark("猜拳"))
@@ -566,8 +694,12 @@ class _Walk:
             if not isinstance(data, dict):
                 continue
             sender = data.get("sender") if isinstance(data.get("sender"), dict) else {}
-            who = defang(str(sender.get("card") or sender.get("nickname")
-                             or data.get("nickname") or "")).strip() or "成员"
+            who = (
+                defang(
+                    str(sender.get("card") or sender.get("nickname") or data.get("nickname") or "")
+                ).strip()
+                or "成员"
+            )
             when = ""
             if stamp := _int_or_none(data.get("time")):
                 try:
@@ -592,8 +724,11 @@ def _own_len(parts: list) -> int:
     """The characters a forwarded entry contributes by itself: its text and its
     markers' placeholders. A record nested inside it is not counted again - its
     own entries were charged as they were parsed."""
-    return sum(len(p.placeholder()) if isinstance(p, Ref) else len(p)
-               for p in parts if not isinstance(p, ForwardBlock))
+    return sum(
+        len(p.placeholder()) if isinstance(p, Ref) else len(p)
+        for p in parts
+        if not isinstance(p, ForwardBlock)
+    )
 
 
 def parse_segments(
@@ -632,5 +767,3 @@ def segments_of(msg: dict) -> tuple[list | None, str]:
     if isinstance(segs, list):
         return segs, ""
     return None, str(msg.get("raw_message") or segs or "").strip()
-
-

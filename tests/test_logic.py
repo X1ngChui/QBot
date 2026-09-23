@@ -12,6 +12,7 @@ from _db import configure_test_database
 configure_test_database()
 
 
+from qqbot.domain.ids import AccountId, GroupId, MessageId
 from qqbot.settings import config
 from qqbot.core.output import strip_markdown
 from qqbot.core import nickname, prompt, trigger
@@ -38,10 +39,23 @@ def check(name, cond, detail=""):
 
 # ---- config
 b = config()
+check("group ids normalize once and expose explicit boundaries",
+      GroupId(" 00123 ") == "123"
+      and GroupId("123").to_onebot() == 123
+      and GroupId("123").to_db() == 123)
+check("account and message ids retain opaque text",
+      AccountId(" account-01 ") == "account-01"
+      and MessageId(" notice:01 ") == "notice:01")
+for raw in ("", "0", "-1", "group"):
+    try:
+        GroupId(raw)
+    except ValueError:
+        continue
+    check(f"invalid group id {raw!r} is rejected", False)
 check("config loads", b.default.tools.send_messages.max_text_chars_per_message == 2000,
       f"nicknames={b.default.trigger.nicknames}")
-check("persona loaded", "default" in b.personas, str(list(b.personas)))
-cfg, persona = b.for_group("12345")
+check("persona loaded", GroupId("555") in b.personas, str(list(b.personas)))
+cfg, persona = b.for_group(GroupId("12345"))
 check("for_group falls back to default persona", persona.name == "小X")
 
 # owners is a list: several people must be able to run ops commands, and a bot that
@@ -60,8 +74,8 @@ check("an unquoted owner id validates as a string",
 # Persona inheritance: a group file states only its differences. Without this the shared
 # blocks are copied into every group file, and they drift - which is exactly what had
 # happened to the real ones before this was added.
-base_cfg, base_p = b.for_group("nosuchgroup")
-grp_cfg, grp_p = b.for_group("555")
+base_cfg, base_p = b.for_group(GroupId("999999"))
+grp_cfg, grp_p = b.for_group(GroupId("555"))
 check("group without a file gets the default persona", base_p.name == "小X")
 check("group persona inherits the name", grp_p.name == "小X", grp_p.name)
 check("group persona inherits the base prompt",
@@ -124,9 +138,12 @@ import tempfile as _tmpf
 from qqbot.core import debug as _dbg
 _dbg_dir = _tmpf.mkdtemp()
 os.environ["LOG_DIR"] = _dbg_dir
-check("arming caps at the maximum", _dbg.arm(999) == _dbg.MAX_ROUNDS)
-check("arming zero disarms", _dbg.arm(0) == 0 and _dbg.armed() == 0)
-_dbg.arm(2)
+_dbg_max = config().default.diagnostics.debug_max_rounds
+check("arming caps at the configured maximum",
+      _dbg.arm(999, max_rounds=_dbg_max) == _dbg_max)
+check("arming zero disarms",
+      _dbg.arm(0, max_rounds=_dbg_max) == 0 and _dbg.armed() == 0)
+_dbg.arm(2, max_rounds=_dbg_max)
 
 
 from qqbot.providers.contracts import (
@@ -174,8 +191,8 @@ check("unrelated text no hit", nickname.word_hit("今天天气不错", nicks) is
 # One rule, and nothing to tune. What was here before - a logistic cooldown curve and the
 # adaptive ceiling it was scaled by - decided whether to speak uninvited, and there is no
 # such decision now.
-_st = GroupState(group_id="555")
-_tcfg = b.for_group("555")[0]
+_st = GroupState(group_id=GroupId("555"))
+_tcfg = b.for_group(GroupId("555"))[0]
 
 
 def _tm(uid, text, is_bot=False):
@@ -316,9 +333,9 @@ check("only media costs a model call",
 
 # Transient paid failures stay retryable: the describing path marks a rate-limited /
 # cap-blocked / failed turn-away by returning the fallback as an Unsettled string,
-# and MediaProcessor.settled is the reader - pipeline clears ChatMsg.pending on that
+# and MediaProcessor.settled is the reader - the coordinator keeps retry state on that
 # verdict alone. A terminal answer is a plain str and settles.
-from qqbot.core.media import MEDIA as _MD, Unsettled as _Un
+from qqbot.core.media import MediaProcessor as _MD, Unsettled as _Un
 check("a described slot settles", _MD.settled(real_img, {0: "[图片:猫]"}))
 check("an Unsettled fallback does not settle",
       not _MD.settled(real_img, {0: _Un("[图片:猫]")}))
@@ -332,7 +349,7 @@ check("Unsettled renders as its own text", _Un("[图片:猫]") == "[图片:猫]"
 from qqbot.core.member_numbers import MemberNumbers as _MN
 _qa = ChatMsg(msg_id="q1", user_id="u1", nickname="阿强", text="在吗", ts=now_local())
 _qb = ChatMsg(msg_id="q2", user_id="999", nickname="小X",
-              text="在的 ⟦依据:搜索“在不在”⟧", ts=now_local(),
+              text="在的", ts=now_local(),
               is_bot=True, reply_to="q1", at=[("u1", "阿强")])
 _qc = ChatMsg(msg_id="q3", user_id="u2", nickname="阿花", text="哦哦", ts=now_local(),
               reply_to="q1")
@@ -385,47 +402,65 @@ check("and the platform result is visible on the historical tool result",
       and "平台显示：⟦骰子:4点⟧" in str(_qd_result.output),
       repr(_qd_result))
 
-from qqbot.core.archive import (
-    archive_author as _archive_author,
-    archive_mentions as _archive_mentions,
-    archive_sender as _archive_sender,
-    archive_text as _archive_text,
-)
+from qqbot.domain.archive import ArchivedMessage as _ArchivedMessage
 from qqbot.domain.archive import AuthorKind as _AuthorKind
+import uuid as _uuid
+
 _archive_row = {
-    "plain_text": "@阿花 已查到 ⟦依据:搜索“旧查询”⟧",
+    "id": _uuid.uuid4(),
+    "platform_event_id": "archive-1",
+    "group_id": 123,
+    "event_type": "message",
+    "occurred_at": now_local(),
+    "created_at": now_local(),
+    "plain_text": "@阿花 已查到",
+    "archive_schema": 1,
     "payload": {
+        "message_id": "archive-1",
         "author_kind": "bot",
-        "sender": {"nickname": "小X"},
+        "self_id": "999",
+        "sender": {
+            "user_id": "999",
+            "nickname": "小X",
+            "card": "",
+            "role": "member",
+        },
         "segments": [
             {"type": "at", "data": {"qq": "u2", "name": "阿花"}},
             {"type": "text", "data": {"text": " 已查到"}},
         ],
+        "typed_text": "已查到",
+        "reply_to": "member-1",
+        "to_me": False,
     },
 }
-check("archive helpers share explicit author, sender, text and mentions",
-      _archive_author(_archive_row["payload"], "999") is _AuthorKind.BOT
-      and _archive_sender(_archive_row["payload"]) == "小X"
-      and _archive_text(_archive_row) == "@阿花 已查到"
-      and _archive_mentions(_archive_row["payload"]) == [("u2", "阿花")])
-check("explicit member authorship wins over legacy bot hints",
-      _archive_author(
-          {"author_kind": "member", "self_id": "999", "outbound_schema": 1},
-          "999",
-      ) is _AuthorKind.MEMBER)
-check("legacy structured outbound still classifies as bot",
-      _archive_author({"outbound_schema": 1}, "legacy-bot") is _AuthorKind.BOT)
+_archived = _ArchivedMessage.from_row(_archive_row)
+check("the canonical archive shares author, sender, text and mentions",
+      _archived.author_kind is _AuthorKind.BOT
+      and _archived.sender.display_name == "小X"
+      and _archived.text == "@阿花 已查到"
+      and _archived.mentions == (("u2", "阿花"),))
+try:
+    _archived.segments[0]["type"] = "text"
+    _archive_frozen = False
+except TypeError:
+    _archive_frozen = True
+check("canonical archive segments are deeply immutable", _archive_frozen)
+try:
+    _ArchivedMessage.from_row({**_archive_row, "archive_schema": 0})
+    _old_schema_refused = False
+except ValueError:
+    _old_schema_refused = True
+check("runtime archive reads reject pre-migration schemas", _old_schema_refused)
 
-# A message the adapter replays across a restart must not enter the window twice:
-# the pipeline's dedup set is process-local, and load_history - triggered by that
-# same replay - has already rebuilt the deque from the archive with the original.
-_dupe = GroupState(group_id="777")
-_dupe.add(ChatMsg(msg_id="r1", user_id="u1", nickname="阿强", text="重放的一句", ts=now_local()))
-_dupe.add(ChatMsg(msg_id="r1", user_id="u1", nickname="阿强", text="重放的一句", ts=now_local()))
-check("a replayed msg_id does not enter the window twice", len(_dupe.recent) == 1)
+# Live state trusts the database admission verdict and owns no second idempotency rule.
+_dupe = GroupState(group_id=GroupId("777"))
+_dupe.add(ChatMsg(msg_id="r1", user_id="u1", nickname="阿强", text="第一句", ts=now_local()))
+_dupe.add(ChatMsg(msg_id="r1", user_id="u1", nickname="阿强", text="第二句", ts=now_local()))
+check("live state performs no independent event deduplication", len(_dupe.recent) == 2)
 
 # ---- prompt assembly + ordering
-st = GroupState(group_id="12345")
+st = GroupState(group_id=GroupId("12345"))
 for i in range(25):
     st.add(ChatMsg(msg_id=f"m{i}", user_id="u1", nickname="阿强",
                    text=f"第{i}条消息", ts=now_local()))
@@ -486,10 +521,8 @@ _util._TZ = _saved_tz
 # leave at the envelope: the rendered text through defang, the verbatim segments
 # through the event parser. Before this, one stray NUL cost the whole message its
 # place in the archive (three times in a month).
-from qqbot.gateway.onebot import (
-    GroupMessage as _GM,
-    NapCatGroupMessageSentEvent as _SentEvent,
-)
+from qqbot.gateway.nonebot_adapter import NapCatGroupMessageSentEvent as _SentEvent
+from qqbot.gateway.onebot import GroupMessage as _GM
 check("defang drops NUL", _util.defang("a\x00b⟦c⟧") == "ab[c]", repr(_util.defang("a\x00b")))
 check("scrub_nul walks a nested structure",
       _util.scrub_nul({"a": ["x\x00", {"b": "\x00y"}], "n": 3})
@@ -523,6 +556,8 @@ check("an event carrying NUL is archived without it",
       "\x00" not in _pl_json and _gm.sender.nickname == "王大锤", repr(_pl_json[:80]))
 check("the live adapter message is captured exactly once",
       _Ev.calls == 1 and _gm.reply_to_message_id == "9", str(_Ev.calls))
+check("the raw typed text survives mention restoration",
+      _gm.typed_text == "hithere" and _gm_with_mention.typed_text == "hithere")
 check("an adapter-stripped self mention is restored on the detached envelope",
       _gm.segments[0]["type"] == "text"
       and _gm_with_mention.segments[0] == {
@@ -590,8 +625,8 @@ check("a hashtag is not a heading", _mdt("#话题 今天") == "#话题 今天", 
 _hd = _mdt("## 标题\n正文")
 check("a real heading loses its hashes", _hd == "标题\n正文", repr(_hd))
 
-# The parser is total: it runs under the message's dedup mark, so a card whose
-# JSON is a list, or a size that is not a number, must degrade rather than raise.
+# Parsing is total because it runs before database admission: malformed segment data
+# degrades rather than raising and preventing an otherwise archivable event.
 _odd = parse_segments([
     {"type": "json", "data": {"data": "[1, 2]"}},
     {"type": "json", "data": {"data": '{"meta": {"x": {"title": 7}}, "prompt": 3}'}},
@@ -763,14 +798,10 @@ check("send tool expands the fixed QQ face catalog",
       and "{{FACE_CATALOG}}" not in _send_description,
       _send_description[-200:])
 _send_contract = json.dumps(_send_spec.parameters, ensure_ascii=False)
-_send_schemas = (
-    _send_spec.parameters["properties"]["messages"]["items"]
-    ["properties"]["content"]["items"]["anyOf"]
+_send_types = set(
+    _send_spec.parameters["$defs"]["SendMessageInput"]
+    ["properties"]["content"]["items"]["discriminator"]["mapping"]
 )
-_send_types = {
-    schema["properties"]["type"]["enum"][0]
-    for schema in _send_schemas
-}
 check("send tool does not expose market faces to the model",
       "mface" not in _send_description and "商城表情" not in _send_description
       and "mface" not in _send_contract)
@@ -811,63 +842,54 @@ _out_content = [
     {"type": "at", "data": {"member": 2}},
     {"type": "text", "data": {"text": "看这里"}},
     {"type": "face", "data": {"id": 14}},
-    {"type": "dice", "data": {}},
-    {"type": "rps", "data": {}},
-    {"type": "contact_member", "data": {"member": 1}},
-    {"type": "contact_group", "data": {}},
-    {"type": "music", "data": {"platform": "qq", "id": "42"}},
-    {"type": "music_custom", "data": {
-        "url": "https://example.invalid/song",
-        "audio": "https://example.invalid/song.mp3",
-        "title": "测试曲",
-        "image": "https://example.invalid/cover.jpg",
-        "singer": "测试歌手",
-    }},
-    {"type": "json", "data": {"payload": {"app": "test", "version": 1}}},
     {"type": "reply", "data": {"line": 7}},
 ]
 _out_reply, _out_note = _parse_send(
     _out_call(_out_content),
     people=_out_people,
     lines={7: _out_line},
-    group_id="123",
+    group_id=GroupId("123"),
     max_messages=4,
+    max_text_chars=2000,
 )
-check("ordered send parses every supported scalar-only segment", _out_reply is not None,
+check("ordered send parses the current composable segments", _out_reply is not None,
       _out_note)
 _out_types = tuple(type(segment) for segment in _out_reply.messages[0].segments)
 check("an @ keeps its arbitrary position",
       _out_types[:3] == (_OutText, _OutAt, _OutText), str(_out_types))
-check("special segments remain closed typed variants",
-      all(kind in _out_types for kind in (
-          _OutFace, _OutDice, _OutRps, _OutContact,
-          _OutMusic, _OutCustomMusic, _OutJson, _OutReply,
-      )), str(_out_types))
+check("current segments remain closed typed variants",
+      all(kind in _out_types for kind in (_OutFace, _OutReply)), str(_out_types))
 _out_wire = [_to_onebot(segment) for segment in _out_reply.messages[0].segments]
 check("typed variants project to literal OneBot nested segments",
       [segment["type"] for segment in _out_wire]
-      == ["text", "at", "text", "face", "dice", "rps", "contact",
-          "contact", "music", "music", "json", "reply"], str(_out_wire))
+      == ["text", "at", "text", "face", "reply"], str(_out_wire))
 check("member and message numbers resolve against this snapshot",
       _out_wire[1]["data"]["qq"] == "member-b"
       and _out_wire[-1]["data"]["id"] == "line-7")
 
 _batch_reply, _batch_note = _parse_send(
     _out_call(
-        [{"type": "text", "data": {"text": "先说明"}}],
         [{"type": "dice", "data": {}}],
+        [{"type": "rps", "data": {}}],
+        [{"type": "contact_member", "data": {"member": 1}}],
+        [{"type": "contact_group", "data": {}}],
     ),
     people=_out_people,
     lines={7: _out_line},
-    group_id="123",
+    group_id=GroupId("123"),
     max_messages=4,
+    max_text_chars=2000,
 )
 check(
-    "send parses an ordered batch of independent messages",
+    "exclusive segments parse as independent messages in one batch",
     _batch_reply is not None
-    and len(_batch_reply.messages) == 2
-    and isinstance(_batch_reply.messages[0].segments[0], _OutText)
-    and isinstance(_batch_reply.messages[1].segments[0], _OutDice),
+    and len(_batch_reply.messages) == 4
+    and isinstance(_batch_reply.messages[0].segments[0], _OutDice)
+    and isinstance(_batch_reply.messages[1].segments[0], _OutRps)
+    and all(
+        isinstance(message.segments[0], _OutContact)
+        for message in _batch_reply.messages[2:]
+    ),
     _batch_note,
 )
 _too_many, _ = _parse_send(
@@ -876,8 +898,9 @@ _too_many, _ = _parse_send(
     ] for index in range(5))),
     people=_out_people,
     lines={7: _out_line},
-    group_id="123",
+    group_id=GroupId("123"),
     max_messages=4,
+    max_text_chars=2000,
 )
 check("the global message limit rejects an oversized batch", _too_many is None)
 _invalid_batch, _ = _parse_send(
@@ -887,8 +910,9 @@ _invalid_batch, _ = _parse_send(
     ),
     people=_out_people,
     lines={7: _out_line},
-    group_id="123",
+    group_id=GroupId("123"),
     max_messages=4,
+    max_text_chars=2000,
 )
 check("one invalid item rejects the entire batch", _invalid_batch is None)
 
@@ -900,22 +924,150 @@ _guessed_mface, _guessed_note = _parse_send(
     }}]),
     people=_out_people,
     lines={7: _out_line},
-    group_id="123",
+    group_id=GroupId("123"),
     max_messages=4,
+    max_text_chars=2000,
 )
 check("a guessed market-face segment rejects the entire model send",
       _guessed_mface is None and "无效" in _guessed_note, _guessed_note)
-_historical_mface = _from_onebot([{"type": "mface", "data": {
-    "emoji_package_id": "pkg",
-    "emoji_id": "emoji",
-    "key": "key",
-    "summary": "[历史表情]",
-}}])
-check("an archived market face remains readable",
-      len(_historical_mface) == 1
-      and isinstance(_historical_mface[0], _OutMarketFace)
-      and _to_onebot(_historical_mface[0])["type"] == "mface",
-      repr(_historical_mface))
+for _hidden_kind, _hidden_data in (
+    ("music", {"platform": "qq", "id": "42"}),
+    ("music_custom", {
+        "url": "https://example.invalid/song",
+        "audio": "https://example.invalid/song.mp3",
+        "title": "测试曲",
+        "image": "https://example.invalid/cover.jpg",
+    }),
+    ("json", {"payload": {"app": "test"}}),
+):
+    _hidden_reply, _ = _parse_send(
+        _out_call([{"type": _hidden_kind, "data": _hidden_data}]),
+        people=_out_people,
+        lines={7: _out_line},
+        group_id=GroupId("123"),
+        max_messages=4,
+        max_text_chars=2000,
+    )
+    check(f"hidden {_hidden_kind} rejects current sends", _hidden_reply is None)
+_exclusive_mix, _ = _parse_send(
+    _out_call([
+        {"type": "text", "data": {"text": "掷一下"}},
+        {"type": "dice", "data": {}},
+    ]),
+    people=_out_people,
+    lines={7: _out_line},
+    group_id=GroupId("123"),
+    max_messages=4,
+    max_text_chars=2000,
+)
+check("an exclusive segment rejects companions", _exclusive_mix is None)
+_long_text, _ = _parse_send(
+    _out_call([
+        {"type": "text", "data": {"text": "123"}},
+        {"type": "text", "data": {"text": "456"}},
+    ]),
+    people=_out_people,
+    lines={7: _out_line},
+    group_id=GroupId("123"),
+    max_messages=4,
+    max_text_chars=5,
+)
+check("the configured text bound applies across all text segments", _long_text is None)
+_string_member, _ = _parse_send(
+    _out_call([
+        {"type": "at", "data": {"member": "1"}},
+        {"type": "text", "data": {"text": "不接受字符串编号"}},
+    ]),
+    people=_out_people,
+    lines={7: _out_line},
+    group_id=GroupId("123"),
+    max_messages=4,
+    max_text_chars=2000,
+)
+check("member and line numbers are strict integers", _string_member is None)
+for _label, _content in (
+    ("a reply-only or blank message has no visible content", [
+        {"type": "reply", "data": {"line": 7}},
+        {"type": "text", "data": {"text": "   "}},
+    ]),
+    ("a message has at most one reply segment", [
+        {"type": "reply", "data": {"line": 7}},
+        {"type": "reply", "data": {"line": 7}},
+        {"type": "text", "data": {"text": "重复引用"}},
+    ]),
+    ("a message has at most five at segments", [
+        *({"type": "at", "data": {"member": 1}} for _ in range(6)),
+        {"type": "text", "data": {"text": "太多"}},
+    ]),
+    ("a message has at most 32 segments", [
+        *({"type": "face", "data": {"id": 14}} for _ in range(33)),
+    ]),
+    ("unknown nested fields are rejected", [
+        {"type": "text", "data": {"text": "内容", "extra": True}},
+    ]),
+):
+    _bounded, _ = _parse_send(
+        _out_call(_content),
+        people=_out_people,
+        lines={7: _out_line},
+        group_id=GroupId("123"),
+        max_messages=4,
+        max_text_chars=2000,
+    )
+    check(_label, _bounded is None)
+_historical = _from_onebot([
+    {"type": "mface", "data": {
+        "emoji_package_id": "pkg",
+        "emoji_id": "emoji",
+        "key": "key",
+        "summary": "[历史表情]",
+    }},
+    {"type": "music", "data": {"type": "qq", "id": "42"}},
+    {"type": "music", "data": {
+        "type": "custom",
+        "url": "https://example.invalid/song",
+        "audio": "https://example.invalid/song.mp3",
+        "title": "测试曲",
+        "image": "https://example.invalid/cover.jpg",
+    }},
+    {"type": "json", "data": {"data": {"app": "test"}}},
+])
+check("archived hidden segments remain readable",
+      len(_historical) == 4
+      and isinstance(_historical[0], _OutMarketFace)
+      and isinstance(_historical[1], _OutMusic)
+      and isinstance(_historical[2], _OutCustomMusic)
+      and isinstance(_historical[3], _OutJson),
+      repr(_historical))
+try:
+    _to_onebot(_historical[0])
+except TypeError:
+    _historical_rejected = True
+else:
+    _historical_rejected = False
+check("historical-only segments cannot re-enter current sending", _historical_rejected)
+_hidden_history = ChatMsg(
+    msg_id="sent-hidden",
+    user_id="bot",
+    nickname="小X",
+    text="平台渲染后的历史卡片",
+    ts=now_local(),
+    is_bot=True,
+    outbound=_historical,
+)
+_hidden_items = prompt.own_line(
+    _hidden_history,
+    nums={"sent-hidden": 9},
+    people=_out_people,
+)
+check(
+    "historical-only segments project as display text rather than hidden tool arguments",
+    len(_hidden_items) == 1
+    and isinstance(_hidden_items[0], _PromptMessage)
+    and _hidden_items[0].content.startswith("平台显示：")
+    and "平台渲染后的历史卡片" in _hidden_items[0].content,
+    repr(_hidden_items),
+)
 
 _repeated, _ = _parse_send(
     _out_call([
@@ -926,8 +1078,9 @@ _repeated, _ = _parse_send(
     ]),
     people=_out_people,
     lines={7: _out_line},
-    group_id="123",
+    group_id=GroupId("123"),
     max_messages=4,
+    max_text_chars=2000,
 )
 check("repeated mentions are preserved rather than deduplicated",
       _repeated is not None
@@ -944,8 +1097,9 @@ _invalid_member, _ = _parse_send(
     ]),
     people=_out_people,
     lines={7: _out_line},
-    group_id="123",
+    group_id=GroupId("123"),
     max_messages=4,
+    max_text_chars=2000,
 )
 check("an unknown member number rejects the entire send", _invalid_member is None)
 _zero_member, _ = _parse_send(
@@ -955,8 +1109,9 @@ _zero_member, _ = _parse_send(
     ]),
     people=_out_people,
     lines={7: _out_line},
-    group_id="123",
+    group_id=GroupId("123"),
     max_messages=4,
+    max_text_chars=2000,
 )
 check("reserved bot zero is not an addressable send target", _zero_member is None)
 _invalid_line, _ = _parse_send(
@@ -966,16 +1121,18 @@ _invalid_line, _ = _parse_send(
     ]),
     people=_out_people,
     lines={7: _out_line},
-    group_id="123",
+    group_id=GroupId("123"),
     max_messages=4,
+    max_text_chars=2000,
 )
 check("an unknown line number rejects the entire send", _invalid_line is None)
 _unsupported, _ = _parse_send(
     _out_call([{"type": "xml", "data": {"data": "<msg/>"}}]),
     people=_out_people,
     lines={7: _out_line},
-    group_id="123",
+    group_id=GroupId("123"),
     max_messages=4,
+    max_text_chars=2000,
 )
 check("unsupported raw segment kinds cannot cross the closed schema", _unsupported is None)
 
@@ -1162,7 +1319,7 @@ except Exception as _e:
 
 # Config numbers with a blast radius validate at load, not at detonation time:
 # backup_keep=0 deletes the backup just written, nightly; a 4-field cron passes
-# /reload and then fails the next boot, days away from the edit that caused it.
+# invalid cron is refused immediately during startup validation.
 from qqbot.settings import ScheduleCfg as _SC
 for _name, _bad in (
     ("backup_keep below one", lambda: _SC(backup_keep=0)),
@@ -1193,9 +1350,10 @@ check("no prompt tokens at all means no line", hit_split([]) == "")
 # The window is a message count, evicted in chunks: the anchor must survive several
 # turns so the prefix cache keeps hitting, and when it moves it moves by a whole chunk.
 # There is no token budget to test - money bounds spending, and nothing trims blocks.
-small = cfg.model_copy(deep=True)
-small.prompt.evict_chunk, small.prompt.window_chunks = 5, 4
-st2 = GroupState(group_id="9")
+small = cfg.model_copy(update={
+    "prompt": cfg.prompt.model_copy(update={"evict_chunk": 5, "window_chunks": 4})
+})
+st2 = GroupState(group_id=GroupId("9"))
 for i in range(22):
     st2.add(ChatMsg(msg_id=f"x{i}", user_id="u", nickname="a", text="消息", ts=now_local()))
 h1 = prompt.history_window(st2, None, small)
@@ -1213,12 +1371,11 @@ prompt.history_window(st2, None, small)
 check("and moves by a whole chunk when the window fills again",
       st2.history_anchor == "x10", str(st2.history_anchor))
 
-# ---- every source file parses, and the handler module's calls resolve
+# ---- every source file parses, and deferred module calls resolve
 #
-# plugins/commands.py cannot be imported by a test: on_command() runs at import time and
-# needs a NoneBot runtime. That left it with no coverage of any kind, and a file with no
-# coverage of any kind reaches production with a syntax error in it - which is exactly what
-# happened. These two checks are what can be done without importing it.
+# Scheduled and adapter modules still execute outside most direct test paths. Parse the
+# package and verify referenced repository functions so a late-only code path cannot carry
+# a syntax error or stale function name to production.
 import ast as _ast
 import pathlib as _pl
 
@@ -1237,89 +1394,41 @@ from qqbot.db import repo as _repo
 
 _mods = {"repo": _repo}
 _missing = []
-# tasks.py shares the blind spot: scheduled jobs import nonebot at module level, so a
-# renamed repo function there also fails at fire time - 04:30, with nobody watching.
-for _path in ("qqbot/plugins/commands.py", "qqbot/plugins/tasks.py"):
+for _path in (
+    "qqbot/core/commands.py",
+    "qqbot/plugins/tasks.py",
+):
     for _n in _ast.walk(_ast.parse(_pl.Path(_path).read_text(encoding="utf-8"))):
         if (isinstance(_n, _ast.Attribute) and isinstance(_n.value, _ast.Name)
                 and _n.value.id in _mods and not hasattr(_mods[_n.value.id], _n.attr)):
             _missing.append(f"{_path}: {_n.value.id}.{_n.attr} (line {_n.lineno})")
 check("and every module attribute the handlers reach for exists",
       not _missing, "; ".join(_missing))
-_tree = _ast.parse(_pl.Path("qqbot/plugins/commands.py").read_text(encoding="utf-8"))
-
 # The gate's decision table, as the pure function the handlers call.
+from qqbot.core.command_catalog import Access as _Access
 from qqbot.core.perms import Verdict as _V, decide as _decide
 _own = ["10001", "20001"]
 
 
-def _d(uid, **flags):
-    return _decide(uid, owners=_own, **flags)
+def _d(uid, access):
+    return _decide(uid, owners=_own, access=access)
 
 
-check("an owner holds an ordinary command", _d("20001") is _V.OWNER)
-check("a member is denied an owner-only command", _d("30001") is _V.DENIED)
-check("every owner holds a global-only command",
-      _d("20001", global_only=True) is _V.OWNER)
-check("a member reaches a self-serve command only past the agreement",
-      _d("30001", self_serve=True) is _V.MEMBER_IF_AGREED)
-check("and a member-readable surface the same way",
-      _d("30001", open_to_members=True) is _V.MEMBER_IF_AGREED)
-check("consenting itself is open before the agreement",
-      _d("30001", self_serve=True, pre_agreement=True) is _V.MEMBER)
-check("a global-only command stays closed to members whatever else it is flagged",
-      _d("30001", global_only=True, self_serve=True, open_to_members=True) is _V.DENIED)
+check("an owner holds an agreed command", _d("20001", _Access.AGREED) is _V.OWNER)
+check("every owner holds an owner command", _d("20001", _Access.OWNER) is _V.OWNER)
+check("a member is denied an owner command", _d("30001", _Access.OWNER) is _V.DENIED)
+check("an agreed command reaches a member through consent",
+      _d("30001", _Access.AGREED) is _V.MEMBER_IF_AGREED)
+check("an open command is available before consent",
+      _d("30001", _Access.OPEN) is _V.MEMBER)
 
-# Every handler has to decide who may run it. A handler that simply forgets to ask is
-# indistinguishable from one open on purpose, and that is how /who came to hand any
-# member every impression in the group while the owner-only commands were gated. The decision
-# itself is tested in test_pipeline (qqbot/core/perms.py); what is checked here is only
-# that each handler asks at all.
-_ungated = []
-for _n in _ast.walk(_tree):
-    if not isinstance(_n, (_ast.AsyncFunctionDef, _ast.FunctionDef)):
-        continue
-    _handler = any(
-        isinstance(_d, _ast.Call) and isinstance(_d.func, _ast.Attribute)
-        and _d.func.attr == "handle" and isinstance(_d.func.value, _ast.Name)
-        and _d.func.value.id.endswith("_cmd")
-        for _d in _n.decorator_list
-    )
-    if not _handler:
-        continue
-    _asks = any(
-        isinstance(_c, _ast.Call) and isinstance(_c.func, _ast.Name) and _c.func.id == "_gate"
-        for _c in _ast.walk(_n)
-    )
-    if not _asks:
-        _cmds = [
-            _d.func.value.id for _d in _n.decorator_list
-            if isinstance(_d, _ast.Call) and isinstance(_d.func, _ast.Attribute)
-        ]
-        _ungated.append(f"{_cmds} (line {_n.lineno})")
-check("every command handler checks who is calling it",
-      not _ungated, "; ".join(_ungated))
-
-# The global-only set is catalogue data, and each handler's gate must agree with
-# it: losing the scope marker could expose a cross-group command to members if its
-# catalogue flags changed later.
-from qqbot.core.command_catalog import CATALOG as _CAT
-_gated_global = set()
-for _n in _ast.walk(_tree):
-    if not isinstance(_n, _ast.AsyncFunctionDef):
-        continue
-    _cmds = [_d.func.value.id for _d in _n.decorator_list
-             if isinstance(_d, _ast.Call) and isinstance(_d.func, _ast.Attribute)
-             and _d.func.attr == "handle" and isinstance(_d.func.value, _ast.Name)]
-    for _c in _ast.walk(_n):
-        if (isinstance(_c, _ast.Call) and isinstance(_c.func, _ast.Name)
-                and _c.func.id == "_gate"
-                and any(k.arg == "global_only" and isinstance(k.value, _ast.Constant)
-                        and k.value.value is True for k in _c.keywords)):
-            _gated_global.update("/" + c.removesuffix("_cmd") for c in _cmds)
-_catalog_global = {c.name for c in _CAT if c.global_only}
-check("the handlers gated global-only are exactly the catalogue's global-only set",
-      _gated_global == _catalog_global, f"{_gated_global} vs {_catalog_global}")
+from qqbot.core.commands import registered_commands as _registered_commands
+from qqbot.core.command_catalog import PREFIXES as _COMMAND_PREFIXES
+check(
+    "the importable command registry covers the catalog exactly",
+    _registered_commands() == _COMMAND_PREFIXES,
+    repr(_registered_commands()),
+)
 
 # A name that does not exist anywhere in the file. Parsing catches a typo in the syntax;
 # nothing caught `int(owner)` in a function whose list is called `owners`, so the 09:00

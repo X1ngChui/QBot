@@ -13,14 +13,31 @@ nothing in the model could hold either question.
 
 from .alias import (
     ALIAS_MAX_CHARS,
-    Alias, AliasEvidence, AliasStatus, AliasType, EvidenceType, normalize,
-    fused_confidence, platform_weight, usage_weight,
+    Alias,
+    AliasEvidence,
+    AliasStatus,
+    AliasType,
+    EvidenceType,
+    normalize,
+    fused_confidence,
+    platform_weight,
+    usage_weight,
 )
 from .entity import Entity, EntityStatus, EntityType, IdentityAccount
 
 __all__ = [
-    "ALIAS_MAX_CHARS", "Alias", "AliasEvidence", "AliasStatus", "AliasType",
-    "EvidenceType", "normalize",
-    "fused_confidence", "platform_weight", "usage_weight",
-    "Entity", "EntityStatus", "EntityType", "IdentityAccount",
+    "ALIAS_MAX_CHARS",
+    "Alias",
+    "AliasEvidence",
+    "AliasStatus",
+    "AliasType",
+    "EvidenceType",
+    "normalize",
+    "fused_confidence",
+    "platform_weight",
+    "usage_weight",
+    "Entity",
+    "EntityStatus",
+    "EntityType",
+    "IdentityAccount",
 ]

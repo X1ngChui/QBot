@@ -1,5 +1,5 @@
-# Per-group override example. Rename to group_<real gid>.yaml to activate (/reload picks it up).
-# Only list the fields you override; everything else inherits default.yaml + settings.yaml.
+# Per-group persona example. Rename to group_<real gid>.yaml and restart to activate it.
+# Only these persona fields may differ from default.yaml; behavior settings stay global.
 
 name: 小X
 
@@ -9,8 +9,3 @@ system_prompt: |
 group_knowledge: |
   群名：XXX
   梗：XXX 指的是 ……
-
-overrides:
-  trigger:
-    # This group calls the bot by other names too - list every variant.
-    nicknames: ["小X", "小叉", "叉子"]

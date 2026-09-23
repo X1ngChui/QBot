@@ -17,9 +17,18 @@ from typing import Any
 import openai
 
 from ..core.budget import BUDGET
+from ..domain.ids import GroupId
 from ..settings import TextCfg, VisionCfg
 from ..util import why
-from .base import Rate, TextModel, TextSession, VisionModel, backoff_delay, retry_after_seconds
+from .base import (
+    Rate,
+    RetryPolicy,
+    TextModel,
+    TextSession,
+    VisionModel,
+    backoff_delay,
+    retry_after_seconds,
+)
 from .contracts import (
     AttachmentStore,
     CallContext,
@@ -348,6 +357,7 @@ class ResponsesExecutor:
         endpoint: str,
         credential_env: str,
         max_concurrency: int,
+        retry: RetryPolicy,
         codec: ResponsesCodec,
         rate_for: Callable[[str], Rate],
         key_required: bool = True,
@@ -358,6 +368,7 @@ class ResponsesExecutor:
         self.codec = codec
         self.rate_for = rate_for
         self.key_required = key_required
+        self._retry = retry
         self._transport = ResponsesTransport()
         self._gate = asyncio.Semaphore(max_concurrency)
 
@@ -409,9 +420,7 @@ class ResponsesExecutor:
         cny = await BUDGET.record(
             kind=context.purpose,
             model=model,
-            cny=self.rate_for(model).tokens(
-                usage.input_cached, usage.input_uncached, usage.output
-            ),
+            cny=self.rate_for(model).tokens(usage.input_cached, usage.input_uncached, usage.output),
             group_id=context.group_id,
             in_hit=usage.input_cached,
             in_miss=usage.input_uncached,
@@ -573,7 +582,13 @@ class ResponsesExecutor:
                 )
                 log.warning("Responses model %s out of retries: %s", policy.model, why(retry_error))
                 raise retry_error
-            await asyncio.sleep(backoff_delay(attempt, retry_after=retry_after))
+            await asyncio.sleep(
+                backoff_delay(
+                    attempt,
+                    retry_after=retry_after,
+                    cap=self._retry.retry_after_cap_sec,
+                )
+            )
 
 
 class ResponsesTextSession(TextSession):
@@ -597,8 +612,7 @@ class ResponsesTextSession(TextSession):
         self._run_id = uuid.uuid4().hex
         self._stable_prefix_hash = hashlib.sha256(stable_bytes).hexdigest()[:16]
         user_messages = sum(
-            isinstance(item, Message) and item.role is Role.USER
-            for item in request.prompt
+            isinstance(item, Message) and item.role is Role.USER for item in request.prompt
         )
         self._history_messages = max(0, user_messages - 1)
         self._step_index = 0
@@ -672,6 +686,7 @@ class ResponsesTextModel(TextModel):
     def __init__(
         self,
         cfg: TextCfg,
+        retry: RetryPolicy,
         *,
         name: str,
         codec: ResponsesCodec,
@@ -688,6 +703,7 @@ class ResponsesTextModel(TextModel):
             endpoint=cfg.endpoint,
             credential_env=cfg.credential_env,
             max_concurrency=cfg.max_concurrency,
+            retry=retry,
             codec=codec,
             rate_for=rate_for,
             key_required=key_required,
@@ -709,6 +725,7 @@ class ResponsesVisionModel(VisionModel):
     def __init__(
         self,
         cfg: VisionCfg,
+        retry: RetryPolicy,
         *,
         name: str,
         codec: ResponsesCodec,
@@ -718,11 +735,13 @@ class ResponsesVisionModel(VisionModel):
         self.name = name
         self.needs_key = key_required
         self._rate_for = rate_for
+        self._cfg = cfg
         self._executor = ResponsesExecutor(
             provider=name,
             endpoint=cfg.endpoint,
             credential_env=cfg.credential_env,
-            max_concurrency=1,
+            max_concurrency=cfg.max_concurrency,
+            retry=retry,
             codec=codec,
             rate_for=rate_for,
             key_required=key_required,
@@ -735,11 +754,11 @@ class ResponsesVisionModel(VisionModel):
         self,
         data: bytes,
         *,
-        cfg: VisionCfg,
         prompt: str,
         mime: str = "image/jpeg",
-        group_id: str | None = None,
+        group_id: GroupId | None = None,
     ) -> str:
+        cfg = self._cfg
         policy = GenerationPolicy(
             model=cfg.model,
             reasoning=ReasoningEffort(cfg.reasoning_effort),
@@ -747,7 +766,7 @@ class ResponsesVisionModel(VisionModel):
             retries=0,
             # Reasoning tokens share this ceiling with the short visible description.
             # Low-effort vision can still consume more than 1k before emitting text.
-            max_output_tokens=4096,
+            max_output_tokens=cfg.max_output_tokens,
         )
         items = (
             Message(
@@ -770,18 +789,20 @@ class ResponsesVisionModel(VisionModel):
 class OpenAIResponses(ResponsesTextModel):
     """Generic OpenAI-style Responses text backend."""
 
-    def __init__(self, cfg: TextCfg) -> None:
+    def __init__(self, cfg: TextCfg, retry: RetryPolicy) -> None:
         super().__init__(
             cfg,
+            retry,
             name="openai_responses",
             codec=ResponsesCodec(),
             rate_for=lambda _model: UNKNOWN_TOKEN_RATE,
         )
 
 
-def openai_vision(cfg: VisionCfg) -> ResponsesVisionModel:
+def openai_vision(cfg: VisionCfg, retry: RetryPolicy) -> ResponsesVisionModel:
     return ResponsesVisionModel(
         cfg,
+        retry,
         name="openai_responses",
         codec=ResponsesCodec(),
         rate_for=lambda _model: UNKNOWN_TOKEN_RATE,

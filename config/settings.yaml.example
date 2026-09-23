@@ -3,17 +3,12 @@
 # structural about the file is documented here.
 # Persona files in config/personas/group_<gid>.yaml may vary only the bot's identity
 # and standing group context; behavior and resource settings in this file are global.
-# Two things this file does not say per line:
+# The complete bundle is validated at startup and stays fixed for the process lifetime.
+# Restart the process after changing settings, personas, prompts, predicates or the
+# agreement.
 #
-#   /reload vs restart. A reload is atomic: it either applies every edit or leaves the
-#   running bundle untouched. Process-owned resources require restart, including timezone,
-#   provider/endpoint/credential/concurrency fields, local ASR resources, database, memory,
-#   scheduler fields, extraction prompts and predicate definitions. /reload reports the
-#   exact paths that prevented it. Other policy, prompt and persona edits take effect when
-#   /reload succeeds.
-#
-#   Settings that wait on another setting are marked where they appear. A knob whose
-#   gate is shut does nothing at all - it is not doing a smaller version of its job.
+# Settings that wait on another setting are marked where they appear. A knob whose
+# gate is shut does nothing at all - it is not doing a smaller version of its job.
 
 
 # Everyone who holds the ops console (/help lists it) and receives the daily report,
@@ -36,11 +31,9 @@ trigger:
   # If it ever gets annoying, keep only the unambiguous names - @ still works.
   nicknames: ["小X", "小叉", "叉子"]
 
-# OneBot event admission and shutdown behavior.
+# Shutdown behavior for admitted background work.
 gateway:
-  # Seconds a received event ID remains in the live replay filter.
-  dedup_ttl_sec: 300
-  # Seconds shutdown waits for in-flight archive writes and media patches.
+  # Seconds shutdown waits for in-flight media patches.
   shutdown_wait_sec: 5
 
 media:
@@ -56,6 +49,32 @@ media:
 members:
   # Seconds a fetched group member list remains fresh.
   cache_ttl_sec: 1800
+
+commands:
+  # Group roster entries rendered by one /members response.
+  roster_max_entries: 60
+  # Default and maximum spending rows rendered by /top.
+  top_default_entries: 5
+  top_max_entries: 20
+
+identity_link:
+  # Lifetime of a cross-account confirmation challenge created by /link.
+  challenge_ttl_sec: 600
+  # Global cap on durable pending challenges.
+  max_pending_challenges: 1000
+  # Pending challenges one initiating account may hold at once.
+  max_pending_per_account: 3
+  # Decimal digits in a newly issued confirmation code.
+  challenge_code_length: 8
+
+diagnostics:
+  debug_max_rounds: 50
+  log_tail_default_lines: 15
+  log_tail_max_lines: 60
+  log_tail_scan_bytes: 65536
+  error_ring_entries: 200
+  error_message_chars: 300
+  daily_report_recent_errors: 8
 
 tools:
   # Tool calls allowed in one model round.
@@ -84,6 +103,8 @@ tools:
   recall_events:
     # Episodes included before and after each hit.
     context_episodes: 2
+    # Similarity hits returned before temporal context is added.
+    max_hits: 5
   read_url:
     # Page-text characters returned by one read.
     max_content_chars: 8000
@@ -120,8 +141,8 @@ capabilities:
     # "low" keeps sanity-check thinking without paying the full deliberation
     # habit at output prices.
     reasoning_effort: low
-    # RESTART: the semaphore is built once. A reload that changes this field is
-    # rejected atomically; restart to resize it without losing outstanding permits.
+    # The semaphore is built once at startup; restart to resize it without losing
+    # outstanding permits.
     max_concurrency: 3
     timeout_sec: 30
     retries: 2
@@ -131,8 +152,7 @@ capabilities:
     # account, and a second copy of an endpoint is how one goes stale.
     # Anything left out follows the reply settings above.
     extract:
-    # RESTART: the extractor freezes the resolved policy when its worker is built.
-    # A reload that changes it is rejected atomically. Any field left out inherits
+    # The extractor resolves this policy once at startup. Any field left out inherits
     # the reply setting above it.
       # The one place a cheaper tier can measurably do the reply model's work,
       # because extraction is schema-guarded and eval-covered. Empty = the
@@ -173,6 +193,10 @@ capabilities:
     # for DeepSeek).
     file_max_age_days: 20
     max_images_per_min: 6
+    # Concurrent paid description calls across all groups.
+    max_concurrency: 1
+    # Shared reasoning and visible-output token ceiling for one description.
+    max_output_tokens: 4096
     # Biggest picture worth handling, in MB. Bounds both halves of picture
     # handling: the download that feeds the description call, and the upload
     # that puts the original in front of the reply model.
@@ -256,8 +280,7 @@ prompt:
 # extraction is not here - it belongs to the capability doing the work
 # (capabilities.text.extract); this is the machinery around it.
 memory:
-  # RESTART: the memory worker freezes this whole block at construction. A reload
-  # that changes it is rejected atomically; restart to apply the edit.
+  # The memory worker captures this whole block at construction; restart to apply edits.
   # Messages one extraction chunk holds at most.
   extract_window: 120
   # A full chunk is trimmed back to the last conversation gap of at least this many
@@ -270,6 +293,8 @@ memory:
   # is reminded of so it recognises what it already wrote down.
   max_passes: 10
   known_episodes: 8
+  # Confirmed aliases shown beside one exact account in extraction context.
+  roster_aliases_per_account: 4
   # Episodes older than this leave semantic recall. Their rows and source links stay
   # as history, while their rebuildable vector projections are removed.
   episode_ttl_days: 90
@@ -280,10 +305,13 @@ memory:
   # How long a claimed memory job stays claimed. A full drain is several model calls
   # and can outlive a short lease; a deploy overlap would then pay twice.
   job_lease_min: 30
+  # Idle polling, embedding page width, and queue retry delays in seconds.
+  worker_idle_sec: 5
+  embedding_page_size: 200
+  worker_retry_backoff_sec: [60, 300, 1800, 3600]
 
 schedule:
-  # RESTART: the scheduler owns this whole block. A reload that changes any field
-  # is rejected atomically; restart to register the new values.
+  # The scheduler registers this whole block once at startup.
   # The whole night is one pipeline in dependency order - extraction drain,
   # decay, pg_dump, napcat cache sweep - with a queue-drain wait between
   # stages (tasks.nightly). The report fires the moment the ledger day
@@ -302,6 +330,8 @@ schedule:
   misfire_grace_sec: 3600
   # How old the newest dump may be before the daily report calls it out.
   backup_stale_hours: 26
+  # Completed memory jobs older than this are pruned from the queue audit table.
+  completed_job_keep_days: 30
 
 # The connection pool. Small on purpose: one bot on one machine, and a pool larger
 # than the work only moves contention into postgres.
@@ -323,7 +353,7 @@ personas_dir: personas
 # exist and be non-empty - a deployment without an agreement fails at load, so
 # there is no placeholder state. Acceptances are stored against `version`: bump
 # it to void them all and re-ask everyone; text edits without a bump do not
-# re-ask. /reload applies both.
+# re-ask. Both changes take effect on the next restart.
 agreement:
   version: 1
   file: agreement.txt
@@ -332,7 +362,7 @@ agreement:
   prompt_every_sec: 600
 
 # Directory containing the versioned prompts.yaml bundle. Template keys, roles,
-# reload scopes and slots are fixed by prompting/templates.py; the whole bundle
+# roles and slots are fixed by prompting/templates.py; the whole bundle
 # must validate before any of it loads. Wording rationale: prompts/README.md.
 prompts_dir: prompts
 # What may be recorded about a person, one entry per predicate (see the file).

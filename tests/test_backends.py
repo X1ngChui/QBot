@@ -14,6 +14,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("CONFIG_DIR", str(ROOT / "config"))
 
+from qqbot.domain.ids import GroupId
 from qqbot.providers import base
 from qqbot.providers.contracts import (
     CallContext,
@@ -46,9 +47,6 @@ from qqbot.settings import (
     ConfigBundle,
     EmbeddingCfg,
     Persona,
-    RestartRequired,
-    SETTING_CONTRACTS,
-    SettingScope,
     Settings,
     TextCfg,
     load_bundle,
@@ -142,9 +140,9 @@ def config_checks(settings: Settings) -> None:
     )
     group_bundle = ConfigBundle(
         settings.model_dump(),
-        {"42": Persona(name="Different")},
+        {GroupId("42"): Persona(name="Different")},
     )
-    group_settings, group_persona = group_bundle.for_group("42")
+    group_settings, group_persona = group_bundle.for_group(GroupId("42"))
     check(
         "group personas cannot replace global settings",
         group_settings is group_bundle.default and group_persona.name == "Different",
@@ -160,71 +158,14 @@ def config_checks(settings: Settings) -> None:
         is not None,
     )
 
-    import qqbot.settings as settings_module
-    from qqbot import util
-
-    current = ConfigBundle(settings.model_dump(), {})
-    process_names = {
-        contract.name
-        for contract in SETTING_CONTRACTS
-        if contract.scope is SettingScope.PROCESS_RESTART
-    }
-    current_fingerprint = current.startup_fingerprint()
     check(
-        "every process setting contract contributes to the restart fingerprint",
-        process_names <= current_fingerprint.keys(),
-        str(sorted(process_names - current_fingerprint.keys())),
-    )
-    check(
-        "global-reloadable contracts stay out of the restart fingerprint",
-        not {
-            contract.name
-            for contract in SETTING_CONTRACTS
-            if contract.scope is SettingScope.GLOBAL_RELOADABLE
-        }
-        & current_fingerprint.keys(),
-    )
-    inherited = settings.model_copy(deep=True)
-    inherited.capabilities.text.model += "-new"
-    inherited_fingerprint = ConfigBundle(
-        inherited.model_dump(), {}
-    ).startup_fingerprint()
-    check(
-        "resolved extraction inheritance participates in restart detection",
-        current_fingerprint["capabilities.text.extract"]
-        != inherited_fingerprint["capabilities.text.extract"],
-    )
-    changed = settings.model_copy(deep=True)
-    changed.capabilities.text.endpoint = "https://restart.invalid"
-    fresh = ConfigBundle(changed.model_dump(), {})
-    original_bundle = settings_module._bundle
-    original_loader = settings_module.load_bundle
-    original_timezone = util.tz()
-    settings_module._bundle = current
-    settings_module.load_bundle = lambda: fresh
-    try:
-        rejected = raises(RestartRequired, settings_module.reload_config)
-        check(
-            "restart-scoped reload is atomic",
-            rejected is not None and settings_module._bundle is current,
-            str(rejected),
+        "startup configuration is immutable",
+        raises(
+            ValueError,
+            lambda: setattr(settings.capabilities.text, "model", "changed"),
         )
-        check(
-            "rejected reload leaves the active timezone unchanged",
-            util.tz() == original_timezone,
-        )
-        hot = settings.model_copy(deep=True)
-        hot.tools.send_messages.max_text_chars_per_message += 1
-        hot_bundle = ConfigBundle(hot.model_dump(), {})
-        settings_module.load_bundle = lambda: hot_bundle
-        applied = settings_module.reload_config()
-        check(
-            "a fully reloadable bundle swaps atomically",
-            applied is hot_bundle and settings_module._bundle is hot_bundle,
-        )
-    finally:
-        settings_module.load_bundle = original_loader
-        settings_module._bundle = original_bundle
+        is not None,
+    )
 
 
 async def session_checks() -> None:
@@ -326,8 +267,13 @@ def main() -> int:
         bundle.page_reader is bundle.search,
     )
 
-    bad = settings.model_copy(deep=True)
-    bad.capabilities.vision.provider = "nope"
+    bad = settings.model_copy(update={
+        "capabilities": settings.capabilities.model_copy(update={
+            "vision": settings.capabilities.vision.model_copy(
+                update={"provider": "nope"}
+            )
+        })
+    })
     check(
         "an unknown selected provider is rejected",
         raises(RuntimeError, lambda: build(bad)) is not None,
@@ -455,7 +401,7 @@ def main() -> int:
         raises(ModelFailure, lambda: generic.encode_items(mismatch)) is not None,
     )
 
-    local = local_text(_text_cfg(provider="local"))
+    local = local_text(_text_cfg(provider="local"), base.RetryPolicy(0, 30))
     check("the local Responses capability is keyless", not local.needs_key)
     check(
         "the local capability has explicit zero pricing",
@@ -504,27 +450,28 @@ def main() -> int:
             posted.append(url)
             raise Stop
 
-    embedding = DashScopeEmbedding()
-    embedding._client = lambda cfg: RecordingClient()
-
-    def embedding_cfg(endpoint: str) -> EmbeddingCfg:
-        return EmbeddingCfg.model_validate(
-            {
-                "provider": "dashscope",
-                "endpoint": endpoint,
-                "model": "m",
-                "credential_env": "PATH",
-            }
-        )
-
-    for url in ("https://first.example/v1", "https://second.example/v1/"):
-        try:
-            asyncio.run(embedding.embed(["x"], cfg=embedding_cfg(url)))
-        except Stop:
-            pass
+    cfg = EmbeddingCfg.model_validate(
+        {
+            "provider": "dashscope",
+            "endpoint": "https://first.example/v1",
+            "model": "m",
+            "credential_env": "PATH",
+        }
+    )
+    embedding = DashScopeEmbedding(cfg, base.RetryPolicy(0, 30))
+    embedding._http = RecordingClient()
+    try:
+        asyncio.run(embedding.embed(["x"]))
+    except Stop:
+        pass
+    _unused = cfg.model_copy(update={"endpoint": "https://second.example/v1/"})
+    try:
+        asyncio.run(embedding.embed(["x"]))
+    except Stop:
+        pass
     check(
-        "embedding follows the endpoint in its call config",
-        posted == ["https://first.example/v1/embeddings", "https://second.example/v1/embeddings"],
+        "embedding retains its construction-time endpoint",
+        posted == ["https://first.example/v1/embeddings"] * 2,
         str(posted),
     )
 

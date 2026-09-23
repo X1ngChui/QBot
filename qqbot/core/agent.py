@@ -8,7 +8,10 @@ import logging
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+from pydantic import ValidationError
+
 from ..domain.evidence import EvidenceMemo
+from ..domain.ids import GroupId
 from ..providers.base import QuotaExhausted, TextModel
 from ..providers.contracts import (
     CallContext,
@@ -34,19 +37,28 @@ from .outbound import (
     AtSegment,
     ContactKind,
     ContactSegment,
-    CustomMusicSegment,
     DiceSegment,
     FaceSegment,
-    JsonCardSegment,
-    MusicPlatform,
-    MusicSegment,
-    OutboundSegment,
     ReplySegment,
     RpsSegment,
+    SendSegment,
     TextSegment,
     at_accounts,
     reply_target,
     text_content,
+)
+from .send_contract import (
+    AtInput,
+    ContactGroupInput,
+    ContactMemberInput,
+    DiceInput,
+    FaceInput,
+    ReplyInput,
+    RpsInput,
+    SendMessageInput,
+    SendSegmentInput,
+    TextInput,
+    send_arguments_model,
 )
 from .state import ChatMsg, GroupState
 
@@ -54,8 +66,7 @@ log = logging.getLogger("qqbot.agent")
 
 QUOTA_NOTE = "（检索额度已用完，这个查询没有执行。）"
 OVERFLOW_NOTE = (
-    "（本轮工具调用次数已达上限，这个调用没有执行；"
-    "可先用已有结果，如需再查请下一轮再调用。）"
+    "（本轮工具调用次数已达上限，这个调用没有执行；可先用已有结果，如需再查请下一轮再调用。）"
 )
 REPEAT_NOTE = "（这个查询刚执行过，结果就在上面。换个检索词，或用已有结果。）"
 WRAP_UP_NOTE = (
@@ -66,9 +77,6 @@ WRAP_UP_NOTE = (
 SEND_UNREADABLE_NOTE = "（send_messages 的参数无法解析，没有发出。请重新调用。）"
 SEND_EMPTY_NOTE = "（send_messages 没有可发送的内容，没有发出。请重新调用。）"
 SEND_INVALID_NOTE = "（send_messages 含有无效的消息段或编号，没有发出。请修正后重新调用。）"
-MAX_AT = 5
-MAX_SEGMENTS = 32
-MAX_JSON_CHARS = 16_384
 PARALLEL_SAFE_TOOLS = frozenset({"web_search", "read_url", "search_history", "open_images"})
 
 
@@ -90,7 +98,7 @@ class ToolExecution:
 class MessageDraft:
     """One independently delivered QQ message in a terminal reply batch."""
 
-    segments: tuple[OutboundSegment, ...]
+    segments: tuple[SendSegment, ...]
 
     def __post_init__(self) -> None:
         if not self.segments:
@@ -140,120 +148,65 @@ def generation_policy(cfg, *, max_output_tokens: int | None = None) -> Generatio
     )
 
 
-def _fields(data: dict, required: set[str], optional: set[str] = frozenset()) -> bool:
-    return required <= data.keys() <= required | optional
-
-
-def _nonempty(data: dict, key: str) -> str | None:
-    value = data.get(key)
-    return value.strip() if isinstance(value, str) and value.strip() else None
-
-
-def _http_url(data: dict, key: str) -> str | None:
-    value = _nonempty(data, key)
-    return value if value and value.startswith(("http://", "https://")) else None
-
-
-def _parse_segment(
-    item: object,
+def _resolve_segment(
+    item: SendSegmentInput,
     *,
     people: MemberNumbers,
     lines: dict[int, ChatMsg],
-    group_id: str,
-) -> OutboundSegment | None:
-    if not isinstance(item, dict) or set(item) != {"type", "data"}:
-        return None
-    kind, data = item.get("type"), item.get("data")
-    if not isinstance(kind, str) or not isinstance(data, dict):
-        return None
+    group_id: GroupId,
+) -> SendSegment | None:
+    """Resolve one prompt-local member or line number into a platform identifier."""
 
-    if kind == "text" and _fields(data, {"text"}):
-        text = data.get("text")
-        return TextSegment(text) if isinstance(text, str) else None
-    if kind == "at" and _fields(data, {"member"}):
-        number = tools.number(data.get("member"))
-        account = people.account(number) if number is not None else None
+    if isinstance(item, TextInput):
+        return TextSegment(item.data.text)
+    if isinstance(item, AtInput):
+        account = people.account(item.data.member)
         return AtSegment(account) if account else None
-    if kind == "reply" and _fields(data, {"line"}):
-        number = tools.number(data.get("line"))
-        target = lines.get(number or 0)
+    if isinstance(item, ReplyInput):
+        target = lines.get(item.data.line)
         return ReplySegment(target.msg_id) if target else None
-    if kind == "face" and _fields(data, {"id"}):
-        face_id = data.get("id")
-        if isinstance(face_id, int) and not isinstance(face_id, bool) and face_id >= 0:
-            return FaceSegment(face_id)
-        return None
-    if kind == "dice" and not data:
+    if isinstance(item, FaceInput):
+        return FaceSegment(item.data.id)
+    if isinstance(item, DiceInput):
         return DiceSegment()
-    if kind == "rps" and not data:
+    if isinstance(item, RpsInput):
         return RpsSegment()
-    if kind == "contact_member" and _fields(data, {"member"}):
-        number = tools.number(data.get("member"))
-        account = people.account(number) if number is not None else None
+    if isinstance(item, ContactMemberInput):
+        account = people.account(item.data.member)
         return ContactSegment(ContactKind.MEMBER, account) if account else None
-    if kind == "contact_group" and not data:
+    if isinstance(item, ContactGroupInput):
         return ContactSegment(ContactKind.CURRENT_GROUP, group_id)
-    if kind == "music" and _fields(data, {"platform", "id"}):
-        track_id = _nonempty(data, "id")
-        try:
-            platform = MusicPlatform(data.get("platform"))
-        except (TypeError, ValueError):
-            return None
-        return MusicSegment(platform, track_id) if track_id else None
-    if kind == "music_custom" and _fields(
-        data,
-        {"url", "audio", "title", "image"},
-        {"singer"},
-    ):
-        url = _http_url(data, "url")
-        audio = _http_url(data, "audio")
-        image = _http_url(data, "image")
-        title = _nonempty(data, "title")
-        singer = data.get("singer", "")
-        if url and audio and image and title and isinstance(singer, str):
-            return CustomMusicSegment(url, audio, title, image, singer)
-        return None
-    if kind == "json" and _fields(data, {"payload"}):
-        payload = data.get("payload")
-        if not isinstance(payload, dict):
-            return None
-        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        return JsonCardSegment(encoded) if len(encoded) <= MAX_JSON_CHARS else None
     return None
 
 
-def _parse_message(
-    value: object,
+def _resolve_message(
+    value: SendMessageInput,
     *,
     people: MemberNumbers,
     lines: dict[int, ChatMsg],
-    group_id: str,
-) -> tuple[MessageDraft | None, str]:
-    if not isinstance(value, dict) or set(value) != {"content"}:
-        return None, SEND_UNREADABLE_NOTE
-    content = value.get("content")
-    if not isinstance(content, list) or not content or len(content) > MAX_SEGMENTS:
-        return None, SEND_EMPTY_NOTE if content == [] else SEND_INVALID_NOTE
-
-    segments: list[OutboundSegment] = []
-    for item in content:
-        segment = _parse_segment(item, people=people, lines=lines, group_id=group_id)
+    group_id: GroupId,
+) -> MessageDraft | None:
+    segments: list[SendSegment] = []
+    for item in value.content:
+        segment = _resolve_segment(
+            item,
+            people=people,
+            lines=lines,
+            group_id=group_id,
+        )
         if segment is None:
-            return None, SEND_INVALID_NOTE
+            return None
         segments.append(segment)
+    return MessageDraft(tuple(segments))
 
-    if sum(isinstance(segment, ReplySegment) for segment in segments) > 1:
-        return None, SEND_INVALID_NOTE
-    if sum(isinstance(segment, AtSegment) for segment in segments) > MAX_AT:
-        return None, SEND_INVALID_NOTE
-    visible = any(
-        not isinstance(segment, ReplySegment)
-        and (not isinstance(segment, TextSegment) or bool(segment.text.strip()))
-        for segment in segments
-    )
-    if not visible:
-        return None, SEND_EMPTY_NOTE
-    return MessageDraft(tuple(segments)), ""
+
+def _validation_note(exc: ValidationError) -> str:
+    kinds = {error["type"] for error in exc.errors()}
+    if kinds & {"json_invalid", "json_type", "model_type"}:
+        return SEND_UNREADABLE_NOTE
+    if kinds & {"send_empty", "too_short"}:
+        return SEND_EMPTY_NOTE
+    return SEND_INVALID_NOTE
 
 
 def parse_send(
@@ -261,29 +214,26 @@ def parse_send(
     *,
     people: MemberNumbers,
     lines: dict[int, ChatMsg],
-    group_id: str,
+    group_id: GroupId,
     max_messages: int,
+    max_text_chars: int,
 ) -> tuple[ReplyDraft | None, str]:
+    model = send_arguments_model(max_messages, max_text_chars)
     try:
-        arguments = json.loads(call.arguments or "{}")
-    except json.JSONDecodeError:
-        return None, SEND_UNREADABLE_NOTE
-    if not isinstance(arguments, dict) or set(arguments) != {"messages"}:
-        return None, SEND_UNREADABLE_NOTE
-    values = arguments.get("messages")
-    if not isinstance(values, list) or not values or len(values) > max_messages:
-        return None, SEND_EMPTY_NOTE if values == [] else SEND_INVALID_NOTE
+        arguments = model.model_validate_json(call.arguments or "{}")
+    except ValidationError as exc:
+        return None, _validation_note(exc)
 
     messages: list[MessageDraft] = []
-    for value in values:
-        message, note = _parse_message(
+    for value in arguments.messages:
+        message = _resolve_message(
             value,
             people=people,
             lines=lines,
             group_id=group_id,
         )
         if message is None:
-            return None, note
+            return None, SEND_INVALID_NOTE
         messages.append(message)
     return ReplyDraft(tuple(messages)), ""
 
@@ -359,6 +309,7 @@ class AgentRun:
                 lines=self._lines,
                 group_id=self._state.group_id,
                 max_messages=self._cfg.tools.send_messages.max_messages_per_call,
+                max_text_chars=self._cfg.tools.send_messages.max_text_chars_per_message,
             )
             if reply is not None:
                 if len(turn.tool_calls) > 1:
@@ -548,7 +499,7 @@ class AgentRun:
 
 
 def request_for_reply(
-    prompt: tuple[PromptItem, ...], cfg: Settings, *, group_id: str
+    prompt: tuple[PromptItem, ...], cfg: Settings, *, group_id: GroupId
 ) -> ModelRequest:
     return ModelRequest(
         prompt=prompt,

@@ -69,9 +69,8 @@ _LINE_NO = re.compile(
 #: form is what a member's imitation looks like after defang, and quoting a
 #: member is content.
 _TS_ONLY = re.compile(rf"^\s*{_L}\d{{2}}-\d{{2}} \d{{2}}:\d{{2}}{_R}\s*", re.M)
-#: The retired permanent evidence marker found on legacy archived lines. A model may
-#: still imitate syntax it saw in old context or untrusted content, so the output guard
-#: strips the reserved form wherever it appears.
+#: A fabricated permanent-evidence marker. It is not part of the archive contract, and
+#: reserved-form imitation must never reach the group.
 _PROV = re.compile(rf"\s*{_L}依据[:：][^{_R}]*{_R}")
 #: A line imitating the trajectory-entry marker. Whole lines carrying it are
 #: dropped: the marker is system-written and must never reach the group, while the
@@ -89,8 +88,7 @@ _REPLY_MARK = re.compile(rf"^\s*{_L}回复\s*(?:#\d{{1,4}}|更早的消息){_R}\
 #: Speaker tags copied out of the history: the owner and self annotations and the
 #: member numbers that ride behind names in transcripts. Dropped whole wherever
 #: they appear - they are annotations about a name, never words anyone says.
-_NAME_TAG = re.compile(
-    rf"{re.escape(SYS_L)}(?:拥有者|你|\d{{1,9}}){re.escape(SYS_R)}")
+_NAME_TAG = re.compile(rf"{re.escape(SYS_L)}(?:拥有者|你|\d{{1,9}}){re.escape(SYS_R)}")
 
 
 def strip_markdown(text: str) -> str:
@@ -189,10 +187,12 @@ def _before_markup(text: str) -> str:
     m = _TOOL_MARKUP.search(text)
     if m is None:
         return text
-    kept = text[:m.start()]
+    kept = text[: m.start()]
     log.warning(
         "reply contained a tool call written as text; dropped %d chars, kept %d. "
         "The model wanted a tool it was not offered on this round: %s",
-        len(text) - len(kept), len(kept.strip()), text[m.start():m.start() + 60],
+        len(text) - len(kept),
+        len(kept.strip()),
+        text[m.start() : m.start() + 60],
     )
     return kept

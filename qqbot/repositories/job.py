@@ -21,10 +21,9 @@ from ..db import pool
 
 
 class JobType(StrEnum):
-    EXTRACT_MEMORY = "extract_memory"     # read a batch of messages into candidates
-    CONSOLIDATE = "consolidate"           # validate candidates and write them down
-    EMBED = "embed"                       # fill in missing vectors
-    DECAY = "decay"                       # age memories out
+    EXTRACT_MEMORY = "extract_memory"  # read a batch of messages into candidates
+    EMBED = "embed"  # fill in missing vectors
+    DECAY = "decay"  # age memories out
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,8 +44,13 @@ class JobQueue:
         self._worker = worker_id
 
     async def submit(
-        self, job_type: JobType, payload: dict, *, priority: int = 0,
+        self,
+        job_type: JobType,
+        payload: dict,
+        *,
+        priority: int = 0,
         delay: timedelta | None = None,
+        _conn: asyncpg.Connection | None = None,
     ) -> uuid.UUID | None:
         """Queue one job. Returns None when an identical job is already pending.
 
@@ -54,12 +58,15 @@ class JobQueue:
         the same work queued twice is the same work, so concurrent schedulers or a retry
         cannot buy the same operation twice.
         """
-        return await pool().fetchval(
+        return await (_conn or pool()).fetchval(
             """INSERT INTO memory_job (job_type, payload, priority, available_at)
                VALUES ($1,$2,$3, NOW() + $4::interval)
                ON CONFLICT DO NOTHING
                RETURNING id""",
-            job_type.value, payload, priority, delay or timedelta(0),
+            job_type.value,
+            payload,
+            priority,
+            delay or timedelta(0),
         )
 
     async def claim(self, *, lease: timedelta = timedelta(minutes=10)) -> Job | None:
@@ -98,17 +105,20 @@ class JobQueue:
                  FROM picked
                 WHERE j.id = picked.id
             RETURNING j.id, j.job_type, j.payload, j.retry_count, j.max_retry""",
-            self._worker, lease,
+            self._worker,
+            lease,
         )
         if row is None:
             return None
         return Job(
-            id=row["id"], job_type=JobType(row["job_type"]),
+            id=row["id"],
+            job_type=JobType(row["job_type"]),
             payload=row["payload"],
-            retry_count=row["retry_count"], max_retry=row["max_retry"],
+            retry_count=row["retry_count"],
+            max_retry=row["max_retry"],
         )
 
-    async def purge_done(self, *, days: int = 30) -> int:
+    async def purge_done(self, *, days: int) -> int:
         """Delete finished jobs older than `days`. Dead rows stay - they are the
         error record - but 'done' is pure history, and a table nothing prunes is
         scanned by every claim poll forever."""
@@ -124,7 +134,8 @@ class JobQueue:
         await pool().execute(
             """UPDATE memory_job SET status='done', finished_at=NOW(), locked_by=NULL
                 WHERE id=$1 AND locked_by=$2""",
-            job_id, self._worker,
+            job_id,
+            self._worker,
         )
 
     async def fail(self, job: Job, error: str, *, backoff: timedelta) -> None:
@@ -137,7 +148,9 @@ class JobQueue:
                 """UPDATE memory_job SET status='dead', last_error=$2,
                                          finished_at=NOW(), locked_by=NULL
                     WHERE id=$1 AND locked_by=$3""",
-                job.id, error[:2000], self._worker,
+                job.id,
+                error[:2000],
+                self._worker,
             )
             return
         try:
@@ -151,7 +164,10 @@ class JobQueue:
                       SET status='pending', retry_count=retry_count+1,
                           available_at=NOW() + $3::interval, last_error=$2, locked_by=NULL
                     WHERE id=$1 AND locked_by=$4""",
-                job.id, error[:2000], backoff, self._worker,
+                job.id,
+                error[:2000],
+                backoff,
+                self._worker,
             )
         except asyncpg.UniqueViolationError:
             # A fresh pending twin was legally submitted while this one ran (the
@@ -163,13 +179,26 @@ class JobQueue:
                 """UPDATE memory_job SET status='dead', last_error=$2,
                                          finished_at=NOW(), locked_by=NULL
                     WHERE id=$1 AND locked_by=$3""",
-                job.id, ("yielded to a newer pending twin: " + error)[:2000],
+                job.id,
+                ("yielded to a newer pending twin: " + error)[:2000],
                 self._worker,
             )
 
-    async def depth(self) -> dict[str, int]:
-        """How many jobs are in each state. Reported daily, because a stuck queue has no
-        other symptom."""
-        rows = await pool().fetch(
-            "SELECT status, count(*) AS n FROM memory_job GROUP BY status")
+    async def depth(
+        self,
+        *,
+        job_types: tuple[JobType, ...] | None = None,
+    ) -> dict[str, int]:
+        """Count jobs by state, optionally for only the named kinds."""
+
+        if job_types:
+            rows = await pool().fetch(
+                """SELECT status, count(*) AS n FROM memory_job
+                    WHERE job_type = ANY($1::text[]) GROUP BY status""",
+                [job_type.value for job_type in job_types],
+            )
+        else:
+            rows = await pool().fetch(
+                "SELECT status, count(*) AS n FROM memory_job GROUP BY status"
+            )
         return {r["status"]: r["n"] for r in rows}

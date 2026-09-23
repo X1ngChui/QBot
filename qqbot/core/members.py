@@ -19,27 +19,29 @@ import asyncio
 import logging
 import time
 
+from ..domain.ids import GroupId
 from ..settings import config
 from ..util import display_name, why
 from .botapi import BotApi
 
 log = logging.getLogger("qqbot.members")
 
+
 class MemberDirectory:
     def __init__(self) -> None:
-        self._by_group: dict[str, dict[str, str]] = {}
-        self._fetched: dict[str, float] = {}
-        self._locks: dict[str, asyncio.Lock] = {}
+        self._by_group: dict[GroupId, dict[str, str]] = {}
+        self._fetched: dict[GroupId, float] = {}
+        self._locks: dict[GroupId, asyncio.Lock] = {}
         #: Accounts asked about and absent from the table as of its last fetch -
         #: members who have left, quoted or still in the window. A miss forces a
         #: refresh once; remembered here, it does not force one on every reply.
-        self._missing: dict[str, set[str]] = {}
+        self._missing: dict[GroupId, set[str]] = {}
 
-    def _fresh(self, group_id: str) -> bool:
+    def _fresh(self, group_id: GroupId) -> bool:
         ttl = config().default.members.cache_ttl_sec
         return time.monotonic() - self._fetched.get(group_id, 0.0) < ttl
 
-    async def _fetch(self, bot: BotApi, group_id: str, *, force: bool = False) -> None:
+    async def _fetch(self, bot: BotApi, group_id: GroupId, *, force: bool = False) -> None:
         """Refresh one group's table. `force` refetches inside the TTL - for a member
         the table has never heard of - but never twice for one decision: a refresh
         that landed while this caller waited for the lock is the refresh it wanted."""
@@ -51,7 +53,7 @@ class MemberDirectory:
             if not force and self._fresh(group_id):
                 return
             try:
-                rows = await bot.call_api("get_group_member_list", group_id=int(group_id))
+                rows = await bot.call_api("get_group_member_list", group_id=group_id.to_onebot())
             except Exception as e:
                 # Mark the attempt so a persistently failing group does not retry per
                 # message; the old table, if any, stays usable - names captured when each
@@ -61,8 +63,9 @@ class MemberDirectory:
                 # the bot calling somebody by a name they dropped last week, and nothing
                 # about that says the member list is what failed.
                 self._fetched[group_id] = time.monotonic()
-                log.warning("group %s: member list unavailable, names may be stale: %s",
-                            group_id, why(e))
+                log.warning(
+                    "group %s: member list unavailable, names may be stale: %s", group_id, why(e)
+                )
                 return
             table: dict[str, str] = {}
             for r in rows or []:
@@ -78,8 +81,7 @@ class MemberDirectory:
             self._fetched[group_id] = time.monotonic()
             log.info("group %s: member list refreshed (%d people)", group_id, len(table))
 
-    async def _current(self, bot: BotApi, group_id: str,
-                       wanted: list[str]) -> dict[str, str]:
+    async def _current(self, bot: BotApi, group_id: GroupId, wanted: list[str]) -> dict[str, str]:
         """The live table, refreshed when stale or when it lacks a member it has not
         been asked about since its last fetch.
 
@@ -99,17 +101,16 @@ class MemberDirectory:
         elif not self._fresh(group_id):
             await self._fetch(bot, group_id)
         table = self._by_group.get(group_id) or {}
-        self._missing.setdefault(group_id, set()).update(
-            q for q in wanted if q not in table)
+        self._missing.setdefault(group_id, set()).update(q for q in wanted if q not in table)
         return table
 
-    async def name_of(self, bot: BotApi, group_id: str, qq: str) -> str | None:
+    async def name_of(self, bot: BotApi, group_id: GroupId, qq: str) -> str | None:
         """The display name for one member - see _current for when the list is refetched."""
         if not qq:
             return None
         return (await self._current(bot, group_id, [qq])).get(qq)
 
-    async def names_of(self, bot: BotApi, group_id: str, qqs: list[str]) -> dict[str, str]:
+    async def names_of(self, bot: BotApi, group_id: GroupId, qqs: list[str]) -> dict[str, str]:
         """Display names for several members in one go - at most one API call."""
         wanted = [q for q in qqs if q]
         if not wanted:
@@ -117,7 +118,7 @@ class MemberDirectory:
         table = await self._current(bot, group_id, wanted)
         return {q: table[q] for q in wanted if q in table}
 
-    async def relabel(self, bot: BotApi, group_id: str, msgs) -> int:
+    async def relabel(self, bot: BotApi, group_id: GroupId, msgs) -> int:
         """Update the names on a batch of ChatMsg to the current group cards: each
         member line's speaker, and whom each of the bot's own lines @-ed.
 
@@ -150,7 +151,7 @@ class MemberDirectory:
             log.info("group %s: %d name(s) relabelled after a rename", group_id, renamed)
         return renamed
 
-    def forget(self, group_id: str | None = None) -> None:
+    def forget(self, group_id: GroupId | None = None) -> None:
         if group_id is None:
             self._by_group.clear()
             self._fetched.clear()

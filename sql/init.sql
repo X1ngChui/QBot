@@ -1,430 +1,1005 @@
--- QQ group-chat bot long-term memory: the physical model.
---
--- The layers, and the tables that hold each:
---   L0 raw_event                     raw events, append-only, never modified
---   L1 entity / identity_account     person and account kept apart; the account is the
---                                    strong identity
---      alias / alias_evidence        names, with scope, evidence and status
---   L3 memory_fact / _evidence       temporal semantic facts
---      memory_candidate              LLM output, staged before validation
---   L4 episode / _participant/_event episodic memory
---   L6 embedding_index               vector projections, decoupled from what they project
---      memory_job                    the background job queue
---
--- L2 (reference-resolution traces) is deliberately absent: every reference this system
--- receives is an @ or a quote, where the platform states the account outright, so
--- resolution is not a judgement and a trace of it would have no reader.
---
--- Group isolation: on every table that carries a group_id, the group_id
--- is the first column of its indexes, and no retrieval path exists that crosses groups.
--- alias.group_id may be NULL for a global name - the one cross-group channel, and only
--- an owner may open it by hand; everything the LLM writes carries a group id.
+-- Canonical QBot schema for a fresh PostgreSQL database.
+-- Existing installations are migrated manually before deploying matching code.
 
 CREATE EXTENSION IF NOT EXISTS vector;
-CREATE EXTENSION IF NOT EXISTS pgcrypto;   -- gen_random_uuid()
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
--- ---------------------------------------------------------------- L0
+SET default_tablespace = '';
 
-CREATE TABLE IF NOT EXISTS raw_event (
-    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    platform          VARCHAR(32)  NOT NULL,
-    event_type        VARCHAR(64)  NOT NULL,
-    group_id          BIGINT,
-    platform_user_id  VARCHAR(128),
-    platform_event_id VARCHAR(128),
-    occurred_at       TIMESTAMPTZ  NOT NULL,
-    -- The platform message verbatim: append-only, never modified. The derived reading
-    -- lives in the plain_text column instead - it gets backfilled once a picture is
-    -- understood, and something updatable has no place inside a blob that claims to be
-    -- immutable.
-    payload           JSONB        NOT NULL,
-    plain_text        TEXT,
-    created_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-);
+SET default_table_access_method = heap;
 
--- One platform message lands exactly once; this is what stops a replay after a
--- reconnect.
-CREATE UNIQUE INDEX IF NOT EXISTS raw_event_platform_key
-    ON raw_event (platform, platform_event_id)
-    WHERE platform_event_id IS NOT NULL;
-CREATE INDEX IF NOT EXISTS raw_event_group_time
-    ON raw_event (group_id, occurred_at DESC);
-CREATE INDEX IF NOT EXISTS raw_event_speaker
-    ON raw_event (group_id, platform_user_id, occurred_at DESC);
--- unread_since_extract filters on created_at (the ingest watermark), which the
--- occurred_at indexes cannot serve: without this the count (read by /stats,
--- /groupstats and every worker pass) is a full-group scan over a table that only
--- ever grows.
-CREATE INDEX IF NOT EXISTS raw_event_group_created
-    ON raw_event (group_id, created_at)
-    WHERE event_type = 'message';
-
--- ---------------------------------------------------------------- L1
-
-CREATE TABLE IF NOT EXISTS entity (
-    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    entity_type    VARCHAR(32)  NOT NULL,
-    canonical_name VARCHAR(256),
-    status         VARCHAR(32)  NOT NULL DEFAULT 'active',
-    -- After a merge this points at the survivor, and reads follow it one hop. Physical
-    -- deletion would leave the historical records dangling.
-    merged_into    UUID REFERENCES entity(id),
-    revision       BIGINT       NOT NULL DEFAULT 1,
-    created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    updated_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS entity_alive ON entity (entity_type) WHERE status = 'active';
-
-CREATE TABLE IF NOT EXISTS identity_account (
-    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    entity_id        UUID        NOT NULL REFERENCES entity(id),
-    platform         VARCHAR(32) NOT NULL,
-    platform_user_id VARCHAR(128) NOT NULL,
-    first_seen_at    TIMESTAMPTZ,
-    last_seen_at     TIMESTAMPTZ,
-    UNIQUE (platform, platform_user_id)
-);
-
-CREATE INDEX IF NOT EXISTS identity_account_entity ON identity_account (entity_id);
-
-CREATE TABLE IF NOT EXISTS alias (
-    id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    alias_text         VARCHAR(256) NOT NULL,
-    -- The form with case, whitespace and full-width folded away; matching goes through
-    -- this, display always uses alias_text.
-    normalized_text    VARCHAR(256) NOT NULL,
-    target_entity_id   UUID         NOT NULL REFERENCES entity(id),
-    group_id           BIGINT,
-    alias_type         VARCHAR(32),
-    confidence         REAL         NOT NULL,
-    status             VARCHAR(32)  NOT NULL DEFAULT 'candidate',
-    valid_from         TIMESTAMPTZ,
-    valid_to           TIMESTAMPTZ,
-    last_used_at       TIMESTAMPTZ,
-    created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    updated_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-);
-
--- One row per (group, name, entity): repeated sightings of the same binding upsert into
--- one row instead of accumulating duplicates. The same name may still point at several
--- entities - that ambiguity is real, and lookup hands it to the caller undecided.
-CREATE UNIQUE INDEX IF NOT EXISTS alias_unique_in_scope
-    ON alias (COALESCE(group_id, 0), normalized_text, target_entity_id);
--- Name resolution filters on normalized_text with (group_id = X OR group_id IS NULL);
--- the text is the selective column, so it leads and the group test rides along.
-CREATE INDEX IF NOT EXISTS alias_lookup
-    ON alias (normalized_text)
-    WHERE status <> 'inactive';
-CREATE INDEX IF NOT EXISTS alias_by_entity ON alias (target_entity_id);
-
-CREATE TABLE IF NOT EXISTS alias_evidence (
-    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    alias_id       UUID        NOT NULL REFERENCES alias(id) ON DELETE CASCADE,
-    raw_event_id   UUID        REFERENCES raw_event(id),
-    evidence_type  VARCHAR(64) NOT NULL,
-    evidence_score REAL,
-    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
--- Serves both the plain by-alias reads and upsert_alias's fast-path probe
--- (newest evidence of one type for one alias, an index-only backward scan).
-CREATE INDEX IF NOT EXISTS alias_evidence_probe
-    ON alias_evidence (alias_id, evidence_type, created_at);
-
--- ---------------------------------------------------------------- L3
-
-CREATE TABLE IF NOT EXISTS memory_fact (
-    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    group_id          BIGINT,
-    subject_entity_id UUID         NOT NULL REFERENCES entity(id),
-    predicate         VARCHAR(128) NOT NULL,
-    -- What distinguishes rows of a multi-valued predicate (likes, by the thing liked;
-    -- term, by the word defined). NULL for single-valued predicates. Its own column
-    -- rather than a suffix on the predicate: two values in one column is what first
-    -- normal form forbids, and the key is what supersede matches on.
-    object_key        TEXT,
-    object_entity_id  UUID         REFERENCES entity(id),
-    object_value      JSONB,
-    memory_type       VARCHAR(64)  NOT NULL,
-    confidence        REAL         NOT NULL,
-    status            VARCHAR(32)  NOT NULL DEFAULT 'active',
-    -- Facts carry time. "Quit the game" stamps valid_to on the old fact; it does not
-    -- delete it.
-    valid_from        TIMESTAMPTZ,
-    valid_to          TIMESTAMPTZ,
-    first_observed_at TIMESTAMPTZ,
-    last_confirmed_at TIMESTAMPTZ,
-    revision          BIGINT       NOT NULL DEFAULT 1,
-    created_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    updated_at        TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS fact_subject
-    ON memory_fact (group_id, subject_entity_id, status);
--- One current fact per subject and predicate (and, for multi-valued predicates, per
--- object key). The database guarantees the invariant directly: violating it is a
--- unique-index conflict, not a race between writers.
-CREATE UNIQUE INDEX IF NOT EXISTS fact_one_current
-    ON memory_fact (COALESCE(group_id, 0), subject_entity_id, predicate,
-                    COALESCE(object_key, ''))
-    WHERE valid_to IS NULL AND status = 'active';
-
-CREATE TABLE IF NOT EXISTS memory_fact_evidence (
-    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    fact_id        UUID        NOT NULL REFERENCES memory_fact(id) ON DELETE CASCADE,
-    raw_event_id   UUID        NOT NULL REFERENCES raw_event(id),
-    relation       VARCHAR(32) NOT NULL,   -- supports | contradicts
-    evidence_score REAL,
-    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS fact_evidence_fact ON memory_fact_evidence (fact_id);
-
--- Everything the LLM produces lands here first, and reaches memory_fact / alias only
--- through the Validator.
-CREATE TABLE IF NOT EXISTS memory_candidate (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    group_id        BIGINT,
-    source_event_id UUID        REFERENCES raw_event(id),
-    -- The last message of the batch this came from, and how many rows that batch
-    -- held. Validation has to run against the same batch the model read: the quote,
-    -- the name and the term must all appear word for word in the messages it was
-    -- shown. Consolidation is a separate queued job that runs later, and re-fetching
-    -- the unread messages by then reads past a watermark that has moved, rejecting
-    -- correctly-quoted records as if invented. Anchor plus size name the exact set;
-    -- batches are cut at conversation gaps, so their length varies.
-    batch_event_id  UUID        REFERENCES raw_event(id),
-    batch_size      INT          NOT NULL,
-    candidate_type  VARCHAR(64) NOT NULL,
-    payload         JSONB       NOT NULL,
-    confidence      REAL,
-    status          VARCHAR(32) NOT NULL DEFAULT 'pending',
-    reject_reason   TEXT,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    processed_at    TIMESTAMPTZ
-);
-
-CREATE INDEX IF NOT EXISTS candidate_pending
-    ON memory_candidate (group_id, created_at) WHERE status = 'pending';
-
--- ---------------------------------------------------------------- L4
-
-CREATE TABLE IF NOT EXISTS episode (
-    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    group_id     BIGINT       NOT NULL,
-    episode_type VARCHAR(64),
-    title        VARCHAR(256),
-    summary      TEXT         NOT NULL,
-    started_at   TIMESTAMPTZ,
-    ended_at     TIMESTAMPTZ,
-    importance   REAL,
-    confidence   REAL,
-    status       VARCHAR(32)  NOT NULL DEFAULT 'active',
-    revision     BIGINT       NOT NULL DEFAULT 1,
-    created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS episode_group_time ON episode (group_id, started_at DESC);
-
-CREATE TABLE IF NOT EXISTS episode_participant (
-    episode_id UUID NOT NULL REFERENCES episode(id) ON DELETE CASCADE,
-    entity_id  UUID NOT NULL REFERENCES entity(id),
-    role       VARCHAR(64),
-    PRIMARY KEY (episode_id, entity_id)
-);
-
-CREATE INDEX IF NOT EXISTS episode_participant_entity ON episode_participant (entity_id);
-
-CREATE TABLE IF NOT EXISTS episode_event (
-    episode_id   UUID NOT NULL REFERENCES episode(id) ON DELETE CASCADE,
-    raw_event_id UUID NOT NULL REFERENCES raw_event(id),
-    PRIMARY KEY (episode_id, raw_event_id)
-);
-
--- ---------------------------------------------------------------- L6
-
--- Vectors are decoupled from the objects they project: switching embedding models
--- rebuilds this one table and nothing else.
 --
--- 2048 dimensions, text-embedding-v4. Measured on Chinese, the model separates related
--- from unrelated sentences by a cosine margin of 0.345 at 1024 dims and 0.388 at 2048;
--- the larger won.
+-- Name: account_link_challenge; Type: TABLE; Schema: public; Owner: -
 --
--- The price is no ANN index: pgvector's hnsw caps at 2000 dims. Going without one is
--- deliberate - retrieval always filters by group_id first (the btree below), the
--- remaining set is in the hundreds, and an exact scan is both more accurate than an
--- approximation and indistinguishably fast. Dimension reduction becomes a conversation
--- the day one group outgrows that.
-CREATE TABLE IF NOT EXISTS embedding_index (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    group_id        BIGINT,
-    object_type     VARCHAR(32)  NOT NULL,
-    object_id       UUID         NOT NULL,
-    embedding       VECTOR(2048) NOT NULL,
-    embedding_model VARCHAR(128) NOT NULL,
-    embedding_version INTEGER    NOT NULL DEFAULT 1,
-    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    UNIQUE (object_type, object_id, embedding_model, embedding_version)
+
+CREATE TABLE account_link_challenge (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    group_id bigint NOT NULL,
+    token_hash character varying(64) NOT NULL,
+    initiator_account_id uuid NOT NULL,
+    target_account_id uuid NOT NULL,
+    initiator_entity_id uuid NOT NULL,
+    target_entity_id uuid NOT NULL,
+    initiator_entity_revision bigint NOT NULL,
+    target_entity_revision bigint NOT NULL,
+    status character varying(32) DEFAULT 'pending'::character varying NOT NULL,
+    created_event_id uuid NOT NULL,
+    confirmed_event_id uuid,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    confirmed_at timestamp with time zone,
+    cancelled_at timestamp with time zone,
+    CONSTRAINT account_link_distinct_accounts CHECK ((initiator_account_id <> target_account_id)),
+    CONSTRAINT account_link_revision_valid CHECK (((initiator_entity_revision >= 1) AND (target_entity_revision >= 1))),
+    CONSTRAINT account_link_status_valid CHECK (((status)::text = ANY ((ARRAY['pending'::character varying, 'applied'::character varying, 'cancelled'::character varying, 'expired'::character varying])::text[])))
 );
 
--- Group isolation holds in vector search too: filter by group, then measure distance -
--- never a store-wide nearest neighbour. The same index is the performance guarantee:
--- it confines the exact scan to one group.
-CREATE INDEX IF NOT EXISTS embedding_group ON embedding_index (group_id, object_type);
 
-CREATE TABLE IF NOT EXISTS memory_job (
-    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    job_type     VARCHAR(64) NOT NULL,
-    payload      JSONB       NOT NULL,
-    status       VARCHAR(32) NOT NULL DEFAULT 'pending',
-    priority     INTEGER     NOT NULL DEFAULT 0,
-    retry_count  INTEGER     NOT NULL DEFAULT 0,
-    max_retry    INTEGER     NOT NULL DEFAULT 5,
-    available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    locked_at    TIMESTAMPTZ,
-    locked_by    VARCHAR(128),
-    last_error   TEXT,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    finished_at  TIMESTAMPTZ
+--
+-- Name: alias; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE alias (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    alias_text character varying(256) NOT NULL,
+    normalized_text character varying(256) NOT NULL,
+    target_entity_id uuid,
+    group_id bigint,
+    alias_type character varying(32),
+    confidence real NOT NULL,
+    status character varying(32) DEFAULT 'candidate'::character varying NOT NULL,
+    valid_from timestamp with time zone,
+    valid_to timestamp with time zone,
+    last_used_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    target_account_id uuid,
+    CONSTRAINT alias_exactly_one_target CHECK ((num_nonnulls(target_entity_id, target_account_id) = 1))
 );
 
--- Claim order: higher priority first, then first come first served. SKIP LOCKED leans
--- on this.
-CREATE INDEX IF NOT EXISTS job_claimable
-    ON memory_job (priority DESC, available_at)
-    WHERE status = 'pending';
 
--- Identical pending work is one job: submit() relies on this to collapse double
--- submissions (two messages crossing the extraction threshold at once).
-CREATE UNIQUE INDEX IF NOT EXISTS job_pending_once
-    ON memory_job (job_type, (payload->>'group_id'))
-    WHERE status = 'pending';
+--
+-- Name: alias_evidence; Type: TABLE; Schema: public; Owner: -
+--
 
--- ---------------------------------------------------------------- runtime
-
--- The bot's bounded evidence memo for one reply. It is not group memory and is never
--- searched or extracted. `content` remains for schema-v0 rows; schema-v1 writes only
--- `memo`. Every row expires because evidence is follow-up context, not an archive.
-CREATE TABLE IF NOT EXISTS reply_trace (
-    id             UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
-    group_id       BIGINT      NOT NULL,
-    reply_event_id VARCHAR(64) NOT NULL,
-    content        TEXT        NOT NULL DEFAULT '',
-    memo           JSONB,
-    expires_at     TIMESTAMPTZ,
-    created_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-ALTER TABLE reply_trace ADD COLUMN IF NOT EXISTS memo JSONB;
-ALTER TABLE reply_trace ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
-ALTER TABLE reply_trace ALTER COLUMN content SET DEFAULT '';
--- Give legacy text rows one final compatibility window rather than retaining them forever.
-UPDATE reply_trace
-   SET expires_at = created_at + INTERVAL '30 days'
- WHERE memo IS NULL AND expires_at IS NULL;
-CREATE UNIQUE INDEX IF NOT EXISTS reply_trace_reply
-    ON reply_trace (group_id, reply_event_id);
-CREATE INDEX IF NOT EXISTS reply_trace_expiry
-    ON reply_trace (expires_at)
-    WHERE expires_at IS NOT NULL;
-
--- Budget and usage, aggregated per day, group, kind and causing account: one
--- authoritative billing shape.
-CREATE TABLE IF NOT EXISTS cost_ledger (
-    day      DATE         NOT NULL,
-    -- 0 means belonging to no group (a global search call, say). 0 rather than NULL:
-    -- NULLs in a primary key never compare equal, ON CONFLICT stops matching, and the
-    -- day's second global record quietly starts a second row - which silently breaks
-    -- the one-row-per-day-group-kind shape this table exists for.
-    group_id BIGINT       NOT NULL DEFAULT 0,
-    kind     VARCHAR(32)  NOT NULL,
-    model    VARCHAR(128) NOT NULL,
-    -- The account whose action caused the spend: whoever addressed the bot for a
-    -- reply, whoever posted the picture or clip for vision/ASR. '' for spend no
-    -- single account caused (extraction reads everybody). An account id, not an
-    -- entity id: entities merge and split after the fact, and the ledger is
-    -- append-only - person-level readings aggregate through identity_account at
-    -- query time, which is what makes them follow a later merge for free.
-    user_id  VARCHAR(64)  NOT NULL DEFAULT '',
-    calls    BIGINT       NOT NULL DEFAULT 0,
-    in_hit   BIGINT       NOT NULL DEFAULT 0,
-    in_miss  BIGINT       NOT NULL DEFAULT 0,
-    out      BIGINT       NOT NULL DEFAULT 0,
-    cny      NUMERIC(12,6) NOT NULL DEFAULT 0,
-    PRIMARY KEY (day, group_id, kind, model, user_id)
+CREATE TABLE alias_evidence (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    alias_id uuid NOT NULL,
+    raw_event_id uuid,
+    evidence_type character varying(64) NOT NULL,
+    evidence_score real,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
--- Per-group runtime switches and watermarks, one typed column per field: the schema
--- itself says what runtime state the system keeps, with names and types a generic
--- kv/jsonb blob cannot offer.
-CREATE TABLE IF NOT EXISTS group_state (
-    group_id        BIGINT      PRIMARY KEY,
-    muted           BOOLEAN     NOT NULL DEFAULT FALSE,
-    -- When this group first reached the bot. Written on the first message, and the row's
-    -- absence is what makes a group new: there is no allowlist to add a group to, so this
-    -- is the only record that one appeared.
-    first_seen_at   TIMESTAMPTZ,
-    -- How far memory extraction has read. In the database rather than in memory: a
-    -- restart must not send a half-accumulated batch back to zero.
-    last_extract_at TIMESTAMPTZ,
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+
+--
+-- Name: cost_ledger; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE cost_ledger (
+    day date NOT NULL,
+    group_id bigint DEFAULT 0 NOT NULL,
+    kind character varying(32) NOT NULL,
+    model character varying(128) NOT NULL,
+    user_id character varying(64) DEFAULT ''::character varying NOT NULL,
+    calls bigint DEFAULT 0 NOT NULL,
+    in_hit bigint DEFAULT 0 NOT NULL,
+    in_miss bigint DEFAULT 0 NOT NULL,
+    "out" bigint DEFAULT 0 NOT NULL,
+    cny numeric(12,6) DEFAULT 0 NOT NULL
 );
 
--- A group blocking members is a one-to-many relation, so it is a table - not an array
--- column inside group_state.
-CREATE TABLE IF NOT EXISTS group_blocklist (
-    group_id   BIGINT      NOT NULL,
-    user_id    VARCHAR(128) NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    -- NULL means blocked until somebody lifts it; a timestamp means the block
-    -- lapses on its own at that moment (checked lazily, no sweeper).
-    blocked_until TIMESTAMPTZ,
-    PRIMARY KEY (group_id, user_id)
+
+--
+-- Name: embedding_index; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE embedding_index (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    group_id bigint,
+    object_type character varying(32) NOT NULL,
+    object_id uuid NOT NULL,
+    embedding public.vector(2048) NOT NULL,
+    embedding_model character varying(128) NOT NULL,
+    embedding_version integer DEFAULT 1 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
--- User-agreement acceptances (core/agreement.py), one per group and account:
--- each group is its own audience, so consent given in one says nothing about
--- another. The row remembers which version was accepted; a bumped agreement
--- version voids older rows without deleting them. No revocation command.
-CREATE TABLE IF NOT EXISTS user_agreement (
-    group_id  BIGINT       NOT NULL,
-    user_id   VARCHAR(128) NOT NULL,
-    version   INT          NOT NULL DEFAULT 1,
-    agreed_at TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (group_id, user_id)
+
+--
+-- Name: entity; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE entity (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    entity_type character varying(32) NOT NULL,
+    canonical_name character varying(256),
+    status character varying(32) DEFAULT 'active'::character varying NOT NULL,
+    merged_into uuid,
+    revision bigint DEFAULT 1 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
--- Image description cache. Keyed by image md5 or sticker id, deliberately without a
--- group: the same picture is the same picture wherever it is posted.
-CREATE TABLE IF NOT EXISTS image_cache (
-    key         VARCHAR(64) PRIMARY KEY,
-    -- Empty until the describing call has run: the file_id can land first, and a row
-    -- exists from whichever write happens first.
-    description TEXT        NOT NULL DEFAULT '',
-    -- Where the reply model's backend filed the original picture (Files API), and
-    -- when. The open_images tool hands the id to the model so it reads the pixels;
-    -- NULL when never uploaded. The backend drops files after its own retention, so
-    -- an id older than capabilities.vision.file_max_age_days, or issued by another
-    -- provider, is treated as gone and uploaded again.
-    file_id     VARCHAR(64),
-    file_provider VARCHAR(32),
-    file_uploaded_at TIMESTAMPTZ,
-    -- When the description was written, which is not when the row was last used.
-    -- The describing path treats one older than capabilities.vision.description_ttl_days as
-    -- a miss and pays to write a fresh one: models improve, and a vendor can put a
-    -- better model behind an unchanged id, so age is the only thing that tracks
-    -- description quality from here. NULL only while there is no description (the
-    -- constraint below); free paths ignore the age - a stale description still
-    -- beats a bare marker when nothing may be spent.
-    described_at TIMESTAMPTZ,
-    -- The description is a placeholder standing in for a picture the backend's
-    -- content filter declined to look at, not something it saw. Expires on the same
-    -- clock as any other description: a different backend, or the same one with
-    -- different rules, may well look at it.
-    refused     BOOLEAN     NOT NULL DEFAULT FALSE,
-    hit_count   BIGINT      NOT NULL DEFAULT 0,
-    last_seen   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT image_cache_described_stamped
-        CHECK (description = '' OR described_at IS NOT NULL)
+
+--
+-- Name: episode; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE episode (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    group_id bigint NOT NULL,
+    episode_type character varying(64),
+    title character varying(256),
+    summary text NOT NULL,
+    started_at timestamp with time zone,
+    ended_at timestamp with time zone,
+    importance real,
+    confidence real,
+    status character varying(32) DEFAULT 'active'::character varying NOT NULL,
+    revision bigint DEFAULT 1 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    extraction_id uuid
 );
-ALTER TABLE image_cache ADD COLUMN IF NOT EXISTS file_provider VARCHAR(32);
+
+
+--
+-- Name: episode_event; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE episode_event (
+    episode_id uuid NOT NULL,
+    raw_event_id uuid NOT NULL
+);
+
+
+--
+-- Name: group_blocklist; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE group_blocklist (
+    group_id bigint NOT NULL,
+    user_id character varying(128),
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    blocked_until timestamp with time zone,
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    entity_id uuid,
+    CONSTRAINT group_blocklist_exactly_one_target CHECK ((num_nonnulls(user_id, entity_id) = 1))
+);
+
+
+--
+-- Name: group_state; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE group_state (
+    group_id bigint NOT NULL,
+    muted boolean DEFAULT false NOT NULL,
+    first_seen_at timestamp with time zone,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: identity_account; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE identity_account (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    entity_id uuid NOT NULL,
+    platform character varying(32) NOT NULL,
+    platform_user_id character varying(128) NOT NULL,
+    first_seen_at timestamp with time zone,
+    last_seen_at timestamp with time zone
+);
+
+
+--
+-- Name: image_cache; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE image_cache (
+    key character varying(64) NOT NULL,
+    description text DEFAULT ''::text NOT NULL,
+    file_id character varying(64),
+    file_provider character varying(32),
+    file_uploaded_at timestamp with time zone,
+    described_at timestamp with time zone,
+    refused boolean DEFAULT false NOT NULL,
+    hit_count bigint DEFAULT 0 NOT NULL,
+    last_seen timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT image_cache_described_stamped CHECK (((description = ''::text) OR (described_at IS NOT NULL)))
+);
+
+
+--
+-- Name: memory_candidate; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE memory_candidate (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    group_id bigint,
+    source_event_id uuid,
+    candidate_type character varying(64) NOT NULL,
+    payload jsonb NOT NULL,
+    confidence real,
+    status character varying(32) DEFAULT 'pending'::character varying NOT NULL,
+    reject_reason text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    processed_at timestamp with time zone,
+    extraction_id uuid NOT NULL
+);
+
+
+--
+-- Name: memory_extraction; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE memory_extraction (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    group_id bigint NOT NULL,
+    status character varying(32) NOT NULL,
+    snapshot jsonb,
+    candidate_count integer DEFAULT 0 NOT NULL,
+    started_at timestamp with time zone DEFAULT now() NOT NULL,
+    staged_at timestamp with time zone,
+    applied_at timestamp with time zone,
+    CONSTRAINT memory_extraction_live_snapshot_v2 CHECK ((((status)::text = 'applied'::text) OR (((status)::text = 'extracting'::text) AND (snapshot IS NULL)) OR (((status)::text = 'staged'::text) AND (snapshot IS NOT NULL) AND (snapshot @> '{"version": 2}'::jsonb)))),
+    CONSTRAINT memory_extraction_status_valid CHECK (((status)::text = ANY ((ARRAY['extracting'::character varying, 'staged'::character varying, 'applied'::character varying])::text[])))
+);
+
+
+--
+-- Name: memory_extraction_event; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE memory_extraction_event (
+    extraction_id uuid NOT NULL,
+    raw_event_id uuid NOT NULL,
+    ordinal integer NOT NULL
+);
+
+
+--
+-- Name: memory_fact; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE memory_fact (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    group_id bigint,
+    subject_entity_id uuid,
+    predicate character varying(128) NOT NULL,
+    object_key text,
+    object_entity_id uuid,
+    object_value jsonb,
+    memory_type character varying(64) NOT NULL,
+    confidence real NOT NULL,
+    status character varying(32) DEFAULT 'active'::character varying NOT NULL,
+    valid_from timestamp with time zone,
+    valid_to timestamp with time zone,
+    first_observed_at timestamp with time zone,
+    last_confirmed_at timestamp with time zone,
+    revision bigint DEFAULT 1 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    subject_account_id uuid,
+    CONSTRAINT fact_exactly_one_subject CHECK ((num_nonnulls(subject_entity_id, subject_account_id) = 1))
+);
+
+
+--
+-- Name: memory_fact_evidence; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE memory_fact_evidence (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    fact_id uuid NOT NULL,
+    raw_event_id uuid NOT NULL,
+    relation character varying(32) NOT NULL,
+    evidence_score real,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: memory_job; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE memory_job (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    job_type character varying(64) NOT NULL,
+    payload jsonb NOT NULL,
+    status character varying(32) DEFAULT 'pending'::character varying NOT NULL,
+    priority integer DEFAULT 0 NOT NULL,
+    retry_count integer DEFAULT 0 NOT NULL,
+    max_retry integer DEFAULT 5 NOT NULL,
+    available_at timestamp with time zone DEFAULT now() NOT NULL,
+    locked_at timestamp with time zone,
+    locked_by character varying(128),
+    last_error text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    finished_at timestamp with time zone
+);
+
+
+--
+-- Name: raw_event; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE raw_event (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    platform character varying(32) NOT NULL,
+    event_type character varying(64) NOT NULL,
+    group_id bigint,
+    platform_user_id character varying(128),
+    platform_event_id character varying(128),
+    occurred_at timestamp with time zone NOT NULL,
+    payload jsonb NOT NULL,
+    plain_text text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    archive_schema smallint DEFAULT 1 NOT NULL,
+    CONSTRAINT raw_event_archive_schema_valid CHECK ((archive_schema >= 1))
+);
+
+
+--
+-- Name: reply_trace; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE reply_trace (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    group_id bigint NOT NULL,
+    reply_event_id character varying(64) NOT NULL,
+    memo jsonb NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: user_agreement; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE user_agreement (
+    group_id bigint NOT NULL,
+    user_id character varying(128) NOT NULL,
+    version integer DEFAULT 1 NOT NULL,
+    agreed_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: account_link_challenge account_link_challenge_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY account_link_challenge
+    ADD CONSTRAINT account_link_challenge_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: account_link_challenge account_link_challenge_token_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY account_link_challenge
+    ADD CONSTRAINT account_link_challenge_token_hash_key UNIQUE (token_hash);
+
+
+--
+-- Name: alias_evidence alias_evidence_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY alias_evidence
+    ADD CONSTRAINT alias_evidence_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: alias alias_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY alias
+    ADD CONSTRAINT alias_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: cost_ledger cost_ledger_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY cost_ledger
+    ADD CONSTRAINT cost_ledger_pkey PRIMARY KEY (day, group_id, kind, model, user_id);
+
+
+--
+-- Name: embedding_index embedding_index_object_type_object_id_embedding_model_embed_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY embedding_index
+    ADD CONSTRAINT embedding_index_object_type_object_id_embedding_model_embed_key UNIQUE (object_type, object_id, embedding_model, embedding_version);
+
+
+--
+-- Name: embedding_index embedding_index_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY embedding_index
+    ADD CONSTRAINT embedding_index_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: entity entity_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY entity
+    ADD CONSTRAINT entity_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: episode_event episode_event_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY episode_event
+    ADD CONSTRAINT episode_event_pkey PRIMARY KEY (episode_id, raw_event_id);
+
+
+--
+-- Name: episode episode_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY episode
+    ADD CONSTRAINT episode_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: group_blocklist group_blocklist_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY group_blocklist
+    ADD CONSTRAINT group_blocklist_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: group_state group_state_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY group_state
+    ADD CONSTRAINT group_state_pkey PRIMARY KEY (group_id);
+
+
+--
+-- Name: identity_account identity_account_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY identity_account
+    ADD CONSTRAINT identity_account_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: identity_account identity_account_platform_platform_user_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY identity_account
+    ADD CONSTRAINT identity_account_platform_platform_user_id_key UNIQUE (platform, platform_user_id);
+
+
+--
+-- Name: image_cache image_cache_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY image_cache
+    ADD CONSTRAINT image_cache_pkey PRIMARY KEY (key);
+
+
+--
+-- Name: memory_candidate memory_candidate_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY memory_candidate
+    ADD CONSTRAINT memory_candidate_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: memory_extraction_event memory_extraction_event_extraction_id_ordinal_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY memory_extraction_event
+    ADD CONSTRAINT memory_extraction_event_extraction_id_ordinal_key UNIQUE (extraction_id, ordinal);
+
+
+--
+-- Name: memory_extraction_event memory_extraction_event_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY memory_extraction_event
+    ADD CONSTRAINT memory_extraction_event_pkey PRIMARY KEY (extraction_id, raw_event_id);
+
+
+--
+-- Name: memory_extraction_event memory_extraction_event_raw_event_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY memory_extraction_event
+    ADD CONSTRAINT memory_extraction_event_raw_event_id_key UNIQUE (raw_event_id);
+
+
+--
+-- Name: memory_extraction memory_extraction_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY memory_extraction
+    ADD CONSTRAINT memory_extraction_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: memory_fact_evidence memory_fact_evidence_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY memory_fact_evidence
+    ADD CONSTRAINT memory_fact_evidence_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: memory_fact memory_fact_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY memory_fact
+    ADD CONSTRAINT memory_fact_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: memory_job memory_job_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY memory_job
+    ADD CONSTRAINT memory_job_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: raw_event raw_event_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY raw_event
+    ADD CONSTRAINT raw_event_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: reply_trace reply_trace_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY reply_trace
+    ADD CONSTRAINT reply_trace_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: user_agreement user_agreement_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY user_agreement
+    ADD CONSTRAINT user_agreement_pkey PRIMARY KEY (group_id, user_id);
+
+
+--
+-- Name: account_link_pending_initiator; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX account_link_pending_initiator ON account_link_challenge USING btree (initiator_account_id, expires_at) WHERE ((status)::text = 'pending'::text);
+
+
+--
+-- Name: account_link_pending_pair; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX account_link_pending_pair ON account_link_challenge USING btree (group_id, LEAST(initiator_account_id, target_account_id), GREATEST(initiator_account_id, target_account_id)) WHERE ((status)::text = 'pending'::text);
+
+
+--
+-- Name: account_link_pending_target; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX account_link_pending_target ON account_link_challenge USING btree (target_account_id, expires_at) WHERE ((status)::text = 'pending'::text);
+
+
+--
+-- Name: alias_by_account; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX alias_by_account ON alias USING btree (target_account_id) WHERE (target_account_id IS NOT NULL);
+
+
+--
+-- Name: alias_by_entity; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX alias_by_entity ON alias USING btree (target_entity_id) WHERE (target_entity_id IS NOT NULL);
+
+
+--
+-- Name: alias_evidence_probe; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX alias_evidence_probe ON alias_evidence USING btree (alias_id, evidence_type, created_at);
+
+
+--
+-- Name: alias_lookup; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX alias_lookup ON alias USING btree (normalized_text) WHERE ((status)::text <> 'inactive'::text);
+
+
+--
+-- Name: alias_unique_account_scope; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX alias_unique_account_scope ON alias USING btree (COALESCE(group_id, (0)::bigint), normalized_text, target_account_id) WHERE (target_account_id IS NOT NULL);
+
+
+--
+-- Name: alias_unique_entity_scope; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX alias_unique_entity_scope ON alias USING btree (COALESCE(group_id, (0)::bigint), normalized_text, target_entity_id) WHERE (target_entity_id IS NOT NULL);
+
+
+--
+-- Name: candidate_pending; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX candidate_pending ON memory_candidate USING btree (group_id, created_at) WHERE ((status)::text = 'pending'::text);
+
+
+--
+-- Name: embedding_group; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX embedding_group ON embedding_index USING btree (group_id, object_type);
+
+
+--
+-- Name: entity_alive; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX entity_alive ON entity USING btree (entity_type) WHERE ((status)::text = 'active'::text);
+
+
+--
+-- Name: episode_extraction; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX episode_extraction ON episode USING btree (extraction_id) WHERE (extraction_id IS NOT NULL);
+
+
+--
+-- Name: episode_group_time; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX episode_group_time ON episode USING btree (group_id, started_at DESC);
+
+
+--
+-- Name: fact_account_subject; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX fact_account_subject ON memory_fact USING btree (group_id, subject_account_id, status) WHERE (subject_account_id IS NOT NULL);
+
+
+--
+-- Name: fact_entity_subject; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX fact_entity_subject ON memory_fact USING btree (group_id, subject_entity_id, status) WHERE (subject_entity_id IS NOT NULL);
+
+
+--
+-- Name: fact_evidence_fact; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX fact_evidence_fact ON memory_fact_evidence USING btree (fact_id);
+
+
+--
+-- Name: fact_one_current_account; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX fact_one_current_account ON memory_fact USING btree (COALESCE(group_id, (0)::bigint), subject_account_id, predicate, COALESCE(object_key, ''::text)) WHERE ((subject_account_id IS NOT NULL) AND (valid_to IS NULL) AND ((status)::text = 'active'::text));
+
+
+--
+-- Name: fact_one_current_entity; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX fact_one_current_entity ON memory_fact USING btree (COALESCE(group_id, (0)::bigint), subject_entity_id, predicate, COALESCE(object_key, ''::text)) WHERE ((subject_entity_id IS NOT NULL) AND (valid_to IS NULL) AND ((status)::text = 'active'::text));
+
+
+--
+-- Name: group_blocklist_account; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX group_blocklist_account ON group_blocklist USING btree (group_id, user_id) WHERE (user_id IS NOT NULL);
+
+
+--
+-- Name: group_blocklist_expiry; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX group_blocklist_expiry ON group_blocklist USING btree (group_id, blocked_until);
+
+
+--
+-- Name: group_blocklist_holder; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX group_blocklist_holder ON group_blocklist USING btree (group_id, entity_id) WHERE (entity_id IS NOT NULL);
+
+
+--
+-- Name: identity_account_entity; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX identity_account_entity ON identity_account USING btree (entity_id);
+
+
+--
+-- Name: job_claimable; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX job_claimable ON memory_job USING btree (priority DESC, available_at) WHERE ((status)::text = 'pending'::text);
+
+
+--
+-- Name: job_pending_once; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX job_pending_once ON memory_job USING btree (job_type, ((payload ->> 'group_id'::text))) WHERE ((status)::text = 'pending'::text);
+
+
+--
+-- Name: memory_extraction_group_status; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX memory_extraction_group_status ON memory_extraction USING btree (group_id, status, started_at);
+
+
+--
+-- Name: raw_event_group_created; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX raw_event_group_created ON raw_event USING btree (group_id, created_at, id) WHERE ((event_type)::text = ANY ((ARRAY['message'::character varying, 'notice'::character varying])::text[]));
+
+
+--
+-- Name: raw_event_group_time; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX raw_event_group_time ON raw_event USING btree (group_id, occurred_at DESC);
+
+
+--
+-- Name: raw_event_platform_key; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX raw_event_platform_key ON raw_event USING btree (platform, platform_event_id) WHERE (platform_event_id IS NOT NULL);
+
+
+--
+-- Name: raw_event_speaker; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX raw_event_speaker ON raw_event USING btree (group_id, platform_user_id, occurred_at DESC);
+
+
+--
+-- Name: reply_trace_expiry; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX reply_trace_expiry ON reply_trace USING btree (expires_at) WHERE (expires_at IS NOT NULL);
+
+
+--
+-- Name: reply_trace_reply; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX reply_trace_reply ON reply_trace USING btree (group_id, reply_event_id);
+
+
+--
+-- Name: account_link_challenge account_link_challenge_confirmed_event_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY account_link_challenge
+    ADD CONSTRAINT account_link_challenge_confirmed_event_id_fkey FOREIGN KEY (confirmed_event_id) REFERENCES raw_event(id);
+
+
+--
+-- Name: account_link_challenge account_link_challenge_created_event_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY account_link_challenge
+    ADD CONSTRAINT account_link_challenge_created_event_id_fkey FOREIGN KEY (created_event_id) REFERENCES raw_event(id);
+
+
+--
+-- Name: account_link_challenge account_link_challenge_initiator_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY account_link_challenge
+    ADD CONSTRAINT account_link_challenge_initiator_account_id_fkey FOREIGN KEY (initiator_account_id) REFERENCES identity_account(id);
+
+
+--
+-- Name: account_link_challenge account_link_challenge_initiator_entity_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY account_link_challenge
+    ADD CONSTRAINT account_link_challenge_initiator_entity_id_fkey FOREIGN KEY (initiator_entity_id) REFERENCES entity(id);
+
+
+--
+-- Name: account_link_challenge account_link_challenge_target_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY account_link_challenge
+    ADD CONSTRAINT account_link_challenge_target_account_id_fkey FOREIGN KEY (target_account_id) REFERENCES identity_account(id);
+
+
+--
+-- Name: account_link_challenge account_link_challenge_target_entity_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY account_link_challenge
+    ADD CONSTRAINT account_link_challenge_target_entity_id_fkey FOREIGN KEY (target_entity_id) REFERENCES entity(id);
+
+
+--
+-- Name: alias_evidence alias_evidence_alias_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY alias_evidence
+    ADD CONSTRAINT alias_evidence_alias_id_fkey FOREIGN KEY (alias_id) REFERENCES alias(id) ON DELETE CASCADE;
+
+
+--
+-- Name: alias_evidence alias_evidence_raw_event_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY alias_evidence
+    ADD CONSTRAINT alias_evidence_raw_event_id_fkey FOREIGN KEY (raw_event_id) REFERENCES raw_event(id);
+
+
+--
+-- Name: alias alias_target_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY alias
+    ADD CONSTRAINT alias_target_account_id_fkey FOREIGN KEY (target_account_id) REFERENCES identity_account(id);
+
+
+--
+-- Name: alias alias_target_entity_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY alias
+    ADD CONSTRAINT alias_target_entity_id_fkey FOREIGN KEY (target_entity_id) REFERENCES entity(id);
+
+
+--
+-- Name: entity entity_merged_into_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY entity
+    ADD CONSTRAINT entity_merged_into_fkey FOREIGN KEY (merged_into) REFERENCES entity(id);
+
+
+--
+-- Name: episode_event episode_event_episode_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY episode_event
+    ADD CONSTRAINT episode_event_episode_id_fkey FOREIGN KEY (episode_id) REFERENCES episode(id) ON DELETE CASCADE;
+
+
+--
+-- Name: episode_event episode_event_raw_event_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY episode_event
+    ADD CONSTRAINT episode_event_raw_event_id_fkey FOREIGN KEY (raw_event_id) REFERENCES raw_event(id);
+
+
+--
+-- Name: episode episode_extraction_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY episode
+    ADD CONSTRAINT episode_extraction_id_fkey FOREIGN KEY (extraction_id) REFERENCES memory_extraction(id);
+
+
+--
+-- Name: group_blocklist group_blocklist_entity_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY group_blocklist
+    ADD CONSTRAINT group_blocklist_entity_id_fkey FOREIGN KEY (entity_id) REFERENCES entity(id);
+
+
+--
+-- Name: identity_account identity_account_entity_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY identity_account
+    ADD CONSTRAINT identity_account_entity_id_fkey FOREIGN KEY (entity_id) REFERENCES entity(id);
+
+
+--
+-- Name: memory_candidate memory_candidate_extraction_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY memory_candidate
+    ADD CONSTRAINT memory_candidate_extraction_id_fkey FOREIGN KEY (extraction_id) REFERENCES memory_extraction(id);
+
+
+--
+-- Name: memory_candidate memory_candidate_source_event_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY memory_candidate
+    ADD CONSTRAINT memory_candidate_source_event_id_fkey FOREIGN KEY (source_event_id) REFERENCES raw_event(id);
+
+
+--
+-- Name: memory_extraction_event memory_extraction_event_extraction_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY memory_extraction_event
+    ADD CONSTRAINT memory_extraction_event_extraction_id_fkey FOREIGN KEY (extraction_id) REFERENCES memory_extraction(id) ON DELETE CASCADE;
+
+
+--
+-- Name: memory_extraction_event memory_extraction_event_raw_event_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY memory_extraction_event
+    ADD CONSTRAINT memory_extraction_event_raw_event_id_fkey FOREIGN KEY (raw_event_id) REFERENCES raw_event(id);
+
+
+--
+-- Name: memory_fact_evidence memory_fact_evidence_fact_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY memory_fact_evidence
+    ADD CONSTRAINT memory_fact_evidence_fact_id_fkey FOREIGN KEY (fact_id) REFERENCES memory_fact(id) ON DELETE CASCADE;
+
+
+--
+-- Name: memory_fact_evidence memory_fact_evidence_raw_event_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY memory_fact_evidence
+    ADD CONSTRAINT memory_fact_evidence_raw_event_id_fkey FOREIGN KEY (raw_event_id) REFERENCES raw_event(id);
+
+
+--
+-- Name: memory_fact memory_fact_object_entity_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY memory_fact
+    ADD CONSTRAINT memory_fact_object_entity_id_fkey FOREIGN KEY (object_entity_id) REFERENCES entity(id);
+
+
+--
+-- Name: memory_fact memory_fact_subject_account_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY memory_fact
+    ADD CONSTRAINT memory_fact_subject_account_id_fkey FOREIGN KEY (subject_account_id) REFERENCES identity_account(id);
+
+
+--
+-- Name: memory_fact memory_fact_subject_entity_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY memory_fact
+    ADD CONSTRAINT memory_fact_subject_entity_id_fkey FOREIGN KEY (subject_entity_id) REFERENCES entity(id);
+
+
+--
+-- PostgreSQL database dump complete
+--

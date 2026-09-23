@@ -58,15 +58,17 @@ class MemberNumbers:
         read as two people, which is what the prompt assumes of unmerged ones
         anyway, and the reply still goes out.
         """
-        want = [a for a in dict.fromkeys(accounts)
-                if a and a != self._self and a not in self._person]
+        want = [
+            a for a in dict.fromkeys(accounts) if a and a != self._self and a not in self._person
+        ]
         if not want:
             return
         try:
-            found = await repo.person_of_accounts(want)
+            found = await repo.holder_ids_for_accounts(want)
         except Exception as e:
-            log.warning("person lookup for member numbers failed, numbering "
-                        "accounts separately: %s", why(e))
+            log.warning(
+                "person lookup for member numbers failed, numbering accounts separately: %s", why(e)
+            )
             return
         for account, person in found.items():
             self.teach(account, person)

@@ -13,17 +13,17 @@ from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
+from ..domain.ids import GroupId
 from ..providers.contracts import ModelTurn, PromptItem
 
 log = logging.getLogger("qqbot.debug")
 
 _left = 0
-MAX_ROUNDS = 50
 
 
-def arm(n: int) -> int:
+def arm(n: int, *, max_rounds: int) -> int:
     global _left
-    _left = max(0, min(int(n), MAX_ROUNDS))
+    _left = max(0, min(int(n), max_rounds))
     return _left
 
 
@@ -32,7 +32,7 @@ def armed() -> int:
 
 
 def capture(
-    group_id: str,
+    group_id: GroupId,
     round_no: int,
     prompt: tuple[PromptItem, ...],
     turn: ModelTurn,

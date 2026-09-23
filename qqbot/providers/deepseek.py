@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from dataclasses import replace
 from datetime import datetime
@@ -12,7 +11,7 @@ import httpx
 
 from ..settings import TextCfg, VisionCfg
 from ..util import require_key
-from .base import Rate, with_retry
+from .base import Rate, RetryPolicy, with_retry
 from .contracts import ReasoningEffort, Role, StoredImage
 from .openai_responses import (
     ResponsesCodec,
@@ -24,19 +23,31 @@ log = logging.getLogger("qqbot.deepseek")
 
 _PRICES = {
     "deepseek-v4-flash": Rate(
-        "Mtoken", in_hit=0.05, in_miss=1.5, out=4.5,
+        "Mtoken",
+        in_hit=0.05,
+        in_miss=1.5,
+        out=4.5,
         source="deepseek repricing eff. 2026-08-17",
     ),
     "deepseek-v4-flash-vision-exp": Rate(
-        "Mtoken", in_hit=0.05, in_miss=1.5, out=4.5,
+        "Mtoken",
+        in_hit=0.05,
+        in_miss=1.5,
+        out=4.5,
         source="deepseek vision launch note: priced as V4-Flash",
     ),
     "deepseek-v4-pro": Rate(
-        "Mtoken", in_hit=0.15, in_miss=4.5, out=13.5,
+        "Mtoken",
+        in_hit=0.15,
+        in_miss=4.5,
+        out=13.5,
         source="deepseek pricing page, verified 2026-09-10",
     ),
     "deepseek-flash": Rate(
-        "Mtoken", in_hit=0.02, in_miss=1.0, out=4.0,
+        "Mtoken",
+        in_hit=0.02,
+        in_miss=1.0,
+        out=4.0,
         source="deepseek pricing page, verified 2026-09-10",
     ),
 }
@@ -101,22 +112,18 @@ class DeepSeekAttachmentStore:
 
     FILE_TTL_SEC = 30 * 24 * 3600
 
-    def __init__(self, cfg: TextCfg) -> None:
+    def __init__(self, cfg: TextCfg, retry: RetryPolicy) -> None:
         self._endpoint = cfg.endpoint.rstrip("/")
         self._credential_env = cfg.credential_env
-        self._timeout = cfg.timeout_sec
-        self._clients: dict[float, httpx.AsyncClient] = {}
+        self._retry = retry
+        self._client = httpx.AsyncClient(timeout=cfg.timeout_sec)
 
     async def store(self, data: bytes, media_type: str) -> StoredImage:
         key = require_key(self._credential_env, "text")
-        client = self._clients.get(self._timeout)
-        if client is None:
-            client = httpx.AsyncClient(timeout=self._timeout)
-            self._clients[self._timeout] = client
         extension = media_type.partition("/")[2] or "bin"
 
         async def post() -> httpx.Response:
-            response = await client.post(
+            response = await self._client.post(
                 f"{self._endpoint}/files",
                 headers={"Authorization": f"Bearer {key}"},
                 files={"file": (f"img.{extension}", data, media_type)},
@@ -129,30 +136,31 @@ class DeepSeekAttachmentStore:
             response.raise_for_status()
             return response
 
-        response = await with_retry(post, what="file upload")
+        response = await with_retry(post, what="file upload", policy=self._retry)
         handle = str((response.json() or {}).get("id") or "")
         if not handle:
             raise RuntimeError("DeepSeek file upload returned no id")
         return StoredImage("deepseek", handle)
 
     async def aclose(self) -> None:
-        clients, self._clients = tuple(self._clients.values()), {}
-        await asyncio.gather(*(client.aclose() for client in clients))
+        await self._client.aclose()
 
 
-def deepseek_text(cfg: TextCfg) -> ResponsesTextModel:
+def deepseek_text(cfg: TextCfg, retry: RetryPolicy) -> ResponsesTextModel:
     return ResponsesTextModel(
         cfg,
+        retry,
         name="deepseek",
         codec=DeepSeekResponsesCodec(),
         rate_for=rate_for,
-        attachments=DeepSeekAttachmentStore(cfg),
+        attachments=DeepSeekAttachmentStore(cfg, retry),
     )
 
 
-def deepseek_vision(cfg: VisionCfg) -> ResponsesVisionModel:
+def deepseek_vision(cfg: VisionCfg, retry: RetryPolicy) -> ResponsesVisionModel:
     return ResponsesVisionModel(
         cfg,
+        retry,
         name="deepseek",
         codec=DeepSeekResponsesCodec(),
         rate_for=rate_for,

@@ -66,14 +66,34 @@ There is no automatic fallback between backends. A failed call is logged and the
 is dropped; being addressed and staying silent gets its own log line so it can be told
 apart from a message that was not addressed at all.
 
+### Runtime ownership
+
+`qqbot/runtime.py` is the process composition root. `Runtime.build()` creates one
+immutable config bundle, provider bundle, directory, admission service, registry,
+`GroupDelivery`, media processor/coordinator, command router, gateway and memory worker.
+Those objects are injected explicitly; core modules do not discover `GATEWAY`, `MEDIA`,
+provider or registry singletons.
+
+`Runtime.start()` verifies the database, starts ASR, initializes nickname matching and
+then launches the memory worker. `Runtime.aclose()` cancels and joins the worker, stops
+reply and media coordination, closes media flights and providers, and closes the pool in
+that order. A close failure is logged without skipping later resources. `plugin.py` only
+adapts NoneBot lifecycle/events to this Runtime; scheduled job bodies live in the
+framework-independent `qqbot/scheduled.py`.
+
 ## Message pipeline
 
 ```text
-message arrives
- |- dedup (platform message id, short TTL)
- |- archive to raw_event (always, including in groups the bot never answers in)
- |- resolve @-mentions, quotes and forwarded records; start picture and voice work
- |- command?  -> archived and windowed, then routed to the command handlers
+message or supported notice arrives
+ |- normalize to one InboundEvent
+ |- parse and load the existing window
+ |- append raw_event and required identity writes in one transaction
+ |   `ON CONFLICT DO NOTHING RETURNING id` is the sole admission gate
+ |- duplicate or archive failure -> stop with no window, media, command or reply effect
+ |- admitted -> append to the live window; start picture and voice work
+ |- self message or notice? -> done
+ |- command?  -> exact first token of the original typed text routes through the
+ |                importable command registry and GroupDelivery
  |- trigger?  -> no: done
  |             yes: cut the context slice now and spawn one reply task
  |
@@ -102,7 +122,7 @@ nickname cannot match inside a longer word. A muted group never answers.
 
 ### Gates
 
-Before any money is spent the task checks, in order: the daily cap (silence when
+Before reply-model or tool spending, the task checks, in order: the daily cap (silence when
 reached), the group's block list (a blocked member is read and remembered as always
 and only never answered), the mute switch, and the user agreement. A member who has
 not accepted the agreement receives a short pointer to `/terms` at most once per
@@ -150,25 +170,29 @@ belongs rather than being hoisted into a parallel field:
 | `dice`, `rps` | Parameter-free QQ game elements; each must be the only segment in its message item |
 | `contact_member`, `contact_group` | A member card or current group card; each must be the only segment in its message item |
 
-Music cards and JSON cards remain implemented in the typed outbound/parser layer but are omitted
-from the model-facing schema and prompt, so restoring them later does not require rebuilding the
-feature. `mface` likewise retains historical decoding/display support while remaining absent from
-the model-facing contract because its identifiers are not a stable public catalog and may require
-purchase.
+Music cards, custom music, JSON cards and `mface` are historical decode/display variants only.
+They remain readable from archived OneBot segments but are absent from both the current
+`SendSegment` union and the model-facing contract, so old data can never re-enter sending.
 
-The complete batch is parsed and validated before the first protocol call. A member or line number
-outside the frozen prompt snapshot, an invalid segment, an empty item or a batch above the global
-limit rejects the whole call; no prefix is sent. Bare assistant text is never sent: a round that
-ends without a tool call ends the reply in silence, with a warning in the log.
+The generated tool schema and runtime parser come from the same strict Pydantic model. The complete
+batch is validated before the first protocol call. A member or line number outside the frozen prompt
+snapshot, a non-integer number, an unknown field, an invalid segment, an empty item, a message above
+the text bound or a batch above the configured limit rejects the whole call; no prefix is sent. Bare
+assistant text is never sent: a round that ends without a tool call ends the reply in silence, with a
+warning in the log.
 
-After validation, messages are sent sequentially under a per-group delivery lock and each successful
-message is archived immediately as its own row. This lock does not cover model generation, so the
-one-task-per-addressed-message concurrency model remains intact. If a send with a reply segment is
-refused by the platform (the replied-to message may have been recalled), only that message is
-retried once without reply segments. Any unrecoverable failure stops the batch: delivered and
-archived messages remain, and later items are not attempted. Batch-level retrieval evidence is
-stored only beside the first delivered message. Historical bot rows project back to the model as
-one-message batches; the archive does not reconstruct an original batch id.
+`GroupDelivery` owns per-group serialization, OneBot projection and the reply-segment fallback for
+model replies, agreement pointers and commands. It does not write the archive or live window. NapCat's
+reported `message_sent` event remains the only source of bot-authored rows and messages. The delivery
+lock does not cover model generation, so the one-task-per-addressed-message concurrency model remains
+intact. If a send with a reply segment is refused by the platform (the replied-to message may have
+been recalled), only that message is retried once without reply segments. Any unrecoverable failure
+stops the batch: the delivered prefix remains visible and later items are not attempted. Batch-level
+retrieval evidence is stored only beside the first acknowledged platform message id.
+
+Historical bot rows project back to the model as one-message `send_messages` calls only when every
+segment is losslessly expressible by the current contract. Historical-only or otherwise invalid rows
+render as a marked platform-text projection, so hidden arguments are never demonstrated to the model.
 
 ### Tools
 
@@ -186,7 +210,7 @@ carries them.
 
 All model-facing wording lives in one `config/prompts/prompts.yaml` bundle. Tool
 descriptions remain separate logical templates because each maps one-to-one to a
-code-owned schema, but they are generated, validated, reloaded and reviewed with the
+code-owned schema, and they are generated, validated, loaded and reviewed with the
 rest of the family as one atomic document.
 
 ### Output
@@ -263,12 +287,13 @@ Markers in use:
 
 ### Member numbers
 
-Two members sharing a display name is ordinary, so every person a prompt shows wears a
-member number behind their name (`qqbot/core/member_numbers.py`). Zero is reserved for
+Two members sharing a display name is ordinary, so every person a reply prompt shows wears
+a member number behind their name (`qqbot/core/member_numbers.py`). Zero is reserved for
 the bot's display identity; humans receive positive numbers, while `None` is the only
-absence/unknown sentinel. Zero never resolves through `at`, contact, speaker, extraction
-account or episode participant fields. A positive number belongs to a person: accounts
-merged into one person share it. The numbers follow the roster. The
+absence/unknown sentinel. Zero never resolves through member-targeted tools. In reply
+prompts a positive number belongs to a current account holder, so linked accounts share
+it. Extraction uses a separate exact-account projection: each account receives its own
+batch-local code and every candidate is validated against that precise account. The reply
 roster lists everyone who has appeared in the group, whether or not anything is known
 about them, ordered by first appearance, and is numbered in that order, so a newcomer
 joins at the end and nobody else's number moves. The roster is therefore also where the
@@ -293,8 +318,8 @@ reported self event is the only source for the live window and archive, so rando
 RPS results and other platform transformations are preserved without send-side lookups.
 In the archive, the bot's line reads exactly as the group saw it, `@name` openings
 included, with the @-ed accounts kept as `at` segments so a restart rebuilds the same
-window. Retired permanent evidence tails on legacy rows are removed by the shared archive
-projection and never reach prompts or searches.
+window. Permanent-looking evidence tails are not an archive feature and carry no
+special authority if untrusted text imitates one.
 
 ## Pictures and voice
 
@@ -306,6 +331,14 @@ text. The description is cached by image content, so a repost costs nothing, and
 expires by age so that a better model gets to look again; refreshing is lazy, because
 only a picture posted again is ever looked up. A picture the backend's content filter
 declined is cached as a marked placeholder on the same clock.
+
+`MediaCoordinator` owns asynchronous work by admitted raw-event ID. A `MediaTicket`
+tracks `pending`, `retryable` or `final`, the shared task, parsed references, bounded
+reply waits, live-window patching and archive backfill. `ChatMsg` contains only stable
+raw-event identity and typed image references; it owns no tasks. Multiple waiters share
+one task, waiter cancellation does not cancel that task, a timeout leaves it running to
+patch later, and a transient verdict can retry on a later reply. Restart restores image
+references from canonical archive segments but does not create a durable media queue.
 
 No picture is pushed into the prompt. Every picture appears as a numbered description
 line, and the reply model fetches the originals it wants with `open_images`. The
@@ -326,16 +359,22 @@ hosted or API ASR path in the provider registry.
 
 ### Storage
 
-Nineteen tables in `sql/init.sql`, layered:
+Twenty-one application tables form the canonical schema:
 
 | Layer | Tables | Holds |
 | --- | --- | --- |
-| Archive | `raw_event` | Every event, append-only. `payload` is the platform's verbatim message and is never modified; `plain_text` is the derived reading, updated with descriptions and transcripts. |
-| Identity | `entity`, `identity_account`, `alias`, `alias_evidence` | Persons, their accounts, and their names with evidence and scope. |
-| Facts | `memory_fact`, `memory_fact_evidence`, `memory_candidate` | Temporal facts about persons and groups, their evidence, and the model's proposals awaiting validation. |
-| Episodes | `episode`, `episode_participant`, `episode_event` | Summaries of stretches of conversation, with participants. |
-| Index and queue | `embedding_index`, `memory_job` | Vectors, kept apart from what they index; the background job queue. |
-| Operations | `reply_trace`, `cost_ledger`, `group_state`, `group_blocklist`, `user_agreement`, `image_cache` | Expiring structured reply evidence, spending, per-group switches and watermarks, blocks, consent, picture descriptions and file ids. |
+| Archive | `raw_event` | Every event, append-once. Versioned `payload` is the canonical code-owned envelope; its segments preserve the detached platform data. `plain_text` is the derived reading, updated with descriptions and transcripts. |
+| Identity | `entity`, `identity_account`, `alias`, `alias_evidence`, `account_link_challenge` | Account equivalence classes, exact accounts, scoped names with evidence, and durable two-account confirmation. |
+| Facts | `memory_fact`, `memory_fact_evidence`, `memory_candidate` | Temporal exact-account, holder and group facts; evidence; and audited model proposals. |
+| Extraction | `memory_extraction`, `memory_extraction_event` | Durable extraction state, exact ordered event membership, and the immutable staged validation snapshot. |
+| Episodes | `episode`, `episode_event` | Group-scoped summaries backed by every source event and their extraction batch. |
+| Index and queue | `embedding_index`, `memory_job` | Derived vectors and the background job queue. |
+| Operations | `reply_trace`, `cost_ledger`, `group_state`, `group_blocklist`, `user_agreement`, `image_cache` | Expiring reply evidence, spending, group switches, dynamic block rules, consent, descriptions and file IDs. |
+
+`sql/init.sql` is the sole schema definition and describes a fresh database at the current
+code contract. Existing installations are updated manually under a verified backup.
+Startup and deployment perform a read-only structural check over required tables, columns,
+constraints, retired-table absence and vector width; they never execute DDL.
 
 Every table that carries a `group_id` indexes it first, and no retrieval path crosses
 groups. The identity graph (which accounts form one person) is the one deliberately
@@ -343,27 +382,38 @@ global structure.
 
 ### Identity
 
-An account is the strong identity. A person is an entity that owns one or more
-accounts; a name is an alias with a scope (group or global), an evidence trail and a
-status. Alias confidence is the maximum within an evidence channel and a noisy-OR across
-channels. A platform display name only becomes a candidate on its first day, so a
-rename game cannot confirm itself. Manual evidence (`/alias`, `/note`) is authoritative,
-and a retired name stays retired against automatic evidence.
+An account is the strong identity. `entity` supplies the small account-equivalence class;
+`identity_account.entity_id` is its current membership and `merged_into` preserves root
+history. Automatic person aliases and facts are written against exact account foreign
+keys. Explicit `--all` edits write holder-scoped rows, and aggregate views combine those
+rows with the exact-account rows of the holder's current set.
 
-`/merge` repoints an account's rows to another person; `/split` gives an account its own
-person again. Person-level operations reduce to two primitives: expanding a person to
-their accounts on the write side (`/block` blocks the person) and aggregating by entity
-on the read side (`/top` ranks people).
+`/merge` and confirmed `/link` use one deterministic union primitive. One transaction-level
+advisory lock serializes this deliberately tiny identity topology; each operation then locks
+its exact accounts and current roots before changing membership. Link challenges snapshot
+both root IDs and entity revisions;
+union and detach increment the affected live root revision, so any intervening membership
+change invalidates every stale confirmation even when the same root survives.
+`/split @account` and `/unlink` use one detach primitive that
+moves only that exact account to a fresh holder; every other account stays linked.
+Account-scoped rows therefore follow their account without rewrites, while holder-scoped
+rows remain with their holder. Exact-account and holder block rules are also evaluated
+dynamically, so a later link or split cannot leave expanded block copies behind.
+
+Aliases retain group/global scope, evidence and status. Confidence is the maximum within
+one evidence channel and a noisy-OR across channels. A platform display name begins as a
+candidate, manual `/alias` evidence is authoritative, and a retired name stays retired
+against automatic evidence.
 
 ### Facts
 
-A fact is a subject, a predicate from a closed set, an object, a validity window, a
-confidence and evidence. Predicates are defined in `config/predicates.yaml` with their
-Chinese rendering, cardinality, decay class and the rule shown to the extraction
-model. A single-valued predicate closes the previous value when a new one arrives, so
-"they moved" is expressible; multi-valued ones stand side by side. "One current fact per
-subject, predicate and object key" is enforced by a partial unique index in the
-database.
+A fact has exactly one subject: an exact account or an entity (a holder or the group).
+It also has a predicate from a closed set, object, validity window, confidence and exact
+evidence events. Predicates are defined in `config/predicates.yaml` with their Chinese
+rendering, cardinality, decay class and the rule shown to the extraction model. A
+single-valued predicate closes the previous value within the same subject scope when a
+new one arrives; multi-valued values stand side by side. Partial unique indexes enforce
+one current row per subject, predicate and object key.
 
 Confidence is a Wilson lower bound over distinct source events, so one mention earns
 about 0.27, three about 0.53 and eight about 0.75. Re-confirmation accumulates evidence
@@ -373,43 +423,61 @@ fades. A decayed fact is expired, never physically deleted; the archive is never
 deleted at all.
 
 Episodes remain available to `recall_events` for `memory.episode_ttl_days` from the
-conversation time. The nightly decay then marks them expired while retaining their
-participant and source-event links. Their embedding rows are derived projections rather
-than evidence, so decay deletes them across model versions; an expired episode cannot be
+conversation time. Nightly decay marks them expired while retaining extraction and exact
+source-event provenance. Their embedding rows are derived projections rather than
+evidence, so decay deletes them across model versions; an expired episode cannot be
 returned or re-embedded.
 
 ### Extraction
 
 Extraction runs once a night as the first stage of the nightly pipeline. It drains
-everything unread, oldest first, in chunks of up to `memory.extract_window` messages,
+unconsumed events, oldest first, in chunks of up to `memory.extract_window` messages,
 each chunk cut at a conversation gap of at least `memory.batch_gap_min` minutes so that
 batches end where conversations end. A remainder below `memory.drain_floor` waits for
 the next night. There are no real-time triggers, so memory lags at most a day.
 
-One model call reads one chunk, with the group's known facts alongside so they are not
-re-learned, the group's standing knowledge from the persona, and the bot's own names so
-that people addressing the bot are not filed onto whoever sits nearby. The bot's own
-lines are rendered too, marked and off the roster, so the extractor reads both halves
-of every conversation; a candidate quoting one of them fails validation.
+Before any provider call, a short transaction reserves the exact ordered raw-event IDs
+in `memory_extraction_event`. A per-group session advisory lock allows only one worker to
+pay for an extracting batch at a time without keeping a transaction open across the
+provider call. Events that arrive after reservation belong to a later batch, even when
+the timestamps tie. If a worker fails, the next worker opens the same durable event set.
 
-The model may only propose. Names, facts and episodes arrive through function calls,
-never free-text JSON. A pure-code validator checks that every quote matches verbatim
-inside a single message of the batch and that the batch anchor reproduces exactly;
-failures reject the candidate. The consolidator writes: newest wins within a fact
-family, superseded values get a `valid_to`, confidence is recomputed from evidence,
-and an incoming confidence only acts as a floor.
+One model call reads one chunk, known structured memory for deduplication, standing group
+knowledge, and the bot's names. Every rendered line receives a batch-local source ordinal.
+The immutable version-2 snapshot binds that ordinal to the raw event, timestamp, exact
+author account, eligible member-authored span and line-local account resolutions.
 
-The extraction watermark (`group_state.last_extract_at`) records what was actually
-read and never moves backwards.
+Only top-level member text, structured mentions and top-level voice transcripts are
+eligible evidence. Bot output, notices, forwarded text, cards and generated media
+descriptions remain visible as context but cannot validate a quote. A person target must
+be the source author, a structured mention, or an account uniquely resolved by a
+confirmed name or alias literally present on that line. This permits facts about a
+clearly named non-speaker without exposing the complete group directory to the model.
+
+The model may only propose through structured calls. Every candidate supplies an explicit
+source ordinal and verbatim quote; an episode supplies one or more independent
+`source + quote` pairs and no model-generated identity list. The pure validator binds each
+quote to the eligible span of its exact source event and binds each person candidate to
+an allowed exact account before any projection begins. Known memory, notes and standing
+knowledge aid interpretation and deduplication but can never become fresh evidence. The
+worker checkpoints the snapshot and every candidate, including an empty set, before
+projection begins.
+
+An extraction moves through `extracting`, `staged`, and `applied`. Applying a staged
+checkpoint locks it and commits candidate audit, aliases, facts and evidence, group
+facts, episodes and provenance, required EMBED jobs, and the final `applied` state in one
+transaction. A database failure rolls the entire projection back; restart retries the
+staged checkpoint without another extraction call. The only unavoidable duplicate-call
+window is a process failure after the provider returns but before the staged checkpoint
+commits, because the provider offers no idempotency key.
 
 ### Reply evidence
 
 Each reply's retrieval work becomes a versioned `EvidenceMemo`: a closed source kind,
 a bounded sanitized request summary, verified/unconfirmed outcome, bounded defanged
 digest, and explicit creation/expiry times. It contains no provider response, reasoning,
-response id, prompt-local member number or full page. The physical `reply_trace` table
-name and its schema-v0 text column remain for migration compatibility, but only unexpired,
-valid structured memos are prompt-visible; every new row writes only structured JSON.
+response id, prompt-local member number or full page. `reply_trace` stores only the
+structured memo and mandatory expiry; there is no prose or compatibility payload.
 
 Prompt assembly renders unexpired evidence immediately before the send call it supported.
 The memo is working context for nearby follow-ups, not group memory: it is absent from
@@ -443,17 +511,18 @@ is still booked to the ledger at zero.
 
 One reply task per addressed message. A global semaphore at the provider layer
 (`capabilities.text.max_concurrency`) bounds concurrent model calls. A per-group delivery lock
-covers only the sequential protocol sends and immediate archive writes of one terminal message
-batch, preventing another concurrently generated reply from appearing between its items. Background work rides the
-database job queue (`FOR UPDATE SKIP LOCKED`, leases, and a partial unique index that
-keeps one pending job per type and group). Extraction jobs hold a lease long enough
-that a deploy overlapping a drain cannot run it twice.
+covers only the sequential protocol sends of one terminal message batch, preventing another
+concurrently generated reply from appearing between its items. Self-observation archives those
+messages independently when NapCat reports them. Background work rides the database job queue
+ (`FOR UPDATE SKIP LOCKED`, leases, and a partial unique index that
+keeps one pending job per type and group). Exact extraction membership and the
+per-group provider slot prevent twin workers from paying for one batch together.
 
 ## Scheduled jobs
 
 | Schedule | Job |
 | --- | --- |
-| `schedule.nightly_cron` (02:30) | One pipeline in dependency order: memory extraction, memory decay, `pg_dump`, NapCat media cache cleanup. Between stages it waits, with a deadline, for the job queue to empty. |
+| `schedule.nightly_cron` (02:30) | One pipeline in dependency order: memory extraction, memory decay, `pg_dump`, NapCat media cache cleanup. Each wait tracks only that stage's jobs; independent embedding backlog does not delay decay or backup. |
 | `schedule.report_cron` (00:00) | The daily report to the owners: spend by kind and model, cache hit rates, picture cache, search allowance, job backlog, new and muted groups, backup age, error digest, output-stripper counters. |
 | resident | The job-queue worker, including lease reclaim. |
 
@@ -470,10 +539,11 @@ are validated with pydantic and unknown keys are rejected. New groups need no co
 
 Prompts are data: every runtime prompt template lives in one versioned
 `config/prompts/prompts.yaml` bundle. A closed contract in
-`qqbot/prompting/templates.py` owns the template keys, roles, reload scopes and exact
-`{{slot}}` sets. Loading is atomic and rejects missing, extra, duplicate or malformed
-slots before any template becomes active. Marker formats that application code produces
-remain code-owned; their shared explanation has one source in the bundle.
+`qqbot/prompting/templates.py` owns the template keys, roles and exact `{{slot}}` sets.
+The whole catalog is validated as one immutable startup snapshot and rejects missing,
+extra, duplicate or malformed slots before any template becomes active. Marker formats
+that application code produces remain code-owned; their shared explanation has one
+source in the bundle.
 
 ## Design decisions
 

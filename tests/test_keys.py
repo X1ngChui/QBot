@@ -89,16 +89,22 @@ def main() -> int:
     check("no credential name mentions a platform", not leaked, str(leaked))
 
     # 8. Network capabilities can still move credentials independently.
-    split = load_bundle()
-    split.default.capabilities.vision.credential_env = "VISION_API_KEY"
+    split = load_bundle().default
+    split = split.model_copy(update={
+        "capabilities": split.capabilities.model_copy(update={
+            "vision": split.capabilities.vision.model_copy(
+                update={"credential_env": "VISION_API_KEY"}
+            ),
+        }),
+    })
     os.environ["VISION_API_KEY"] = "vision-only-key"
-    os.environ[split.default.capabilities.text.credential_env] = "text-key"
-    vkey = util.read_api_key(split.default.capabilities.vision.credential_env)
-    tkey = util.read_api_key(split.default.capabilities.text.credential_env)
+    os.environ[split.capabilities.text.credential_env] = "text-key"
+    vkey = util.read_api_key(split.capabilities.vision.credential_env)
+    tkey = util.read_api_key(split.capabilities.text.credential_env)
     check("split config yields two different network keys",
           vkey == "vision-only-key" and tkey == "text-key",
           f"vision={vkey!r} text={tkey!r}")
-    clear("VISION_API_KEY", split.default.capabilities.text.credential_env)
+    clear("VISION_API_KEY", split.capabilities.text.credential_env)
 
     print()
     print("FAILED:", fails if fails else "none")

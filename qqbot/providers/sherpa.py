@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from ..core.budget import BUDGET
+from ..domain.ids import GroupId
 from ..settings import AsrCfg
 from .base import AsrModel, Kind, Rate
 
@@ -41,7 +42,7 @@ class _State(StrEnum):
 class _Job:
     data: bytes
     seconds: float | None
-    group_id: str | None
+    group_id: GroupId | None
     result: asyncio.Future[str]
 
 
@@ -78,7 +79,8 @@ class SherpaAsr(AsrModel):
     name = "sherpa"
     needs_key = False
 
-    def __init__(self) -> None:
+    def __init__(self, cfg: AsrCfg) -> None:
+        self._cfg = cfg
         self._state = _State.NEW
         self._recognizer: Any = None
         self._executor: ThreadPoolExecutor | None = None
@@ -115,7 +117,8 @@ class SherpaAsr(AsrModel):
         _ = stream.result.text
         return recognizer
 
-    async def start(self, cfg: AsrCfg) -> None:
+    async def start(self) -> None:
+        cfg = self._cfg
         if self._state is not _State.NEW:
             raise RuntimeError(f"ASR cannot start from {self._state}")
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="qbot-asr")
@@ -182,12 +185,10 @@ class SherpaAsr(AsrModel):
         self,
         data: bytes,
         *,
-        cfg: AsrCfg,
         fmt: str = "wav",
         seconds: float | None = None,
-        group_id: str | None = None,
+        group_id: GroupId | None = None,
     ) -> str:
-        del cfg
         if fmt != "wav":
             raise ValueError(f"sherpa backend takes WAV only, got {fmt!r}")
         if self._state is not _State.READY or self._queue is None:

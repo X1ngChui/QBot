@@ -32,8 +32,7 @@ class Decision:
     initiator_msg_id: str = ""
 
 
-def decide(msg: ChatMsg, at_bot: bool, *, st: GroupState,
-           cfg: Settings) -> Decision:
+def decide(msg: ChatMsg, at_bot: bool, *, st: GroupState, cfg: Settings) -> Decision:
     """Answer this message, or do not. No model call, no randomness, no state to
     calibrate.
 
@@ -49,8 +48,7 @@ def decide(msg: ChatMsg, at_bot: bool, *, st: GroupState,
         reason = "at"
     elif (hit := nickname.word_hit(msg.text, cfg.trigger.nicknames)) is not None:
         reason = f"nick:{hit}"
-    elif msg.reply_to and any(m.msg_id == msg.reply_to and m.is_bot
-                              for m in st.recent):
+    elif msg.reply_to and any(m.msg_id == msg.reply_to and m.is_bot for m in st.recent):
         # Quoting the bot's own line is speech aimed at the bot, even with the
         # auto-@ the reply button adds stripped off by hand. Window-scoped on
         # purpose: the check must stay synchronous (the caller cuts the context
@@ -60,5 +58,4 @@ def decide(msg: ChatMsg, at_bot: bool, *, st: GroupState,
     else:
         return Decision(False, reason="not_addressed")
 
-    return Decision(True, reason=reason,
-                    initiator=msg.user_id, initiator_msg_id=msg.msg_id)
+    return Decision(True, reason=reason, initiator=msg.user_id, initiator_msg_id=msg.msg_id)

@@ -32,7 +32,7 @@ within limits you set.
 - **Consent gate.** Members are answered only after they accept a user agreement, whose
   text and version you control.
 - **An operator console in chat.** Inspect and correct memory, block or mute, read
-  usage, reload configuration, and capture model calls for debugging.
+  usage, and capture model calls for debugging.
 
 ## How it works
 
@@ -120,26 +120,26 @@ Behaviour lives in `config/`, credentials in `.env`, runtime state in the databa
 | `config/prompts/prompts.yaml` | Versioned bundle containing every runtime prompt template |
 | `config/agreement.txt` | The user agreement shown by `/terms` |
 
-`/reload` applies reloadable edits atomically. If a process-owned setting changed, it
-rejects the whole candidate and reports which paths require a restart. The reference is
-in [docs/configuration.md](docs/configuration.md).
+The complete configuration bundle is validated at startup. Changes to settings,
+personas, prompts, predicates, or the agreement take effect after a restart. The
+reference is in [docs/configuration.md](docs/configuration.md).
 
 ## Commands
 
-Commands are typed in the group, prefixed with `/`. Owners hold the whole console.
-Members can read and correct their own record, view read-only statistics, and accept
-the agreement. Anything a member may not run is ignored without a reply.
+Commands use one meaning for every caller; authorization only permits or rejects the
+action. Person commands target the exact account by default and use explicit `--all` for
+the current linked account set.
 
 | Command | Purpose |
 | --- | --- |
-| `/help` | List the commands you may run |
+| `/help` | Show the shared command catalogue and authorization labels |
 | `/agree`, `/terms` | Accept or read the user agreement |
-| `/who`, `/note`, `/alias`, `/forget` | Inspect and correct what is known about a member |
-| `/card` | What is known about the group itself |
-| `/merge`, `/split` | Declare that two accounts are one person, or undo it |
-| `/block`, `/unblock`, `/mute`, `/unmute` | Stop answering a member, or the whole group |
-| `/stats`, `/groupstats`, `/top` | Spending and usage |
-| `/reload`, `/debug`, `/log` | Maintenance |
+| `/who`, `/note`, `/alias`, `/forget` | Inspect and correct exact-account or explicit linked-set records |
+| `/link`, `/unlink` | Confirm an alternate account or detach the current exact account |
+| `/card`, `/stats`, `/top` | Group memory and usage |
+| `/members`, `/merge`, `/split` | Owner directory and identity repair |
+| `/block`, `/mute` | Owner reply controls with explicit subcommands |
+| `/debug`, `/log` | Maintenance |
 
 See [docs/commands.md](docs/commands.md) for usage and permissions.
 
@@ -158,9 +158,10 @@ python -m venv .venv
 .venv/bin/pip install -r requirements.txt -r requirements-dev.txt
 
 docker run -d --name qbot-pgtest \
-  -e POSTGRES_DB=qqbot -e POSTGRES_USER=qqbot -e POSTGRES_PASSWORD=testpw \
+  -e POSTGRES_DB=qbot_test -e POSTGRES_USER=qbot_test -e POSTGRES_PASSWORD=testpw \
   -p 15432:5432 \
-  -v "$PWD/sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro" \
+  -v "$PWD/sql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro" \
+  -v "$PWD/tests/fixtures/test_db_marker.sql:/docker-entrypoint-initdb.d/02-test-marker.sql:ro" \
   pgvector/pgvector:0.8.5-pg17
 
 .venv/bin/python tests/run_all.py        # every suite, then ruff
@@ -174,16 +175,18 @@ for what each suite covers.
 | Path | Contents |
 | --- | --- |
 | `bot.py` | Entry point; serves the OneBot reverse WebSocket |
-| `qqbot/plugin.py` | NoneBot plugin wiring and startup order |
-| `qqbot/settings.py` | Configuration models, persona merge, `/reload` |
-| `qqbot/gateway/` | Inbound message handling: segments, dedup, archiving |
-| `qqbot/core/` | Trigger, pipeline, prompt assembly, reply engine, tools, media, budget, commands catalogue |
-| `qqbot/domain/` | The memory model: identities, aliases, facts, episodes, evidence |
+| `qqbot/plugin.py` | Thin NoneBot lifecycle and event adapter |
+| `qqbot/runtime.py` | Process composition root and ordered lifecycle ownership |
+| `qqbot/scheduled.py` | Framework-independent nightly and reporting job bodies |
+| `qqbot/settings.py` | Startup configuration models and persona merge |
+| `qqbot/gateway/` | OneBot normalization and append-once database admission |
+| `qqbot/core/` | Ingress routing, commands, delivery, trigger, prompt, tools, media and budget |
+| `qqbot/domain/` | Typed ingress plus the memory model: identities, aliases, facts, episodes, evidence |
 | `qqbot/repositories/` | Database access for the memory model |
 | `qqbot/services/` | Extraction, validation, consolidation, the member directory |
 | `qqbot/workers/` | The background memory worker |
 | `qqbot/providers/` | Provider abstractions and one module per backend |
-| `qqbot/plugins/` | The command handlers and the scheduled jobs |
+| `qqbot/plugins/` | Thin scheduled-job registration adapters |
 | `qqbot/db/` | Connection pool, schema check, archive and ledger access |
 | `config/` | Configuration templates, prompts, predicates, agreement |
 | `sql/` | Database schema and the schema changelog |

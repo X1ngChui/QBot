@@ -3,9 +3,9 @@
 `Entity` is the thing in the world; `IdentityAccount` is that thing's account on one
 platform. A person may hold several accounts; an account belongs to exactly one person.
 
-The separation costs one indirection. It buys three things: merging two accounts
-without losing either history, recording facts against a *person* rather than an
-account, and still recognising somebody after they switch accounts.
+The separation costs one indirection. It permits deterministic account linking while
+keeping exact-account records attached to the account that supplied them. Explicit
+holder-scoped records remain attached to the entity equivalence class.
 """
 
 from __future__ import annotations
@@ -27,8 +27,7 @@ class EntityType(StrEnum):
 class EntityStatus(StrEnum):
     ACTIVE = "active"
     #: Merged into somebody else. The row stays, and a read follows merged_into.
-    #: Never deleted outright: historical facts, alias evidence and episode participants
-    #: all still point at this id.
+    #: Never deleted outright: holder-scoped records may still point at this id.
     MERGED = "merged"
 
 

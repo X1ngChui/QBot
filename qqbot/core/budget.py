@@ -23,6 +23,7 @@ from contextvars import ContextVar
 from collections.abc import Iterator
 
 from ..db import repo
+from ..domain.ids import GroupId
 from ..providers.base import Kind
 from ..util import today_local
 
@@ -130,7 +131,7 @@ class Budget:
         kind: str,
         model: str,
         cny: float,
-        group_id: str | None = None,
+        group_id: GroupId | None = None,
         in_hit: int = 0,
         in_miss: int = 0,
         out: int = 0,
@@ -154,8 +155,14 @@ class Budget:
             s.charge(cny)
         try:
             await repo.ledger_add(
-                group_id=group_id, kind=kind, model=model,
-                in_hit=in_hit, in_miss=in_miss, out=out, calls=calls, cny=cny,
+                group_id=group_id,
+                kind=kind,
+                model=model,
+                in_hit=in_hit,
+                in_miss=in_miss,
+                out=out,
+                calls=calls,
+                cny=cny,
                 user_id=_WHO.get() or "",
             )
         except Exception:
@@ -164,8 +171,10 @@ class Budget:
             # logged as an error rather than a note, because what is now wrong is the
             # spend total - and therefore the daily cap, /stats and the report. A
             # ledger that quietly stops accepting rows reads exactly like a quiet day.
-            log.exception("cost_ledger write failed: today's spend is now understated, "
-                          "and the daily cap is measuring from the wrong number")
+            log.exception(
+                "cost_ledger write failed: today's spend is now understated, "
+                "and the daily cap is measuring from the wrong number"
+            )
         return cny
 
     async def spent_today(self) -> float:
@@ -188,8 +197,10 @@ BUDGET = Budget()
 
 def _tokens(rows: list[dict], kind: str) -> tuple[int, int]:
     """One kind's prompt tokens across ledger rows, as (cache hits, cache misses)."""
-    return (sum(int(r["in_hit"]) for r in rows if r["kind"] == kind),
-            sum(int(r["in_miss"]) for r in rows if r["kind"] == kind))
+    return (
+        sum(int(r["in_hit"]) for r in rows if r["kind"] == kind),
+        sum(int(r["in_miss"]) for r in rows if r["kind"] == kind),
+    )
 
 
 def hit_split(rows: list[dict]) -> str:
@@ -211,4 +222,5 @@ def hit_split(rows: list[dict]) -> str:
     return "　".join(
         f"{label} {h / (h + m) * 100:.0f}%"
         for label, (h, m) in (("回复", reply), ("归纳", extract), ("其他", other))
-        if h + m)
+        if h + m
+    )

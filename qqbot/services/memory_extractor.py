@@ -18,12 +18,13 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
+from ..domain.ids import GroupId
 from ..domain.identity import AliasType
-from ..domain.memory import Candidate, CandidateType
+from ..domain.memory import Candidate, CandidateType, SnapshotTarget
 from ..prompting import PromptKey
-from ..providers import providers
+from ..providers.base import TextModel
 from ..providers.contracts import (
     CallContext,
     CallPurpose,
@@ -42,7 +43,7 @@ log = logging.getLogger("qqbot.extract")
 
 
 def _table() -> dict:
-    """The predicate table as configured. Read at use time, so /reload applies."""
+    """The predicate table from the immutable startup configuration."""
     return config().predicates.person
 
 
@@ -91,7 +92,7 @@ def rules_block() -> str:
     return "\n".join(lines)
 
 
-#: Deliberately without `note`: that predicate belongs to what an owner typed, and the
+#: Deliberately without `note`: that predicate belongs to explicit command input, and the
 #: model must have no way to write over it.
 ALIAS_KINDS = tuple(
     t.value
@@ -164,9 +165,16 @@ def tools() -> tuple[ToolSpec, ...]:
                         "joke_name 玩笑性质的称呼；title 头衔或职务；"
                         "relationship_name 按关系叫的（如「师兄」）",
                     },
-                    "quote": {"type": "string", "description": "记录中逐字存在的一句，作为依据"},
+                    "source": {
+                        "type": "integer",
+                        "description": "依据所在行的来源编号",
+                    },
+                    "quote": {
+                        "type": "string",
+                        "description": "该来源行中逐字存在的一句，作为依据",
+                    },
                 },
-                "required": ["alias", "account", "kind", "quote"],
+                "required": ["alias", "account", "kind", "source", "quote"],
             },
         },
         {
@@ -189,9 +197,16 @@ def tools() -> tuple[ToolSpec, ...]:
                         "不加括号注解、补充说明或时间限定，"
                         "也不要把职位和单位写进同一个值",
                     },
-                    "quote": {"type": "string", "description": "记录中逐字存在的一句，作为依据"},
+                    "source": {
+                        "type": "integer",
+                        "description": "依据所在行的来源编号",
+                    },
+                    "quote": {
+                        "type": "string",
+                        "description": "该来源行中逐字存在的一句，作为依据",
+                    },
                 },
-                "required": ["account", "predicate", "object", "quote"],
+                "required": ["account", "predicate", "object", "source", "quote"],
             },
         },
         {
@@ -207,9 +222,16 @@ def tools() -> tuple[ToolSpec, ...]:
                         "type": "string",
                         "description": "它在本群指什么，一句话说清",
                     },
-                    "quote": {"type": "string", "description": "记录中逐字存在的一句，作为依据"},
+                    "source": {
+                        "type": "integer",
+                        "description": "依据所在行的来源编号",
+                    },
+                    "quote": {
+                        "type": "string",
+                        "description": "该来源行中逐字存在的一句，作为依据",
+                    },
                 },
-                "required": ["term", "meaning", "quote"],
+                "required": ["term", "meaning", "source", "quote"],
             },
         },
         {
@@ -221,9 +243,16 @@ def tools() -> tuple[ToolSpec, ...]:
                 "type": "object",
                 "properties": {
                     "topic": {"type": "string", "description": "本群的性质与主题，一句话"},
-                    "quote": {"type": "string", "description": "记录中逐字存在的一句，作为依据"},
+                    "source": {
+                        "type": "integer",
+                        "description": "依据所在行的来源编号",
+                    },
+                    "quote": {
+                        "type": "string",
+                        "description": "该来源行中逐字存在的一句，作为依据",
+                    },
                 },
-                "required": ["topic", "quote"],
+                "required": ["topic", "source", "quote"],
             },
         },
         {
@@ -239,16 +268,28 @@ def tools() -> tuple[ToolSpec, ...]:
                         "description": "这件事是什么，一到两句话，写清谁做了什么；"
                         "只写记录里有的，不要补充没提到的细节",
                     },
-                    "participants": {
+                    "sources": {
                         "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "参与者的账号编号，取自「本群账号」列表；"
-                        "只填能确认的人，指不准的宁可不填；"
-                        "一个都指不出就不要调用",
+                        "minItems": 1,
+                        "maxItems": 8,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "source": {
+                                    "type": "integer",
+                                    "description": "依据所在行的来源编号",
+                                },
+                                "quote": {
+                                    "type": "string",
+                                    "description": "该来源行中逐字存在的一句，作为依据",
+                                },
+                            },
+                            "required": ["source", "quote"],
+                        },
+                        "description": "支持这件事的一个或多个来源行及逐字引文",
                     },
-                    "quote": {"type": "string", "description": "记录中逐字存在的一句，作为依据"},
                 },
-                "required": ["summary", "participants", "quote"],
+                "required": ["summary", "sources"],
             },
         },
     ]
@@ -266,10 +307,10 @@ def tools() -> tuple[ToolSpec, ...]:
 def line_body(line: str) -> str:
     """What the member typed, without the line's time stamp and speaker prefix.
 
-    A transcript line reads `⟦time⟧ name⟦code⟧: body`, and the prefix must not take
-    part in quote matching: a quote that is somebody's name would otherwise be
-    "found" on every line that person spoke, and the evidence for it filed under
-    whichever line came first. Names are defanged before they enter a line, so the
+    A transcript line reads `⟦source:N⟧ ⟦time⟧ name⟦code⟧: body`, and the
+    prefix must not take part in quote matching: a quote that is somebody's name
+    would otherwise be "found" on every line that person spoke, and attributed by
+    accident of ordering. Names are defanged before they enter a line, so the first
     first closing marker followed by ": " is the end of the prefix and nothing else
     can be. A line with no such prefix is taken whole.
     """
@@ -277,50 +318,34 @@ def line_body(line: str) -> str:
     return body if sep else line
 
 
-def quoted_in(quote: str, bodies) -> int | None:
-    """The index of the one message body containing `quote`, or None.
-
-    None both when no body contains it and when more than one does: a quote that
-    matches several messages names no single message, and evidence attached to the
-    first of them would be attributed to a speaker by accident of ordering.
-    """
-    hits = [i for i, body in enumerate(bodies) if quote in body]
-    return hits[0] if len(hits) == 1 else None
-
-
 @dataclass(frozen=True, slots=True)
 class SourceLine:
-    """One line of the transcript, and the event it came from."""
+    """One rendered source and the exact member-authored span it can prove."""
 
     event_id: uuid.UUID
     text: str
-    #: The bot's own line. Rendered into the transcript so the model reads both
-    #: halves of a conversation, and excluded from evidence: source_of skips it,
-    #: so any candidate quoting it fails validation mechanically. Comprehension
-    #: without the self-loop - the bot's words never come back as evidence.
+    ordinal: int = 0
+    event_type: str = "message"
+    evidence_text: str = ""
+    author_account_id: uuid.UUID | None = None
+    targets: tuple[SnapshotTarget, ...] = ()
+    #: The bot's own line is context but can never be evidence.
     own: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class ExtractionInput:
-    """One batch to read. `account_codes` maps a code to a person, built by the caller
-    from the roster it rendered."""
+    """One batch to read. `account_codes` maps prompt-local codes to exact accounts."""
 
-    group_id: int
+    group_id: GroupId
     transcript: str
     roster: str
     account_codes: dict[int, uuid.UUID]
     #: The lines the transcript was built from, so each record can be attributed to the
     #: message it actually came from rather than to the batch as a whole.
     lines: tuple[SourceLine, ...] = ()
-    #: The last message of this batch. Stored on every candidate so that validation, which
-    #: runs later and separately, can reproduce this exact batch instead of re-fetching
-    #: whatever the recent messages happen to be by then.
-    source_event_id: uuid.UUID | None = None
-    #: How many rows the batch held - the other half of exact reproduction, since
-    #: gap-cut batches vary in length. Required: a candidate carries it into the
-    #: store, which refuses NULL.
-    batch_size: int = field(kw_only=True)
+    #: The durable exact-event batch reserved before the model call.
+    extraction_id: uuid.UUID | None = None
     #: What is already on record for this group, rendered. Given to the model so it
     #: proposes what is new rather than re-deriving what is known - see the extract prompt.
     known: str = ""
@@ -329,34 +354,26 @@ class ExtractionInput:
     #: an alias of whichever member happens to sit nearby.
     self_names: str = ""
 
-    def source_of(self, quote: str) -> uuid.UUID | None:
-        """Which message a quote came from, or None if no single message contains it.
+    def source_of(self, source: object, quote: object) -> uuid.UUID | None:
+        """Resolve one explicit source and verbatim quote to its archived event."""
 
-        Deliberately no fallback to the batch: a quote that matches no line must not
-        come back with a plausible-looking event id, or a record would be filed as
-        evidence from a message that does not contain it. Evidence attribution is not
-        decorative here - how many *different* people were seen using a name is the one
-        route by which a name the model merely observed becomes usable, and that count
-        is taken over exactly these rows. For the same reason a quote found in two
-        messages sources neither: picking the first would credit a speaker by luck.
-
-        Matched against each line's body, never its speaker prefix - see line_body.
-        A quote of another type (a model can send a number where the schema said
-        string) sources nothing, the same as an empty one.
-        """
-        quote = quote.strip() if isinstance(quote, str) else ""
+        if not isinstance(source, int) or not isinstance(quote, str):
+            return None
+        quote = quote.strip()
         if not quote:
             return None
-        # The bot's own lines are context, never evidence: a quote found only
-        # there validates nowhere, and the candidate dies for it.
-        members = [line for line in self.lines if not line.own]
-        hit = quoted_in(quote, [line_body(line.text) for line in members])
-        return members[hit].event_id if hit is not None else None
+        line = next((item for item in self.lines if item.ordinal == source), None)
+        if line is None or line.own or line.event_type != "message":
+            return None
+        evidence = line.evidence_text or line_body(line.text)
+        return line.event_id if quote in evidence else None
 
 
 class MemoryExtractor:
-    def __init__(self, cfg: Settings) -> None:
+    def __init__(self, cfg: Settings, text: TextModel) -> None:
         """Freeze the complete extraction template family for this worker."""
+
+        self._text = text
 
         self._prompts = prompt_catalog()
         self._prompt = self._prompts.render(
@@ -365,8 +382,7 @@ class MemoryExtractor:
         )
         # Extraction's own model, grade and timeout on the reply backend's wiring:
         # same endpoint, same key, its own price tier and its own patience. The
-        # resolved policy is frozen here; a reload changing it is rejected until
-        # restart.
+        # resolved policy is fixed for this worker's lifetime.
         self._text_cfg = cfg.capabilities.text.for_extract()
 
     @property
@@ -401,7 +417,7 @@ class MemoryExtractor:
             ),
             context=CallContext(CallPurpose.EXTRACT, str(inp.group_id)),
         )
-        async with providers().text.open_session(request) as session:
+        async with self._text.open_session(request) as session:
             turn = await session.start()
         return [
             candidate
@@ -438,11 +454,21 @@ class MemoryExtractor:
             # alone cannot, and the consolidator needs to know.
             args = args | {"kind": GROUP_TERM if name == "record_group_term" else GROUP_TOPIC}
 
+        if kind is CandidateType.EPISODE:
+            raw_sources = args.get("sources")
+            first = raw_sources[0] if isinstance(raw_sources, list) and raw_sources else {}
+            source_event_id = (
+                inp.source_of(first.get("source"), first.get("quote"))
+                if isinstance(first, dict)
+                else None
+            )
+        else:
+            source_event_id = inp.source_of(args.get("source"), args.get("quote"))
+
         return Candidate(
             candidate_type=kind,
             payload=args,
             group_id=inp.group_id,
-            source_event_id=inp.source_of(args.get("quote", "")),
-            batch_event_id=inp.source_event_id,
-            batch_size=inp.batch_size,
+            source_event_id=source_event_id,
+            extraction_id=inp.extraction_id,
         )

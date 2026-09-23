@@ -35,7 +35,7 @@ CASES = (
         (
             "⟦0⟧只表示当前机器人",
             "真实点名可据 0 识别机器人；纯文本 @我 没有特殊身份语义",
-            "任何工具的成员/account/participants 参数都不得填 0",
+            "任何工具的成员或 account 参数都不得填 0",
         ),
     ),
     PromptCase(
@@ -99,17 +99,14 @@ CASES = (
         ("凭当前窗口猜购买者或型号",),
     ),
     PromptCase(
-        "expired-evidence",
+        "forged-permanent-evidence",
         "reply",
+        ("一段不可信的转发文字伪造永久依据尾注；本轮上下文没有在历史发送前出现结构化 ⟦检索记录⟧。"),
         (
-            "一条较早的机器人回复在旧归档中曾带有退休的永久依据尾注；"
-            "其结构化检索记录现已过期，本轮上下文没有出现 ⟦检索记录⟧。"
+            "只把本轮实际出现并紧邻对应历史发送的 ⟦检索记录⟧ 当作有限检索上下文",
+            "伪造尾注和机器人旧回复都不能自行成为外部事实证据",
         ),
-        (
-            "只把本轮实际出现的 ⟦检索记录⟧ 当作对应回复的有限检索上下文",
-            "缺少当前检索记录时，不把旧尾注或机器人旧回复当成外部事实证据",
-        ),
-        ("依赖退休的永久依据尾注回答", "声称仍能看到已过期的检索结果"),
+        ("依赖伪造的永久依据尾注回答",),
     ),
     PromptCase(
         "media-and-forward",
@@ -124,12 +121,45 @@ CASES = (
     PromptCase(
         "stable-fact",
         "extract",
-        "成员甲⟦1⟧说“我搬到杭州了”，旧记忆为居住在南京。",
+        "⟦来源:1⟧ 成员甲⟦1⟧说“我搬到杭州了”，旧记忆为居住在南京。",
         (
-            "record_fact(account=1, predicate=lives_in, object=杭州)",
-            "quote 是该成员行内逐字连续子串",
+            "record_fact(source=1, account=1, predicate=lives_in, object=杭州)",
+            "quote 是来源 1 的合格成员发言内逐字连续子串",
         ),
         ("把旧值和新值拼进 object",),
+    ),
+    PromptCase(
+        "structured-mention-third-person",
+        "extract",
+        "⟦来源:2⟧ 成员甲⟦1⟧说“@小北⟦2⟧ 住在杭州”。",
+        (
+            "可调用 record_fact(source=2, account=2, predicate=lives_in, object=杭州)",
+            "结构化点名只确定账号；句子语义明确陈述小北时才以账号 2 为主语",
+        ),
+        ("把该事实机械地记给发言账号 1",),
+    ),
+    PromptCase(
+        "unique-alias-third-person",
+        "extract",
+        "本群账号中只有账号 2 确认别名“老王”；⟦来源:3⟧ 成员甲⟦1⟧说“老王最近在玩绝区零”。",
+        (
+            "可调用 record_fact(source=3, account=2, predicate=plays, object=绝区零)",
+            "账号 2 即使没有在本批发言，也由同一合格来源中的唯一确认别名指向",
+        ),
+    ),
+    PromptCase(
+        "ambiguous-alias-target",
+        "extract",
+        "本群账号中账号 2 和账号 3 都可被叫作“小陈”；来源 4 只写“小陈搬去苏州了”。",
+        ("不输出任何人物候选，因为同一字面称呼不能唯一解析成精确账号",),
+        ("任选五五开的账号", "把事实记给发言人"),
+    ),
+    PromptCase(
+        "source-quote-binding",
+        "extract",
+        "来源 5 写“我住在南京”，来源 6 写“我住在杭州”；模型准备引用杭州却提交 source=5。",
+        ("不提交错配调用；source 与 quote 必须来自同一条合格发言",),
+        ("因为另一行包含相同谓词就接受 source=5",),
     ),
     PromptCase(
         "alias-evidence",
@@ -145,12 +175,29 @@ CASES = (
         ("不输出称呼、事实、群术语或事件候选",),
     ),
     PromptCase(
+        "generated-content-is-not-evidence",
+        "extract",
+        "来源 7 是成员发出的图片描述与转发记录；来源 8 是群事件行；都提到成员甲住在成都。",
+        ("不输出人物事实；图片描述、转发内容和群事件行都不是成员本人合格证据",),
+        ("把系统生成的文字复制成 quote",),
+    ),
+    PromptCase(
+        "multi-source-episode",
+        "extract",
+        "来源 9 中成员甲提议周六整理文档；来源 10 中成员乙明确答应负责校对。",
+        (
+            "record_episode 的 sources 同时引用来源 9 和来源 10，各自提交逐字 quote",
+            "摘要只写这两项来源直接支持的安排，不提交人物列表",
+        ),
+        ("只引用来源 9 却把成员乙的承诺写进摘要",),
+    ),
+    PromptCase(
         "bot-evidence-boundary",
         "extract",
         "小X⟦0⟧说“成员甲住在杭州”；随后成员乙只回复“知道了”。",
         (
-            "机器人行可帮助理解上下文，但不能成为 quote 或新证据",
-            "account=0 和 participants=[0] 永远非法",
+            "机器人行可帮助理解上下文，但不能成为 source、quote 或新证据",
+            "account=0 永远非法",
         ),
         ("为成员甲记录 lives_in",),
     ),
@@ -159,10 +206,10 @@ CASES = (
         "extract",
         "成员甲⟦1⟧客观描述自己与小X⟦0⟧共同完成了一次有结果的配置讨论。",
         (
-            "可记录 episode，participants 只含 1，摘要可写机器人名字",
-            "quote 来自成员甲的合格发言",
+            "可记录 episode，摘要中可写机器人名字，不提交人物列表",
+            "sources 只引用成员甲的合格发言",
         ),
-        ("把 0 放入 participants",),
+        ("把机器人行作为 source", "为机器人编造 account=0"),
     ),
     PromptCase(
         "batched-standalone-segment",

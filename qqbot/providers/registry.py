@@ -1,7 +1,7 @@
 """Composition root for configured capabilities.
 
-Provider identity is selected once at startup. Calls receive only reloadable generation
-policy; endpoint, credentials, clients and concurrency stay owned by the built capability.
+Provider identity and client policy are selected once at startup. Calls receive only
+request data and request-specific options; clients keep their immutable configuration.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ import logging
 from collections.abc import Callable
 
 from ..settings import Settings, TextCfg, VisionCfg
-from .base import EmbeddingModel, Providers, SearchEngine, TextModel, VisionModel
+from .base import EmbeddingModel, Providers, RetryPolicy, SearchEngine, TextModel, VisionModel
 from .deepseek import deepseek_text, deepseek_vision
 from .embedding import DashScopeEmbedding
 from .local import local_text, local_vision
@@ -20,12 +20,12 @@ from .tavily import TavilySearch
 
 log = logging.getLogger("qqbot.providers")
 
-TextBuilder = Callable[[TextCfg], TextModel]
-VisionBuilder = Callable[[VisionCfg], VisionModel]
+TextBuilder = Callable[[TextCfg, RetryPolicy], TextModel]
+VisionBuilder = Callable[[VisionCfg, RetryPolicy], VisionModel]
 
 TEXT_PROVIDERS: dict[str, TextBuilder] = {
     "deepseek": deepseek_text,
-    "openai_responses": OpenAIResponses,
+    "openai_responses": lambda cfg, retry: OpenAIResponses(cfg, retry),
     "local": local_text,
 }
 VISION_PROVIDERS: dict[str, VisionBuilder] = {
@@ -46,24 +46,22 @@ def _builder(table: dict[str, Callable], name: str, capability: str) -> Callable
     return build
 
 
-def _instance(table: dict[str, type], name: str, capability: str):
-    return _builder(table, name, capability)()
-
-
 def build(settings: Settings) -> Providers:
     capabilities = settings.capabilities
-    search = _instance(SEARCH_PROVIDERS, capabilities.search.provider, "search")
+    retry = RetryPolicy(
+        retries=capabilities.http_retries,
+        retry_after_cap_sec=capabilities.retry_after_cap_sec,
+    )
+    search_type = _builder(SEARCH_PROVIDERS, capabilities.search.provider, "search")
+    embedding_type = _builder(EMBEDDING_PROVIDERS, capabilities.embedding.provider, "embedding")
+    search = search_type(capabilities.search, retry)
     bundle = Providers(
-        text=_builder(
-            TEXT_PROVIDERS, capabilities.text.provider, "text"
-        )(capabilities.text),
-        vision=_builder(
-            VISION_PROVIDERS, capabilities.vision.provider, "vision"
-        )(capabilities.vision),
-        asr=SherpaAsr(),
-        embedding=_instance(
-            EMBEDDING_PROVIDERS, capabilities.embedding.provider, "embedding"
+        text=_builder(TEXT_PROVIDERS, capabilities.text.provider, "text")(capabilities.text, retry),
+        vision=_builder(VISION_PROVIDERS, capabilities.vision.provider, "vision")(
+            capabilities.vision, retry
         ),
+        asr=SherpaAsr(capabilities.asr),
+        embedding=embedding_type(capabilities.embedding, retry),
         search=search,
         page_reader=search,
     )

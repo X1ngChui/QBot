@@ -36,25 +36,18 @@ and standing context.
 
 ### Applying changes
 
-`/reload` first validates the entire candidate bundle, then compares every value owned by
-long-lived process resources. The code-owned setting contract decides which global paths require
-a restart. If validation fails or any restart-scoped value changed, the whole reload is rejected
-and the active bundle—including its timezone—remains untouched. A successful reload therefore
-means every accepted edit is live.
+The application loads and validates one immutable configuration bundle at startup. The
+bundle includes settings, personas, prompts, predicates and the agreement text. A missing
+file, unknown key, duplicate template key or invalid value prevents startup; no partially
+validated configuration becomes active.
 
-Restart-scoped values are reported by exact path and include:
+Any configuration change requires a process restart. Provider clients, concurrency gates,
+local ASR resources, the memory worker, scheduler jobs and prompt catalogs all retain the
+same validated startup snapshot for their lifetime. Code changes additionally require an
+image rebuild.
 
-- Provider identity, endpoint, credential and concurrency settings.
-- The resolved extraction model policy, restart-scoped prompt templates and predicate
-  table, because the memory worker freezes them at construction.
-- Local ASR model path, CPU threads and queue capacity.
-- The complete embedding, database, memory and scheduler blocks.
-- The configured timezone.
-
-Changing code never takes effect through `/reload`; the image must be rebuilt.
-
-The current schema deliberately does not dual-read retired names. Validation reports the
-migration directly: `llm` → `capabilities`, `backend` → `provider`, `base_url` →
+Retired configuration names are not dual-read. Validation names the unsupported key so it
+can be replaced directly: `llm` → `capabilities`, `backend` → `provider`, `base_url` →
 `endpoint`, and `api_key_env` → `credential_env`.
 
 ### Top level
@@ -77,14 +70,13 @@ migration directly: `llm` → `capabilities`, `backend` → `provider`, `base_ur
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `dedup_ttl_sec` | 300 | Seconds a received event ID remains in the live replay filter |
-| `shutdown_wait_sec` | 5 | Seconds shutdown waits for in-flight archive and media writes |
+| `shutdown_wait_sec` | 5 | Seconds shutdown waits for in-flight media patches |
 
 ### `media`
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `wait_sec` | 25 | Seconds a reply waits for pending media resolution |
+| `wait_sec` | 25 | Seconds a reply waits for shared media tickets before continuing; slow work keeps running and patches later |
 | `protocol_timeout_sec` | 10 | Seconds allowed for one NapCat media API call |
 | `http_timeout_sec` | 20 | Seconds allowed for one media download |
 | `unreadable_retry_sec` | 600 | Seconds before retrying media marked unreadable |
@@ -94,6 +86,33 @@ migration directly: `llm` → `capabilities`, `backend` → `provider`, `base_ur
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `cache_ttl_sec` | 1800 | Seconds a fetched group member list remains fresh |
+
+### `commands`
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `roster_max_entries` | 60 | Account rows shown by one owner `/members` response |
+| `top_default_entries`, `top_max_entries` | 5, 20 | Default and maximum spending rows shown by `/top` |
+
+### `identity_link`
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `challenge_ttl_sec` | 600 | Lifetime of one `/link` confirmation request |
+| `max_pending_challenges` | 1000 | Global ceiling on durable pending requests |
+| `max_pending_per_account` | 3 | Pending requests one initiating account may hold |
+| `challenge_code_length` | 8 | Decimal digits in a newly issued confirmation code |
+
+### `diagnostics`
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `debug_max_rounds` | 50 | Largest accepted `/debug start N` capture |
+| `log_tail_default_lines`, `log_tail_max_lines` | 15, 60 | Default and maximum `/log` line count |
+| `log_tail_scan_bytes` | 65536 | Maximum suffix of the log file scanned for one response |
+| `error_ring_entries` | 200 | Process-local recent-error ring capacity |
+| `error_message_chars` | 300 | Stored characters per recent error |
+| `daily_report_recent_errors` | 8 | Recent errors included in the owner report |
 
 ### `tools`
 
@@ -110,6 +129,7 @@ migration directly: `llm` → `capabilities`, `backend` → `provider`, `base_ur
 | `search_history.max_query_terms` | 8 | Terms accepted in one search expression |
 | `search_history.max_result_chars` | 12000 | Characters returned by one search |
 | `recall_events.context_episodes` | 2 | Episodes included before and after each hit |
+| `recall_events.max_hits` | 5 | Similarity hits selected before temporal context is added |
 | `read_url.max_content_chars` | 8000 | Page-text characters returned by one read |
 | `open_images.max_images` | 6 | Images accepted by one call |
 
@@ -143,6 +163,8 @@ Responses image-input shape as well as text responses.
 | `description_ttl_days` | How long a stored description stays current; past it, a reposted picture is described again. 0 disables expiry. |
 | `file_max_age_days` | How long an uploaded original is trusted to still exist at the backend; past it `open_images` uploads again. Keep it under the backend's retention. |
 | `max_images_per_min` | Pace gate for description calls |
+| `max_concurrency` | Concurrent paid description calls across all groups (restart) |
+| `max_output_tokens` | Shared reasoning and visible-output ceiling for one description |
 | `max_image_mb` | Largest picture handled |
 
 **`capabilities.asr`** — fixed in-process SenseVoice CPU transcription. It has no
@@ -195,12 +217,16 @@ Restart to apply.
 | --- | --- |
 | `extract_window` | Messages per extraction chunk |
 | `batch_gap_min` | A full chunk is trimmed back to the last conversation gap of at least this many minutes |
-| `drain_floor` | Fewer unread messages than this are left for the next night |
+| `drain_floor` | Fewer unconsumed events than this are left for the next night |
 | `max_passes` | Chunks one nightly drain may process |
 | `known_episodes` | Recorded episodes the extractor is reminded of |
+| `roster_aliases_per_account` | Confirmed aliases shown beside one exact account in extraction context |
 | `episode_ttl_days` | Age after which an episode leaves semantic recall and loses its rebuildable vectors; provenance remains |
 | `alias_unused_days`, `joke_unused_days` | How long an unconfirmed name, or one marked as a joke, survives unused |
 | `job_lease_min` | How long a claimed job stays claimed |
+| `worker_idle_sec` | Idle polling interval for the background worker |
+| `embedding_page_size` | Episode rows embedded in one page |
+| `worker_retry_backoff_sec` | Retry delays for failed memory jobs |
 
 ### `schedule`
 
@@ -210,9 +236,10 @@ Restart to apply.
 | `report_cron` | The daily report (restart) |
 | `backup_keep` | Dumps kept |
 | `napcat_cache_days` | Age past which NapCat's media cache is deleted |
-| `extract_drain_hours`, `decay_drain_min`, `drain_poll_sec` | How long the pipeline waits for each stage's jobs to finish before moving on |
+| `extract_drain_hours`, `decay_drain_min`, `drain_poll_sec` | How long the pipeline waits for each stage's own jobs before moving on; embedding drains independently |
 | `misfire_grace_sec` | How late a missed trigger may still fire (restart) |
 | `backup_stale_hours` | Age past which the report flags the newest dump |
+| `completed_job_keep_days` | Age after which completed memory-job audit rows are pruned |
 
 ### `database`
 
@@ -270,8 +297,7 @@ categories).
 
 All runtime prompt wording lives in the single versioned
 `config/prompts/prompts.yaml` bundle. The closed manifest in
-`qqbot/prompting/templates.py` defines each logical template's role, reload scope and
-exact slots; the whole bundle is rejected atomically if any key or slot is missing,
+`qqbot/prompting/templates.py` defines each logical template's role and exact slots;
 extra or malformed. See [config/prompts/README.md](../config/prompts/README.md) for the
 contract and safe generation workflow.
 

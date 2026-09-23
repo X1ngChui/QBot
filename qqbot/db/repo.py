@@ -11,6 +11,8 @@ import uuid
 from datetime import date, timedelta
 
 from ..domain.evidence import EvidenceMemo
+from ..domain.ids import GroupId
+from ..repositories.archive import ArchiveRepository
 from ..settings import config
 from ..util import now_local, today_local, tz_sql
 from .pool import pool
@@ -28,144 +30,186 @@ async def backfill_plain_text(msg_id: str, plain_text: str) -> None:
     await pool().execute(
         """UPDATE raw_event SET plain_text = $2
             WHERE platform = 'qq' AND platform_event_id = $1""",
-        msg_id, plain_text,
+        msg_id,
+        plain_text,
     )
+
+
+_REQUIRED_SCHEMA_TABLES = {
+    "account_link_challenge",
+    "alias",
+    "alias_evidence",
+    "cost_ledger",
+    "embedding_index",
+    "entity",
+    "episode",
+    "episode_event",
+    "group_blocklist",
+    "group_state",
+    "identity_account",
+    "image_cache",
+    "memory_candidate",
+    "memory_extraction",
+    "memory_extraction_event",
+    "memory_fact",
+    "memory_fact_evidence",
+    "memory_job",
+    "raw_event",
+    "reply_trace",
+    "user_agreement",
+}
+_REQUIRED_SCHEMA_COLUMNS = {
+    "account_link_challenge": {
+        "initiator_account_id",
+        "target_account_id",
+        "initiator_entity_revision",
+        "target_entity_revision",
+        "token_hash",
+    },
+    "alias": {"target_entity_id", "target_account_id"},
+    "episode": {"extraction_id", "summary"},
+    "group_blocklist": {"id", "user_id", "entity_id", "blocked_until"},
+    "identity_account": {"id", "entity_id", "platform", "platform_user_id"},
+    "memory_extraction": {"status", "snapshot"},
+    "memory_fact": {"subject_entity_id", "subject_account_id"},
+    "raw_event": {"archive_schema", "payload", "plain_text"},
+}
+_REQUIRED_NOT_NULL_COLUMNS = {
+    "account_link_challenge": {
+        "group_id",
+        "token_hash",
+        "initiator_account_id",
+        "target_account_id",
+        "initiator_entity_id",
+        "target_entity_id",
+        "initiator_entity_revision",
+        "target_entity_revision",
+        "status",
+        "created_event_id",
+        "created_at",
+        "expires_at",
+    },
+    "reply_trace": {"memo", "expires_at"},
+}
+_REQUIRED_SCHEMA_CONSTRAINTS = {
+    "account_link_distinct_accounts",
+    "account_link_revision_valid",
+    "account_link_status_valid",
+    "alias_exactly_one_target",
+    "fact_exactly_one_subject",
+    "group_blocklist_exactly_one_target",
+    "identity_account_platform_platform_user_id_key",
+    "memory_extraction_event_extraction_id_ordinal_key",
+    "memory_extraction_event_raw_event_id_key",
+    "memory_extraction_live_snapshot_v2",
+    "memory_extraction_status_valid",
+    "raw_event_archive_schema_valid",
+}
+_REQUIRED_SCHEMA_INDEXES = {
+    "account_link_pending_pair",
+    "alias_unique_account_scope",
+    "alias_unique_entity_scope",
+    "fact_one_current_account",
+    "fact_one_current_entity",
+    "group_blocklist_account",
+    "group_blocklist_holder",
+    "raw_event_platform_key",
+    "reply_trace_reply",
+}
+_RETIRED_SCHEMA_TABLES = {"episode_participant", "schema_migration"}
+_RETIRED_SCHEMA_COLUMNS = {"reply_trace": {"content"}}
+
+
+async def check_schema(conn, *, schema: str, embedding_dimensions: int) -> None:
+    """Validate the current schema contract without executing DDL."""
+
+    rows = await conn.fetch(
+        """SELECT table_name, column_name, is_nullable
+             FROM information_schema.columns
+            WHERE table_schema=$1""",
+        schema,
+    )
+    columns: dict[str, set[str]] = {}
+    not_null: dict[str, set[str]] = {}
+    for row in rows:
+        table = row["table_name"]
+        column = row["column_name"]
+        columns.setdefault(table, set()).add(column)
+        if row["is_nullable"] == "NO":
+            not_null.setdefault(table, set()).add(column)
+
+    missing = sorted(_REQUIRED_SCHEMA_TABLES - columns.keys())
+    missing.extend(
+        f"{table}.{column}"
+        for table, expected in _REQUIRED_SCHEMA_COLUMNS.items()
+        for column in sorted(expected - columns.get(table, set()))
+    )
+    missing.extend(
+        f"{table}.{column} NOT NULL"
+        for table, expected in _REQUIRED_NOT_NULL_COLUMNS.items()
+        for column in sorted(expected - not_null.get(table, set()))
+    )
+    constraint_rows = await conn.fetch(
+        """SELECT conname FROM pg_constraint c
+             JOIN pg_namespace n ON n.oid=c.connamespace
+            WHERE n.nspname=$1""",
+        schema,
+    )
+    constraint_names = {row["conname"] for row in constraint_rows}
+    missing.extend(sorted(_REQUIRED_SCHEMA_CONSTRAINTS - constraint_names))
+    index_rows = await conn.fetch(
+        """SELECT indexname FROM pg_indexes WHERE schemaname=$1""",
+        schema,
+    )
+    index_names = {row["indexname"] for row in index_rows}
+    missing.extend(sorted(_REQUIRED_SCHEMA_INDEXES - index_names))
+    retired = sorted(_RETIRED_SCHEMA_TABLES & columns.keys())
+    retired_columns = [
+        f"{table}.{column}"
+        for table, forbidden in _RETIRED_SCHEMA_COLUMNS.items()
+        for column in sorted(forbidden & columns.get(table, set()))
+    ]
+    width = await conn.fetchval(
+        """SELECT a.atttypmod FROM pg_attribute a
+             JOIN pg_class c ON c.oid=a.attrelid
+             JOIN pg_namespace n ON n.oid=c.relnamespace
+            WHERE n.nspname=$1 AND c.relname='embedding_index'
+              AND a.attname='embedding' AND NOT a.attisdropped""",
+        schema,
+    )
+
+    details = []
+    if missing:
+        details.append("missing " + ", ".join(missing))
+    if retired:
+        details.append("retired tables present: " + ", ".join(retired))
+    if retired_columns:
+        details.append("retired columns present: " + ", ".join(retired_columns))
+    if width != embedding_dimensions:
+        details.append(
+            f"embedding_index.embedding is VECTOR({width}) but configuration "
+            f"requires VECTOR({embedding_dimensions})"
+        )
+    if details:
+        raise RuntimeError(
+            "database schema is incompatible; apply the manual schema update first ("
+            + "; ".join(details)
+            + ")"
+        )
 
 
 async def ensure_schema() -> None:
-    """The schema is created by sql/init.sql; this only checks it at startup.
+    """Refuse startup unless the manually managed schema matches this runtime."""
 
-    It confirms, never changes: a schema that does not match the code should fail at
-    boot, not when the first message arrives.
-    """
-    missing = await pool().fetch(
-        """SELECT t.name FROM unnest(ARRAY[
-               'raw_event','entity','identity_account','alias','alias_evidence',
-               'memory_fact','memory_fact_evidence','memory_candidate',
-               'episode','episode_participant','episode_event',
-               'memory_job','embedding_index',
-               'cost_ledger','group_state','group_blocklist','image_cache',
-               'reply_trace','user_agreement'
-           ]) AS t(name)
-           LEFT JOIN information_schema.tables i
-                  ON i.table_name = t.name AND i.table_schema = 'public'
-          WHERE i.table_name IS NULL""",
-    )
-    if missing:
-        raise RuntimeError(
-            "missing tables: " + ", ".join(r["name"] for r in missing))
-
-    # init.sql only runs on a fresh database, so a server that missed a migration has
-    # the table but not a later-added column - and without this check the mismatch
-    # surfaces as a caught-and-logged failure inside a background worker, hours later,
-    # looking like a group with nothing worth extracting. Listed by hand because there is
-    # no way to derive what the code writes; the list only needs the columns that are not
-    # in the original CREATE.
-    absent = await pool().fetch(
-        """SELECT c.tbl, c.col FROM (VALUES
-               ('memory_candidate','batch_event_id'),
-               ('memory_candidate','batch_size'),
-               ('memory_fact','object_key'),
-               ('raw_event','plain_text'),
-               ('group_state','first_seen_at'),
-               ('image_cache','file_id'),
-               ('image_cache','file_provider'),
-               ('image_cache','file_uploaded_at'),
-               ('image_cache','described_at'),
-               ('image_cache','refused'),
-               ('cost_ledger','day'),
-               ('cost_ledger','user_id'),
-               ('group_blocklist','blocked_until'),
-               ('reply_trace','memo'),
-               ('reply_trace','expires_at'),
-               ('user_agreement','version')
-           ) AS c(tbl, col)
-           LEFT JOIN information_schema.columns i
-                  ON i.table_name = c.tbl AND i.column_name = c.col
-                 AND i.table_schema = 'public'
-          WHERE i.column_name IS NULL""",
-    )
-    if absent:
-        raise RuntimeError(
-            "schema is behind the code, missing: "
-            + ", ".join(f"{r['tbl']}.{r['col']}" for r in absent))
-
-    # The column check alone is not enough where the code upserts: ledger_add's
-    # ON CONFLICT names the five-column primary key, and a hand migration that adds
-    # the column but keeps the old key passes the check above while every upsert
-    # fails - caught, so the ledger silently stops accruing and the budget restores
-    # understated after a restart. Verify the key itself.
-    pk = await pool().fetchval(
-        """SELECT array_agg(a.attname ORDER BY x.ord)
-             FROM pg_constraint c
-             JOIN unnest(c.conkey) WITH ORDINALITY AS x(attnum, ord) ON true
-             JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = x.attnum
-            WHERE c.conrelid = 'cost_ledger'::regclass AND c.contype = 'p'""",
-    )
-    want = ["day", "group_id", "kind", "model", "user_id"]
-    if list(pk or []) != want:
-        raise RuntimeError(
-            f"cost_ledger primary key is behind the code: expected {want}, "
-            f"found {list(pk or [])}")
-
-    # Same reasoning for the unique indexes that back ON CONFLICT upserts but
-    # live as separate CREATE INDEX statements in init.sql - a hand migration
-    # that runs the CREATE TABLE block and stops there passes every check above
-    # while every inbound insert (raw_event) or trace write (reply_trace) fails.
-    # job_pending_once collapses duplicate job submits, alias_unique_in_scope makes a
-    # repeated sighting an upsert rather than a second row, and fact_one_current is
-    # the one-current-fact invariant itself - without it two writers can both
-    # succeed and a person answers with two contradictory current facts.
-    no_index = await pool().fetch(
-        """SELECT n.name FROM unnest(ARRAY[
-               'raw_event_platform_key','reply_trace_reply','job_pending_once',
-               'alias_unique_in_scope','fact_one_current'
-           ]) AS n(name)
-           LEFT JOIN pg_indexes p
-                  ON p.indexname = n.name AND p.schemaname = 'public'
-          WHERE p.indexname IS NULL""",
-    )
-    if no_index:
-        raise RuntimeError(
-            "missing unique indexes (ON CONFLICT depends on them): "
-            + ", ".join(r["name"] for r in no_index))
-
-    # The vector column's declared width must match what the embedding backend is
-    # configured to produce. pgvector keeps the width as the column's type modifier,
-    # and a mismatch is not caught until the first insert - inside the background
-    # worker, hours later, where it reads as a group with nothing to embed.
-    width = await pool().fetchval(
-        """SELECT atttypmod FROM pg_attribute
-            WHERE attrelid = 'embedding_index'::regclass AND attname = 'embedding'""",
-    )
-    want_dims = config().default.capabilities.embedding.dimensions
-    if width != want_dims:
-        raise RuntimeError(
-            f"embedding_index.embedding is VECTOR({width}) but "
-            f"capabilities.embedding.dimensions is {want_dims}; the column and the backend "
-            "must agree, or every vector insert fails")
+    dimensions = config().default.capabilities.embedding.dimensions
+    async with pool().acquire() as conn:
+        await check_schema(conn, schema="public", embedding_dimensions=dimensions)
 
 
-async def recent_messages(group_id: int, *, limit: int) -> list:
-    """The newest messages of one group, returned oldest first.
+async def recent_messages(group_id: GroupId, *, limit: int) -> list:
+    """The newest canonical archived messages of one group, oldest first."""
 
-    What the reply path's in-memory window is rebuilt from after a restart: the stored
-    reading already has pictures described, so the window comes back full instead of the
-    bot rejoining a conversation it was part of thirty seconds earlier with no idea what
-    is being discussed.
-
-    Ordered by (occurred_at, id) so two messages sharing a timestamp cannot swap places
-    between two calls.
-    """
-    rows = await pool().fetch(
-        """SELECT id, platform_event_id, platform_user_id, occurred_at, payload,
-                  plain_text
-             FROM raw_event
-            WHERE group_id=$1 AND event_type='message'
-            ORDER BY occurred_at DESC, id DESC LIMIT $2""",
-        group_id, limit,
-    )
-    return list(reversed(rows))
+    return await ArchiveRepository().recent(group_id, limit=limit)
 
 
 async def image_cache_get(key: str, *, max_age: timedelta | None = None) -> str | None:
@@ -261,126 +305,155 @@ async def image_cache_stats() -> dict:
     return dict(row) if row else {"n": 0, "hits": 0, "refused": 0}
 
 
-# -- group_state (per-group switches and watermarks) ------------------------
+# -- group_state (per-group switches) ----------------------------------------
 # One typed column per field, so the schema itself says what runtime state the system
 # keeps - no magic strings inside a jsonb blob.
 
 
-async def group_switches(group_id: int) -> tuple[bool, dict]:
-    """This group's persisted switches: (muted, {blocked account: lapses at}).
+async def group_muted(group_id: GroupId) -> bool:
+    """Return this group's persisted mute switch."""
 
-    Two tables, one read: the mute flag is an attribute of the group, while who is
-    blocked is a one-to-many relation and so lives in its own table. A block that
-    has already lapsed is simply not loaded; its row waits for blocked_now or the
-    next timed lapse in the group to sweep it, and is invisible until then.
-    """
     muted = await pool().fetchval(
-        "SELECT muted FROM group_state WHERE group_id=$1", group_id)
-    rows = await pool().fetch(
-        """SELECT user_id, blocked_until FROM group_blocklist
-            WHERE group_id=$1 AND (blocked_until IS NULL OR blocked_until > NOW())""",
-        group_id)
-    return bool(muted), {r["user_id"]: r["blocked_until"] for r in rows}
+        "SELECT muted FROM group_state WHERE group_id=$1", _group(group_id)
+    )
+    return bool(muted)
 
 
-async def set_group_muted(group_id: int, muted: bool) -> None:
+async def set_group_muted(group_id: GroupId, muted: bool) -> None:
     await pool().execute(
         """INSERT INTO group_state (group_id, muted) VALUES ($1,$2)
            ON CONFLICT (group_id) DO UPDATE SET muted=$2, updated_at=NOW()""",
-        group_id, muted,
+        _group(group_id),
+        muted,
     )
 
 
-async def block(group_id: int, user_ids: list[str] | str, *, until=None) -> None:
-    """Block one person - every account they hold - until `until`, or for good.
+async def block(group_id: GroupId, user_ids: list[str] | str, *, until=None) -> None:
+    """Create or replace exact-account block rules."""
 
-    Takes a list because a merge makes several accounts one person, and a decision
-    about a person that only reached the account that was @-ed is not a decision:
-    the alt keeps talking, keeps being archived, keeps feeding memory. The rows stay
-    account-keyed so the hot path can keep testing a plain mapping
-    (state.GroupState), and expanding to the person happens here, at write time.
-
-    Re-blocking overwrites the expiry: the newest decision is the decision, so
-    /block again without a duration turns a timed block permanent, and with one
-    restarts the clock.
-    """
     ids = [user_ids] if isinstance(user_ids, str) else list(user_ids)
     if not ids:
         return
     await pool().executemany(
         """INSERT INTO group_blocklist (group_id, user_id, blocked_until)
            VALUES ($1,$2,$3)
-           ON CONFLICT (group_id, user_id)
+           ON CONFLICT (group_id, user_id) WHERE user_id IS NOT NULL
              DO UPDATE SET blocked_until = EXCLUDED.blocked_until""",
-        [(group_id, uid, until) for uid in ids],
+        [(_group(group_id), user_id, until) for user_id in ids],
     )
 
 
-async def unblock(group_id: int, user_ids: list[str] | str) -> bool:
-    """Lift the block from every account of one person.
+async def block_holder(group_id: GroupId, entity_id: uuid.UUID, *, until=None) -> None:
+    """Create or replace a dynamic linked-holder block rule."""
 
-    True if anything was actually removed - the command reports the difference.
-    """
+    await pool().execute(
+        """INSERT INTO group_blocklist (group_id, entity_id, blocked_until)
+           VALUES ($1,$2,$3)
+           ON CONFLICT (group_id, entity_id) WHERE entity_id IS NOT NULL
+             DO UPDATE SET blocked_until = EXCLUDED.blocked_until""",
+        _group(group_id),
+        entity_id,
+        until,
+    )
+
+
+async def unblock(group_id: GroupId, user_ids: list[str] | str) -> bool:
+    """Delete exact-account block rules."""
+
     ids = [user_ids] if isinstance(user_ids, str) else list(user_ids)
     if not ids:
         return False
     tag = await pool().execute(
-        "DELETE FROM group_blocklist WHERE group_id=$1 AND user_id = ANY($2::text[])",
-        group_id, ids,
+        "DELETE FROM group_blocklist WHERE group_id=$1 AND user_id=ANY($2::text[])",
+        _group(group_id),
+        ids,
     )
     return not tag.endswith(" 0")
 
 
-async def groups_blocking(user_ids: list[str]) -> list[tuple[int, object]]:
-    """Groups where any of these accounts is live-blocked, with the block's expiry.
+async def unblock_holder(group_id: GroupId, entity_id: uuid.UUID) -> bool:
+    """Delete every holder rule that currently resolves to this linked set."""
 
-    What a merge needs to know: the accounts became one person, so wherever one of
-    them was blocked, all of them now are - and for how long. Per group the
-    strongest standing block wins: a permanent one (NULL) dominates, otherwise the
-    latest expiry; already-lapsed rows count for nothing.
-    """
-    if not user_ids:
-        return []
+    tag = await pool().execute(
+        """WITH RECURSIVE family AS (
+               SELECT $2::uuid AS id
+               UNION ALL
+               SELECT e.id FROM entity e JOIN family f ON e.merged_into=f.id
+           )
+           DELETE FROM group_blocklist
+            WHERE group_id=$1 AND entity_id IN (SELECT id FROM family)""",
+        _group(group_id),
+        entity_id,
+    )
+    return not tag.endswith(" 0")
+
+
+async def blocked(group_id: GroupId, user_id: str) -> bool:
+    """Resolve exact and linked-holder rules against current identity membership."""
+
+    return bool(
+        await pool().fetchval(
+            """WITH RECURSIVE family AS (
+               SELECT entity_id AS id FROM identity_account
+                WHERE platform='qq' AND platform_user_id=$2
+               UNION ALL
+               SELECT e.id FROM entity e JOIN family f ON e.merged_into=f.id
+           )
+           SELECT EXISTS (
+               SELECT 1 FROM group_blocklist b
+                WHERE b.group_id=$1
+                  AND (b.blocked_until IS NULL OR b.blocked_until > NOW())
+                  AND (b.user_id=$2 OR b.entity_id IN (SELECT id FROM family))
+           )""",
+            _group(group_id),
+            user_id,
+        )
+    )
+
+
+async def block_rules(group_id: GroupId) -> list[dict]:
+    """Return active rules in their current exact-account or holder scope."""
+
     rows = await pool().fetch(
-        """SELECT group_id,
-                  CASE WHEN bool_or(blocked_until IS NULL) THEN NULL
-                       ELSE max(blocked_until) END AS lapses
-             FROM group_blocklist
-            WHERE user_id = ANY($1::text[])
-              AND (blocked_until IS NULL OR blocked_until > NOW())
-            GROUP BY group_id""",
-        user_ids,
+        """WITH RECURSIVE resolved AS (
+               SELECT b.id AS rule_id, b.user_id, b.blocked_until, b.created_at,
+                      e.id AS current_entity_id, e.merged_into
+                 FROM group_blocklist b
+                 LEFT JOIN entity e ON e.id=b.entity_id
+                WHERE b.group_id=$1
+                  AND (b.blocked_until IS NULL OR b.blocked_until > NOW())
+               UNION ALL
+               SELECT r.rule_id, r.user_id, r.blocked_until, r.created_at,
+                      e.id, e.merged_into
+                 FROM resolved r
+                 JOIN entity e ON e.id=r.merged_into
+           )
+           SELECT rule_id AS id, user_id,
+                  CASE WHEN user_id IS NULL THEN current_entity_id END AS entity_id,
+                  blocked_until, created_at
+             FROM resolved
+            WHERE user_id IS NOT NULL OR merged_into IS NULL
+            ORDER BY created_at, rule_id""",
+        _group(group_id),
     )
-    return [(r["group_id"], r["lapses"]) for r in rows]
+    combined: dict[tuple[str | None, uuid.UUID | None], dict] = {}
+    for row in rows:
+        item = dict(row)
+        item.pop("created_at")
+        key = (item["user_id"], item["entity_id"])
+        previous = combined.get(key)
+        if previous is None:
+            combined[key] = item
+            continue
+        old_until = previous["blocked_until"]
+        new_until = item["blocked_until"]
+        previous["blocked_until"] = (
+            None if old_until is None or new_until is None else max(old_until, new_until)
+        )
+    return list(combined.values())
 
 
-async def unblock_expired(group_id: int) -> None:
-    """Sweep this group's lapsed timed blocks. Called when one is noticed - there
-    is no scheduler for something the hot path detects for free."""
-    await pool().execute(
-        """DELETE FROM group_blocklist
-            WHERE group_id=$1 AND blocked_until IS NOT NULL AND blocked_until <= NOW()""",
-        group_id,
-    )
-
-
-async def mark_extracted(group_id: int, upto) -> None:
-    """Move the watermark to the newest message an extraction actually read.
-
-    Never backwards: two passes can overlap, and the later-finishing one must not reopen
-    messages the other has already read.
-    """
-    await pool().execute(
-        """INSERT INTO group_state (group_id, last_extract_at) VALUES ($1,$2)
-           ON CONFLICT (group_id) DO UPDATE
-             SET last_extract_at = GREATEST(
-                     COALESCE(group_state.last_extract_at, 'epoch'), EXCLUDED.last_extract_at),
-                 updated_at = NOW()""",
-        group_id, upto,
-    )
-
-
-async def note_group_seen(group_id: int) -> bool:
+async def note_group_seen(group_id: GroupId) -> bool:
     """Record that this group exists. True only for the call that first saw it.
 
     The insert is the claim: whoever creates the row is the discoverer, and everyone
@@ -392,103 +465,113 @@ async def note_group_seen(group_id: int) -> bool:
         """INSERT INTO group_state (group_id, first_seen_at) VALUES ($1, NOW())
            ON CONFLICT (group_id) DO NOTHING
            RETURNING group_id""",
-        group_id,
+        _group(group_id),
     )
     return row is not None
 
 
-async def groups_first_seen_on(day: str | date) -> list[int]:
+async def groups_first_seen_on(day: str | date) -> list[GroupId]:
     """Groups whose first message arrived on this day, for the daily report."""
     rows = await pool().fetch(
         """SELECT group_id FROM group_state
             WHERE first_seen_at IS NOT NULL
               AND (first_seen_at AT TIME ZONE $2)::date = $1::date
             ORDER BY first_seen_at""",
-        _as_date(day), tz_sql(),
+        _as_date(day),
+        tz_sql(),
     )
-    return [r["group_id"] for r in rows]
+    return [GroupId(r["group_id"]) for r in rows]
 
 
-async def groups_with_state() -> list[int]:
+async def groups_with_state() -> list[GroupId]:
     rows = await pool().fetch("SELECT group_id FROM group_state")
-    return [r["group_id"] for r in rows]
+    return [GroupId(r["group_id"]) for r in rows]
 
 
-async def has_agreed(group_id: int, user_id: str, version: int) -> bool:
+async def has_agreed(group_id: GroupId, user_id: str, version: int) -> bool:
     """Whether this account accepted the agreement, at this version or later,
     in this group. An older acceptance does not count: bumping the version is
     how the owner voids it."""
     return await pool().fetchval(
         "SELECT EXISTS(SELECT 1 FROM user_agreement"
         " WHERE group_id=$1 AND user_id=$2 AND version >= $3)",
-        group_id, user_id, version)
+        _group(group_id),
+        user_id,
+        version,
+    )
 
 
-async def record_agreement(group_id: int, user_id: str, version: int) -> bool:
+async def record_agreement(group_id: GroupId, user_id: str, version: int) -> bool:
     """File one acceptance of this version; True when it changed anything - a
     first acceptance or an upgrade - False when already at this version or
     later."""
-    return bool(await pool().fetchval(
-        """INSERT INTO user_agreement (group_id, user_id, version)
+    return bool(
+        await pool().fetchval(
+            """INSERT INTO user_agreement (group_id, user_id, version)
            VALUES ($1,$2,$3)
            ON CONFLICT (group_id, user_id)
            DO UPDATE SET version = EXCLUDED.version, agreed_at = NOW()
                    WHERE user_agreement.version < EXCLUDED.version
         RETURNING TRUE""",
-        group_id, user_id, version,
-    ))
+            _group(group_id),
+            user_id,
+            version,
+        )
+    )
 
 
-async def person_of_accounts(user_ids: list[str]) -> dict[str, uuid.UUID]:
-    """Which person each account belongs to, for the accounts the identity layer
-    knows. A merge repoints every account of the loser, so equal ids here mean one
-    person; an account absent from the answer has never spoken anywhere."""
+async def holder_ids_for_accounts(user_ids: list[str]) -> dict[str, uuid.UUID]:
+    """Return the current holder id for each known exact account."""
     want = sorted({u for u in user_ids if u})
     if not want:
         return {}
     rows = await pool().fetch(
         """SELECT platform_user_id, entity_id FROM identity_account
-            WHERE platform='qq' AND platform_user_id = ANY($1::text[])""", want)
+            WHERE platform='qq' AND platform_user_id = ANY($1::text[])""",
+        want,
+    )
     return {r["platform_user_id"]: r["entity_id"] for r in rows}
 
 
-async def accounts_sharing_person(user_id: str) -> list[str]:
-    """Every account of the person this one belongs to, itself included."""
+async def linked_account_ids(user_id: str) -> list[str]:
+    """Return every exact account currently linked to this one."""
     rows = await pool().fetch(
         """SELECT b.platform_user_id FROM identity_account a
              JOIN identity_account b ON b.entity_id = a.entity_id AND b.platform = 'qq'
-            WHERE a.platform='qq' AND a.platform_user_id=$1""", user_id)
+            WHERE a.platform='qq' AND a.platform_user_id=$1""",
+        user_id,
+    )
     found = [r["platform_user_id"] for r in rows]
     return found if user_id in found else [*found, user_id]
 
 
-async def muted_groups() -> list[int]:
+async def muted_groups() -> list[GroupId]:
     """Read from the table, not the in-memory registry: a group muted before the
     last restart and quiet since is exactly the one the daily report must not
     forget to list."""
     rows = await pool().fetch("SELECT group_id FROM group_state WHERE muted")
-    return [r["group_id"] for r in rows]
+    return [GroupId(r["group_id"]) for r in rows]
 
 
 # -- reply evidence ----------------------------------------------------------
 
 
-async def evidence_add(group_id: int, reply_event_id: str, memo: EvidenceMemo) -> None:
+async def evidence_add(group_id: GroupId, reply_event_id: str, memo: EvidenceMemo) -> None:
     """Store one structured memo; a replayed reply keeps its original evidence."""
 
     await pool().execute(
         """INSERT INTO reply_trace
-               (group_id, reply_event_id, content, memo, expires_at)
-           VALUES ($1,$2,'',$3,$4)
+               (group_id, reply_event_id, memo, expires_at)
+           VALUES ($1,$2,$3,$4)
            ON CONFLICT (group_id, reply_event_id) DO NOTHING""",
-        group_id,
+        _group(group_id),
         reply_event_id,
         memo.to_dict(),
         memo.expires_at,
     )
 
 
-async def evidence_for(group_id: int, reply_event_ids: list[str]) -> dict[str, str]:
+async def evidence_for(group_id: GroupId, reply_event_ids: list[str]) -> dict[str, str]:
     """Render unexpired structured memos for prompt replay."""
 
     if not reply_event_ids:
@@ -497,7 +580,7 @@ async def evidence_for(group_id: int, reply_event_ids: list[str]) -> dict[str, s
         """SELECT reply_event_id, memo FROM reply_trace
             WHERE group_id=$1 AND reply_event_id = ANY($2::text[])
               AND memo IS NOT NULL AND expires_at > NOW()""",
-        group_id,
+        _group(group_id),
         reply_event_ids,
     )
     rendered: dict[str, str] = {}
@@ -525,7 +608,7 @@ async def evidence_prune() -> int:
 
 async def ledger_add(
     *,
-    group_id: str | None,
+    group_id: GroupId | None,
     kind: str,
     model: str,
     in_hit: int = 0,
@@ -571,17 +654,26 @@ async def ledger_add(
     )
 
 
-async def top_spenders(group_id: int, *, k: int) -> list[dict]:
-    """This group's costliest people this calendar month, merged accounts as one.
+async def top_spenders(group_id: GroupId, *, k: int, all_linked: bool = False) -> list[dict]:
+    """This group's costliest exact accounts or explicitly linked holders."""
 
-    The read-side person primitive, written out once so later person-level readings
-    copy it rather than reinvent it: the ledger stores the causing *account* (append-
-    only, never rewritten), and the person is resolved at query time by joining
-    identity_account and grouping on entity_id - a merge repoints the account rows,
-    so every past charge follows the person the moment the owner declares them one.
-    An account the identity layer has never seen groups as itself.
-    """
     today = _as_date(today_local())
+    if not all_linked:
+        rows = await pool().fetch(
+            """SELECT user_id AS person, ARRAY[user_id] AS accounts,
+                      sum(cny) AS cny, sum(calls) AS calls
+                 FROM cost_ledger
+                WHERE group_id=$1 AND user_id <> ''
+                  AND day >= $2 AND day <= $3
+                GROUP BY user_id
+                ORDER BY sum(cny) DESC, user_id
+                LIMIT $4""",
+            _group(group_id),
+            today.replace(day=1),
+            today,
+            k,
+        )
+        return [dict(row) for row in rows]
     rows = await pool().fetch(
         """SELECT COALESCE(ia.entity_id::text, l.user_id) AS person,
                   array_agg(DISTINCT l.user_id) AS accounts,
@@ -594,22 +686,17 @@ async def top_spenders(group_id: int, *, k: int) -> list[dict]:
             GROUP BY person
             ORDER BY sum(l.cny) DESC, person
             LIMIT $4""",
-        group_id, today.replace(day=1), today, k,
+        _group(group_id),
+        today.replace(day=1),
+        today,
+        k,
     )
-    return [dict(r) for r in rows]
+    return [dict(row) for row in rows]
 
 
-def _group(group_id: str | int | None) -> int | None:
-    """A group id as the ledger stores it.
-
-    Everything above the repositories carries it as a string, because that is what the
-    platform hands over and what a config key looks like; the column is a bigint like
-    every other group_id in the schema. Converting in one place keeps a write from
-    failing at runtime with a type error nobody sees until the bill is wrong.
-
-    None becomes 0, the row for costs that belong to no single group.
-    """
-    return 0 if group_id is None else int(group_id)
+def _group(group_id: GroupId | None) -> int:
+    """Encode an optional domain group id for the ledger and SQL parameters."""
+    return 0 if group_id is None else group_id.to_db()
 
 
 def _as_date(day: str | date) -> date:
@@ -629,7 +716,10 @@ async def month_calls(kind: str, model: str) -> int:
     v = await pool().fetchval(
         """SELECT COALESCE(sum(calls),0) FROM cost_ledger
             WHERE day >= $1 AND day <= $2 AND kind=$3 AND model=$4""",
-        today.replace(day=1), today, kind, model,
+        today.replace(day=1),
+        today,
+        kind,
+        model,
     )
     return int(v or 0)
 
@@ -641,7 +731,7 @@ async def day_cost(day: str | date) -> float:
     return float(v or 0.0)
 
 
-async def day_breakdown(day: str | date, group_id: str | None = None) -> list[dict]:
+async def day_breakdown(day: str | date, group_id: GroupId | None = None) -> list[dict]:
     """Cost and call counts for one day, by kind and model.
 
     Without group_id this covers every group, which is what the budget is measured

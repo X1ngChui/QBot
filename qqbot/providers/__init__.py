@@ -56,29 +56,4 @@ __all__ = [
     "ToolResult",
     "ToolSpec",
     "VisionModel",
-    "build_default",
-    "providers",
-    "set_providers",
 ]
-
-_providers: Providers | None = None
-
-
-def build_default() -> Providers:
-    from ..settings import config
-    from .registry import build
-
-    return build(config().default)
-
-
-def providers() -> Providers:
-    global _providers
-    if _providers is None:
-        _providers = build_default()
-    return _providers
-
-
-def set_providers(bundle: Providers | None) -> None:
-    """Inject a bundle for tests; None restores startup construction."""
-    global _providers
-    _providers = bundle

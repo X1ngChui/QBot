@@ -1,92 +1,112 @@
 # Commands
 
-Commands are typed in the group and start with `/`. A command name must be followed by
-a space or the end of the message; `/who@someone` without the space is not a command.
-Command lines are archived and shown to the model like any other message, and the
-bot's answers to them are on the record too.
+Commands are sent in a group and start with `/`. The command name must end or be
+followed by a space; `/who@someone` is not a command. `/help` shows the same catalogue
+to everyone, with authorization labels, and `/help <name>` shows the exact syntax.
 
-`/help` lists exactly the commands the reader may run, and `/help <name>` shows one in
-detail. Anything the reader may not run is ignored without a reply.
+Authorization never changes an action's meaning. The same command and arguments select
+the same target and scope for an owner and a member; authorization only allows or rejects
+the action. The QQ group's administrator role is not used. "Owner" means an account in
+the bot's global `owners` setting.
+
+## Account scope
+
+Person commands distinguish an exact platform account from the account holder's current
+linked set:
+
+- Exact account is the default.
+- `--all` explicitly selects the linked account set and its holder-scoped records.
+- An agreed member may target only their own exact account or linked set. An owner may
+  target another account with a structured `@` mention.
+- Bare `/who` therefore means the caller's exact account for everyone. The owner-only
+  whole-group directory is the separate `/members` command.
+
+Unknown flags, duplicate flags, surplus text and surplus mentions are rejected. Retired
+implicit forms such as `-` for clearing a value are not aliases for the current syntax.
 
 ## Permission levels
 
-| Level | Who | What |
+| Level | Who | Commands |
 | --- | --- | --- |
-| Owner | Accounts in the global `owners` list | The whole console, including commands whose effects span groups |
-| Member (self) | Anyone who has accepted the agreement | `/who`, `/note`, `/alias`, `/forget` against their own record |
-| Member | Anyone who has accepted the agreement | The read-only `/card`, `/stats`, `/top`, `/groupstats` |
-| Anyone | Before accepting the agreement | `/agree`, `/terms` |
+| Open | Anyone | `/help`, `/terms`, `/agree` |
+| Agreed | A member who accepted this group's current agreement | `/who`, `/note`, `/alias`, `/forget`, `/link`, `/unlink`, `/card`, `/stats`, `/top` |
+| Owner | An account in `owners` | `/members`, `/block`, `/mute`, `/merge`, `/split`, `/debug`, `/log`, plus owner-only sub-actions noted below |
 
-"Self" means the person, not the account: a merged alt operates its main's record. The
-QQ group's own admin role is never consulted.
+## My account data
 
-## Reference
-
-### Agreement
-
-| Command | Usage |
+| Command | Meaning |
 | --- | --- |
-| `/terms` | Shows the user agreement. |
-| `/agree` | Records acceptance for this group and the current agreement version. Until then the bot does not reply to the member and only points at `/terms`; their messages are still read and archived. |
+| `/who [--all] [@account]` | Show the exact account by default, or the linked aggregate with `--all`. Fact indexes belong to this view. |
+| `/note [--all] [@account]` | Show the note at the selected scope. |
+| `/note set [--all] [@account] TEXT` | Replace the note at the selected scope. Notes are explicit confirmed context and are never rewritten automatically. |
+| `/note clear [--all] [@account]` | Clear the selected note. |
+| `/alias [--all] [@account]` | List aliases at the selected scope. |
+| `/alias add [--all] [@account] NAME` | Add a confirmed alias. |
+| `/alias remove [--all] [@account] NAME` | Retire an alias. Historical messages remain unchanged. |
+| `/alias confidence [--all] [@account] SCORE NAME` | Set manual confidence from 0 through 1. |
+| `/forget [--all] [@account] N` | Retract fact N from the matching `/who` view. |
 
-### Member records
+## Linking accounts
 
-| Command | Usage |
+Member self-service and owner repair use different commands.
+
+| Command | Meaning |
 | --- | --- |
-| `/who` | Lists the group's members. |
-| `/who @member` | Shows what is known about the member: names with confidence, facts with their index and confidence, the note. Members may only look at themselves. |
-| `/note @member` | Shows the note. |
-| `/note @member text` | Writes the note, replacing the previous one. Notes are never rewritten automatically and are treated as confirmed information by extraction. |
-| `/note @member -` | Clears the note. |
-| `/alias @member` | Lists the member's names with confidence. |
-| `/alias @member name` | Registers a name at confidence 1.0. |
-| `/alias @member name=0.6` | Sets a name's confidence. Manual values are final; automatic observation does not override them. |
-| `/alias @member -name` | Retires a name. Old messages using it are still resolved. |
-| `/forget @member N` | Deletes fact N from the member's record. Indexes come from `/who @member`. |
+| `/link @other-account` | Create a short-lived link request. This command confirms the initiating account. |
+| `/link confirm CODE` | The invited account confirms in the same group. Both current linked sets are then merged. The target account must have accepted the agreement. |
+| `/link cancel CODE` | Either endpoint cancels a pending request. |
+| `/unlink` | Immediately detach only the account sending the command. It accepts no target; every other account in the set stays linked. |
+| `/merge @account-A @account-B` | Owner-only repair: symmetrically merge the two current linked sets. |
+| `/split @account` | Owner-only repair: detach only the mentioned exact account. |
 
-### Group record
+Link codes prevent mix-ups and replay; ownership is proven by the invited platform account
+sending the confirmation. A request expires or becomes invalid if either linked set
+changes before confirmation.
 
-| Command | Usage |
+## Group data and usage
+
+| Command | Meaning |
 | --- | --- |
-| `/card` | What is known about the group itself: its topic and the meaning of its jargon. Same source and same decay as member records. |
-| `/forget N` | Deletes fact N from the group record. Owners only. |
+| `/card` | Show structured facts about this group, such as its topic and local terminology. |
+| `/card forget N` | Owner-only: retract group fact N. |
+| `/stats` | Show this group's usage and state. |
+| `/stats global` | Owner-only: show global usage and diagnostics. |
+| `/top [N]` | Show up to N spending rows for exact accounts. |
+| `/top --all [N]` | Aggregate spending by current linked account sets. |
+| `/members` | Owner-only: show the whole-group account directory. This is never an alternate meaning of `/who`. |
 
-### Identity
+## Blocking and muting
 
-Owners only. These rewrite the identity graph, which spans every group.
-
-| Command | Usage |
+| Command | Meaning |
 | --- | --- |
-| `/merge @alt @main` | Declares the two accounts one person. Records are combined, not rewritten. A block on either account then covers both. |
-| `/split @account` | Gives the account its own person again. Names it produced itself move with it. |
+| `/block` | List the group's current exact-account and linked-set rules. |
+| `/block add @account [30m\|12h\|3d]` | Add or replace an exact-account rule, optionally with an expiry. |
+| `/block add --all @account [30m\|12h\|3d]` | Add or replace a rule for the account's linked set. The rule follows later links and splits dynamically. |
+| `/block remove [--all] @account` | Remove the matching exact-account or linked-set rule. |
+| `/mute [status]` | Show this group's mute state. |
+| `/mute on` / `/mute off` | Enable or disable group mute. |
 
-### Blocking and muting
+Blocked and muted messages are still admitted to the canonical archive. Owners cannot be
+blocked.
 
-| Command | Usage |
+## Maintenance
+
+| Command | Meaning |
 | --- | --- |
-| `/block` | Lists the group's block list. |
-| `/block @member` | Stops answering the member until unblocked. Their messages are still read, archived and used for memory. Covers every account of the person. Owners cannot be blocked. |
-| `/block @member 3d` | Same, expiring after the duration (`m`, `h`, `d`). A second `/block` replaces the duration. |
-| `/unblock @member` | Lifts the block. |
-| `/mute` | The bot stops speaking in this group, even when addressed. Survives restarts. |
-| `/unmute` | Resumes. |
+| `/debug [status]` | Show debug capture state. |
+| `/debug start N` | Capture the next N model rounds, bounded by `diagnostics.debug_max_rounds`. |
+| `/debug stop` | Stop capture. |
+| `/log [N]` | Show the configured bounded tail of the application log. |
 
-### Usage
+Debug captures contain provider-neutral prompt and completed-turn data. Credentials,
+provider wire state and model reasoning are not written.
 
-| Command | Usage |
+## Agreement
+
+| Command | Meaning |
 | --- | --- |
-| `/stats` | Totals over every group: today's spend against the cap, calls by kind, search allowance for the month, extraction backlog, cache hit rates, recent errors. |
-| `/groupstats` | This group today: persona, spend, replies, backlog, mute state, blocked members. |
-| `/top` | The group's top spenders this month, by person. A reply's whole cost is booked to whoever addressed the bot; a picture's description to whoever posted it. |
-| `/top N` | Top N, at most 20. |
+| `/terms` | Show the current group agreement. |
+| `/agree` | Accept its current version for this exact account in this group. Account linking does not transfer agreement. |
 
-### Maintenance
-
-Owners only.
-
-| Command | Usage |
-| --- | --- |
-| `/reload` | Re-reads settings, personas, prompts, predicates and the agreement. Invalid candidates and any change to a restart-scoped field are rejected atomically; the active bundle stays untouched and exact restart paths are reported. Code changes need a rebuild. |
-| `/debug N` | Captures the next N model rounds (at most 50) from every group into `logs/debug/`, one JSON file per round with provider-neutral prompt items and completed turn data. Provider wire items, reasoning, response ids and credentials never enter the capture. Turns itself off when done or on restart. `/debug` shows the state, `/debug off` stops it. |
-| `/log` | The last 15 lines of the application log. |
-| `/log N` | The last N lines, at most 60. |
+Command messages and bot command responses enter the same canonical archive as ordinary
+messages.

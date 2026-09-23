@@ -5,14 +5,13 @@ not scan arbitrary text files and does not accept a user-editable role manifest.
 `qqbot/prompting/templates.py` is the single code-owned contract for:
 
 - the closed logical template keys;
-- each template's model role and reload lifecycle;
+- each template's model role;
 - the exact allowed slots, whether a slot may be empty, and any code-owned partial source;
 - one-pass, non-executable `{{ascii_slot}}` rendering.
 
-A load or `/reload` accepts the complete bundle or rejects it unchanged. Unknown,
-missing, duplicate or malformed slots fail before any model request. Inserted values
-are never parsed again as templates, so member text containing braces cannot gain
-formatting authority.
+A startup load accepts the complete bundle or rejects it. Unknown, missing, duplicate or
+malformed slots fail before any model request. Inserted values are never parsed again as
+templates, so member text containing braces cannot gain formatting authority.
 
 ## Logical templates
 
@@ -48,9 +47,8 @@ The reply request remains:
 3. structured history and tool continuations;
 4. volatile `reply_user`.
 
-The extraction request is `extract_system` plus `extract_user`. Extraction templates
-and both shared partials are restart-scoped because `MemoryExtractor` freezes its
-prefix at worker construction. Other templates are reloadable.
+The extraction request is `extract_system` plus `extract_user`. The complete catalog is
+validated once at startup and remains unchanged for the process lifetime.
 
 ## Identity legend
 

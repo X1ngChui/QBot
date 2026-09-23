@@ -13,7 +13,7 @@ from ..settings import config
 from .memory_extractor import GROUP_TERM, GROUP_TOPIC
 
 #: The predicate a hand-written note is filed under. It renders as itself, with no verb
-#: in front: an owner who types a note has already written the sentence they want.
+#: in front: an authorized user who types a note already wrote the complete sentence.
 NOTE = "note"
 
 
@@ -52,5 +52,3 @@ def render_fact(predicate: str, object_value, object_key: str | None = None) -> 
     if entry is None:
         return ""
     return entry.render(obj)
-
-

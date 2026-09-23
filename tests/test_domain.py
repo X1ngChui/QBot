@@ -15,8 +15,7 @@ from qqbot.domain.identity import (
     IdentityAccount, normalize,
 )
 from qqbot.domain.memory import (
-    Candidate, CandidateType, Episode, EpisodeType, Fact, Participant,
-    RejectReason,
+    Candidate, CandidateType, Episode, EpisodeType, Fact, RejectReason,
 )
 
 fails = []
@@ -116,18 +115,22 @@ except ValueError:
 
 # ---- candidates -----------------------------------------------------------
 cand = Candidate(candidate_type=CandidateType.ALIAS, payload={"alias": "老周"},
-                 group_id=1, batch_size=1)
+                 group_id=1)
 check("候选默认待处理", cand.status == "pending")
 bad = cand.rejected(RejectReason.AMBIGUOUS_ALIAS)
 check("否掉时记下理由", bad.status == "rejected" and bad.reject_reason == "ambiguous_alias")
 check("否掉不改原对象", cand.status == "pending")
 
 # ---- episodes -------------------------------------------------------------
-ep = Episode(group_id=111, summary="讨论了买哪把键盘",
-             episode_type=EpisodeType.DISCUSSION,
-             participants=(Participant(entity_id=wang.id, role="推荐者"),),
-             event_ids=(uuid.uuid4(),))
+ep = Episode(
+    group_id=111,
+    summary="讨论了买哪把键盘",
+    episode_type=EpisodeType.DISCUSSION,
+    extraction_id=uuid.uuid4(),
+    event_ids=(uuid.uuid4(),),
+)
 check("事件挂着原始消息作为凭据", len(ep.event_ids) == 1)
+check("事件记得来自哪个精确归纳批次", ep.extraction_id is not None)
 
 from datetime import UTC, datetime, timedelta
 from qqbot.domain.evidence import (

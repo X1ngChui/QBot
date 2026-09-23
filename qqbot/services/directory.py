@@ -1,10 +1,7 @@
-"""What the bot knows about the people in one group, and how an owner corrects it.
+"""What the bot knows about people in one group and how authorized users correct it.
 
-This is the application service the ops commands sit on. It is its own module because
-`plugins/commands.py` cannot be imported without a live NoneBot runtime - `on_command()`
-runs at import time - so any logic written inside a handler sits in a blind spot the
-test suite cannot reach. Everything here is plain async Python over the repositories,
-so the suite exercises the real thing.
+This application service keeps identity and memory operations independent of the adapter;
+the importable command handlers and other callers exercise the same methods directly.
 
 The shape it returns - one card per *person*, not per account - is the point of the
 identity layer. Two accounts an owner has merged are one line here, with one set of names
@@ -15,17 +12,25 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, UTC
+from datetime import UTC, datetime
 
-from ..domain.identity import (ALIAS_MAX_CHARS, Alias, AliasEvidence, AliasType,
-                               EvidenceType, normalize)
+from ..domain.ids import GroupId
+from ..domain.identity import (
+    ALIAS_MAX_CHARS,
+    Alias,
+    AliasEvidence,
+    AliasType,
+    EvidenceType,
+    IdentityAccount,
+    normalize,
+)
 from ..domain.memory import Fact, MemoryType
 from ..repositories import (
-    EventRepository, IdentityRepository, MemoryRepository,
+    EventRepository,
+    IdentityRepository,
+    MemoryRepository,
 )
-from ..db import repo as db_repo
 from ..util import now_local
 from .context_builder import NOTE, render_fact
 from .identity_resolver import IdentityResolver, UnknownAccount
@@ -33,9 +38,9 @@ from .memory_extractor import GROUP_TOPIC
 
 log = logging.getLogger("qqbot.directory")
 
-#: Confidence given to anything an owner types. Equal to platform identity and above
-#: every inference, because it is the one input the model is not allowed to overrule -
-#: a correction that the next extraction round could outvote would not be a correction.
+#: Confidence given to an explicit command correction. Equal to platform identity and
+#: above every inference, because a correction that the next extraction round could
+#: outvote would not be a correction.
 MANUAL_CONFIDENCE = 1.0
 
 
@@ -50,7 +55,7 @@ class NameTaken(ValueError):
     """This name already points at somebody else in this group.
 
     Its own class because the command layer answers it differently from every other
-    failure: nothing broke, the owner is being told who has the name.
+    failure: nothing broke, the caller is being told who has the name.
     """
 
     def __init__(self, text: str, holder: str) -> None:
@@ -71,7 +76,7 @@ class NotMerged(ValueError):
     def __init__(self, user_id: str) -> None:
         super().__init__(f"account {user_id} is not merged with anything")
         self.user_id = user_id
-        #: What the owner is told.
+        #: What the caller is told.
         self.message = "这个账号没有和别的账号合并过，不需要拆分。"
 
 
@@ -92,7 +97,7 @@ class NameCard:
 
 @dataclass(frozen=True, slots=True)
 class FactCard:
-    """One current fact, numbered so that an owner can point at it.
+    """One current fact, numbered so an authorized caller can point at it.
 
     The number is what /forget takes. It is positional within a single listing rather
     than stored, so it has to be produced by the same call that displays them - which is
@@ -106,9 +111,10 @@ class FactCard:
     object_key: str | None
     object: str
     #: The Wilson lower bound earned from distinct supporting events - see
-    #: domain.memory.earned_confidence. The number shown to an owner: "how sure" and
+    #: domain.memory.earned_confidence. The displayed number combines "how sure" and
     #: "how much evidence" in one unit.
     confidence: float
+    account_id: uuid.UUID | None = None
 
     @property
     def manual(self) -> bool:
@@ -126,11 +132,12 @@ class PersonCard:
     entity_id: uuid.UUID
     user_id: str
     display: str
+    account_id: uuid.UUID | None = None
     accounts: tuple[str, ...] = ()
     messages: int = 0
     names: tuple[NameCard, ...] = ()
     #: Names on record but below the line the bot uses - the model's unconfirmed guesses
-    #: and first-day platform names. Shown to an owner because these are exactly what the
+    #: and first-day platform names. Exposed because these are exactly what the
     #: confidence-setting form of /alias adjusts, and a lever over invisible state is not
     #: a lever.
     candidates: tuple[NameCard, ...] = ()
@@ -144,8 +151,7 @@ class PersonCard:
     @property
     def other_names(self) -> tuple[str, ...]:
         """Names besides the one currently shown in the group."""
-        return tuple(dict.fromkeys(
-            n.text for n in self.names if n.text != self.display))
+        return tuple(dict.fromkeys(n.text for n in self.names if n.text != self.display))
 
     @property
     def displayed_names(self) -> tuple[str, ...]:
@@ -156,20 +162,22 @@ class PersonCard:
         This one the platform reported: the account really did carry that name. What the
         group calls somebody is a claim about usage, and it can be wrong.
         """
-        return tuple(dict.fromkeys(
-            n.text for n in self.names
-            if n.platform_given and n.text != self.display))
+        return tuple(
+            dict.fromkeys(n.text for n in self.names if n.platform_given and n.text != self.display)
+        )
 
     @property
     def nicknames(self) -> tuple[str, ...]:
         """What people call this person, as opposed to what the account displays."""
-        return tuple(dict.fromkeys(
-            n.text for n in self.names
-            if not n.platform_given and n.text != self.display))
+        return tuple(
+            dict.fromkeys(
+                n.text for n in self.names if not n.platform_given and n.text != self.display
+            )
+        )
 
     @property
     def note(self) -> str:
-        """What an owner wrote by hand, if anything."""
+        """What an owner or the account holder wrote by hand, if anything."""
         return "；".join(f.object for f in self.facts if f.manual)
 
     @property
@@ -192,13 +200,11 @@ def _current_platform_name(aliases) -> str:
     a rename, the old confirmed card outweighs the new one on certainty precisely because
     it endured, but the account is no longer wearing it.
     """
-    platform = [a for a in aliases
-                if a.alias_type in (AliasType.GROUP_CARD, AliasType.QQ_NICKNAME)]
+    platform = [a for a in aliases if a.alias_type in (AliasType.GROUP_CARD, AliasType.QQ_NICKNAME)]
     if not platform:
         return ""
     epoch = datetime.min.replace(tzinfo=UTC)
-    newest = max(platform,
-                 key=lambda a: (a.last_used_at or a.valid_from or epoch, a.confidence))
+    newest = max(platform, key=lambda a: (a.last_used_at or a.valid_from or epoch, a.confidence))
     return newest.alias_text
 
 
@@ -230,7 +236,10 @@ class Directory:
 
     # -- reads ------------------------------------------------------------
     async def roster(
-        self, group_id: int, *, display: dict[str, str] | None = None,
+        self,
+        group_id: GroupId,
+        *,
+        display: dict[str, str] | None = None,
         exclude: set[str] | None = None,
     ) -> list[PersonCard]:
         """Everyone who has spoken here, most talkative first.
@@ -266,74 +275,137 @@ class Directory:
         cards.sort(key=lambda c: (-c.messages, c.user_id))
         return cards
 
-    async def person(self, group_id: int, user_id: str) -> PersonCard:
-        """One person, named by the account that was @-ed.
+    async def account_card(self, group_id: GroupId, user_id: str) -> PersonCard:
+        """The record attached to one exact platform account."""
 
-        Raises UnknownAccount if this account has never been seen - which is a different
-        answer from "nothing is known about them yet", and the caller says so differently.
-        """
-        acc = await self._identity.account(user_id)
-        eid = acc.entity_id
-        accounts = [a.platform_user_id for a in await self._ids.accounts_of(eid)]
+        account = await self._identity.account(user_id)
         counts = await self._events.speaker_counts(group_id)
-        return await self._card(group_id, eid, accounts or [user_id], counts, {})
+        aliases = await self._ids.aliases_for_account(group_id, account.id)
+        facts = await self._memory.current_account_facts(group_id, [account.id])
+        shown = _current_platform_name(aliases) or user_id
+        return self._make_card(
+            entity_id=account.entity_id,
+            account_id=account.id,
+            primary=user_id,
+            accounts=[user_id],
+            display=shown,
+            counts=counts,
+            aliases=aliases,
+            facts=facts,
+        )
 
-    async def accounts_of_person(self, user_id: str) -> list[str]:
-        """Every account the person behind this one holds, the given one included.
+    async def holder_card(self, group_id: GroupId, user_id: str) -> PersonCard:
+        """The aggregate record for every account linked to the named account."""
 
-        A merge makes several accounts one person, and anything an owner decides
-        about a person has to reach all of them - being blocked on the account
-        that was @-ed while the alt keeps talking is the whole reason this exists.
-        An account nobody has seen yet is a person of one: the caller acts on what
-        it was given rather than failing.
-        """
-        return await db_repo.accounts_sharing_person(user_id)
+        account = await self._identity.account(user_id)
+        accounts = [a.platform_user_id for a in await self._ids.accounts_of(account.entity_id)]
+        counts = await self._events.speaker_counts(group_id)
+        return await self._card(
+            group_id,
+            account.entity_id,
+            accounts or [user_id],
+            counts,
+            {},
+        )
+
+    async def account(self, user_id: str) -> IdentityAccount:
+        """Resolve one platform account for command and policy services."""
+
+        return await self._identity.account(user_id)
+
+    async def accounts_of_holder(self, entity_id: uuid.UUID) -> list[IdentityAccount]:
+        return await self._ids.accounts_of(entity_id)
+
+    async def linked_account_ids(self, user_id: str) -> list[str]:
+        """Every exact account currently linked to this one."""
+
+        try:
+            account = await self._identity.account(user_id)
+        except UnknownAccount:
+            return [user_id]
+        return [item.platform_user_id for item in await self._ids.accounts_of(account.entity_id)]
 
     async def _card(
-        self, group_id: int, entity_id: uuid.UUID, accounts: list[str],
-        counts: dict[str, int], display: dict[str, str],
+        self,
+        group_id: GroupId,
+        entity_id: uuid.UUID,
+        accounts: list[str],
+        counts: dict[str, int],
+        display: dict[str, str],
     ) -> PersonCard:
         aliases = await self._ids.aliases_for(group_id, entity_id)
-        usable = [a for a in aliases if a.is_usable]
         facts = await self._memory.current_facts(group_id, [entity_id])
-
-        # Whichever of this person's accounts talks the most is the one they are filed
-        # under: it is the account whose group card people actually see.
-        primary = max(accounts, key=lambda u: (counts.get(u, 0), u))
+        primary = max(accounts, key=lambda user: (counts.get(user, 0), user))
         shown = (display.get(primary) or "").strip() or next(
-            (display[u] for u in accounts if (display.get(u) or "").strip()), ""
+            (display[user] for user in accounts if (display.get(user) or "").strip()),
+            "",
         ).strip()
         if not shown:
             shown = _current_platform_name(aliases) or primary
+        return self._make_card(
+            entity_id=entity_id,
+            account_id=None,
+            primary=primary,
+            accounts=accounts,
+            display=shown,
+            counts=counts,
+            aliases=aliases,
+            facts=facts,
+        )
 
-        # Sorted by predicate rather than by confidence so the numbering an owner reads
-        # off /who is still the same numbering a moment later when they type /forget.
-        ordered = sorted(facts, key=lambda f: (f.predicate != NOTE, f.predicate, str(f.id)))
+    @staticmethod
+    def _make_card(
+        *,
+        entity_id: uuid.UUID,
+        account_id: uuid.UUID | None,
+        primary: str,
+        accounts: list[str],
+        display: str,
+        counts: dict[str, int],
+        aliases: list[Alias],
+        facts: list[Fact],
+    ) -> PersonCard:
+        usable = [alias for alias in aliases if alias.is_usable]
+        ordered = sorted(
+            facts,
+            key=lambda fact: (
+                fact.predicate != NOTE,
+                fact.predicate,
+                str(fact.subject_account_id or ""),
+                str(fact.id),
+            ),
+        )
         return PersonCard(
             entity_id=entity_id,
+            account_id=account_id,
             user_id=primary,
-            display=shown,
+            display=display,
             accounts=tuple(sorted(accounts)),
-            messages=sum(counts.get(u, 0) for u in accounts),
+            messages=sum(counts.get(user, 0) for user in accounts),
             names=tuple(
-                NameCard(a.alias_text, a.alias_type, a.confidence, a.is_global)
-                for a in usable
+                NameCard(alias.alias_text, alias.alias_type, alias.confidence, alias.is_global)
+                for alias in usable
             ),
             candidates=tuple(
-                NameCard(a.alias_text, a.alias_type, a.confidence, a.is_global)
-                for a in aliases if not a.is_usable
+                NameCard(alias.alias_text, alias.alias_type, alias.confidence, alias.is_global)
+                for alias in aliases
+                if not alias.is_usable
             ),
             facts=tuple(
                 FactCard(
-                    index=i, id=f.id, predicate=f.predicate, object_key=f.object_key,
-                    object="" if f.object_value is None else str(f.object_value),
-                    confidence=f.confidence,
+                    index=index,
+                    id=fact.id,
+                    predicate=fact.predicate,
+                    object_key=fact.object_key,
+                    object="" if fact.object_value is None else str(fact.object_value),
+                    confidence=fact.confidence,
+                    account_id=fact.subject_account_id,
                 )
-                for i, f in enumerate(ordered, start=1)
+                for index, fact in enumerate(ordered, start=1)
             ),
         )
 
-    async def group_facts(self, group_id: int) -> tuple[FactCard, ...]:
+    async def group_facts(self, group_id: GroupId) -> tuple[FactCard, ...]:
         """What is known about the group itself, numbered for /forget.
 
         The group is an entity, so what it is for and what its words mean are facts with
@@ -342,51 +414,57 @@ class Directory:
         """
         subject = await self._ids.group_entity(group_id)
         facts = await self._memory.current_facts(group_id, [subject])
-        ordered = sorted(facts,
-                         key=lambda f: (f.predicate != GROUP_TOPIC, f.predicate,
-                                        str(f.id)))
+        ordered = sorted(facts, key=lambda f: (f.predicate != GROUP_TOPIC, f.predicate, str(f.id)))
         return tuple(
             FactCard(
-                index=i, id=f.id, predicate=f.predicate, object_key=f.object_key,
+                index=i,
+                id=f.id,
+                predicate=f.predicate,
+                object_key=f.object_key,
                 object="" if f.object_value is None else str(f.object_value),
                 confidence=f.confidence,
             )
             for i, f in enumerate(ordered, start=1)
         )
 
-    async def forget_group_fact(self, group_id: int, index: int) -> FactCard | None:
+    async def forget_group_fact(self, group_id: GroupId, index: int) -> FactCard | None:
         """Retract one of the group's own facts by the number /card showed."""
-        match = next((f for f in await self.group_facts(group_id) if f.index == index),
-                     None)
+        match = next((f for f in await self.group_facts(group_id) if f.index == index), None)
         if match is None:
             return None
         await self._memory.retract(match.id)
-        log.info("group %s: retracted group fact %s (%s)",
-                 group_id, match.id, match.predicate)
+        log.info("group %s: retracted group fact %s (%s)", group_id, match.id, match.predicate)
         return match
 
     # -- corrections ------------------------------------------------------
-    async def note(self, group_id: int, user_id: str, text: str) -> None:
-        """Write, replace or clear the hand-written note about somebody.
+    async def note(
+        self,
+        group_id: GroupId,
+        user_id: str,
+        text: str,
+        *,
+        all_linked: bool = False,
+    ) -> None:
+        """Write, replace, or clear one exact-account or linked-holder note."""
 
-        Stored as an ordinary fact under its own predicate rather than off to one side.
-        That gets it three things for free: it flows into the prompt through the same
-        path as everything else, `supersede` guarantees there is only ever one of them,
-        and clearing it is a retraction that leaves a record instead of a deletion that
-        does not.
-
-        It never collides with an extracted fact because no extracted predicate is
-        `note` - the tool schema the model answers through does not offer it.
-        """
-        entity_id = await self._entity(user_id)
+        account = await self._identity.account(user_id)
+        facts = (
+            await self._memory.current_facts(group_id, [account.entity_id])
+            if all_linked
+            else await self._memory.current_account_facts(group_id, [account.id])
+        )
         if not text.strip():
-            for f in await self._memory.current_facts(group_id, [entity_id]):
-                if f.predicate == NOTE:
-                    await self._memory.retract(f.id)
+            for fact in facts:
+                if fact.predicate == NOTE and (
+                    (all_linked and fact.subject_entity_id is not None)
+                    or (not all_linked and fact.subject_account_id == account.id)
+                ):
+                    await self._memory.retract(fact.id)
             return
         await self._memory.supersede(
             Fact(
-                subject_entity_id=entity_id,
+                subject_entity_id=account.entity_id if all_linked else None,
+                subject_account_id=None if all_linked else account.id,
                 predicate=NOTE,
                 object_value=text.strip(),
                 memory_type=MemoryType.ATTRIBUTE,
@@ -397,171 +475,151 @@ class Directory:
             when=now_local(),
         )
 
-    async def name(self, group_id: int, user_id: str, text: str) -> NameCard:
-        """Bind a name to somebody by hand.
+    async def name(
+        self,
+        group_id: GroupId,
+        user_id: str,
+        text: str,
+        *,
+        all_linked: bool = False,
+    ) -> NameCard:
+        """Bind a name to one exact account or its linked holder."""
 
-        The escape hatch for names the group uses that the transcript never spells out -
-        the ones people say out loud and type at nobody. MANUAL evidence carries the
-        weight of platform identity, so the alias is confirmed on the spot rather than
-        waiting for a second sighting.
-
-        Raises NameTaken if somebody else here already answers to it. A name belongs to
-        one person - the same rule under which the validator refuses a batch pointing one
-        name at two accounts, and the path that carries the most authority must not be
-        the one path allowed to break it. Retire the name from the other person first if
-        that is really what is wanted.
-        """
         _check_length(text)
-        entity_id = await self._entity(user_id)
+        account = await self._identity.account(user_id)
         for other in await self._ids.lookup(group_id, text):
-            if other.target_entity_id != entity_id:
-                raise NameTaken(text.strip(),
-                                await self._display_of(group_id, other.target_entity_id,
-                                                       excluding=text))
+            holder_id = await self._ids.holder_for_alias(other)
+            if holder_id != account.entity_id:
+                raise NameTaken(
+                    text.strip(),
+                    await self._display_of(group_id, holder_id, excluding=text),
+                )
         alias = await self._ids.upsert_alias(
             Alias(
                 alias_text=text.strip(),
-                target_entity_id=entity_id,
+                target_entity_id=account.entity_id if all_linked else None,
+                target_account_id=None if all_linked else account.id,
                 group_id=group_id,
                 alias_type=AliasType.NICKNAME,
             ),
             [AliasEvidence(EvidenceType.MANUAL)],
         )
-        log.info("group %s: alias %r bound to entity %s by hand",
-                 group_id, text.strip(), entity_id)
-        return NameCard(alias.alias_text, alias.alias_type, alias.confidence,
-                        alias.is_global)
+        log.info("group %s: alias %r bound by hand", group_id, text.strip())
+        return NameCard(alias.alias_text, alias.alias_type, alias.confidence, alias.is_global)
 
     async def set_confidence(
-        self, group_id: int, user_id: str, text: str, confidence: float,
+        self,
+        group_id: GroupId,
+        user_id: str,
+        text: str,
+        confidence: float,
+        *,
+        all_linked: bool = False,
     ) -> NameCard:
-        """Set how much one name is trusted, by hand.
+        """Set one exact-account or linked-holder alias confidence by hand."""
 
-        The lever between "certain" and "struck out", for the common correction: a name
-        that is real but over-trusted - a short-lived joke card the platform reported, a
-        nickname only half the group uses. Below 0.75 the name stays
-        on record but the bot stops using it; at or above, it is usable on the spot. The
-        number is the owner's verdict: automatic sightings cannot outvote it either way.
-
-        Setting a name this person does not yet carry coins it at that confidence.
-        Raises NameTaken if somebody else here answers to it.
-        """
         confidence = max(0.0, min(1.0, confidence))
         _check_length(text)
-        entity_id = await self._entity(user_id)
+        account = await self._identity.account(user_id)
         for other in await self._ids.lookup(group_id, text):
-            if other.target_entity_id != entity_id:
-                raise NameTaken(text.strip(),
-                                await self._display_of(group_id, other.target_entity_id,
-                                                       excluding=text))
-        updated = await self._ids.set_alias_confidence(
-            group_id, entity_id, text, confidence)
+            holder_id = await self._ids.holder_for_alias(other)
+            if holder_id != account.entity_id:
+                raise NameTaken(
+                    text.strip(),
+                    await self._display_of(group_id, holder_id, excluding=text),
+                )
+        if all_linked:
+            updated = await self._ids.set_alias_confidence(
+                group_id, account.entity_id, text, confidence
+            )
+        else:
+            updated = await self._ids.set_account_alias_confidence(
+                group_id, account.id, text, confidence
+            )
         if updated is None:
             updated = await self._ids.upsert_alias(
                 Alias(
                     alias_text=text.strip(),
-                    target_entity_id=entity_id,
+                    target_entity_id=account.entity_id if all_linked else None,
+                    target_account_id=None if all_linked else account.id,
                     group_id=group_id,
                     alias_type=AliasType.NICKNAME,
                 ),
                 [AliasEvidence(EvidenceType.MANUAL, score=confidence)],
             )
-        log.info("group %s: alias %r confidence set to %.2f by hand",
-                 group_id, text.strip(), confidence)
-        return NameCard(updated.alias_text, updated.alias_type, updated.confidence,
-                        updated.is_global)
+        return NameCard(
+            updated.alias_text,
+            updated.alias_type,
+            updated.confidence,
+            updated.is_global,
+        )
 
-    async def unname(self, group_id: int, user_id: str, text: str) -> bool:
-        """Retire a name. False if this person does not answer to it.
+    async def unname(
+        self,
+        group_id: GroupId,
+        user_id: str,
+        text: str,
+        *,
+        all_linked: bool = False,
+    ) -> bool:
+        """Retire a name from one exact account or linked-holder view."""
 
-        Retired, not deleted: messages already in the archive still need it to be
-        resolvable, and dropping the row would make them unreadable in a way nothing
-        could reconstruct.
-        """
-        entity_id = await self._entity(user_id)
+        account = await self._identity.account(user_id)
+        aliases = (
+            await self._ids.aliases_for(group_id, account.entity_id)
+            if all_linked
+            else await self._ids.aliases_for_account(group_id, account.id)
+        )
         wanted = normalize(text)
         gone = 0
-        # Every matching row, not the first. A merged person can carry the same name once
-        # per pre-merge account, and retiring one row of two leaves the name showing -
-        # which reads as the command having silently failed.
-        for a in await self._ids.aliases_for(group_id, entity_id):
-            # A group's command reaches the group's rows only; a global alias
-            # (group_id NULL) is not this group's to retire.
-            if a.normalized_text == wanted and not a.is_global:
-                await self._ids.retire_alias(a.id)
+        for alias in aliases:
+            if alias.normalized_text == wanted and not alias.is_global:
+                await self._ids.retire_alias(alias.id)
                 gone += 1
         return gone > 0
 
-    async def forget(self, group_id: int, user_id: str, index: int) -> FactCard | None:
-        """Retract one fact by the number /who showed against it.
+    async def forget(
+        self,
+        group_id: GroupId,
+        user_id: str,
+        index: int,
+        *,
+        all_linked: bool = False,
+    ) -> FactCard | None:
+        """Retract one fact by the number from the matching account or holder card."""
 
-        Numbered rather than described because the alternative is matching on text, and
-        an owner retyping a fact they want gone is the one moment where a near-miss
-        deletes the wrong one.
-        """
-        card = await self.person(group_id, user_id)
-        match = next((f for f in card.facts if f.index == index), None)
+        card = (
+            await self.holder_card(group_id, user_id)
+            if all_linked
+            else await self.account_card(group_id, user_id)
+        )
+        match = next((fact for fact in card.facts if fact.index == index), None)
         if match is None:
             return None
         await self._memory.retract(match.id)
-        log.info("group %s: retracted fact %s (%s) on entity %s",
-                 group_id, match.id, match.predicate, card.entity_id)
+        log.info("group %s: retracted fact %s (%s)", group_id, match.id, match.predicate)
         return match
 
-    async def merge(self, loser: str, winner: str) -> bool:
-        """File two accounts under one person. See IdentityResolver.merge.
+    async def merge(self, left: str, right: str) -> bool:
+        """Union the current holder sets of two exact accounts."""
 
-        A block follows the merge. Being blocked is a decision about a *person*,
-        and the moment two accounts become one person a block that reached only one
-        of them is half a decision: wherever either was blocked, both now are.
-        Returns whether the merge itself did anything; the propagation is reported
-        through the returned group list of `blocks_after_merge`.
-        """
-        return await self._identity.merge(loser, winner)
-
-    async def blocks_after_merge(
-        self, user_id: str, *, shielded: Callable[[int], bool] | None = None,
-    ) -> list[tuple[int, datetime | None]]:
-        """Extend each existing block to every account of this person.
-
-        Called right after a merge. Returns (group, lapses-at) for each group whose
-        blocklist changed - the expiry rides along so the caller can refresh the
-        in-memory copies (state.GroupState.blocked; a row written behind its back
-        would not take effect until a restart). A timed block spreads with its own
-        clock: the merge widens who is blocked, never for how long.
-
-        `shielded(gid)` lets the caller veto a group: /block refuses the owner and
-        the bot itself, and a merge must not smuggle either onto a blocklist. The
-        veto is a callback because who counts as owner is per-group config, which
-        this layer does not read.
-        """
-        accounts = await self.accounts_of_person(user_id)
-        if len(accounts) < 2:
-            return []
-        touched = []
-        for gid, until in await db_repo.groups_blocking(accounts):
-            if shielded is not None and shielded(gid):
-                continue
-            await db_repo.block(gid, accounts, until=until)
-            touched.append((gid, until))
-        return touched
+        return await self._identity.merge(left, right)
 
     async def split(self, user_id: str) -> uuid.UUID:
         """Give one account its own person again. See IdentityResolver.split.
 
-        Raises NotMerged when the account is the only one its person holds. A split
-        moves the account to a fresh person and leaves facts and episodes with the
-        old one, on the evidence that they may belong to the other account - with no
-        other account, that would orphan everything ever learned about this person
-        for nothing.
+        Raises NotMerged when the account is already alone. Exact-account rows follow
+        the detached account through their foreign key; holder-scoped rows remain with
+        the original linked set because their account provenance is unknown.
         """
-        acc = await self._identity.account(user_id)
-        if len(await self._ids.accounts_of(acc.entity_id)) < 2:
-            raise NotMerged(user_id)
-        return await self._identity.split(user_id)
+        try:
+            return await self._identity.split(user_id)
+        except ValueError as exc:
+            raise NotMerged(user_id) from exc
 
-    async def _display_of(self, group_id: int, entity_id: uuid.UUID, *,
-                          excluding: str = "") -> str:
+    async def _display_of(
+        self, group_id: GroupId, entity_id: uuid.UUID, *, excluding: str = ""
+    ) -> str:
         """How somebody shows up here, for an answer that has to name them.
 
         Cheaper than a whole card: this is only ever wanted to say who already holds a
@@ -571,15 +629,25 @@ class Directory:
         """
         aliases = await self._ids.aliases_for(group_id, entity_id)
         skip = normalize(excluding)
-        return (_current_platform_name(aliases)
-                or next((a.alias_text for a in aliases
-                         if a.is_usable and a.normalized_text != skip), "")
-                or "另一位成员")
+        return (
+            _current_platform_name(aliases)
+            or next(
+                (a.alias_text for a in aliases if a.is_usable and a.normalized_text != skip), ""
+            )
+            or "另一位成员"
+        )
 
     async def _entity(self, user_id: str) -> uuid.UUID:
         # The live person: merge() repoints every account, so no chase is needed.
         return (await self._identity.account(user_id)).entity_id
 
 
-__all__ = ["Directory", "PersonCard", "FactCard", "NameCard", "UnknownAccount",
-           "NameTaken", "NotMerged"]
+__all__ = [
+    "Directory",
+    "PersonCard",
+    "FactCard",
+    "NameCard",
+    "UnknownAccount",
+    "NameTaken",
+    "NotMerged",
+]

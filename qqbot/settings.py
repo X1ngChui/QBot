@@ -1,31 +1,27 @@
 """Configuration loading and validation.
 
 Settings are global. Persona files may vary only model-facing identity and group context.
-Pydantic validates; /reload re-reads from disk and swaps the global singleton atomically
-(readers never take a lock).
+The complete bundle is validated once at startup and remains fixed for the process lifetime.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Mapping
 from dataclasses import dataclass
-from enum import StrEnum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from . import util
+from .domain.ids import GroupId
 from .prompting import PromptCatalog
 
 log = logging.getLogger("qqbot.settings")
-
-
-class RestartRequired(ValueError):
-    """A validated reload changes resources owned by the running process."""
 
 
 CONFIG_DIR = Path(os.getenv("CONFIG_DIR", "/app/config"))
@@ -33,7 +29,7 @@ DEFAULT_PERSONA_KEY = "default"
 
 
 class _M(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     @model_validator(mode="before")
     @classmethod
@@ -62,10 +58,8 @@ Effort = Literal["off", "low", "high", "max"]
 
 
 class GatewayCfg(_M):
-    #: How long an event id remains in the live gateway's replay filter.
-    dedup_ttl_sec: int = 300
-    #: How long shutdown waits for in-flight archive writes and media patches. They
-    #: are never cancelled, only waited for; a hung one must not hold a deploy.
+    #: How long shutdown waits for in-flight media patches. They are never cancelled;
+    #: a hung one must not hold a deploy.
     shutdown_wait_sec: float = Field(5.0, ge=0)
 
 
@@ -87,6 +81,49 @@ class MembersCfg(_M):
     """Caching policy for platform member metadata."""
 
     cache_ttl_sec: int = Field(1800, ge=0)
+
+
+class CommandsCfg(_M):
+    """Presentation bounds for the group command console."""
+
+    roster_max_entries: int = Field(60, ge=1, le=200)
+    top_default_entries: int = Field(5, ge=1, le=100)
+    top_max_entries: int = Field(20, ge=1, le=100)
+
+    @model_validator(mode="after")
+    def _consistent_limits(self) -> CommandsCfg:
+        if self.top_default_entries > self.top_max_entries:
+            raise ValueError("top_default_entries must not exceed top_max_entries")
+        return self
+
+
+class IdentityLinkCfg(_M):
+    """Durable cross-account ownership challenge policy."""
+
+    challenge_ttl_sec: int = Field(600, ge=60, le=3600)
+    max_pending_challenges: int = Field(1000, ge=1, le=10000)
+    max_pending_per_account: int = Field(3, ge=1, le=100)
+    challenge_code_length: int = Field(8, ge=6, le=12)
+
+
+class DiagnosticsCfg(_M):
+    """Operator-console and retained diagnostic output bounds."""
+
+    debug_max_rounds: int = Field(50, ge=1, le=200)
+    log_tail_default_lines: int = Field(15, ge=1, le=500)
+    log_tail_max_lines: int = Field(60, ge=1, le=500)
+    log_tail_scan_bytes: int = Field(65536, ge=4096, le=1048576)
+    error_ring_entries: int = Field(200, ge=10, le=5000)
+    error_message_chars: int = Field(300, ge=80, le=4000)
+    daily_report_recent_errors: int = Field(8, ge=1, le=50)
+
+    @model_validator(mode="after")
+    def _consistent_limits(self) -> DiagnosticsCfg:
+        if self.log_tail_default_lines > self.log_tail_max_lines:
+            raise ValueError("log_tail_default_lines must not exceed log_tail_max_lines")
+        if self.daily_report_recent_errors > self.error_ring_entries:
+            raise ValueError("daily_report_recent_errors must not exceed error_ring_entries")
+        return self
 
 
 class SendMessagesCfg(_M):
@@ -114,6 +151,7 @@ class SearchHistoryToolCfg(_M):
 
 class RecallEventsToolCfg(_M):
     context_episodes: int = Field(2, ge=0)
+    max_hits: int = Field(5, ge=1, le=10)
 
 
 class ReadUrlToolCfg(_M):
@@ -177,9 +215,7 @@ class PromptCfg(_M):
     @model_validator(mode="after")
     def _coherent_evidence_bounds(self) -> PromptCfg:
         if self.evidence_total_chars < self.evidence_result_chars:
-            raise ValueError(
-                "evidence_total_chars must be at least evidence_result_chars"
-            )
+            raise ValueError("evidence_total_chars must be at least evidence_result_chars")
         return self
 
 
@@ -224,8 +260,8 @@ class TextCfg(_ProviderCfg):
     #: How hard replies may think. Other uses of this model carry their own grade:
     #: extraction below, describing in capabilities.vision.
     reasoning_effort: Effort = "off"
-    #: Applied at startup only: the semaphore is built once. A reload changing it
-    #: is rejected atomically; restart to resize without losing outstanding permits.
+    #: Applied at startup only: the semaphore is built once and a restart resizes it
+    #: without losing outstanding permits.
     max_concurrency: int = Field(3, ge=1)
     timeout_sec: float = Field(30.0, gt=0)
     retries: int = Field(2, ge=0)
@@ -244,11 +280,13 @@ class TextCfg(_ProviderCfg):
         setting as an argument.
         """
         use = self.extract
-        return self.model_copy(update={
-            "model": use.model or self.model,
-            "reasoning_effort": use.reasoning_effort or self.reasoning_effort,
-            "timeout_sec": use.timeout_sec or self.timeout_sec,
-        })
+        return self.model_copy(
+            update={
+                "model": use.model or self.model,
+                "reasoning_effort": use.reasoning_effort or self.reasoning_effort,
+                "timeout_sec": use.timeout_sec or self.timeout_sec,
+            }
+        )
 
 
 class VisionCfg(_ProviderCfg):
@@ -276,6 +314,8 @@ class VisionCfg(_ProviderCfg):
     #: shortest retention any backend keeps files for (DeepSeek: 30 days).
     file_max_age_days: int = Field(20, ge=1, le=29)
     max_images_per_min: int = Field(6, ge=1)
+    max_concurrency: int = Field(1, ge=1, le=16)
+    max_output_tokens: int = Field(4096, ge=256, le=8192)
     #: Bounds both halves of picture handling: the download that feeds the
     #: description call, and the upload that puts the original in front of the
     #: reply model.
@@ -359,8 +399,7 @@ class MemoryCfg(_M):
     Model settings for the extraction call are not here - they belong to the text
     capability that runs it (capabilities.text.extract). This is the machinery around it.
 
-    Read once, when the worker is constructed: a /reload cannot change a batch that
-    is already being read, so edits here apply at the next restart.
+    Loaded once with the worker, so one process uses one memory policy.
     """
 
     #: Messages one extraction chunk holds at most.
@@ -380,6 +419,8 @@ class MemoryCfg(_M):
     #: How many already-recorded episodes the extractor is reminded of, so it
     #: recognises a conversation it has already written down.
     known_episodes: int = Field(8, ge=0)
+    #: Confirmed aliases shown beside one exact account in extraction context.
+    roster_aliases_per_account: int = Field(4, ge=0, le=20)
     #: How long an episode remains available to semantic recall. Importance is not a
     #: lifetime signal yet: extraction writes the same placeholder score on every episode,
     #: so retention stays a plain age until that score has real meaning.
@@ -392,11 +433,24 @@ class MemoryCfg(_M):
     #: calls and can outlive a short lease, and a deploy overlap would then pay for
     #: the same transcript twice.
     job_lease_min: int = Field(30, ge=1)
+    worker_idle_sec: float = Field(5.0, ge=0.1, le=60.0)
+    embedding_page_size: int = Field(200, ge=1, le=1000)
+    worker_retry_backoff_sec: tuple[int, ...] = (60, 300, 1800, 3600)
+
+    @field_validator("worker_retry_backoff_sec")
+    @classmethod
+    def _valid_backoff(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        if not 1 <= len(value) <= 8:
+            raise ValueError("worker_retry_backoff_sec needs 1 to 8 entries")
+        if any(item < 1 or item > 86400 for item in value):
+            raise ValueError("worker_retry_backoff_sec entries must be 1..86400")
+        if tuple(sorted(value)) != value:
+            raise ValueError("worker_retry_backoff_sec must be non-decreasing")
+        return value
 
 
 class ScheduleCfg(_M):
-    #: The scheduler owns this complete block. A reload changing any field is
-    #: rejected atomically; restart registers the replacement values.
+    #: The scheduler registers this complete block once at startup.
     #:
     #: The nightly pipeline: extraction drain, then decay, then backup, then the
     #: NapCat cache sweep - one trigger, stages run in order (tasks.nightly). One
@@ -430,20 +484,19 @@ class ScheduleCfg(_M):
     #: How old the newest dump may be before the daily report calls it out. Just over
     #: a day, so an ordinary night's backup never trips it.
     backup_stale_hours: float = Field(26.0, gt=0)
+    completed_job_keep_days: int = Field(30, ge=1, le=3650)
 
     @field_validator("nightly_cron", "report_cron")
     @classmethod
     def _five_fields(cls, v: str) -> str:
-        # Checked at load with the scheduler's own parser, because the scheduler
-        # only parses these at startup: a typo accepted by /reload would otherwise
-        # detonate at the next restart, hours or days later, as a boot failure far
-        # from its cause - and counting fields alone lets '30 25 * * *' through.
+        # Parse with the scheduler's own implementation during startup. This catches
+        # invalid ranges immediately; counting fields alone lets '30 25 * * *' through.
         if len(v.split()) != 5:
             raise ValueError(f"cron expression needs 5 fields: {v!r}")
         try:
             from apscheduler.triggers.cron import CronTrigger
         except ImportError:
-            return v          # bare test venv; the container always has it
+            return v  # bare test venv; the container always has it
         try:
             CronTrigger.from_crontab(v)
         except ValueError as e:
@@ -477,9 +530,7 @@ class PredicateCfg(_M):
             raise ValueError("predicate verb may contain {{object}} at most once")
         rest = value.replace(slot, "")
         if "{{" in rest or "}}" in rest or "{" in rest or "}" in rest:
-            raise ValueError(
-                "predicate verb supports only the optional {{object}} slot"
-            )
+            raise ValueError("predicate verb supports only the optional {{object}} slot")
         return value
 
     def render(self, object_value: str) -> str:
@@ -534,22 +585,21 @@ class PredicateTable(_M):
         for name, p in table.items():
             if not name.replace("_", "").isalnum() or not name.islower():
                 raise ValueError(
-                    f"predicate name must be lower-case letters, digits and _: {name!r}")
+                    f"predicate name must be lower-case letters, digits and _: {name!r}"
+                )
             if name in RESERVED_PREDICATES:
-                raise ValueError(
-                    f"{name!r} is reserved: it has its own tool and its own shape")
+                raise ValueError(f"{name!r} is reserved: it has its own tool and its own shape")
             if p.opposite is None:
                 continue
             other = table.get(p.opposite)
             if other is None:
                 raise ValueError(f"{name}: opposite names no predicate: {p.opposite!r}")
             if other.opposite != name:
-                raise ValueError(
-                    f"{name} and {p.opposite} disagree about being opposites")
+                raise ValueError(f"{name} and {p.opposite} disagree about being opposites")
         return table
 
 
-#: Names the person table may not use. `note` is what an owner typed by hand, and the
+#: Names the person table may not use. `note` is explicit command input, and the
 #: model must have no way to write over it; `topic` and `term` are about the group
 #: rather than about a person, and reach memory through their own tools.
 RESERVED_PREDICATES = frozenset({"note", "topic", "term"})
@@ -604,6 +654,7 @@ class Settings(_M):
         # Account ids are numbers to YAML unless quoted, and the checks compare
         # strings: an unquoted entry is the same person, not a schema error.
         return [str(x) for x in v] if isinstance(v, list) else v
+
     # IANA zone name. Applied at startup to every local-time reading: the clock the model
     # is told, the cron schedules, and the day the budget rolls over on.
     timezone: str = "Asia/Shanghai"
@@ -611,6 +662,9 @@ class Settings(_M):
     gateway: GatewayCfg = Field(default_factory=GatewayCfg)
     media: MediaCfg = Field(default_factory=MediaCfg)
     members: MembersCfg = Field(default_factory=MembersCfg)
+    commands: CommandsCfg = Field(default_factory=CommandsCfg)
+    identity_link: IdentityLinkCfg = Field(default_factory=IdentityLinkCfg)
+    diagnostics: DiagnosticsCfg = Field(default_factory=DiagnosticsCfg)
     tools: ToolsCfg = Field(default_factory=ToolsCfg)
     capabilities: CapabilitiesCfg
     budget: BudgetCfg = Field(default_factory=BudgetCfg)
@@ -626,157 +680,6 @@ class Settings(_M):
     prompts_dir: str = "prompts"
     #: What may be recorded about a person, one entry per predicate.
     predicates_file: str = "predicates.yaml"
-
-
-class SettingScope(StrEnum):
-    """When a global setting change can take effect."""
-
-    GLOBAL_RELOADABLE = "global_reloadable"
-    PROCESS_RESTART = "process_restart"
-
-
-@dataclass(frozen=True, slots=True)
-class SettingContract:
-    """One global setting path and the lifecycle of its runtime owner."""
-
-    path: tuple[str, ...]
-    scope: SettingScope
-    fingerprint: Callable[[Settings], object] | None = None
-
-    @property
-    def name(self) -> str:
-        return ".".join(self.path)
-
-    def value(self, settings: Settings) -> object:
-        if self.fingerprint is not None:
-            return self.fingerprint(settings)
-        value: object = settings
-        for part in self.path:
-            value = getattr(value, part)
-        if isinstance(value, BaseModel):
-            return value.model_dump(mode="json")
-        return value
-
-
-def _extract_policy(settings: Settings) -> object:
-    """Resolved worker policy, including values inherited from reply settings."""
-
-    cfg = settings.capabilities.text.for_extract()
-    return {
-        "model": cfg.model,
-        "reasoning_effort": cfg.reasoning_effort,
-        "timeout_sec": cfg.timeout_sec,
-        "retries": cfg.retries,
-    }
-
-
-SETTING_CONTRACTS = (
-    SettingContract(("timezone",), SettingScope.PROCESS_RESTART),
-    SettingContract(
-        ("capabilities", "text", "provider"), SettingScope.PROCESS_RESTART
-    ),
-    SettingContract(
-        ("capabilities", "text", "endpoint"), SettingScope.PROCESS_RESTART
-    ),
-    SettingContract(
-        ("capabilities", "text", "credential_env"), SettingScope.PROCESS_RESTART
-    ),
-    SettingContract(
-        ("capabilities", "text", "max_concurrency"),
-        SettingScope.PROCESS_RESTART,
-    ),
-    SettingContract(
-        ("capabilities", "text", "extract"),
-        SettingScope.PROCESS_RESTART,
-        _extract_policy,
-    ),
-    SettingContract(
-        ("capabilities", "vision", "provider"), SettingScope.PROCESS_RESTART
-    ),
-    SettingContract(
-        ("capabilities", "vision", "endpoint"), SettingScope.PROCESS_RESTART
-    ),
-    SettingContract(
-        ("capabilities", "vision", "credential_env"),
-        SettingScope.PROCESS_RESTART,
-    ),
-    SettingContract(
-        ("capabilities", "asr", "model_dir"), SettingScope.PROCESS_RESTART
-    ),
-    SettingContract(
-        ("capabilities", "asr", "threads"), SettingScope.PROCESS_RESTART
-    ),
-    SettingContract(
-        ("capabilities", "asr", "queue_capacity"),
-        SettingScope.PROCESS_RESTART,
-    ),
-    SettingContract(("capabilities", "embedding"), SettingScope.PROCESS_RESTART),
-    SettingContract(
-        ("capabilities", "search", "provider"), SettingScope.PROCESS_RESTART
-    ),
-    SettingContract(
-        ("capabilities", "search", "endpoint"), SettingScope.PROCESS_RESTART
-    ),
-    SettingContract(
-        ("capabilities", "search", "credential_env"),
-        SettingScope.PROCESS_RESTART,
-    ),
-    SettingContract(
-        ("capabilities", "search", "proxy"), SettingScope.PROCESS_RESTART
-    ),
-    SettingContract(("database",), SettingScope.PROCESS_RESTART),
-    SettingContract(("memory",), SettingScope.PROCESS_RESTART),
-    SettingContract(("schedule",), SettingScope.PROCESS_RESTART),
-    SettingContract(
-        ("gateway", "dedup_ttl_sec"), SettingScope.GLOBAL_RELOADABLE
-    ),
-    SettingContract(
-        ("tools", "send_messages"), SettingScope.GLOBAL_RELOADABLE
-    ),
-    SettingContract(
-        ("members", "cache_ttl_sec"), SettingScope.GLOBAL_RELOADABLE
-    ),
-    SettingContract(
-        ("media", "protocol_timeout_sec"), SettingScope.GLOBAL_RELOADABLE
-    ),
-    SettingContract(
-        ("media", "http_timeout_sec"), SettingScope.GLOBAL_RELOADABLE
-    ),
-    SettingContract(
-        ("media", "unreadable_retry_sec"), SettingScope.GLOBAL_RELOADABLE
-    ),
-    SettingContract(
-        ("gateway", "shutdown_wait_sec"), SettingScope.GLOBAL_RELOADABLE
-    ),
-    SettingContract(
-        ("capabilities", "http_retries"), SettingScope.GLOBAL_RELOADABLE
-    ),
-    SettingContract(
-        ("capabilities", "retry_after_cap_sec"),
-        SettingScope.GLOBAL_RELOADABLE,
-    ),
-    SettingContract(
-        ("capabilities", "search", "monthly_quota"),
-        SettingScope.GLOBAL_RELOADABLE,
-    ),
-    SettingContract(
-        ("budget", "daily_cny_cap"), SettingScope.GLOBAL_RELOADABLE
-    ),
-    SettingContract(("personas_dir",), SettingScope.GLOBAL_RELOADABLE),
-    SettingContract(("agreement", "file"), SettingScope.GLOBAL_RELOADABLE),
-    SettingContract(("prompts_dir",), SettingScope.GLOBAL_RELOADABLE),
-    SettingContract(("predicates_file",), SettingScope.GLOBAL_RELOADABLE),
-)
-
-
-def _startup_settings(settings: Settings) -> dict[str, object]:
-    """Values captured by process-owned clients, workers, pools and schedulers."""
-
-    return {
-        contract.name: contract.value(settings)
-        for contract in SETTING_CONTRACTS
-        if contract.scope is SettingScope.PROCESS_RESTART
-    }
 
 
 class Persona(_M):
@@ -816,9 +719,7 @@ def _merge_persona(base: Persona, override: Persona | None) -> Persona:
         merged = merged.model_copy(
             update={
                 "system_prompt": (
-                    merged.system_prompt.rstrip()
-                    + "\n\n"
-                    + merged.system_prompt_extra.strip()
+                    merged.system_prompt.rstrip() + "\n\n" + merged.system_prompt_extra.strip()
                 ),
                 "system_prompt_extra": "",
             }
@@ -834,43 +735,55 @@ def _read_yaml(path: Path) -> dict:
     return data
 
 
+@dataclass(frozen=True, slots=True)
 class ConfigBundle:
-    """One disk read: global settings, every persona, and shared prompt resources."""
+    """One immutable startup snapshot of settings and prompt resources."""
 
-    def __init__(self, raw_settings: dict, personas: dict[str, Persona],
-                 prompts: PromptCatalog | None = None,
-                 agreement_text: str = "",
-                 predicates: PredicateTable | None = None):
-        self.default = Settings.model_validate(raw_settings)
-        self.personas = personas
-        #: What may be recorded about a person, from predicates_file. Read through
-        #: `predicates()`; empty only for a bundle built outside load_bundle.
-        self.predicates: PredicateTable = predicates or PredicateTable(person={})
-        #: Strict model-facing templates, loaded and validated as one catalog.
-        self.prompts = prompts or PromptCatalog.empty()
-        #: The user agreement's full text, loaded from agreement.file at the
-        #: same moment as everything else - /reload swaps it atomically with
-        #: the version number it belongs to. Empty only for a bundle built
-        #: outside load_bundle.
-        self.agreement_text: str = agreement_text
-        self._resolved_personas: dict[str, Persona] = {}
+    default: Settings
+    personas: Mapping[GroupId, Persona]
+    prompts: PromptCatalog
+    agreement_text: str
+    predicates: PredicateTable
+    _default_persona: Persona
+    _resolved_personas: Mapping[GroupId, Persona]
 
-    def persona_for(self, group_id: str) -> Persona:
-        cached = self._resolved_personas.get(group_id)
-        if cached is None:
-            base = self.personas.get(DEFAULT_PERSONA_KEY, Persona())
-            cached = _merge_persona(base, self.personas.get(group_id))
-            self._resolved_personas[group_id] = cached
-        return cached
+    def __init__(
+        self,
+        raw_settings: dict,
+        personas: Mapping[GroupId | str, Persona],
+        prompts: PromptCatalog | None = None,
+        agreement_text: str = "",
+        predicates: PredicateTable | None = None,
+    ) -> None:
+        default = personas.get(DEFAULT_PERSONA_KEY, Persona())
+        groups: dict[GroupId, Persona] = {}
+        for key, persona in personas.items():
+            if key == DEFAULT_PERSONA_KEY:
+                continue
+            try:
+                gid = GroupId(key)
+            except ValueError:
+                raise ValueError(f"persona group id must be numeric: {key!r}") from None
+            groups[gid] = persona
+        resolved_default = _merge_persona(default, None)
+        resolved = {gid: _merge_persona(default, persona) for gid, persona in groups.items()}
+        object.__setattr__(self, "default", Settings.model_validate(raw_settings))
+        object.__setattr__(self, "personas", MappingProxyType(groups))
+        object.__setattr__(self, "prompts", prompts or PromptCatalog.empty())
+        object.__setattr__(self, "agreement_text", agreement_text)
+        object.__setattr__(
+            self,
+            "predicates",
+            predicates or PredicateTable(person={}),
+        )
+        object.__setattr__(self, "_default_persona", resolved_default)
+        object.__setattr__(self, "_resolved_personas", MappingProxyType(resolved))
 
-    def for_group(self, group_id: str) -> tuple[Settings, Persona]:
-        return self.default, self.persona_for(group_id)
+    def persona_for(self, group: GroupId) -> Persona:
+        return self._resolved_personas.get(group, self._default_persona)
 
-    def startup_fingerprint(self) -> dict[str, object]:
-        fingerprint = _startup_settings(self.default)
-        fingerprint.update(self.prompts.restart_fingerprint())
-        fingerprint["predicates"] = repr(self.predicates.model_dump())
-        return fingerprint
+    def for_group(self, group: GroupId) -> tuple[Settings, Persona]:
+        return self.default, self.persona_for(group)
 
 
 def _resolve(root: Path, p: str) -> Path:
@@ -885,16 +798,23 @@ def load_bundle(config_dir: Path | None = None) -> ConfigBundle:
     # itself, so the schema has to hold before anything else is read.
     settings = Settings.model_validate(raw)
 
-    personas: dict[str, Persona] = {}
+    personas: dict[GroupId | str, Persona] = {}
     persona_dir = _resolve(root, settings.personas_dir)
     if persona_dir.is_dir():
         for path in sorted(persona_dir.glob("*.yaml")):
             stem = path.stem
-            key = stem[len("group_"):] if stem.startswith("group_") else stem
+            if stem == DEFAULT_PERSONA_KEY:
+                key: GroupId | str = DEFAULT_PERSONA_KEY
+            elif stem.startswith("group_") and stem[6:].isdigit():
+                key = GroupId(stem[6:])
+            else:
+                raise ValueError(
+                    f"{path}: persona file must be default.yaml or group_<numeric id>.yaml"
+                )
             personas[key] = Persona.model_validate(_read_yaml(path))
 
-    # Prompt wording is customizable, but its role, lifecycle and slot surface are
-    # code-owned. The whole catalog validates before a reload can swap it in.
+    # Prompt wording is customizable, but its role and slot surface are code-owned.
+    # The complete catalog validates before startup continues.
     prompt_dir = _resolve(root, settings.prompts_dir)
     prompts = PromptCatalog.load(prompt_dir)
 
@@ -909,9 +829,8 @@ def load_bundle(config_dir: Path | None = None) -> ConfigBundle:
         raise ValueError(f"predicate file unreadable: {ppath}: {e}") from None
     if not predicates.person:
         raise ValueError(f"predicate file lists no predicates: {ppath}")
-    # The agreement text follows its configured path, loaded with everything
-    # else so /reload swaps text and version together. Mandatory like the
-    # prompts: a missing or empty file fails the load, never a placeholder.
+    # The agreement text is loaded with the rest of the startup bundle so the text and
+    # version always belong to one validated configuration snapshot.
     apath = _resolve(root, settings.agreement.file)
     try:
         agreement_text = apath.read_text(encoding="utf-8-sig").strip()
@@ -921,8 +840,8 @@ def load_bundle(config_dir: Path | None = None) -> ConfigBundle:
         raise ValueError(f"agreement file is empty: {apath}")
 
     bundle = ConfigBundle(raw, personas, prompts, agreement_text, predicates)
-    # Resolve every configured persona before a reload can swap in the bundle.
-    for group_id in personas:
+    # Resolve every configured persona before startup accepts the bundle.
+    for group_id in bundle.personas:
         bundle.persona_for(group_id)
     return bundle
 
@@ -939,26 +858,6 @@ def config() -> ConfigBundle:
 
 
 def prompt_catalog() -> PromptCatalog:
-    """The atomically loaded, strictly validated prompt template bundle."""
+    """Return the startup-validated prompt template bundle."""
 
     return config().prompts
-
-
-def reload_config() -> ConfigBundle:
-    """Atomically apply a fully reloadable bundle or reject it unchanged."""
-
-    global _bundle
-    fresh = load_bundle()
-    current = config()
-    before = current.startup_fingerprint()
-    after = fresh.startup_fingerprint()
-    changed = sorted(
-        path
-        for path in before.keys() | after.keys()
-        if before.get(path) != after.get(path)
-    )
-    if changed:
-        raise RestartRequired("restart required for: " + ", ".join(changed))
-    util.set_timezone(fresh.default.timezone)
-    _bundle = fresh
-    return fresh

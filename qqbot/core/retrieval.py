@@ -24,32 +24,39 @@ import logging
 from datetime import UTC, datetime
 
 from ..db import pool
+from ..domain.ids import GroupId
 from ..settings import RecallEventsToolCfg, config
 from ..util import defang, merge_overlapping, sysmark
 from ..repositories import (
-    EpisodeRepository, EventRepository, IdentityRepository, MemoryRepository,
+    EpisodeRepository,
+    EventRepository,
+    IdentityRepository,
+    MemoryRepository,
     VectorRepository,
 )
-from ..providers import providers
+from ..providers.base import EmbeddingModel
 from ..services import Directory, IdentityResolver, Retriever
 from ..services.memory_extractor import GROUP_TERM, GROUP_TOPIC
 from .members import MEMBERS
 
 log = logging.getLogger("qqbot.retrieval")
 
-_IDS = IdentityRepository()
-_RESOLVER = IdentityResolver(_IDS)
-_DIRECTORY = Directory(
-    identity=_RESOLVER,
-    ids=_IDS,
-    memory=MemoryRepository(),
-    events=EventRepository(),
-)
 
+def build_directory(
+    *,
+    identities: IdentityRepository | None = None,
+    resolver: IdentityResolver | None = None,
+) -> Directory:
+    """Build the shared directory service for one Runtime."""
 
-def directory() -> Directory:
-    """The shared instance. Stateless, so one is enough."""
-    return _DIRECTORY
+    identities = identities or IdentityRepository()
+    resolver = resolver or IdentityResolver(identities)
+    return Directory(
+        identity=resolver,
+        ids=identities,
+        memory=MemoryRepository(),
+        events=EventRepository(),
+    )
 
 
 #: The last roster built for each group: the stamp it was built from, the rendered
@@ -57,10 +64,10 @@ def directory() -> Directory:
 #: kept precisely so a cache hit costs no archive scan: who has ever spoken here is
 #: append-only, and a first-time speaker busts the stamp anyway through the alias
 #: rows their arrival writes.
-_CACHE: dict[str, tuple[tuple, list[dict], list[str]]] = {}
+_CACHE: dict[GroupId, tuple[tuple, list[dict], list[str]]] = {}
 
 
-async def _stamp(gid: int, live: dict[str, str]) -> tuple:
+async def _stamp(gid: GroupId, live: dict[str, str]) -> tuple:
     """Everything the rendered roster depends on, in one query.
 
     The block is deliberately identical between turns - that is the entire reason it is
@@ -83,7 +90,7 @@ async def _stamp(gid: int, live: dict[str, str]) -> tuple:
                   (SELECT max(updated_at) FROM alias
                     WHERE group_id=$1 OR group_id IS NULL) AS names,
                   (SELECT max(updated_at) FROM entity) AS people""",
-        gid,
+        gid.to_db(),
     )
     return (row["facts"], row["names"], row["people"], tuple(sorted(live.items())))
 
@@ -96,10 +103,16 @@ def _named(card) -> bool:
     if not shown:
         return False
     return shown not in card.accounts or any(
-        n.text == shown for n in (*card.names, *card.candidates))
+        n.text == shown for n in (*card.names, *card.candidates)
+    )
 
 
-async def gather(*, group_id: str, bot=None) -> list[dict]:
+async def gather(
+    *,
+    group_id: GroupId,
+    directory: Directory,
+    bot=None,
+) -> list[dict]:
     """This group's roster, one row per person, in order of first appearance.
 
     Per *person*, not per account: two accounts an owner has merged are one row, with
@@ -110,19 +123,18 @@ async def gather(*, group_id: str, bot=None) -> list[dict]:
     the member numbering: somebody new joins at the end, and nobody else's number moves.
 
     The row shape is what prompt.py renders. Two of the fields carry the same split the
-    prompt draws between certainty and guesswork - a note was typed by an owner, a card is
+    prompt draws between certainty and guesswork - a note was entered explicitly, a card is
     the model's own reading - and two more split the names by where they came from: a name
     the account displayed is something the platform reported, while a name the group uses
     is a claim about usage that can be wrong.
     """
-    gid = int(group_id)
+    gid = group_id
     exclude = {str(bot.self_id)} if bot is not None else set()
 
     async def _live(uids: list[str]) -> dict[str, str]:
         if bot is None:
             return {}
-        return await MEMBERS.names_of(
-            bot, group_id, [u for u in uids if u not in exclude])
+        return await MEMBERS.names_of(bot, group_id, [u for u in uids if u not in exclude])
 
     # The hit path never touches the archive: the cached speaker list feeds the
     # live-name check, and the stamp decides. Only a miss pays for the per-group
@@ -136,7 +148,7 @@ async def gather(*, group_id: str, bot=None) -> list[dict]:
     live = await _live(speakers)
     stamp = await _stamp(gid, live)
 
-    cards = await _DIRECTORY.roster(gid, display=live, exclude=exclude)
+    cards = await directory.roster(gid, display=live, exclude=exclude)
     firsts = await EventRepository().first_appearances(gid)
     never = datetime.max.replace(tzinfo=UTC)
 
@@ -146,44 +158,47 @@ async def gather(*, group_id: str, bot=None) -> list[dict]:
 
     out: list[dict] = []
     for c in sorted(cards, key=appeared):
-        out.append({
-            "user_id": c.user_id,
-            # The person and every account of theirs, so the prompt's member
-            # numbers give merged accounts one number without another lookup.
-            "entity_id": c.entity_id,
-            "accounts": list(c.accounts),
-            # A card with no name on record falls back to the account number, which
-            # the model is never shown; the generic member word stands in for it.
-            "nickname": c.display if _named(c) else "成员",
-            "former_names": list(c.displayed_names),
-            "aliases": list(c.nicknames),
-            "persona_card": c.summary,
-            "manual_note": c.note,
-            "msg_count": c.messages,
-        })
+        out.append(
+            {
+                "user_id": c.user_id,
+                # The person and every account of theirs, so the prompt's member
+                # numbers give merged accounts one number without another lookup.
+                "entity_id": c.entity_id,
+                "accounts": list(c.accounts),
+                # A card with no name on record falls back to the account number, which
+                # the model is never shown; the generic member word stands in for it.
+                "nickname": c.display if _named(c) else "成员",
+                "former_names": list(c.displayed_names),
+                "aliases": list(c.nicknames),
+                "persona_card": c.summary,
+                "manual_note": c.note,
+                "msg_count": c.messages,
+            }
+        )
     _CACHE[group_id] = (stamp, out, speakers)
     return out
 
 
-#: Built on first use rather than injected at startup: the embedding backend arrives
-#: with the rest of the bundle now, so there is nothing left for a wiring step to do
-#: and nothing to forget to call. Keyed by backend name because vectors are stored
-#: under the model that produced them.
-_RETRIEVERS: dict[str, Retriever] = {}
+def _retriever(embed: EmbeddingModel) -> Retriever:
+    """Build a lightweight retriever around this Runtime's embedding capability."""
+
+    ids = IdentityRepository()
+    return Retriever(
+        ids,
+        MemoryRepository(),
+        EpisodeRepository(),
+        vec=VectorRepository(embed.name),
+        embed=embed,
+    )
 
 
-def _retriever() -> Retriever:
-    embed = providers().embedding
-    got = _RETRIEVERS.get(embed.name)
-    if got is None:
-        got = Retriever(_IDS, MemoryRepository(), EpisodeRepository(),
-                        vec=VectorRepository(embed.name), embed=embed)
-        _RETRIEVERS[embed.name] = got
-    return got
-
-
-async def episode_lookup(group_id: str, question: str,
-                         rcfg: RecallEventsToolCfg | None = None) -> str:
+async def episode_lookup(
+    group_id: GroupId,
+    question: str,
+    *,
+    embed: EmbeddingModel,
+    rcfg: RecallEventsToolCfg | None = None,
+) -> str:
     """Episodic memory searched on demand, rendered. "" when nothing is close.
 
     On demand is the only way the past reaches a reply: a block pushed per turn
@@ -199,19 +214,26 @@ async def episode_lookup(group_id: str, question: str,
     stretch. Touching windows merge into one block, blocks are separated by an
     ellipsis line, and an undated episode stands alone.
     """
-    eps = await _retriever().search_episodes(int(group_id), question)
+    settings = rcfg or config().default.tools.recall_events
+    eps = await _retriever(embed).search_episodes(
+        group_id,
+        question,
+        limit=settings.max_hits,
+    )
     if not eps:
         return ""
 
     def line(e) -> str:
         # defang the summary: episodes are prose the extractor wrote and carry
         # no legitimate system markup; the date wears the reserved brackets.
-        return (f"{sysmark(f'{e.started_at:%m-%d}')} {defang(e.summary)}"
-                if e.started_at else f"- {defang(e.summary)}")
+        return (
+            f"{sysmark(f'{e.started_at:%m-%d}')} {defang(e.summary)}"
+            if e.started_at
+            else f"- {defang(e.summary)}"
+        )
 
-    ctx = (rcfg or config().default.tools.recall_events).context_episodes
-    windows = (await EpisodeRepository().around(
-        int(group_id), [e.id for e in eps], ctx)) if ctx else {}
+    ctx = settings.context_episodes
+    windows = (await EpisodeRepository().around(group_id, [e.id for e in eps], ctx)) if ctx else {}
     if not windows:
         return "\n".join(line(e) for e in eps)
     by_id = {e.id: e for w in windows.values() for e in w} | {e.id: e for e in eps}
@@ -220,7 +242,8 @@ async def episode_lookup(group_id: str, question: str,
         [{e.id for e in w} for w in windows.values()]
         # A hit the window query could not place (undated) still renders,
         # as a block of one - after the dated story, in recall order.
-        + [{e.id} for e in eps if e.id not in covered])
+        + [{e.id} for e in eps if e.id not in covered]
+    )
 
     def order(i) -> tuple:
         e = by_id[i]
@@ -236,7 +259,7 @@ async def episode_lookup(group_id: str, question: str,
     return "\n".join(out)
 
 
-async def group_knowledge(group_id: str) -> list[str]:
+async def group_knowledge(group_id: GroupId) -> list[str]:
     """What the bot has worked out about the group itself, as individual facts.
 
     These are ordinary facts whose subject is the group's own entity, so they arrive with
@@ -244,7 +267,7 @@ async def group_knowledge(group_id: str) -> list[str]:
     anything else - each one can be checked, deleted, or forgotten on its own, which
     prose never allows.
     """
-    gid = int(group_id)
+    gid = group_id
     ids = IdentityRepository()
     subject = await ids.group_entity(gid)
     facts = await MemoryRepository().current_facts(gid, [subject])
@@ -253,8 +276,15 @@ async def group_knowledge(group_id: str) -> list[str]:
     # of equal confidence swapping places between turns would miss the prefix cache
     # for every reply that follows.
     out = []
-    for f in sorted(facts, key=lambda f: (f.predicate != GROUP_TOPIC, f.predicate,
-                                          f.object_key or "", str(f.object_value or ""))):
+    for f in sorted(
+        facts,
+        key=lambda f: (
+            f.predicate != GROUP_TOPIC,
+            f.predicate,
+            f.object_key or "",
+            str(f.object_value or ""),
+        ),
+    ):
         # defang on render: the values are extractor output over member text.
         value = "" if f.object_value is None else defang(str(f.object_value)).strip()
         if not value:
@@ -266,4 +296,4 @@ async def group_knowledge(group_id: str) -> list[str]:
     return out
 
 
-__all__ = ["gather", "group_knowledge", "episode_lookup", "directory"]
+__all__ = ["build_directory", "gather", "group_knowledge", "episode_lookup"]

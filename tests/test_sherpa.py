@@ -56,8 +56,8 @@ async def startup_checks() -> None:
             release.wait(2)
             return object()
 
-    service = SlowBuild()
-    startup = asyncio.create_task(service.start(CFG))
+    service = SlowBuild(CFG)
+    startup = asyncio.create_task(service.start())
     await asyncio.to_thread(entered.wait, 1)
     heartbeat = False
     await asyncio.sleep(0)
@@ -73,12 +73,12 @@ async def startup_checks() -> None:
             del cfg
             raise RuntimeError("broken model")
 
-    broken = BrokenBuild()
-    failure = await expect(RuntimeError, broken.start(CFG))
+    broken = BrokenBuild(CFG)
+    failure = await expect(RuntimeError, broken.start())
     check("a broken model fails startup", failure is not None)
     unavailable = await expect(
         AsrUnavailable,
-        broken.transcribe(b"x", cfg=CFG),
+        broken.transcribe(b"x"),
     )
     check("a failed startup never advertises readiness", unavailable is not None)
 
@@ -99,13 +99,13 @@ async def queue_checks() -> None:
                 release.wait(2)
             return value, 0.1
 
-    service = BlockingDecode()
-    await service.start(CFG)
-    first = asyncio.create_task(service.transcribe(b"first", cfg=CFG))
+    service = BlockingDecode(CFG)
+    await service.start()
+    first = asyncio.create_task(service.transcribe(b"first"))
     await asyncio.to_thread(entered.wait, 1)
-    second = asyncio.create_task(service.transcribe(b"second", cfg=CFG))
+    second = asyncio.create_task(service.transcribe(b"second"))
     await asyncio.sleep(0)
-    busy = await expect(AsrBusy, service.transcribe(b"third", cfg=CFG))
+    busy = await expect(AsrBusy, service.transcribe(b"third"))
     check("a full ASR queue fails fast with AsrBusy", busy is not None)
     release.set()
     check(
@@ -131,9 +131,9 @@ async def cancellation_checks() -> None:
                 completed.set()
             return data.decode(), 0.1
 
-    service = BlockingDecode()
-    await service.start(CFG)
-    caller = asyncio.create_task(service.transcribe(b"cancelled", cfg=CFG))
+    service = BlockingDecode(CFG)
+    await service.start()
+    caller = asyncio.create_task(service.transcribe(b"cancelled"))
     await asyncio.to_thread(entered.wait, 1)
     caller.cancel()
     cancelled = await expect(asyncio.CancelledError, caller)
@@ -145,7 +145,7 @@ async def cancellation_checks() -> None:
     )
     check(
         "the worker remains usable after a caller cancels",
-        await service.transcribe(b"next", cfg=CFG) == "next",
+        await service.transcribe(b"next") == "next",
     )
     await service.aclose()
 
@@ -163,11 +163,11 @@ async def shutdown_checks() -> None:
                 release.wait(2)
             return data.decode(), 0.1
 
-    service = BlockingDecode()
-    await service.start(CFG)
-    active = asyncio.create_task(service.transcribe(b"active", cfg=CFG))
+    service = BlockingDecode(CFG)
+    await service.start()
+    active = asyncio.create_task(service.transcribe(b"active"))
     await asyncio.to_thread(entered.wait, 1)
-    queued = asyncio.create_task(service.transcribe(b"queued", cfg=CFG))
+    queued = asyncio.create_task(service.transcribe(b"queued"))
     await asyncio.sleep(0)
     await service.aclose()
     release.set()
@@ -177,7 +177,7 @@ async def shutdown_checks() -> None:
         "shutdown fails both active and queued callers explicitly",
         active_failure is not None and queued_failure is not None,
     )
-    refused = await expect(AsrUnavailable, service.transcribe(b"late", cfg=CFG))
+    refused = await expect(AsrUnavailable, service.transcribe(b"late"))
     check("shutdown rejects new ASR work", refused is not None)
 
 

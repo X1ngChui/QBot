@@ -6,10 +6,12 @@
 python -m venv .venv
 .venv/bin/pip install -r requirements.txt -r requirements-dev.txt
 
+ROOT="$(pwd -W 2>/dev/null || pwd)"
 docker run -d --name qbot-pgtest \
-  -e POSTGRES_DB=qqbot -e POSTGRES_USER=qqbot -e POSTGRES_PASSWORD=testpw \
+  -e POSTGRES_DB=qbot_test -e POSTGRES_USER=qbot_test -e POSTGRES_PASSWORD=testpw \
   -p 15432:5432 \
-  -v "$PWD/sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro" \
+  -v "$ROOT/sql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro" \
+  -v "$ROOT/tests/fixtures/test_db_marker.sql:/docker-entrypoint-initdb.d/02-test-marker.sql:ro" \
   pgvector/pgvector:0.8.5-pg17
 
 .venv/bin/python tests/run_all.py
@@ -24,19 +26,19 @@ under `scripts/` do call the real model and are run by hand.
 ## Before opening a pull request
 
 - `tests/run_all.py` passes, including the lint step.
-- New behaviour has a test. If it touches the command handlers or the scheduled jobs,
-  which cannot be imported by tests, extend the source-level checks in
-  `tests/test_commands.py` or `tests/test_logic.py`.
+- New behaviour has a test. Command handlers are importable and must be exercised directly
+  in `tests/test_commands.py`; adapter-only scheduler wiring remains covered by the
+  package-wide syntax and attribute guards until it is similarly detached.
 - A changed prompt file has been run through the matching evaluation script
   (`scripts/eval_replies.py` or `scripts/eval_extract.py`) and the result is mentioned
   in the pull request.
 - A new or renamed configuration key is documented in `config/settings.yaml.example`
   and [docs/configuration.md](docs/configuration.md).
-- A schema change is in `sql/init.sql`, recorded in [sql/MIGRATIONS.md](sql/MIGRATIONS.md),
-  and checked by `ensure_schema` in `qqbot/db/repo.py` where an upsert or the code
-  depends on it.
+- A schema change updates the sole canonical `sql/init.sql` and the read-only structural
+  contract in `qqbot/db/repo.py`; existing installations are updated manually under a
+  newly verified backup. Do not add runtime fallback reads or a migration chain.
 - A new command is added to `qqbot/core/command_catalog.py`, handled in
-  `qqbot/plugins/commands.py`, and listed in [docs/commands.md](docs/commands.md).
+  `qqbot/core/commands.py`, and listed in [docs/commands.md](docs/commands.md).
 
 ## Conventions
 

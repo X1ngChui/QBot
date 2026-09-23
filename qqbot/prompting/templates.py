@@ -36,11 +36,6 @@ class PromptRole(StrEnum):
     TOOL = "tool"
 
 
-class ReloadScope(StrEnum):
-    RELOADABLE = "reloadable"
-    RESTART_REQUIRED = "restart_required"
-
-
 @dataclass(frozen=True, slots=True)
 class SlotSpec:
     name: str
@@ -52,7 +47,6 @@ class SlotSpec:
 class TemplateSpec:
     key: PromptKey
     role: PromptRole
-    reload_scope: ReloadScope
     slots: tuple[SlotSpec, ...] = ()
 
     @property
@@ -81,17 +75,14 @@ _SPECS = (
     TemplateSpec(
         PromptKey.SHARED_LEGEND,
         PromptRole.PARTIAL,
-        ReloadScope.RESTART_REQUIRED,
     ),
     TemplateSpec(
         PromptKey.SHARED_PRAGMATICS,
         PromptRole.PARTIAL,
-        ReloadScope.RESTART_REQUIRED,
     ),
     TemplateSpec(
         PromptKey.REPLY_SYSTEM,
         PromptRole.SYSTEM,
-        ReloadScope.RELOADABLE,
         (
             _slot("shared_legend", source=PromptKey.SHARED_LEGEND),
             _slot("shared_pragmatics", source=PromptKey.SHARED_PRAGMATICS),
@@ -100,7 +91,6 @@ _SPECS = (
     TemplateSpec(
         PromptKey.REPLY_DEVELOPER,
         PromptRole.DEVELOPER,
-        ReloadScope.RELOADABLE,
         (
             _slot("persona"),
             _slot("group_context", allow_empty=True),
@@ -110,13 +100,11 @@ _SPECS = (
     TemplateSpec(
         PromptKey.REPLY_USER,
         PromptRole.USER,
-        ReloadScope.RELOADABLE,
         (_slot("now"), _slot("current_message")),
     ),
     TemplateSpec(
         PromptKey.EXTRACT_SYSTEM,
         PromptRole.SYSTEM,
-        ReloadScope.RESTART_REQUIRED,
         (
             _slot("shared_legend", source=PromptKey.SHARED_LEGEND),
             _slot("shared_pragmatics", source=PromptKey.SHARED_PRAGMATICS),
@@ -126,7 +114,6 @@ _SPECS = (
     TemplateSpec(
         PromptKey.EXTRACT_USER,
         PromptRole.USER,
-        ReloadScope.RESTART_REQUIRED,
         (
             _slot("bot_names"),
             _slot("account_roster"),
@@ -137,37 +124,30 @@ _SPECS = (
     TemplateSpec(
         PromptKey.VISION_SYSTEM,
         PromptRole.SYSTEM,
-        ReloadScope.RELOADABLE,
     ),
     TemplateSpec(
         PromptKey.TOOL_WEB_SEARCH,
         PromptRole.TOOL,
-        ReloadScope.RELOADABLE,
     ),
     TemplateSpec(
         PromptKey.TOOL_SEARCH_HISTORY,
         PromptRole.TOOL,
-        ReloadScope.RELOADABLE,
     ),
     TemplateSpec(
         PromptKey.TOOL_RECALL_EVENTS,
         PromptRole.TOOL,
-        ReloadScope.RELOADABLE,
     ),
     TemplateSpec(
         PromptKey.TOOL_READ_URL,
         PromptRole.TOOL,
-        ReloadScope.RELOADABLE,
     ),
     TemplateSpec(
         PromptKey.TOOL_OPEN_IMAGES,
         PromptRole.TOOL,
-        ReloadScope.RELOADABLE,
     ),
     TemplateSpec(
         PromptKey.TOOL_SEND_MESSAGES,
         PromptRole.TOOL,
-        ReloadScope.RELOADABLE,
         (_slot("face_catalog"), _slot("message_limit")),
     ),
 )
@@ -224,9 +204,7 @@ class PromptTemplate:
             raise TemplateValidationError(f"{spec.path}: malformed slot marker")
         unknown = sorted(set(names) - spec.slot_names)
         if unknown:
-            raise TemplateValidationError(
-                f"{spec.path}: unknown slot(s): {', '.join(unknown)}"
-            )
+            raise TemplateValidationError(f"{spec.path}: unknown slot(s): {', '.join(unknown)}")
         for slot in spec.slots:
             count = names.count(slot.name)
             if count != 1:
@@ -259,9 +237,7 @@ class PromptTemplate:
         for slot in self.spec.slots:
             value = supplied[slot.name]
             if not isinstance(value, str):
-                raise TemplateValidationError(
-                    f"{self.spec.path}: slot {slot.name!r} must be text"
-                )
+                raise TemplateValidationError(f"{self.spec.path}: slot {slot.name!r} must be text")
             if not slot.allow_empty and not value.strip():
                 raise TemplateValidationError(
                     f"{self.spec.path}: slot {slot.name!r} cannot be empty"
@@ -281,14 +257,15 @@ class PromptCatalog:
     def load(cls, root: Path) -> PromptCatalog:
         path = root / "prompts.yaml"
         try:
-            raw = yaml.load(
-                path.read_text(encoding="utf-8-sig"),
-                Loader=_UniqueKeyLoader,
-            ) or {}
+            raw = (
+                yaml.load(
+                    path.read_text(encoding="utf-8-sig"),
+                    Loader=_UniqueKeyLoader,
+                )
+                or {}
+            )
         except (OSError, yaml.YAMLError) as exc:
-            raise TemplateValidationError(
-                f"prompt bundle unreadable: {path}: {exc}"
-            ) from None
+            raise TemplateValidationError(f"prompt bundle unreadable: {path}: {exc}") from None
         if not isinstance(raw, dict) or set(raw) != {"version", "templates"}:
             raise TemplateValidationError(
                 f"{path}: top level must contain exactly version and templates"
@@ -356,13 +333,6 @@ class PromptCatalog:
 
     def sources(self) -> dict[str, str]:
         return {key.value: self.source(key) for key in PROMPT_SPECS}
-
-    def restart_fingerprint(self) -> dict[str, str]:
-        return {
-            f"prompts.{key.value}": template.source
-            for key, template in self.templates.items()
-            if template.spec.reload_scope is ReloadScope.RESTART_REQUIRED
-        }
 
 
 def tool_prompt_key(name: str) -> PromptKey:

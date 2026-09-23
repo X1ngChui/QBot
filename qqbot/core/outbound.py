@@ -1,13 +1,9 @@
-"""Typed outbound QQ message segments.
-
-Raw OneBot dictionaries are decoded at the gateway edge and emitted only from closed
-variants. ``MarketFaceSegment`` is retained solely to read historical bot messages; the
-model-facing send parser cannot construct it.
-"""
+"""Current send segments and the wider set retained for historical decoding."""
 
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -87,30 +83,24 @@ class CustomMusicSegment:
 
 @dataclass(frozen=True, slots=True)
 class JsonCardSegment:
-    """A validated, canonical JSON object encoded for NapCat's ARK segment."""
+    """A canonical JSON object retained from an archived NapCat ARK segment."""
 
     data: str
 
 
-type OutboundSegment = (
-    TextSegment
-    | AtSegment
-    | ReplySegment
-    | FaceSegment
-    | MarketFaceSegment
-    | DiceSegment
-    | RpsSegment
-    | ContactSegment
-    | MusicSegment
-    | CustomMusicSegment
-    | JsonCardSegment
+type SendSegment = (
+    TextSegment | AtSegment | ReplySegment | FaceSegment | DiceSegment | RpsSegment | ContactSegment
+)
+
+type HistoricalSegment = (
+    SendSegment | MarketFaceSegment | MusicSegment | CustomMusicSegment | JsonCardSegment
 )
 
 
-def from_onebot(items: list[dict]) -> tuple[OutboundSegment, ...]:
+def from_onebot(items: list[dict]) -> tuple[HistoricalSegment, ...]:
     """Best-effort decoding of segments previously written by this bot."""
 
-    out: list[OutboundSegment] = []
+    out: list[HistoricalSegment] = []
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -127,37 +117,48 @@ def from_onebot(items: list[dict]) -> tuple[OutboundSegment, ...]:
             elif kind == "face":
                 out.append(FaceSegment(int(data["id"])))
             elif kind == "mface" and data.get("emoji_package_id") and data.get("emoji_id"):
-                out.append(MarketFaceSegment(
-                    str(data["emoji_package_id"]),
-                    str(data["emoji_id"]),
-                    str(data.get("key") or ""),
-                    str(data.get("summary") or ""),
-                ))
+                out.append(
+                    MarketFaceSegment(
+                        str(data["emoji_package_id"]),
+                        str(data["emoji_id"]),
+                        str(data.get("key") or ""),
+                        str(data.get("summary") or ""),
+                    )
+                )
             elif kind == "dice":
                 out.append(DiceSegment())
             elif kind == "rps":
                 out.append(RpsSegment())
             elif kind == "contact" and data.get("id"):
                 contact_kind = (
-                    ContactKind.MEMBER if data.get("type", "qq") == "qq"
+                    ContactKind.MEMBER
+                    if data.get("type", "qq") == "qq"
                     else ContactKind.CURRENT_GROUP
                 )
                 out.append(ContactSegment(contact_kind, str(data["id"])))
             elif kind == "music" and data.get("type") == "custom":
-                out.append(CustomMusicSegment(
-                    str(data.get("url") or ""),
-                    str(data.get("audio") or ""),
-                    str(data.get("title") or ""),
-                    str(data.get("image") or ""),
-                    str(data.get("singer") or data.get("content") or ""),
-                ))
+                out.append(
+                    CustomMusicSegment(
+                        str(data.get("url") or ""),
+                        str(data.get("audio") or ""),
+                        str(data.get("title") or ""),
+                        str(data.get("image") or ""),
+                        str(data.get("singer") or data.get("content") or ""),
+                    )
+                )
             elif kind == "music" and data.get("id"):
                 out.append(MusicSegment(MusicPlatform(data["type"]), str(data["id"])))
             elif kind == "json":
                 raw = data.get("data")
                 encoded = (
-                    raw if isinstance(raw, str)
-                    else json.dumps(raw, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                    raw
+                    if isinstance(raw, str)
+                    else json.dumps(
+                        raw,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
                 )
                 out.append(JsonCardSegment(encoded))
         except (KeyError, TypeError, ValueError):
@@ -165,8 +166,8 @@ def from_onebot(items: list[dict]) -> tuple[OutboundSegment, ...]:
     return tuple(out)
 
 
-def to_onebot(segment: OutboundSegment) -> dict[str, Any]:
-    """Project one domain segment to the literal structure NapCat accepts."""
+def to_onebot(segment: SendSegment) -> dict[str, Any]:
+    """Project one current send segment to the structure NapCat accepts."""
 
     match segment:
         case TextSegment(text):
@@ -177,15 +178,6 @@ def to_onebot(segment: OutboundSegment) -> dict[str, Any]:
             return {"type": "reply", "data": {"id": message_id}}
         case FaceSegment(face_id):
             return {"type": "face", "data": {"id": str(face_id)}}
-        case MarketFaceSegment(package_id, emoji_id, key, summary):
-            data = {
-                "emoji_package_id": package_id,
-                "emoji_id": emoji_id,
-                "key": key,
-            }
-            if summary:
-                data["summary"] = summary
-            return {"type": "mface", "data": data}
         case DiceSegment():
             return {"type": "dice", "data": {}}
         case RpsSegment():
@@ -193,36 +185,23 @@ def to_onebot(segment: OutboundSegment) -> dict[str, Any]:
         case ContactSegment(kind, target_id):
             onebot_kind = "qq" if kind is ContactKind.MEMBER else "group"
             return {"type": "contact", "data": {"type": onebot_kind, "id": target_id}}
-        case MusicSegment(platform, track_id):
-            return {"type": "music", "data": {"type": platform.value, "id": track_id}}
-        case CustomMusicSegment(url, audio, title, image, singer):
-            data = {
-                "type": "custom",
-                "url": url,
-                "audio": audio,
-                "title": title,
-                "image": image,
-            }
-            if singer:
-                data["singer"] = singer
-            return {"type": "music", "data": data}
-        case JsonCardSegment(data):
-            return {"type": "json", "data": {"data": data}}
+        case _:
+            raise TypeError(f"historical segment is not sendable: {type(segment).__name__}")
 
 
-def without_replies(segments: tuple[OutboundSegment, ...]) -> tuple[OutboundSegment, ...]:
+def without_replies(segments: Sequence[SendSegment]) -> tuple[SendSegment, ...]:
     return tuple(segment for segment in segments if not isinstance(segment, ReplySegment))
 
 
-def text_content(segments: tuple[OutboundSegment, ...]) -> str:
+def text_content(segments: Sequence[HistoricalSegment]) -> str:
     return "".join(segment.text for segment in segments if isinstance(segment, TextSegment))
 
 
-def at_accounts(segments: tuple[OutboundSegment, ...]) -> list[str]:
+def at_accounts(segments: Sequence[HistoricalSegment]) -> list[str]:
     return [segment.account for segment in segments if isinstance(segment, AtSegment)]
 
 
-def reply_target(segments: tuple[OutboundSegment, ...]) -> str | None:
+def reply_target(segments: Sequence[HistoricalSegment]) -> str | None:
     return next(
         (segment.message_id for segment in segments if isinstance(segment, ReplySegment)),
         None,
@@ -230,15 +209,11 @@ def reply_target(segments: tuple[OutboundSegment, ...]) -> str | None:
 
 
 def display_text(
-    segments: tuple[OutboundSegment, ...],
+    segments: Sequence[HistoricalSegment],
     *,
     names: dict[str, str] | None = None,
 ) -> str:
-    """A stable textual reading for the transcript and archive.
-
-    Opaque JSON is deliberately represented by a label rather than replayed as chat text.
-    The exact payload remains in the archived segment and historical send call.
-    """
+    """Return a stable textual reading for current or historical segments."""
 
     names = names or {}
     parts: list[str] = []

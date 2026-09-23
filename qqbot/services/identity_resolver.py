@@ -17,8 +17,15 @@ import logging
 import uuid
 from datetime import datetime
 
+import asyncpg
+
+from ..domain.ids import GroupId
 from ..domain.identity import (
-    Alias, AliasEvidence, AliasType, EvidenceType, IdentityAccount,
+    Alias,
+    AliasEvidence,
+    AliasType,
+    EvidenceType,
+    IdentityAccount,
 )
 from ..repositories import IdentityRepository
 
@@ -47,9 +54,15 @@ class IdentityResolver:
         self._repo = repo
 
     async def seen(
-        self, user_id: str, *, group_id: int, at: datetime,
-        card: str | None = None, nickname: str | None = None,
+        self,
+        user_id: str,
+        *,
+        group_id: GroupId,
+        at: datetime,
+        card: str | None = None,
+        nickname: str | None = None,
         raw_event_id: uuid.UUID | None = None,
+        _conn: asyncpg.Connection | None = None,
     ) -> IdentityAccount:
         """Record that an account was seen speaking, and file its current names.
 
@@ -58,7 +71,11 @@ class IdentityResolver:
         whole platform. Here, the former is closer to what people actually call them.
         """
         acc = await self._repo.ensure_account(
-            PLATFORM, user_id, seen_at=at, name=card or nickname
+            PLATFORM,
+            user_id,
+            seen_at=at,
+            name=card or nickname,
+            _conn=_conn,
         )
         for text, kind, ev in (
             (card, AliasType.GROUP_CARD, EvidenceType.GROUP_CARD),
@@ -69,7 +86,8 @@ class IdentityResolver:
             await self._repo.upsert_alias(
                 Alias(
                     alias_text=text.strip(),
-                    target_entity_id=acc.entity_id,
+                    target_entity_id=None,
+                    target_account_id=acc.id,
                     # A group card holds in this group only. A platform nickname is the
                     # same everywhere, but it is still scoped to this group here: a
                     # global alias is the one channel that crosses groups, and no
@@ -78,6 +96,7 @@ class IdentityResolver:
                     alias_type=kind,
                 ),
                 [AliasEvidence(ev, raw_event_id)],
+                _conn=_conn,
             )
         return acc
 
@@ -88,33 +107,28 @@ class IdentityResolver:
             raise UnknownAccount(user_id)
         return acc
 
-    async def merge(self, loser_account: str, winner_account: str) -> bool:
-        """Declare two accounts to be the same person. Owner-triggered only: no
-        automatic path may fold two people into one, because a wrong merge mixes two
-        histories and nothing downstream can tell them apart again.
+    async def merge(self, left_account: str, right_account: str) -> bool:
+        """Union the two account equivalence classes using deterministic root choice."""
 
-        Takes accounts rather than entity ids: what an owner can see from inside the
-        group is a number and a display name, and asking them for a UUID would be
-        leaking the internal model to the person using it.
-
-        False means they were already the same person - worth saying so rather than
-        reporting a merge that did nothing.
-        """
-        a = await self.account(loser_account)
-        b = await self.account(winner_account)
-        if a.entity_id == b.entity_id:
-            return False
-        await self._repo.merge(a.entity_id, b.entity_id)
-        log.info("merged entity %s into %s", a.entity_id, b.entity_id)
-        return True
+        left = await self.account(left_account)
+        right = await self.account(right_account)
+        root, changed = await self._repo.merge_accounts(left.id, right.id)
+        if changed:
+            log.info(
+                "merged holders %s and %s under %s",
+                left.entity_id,
+                right.entity_id,
+                root,
+            )
+        return changed
 
     async def split(self, account_id: str) -> uuid.UUID:
         """Undo a merge for one account: give it a person of its own again.
 
-        Owner-triggered, for the same reason merge is. Returns the new person's id.
+        Used by owner repair and authenticated self-service unlink. Returns the new
+        holder id.
         """
         acc = await self.account(account_id)
         new_id = await self._repo.split(acc)
-        log.info("split account %s out of entity %s into %s",
-                 account_id, acc.entity_id, new_id)
+        log.info("split account %s out of entity %s into %s", account_id, acc.entity_id, new_id)
         return new_id

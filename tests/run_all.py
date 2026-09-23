@@ -7,17 +7,20 @@ import sys
 HERE = pathlib.Path(__file__).resolve().parent
 SCRIPTS = [
     "test_domain.py",
+    "test_schema.py",
     "test_repositories.py",
     "test_services.py",
     "test_commands.py",
     "test_memory.py",
     "test_logic.py",
+    "test_delivery.py",
     "test_nickname.py",
     "test_keys.py",
     "test_backends.py",
     "test_repo.py",
     "test_media.py",
     "test_sherpa.py",
+    "test_runtime.py",
     "test_pipeline.py",
 ]
 

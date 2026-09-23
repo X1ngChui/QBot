@@ -16,6 +16,7 @@ import uuid
 from collections.abc import Sequence
 
 from ..db import pool
+from ..domain.ids import GroupId
 
 
 def _vec(values: Sequence[float]) -> str:
@@ -30,7 +31,10 @@ class VectorRepository:
         self._version = version
 
     async def put_episode(
-        self, *, group_id: int, episode_id: uuid.UUID,
+        self,
+        *,
+        group_id: GroupId,
+        episode_id: uuid.UUID,
         embedding: Sequence[float],
     ) -> bool:
         """Index an episode only while it is active.
@@ -44,7 +48,8 @@ class VectorRepository:
                 """SELECT TRUE FROM episode
                     WHERE id=$1 AND group_id=$2 AND status='active'
                     FOR UPDATE""",
-                episode_id, group_id,
+                episode_id,
+                group_id.to_db(),
             )
             if not active:
                 return False
@@ -55,13 +60,22 @@ class VectorRepository:
                    VALUES ($1,'episode',$2,$3::vector,$4,$5)
                    ON CONFLICT (object_type, object_id, embedding_model, embedding_version)
                    DO UPDATE SET embedding = EXCLUDED.embedding""",
-                group_id, episode_id, _vec(embedding), self._model, self._version,
+                group_id.to_db(),
+                episode_id,
+                _vec(embedding),
+                self._model,
+                self._version,
             )
             return True
 
     async def search(
-        self, *, group_id: int, object_type: str, embedding: Sequence[float],
-        limit: int = 10, max_distance: float = 0.45,
+        self,
+        *,
+        group_id: GroupId,
+        object_type: str,
+        embedding: Sequence[float],
+        limit: int = 10,
+        max_distance: float = 0.45,
     ) -> list[tuple[uuid.UUID, float]]:
         """The closest objects within this group.
 
@@ -77,13 +91,21 @@ class VectorRepository:
                   AND embedding <=> $3::vector < $6
                 ORDER BY embedding <=> $3::vector
                 LIMIT $7""",
-            group_id, object_type, _vec(embedding), self._model, self._version,
-            max_distance, limit,
+            group_id.to_db(),
+            object_type,
+            _vec(embedding),
+            self._model,
+            self._version,
+            max_distance,
+            limit,
         )
         return [(r["object_id"], r["distance"]) for r in rows]
 
     async def unembedded_episodes(
-        self, group_id: int, *, limit: int = 200,
+        self,
+        group_id: GroupId,
+        *,
+        limit: int,
     ) -> list[tuple[uuid.UUID, str]]:
         """Active episodes with no vector for the current model, as (id, summary),
         oldest first.
@@ -106,7 +128,9 @@ class VectorRepository:
                 WHERE e.group_id=$1 AND e.status='active' AND x.object_id IS NULL
                 ORDER BY e.created_at, e.id
                 LIMIT $4""",
-            group_id, self._model, self._version, limit,
+            group_id.to_db(),
+            self._model,
+            self._version,
+            limit,
         )
         return [(r["id"], r["summary"]) for r in rows]
-

@@ -65,11 +65,16 @@ def build_prompt_packet(catalog: PromptCatalog, cfg: Settings) -> str:
         PromptKey.EXTRACT_USER,
         bot_names="小X、机器人X",
         account_roster="成员甲⟦1⟧（也叫：小甲）\n成员乙⟦2⟧",
-        known_memory="【已经记过的】\n- 成员甲居住在南京",
+        known_memory=(
+            "本群固定资料：\n这是只用于验证提示词的虚构群。\n"
+            "本群：\n- group.term 蓝盒 = 虚构测试设备\n"
+            "⟦1⟧：lives_in = 南京；备注：成员本人确认喜欢摄影。\n"
+            "已记过的事：\n- 成员甲曾分享一组虚构照片"
+        ),
         transcript=(
-            "⟦09-17 14:03⟧ 成员甲⟦1⟧: @小X⟦0⟧ 我搬到杭州了\n"
-            "⟦09-17 14:04⟧ 小X⟦0⟧: 收到\n"
-            "⟦09-17 14:05⟧ 成员乙⟦2⟧: 小甲周六一起看展吗"
+            "⟦来源:1⟧ ⟦09-17 14:03⟧ 成员甲⟦1⟧: @小X⟦0⟧ 我搬到杭州了\n"
+            "⟦来源:2⟧ ⟦09-17 14:04⟧ 小X⟦0⟧: 收到\n"
+            "⟦来源:3⟧ ⟦09-17 14:05⟧ 成员乙⟦2⟧: 小甲周六一起看展吗"
         ),
     )
     packet = {
@@ -93,6 +98,16 @@ def build_prompt_packet(catalog: PromptCatalog, cfg: Settings) -> str:
                 ],
                 "vision": ["vision_system"],
                 "tools": ["one description per code-owned schema"],
+            },
+            "dynamic_inputs": {
+                "extract.account_roster": (
+                    "Exact accounts present in the batch or uniquely named by eligible text, "
+                    "plus their confirmed exact-account aliases."
+                ),
+                "extract.known_memory": (
+                    "Fixed group knowledge, group facts, exact-account facts, holder facts, "
+                    "manual notes and recent episodes. It is context only, never fresh evidence."
+                ),
             },
             "markers": {
                 "bot_identity": "display-only 名字⟦0⟧; zero is never a tool target",
@@ -123,14 +138,20 @@ def build_prompt_packet(catalog: PromptCatalog, cfg: Settings) -> str:
                     "a permanent ⟦依据:…⟧ marker."
                 ),
                 "A valid send_messages is the only visible reply and terminates the run.",
-                "Extraction emits structured tool calls only and quotes exact eligible lines.",
+                (
+                    "Every extraction candidate binds source ordinals to verbatim eligible "
+                    "member-authored spans and exact line-local account targets."
+                ),
+                (
+                    "Episodes cite one or more source+quote pairs and carry no model-generated "
+                    "identity list."
+                ),
                 "Keep wording professional, plain, accurate, calm and direct.",
             ],
         },
         "template_specs": {
             key.value: {
                 "role": spec.role.value,
-                "reload_scope": spec.reload_scope.value,
                 "slots": [
                     {
                         "name": slot.name,
@@ -142,9 +163,7 @@ def build_prompt_packet(catalog: PromptCatalog, cfg: Settings) -> str:
             }
             for key, spec in PROMPT_SPECS.items()
         },
-        "current_templates": {
-            key.value: catalog.source(key) for key in PROMPT_SPECS
-        },
+        "current_templates": {key.value: catalog.source(key) for key in PROMPT_SPECS},
         "code_derived": {
             "reply_tools": _tool_document(tool_defs(cfg)),
             "extraction_tools": _tool_document(extraction_tools()),
@@ -162,10 +181,7 @@ def build_prompt_packet(catalog: PromptCatalog, cfg: Settings) -> str:
             "reply_user": catalog.render(
                 PromptKey.REPLY_USER,
                 now="2026年9月18日 14:06",
-                current_message=(
-                    "#3 ⟦09-17 14:06⟧ 成员甲⟦1⟧: "
-                    "@小X⟦0⟧ 帮我问成员乙⟦2⟧周六几点出发"
-                ),
+                current_message=("#3 ⟦09-17 14:06⟧ 成员甲⟦1⟧: @小X⟦0⟧ 帮我问成员乙⟦2⟧周六几点出发"),
             ),
             "extract_system": catalog.render(
                 PromptKey.EXTRACT_SYSTEM,
