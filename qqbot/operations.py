@@ -1,4 +1,4 @@
-"""Verified PostgreSQL backup operations shared by jobs and migrations."""
+"""Verified PostgreSQL backups shared by scheduled jobs and manual maintenance."""
 
 from __future__ import annotations
 
