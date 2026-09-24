@@ -8,6 +8,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 SCRIPTS = [
     "test_domain.py",
     "test_schema.py",
+    "test_deploy.py",
     "test_repositories.py",
     "test_services.py",
     "test_commands.py",

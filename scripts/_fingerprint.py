@@ -5,11 +5,10 @@ Comparing the two is how deploy.sh knows the running image is the code it just s
 `docker compose restart` rebuilds nothing, so without this check a deployment looks
 successful - container up, logs clean - while the old image keeps serving.
 
-Takes any number of roots: a directory contributes its *.py files, a file contributes
-itself. Every path the Dockerfile COPYs code from should be listed - the check once
-covered only qqbot/, which meant a stale bot.py or scripts/ passed as "ok", and
-deciding which half changed is exactly the judgement call that got this wrong in the
-first place.
+Takes any number of roots: source directories contribute their *.py files, the
+mounted config directory contributes all files, and a file contributes itself. Every
+path the Dockerfile COPYs code from, and the config mounted by compose, should be
+listed - a stale image or a stale/mismatched prompt bundle must not pass as "ok".
 
 Hashes file bytes, not mtimes, so it also catches an uncommitted local edit that never
 made it into the tar. Entries are keyed by root-relative names (qqbot/..., bot.py), so
@@ -28,8 +27,8 @@ for arg in sys.argv[1:]:
     else:
         entries = sorted(
             (f"{p.name}/{f.relative_to(p).as_posix()}", f)
-            for f in p.rglob("*.py")
-            if "__pycache__" not in f.parts
+            for f in p.rglob("*" if p.name == "config" else "*.py")
+            if f.is_file() and "__pycache__" not in f.parts
         )
     for name, f in entries:
         h.update(name.encode())

@@ -46,6 +46,30 @@ async def main() -> int:
         await check_schema(conn, schema=schema, embedding_dimensions=dimensions)
         check("a fresh canonical schema passes compatibility checks", True)
 
+        await conn.execute("DROP INDEX raw_event_platform_key")
+        for statement, description in (
+            ("CREATE INDEX raw_event_platform_key ON raw_event (group_id)",
+             "non-unique index with the expected name"),
+            ("CREATE UNIQUE INDEX raw_event_platform_key "
+             "ON raw_event (group_id, platform_event_id) "
+             "WHERE platform_event_id IS NOT NULL", "wrong conflict key columns"),
+            ("CREATE UNIQUE INDEX raw_event_platform_key "
+             "ON raw_event (platform, platform_event_id)", "missing conflict predicate"),
+        ):
+            await conn.execute(statement)
+            try:
+                await check_schema(conn, schema=schema, embedding_dimensions=dimensions)
+                rejected = False
+            except RuntimeError:
+                rejected = True
+            check(f"schema rejects {description}", rejected)
+            await conn.execute("DROP INDEX raw_event_platform_key")
+        await conn.execute(
+            """CREATE UNIQUE INDEX raw_event_platform_key
+                 ON raw_event (platform, platform_event_id)
+              WHERE platform_event_id IS NOT NULL"""
+        )
+
         await conn.execute("DROP INDEX alias_unique_account_scope")
         try:
             await check_schema(conn, schema=schema, embedding_dimensions=dimensions)
@@ -72,6 +96,25 @@ async def main() -> int:
                 CHECK (num_nonnulls(target_entity_id, target_account_id) = 1)'''
         )
 
+        await conn.execute(f'ALTER TABLE "{schema}".alias DROP CONSTRAINT alias_exactly_one_target')
+        await conn.execute(
+            f'''ALTER TABLE "{schema}".alias
+                ADD CONSTRAINT alias_exactly_one_target
+                CHECK (num_nonnulls(target_entity_id, target_account_id) >= 0)'''
+        )
+        try:
+            await check_schema(conn, schema=schema, embedding_dimensions=dimensions)
+            rejected = False
+        except RuntimeError:
+            rejected = True
+        check("same-name constraint with the wrong definition is rejected", rejected)
+        await conn.execute(f'ALTER TABLE "{schema}".alias DROP CONSTRAINT alias_exactly_one_target')
+        await conn.execute(
+            f'''ALTER TABLE "{schema}".alias
+                ADD CONSTRAINT alias_exactly_one_target
+                CHECK (num_nonnulls(target_entity_id, target_account_id) = 1)'''
+        )
+
         await conn.execute(f'ALTER TABLE "{schema}".reply_trace ADD COLUMN content text')
         try:
             await check_schema(conn, schema=schema, embedding_dimensions=dimensions)
@@ -79,6 +122,7 @@ async def main() -> int:
         except RuntimeError:
             rejected = True
         check("retired compatibility columns are rejected", rejected)
+        await conn.execute(f'DROP SCHEMA "{schema}" CASCADE')
 
     await close_pool()
     print(f"\nFAILED: {', '.join(fails) if fails else 'none'}")

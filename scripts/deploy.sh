@@ -34,14 +34,9 @@ if [ -n "$KEY" ]; then SSH=(ssh -i "$KEY" -o StrictHostKeyChecking=accept-new "$
 PAYLOAD=(qqbot scripts config sql bot.py requirements.txt Dockerfile docker-compose.yml .dockerignore)
 
 # Directories are replaced, not merged. A plain `tar x` only overwrites, so a deleted
-# module would stay on the server forever and get COPYed into every next image - and
-# a deleted module that something can still import is a very quiet bug.
-# config/ is NOT in this list: it is bind-mounted into the running container, and
-# rm -rf would orphan the mounted inode - if the build then failed, the old container
-# would keep running against an empty /app/config until someone recreated it. Its
-# *contents* are replaced instead, which the mount survives. The previous contents are
-# copied to .config.rollback first, because rolling the image back without its matching
-# configuration can leave the old process unable to start.
+# module would stay on the server forever and get COPYed into every next image.
+# Leave config/ untouched while building and checking: the running container has it
+# mounted, and a failed gate must not change what that container would read on restart.
 REPLACE=(qqbot scripts sql)
 FILES=(bot.py requirements.txt Dockerfile docker-compose.yml .dockerignore)
 
@@ -51,10 +46,8 @@ echo "==> sending $(git rev-parse --short HEAD 2>/dev/null || echo 'working tree
 # transfer or extract that dies leaves a server that still builds what it ran before.
 tar czf - --exclude=__pycache__ "${PAYLOAD[@]}" | "${SSH[@]}" "cat > '$REMOTE/.deploy.tar.gz'"
 "${SSH[@]}" "cd '$REMOTE' && rm -rf .deploy.new && mkdir .deploy.new && tar xzf .deploy.tar.gz -C .deploy.new && rm -f .deploy.tar.gz \
-  && mkdir -p config && rm -rf .config.rollback && cp -a config .config.rollback \
   && rm -rf ${REPLACE[*]} && for d in ${REPLACE[*]}; do mv .deploy.new/\$d .; done \
-  && find config -mindepth 1 -delete && cp -a .deploy.new/config/. config/ \
-  && for f in ${FILES[*]}; do mv -f .deploy.new/\$f .; done && rm -rf .deploy.new"
+  && for f in ${FILES[*]}; do mv -f .deploy.new/\$f .; done"
 
 echo "==> rebuilding"
 # Keep one step back: tag the running image as :rollback before the build replaces
@@ -64,23 +57,41 @@ echo "==> rebuilding"
 "${SSH[@]}" "cd '$REMOTE' && cid=\$(docker compose ps -q bot 2>/dev/null); img=\$([ -n \"\$cid\" ] && docker inspect --format '{{.Image}}' \"\$cid\"); [ -n \"\$img\" ] && docker tag \"\$img\" qbot-bot:rollback || true"
 "${SSH[@]}" "cd '$REMOTE' && docker compose build bot"
 
-echo "==> checking database schema"
-if ! "${SSH[@]}" "cd '$REMOTE' && docker compose run --rm --no-deps bot python scripts/check_schema.py"; then
+echo "==> checking database schema against staged configuration"
+if ! "${SSH[@]}" "cd '$REMOTE' && docker compose run --rm --no-deps \
+    -e CONFIG_DIR=/app/config.next \
+    -v '$REMOTE/.deploy.new/config:/app/config.next:ro' \
+    bot python scripts/check_schema.py"; then
     echo >&2
-    echo "DEPLOY STOPPED: the database schema does not match this image." >&2
-    echo "The running container was not replaced. Stop it only during the maintenance" >&2
-    echo "window, create and verify a fresh backup, apply the manual schema update," >&2
-    echo "run scripts/check_schema.py, then run this deployment again." >&2
+    echo "DEPLOY STOPPED: the database schema does not match this image and configuration." >&2
+    echo "The running container and its mounted configuration were not replaced." >&2
+    echo "Create and verify a fresh backup before any manual schema update; then" >&2
+    echo "run scripts/check_schema.py with the staged configuration and deploy again." >&2
     exit 1
 fi
-"${SSH[@]}" "cd '$REMOTE' && docker compose up -d bot"
+
+# Stop the old image before changing any bytes inside its mounted config directory.
+# A failed start restores the old config but does not blindly restart an image that
+# might be incompatible with a manually updated database schema.
+"${SSH[@]}" "cd '$REMOTE' && mkdir -p config && rm -rf .config.rollback && cp -a config .config.rollback && docker compose stop bot"
+if ! "${SSH[@]}" "cd '$REMOTE' && find config -mindepth 1 -delete \
+    && cp -a .deploy.new/config/. config/ && docker compose up -d --no-build bot"; then
+    if ! "${SSH[@]}" "cd '$REMOTE' && docker compose stop bot \
+      && find config -mindepth 1 -delete && cp -a .config.rollback/. config/"; then
+        echo "DEPLOY FAILED: could not complete the rollback; inspect bot and config." >&2
+        exit 1
+    fi
+    echo "DEPLOY FAILED: bot is stopped and old configuration restored." >&2
+    echo "Check the schema before deciding whether the previous image can restart." >&2
+    exit 1
+fi
+"${SSH[@]}" "cd '$REMOTE' && rm -rf .deploy.new"
 
 echo "==> verifying"
-# Every path the Dockerfile COPYs code from - a stale bot.py or scripts/ must fail
-# the check the same way a stale qqbot/ does.
-want=$("$PYTHON" scripts/_fingerprint.py qqbot bot.py scripts)
+# Compare both image code and the bind-mounted config, including prompt text.
+want=$("$PYTHON" scripts/_fingerprint.py qqbot bot.py scripts config)
 # tr strips the CR that comes back through ssh from a Windows terminal
-got=$("${SSH[@]}" "cd '$REMOTE' && docker compose exec -T bot python /app/scripts/_fingerprint.py /app/qqbot /app/bot.py /app/scripts" | tr -d '\r')
+got=$("${SSH[@]}" "cd '$REMOTE' && docker compose exec -T bot python /app/scripts/_fingerprint.py /app/qqbot /app/bot.py /app/scripts /app/config" | tr -d '\r')
 
 if [ "$want" != "$got" ]; then
     echo >&2

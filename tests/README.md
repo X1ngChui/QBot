@@ -27,7 +27,8 @@ No QQ connection is needed. The runtime dependencies in `requirements.txt` are e
 | File | Needs a DB | Covers |
 | --- | --- | --- |
 | `test_domain.py` | no | The domain model: alias evidence and confirmation, fact validity windows, candidates, episodes |
-| `test_schema.py` | yes | Fresh installation of the sole canonical schema plus read-only compatibility and drift checks in a rolled-back isolated schema |
+| `test_schema.py` | yes | Fresh canonical schema and read-only structural drift checks, including same-name bad indexes and constraints in a disposable schema |
+| `test_deploy.py` / `test_deploy.sh` | no | Local fake-host build, staged-config schema gate, stopped-bot switch, startup failure rollback and code/config fingerprint |
 | `test_logic.py` | no | Configuration merge, output cleaning, budget arithmetic, segment parsing, prompt ordering, history eviction, the permission table, the source-language guard |
 | `test_nickname.py` | no | Whole-word nickname matching and its boundary cases |
 | `test_keys.py` | no | Per-capability credential resolution |

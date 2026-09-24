@@ -352,9 +352,9 @@ class Gateway:
             return
 
         who = decision.initiator
-        # /block withholds exactly the reply. Checked through blocked_now, never
-        # `in`: a timed block lapses the moment this check notices it has.
-        if who and await st.blocked_now(who):
+        # /block withholds exactly the reply; owners stay exempt even when a
+        # holder rule starts covering them after an identity merge.
+        if who and not perms.is_owner(who, cfg.owners) and await st.blocked_now(who):
             log.debug("group %s: no reply, initiator %s is blocked", group_id, who)
             return
         # The consent gate, before anything is paid for: a member who has not

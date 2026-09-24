@@ -171,6 +171,7 @@ class IdentityLinkRepository:
         invalidated: LinkChallengeError | None = None
         applied: LinkChallenge | None = None
         async with pool().acquire() as conn, conn.transaction():
+            await lock_identity_topology(conn)
             row = await conn.fetchrow(
                 """SELECT * FROM account_link_challenge
                     WHERE token_hash=$1 FOR UPDATE""",
@@ -188,7 +189,6 @@ class IdentityLinkRepository:
             if row["expires_at"] <= datetime.now(row["expires_at"].tzinfo):
                 invalidated = LinkChallengeError("关联请求已过期，请重新发起。")
             else:
-                await lock_identity_topology(conn)
                 accounts = await conn.fetch(
                     """SELECT id, entity_id FROM identity_account
                         WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE""",

@@ -2889,6 +2889,78 @@ async def main():
     await drain()
     check("unblocking restores replies", len(bot.sent) == n_sent15 + 1)
 
+    # A holder block created before a merge must never silence an owner who joins
+    # that holder; the owner must still be able to remove the now-shared rule.
+    block_owner = await _IDS.ensure_account("qq", "block-owner", seen_at=_nl0())
+    block_member = await _IDS.ensure_account("qq", "block-member", seen_at=_nl0())
+    await _repo.record_agreement(GROUP, "block-member", 1)
+    await _repo.block_holder(GROUP, block_member.entity_id)
+    await _IDS.merge_accounts(block_owner.id, block_member.id)
+    cfg = install_settings(cfg.model_copy(update={"owners": ["block-owner"]}))
+    check(
+        "a holder block dynamically covers both accounts after merge",
+        await _repo.blocked(GROUP, "block-owner")
+        and await _repo.blocked(GROUP, "block-member"),
+    )
+    n_owner = len(bot.sent)
+    await GATEWAY.handle(bot, FakeEvent("小X 还在吗", user_id="block-owner", to_me=True))
+    await drain()
+    check(
+        "an owner remains able to receive replies after merging into a block",
+        len(bot.sent) == n_owner + 1,
+    )
+    await GATEWAY.handle(bot, FakeEvent("小X 还在吗", user_id="block-member", to_me=True))
+    await drain()
+    check("other accounts in the blocked holder remain silent", len(bot.sent) == n_owner + 1)
+    await GATEWAY.handle(
+        bot,
+        FakeEvent(
+            user_id="block-owner",
+            segments=[
+                Seg("text", {"text": "/block add --all "}),
+                Seg("at", {"qq": "block-member", "name": "关联成员"}),
+            ],
+        ),
+    )
+    check(
+        "new blocks still reject a holder containing an owner",
+        await _repo.blocked(GROUP, "block-member")
+        and len(await _repo.block_rules(GROUP)) == 1
+        and "不能屏蔽" in bot.sent[-1][1],
+    )
+    await GATEWAY.handle(
+        bot,
+        FakeEvent(
+            user_id="block-owner",
+            segments=[
+                Seg("text", {"text": "/block remove --all "}),
+                Seg("at", {"qq": "block-member", "name": "关联成员"}),
+            ],
+        ),
+    )
+    check(
+        "an owner can remove a pre-merge holder rule",
+        not await _repo.blocked(GROUP, "block-owner")
+        and not await _repo.blocked(GROUP, "block-member")
+        and not await _repo.block_rules(GROUP),
+    )
+    await _repo.block(GROUP, "block-owner")
+    await GATEWAY.handle(
+        bot,
+        FakeEvent(
+            user_id="block-owner",
+            segments=[
+                Seg("text", {"text": "/block remove "}),
+                Seg("at", {"qq": "block-owner", "name": "拥有者"}),
+            ],
+        ),
+    )
+    check(
+        "an owner can remove an inherited exact rule",
+        not await _repo.blocked(GROUP, "block-owner"),
+    )
+    cfg = install_settings(cfg.model_copy(update={"owners": []}))
+
     # A timed block lapses dynamically: the first message past its expiry answers
     # normally. The row remains as bounded per-target audit state and is replaced by a
     # later rule for the same scope.

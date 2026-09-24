@@ -24,17 +24,21 @@ What it does:
 
 1. Archives `qqbot/`, `scripts/`, `sql/`, `config/`, `bot.py`, `requirements.txt`, the
    Dockerfile and the compose file, and extracts them on the host beside the current
-   tree before replacing it, so a failed transfer leaves the old tree intact. `config/`
-   is included even though it is bind-mounted, and its contents are replaced in place
-   so the mount survives. `.env`, `data/`, `models/`, `logs/` and `backups/` are never
-   touched.
+   tree before replacing the build inputs. The running bot's bind-mounted `config/`
+   is not changed during build or schema validation. `.env`, `data/`, `models/`,
+   `logs/` and `backups/` are never touched.
 2. Tags the currently running image `qbot-bot:rollback`, then builds the replacement image.
-3. Runs `scripts/check_schema.py` in a one-shot container. A mismatch stops deployment
-   before the running container is replaced; the check never executes DDL.
-4. Starts the rebuilt bot only after the schema passes.
-5. Computes a content hash of `qqbot/`, `bot.py` and `scripts/` locally and inside the
-   container and fails if they differ. `docker compose restart` never rebuilds an
-   image, so this check is what proves the deployment took effect.
+3. Runs `scripts/check_schema.py` in a one-shot container using the **staged** new
+   configuration. A build or schema mismatch stops deployment with the running bot
+   and its old configuration untouched; the check never executes DDL.
+4. After the gate passes, saves `.config.rollback`, stops the old bot, replaces the
+   mounted configuration's contents in place, and starts the rebuilt image. If
+   startup fails, the script stops the bot and restores the old configuration;
+   it does not automatically restart an image that may no longer match a manually
+   updated database. Inspect the schema before recovering.
+5. Compares the content hash of code **and configuration (including prompts)** locally
+   and inside the running container. `docker compose restart` never rebuilds an
+   image, so this check proves that the intended code and mounted config took effect.
 
 The script uses whatever is in the working tree, including untracked local
 configuration files. Deploy from a clean checkout of the revision you mean to run.
@@ -88,8 +92,9 @@ The dump carries the extensions and every table. The bot verifies the schema at 
 
 ## Rollback
 
-`deploy.sh` tags the previously running image `qbot-bot:rollback` and copies the
-previous mounted configuration to `.config.rollback` before every build. On the host:
+`deploy.sh` tags the previously running image `qbot-bot:rollback` before building and
+copies the previous mounted configuration to `.config.rollback` after the schema gate
+passes. On the host:
 
 ```bash
 cd /opt/docker/qbot
@@ -121,10 +126,19 @@ An existing installation is changed manually in a maintenance window:
 3. Apply a reviewed, installation-specific SQL transaction by hand. Convert rows only
    when the mapping is unambiguous; discard obsolete early-project data instead of adding
    compatibility columns, dual reads or runtime fallbacks.
-4. Run the matching image's `python scripts/check_schema.py`. Do not start the bot until
-   it reports that the database matches the canonical schema.
-5. Run `scripts/deploy.sh` again. It rebuilds, rechecks, starts the bot and verifies the
-   running source fingerprint.
+4. Check the matching image **with the staged new configuration**, without changing
+   the running bot's mount:
+
+   ```bash
+   docker compose run --rm --no-deps \
+     -e CONFIG_DIR=/app/config.next \
+     -v "$(pwd)/.deploy.new/config:/app/config.next:ro" \
+     bot python scripts/check_schema.py
+   ```
+
+   Do not start the bot until it reports that the database matches the canonical schema.
+5. Run `scripts/deploy.sh` again. It rebuilds, rechecks, switches the config and bot,
+   and verifies the running code/configuration fingerprint.
 
 The manual SQL is an operational artifact, not a second schema authority. Review the
 result against `sql/init.sql`, and keep the verified pre-change dump until the new runtime

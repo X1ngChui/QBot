@@ -13,6 +13,8 @@ import pathlib
 import sys
 import uuid
 
+import asyncpg
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("CONFIG_DIR", str(ROOT / "tests" / "fixtures" / "config"))
@@ -50,6 +52,7 @@ from qqbot.repositories import (
     MemoryRepository,
     VectorRepository,
 )
+from qqbot.repositories.identity import lock_identity_topology
 from qqbot.repositories.job import JobType
 from qqbot.services import IdentityLinkService, IdentityResolver
 from qqbot.settings import config
@@ -255,6 +258,79 @@ async def main() -> int:
         "confirmed endpoints now resolve to one holder",
         (await ids.account_by_id(link_a.id)).entity_id
         == (await ids.account_by_id(link_b.id)).entity_id,
+    )
+
+    for name in ("lock-a", "lock-b", "parallel-a", "parallel-b"):
+        await ids.ensure_account("qq", name, seen_at=now)
+    locked, locked_code = await link_service.issue(
+        group_id=GROUP_A,
+        initiator_user_id="lock-a",
+        target_user_id="lock-b",
+        created_event_id=await an_event(GROUP_A),
+    )
+    async with pool().acquire() as guard, guard.transaction():
+        await lock_identity_topology(guard)
+        confirmation = asyncio.create_task(
+            link_service.confirm(
+                group_id=GROUP_A,
+                actor_user_id="lock-b",
+                code=locked_code,
+                confirmed_event_id=await an_event(GROUP_A),
+            )
+        )
+        waiting = False
+        for _ in range(100):
+            waiting = bool(await pool().fetchval(
+                """SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                    WHERE datname=current_database() AND wait_event='advisory')"""
+            ))
+            if waiting:
+                break
+            await asyncio.sleep(0.01)
+        try:
+            async with pool().acquire() as probe, probe.transaction():
+                await probe.fetchval(
+                    "SELECT id FROM account_link_challenge WHERE id=$1 FOR UPDATE NOWAIT",
+                    locked.id,
+                )
+            row_free = True
+        except asyncpg.LockNotAvailableError:
+            row_free = False
+        check("confirmation waits on topology without locking the challenge", waiting and row_free)
+        parallel_issue = asyncio.create_task(
+            link_service.issue(
+                group_id=GROUP_A,
+                initiator_user_id="parallel-a",
+                target_user_id="parallel-b",
+                created_event_id=await an_event(GROUP_A),
+            )
+        )
+    applied, (parallel_challenge, parallel_code) = await asyncio.wait_for(
+        asyncio.gather(confirmation, parallel_issue), timeout=5
+    )
+    check(
+        "issue and confirm complete without reversing topology and row locks",
+        applied.status.value == "applied" and parallel_challenge.status.value == "pending",
+    )
+    await pool().execute(
+        "UPDATE account_link_challenge SET expires_at=NOW()-INTERVAL '1 second' WHERE id=$1",
+        parallel_challenge.id,
+    )
+    try:
+        await link_service.confirm(
+            group_id=GROUP_A,
+            actor_user_id="parallel-b",
+            code=parallel_code,
+            confirmed_event_id=await an_event(GROUP_A),
+        )
+        expired_rejected = False
+    except LinkChallengeError:
+        expired_rejected = True
+    check(
+        "expired confirmation persists its terminal state",
+        expired_rejected and await pool().fetchval(
+            "SELECT status FROM account_link_challenge WHERE id=$1", parallel_challenge.id
+        ) == "expired",
     )
 
     for user_id in ("limit-a", "limit-b", "limit-c"):

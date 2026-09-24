@@ -604,16 +604,10 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
     if len(mentions) != 1:
         raise UsageError("需要准确 @ 1 个账号。")
     target = mentions[0]
-    cfg = config().default
-    accounts = await ctx.directory.linked_account_ids(target)
-    if target == str(event.self_id) or any(
-        perms.is_owner(account, cfg.owners) for account in accounts
-    ):
-        await _finish(ctx, "不能屏蔽机器人或 owner。")
-    account = await ctx.directory.account(target)
     if action == "remove":
         if rest:
             raise UsageError("用法：/block remove [--all] @账号")
+        account = await ctx.directory.account(target)
         changed = (
             await repo.unblock_holder(event.group_id, account.entity_id)
             if all_linked
@@ -622,6 +616,13 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
         await _finish(ctx, "已解除屏蔽。" if changed else "没有对应的屏蔽规则。")
     if len(rest) > 1:
         raise UsageError("用法：/block add [--all] @账号 [30m|12h|3d]")
+    cfg = config().default
+    accounts = await ctx.directory.linked_account_ids(target)
+    if target == str(event.self_id) or any(
+        perms.is_owner(linked, cfg.owners) for linked in accounts
+    ):
+        await _finish(ctx, "不能屏蔽机器人或 owner。")
+    account = await ctx.directory.account(target)
     until = None
     if rest:
         span = parse_duration(rest[0])
