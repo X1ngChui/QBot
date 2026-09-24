@@ -179,7 +179,9 @@ _RETIRED_SCHEMA_COLUMNS = {"reply_trace": {"content"}}
 def _schema_expression(value: str | None) -> str:
     """Compare catalog-deparsed expressions independent of harmless casts and spacing."""
 
-    without_casts = re.sub(r"::(?:bigint|text|character varying)", "", value or "", flags=re.I)
+    without_casts = re.sub(
+        r"::(?:bigint|text(?:\[\])?|character varying)", "", value or "", flags=re.I
+    )
     return re.sub(r"\s+", "", without_casts).lower()
 
 

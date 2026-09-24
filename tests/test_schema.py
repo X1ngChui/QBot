@@ -46,6 +46,33 @@ async def main() -> int:
         await check_schema(conn, schema=schema, embedding_dimensions=dimensions)
         check("a fresh canonical schema passes compatibility checks", True)
 
+        for table, name, values in (
+            ("account_link_challenge", "account_link_status_valid",
+             "'pending', 'applied', 'cancelled', 'expired'"),
+            ("memory_extraction", "memory_extraction_status_valid",
+             "'extracting', 'staged', 'applied'"),
+        ):
+            await conn.execute(f'ALTER TABLE "{schema}"."{table}" DROP CONSTRAINT "{name}"')
+            await conn.execute(
+                f'ALTER TABLE "{schema}"."{table}" ADD CONSTRAINT "{name}" '
+                f'CHECK (status IN ({values}))'
+            )
+        definitions = await conn.fetch(
+            """SELECT pg_get_constraintdef(c.oid, true) AS definition
+                 FROM pg_constraint c
+                 JOIN pg_namespace n ON n.oid=c.connamespace
+                WHERE n.nspname=$1
+                  AND c.conname IN ('account_link_status_valid',
+                                    'memory_extraction_status_valid')""",
+            schema,
+        )
+        check(
+            "manual status checks cast the entire allowed-value array",
+            len(definitions) == 2 and all("::text[]" in row["definition"] for row in definitions),
+        )
+        await check_schema(conn, schema=schema, embedding_dimensions=dimensions)
+        check("equivalent manually authored status constraints pass", True)
+
         await conn.execute("DROP INDEX raw_event_platform_key")
         for statement, description in (
             ("CREATE INDEX raw_event_platform_key ON raw_event (group_id)",
