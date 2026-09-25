@@ -148,8 +148,8 @@ with budget.scope(per_reply_cny):
 
 The first round always runs. A cap that trips mid-reply does not discard the reply:
 outstanding tool requests receive a placeholder result and one final round, offered only
-`send_messages`, answers from what was already fetched, so the overshoot is exactly one
-round. A transport
+`send_messages`, can answer from what was already fetched or finish without a send when
+reply policy permits silence. The overshoot is exactly one round. A transport
 failure is reported to the model as a failure and the loop continues; a broken network
 is an error, not a limit. A configurable round cap exists only as a tripwire against a
 backend that bills zero.
@@ -178,8 +178,10 @@ The generated tool schema and runtime parser come from the same strict Pydantic 
 batch is validated before the first protocol call. A member or line number outside the frozen prompt
 snapshot, a non-integer number, an unknown field, an invalid segment, an empty item, a message above
 the text bound or a batch above the configured limit rejects the whole call; no prefix is sent. Bare
-assistant text is never sent: a round that ends without a tool call ends the reply in silence, with a
-warning in the log.
+assistant text is never sent: a round that ends without a tool call ends the reply in silence.
+This is a normal terminal outcome for a clear accidental address, logged at debug level:
+no reminder round, placeholder message or synthetic bot archive event is created. A genuine
+request that is unclear or must be refused still calls for a brief reply.
 
 `GroupDelivery` owns per-group serialization, OneBot projection and the reply-segment fallback for
 model replies, agreement pointers and commands. It does not write the archive or live window. NapCat's
@@ -241,7 +243,7 @@ hit as often as possible:
 constant rules (how to speak, transcript legend, identity, credibility and retrieval, privacy, tone)
 -> persona
 -> group knowledge
--> member roster: everyone who has appeared, numbered, with confirmed facts (stable order)
+-> member roster: numbered identity and manual notes, then scored unconfirmed hints (stable order)
 -> conversation history (append-only chunks)
 -> [cache boundary]
 -> current time
@@ -404,6 +406,33 @@ Aliases retain group/global scope, evidence and status. Confidence is the maximu
 one evidence channel and a noisy-OR across channels. A platform display name begins as a
 candidate, manual `/alias` evidence is authoritative, and a retired name stays retired
 against automatic evidence.
+
+### Memory visibility and identity authority
+
+Current learned facts and candidate names share one visibility rule: both appear as
+individually typed, scored hints, without a minimum-confidence display gate. Retired,
+closed, retracted, superseded and expired records are excluded. Current platform display
+names, confirmed names and manual notes remain separate reliable context; the current
+live platform display name is not repeated as a candidate hint in the reply roster.
+When the live name cannot be read, a stored candidate display name remains a scored hint;
+only a confirmed platform name may label the roster as a fallback.
+
+A score measures evidence strength within its own type, not calibrated probability.
+Fact scores and alias scores use different formulas; they are not compared against one
+universal cutoff. Even a high-scoring learned fact is still an automatic observation,
+not a manually confirmed statement. Group facts use the same scored hint renderer.
+
+Candidate names are visible for understanding and text search, not for resolving identity
+or addressing a member. Only confirmed live aliases enter lookup and the extraction
+snapshot's name-based account targets. In extraction, candidate names appear in known
+context rather than the account roster; holder hints are labelled as shared, and another
+linked account's exact aliases are not copied onto the current account. Neither reading
+a hint nor repeating it as the bot creates evidence. A fresh member-authored reuse of
+an exact-account candidate can add evidence across batches only when that same line
+independently identifies the exact account; stored candidate context is not evidence.
+Tool argument validation checks the
+selected numeric target, not the model's reason for selecting it; reply prompts enforce
+the distinction, while extraction also enforces line-local source/target validation.
 
 ### Facts
 

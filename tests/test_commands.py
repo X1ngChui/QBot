@@ -319,7 +319,7 @@ async def router_behavior() -> None:
         check("duplicate flags are rejected", "只能写一次" in text_of(duplicate_flag))
 
         directory.calls.clear()
-        await router.handle(
+        confidence_result = await router.handle(
             bot,
             request(
                 "/alias",
@@ -331,6 +331,12 @@ async def router_behavior() -> None:
             "alias confidence has an explicit action and numeric score",
             ("confidence", GROUP, str(MEMBER), "新称呼", 0.6, False) in directory.calls,
         )
+        check(
+            "low confidence is context-only, not invisible",
+            "仅作待确认线索" in text_of(confidence_result),
+        )
+        aliases_result = await router.handle(bot, request("/alias", user=MEMBER))
+        check("alias listing marks confirmed names", "已确认" in text_of(aliases_result))
 
         await router.handle(
             bot,

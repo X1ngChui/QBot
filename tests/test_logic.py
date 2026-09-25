@@ -468,7 +468,10 @@ asked = ChatMsg(msg_id="m99", user_id="u2", nickname="阿花", text="小X你在�
 st.add(asked)
 msgs = prompt.assemble(
     persona=persona, cfg=cfg, st=st, msg=asked,
-    profiles=[{"user_id": "u1", "nickname": "阿强", "persona_card": "爱打游戏"}],
+    profiles=[{
+        "user_id": "u1", "nickname": "阿强",
+        "memory_hints": ("事实：爱打游戏（置信度 0.27）",),
+    }],
 )
 check("system first", isinstance(msgs[0], _PromptMessage) and msgs[0].role is _DbgRole.SYSTEM)
 check("global policy stays in system", "【怎样发言】" in msgs[0].content)

@@ -6,14 +6,15 @@ nothing.
 A reply is one terminal call to the send tool (tools.SEND). The call carries an ordered
 batch of independent QQ messages; each message holds the text, whom to @ and which line to
 reply to as closed segments. The call is the only way out: a round that ends in bare text
-sends nothing, and the reply ends there.
+sends nothing, and the reply ends there. This is also the ordinary terminal path for
+an accidental address: no synthetic send or reminder round is added.
 
 Money normally bounds the tool loop; a high round-count tripwire exists only for a
 backend that bills zero. Free tools themselves cost nothing, but the model rounds carrying
 them are paid and booked into the scope around this reply. Once that scope is spent,
 searching stops and one wrap-up round, offered only the send tool, answers from what was
-already fetched: a mid-reply limit ends the spending, not the speech. Only the daily cap,
-checked before anything is spent, means silence.
+already fetched, or ends without a send when the reply policy permits silence.
+The daily cap is checked before anything is spent and suppresses replies entirely.
 """
 
 from __future__ import annotations

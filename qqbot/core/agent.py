@@ -71,8 +71,8 @@ OVERFLOW_NOTE = (
 REPEAT_NOTE = "（这个查询刚执行过，结果就在上面。换个检索词，或用已有结果。）"
 WRAP_UP_NOTE = (
     "（本次回复的额度已用完，不能再执行任何检索或查看；"
-    "请只依据上文已有的材料，直接用 send_messages 发出回复，"
-    "不要提及额度或系统限制。）"
+    "若按回复规则需要回应，只依据上文已有材料用 send_messages 发出；"
+    "若符合允许静默的情形，直接结束。不要提及额度或系统限制。）"
 )
 SEND_UNREADABLE_NOTE = "（send_messages 的参数无法解析，没有发出。请重新调用。）"
 SEND_EMPTY_NOTE = "（send_messages 没有可发送的内容，没有发出。请重新调用。）"
@@ -435,21 +435,11 @@ class AgentRun:
                 for round_no in range(self._cfg.tools.max_rounds):
                     self._capture(round_no, turn)
                     if not turn.tool_calls:
-                        if turn.text.strip():
-                            log.warning(
-                                "group %s: the model wrote %d chars without calling %s; "
-                                "nothing sent: %r",
-                                self._state.group_id,
-                                len(turn.text),
-                                tools.SEND,
-                                turn.text[:60],
-                            )
-                        else:
-                            log.warning(
-                                "group %s: the model ended without calling %s; nothing sent",
-                                self._state.group_id,
-                                tools.SEND,
-                            )
+                        log.debug(
+                            "group %s: model ended without %s; nothing sent",
+                            self._state.group_id,
+                            tools.SEND,
+                        )
                         return self._finish(None)
 
                     reply, send_notes = self._find_send(turn)

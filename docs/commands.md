@@ -40,10 +40,10 @@ implicit forms such as `-` for clearing a value are not aliases for the current 
 | `/note [--all] [@account]` | Show the note at the selected scope. |
 | `/note set [--all] [@account] TEXT` | Replace the note at the selected scope. Notes are explicit confirmed context and are never rewritten automatically. |
 | `/note clear [--all] [@account]` | Clear the selected note. |
-| `/alias [--all] [@account]` | List aliases at the selected scope. |
+| `/alias [--all] [@account]` | List aliases at the selected scope, marked confirmed or unconfirmed. |
 | `/alias add [--all] [@account] NAME` | Add a confirmed alias. |
 | `/alias remove [--all] [@account] NAME` | Retire an alias. Historical messages remain unchanged. |
-| `/alias confidence [--all] [@account] SCORE NAME` | Set manual confidence from 0 through 1. |
+| `/alias confidence [--all] [@account] SCORE NAME` | Set manual confidence from 0 through 1. At least 0.75 confirms the alias; below that it remains visible only as an unconfirmed hint, not an identity key. |
 | `/forget [--all] [@account] N` | Retract fact N from the matching `/who` view. |
 
 ## Linking accounts

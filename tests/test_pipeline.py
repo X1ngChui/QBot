@@ -955,22 +955,24 @@ async def main():
     _facts = await _r.group_knowledge(_gid)
     check(
         "the group's own facts read back",
-        _facts == ["做音乐的群", "切片：把采样切成小段再重排"],
+        _facts == [
+            "事实：做音乐的群（置信度 0.50）", "事实：切片：把采样切成小段再重排（置信度 0.50）"
+        ],
         str(_facts),
     )
-    check("the topic comes first", _facts[0] == "做音乐的群", str(_facts))
+    check("the topic comes first", _facts[0] == "事实：做音乐的群（置信度 0.50）", str(_facts))
 
     _, persona_k = config().for_group(GROUP)
     _split = prompt_mod.build_system(persona_k, [], _facts)
     check(
         "they reach the prompt as the bot's own summary",
-        "未确认（你自行归纳的印象" in _split and "切片：把采样切成小段再重排" in _split,
+        "未确认线索（可能有误或已过时" in _split and "切片：把采样切成小段再重排" in _split,
         _split[-200:],
     )
     check(
         "and the hand-written material is kept above them",
         "已确认（固定资料）" in _split
-        and _split.index("已确认（固定资料）") < _split.index("未确认（你自行归纳的印象"),
+        and _split.index("已确认（固定资料）") < _split.index("未确认线索（可能有误或已过时"),
         _split[-200:],
     )
 
@@ -1011,11 +1013,13 @@ async def main():
     _facts2 = await _r.group_knowledge(_gid)
     check(
         "redefining a term replaces it rather than adding one",
-        "切片：改了个说法" in _facts2 and "切片：把采样切成小段再重排" not in _facts2,
+        "事实：切片：改了个说法（置信度 0.50）" in _facts2
+        and not any("切片：把采样切成小段再重排" in fact for fact in _facts2),
         str(_facts2),
     )
     check(
-        "and a different term is a separate entry", "干声：没加效果的人声" in _facts2, str(_facts2)
+        "and a different term is a separate entry",
+        "事实：干声：没加效果的人声（置信度 0.50）" in _facts2, str(_facts2)
     )
 
     # 12d. Pictures are understood on arrival: the CDN link is freshest then, the
@@ -1703,8 +1707,11 @@ async def main():
         "",
     )
     check(
-        "the roster carries the member numbers, in its own order",
-        "- a⟦1⟧，note about a" in _numbered and "\n- zz⟦9⟧\n" in _numbered + "\n",
+        "the roster carries the member numbers without promoting candidate names",
+        "- 成员⟦1⟧，note about a" in _numbered
+        and "\n- 成员⟦9⟧\n" in _numbered + "\n"
+        and "未确认显示名：a" in _numbered
+        and "未确认显示名：zz" in _numbered,
         _numbered[_numbered.rfind("【群成员名册】") :][:400],
     )
 
@@ -1761,12 +1768,12 @@ async def main():
     check("the certain half is labelled certain", "已确认（系统记录的名字" in _sys, _sys[-200:])
     check(
         "and the guessed half is labelled guessed",
-        "未确认（你自行归纳的印象" in _sys and "喜欢打游戏" in _sys,
+        "未确认线索（可能有误或已过时" in _sys and "喜欢打游戏" in _sys,
         _sys[-200:],
     )
     check(
         "certain sits above guessed",
-        _sys.index("已确认（系统记录的名字") < _sys.index("未确认（你自行归纳的印象"),
+        _sys.index("已确认（系统记录的名字") < _sys.index("未确认线索（可能有误或已过时"),
     )
     # Stable first: a daily card rewrite must not also invalidate the constants above it.
     check(
@@ -1778,8 +1785,8 @@ async def main():
     # a group card is one alias among several, and changing it only adds another - which
     # is why "what was he called before" is answerable at all.
     # The old card has to have endured into a second day to count as a durable former
-    # name - a card worn for one day stays a candidate, which is what keeps one evening
-    # of joke renames out of the roster. Endurance is simulated by backdating the
+    # name - a card worn for one day remains a scored hint, not a durable identity
+    # mapping. Endurance is simulated by backdating the
     # evidence trail, which is also what decides it in production.
     await seed(ORD, "g", "旧名字")
     await pool().execute(
@@ -1792,8 +1799,10 @@ async def main():
     await seed(ORD, "g", "新名字")
     _renamed = await _DIR.holder_card(ORD, "g")
     check(
-        "a rename leaves the old name behind rather than overwriting it",
-        set(_renamed.other_names) == {"旧名字"} and _renamed.display == "新名字",
+        "a rename keeps the confirmed old name without trusting the new candidate",
+        set(_renamed.other_names) == {"旧名字"}
+        and _renamed.display == "g"
+        and "新名字" in [name.text for name in _renamed.candidates],
         f"{_renamed.display} / {_renamed.other_names}",
     )
     check(
@@ -1855,8 +1864,9 @@ async def main():
         str(_after.accounts),
     )
     check(
-        "names it produced itself go with it",
-        "小号" in _after.other_names + (_after.display,),
+        "an unconfirmed display name stays with the account that produced it",
+        "小号" in [name.text for name in _after.candidates]
+        and "小号" not in _after.other_names + (_after.display,),
         str(_after.other_names),
     )
     check(
@@ -2703,6 +2713,28 @@ async def main():
         "bare text sends nothing, and ends the reply",
         not ok_bare and len(bot.sent) == n_bare and len(LLM_CALLS) == n_calls + 1,
         f"{bot.sent[n_bare:]} {len(LLM_CALLS) - n_calls} round(s)",
+    )
+
+    _use(lambda _m: response(model="fake-light"))
+    n_accidental, n_model = len(bot.sent), len(LLM_CALLS)
+    window_before = list(st_pv.recent)
+    own_before = await pool().fetchval(
+        "SELECT count(*) FROM raw_event WHERE payload->>'author_kind'='bot'"
+    )
+    ok_accidental = await _respond(
+        bot=bot, st=st_pv, cfg=cfg, persona=config().for_group(GROUP)[1],
+        msg=_CM0(
+            msg_id="pv-accidental", user_id="u1", nickname="阿强",
+            text="只是名字碰巧触发，不是在叫你，也没有问题要问", ts=_nl0(),
+        ),
+    )
+    check(
+        "an accidental address may end without any send, retry or synthetic bot event",
+        not ok_accidental and len(bot.sent) == n_accidental
+        and len(LLM_CALLS) == n_model + 1 and list(st_pv.recent) == window_before
+        and await pool().fetchval(
+            "SELECT count(*) FROM raw_event WHERE payload->>'author_kind'='bot'"
+        ) == own_before,
     )
 
     _use(lambda m: response(model="fake-light", tool_calls=send_to_asker(m, "@阿强 明天多云")))

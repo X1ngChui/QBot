@@ -170,7 +170,6 @@ async def main() -> int:
             reasoning=ReasoningEffort.LOW,
             timeout_sec=max(text_cfg.timeout_sec, 240.0),
             retries=text_cfg.retries,
-            max_output_tokens=32000,
         ),
         context=CallContext(CallPurpose.PREFLIGHT),
     )

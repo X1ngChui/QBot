@@ -13,6 +13,7 @@ SCRIPTS = [
     "test_services.py",
     "test_commands.py",
     "test_memory.py",
+    "test_memory_visibility.py",
     "test_logic.py",
     "test_delivery.py",
     "test_nickname.py",

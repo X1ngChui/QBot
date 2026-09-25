@@ -680,7 +680,10 @@ async def main():
     # -- and how the reply path reads it back --------------------------------
     check(
         "the group's own facts render for the prompt",
-        await retrieval.group_knowledge(G) == ["做音乐的群", "切片：把采样切成小段再重排"],
+        await retrieval.group_knowledge(G) == [
+            f"事实：做音乐的群（置信度 {earned_confidence(2):.2f}）",
+            f"事实：切片：把采样切成小段再重排（置信度 {earned_confidence(2):.2f}）",
+        ],
         str(await retrieval.group_knowledge(G)),
     )
     # Episodes reach a reply only through the recall_events tool (covered above):
@@ -688,8 +691,11 @@ async def main():
     roster = await retrieval.gather(group_id=G, directory=_DIRECTORY)
     check(
         "the roster carries the person's fact, not the group's - and lists everyone",
-        [(r["nickname"], r["persona_card"]) for r in roster]
-        == [("董自豪", "在玩鸣潮"), ("小北", "")],
+        [r["nickname"] for r in roster] == ["成员", "成员"]
+        and any("未确认显示名：董自豪" in hint for hint in roster[0]["memory_hints"])
+        and any("未确认显示名：小北" in hint for hint in roster[1]["memory_hints"])
+        and any(hint.startswith("事实：在玩鸣潮（置信度 ") for hint in roster[0]["memory_hints"])
+        and not any(hint.startswith("事实：") for hint in roster[1]["memory_hints"]),
         str(roster),
     )
     # A confirmed name rides the extraction roster as a comprehension key: the
@@ -835,7 +841,7 @@ async def main():
     #
     # Which means the evidence has to be attributed to the message it came from:
     # records all citing the batch's last event would pin this count at 1, and
-    # nothing the model noticed would ever reach the prompt.
+    # nothing the model noticed would ever become usable as an identity mapping.
     from qqbot.domain.identity import Alias, AliasEvidence, AliasType, EvidenceType
     from qqbot.repositories import IdentityRepository as _IR
 

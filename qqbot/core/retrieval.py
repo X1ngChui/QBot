@@ -11,8 +11,8 @@ about them: the roster is where member numbers are assigned (core.member_numbers
 it is the one list in which the model can find anybody it wants to @ or search for.
 
 The rows are assembled by `Directory`, the same service the ops commands read through.
-That is on purpose: with a single query behind both, /who shows an owner exactly the
-wording the model reads, so a wrong fact seen there is the wrong fact the model has.
+Both views use the same scoped records; the prompt separates reliable identities and
+notes from scored facts and candidate-name hints.
 
 Group isolation: `Directory` takes group_id on every call, and there is no path here that
 omits it.
@@ -36,6 +36,7 @@ from ..repositories import (
 )
 from ..providers.base import EmbeddingModel
 from ..services import Directory, IdentityResolver, Retriever
+from ..services.context_builder import render_hint
 from ..services.memory_extractor import GROUP_TERM, GROUP_TOPIC
 from .members import MEMBERS
 
@@ -102,8 +103,8 @@ def _named(card) -> bool:
     shown = card.display.strip()
     if not shown:
         return False
-    return shown not in card.accounts or any(
-        n.text == shown for n in (*card.names, *card.candidates)
+    return shown not in card.accounts or card.live_display or any(
+        n.text == shown for n in card.names
     )
 
 
@@ -122,11 +123,9 @@ async def gather(
     Ordered by when each person first appeared, ties by account, because the order is
     the member numbering: somebody new joins at the end, and nobody else's number moves.
 
-    The row shape is what prompt.py renders. Two of the fields carry the same split the
-    prompt draws between certainty and guesswork - a note was entered explicitly, a card is
-    the model's own reading - and two more split the names by where they came from: a name
-    the account displayed is something the platform reported, while a name the group uses
-    is a claim about usage that can be wrong.
+    The row shape is what prompt.py renders. Reliable names and explicit notes remain
+    separate from scored memory_hints, which carry learned facts and candidate names.
+    Historical platform display names and conversational aliases are distinct claims.
     """
     gid = group_id
     exclude = {str(bot.self_id)} if bot is not None else set()
@@ -170,7 +169,7 @@ async def gather(
                 "nickname": c.display if _named(c) else "成员",
                 "former_names": list(c.displayed_names),
                 "aliases": list(c.nicknames),
-                "persona_card": c.summary,
+                "memory_hints": c.memory_hints,
                 "manual_note": c.note,
                 "msg_count": c.messages,
             }
@@ -290,9 +289,8 @@ async def group_knowledge(group_id: GroupId) -> list[str]:
         if not value:
             continue
         if f.predicate == GROUP_TERM:
-            out.append(f"{defang(str(f.object_key or ''))}：{value}")
-        else:
-            out.append(value)
+            value = f"{defang(str(f.object_key or ''))}：{value}"
+        out.append(render_hint("事实", value, f.confidence))
     return out
 
 

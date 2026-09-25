@@ -407,7 +407,11 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
         names = list(card.names) + list(card.candidates)
         if not names:
             await _finish(ctx, f"{card.display} 暂无记录在案的称呼。")
-        lines = [f"· {name.text}（{name.confidence:.2f}）" for name in names]
+        lines = [
+            f"· {name.text}（{name.confidence:.2f}，已确认）" for name in card.names
+        ] + [
+            f"· {name.text}（{name.confidence:.2f}，待确认线索）" for name in card.candidates
+        ]
         await _finish(
             ctx, _fit(f"{card.display} 的称呼：\n" + "\n".join(lines), gid=event.group_id)
         )
@@ -445,7 +449,9 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
         )
     except NameTaken as exc:
         await _finish(ctx, f"「{exc.text}」已经指向 {exc.holder}。")
-    state = "可以使用" if result.confidence >= CONFIRM_THRESHOLD else "暂不使用"
+    state = (
+        "已确认，可用于称呼和指认" if result.confidence >= CONFIRM_THRESHOLD else "仅作待确认线索"
+    )
     await _finish(ctx, f"已设置「{result.text}」为 {result.confidence:.2f}（{state}）。")
 
 

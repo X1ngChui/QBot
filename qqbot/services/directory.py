@@ -32,7 +32,7 @@ from ..repositories import (
     MemoryRepository,
 )
 from ..util import now_local
-from .context_builder import NOTE, render_fact
+from .context_builder import NOTE, render_fact, render_hint
 from .identity_resolver import IdentityResolver, UnknownAccount
 from .memory_extractor import GROUP_TOPIC
 
@@ -94,6 +94,13 @@ class NameCard:
         """Reported by QQ rather than observed in conversation."""
         return self.kind in (AliasType.GROUP_CARD, AliasType.QQ_NICKNAME)
 
+    @property
+    def hint(self) -> str:
+        """An unconfirmed name is context, never an identity mapping."""
+
+        kind = "未确认显示名" if self.platform_given else "未确认别名"
+        return render_hint(kind, self.text, self.confidence)
+
 
 @dataclass(frozen=True, slots=True)
 class FactCard:
@@ -132,14 +139,12 @@ class PersonCard:
     entity_id: uuid.UUID
     user_id: str
     display: str
+    live_display: bool = False
     account_id: uuid.UUID | None = None
     accounts: tuple[str, ...] = ()
     messages: int = 0
     names: tuple[NameCard, ...] = ()
-    #: Names on record but below the line the bot uses - the model's unconfirmed guesses
-    #: and first-day platform names. Exposed because these are exactly what the
-    #: confidence-setting form of /alias adjusts, and a lever over invisible state is not
-    #: a lever.
+    #: Unconfirmed names remain visible as scored context, not as identity keys.
     candidates: tuple[NameCard, ...] = ()
     facts: tuple[FactCard, ...] = ()
 
@@ -186,26 +191,39 @@ class PersonCard:
         return tuple(f for f in self.facts if not f.manual)
 
     @property
+    def memory_hints(self) -> tuple[str, ...]:
+        """Current learned facts and candidate names share one scored context view."""
+
+        return tuple(
+            render_hint("事实", fact.text, fact.confidence)
+            for fact in self.learned if fact.text
+        ) + tuple(
+            name.hint for name in self.candidates
+            if not (self.live_display and name.text == self.display)
+        )
+
+    @property
     def summary(self) -> str:
-        """The learned facts as one phrase, in the same words the prompt uses."""
+        """A compact fact-only preview for directory commands."""
         return "；".join(f.text for f in self.learned if f.text)
 
 
-def _current_platform_name(aliases) -> str:
+def _current_platform_name(aliases, *, confirmed_only: bool = False) -> str:
     """The name the account is wearing right now, judged by recency.
 
     Display and trust are different axes. A group card is how the account presents itself
     from its first message - what takes a second day is believing the card to be a durable
     *name*. And "right now" is decided by when each was last seen, not by confidence: after
     a rename, the old confirmed card outweighs the new one on certainty precisely because
-    it endured, but the account is no longer wearing it.
+    it endured, but the account is no longer wearing it. Without live confirmation, a
+    candidate cannot label the trusted roster, nor can the older confirmed card replace it.
     """
     platform = [a for a in aliases if a.alias_type in (AliasType.GROUP_CARD, AliasType.QQ_NICKNAME)]
     if not platform:
         return ""
     epoch = datetime.min.replace(tzinfo=UTC)
     newest = max(platform, key=lambda a: (a.last_used_at or a.valid_from or epoch, a.confidence))
-    return newest.alias_text
+    return newest.alias_text if not confirmed_only or newest.is_usable else ""
 
 
 class Directory:
@@ -249,9 +267,9 @@ class Directory:
         forward from the start - ordering it by recency reshuffles it every turn and
         invalidates the whole prompt behind it.
 
-        `display` supplies the live group card per account when the caller has one; the
-        stored aliases are the fallback, which is what a member who has since left still
-        renders as.
+        `display` supplies the live group card per account when the caller has one. Without
+        one, only confirmed platform names may label the reply roster; an unconfirmed
+        stored display name stays a scored hint instead of becoming a trusted heading.
         """
         counts = await self._events.speaker_counts(group_id)
         for uid in exclude or ():
@@ -340,14 +358,16 @@ class Directory:
             (display[user] for user in accounts if (display.get(user) or "").strip()),
             "",
         ).strip()
+        live_display = bool(shown)
         if not shown:
-            shown = _current_platform_name(aliases) or primary
+            shown = _current_platform_name(aliases, confirmed_only=True) or primary
         return self._make_card(
             entity_id=entity_id,
             account_id=None,
             primary=primary,
             accounts=accounts,
             display=shown,
+            live_display=live_display,
             counts=counts,
             aliases=aliases,
             facts=facts,
@@ -364,6 +384,7 @@ class Directory:
         counts: dict[str, int],
         aliases: list[Alias],
         facts: list[Fact],
+        live_display: bool = False,
     ) -> PersonCard:
         usable = [alias for alias in aliases if alias.is_usable]
         ordered = sorted(
@@ -380,6 +401,7 @@ class Directory:
             account_id=account_id,
             user_id=primary,
             display=display,
+            live_display=live_display,
             accounts=tuple(sorted(accounts)),
             messages=sum(counts.get(user, 0) for user in accounts),
             names=tuple(

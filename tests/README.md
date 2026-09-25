@@ -43,6 +43,7 @@ No QQ connection is needed. The runtime dependencies in `requirements.txt` are e
 | `test_runtime.py` | no | Runtime composition and teardown ordering plus per-message media ownership, sharing, retries and late patches |
 | `test_pipeline.py` | yes | The normalized archive-first gateway with a fake protocol side and stubbed models: replay admission, commands, notices, triggers, identity, media and replies |
 | `test_memory.py` | yes | Exact-event extraction end to end: durable/staged restart, concurrent provider exclusion, quote validation, atomic projection and rollback, embedding enqueue, and decay |
+| `test_memory_visibility.py` | yes | Scored fact/name hints, confirmation and cache transitions, exact/holder separation, and candidate names excluded from line-local identity targets |
 
 ## Conventions
 

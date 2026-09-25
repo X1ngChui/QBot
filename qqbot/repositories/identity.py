@@ -437,7 +437,7 @@ class IdentityRepository:
             """SELECT * FROM alias
                 WHERE target_account_id=$2
                   AND (group_id=$1 OR group_id IS NULL)
-                  AND status <> 'inactive'
+                  AND status <> 'inactive' AND valid_to IS NULL
                 ORDER BY confidence DESC, alias_text""",
             group_id.to_db(),
             account_id,
@@ -454,7 +454,7 @@ class IdentityRepository:
                  LEFT JOIN family f ON a.target_entity_id = f.id
                  LEFT JOIN identity_account ia ON a.target_account_id = ia.id
                 WHERE (a.group_id=$1 OR a.group_id IS NULL)
-                  AND a.status <> 'inactive'
+                  AND a.status <> 'inactive' AND a.valid_to IS NULL
                   AND (f.id IS NOT NULL OR ia.entity_id=$2)
                 ORDER BY a.confidence DESC, a.alias_text""",
             group_id.to_db(),
@@ -711,10 +711,8 @@ class IdentityRepository:
             # already points at a message and every message has a sender - the answer was
             # always in there, and a stored counter would be a second thing to keep true.
             #
-            # This is the one route by which a name the model only observed becomes
-            # certain. Without it, everything it noticed would stay a candidate forever
-            # and never reach the prompt, however thoroughly the group had converged on
-            # the nickname.
+            # This promotes an observed name into an identity key. Candidate names
+            # remain visible as context, but cannot resolve accounts until confirmed.
             users = (
                 await conn.fetchval(
                     """SELECT count(DISTINCT r.platform_user_id)

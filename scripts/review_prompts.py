@@ -60,24 +60,23 @@ findings array when nothing material remains. List the coherent boundaries actua
 
 
 def review_tool() -> ToolSpec:
-    """The bounded report shape keeps one review from becoming another rewrite."""
+    """Require actionable findings without truncating the review's coverage."""
 
     return ToolSpec(
         name=REVIEW_TOOL,
-        description="Report the bounded result of reviewing the complete prompt bundle.",
+        description="Report the result of reviewing the complete prompt bundle.",
         parameters={
             "type": "object",
             "properties": {
                 "findings": {
                     "type": "array",
-                    "maxItems": 5,
                     "items": {
                         "type": "object",
                         "properties": {
-                            "template_key": {"type": "string", "maxLength": 80},
-                            "conflicting_clauses": {"type": "string", "maxLength": 1000},
-                            "failing_case": {"type": "string", "maxLength": 500},
-                            "runtime_impact": {"type": "string", "maxLength": 500},
+                            "template_key": {"type": "string", "minLength": 1},
+                            "conflicting_clauses": {"type": "string", "minLength": 1},
+                            "failing_case": {"type": "string", "minLength": 1},
+                            "runtime_impact": {"type": "string", "minLength": 1},
                         },
                         "required": [
                             "template_key",
@@ -90,8 +89,7 @@ def review_tool() -> ToolSpec:
                 },
                 "verified_boundaries": {
                     "type": "array",
-                    "maxItems": 12,
-                    "items": {"type": "string", "maxLength": 300},
+                    "items": {"type": "string", "minLength": 1},
                 },
             },
             "required": ["findings", "verified_boundaries"],
@@ -107,24 +105,19 @@ def _validate_report(value) -> dict:
         raise RuntimeError("review report must contain exactly findings and verified_boundaries")
     findings = value["findings"]
     boundaries = value["verified_boundaries"]
-    if not isinstance(findings, list) or len(findings) > 5:
-        raise RuntimeError("review findings must be an array of at most 5 items")
-    if not isinstance(boundaries, list) or len(boundaries) > 12:
-        raise RuntimeError("review verified_boundaries must be an array of at most 12 items")
-    finding_fields = {
-        "template_key": 80,
-        "conflicting_clauses": 1000,
-        "failing_case": 500,
-        "runtime_impact": 500,
-    }
+    if not isinstance(findings, list):
+        raise RuntimeError("review findings must be an array")
+    if not isinstance(boundaries, list):
+        raise RuntimeError("review verified_boundaries must be an array")
+    finding_fields = {"template_key", "conflicting_clauses", "failing_case", "runtime_impact"}
     for index, finding in enumerate(findings):
-        if not isinstance(finding, dict) or set(finding) != set(finding_fields):
+        if not isinstance(finding, dict) or set(finding) != finding_fields:
             raise RuntimeError(f"review finding {index} has an invalid shape")
-        for field, limit in finding_fields.items():
+        for field in finding_fields:
             item = finding[field]
-            if not isinstance(item, str) or not item.strip() or len(item) > limit:
+            if not isinstance(item, str) or not item.strip():
                 raise RuntimeError(f"review finding {index}.{field} is invalid")
-    if any(not isinstance(item, str) or not item.strip() or len(item) > 300 for item in boundaries):
+    if any(not isinstance(item, str) or not item.strip() for item in boundaries):
         raise RuntimeError("review verified_boundaries contains an invalid item")
     return value
 
@@ -149,7 +142,6 @@ async def main() -> int:
             reasoning=ReasoningEffort.LOW,
             timeout_sec=max(text_cfg.timeout_sec, 600.0),
             retries=text_cfg.retries,
-            max_output_tokens=32000,
         ),
         context=CallContext(CallPurpose.PREFLIGHT),
     )

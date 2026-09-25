@@ -45,7 +45,8 @@ from ..repositories import (
 from ..repositories.job import Job, JobType
 from ..services import ExtractionInput, MemoryConsolidator, MemoryExtractor
 from ..services.memory_extractor import SourceLine, decay_classes
-from ..services.context_builder import NOTE
+from ..services.context_builder import NOTE, render_hint
+from ..services.directory import NameCard
 from ..settings import Settings, config
 from ..util import defang, fmt_when, now_local, sysmark, why
 
@@ -196,11 +197,15 @@ class MemoryWorker:
             out.append(f"本群固定资料：\n{fixed}")
 
         if group_facts := await self._mem.current_entity_facts(group_id, [subject]):
-            out.append("本群：")
+            out.append("本群未确认线索：")
             out += [
-                f"- {fact.predicate}"
-                + (f" {defang(str(fact.object_key))}" if fact.object_key else "")
-                + f" = {defang(str(fact.object_value))}"
+                "- " + render_hint(
+                    "事实",
+                    fact.predicate
+                    + (f" {fact.object_key}" if fact.object_key else "")
+                    + f" = {fact.object_value}",
+                    fact.confidence,
+                )
                 for fact in sorted(
                     group_facts,
                     key=lambda item: (item.predicate, item.object_key or ""),
@@ -224,28 +229,51 @@ class MemoryWorker:
                 notes[code] = defang(str(fact.object_value))
             else:
                 per.setdefault(code, []).append(
-                    f"{fact.predicate} = {defang(str(fact.object_value))}"
+                    render_hint(
+                        "事实", f"{fact.predicate} = {fact.object_value}", fact.confidence
+                    )
                 )
 
-        holder_ids = list(dict.fromkeys(account.entity_id for account in accounts.values()))
+        accounts_by_holder: dict[uuid.UUID, list[uuid.UUID]] = {}
+        for account_id, account in accounts.items():
+            accounts_by_holder.setdefault(account.entity_id, []).append(account_id)
+        holder_ids = list(accounts_by_holder)
         holder_facts = await self._mem.current_entity_facts(group_id, holder_ids)
         for fact in holder_facts:
-            for account_id, account in accounts.items():
-                if account.entity_id != fact.subject_entity_id:
-                    continue
+            for account_id in accounts_by_holder.get(fact.subject_entity_id, ()):
                 code = by_account[account_id]
                 if fact.predicate == NOTE:
                     notes.setdefault(code, defang(str(fact.object_value)))
                 else:
-                    rendered = f"{fact.predicate} = {defang(str(fact.object_value))}"
+                    rendered = "关联集合共享：" + render_hint(
+                        "事实", f"{fact.predicate} = {fact.object_value}", fact.confidence
+                    )
                     if rendered not in per.setdefault(code, []):
                         per[code].append(rendered)
 
+        for holder_id, holder_accounts in accounts_by_holder.items():
+            aliases = await self._ids.aliases_for(group_id, holder_id)
+            for alias in aliases:
+                if alias.is_usable:
+                    continue
+                if alias.target_account_id is None:
+                    targets = holder_accounts
+                elif alias.target_account_id in holder_accounts:
+                    targets = (alias.target_account_id,)
+                else:
+                    continue
+                hint = NameCard(alias.alias_text, alias.alias_type, alias.confidence).hint
+                if alias.target_account_id is None:
+                    hint = "关联集合共享：" + hint
+                for account_id in targets:
+                    per.setdefault(by_account[account_id], []).append(hint)
+
         for code in sorted(per.keys() | notes.keys()):
-            facts = "；".join(sorted(per.get(code, [])))
             note = f"备注：{notes[code]}" if code in notes else ""
-            joined = "；".join(item for item in (facts, note) if item)
-            out.append(f"{sysmark(str(code))}：{joined}")
+            out.append(f"{sysmark(str(code))}：{note}")
+            if hints := sorted(per.get(code, [])):
+                out.append("未确认线索：")
+                out.extend(f"- {hint}" for hint in hints)
 
         episodes = await self._eps.recent_active(
             group_id,

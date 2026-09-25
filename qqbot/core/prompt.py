@@ -100,9 +100,8 @@ def _known_block(profiles: list[dict], people: MemberNumbers) -> str:
       former names - the account displayed them, and QQ said so. Every message files the
         current group card as an alias, so changing it leaves the old one behind rather
         than overwriting it; that is what makes "what was he called before" answerable.
-      aliases      - written in by hand through /alias. Certain because somebody typed it
-        deliberately, but a claim about what people call him, not about what the account
-        displayed.
+      aliases      - confirmed names used to address somebody, whether manually entered
+        or supported by independent observations; not historical platform display names.
       the note     - written in by hand through /note.
 
     The first two must never be flattened into one list: a name an owner registered
@@ -129,24 +128,16 @@ def _known_block(profiles: list[dict], people: MemberNumbers) -> str:
 
 
 def _guessed_block(profiles: list[dict], people: MemberNumbers) -> str:
-    """What the bot worked out by watching, in its own words.
+    """Scored facts and unconfirmed names, separate from usable identity mappings."""
 
-    Kept apart from the block above because a guess and a fact the platform reported are
-    not the same kind of thing, and one list covering both would say they were.
-
-    The names people call someone by live in this prose, not in a structured field
-    beside it: a name only means anything with the sentence around it - "everyone calls
-    him that" and "somebody called him that once and nobody followed" are different
-    claims that reduce to the same array entry.
-    """
     lines = []
     for p in profiles:
-        card = defang(p.get("persona_card") or "").strip()
-        if not card:
+        hints = [defang(hint) for hint in p.get("memory_hints", ())]
+        if not hints:
             continue
         n, shown = _name(p, people)
-        lines.append((n, f"- {shown}。{card}"))
-    return _block("未确认（你自行归纳的印象，可能有误或已过时）：", lines)
+        lines.append((n, f"- {shown}：\n" + "\n".join(f"  - {hint}" for hint in hints)))
+    return _block("未确认线索（可能有误或已过时）：", lines)
 
 
 def build_policy(prompts: PromptCatalog | None = None) -> str:
@@ -178,7 +169,7 @@ def build_developer(
         if fixed:
             parts.append("已确认（固定资料）：\n" + fixed)
         if learned:
-            parts.append("未确认（你自行归纳的印象，可能有误或已过时）：\n" + learned)
+            parts.append("未确认线索（可能有误或已过时）：\n" + learned)
         group_block = H_GROUP + "\n" + "\n\n".join(parts)
 
     if people is None:

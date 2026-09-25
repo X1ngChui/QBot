@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from ..core.agent import WRAP_UP_NOTE
 from ..core.member_numbers import MemberNumbers
 from ..core.prompt import build_developer, build_policy
 from ..core.tools import tool_defs
@@ -48,7 +49,11 @@ def build_prompt_packet(catalog: PromptCatalog, cfg: Settings) -> str:
             "former_names": ["甲同学"],
             "aliases": ["小甲"],
             "manual_note": "成员本人确认喜欢摄影。",
-            "persona_card": "可能经常分享摄影作品。",
+            "memory_hints": (
+                "事实：喜欢摄影（置信度 0.27）",
+                "事实：在用绘图软件（置信度 0.95）",
+                "未确认别名：蓝帆（置信度 0.30）",
+            ),
         },
         {
             "user_id": "member-2",
@@ -58,7 +63,7 @@ def build_prompt_packet(catalog: PromptCatalog, cfg: Settings) -> str:
             "former_names": [],
             "aliases": [],
             "manual_note": "",
-            "persona_card": "",
+            "memory_hints": (),
         },
     ]
     extraction_user = catalog.render(
@@ -67,8 +72,10 @@ def build_prompt_packet(catalog: PromptCatalog, cfg: Settings) -> str:
         account_roster="成员甲⟦1⟧（也叫：小甲）\n成员乙⟦2⟧",
         known_memory=(
             "本群固定资料：\n这是只用于验证提示词的虚构群。\n"
-            "本群：\n- group.term 蓝盒 = 虚构测试设备\n"
-            "⟦1⟧：lives_in = 南京；备注：成员本人确认喜欢摄影。\n"
+            "本群未确认线索：\n- 事实：term 蓝盒 = 虚构测试设备（置信度 0.27）\n"
+            "⟦1⟧：备注：成员本人确认喜欢摄影。\n"
+            "未确认线索：\n- 事实：lives_in = 南京（置信度 0.27）\n"
+            "- 未确认别名：蓝帆（置信度 0.30）\n"
             "已记过的事：\n- 成员甲曾分享一组虚构照片"
         ),
         transcript=(
@@ -104,9 +111,24 @@ def build_prompt_packet(catalog: PromptCatalog, cfg: Settings) -> str:
                     "Exact accounts present in the batch or uniquely named by eligible text, "
                     "plus their confirmed exact-account aliases."
                 ),
+                "reply.memory_hints": (
+                    "Current learned facts and candidate names are visible together as typed, "
+                    "scored unconfirmed context. Names carry the display-name or alias type. "
+                    "They are not identity mappings, even when shown under a member number. "
+                    "Scores are evidence-strength measures within each type, not calibrated "
+                    "probabilities or interchangeable scores between facts and names. "
+                    "High-scoring learned facts do not become manually confirmed statements. "
+                    "A live platform display may label the member, but an unconfirmed stored "
+                    "display name is only a hint when the live name is unavailable."
+                ),
                 "extract.known_memory": (
-                    "Fixed group knowledge, group facts, exact-account facts, holder facts, "
-                    "manual notes and recent episodes. It is context only, never fresh evidence."
+                    "Fixed group knowledge, scored group facts, exact-account facts, holder facts, "
+                    "candidate names, manual notes and recent episodes. Holder context is labelled "
+                    "as shared, not assigned to one endpoint. Candidate names appear only here, "
+                    "not in the confirmed account roster or source-local identity target map. "
+                    "It is context only, never fresh evidence; a new eligible, independently "
+                    "targeted use of the same exact-account candidate may itself add evidence "
+                    "across batches without treating the stored hint as evidence."
                 ),
             },
             "markers": {
@@ -139,6 +161,11 @@ def build_prompt_packet(catalog: PromptCatalog, cfg: Settings) -> str:
                 ),
                 "A valid send_messages is the only visible reply and terminates the run.",
                 (
+                    "A clear accidental address may end without send_messages and has no "
+                    "visible chat effect. Refusal or an unclear real request still needs a "
+                    "brief reply; failed unrepairable sends may also end silently."
+                ),
+                (
                     "Every extraction candidate binds source ordinals to verbatim eligible "
                     "member-authored spans and exact line-local account targets."
                 ),
@@ -165,6 +192,7 @@ def build_prompt_packet(catalog: PromptCatalog, cfg: Settings) -> str:
         },
         "current_templates": {key.value: catalog.source(key) for key in PROMPT_SPECS},
         "code_derived": {
+            "reply_wrap_up": WRAP_UP_NOTE,
             "reply_tools": _tool_document(tool_defs(cfg)),
             "extraction_tools": _tool_document(extraction_tools()),
             "predicate_table": rules_block(),
@@ -174,7 +202,7 @@ def build_prompt_packet(catalog: PromptCatalog, cfg: Settings) -> str:
             "reply_developer": build_developer(
                 persona,
                 profiles,
-                ["本群把“蓝盒”定义为虚构测试设备。"],
+                ["事实：本群把“蓝盒”定义为虚构测试设备。（置信度 0.27）"],
                 people,
                 prompts=catalog,
             ),
