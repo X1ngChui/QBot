@@ -11,7 +11,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("CONFIG_DIR", str(ROOT / "tests" / "fixtures" / "config"))
 
-from qqbot.core import agreement, perms
+from qqbot.core import perms
 from qqbot.core.command_catalog import Access, CATALOG, PREFIXES, detail_text, find, help_text
 from qqbot.core.commands import CommandRequest, CommandRouter, registered_commands
 from qqbot.core.delivery import GroupDelivery
@@ -186,10 +186,12 @@ def catalogue() -> None:
     )
     check("help is role-independent", "仅 owner" in listing and "详细用法" in listing)
     check(
-        "open commands are exactly the protocol commands",
-        {item.name for item in CATALOG if item.access is Access.OPEN}
-        == {"/help", "/terms", "/agree"},
+        "member-access commands are open without an agreement",
+        {item.name for item in CATALOG if item.access is Access.MEMBER}
+        == {"/help", "/who", "/note", "/alias", "/forget", "/link", "/unlink",
+            "/card", "/stats", "/top"},
     )
+    check("agreement commands are absent", "/agree" not in PREFIXES and "/terms" not in PREFIXES)
     check(
         "owner-only commands are marked as authorization, not alternate semantics",
         all("仅 bot owner" in detail_text(item) for item in CATALOG if item.access is Access.OWNER),
@@ -210,12 +212,8 @@ def catalogue() -> None:
     owners = ["owner-a"]
     check("owner identity is normalized", perms.is_owner("owner-a", owners))
     check(
-        "open access admits a member",
-        perms.decide("m", owners=owners, access=Access.OPEN) is perms.Verdict.MEMBER,
-    )
-    check(
-        "agreed access asks a member for consent",
-        perms.decide("m", owners=owners, access=Access.AGREED) is perms.Verdict.MEMBER_IF_AGREED,
+        "member access admits a new member directly",
+        perms.decide("m", owners=owners, access=Access.MEMBER) is perms.Verdict.MEMBER,
     )
     check(
         "owner access denies a member",
@@ -230,203 +228,168 @@ async def router_behavior() -> None:
     router = CommandRouter(GroupDelivery(), Registry(), directory, links, providers)
     bot = FakeBot()
 
-    original_ok = agreement.ok
+    owner_help = await router.handle(bot, request("/help", user=OWNER))
+    member_help = await router.handle(bot, request("/help", user=MEMBER))
+    check("owner and member receive the same help", text_of(owner_help) == text_of(member_help))
+    check(
+        "unknown commands have no behavior", await router.handle(bot, request("/nope")) is None
+    )
 
-    async def agreed(*_args, **_kwargs):
-        return True
+    await router.handle(bot, request("/who", user=OWNER))
+    member_who = await router.handle(bot, request("/who", user=MEMBER))
+    check("a new member can use who without consenting", "账号-" in text_of(member_who))
+    who_calls = [call[0] for call in directory.calls if call[0].endswith("_card")]
+    check(
+        "bare who is exact-account for owner and member",
+        who_calls[-2:] == ["account_card", "account_card"],
+        str(who_calls),
+    )
 
-    agreement.ok = agreed
-    try:
-        owner_help = await router.handle(bot, request("/help", user=OWNER))
-        member_help = await router.handle(bot, request("/help", user=MEMBER))
-        check("owner and member receive the same help", text_of(owner_help) == text_of(member_help))
-        check(
-            "unknown commands have no behavior", await router.handle(bot, request("/nope")) is None
-        )
+    await router.handle(bot, request("/who", user=MEMBER, text="/who --all"))
+    check(
+        "who --all selects the linked holder",
+        directory.calls[-1][0] == "holder_card",
+        str(directory.calls[-1]),
+    )
 
-        await router.handle(bot, request("/who", user=OWNER))
-        await router.handle(bot, request("/who", user=MEMBER))
-        who_calls = [call[0] for call in directory.calls if call[0].endswith("_card")]
-        check(
-            "bare who is exact-account for owner and member",
-            who_calls[-2:] == ["account_card", "account_card"],
-            str(who_calls),
-        )
+    member_members = await router.handle(bot, request("/members", user=MEMBER))
+    check("members remains owner-authorized", "bot owner" in text_of(member_members))
+    owner_members = await router.handle(bot, request("/members", user=OWNER))
+    check("the owner roster is not overloaded onto who", "本群 1 人" in text_of(owner_members))
 
-        await router.handle(bot, request("/who", user=MEMBER, text="/who --all"))
-        check(
-            "who --all selects the linked holder",
-            directory.calls[-1][0] == "holder_card",
-            str(directory.calls[-1]),
-        )
-
-        member_members = await router.handle(bot, request("/members", user=MEMBER))
-        check("members remains owner-authorized", "bot owner" in text_of(member_members))
-        owner_members = await router.handle(bot, request("/members", user=OWNER))
-        check("the owner roster is not overloaded onto who", "本群 1 人" in text_of(owner_members))
-
-        directory.calls.clear()
-        for user in (OWNER, MEMBER):
-            await router.handle(
-                bot,
-                request(
-                    "/note",
-                    user=user,
-                    text="/note set 同一段备注",
-                    mentions=(TARGET,),
-                ),
-            )
-        note_calls = [call for call in directory.calls if call[0] == "note"]
-        check(
-            "the same note command has the same target and scope for both roles",
-            note_calls == [("note", GROUP, str(TARGET), "同一段备注", False)] * 2,
-            str(note_calls),
-        )
-
-        directory.calls.clear()
+    directory.calls.clear()
+    for user in (OWNER, MEMBER):
         await router.handle(
             bot,
             request(
                 "/note",
-                user=MEMBER,
-                text="/note clear --all",
+                user=user,
+                text="/note set 同一段备注",
                 mentions=(TARGET,),
             ),
         )
-        check(
-            "note clear is explicit and preserves all-linked scope",
-            ("note", GROUP, str(TARGET), "", True) in directory.calls,
-        )
-
-        directory.calls.clear()
-        old_note = await router.handle(bot, request("/note", user=MEMBER, text="/note -"))
-        check(
-            "the old dash clear sentinel is rejected",
-            "用法" in text_of(old_note) and not any(call[0] == "note" for call in directory.calls),
-        )
-        old_alias = await router.handle(bot, request("/alias", user=MEMBER, text="/alias -旧称"))
-        check(
-            "the old alias sentinel is rejected",
-            "用法" in text_of(old_alias)
-            and not any(call[0] == "unname" for call in directory.calls),
-        )
-
-        bad_flag = await router.handle(bot, request("/who", user=MEMBER, text="/who --every"))
-        check("unknown flags are rejected without fallback", "未知选项" in text_of(bad_flag))
-        duplicate_flag = await router.handle(
-            bot, request("/who", user=MEMBER, text="/who --all --all")
-        )
-        check("duplicate flags are rejected", "只能写一次" in text_of(duplicate_flag))
-
-        directory.calls.clear()
-        confidence_result = await router.handle(
-            bot,
-            request(
-                "/alias",
-                user=MEMBER,
-                text="/alias confidence 0.6 新称呼",
-            ),
-        )
-        check(
-            "alias confidence has an explicit action and numeric score",
-            ("confidence", GROUP, str(MEMBER), "新称呼", 0.6, False) in directory.calls,
-        )
-        check(
-            "low confidence is context-only, not invisible",
-            "仅作待确认线索" in text_of(confidence_result),
-        )
-        aliases_result = await router.handle(bot, request("/alias", user=MEMBER))
-        check("alias listing marks confirmed names", "已确认" in text_of(aliases_result))
-
-        await router.handle(
-            bot,
-            request("/link", user=MEMBER, mentions=(OTHER,)),
-        )
-        issue = next(call for call in links.calls if call[0] == "issue")
-        check(
-            "link issue records both accounts and the admitted raw event",
-            issue[1]["initiator_user_id"] == str(MEMBER)
-            and issue[1]["target_user_id"] == str(OTHER)
-            and isinstance(issue[1]["created_event_id"], uuid.UUID),
-        )
-
-        await router.handle(
-            bot,
-            request("/link", user=OTHER, text="/link confirm 12345678"),
-        )
-        confirm = next(call for call in links.calls if call[0] == "confirm")
-        check(
-            "link confirmation is attributed to the confirming account and event",
-            confirm[1]["actor_user_id"] == str(OTHER)
-            and isinstance(confirm[1]["confirmed_event_id"], uuid.UUID),
-        )
-
-        directory.calls.clear()
-        await router.handle(bot, request("/unlink", user=MEMBER))
-        check(
-            "unlink can only detach the authenticated sender",
-            directory.calls == [("split", str(MEMBER))],
-            str(directory.calls),
-        )
-
-        directory.calls.clear()
-        await router.handle(
-            bot,
-            request("/split", user=OWNER, mentions=(OTHER,)),
-        )
-        check(
-            "owner split detaches only the mentioned exact account",
-            directory.calls == [("split", str(OTHER))],
-        )
-
-        denied = await router.handle(bot, request("/merge", user=MEMBER, mentions=(MEMBER, OTHER)))
-        check(
-            "owner-only commands fail by authorization, not by alternate behavior",
-            "bot owner" in text_of(denied),
-        )
-
-        before = len(bot.sent)
-        delivered = await router.dispatch(bot, request("/help", user=MEMBER))
-        check(
-            "command output uses typed group delivery",
-            delivered
-            and len(bot.sent) == before + 1
-            and [item["type"] for item in bot.sent[-1][1]] == ["reply", "at", "text"],
-        )
-    finally:
-        agreement.ok = original_ok
-
-
-async def agreement_denial() -> None:
-    directory = FakeDirectory()
-    router = CommandRouter(
-        GroupDelivery(),
-        Registry(),
-        directory,
-        FakeLinks(),
-        types.SimpleNamespace(search=types.SimpleNamespace(name="test-search")),
+    note_calls = [call for call in directory.calls if call[0] == "note"]
+    check(
+        "the same note command has the same target and scope for both roles",
+        note_calls == [("note", GROUP, str(TARGET), "同一段备注", False)] * 2,
+        str(note_calls),
     )
-    original_ok = agreement.ok
 
-    async def not_agreed(*_args, **_kwargs):
-        return False
+    directory.calls.clear()
+    await router.handle(
+        bot,
+        request(
+            "/note",
+            user=MEMBER,
+            text="/note clear --all",
+            mentions=(TARGET,),
+        ),
+    )
+    check(
+        "note clear is explicit and preserves all-linked scope",
+        ("note", GROUP, str(TARGET), "", True) in directory.calls,
+    )
 
-    agreement.ok = not_agreed
-    try:
-        result = await router.handle(FakeBot(), request("/who", user=MEMBER))
-        check(
-            "an unagreed member receives the agreement pointer",
-            "/terms" in text_of(result) and "/agree" in text_of(result),
-        )
-        check("agreement denial does not run the command", not directory.calls)
-    finally:
-        agreement.ok = original_ok
+    directory.calls.clear()
+    old_note = await router.handle(bot, request("/note", user=MEMBER, text="/note -"))
+    check(
+        "the old dash clear sentinel is rejected",
+        "用法" in text_of(old_note) and not any(call[0] == "note" for call in directory.calls),
+    )
+    old_alias = await router.handle(bot, request("/alias", user=MEMBER, text="/alias -旧称"))
+    check(
+        "the old alias sentinel is rejected",
+        "用法" in text_of(old_alias)
+        and not any(call[0] == "unname" for call in directory.calls),
+    )
+
+    bad_flag = await router.handle(bot, request("/who", user=MEMBER, text="/who --every"))
+    check("unknown flags are rejected without fallback", "未知选项" in text_of(bad_flag))
+    duplicate_flag = await router.handle(
+        bot, request("/who", user=MEMBER, text="/who --all --all")
+    )
+    check("duplicate flags are rejected", "只能写一次" in text_of(duplicate_flag))
+
+    directory.calls.clear()
+    confidence_result = await router.handle(
+        bot,
+        request(
+            "/alias",
+            user=MEMBER,
+            text="/alias confidence 0.6 新称呼",
+        ),
+    )
+    check(
+        "alias confidence has an explicit action and numeric score",
+        ("confidence", GROUP, str(MEMBER), "新称呼", 0.6, False) in directory.calls,
+    )
+    check(
+        "low confidence is context-only, not invisible",
+        "仅作待确认线索" in text_of(confidence_result),
+    )
+    aliases_result = await router.handle(bot, request("/alias", user=MEMBER))
+    check("alias listing marks confirmed names", "已确认" in text_of(aliases_result))
+
+    await router.handle(
+        bot,
+        request("/link", user=MEMBER, mentions=(OTHER,)),
+    )
+    issue = next(call for call in links.calls if call[0] == "issue")
+    check(
+        "link issue records both accounts and the admitted raw event",
+        issue[1]["initiator_user_id"] == str(MEMBER)
+        and issue[1]["target_user_id"] == str(OTHER)
+        and isinstance(issue[1]["created_event_id"], uuid.UUID),
+    )
+
+    await router.handle(
+        bot,
+        request("/link", user=OTHER, text="/link confirm 12345678"),
+    )
+    confirm = next(call for call in links.calls if call[0] == "confirm")
+    check(
+        "link confirmation is attributed to the confirming account and event",
+        confirm[1]["actor_user_id"] == str(OTHER)
+        and isinstance(confirm[1]["confirmed_event_id"], uuid.UUID),
+    )
+
+    directory.calls.clear()
+    await router.handle(bot, request("/unlink", user=MEMBER))
+    check(
+        "unlink can only detach the authenticated sender",
+        directory.calls == [("split", str(MEMBER))],
+        str(directory.calls),
+    )
+
+    directory.calls.clear()
+    await router.handle(
+        bot,
+        request("/split", user=OWNER, mentions=(OTHER,)),
+    )
+    check(
+        "owner split detaches only the mentioned exact account",
+        directory.calls == [("split", str(OTHER))],
+    )
+
+    denied = await router.handle(bot, request("/merge", user=MEMBER, mentions=(MEMBER, OTHER)))
+    check(
+        "owner-only commands fail by authorization, not by alternate behavior",
+        "bot owner" in text_of(denied),
+    )
+
+    before = len(bot.sent)
+    delivered = await router.dispatch(bot, request("/help", user=MEMBER))
+    check(
+        "command output uses typed group delivery",
+        delivered
+        and len(bot.sent) == before + 1
+        and [item["type"] for item in bot.sent[-1][1]] == ["reply", "at", "text"],
+    )
 
 
 async def main() -> int:
     catalogue()
     await router_behavior()
-    await agreement_denial()
     print()
     print("FAILED:", fails if fails else "none")
     return 1 if fails else 0

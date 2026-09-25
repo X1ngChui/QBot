@@ -14,8 +14,8 @@ from ..gateway.onebot import GroupMessage, notice_from_event
 from ..providers.base import Providers
 from ..services import Directory
 from ..settings import Settings, config
-from ..util import cut_text, display_name, sysmark, why
-from . import agreement, engine, perms, prompt, trigger
+from ..util import cut_text, display_name, sysmark
+from . import engine, perms, prompt, trigger
 from .botapi import BotApi
 from .budget import BUDGET
 from .command_catalog import find as find_command
@@ -23,7 +23,7 @@ from .commands import CommandRequest, CommandRouter
 from .delivery import GroupDelivery
 from .media import MediaCoordinator
 from .members import MEMBERS
-from .outbound import AtSegment, TextSegment, from_onebot
+from .outbound import from_onebot
 from .segments import ParsedMessage, at_mentions, parse_segments
 from .state import ChatMsg, Registry
 
@@ -357,30 +357,6 @@ class Gateway:
         if who and not perms.is_owner(who, cfg.owners) and await st.blocked_now(who):
             log.debug("group %s: no reply, initiator %s is blocked", group_id, who)
             return
-        # The consent gate, before anything is paid for: a member who has not
-        # accepted the user agreement gets a one-line pointer at /terms and
-        # /agree instead of a reply - at most once per cooldown, and one line
-        # rather than the full text, which re-sent every cooldown reads as
-        # spam - and nothing is spent on their behalf. Of the commands only
-        # /agree and /terms answer before consent (CommandRouter holds the rest);
-        # archiving is untouched, owners are exempt.
-        if who and not perms.is_owner(who, cfg.owners) and not await agreement.ok(group_id, who):
-            if agreement.should_prompt(group_id, who):
-                try:
-                    await self._delivery.deliver(
-                        bot,
-                        group_id=group_id,
-                        messages=(
-                            (
-                                AtSegment(who),
-                                TextSegment(" " + agreement.POINTER),
-                            ),
-                        ),
-                    )
-                except Exception as e:
-                    log.warning("group %s: agreement prompt failed: %s", group_id, why(e))
-            return
-
         # Every yuan this reply spends - the transcribes and backlog describes it
         # forces, the tool calls, the model tokens - is booked to the initiator
         # the trigger decision already named. An attribution, not a charge: the

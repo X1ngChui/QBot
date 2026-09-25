@@ -97,7 +97,7 @@ message or supported notice arrives
  |- trigger?  -> no: done
  |             yes: cut the context slice now and spawn one reply task
  |
- |- in the task: daily budget -> block list -> mute -> user agreement
+ |- in the task: daily budget -> block list
  |- retrieval: member roster (everyone who has appeared, with known facts), group knowledge
  |- prompt assembly
  |- tool loop until the model calls send_messages
@@ -122,12 +122,10 @@ nickname cannot match inside a longer word. A muted group never answers.
 
 ### Gates
 
-Before reply-model or tool spending, the task checks, in order: the daily cap (silence when
-reached), the group's block list (a blocked member is read and remembered as always
-and only never answered), the mute switch, and the user agreement. A member who has
-not accepted the agreement receives a short pointer to `/terms` at most once per
-cooldown, transcribed into the window as a notice rather than as the bot's own words.
-Owners are exempt from the agreement.
+Before reply-model or tool spending, the task checks the daily cap (silence when reached)
+and the group's block list (a blocked member is read and remembered as always, but is not
+answered). The mute switch is checked earlier by the trigger. Any other member can use
+the bot immediately, without an acceptance step.
 
 ## Reply engine
 
@@ -184,7 +182,7 @@ no reminder round, placeholder message or synthetic bot archive event is created
 request that is unclear or must be refused still calls for a brief reply.
 
 `GroupDelivery` owns per-group serialization, OneBot projection and the reply-segment fallback for
-model replies, agreement pointers and commands. It does not write the archive or live window. NapCat's
+model replies and commands. It does not write the archive or live window. NapCat's
 reported `message_sent` event remains the only source of bot-authored rows and messages. The delivery
 lock does not cover model generation, so the one-task-per-addressed-message concurrency model remains
 intact. If a send with a reply segment is refused by the platform (the replied-to message may have
@@ -371,7 +369,7 @@ Twenty-one application tables form the canonical schema:
 | Extraction | `memory_extraction`, `memory_extraction_event` | Durable extraction state, exact ordered event membership, and the immutable staged validation snapshot. |
 | Episodes | `episode`, `episode_event` | Group-scoped summaries backed by every source event and their extraction batch. |
 | Index and queue | `embedding_index`, `memory_job` | Derived vectors and the background job queue. |
-| Operations | `reply_trace`, `cost_ledger`, `group_state`, `group_blocklist`, `user_agreement`, `image_cache` | Expiring reply evidence, spending, group switches, dynamic block rules, consent, descriptions and file IDs. |
+| Operations | `reply_trace`, `cost_ledger`, `group_state`, `group_blocklist`, `image_cache` | Expiring reply evidence, spending, group switches, dynamic block rules, descriptions and file IDs. |
 
 `sql/init.sql` is the sole schema definition and describes a fresh database at the current
 code contract. Existing installations are updated manually under a verified backup.

@@ -20,15 +20,12 @@ def is_owner(user_id: str, owners: Iterable[str]) -> bool:
 class Verdict(StrEnum):
     OWNER = "owner"
     MEMBER = "member"
-    MEMBER_IF_AGREED = "member_if_agreed"
     DENIED = "denied"
 
 
 def decide(user_id: str, *, owners: Iterable[str], access: Access) -> Verdict:
     if is_owner(user_id, owners):
         return Verdict.OWNER
-    if access is Access.OPEN:
+    if access is Access.MEMBER:
         return Verdict.MEMBER
-    if access is Access.AGREED:
-        return Verdict.MEMBER_IF_AGREED
     return Verdict.DENIED

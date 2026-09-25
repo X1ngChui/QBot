@@ -57,7 +57,6 @@ _REQUIRED_SCHEMA_TABLES = {
     "memory_job",
     "raw_event",
     "reply_trace",
-    "user_agreement",
 }
 _REQUIRED_SCHEMA_COLUMNS = {
     "account_link_challenge": {
@@ -172,7 +171,7 @@ _SCHEMA_INDEXES = {
     ),
     "reply_trace_reply": ("reply_trace", ("group_id", "reply_event_id"), ""),
 }
-_RETIRED_SCHEMA_TABLES = {"episode_participant", "schema_migration"}
+_RETIRED_SCHEMA_TABLES = {"episode_participant", "schema_migration", "user_agreement"}
 _RETIRED_SCHEMA_COLUMNS = {"reply_trace": {"content"}}
 
 
@@ -578,38 +577,6 @@ async def groups_first_seen_on(day: str | date) -> list[GroupId]:
 async def groups_with_state() -> list[GroupId]:
     rows = await pool().fetch("SELECT group_id FROM group_state")
     return [GroupId(r["group_id"]) for r in rows]
-
-
-async def has_agreed(group_id: GroupId, user_id: str, version: int) -> bool:
-    """Whether this account accepted the agreement, at this version or later,
-    in this group. An older acceptance does not count: bumping the version is
-    how the owner voids it."""
-    return await pool().fetchval(
-        "SELECT EXISTS(SELECT 1 FROM user_agreement"
-        " WHERE group_id=$1 AND user_id=$2 AND version >= $3)",
-        _group(group_id),
-        user_id,
-        version,
-    )
-
-
-async def record_agreement(group_id: GroupId, user_id: str, version: int) -> bool:
-    """File one acceptance of this version; True when it changed anything - a
-    first acceptance or an upgrade - False when already at this version or
-    later."""
-    return bool(
-        await pool().fetchval(
-            """INSERT INTO user_agreement (group_id, user_id, version)
-           VALUES ($1,$2,$3)
-           ON CONFLICT (group_id, user_id)
-           DO UPDATE SET version = EXCLUDED.version, agreed_at = NOW()
-                   WHERE user_agreement.version < EXCLUDED.version
-        RETURNING TRUE""",
-            _group(group_id),
-            user_id,
-            version,
-        )
-    )
 
 
 async def holder_ids_for_accounts(user_ids: list[str]) -> dict[str, uuid.UUID]:

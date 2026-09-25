@@ -605,25 +605,6 @@ class PredicateTable(_M):
 RESERVED_PREDICATES = frozenset({"note", "topic", "term"})
 
 
-class AgreementCfg(_M):
-    """The user agreement. The version is a number the owner sets - bumping it
-    voids every older acceptance - and the text lives in its own file, named
-    here by path. Both fields are mandatory and the file must exist and be
-    non-empty, so a deployment without an agreement fails at load instead of
-    showing members a placeholder."""
-
-    #: Acceptances are stored against this number; raise it to re-ask everyone.
-    version: int
-    #: Path of the file holding the full text /terms shows, relative to the
-    #: config directory (absolute allowed). The accept instruction is appended
-    #: in code, so an edited body can never lose it.
-    file: str
-    #: How often one member is re-shown the pointer at /terms. The full text re-sent
-    #: every time reads as spam, and a member who has not accepted still costs
-    #: nothing - the pointer is sent instead of a reply, not as well as one.
-    prompt_every_sec: float = Field(600.0, gt=0)
-
-
 class DatabaseCfg(_M):
     """The connection pool. Small on purpose: this is one bot on one machine, and
     a pool larger than the work only moves contention into postgres.
@@ -675,7 +656,6 @@ class Settings(_M):
 
     # -- files: paths relative to the config directory (absolute allowed) ----
     personas_dir: str = "personas"
-    agreement: AgreementCfg
     #: Directory containing the single strictly validated prompts.yaml bundle.
     prompts_dir: str = "prompts"
     #: What may be recorded about a person, one entry per predicate.
@@ -742,7 +722,6 @@ class ConfigBundle:
     default: Settings
     personas: Mapping[GroupId, Persona]
     prompts: PromptCatalog
-    agreement_text: str
     predicates: PredicateTable
     _default_persona: Persona
     _resolved_personas: Mapping[GroupId, Persona]
@@ -752,7 +731,6 @@ class ConfigBundle:
         raw_settings: dict,
         personas: Mapping[GroupId | str, Persona],
         prompts: PromptCatalog | None = None,
-        agreement_text: str = "",
         predicates: PredicateTable | None = None,
     ) -> None:
         default = personas.get(DEFAULT_PERSONA_KEY, Persona())
@@ -770,7 +748,6 @@ class ConfigBundle:
         object.__setattr__(self, "default", Settings.model_validate(raw_settings))
         object.__setattr__(self, "personas", MappingProxyType(groups))
         object.__setattr__(self, "prompts", prompts or PromptCatalog.empty())
-        object.__setattr__(self, "agreement_text", agreement_text)
         object.__setattr__(
             self,
             "predicates",
@@ -829,17 +806,7 @@ def load_bundle(config_dir: Path | None = None) -> ConfigBundle:
         raise ValueError(f"predicate file unreadable: {ppath}: {e}") from None
     if not predicates.person:
         raise ValueError(f"predicate file lists no predicates: {ppath}")
-    # The agreement text is loaded with the rest of the startup bundle so the text and
-    # version always belong to one validated configuration snapshot.
-    apath = _resolve(root, settings.agreement.file)
-    try:
-        agreement_text = apath.read_text(encoding="utf-8-sig").strip()
-    except OSError as e:
-        raise ValueError(f"agreement file unreadable: {apath}: {e}") from None
-    if not agreement_text:
-        raise ValueError(f"agreement file is empty: {apath}")
-
-    bundle = ConfigBundle(raw, personas, prompts, agreement_text, predicates)
+    bundle = ConfigBundle(raw, personas, prompts, predicates)
     # Resolve every configured persona before startup accepts the bundle.
     for group_id in bundle.personas:
         bundle.persona_for(group_id)

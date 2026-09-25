@@ -26,7 +26,7 @@ from ..services import (
 )
 from ..settings import config
 from ..util import defang, fmt_when, now_local, parse_duration, today_local
-from . import agreement, command_catalog, debug, errors, perms
+from . import command_catalog, debug, errors, perms
 from .botapi import BotApi
 from .budget import BUDGET, hit_split
 from .delivery import GroupDelivery
@@ -142,14 +142,9 @@ class CommandRouter:
             owners=config().default.owners,
             access=spec.access,
         )
-        if verdict is perms.Verdict.MEMBER_IF_AGREED:
-            allowed = await agreement.ok(request.group_id, request.user_id)
-            denial = agreement.POINTER
-        else:
-            allowed = verdict in (perms.Verdict.OWNER, perms.Verdict.MEMBER)
-            denial = "该操作需要 bot owner 权限。"
+        allowed = verdict in (perms.Verdict.OWNER, perms.Verdict.MEMBER)
         if not allowed:
-            return CommandResult.reply(request, denial)
+            return CommandResult.reply(request, "该操作需要 bot owner 权限。")
 
         handler = _HANDLERS.get(spec.name)
         if handler is None:
@@ -312,22 +307,6 @@ async def _card_of(
     if not card.display or card.display in card.accounts:
         card = replace(card, display=await _name(ctx, group_id, user_id))
     return card
-
-
-@_handler("/agree")
-async def _(ctx: CommandContext, event: CommandRequest) -> None:
-    if _args(event, "agree") or event.mentions:
-        raise UsageError("用法：/agree")
-    if await agreement.accept(event.group_id, event.user_id):
-        await _finish(ctx, "已记录你在本群同意用户协议。")
-    await _finish(ctx, "你已在本群同意过用户协议。")
-
-
-@_handler("/terms")
-async def _(ctx: CommandContext, event: CommandRequest) -> None:
-    if _args(event, "terms") or event.mentions:
-        raise UsageError("用法：/terms")
-    await _finish(ctx, _fit(agreement.text(), gid=event.group_id))
 
 
 @_handler("/help")
@@ -529,8 +508,6 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
     target = mentions[0]
     if target == str(event.self_id):
         await _finish(ctx, "不能关联机器人账号。")
-    if not await agreement.ok(event.group_id, AccountId(target)):
-        await _finish(ctx, "目标账号需要先在本群发送 /agree。")
     try:
         _challenge, code = await ctx.links.issue(
             group_id=event.group_id,

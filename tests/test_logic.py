@@ -70,6 +70,15 @@ from qqbot.settings import Settings as _OwnerSettings
 check("an unquoted owner id validates as a string",
       _OwnerSettings.model_validate({**b.default.model_dump(), "owners": [10001, "10002"]}).owners
       == ["10001", "10002"])
+try:
+    _OwnerSettings.model_validate({**b.default.model_dump(), "agreement": {"version": 1}})
+except ValueError:
+    _retired_agreement_rejected = True
+else:
+    _retired_agreement_rejected = False
+check("retired agreement settings are rejected", _retired_agreement_rejected)
+check("fixture configuration loads without an agreement file",
+      not (ROOT / "tests" / "fixtures" / "config" / "agreement.txt").exists())
 
 # Persona inheritance: a group file states only its differences. Without this the shared
 # blocks are copied into every group file, and they drift - which is exactly what had
@@ -1417,13 +1426,11 @@ def _d(uid, access):
     return _decide(uid, owners=_own, access=access)
 
 
-check("an owner holds an agreed command", _d("20001", _Access.AGREED) is _V.OWNER)
+check("an owner holds a member command", _d("20001", _Access.MEMBER) is _V.OWNER)
 check("every owner holds an owner command", _d("20001", _Access.OWNER) is _V.OWNER)
 check("a member is denied an owner command", _d("30001", _Access.OWNER) is _V.DENIED)
-check("an agreed command reaches a member through consent",
-      _d("30001", _Access.AGREED) is _V.MEMBER_IF_AGREED)
-check("an open command is available before consent",
-      _d("30001", _Access.OPEN) is _V.MEMBER)
+check("a new member can use member commands directly",
+      _d("30001", _Access.MEMBER) is _V.MEMBER)
 
 from qqbot.core.commands import registered_commands as _registered_commands
 from qqbot.core.command_catalog import PREFIXES as _COMMAND_PREFIXES

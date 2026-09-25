@@ -33,6 +33,7 @@ async def main() -> int:
     sql = (ROOT / "sql" / "init.sql").read_text(encoding="utf-8")
     check("the schema contains no migration ledger", "schema_migration" not in sql)
     check("the schema contains no episode participants", "episode_participant" not in sql)
+    check("the schema contains no agreement table", "user_agreement" not in sql)
     check("dump comments name the public schema", "qbot_schema_export" not in sql)
 
     await init_pool()
@@ -45,6 +46,15 @@ async def main() -> int:
         await conn.execute(sql)
         await check_schema(conn, schema=schema, embedding_dimensions=dimensions)
         check("a fresh canonical schema passes compatibility checks", True)
+
+        await conn.execute(f'CREATE TABLE "{schema}".user_agreement (id bigint)')
+        try:
+            await check_schema(conn, schema=schema, embedding_dimensions=dimensions)
+            rejected = False
+        except RuntimeError:
+            rejected = True
+        check("a retired agreement table is rejected", rejected)
+        await conn.execute(f'DROP TABLE "{schema}".user_agreement')
 
         for table, name, values in (
             ("account_link_challenge", "account_link_status_valid",

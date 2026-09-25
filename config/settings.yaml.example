@@ -4,8 +4,7 @@
 # Persona files in config/personas/group_<gid>.yaml may vary only the bot's identity
 # and standing group context; behavior and resource settings in this file are global.
 # The complete bundle is validated at startup and stays fixed for the process lifetime.
-# Restart the process after changing settings, personas, prompts, predicates or the
-# agreement.
+# Restart the process after changing settings, personas, prompts or predicates.
 #
 # Settings that wait on another setting are marked where they appear. A knob whose
 # gate is shut does nothing at all - it is not doing a smaller version of its job.
@@ -348,18 +347,6 @@ database:
 
 # Per-group persona files (default.yaml + group_<gid>.yaml) live here.
 personas_dir: personas
-
-# The user agreement /terms shows. Both fields are mandatory and the file must
-# exist and be non-empty - a deployment without an agreement fails at load, so
-# there is no placeholder state. Acceptances are stored against `version`: bump
-# it to void them all and re-ask everyone; text edits without a bump do not
-# re-ask. Both changes take effect on the next restart.
-agreement:
-  version: 1
-  file: agreement.txt
-  # How often one member is re-shown the pointer at /terms. The full text re-sent
-  # every time reads as spam.
-  prompt_every_sec: 600
 
 # Directory containing the versioned prompts.yaml bundle. Template keys, roles,
 # roles and slots are fixed by prompting/templates.py; the whole bundle

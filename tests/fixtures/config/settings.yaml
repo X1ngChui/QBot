@@ -68,10 +68,6 @@ schedule:
   backup_keep: 14
   napcat_cache_days: 7
 
-agreement:
-  version: 1
-  file: agreement.txt
-
 # Borrow the real prompt texts instead of copying every file into fixtures;
 # the path is relative to this fixture config directory.
 prompts_dir: ../../../config/prompts

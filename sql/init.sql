@@ -357,18 +357,6 @@ CREATE TABLE reply_trace (
 
 
 --
--- Name: user_agreement; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE user_agreement (
-    group_id bigint NOT NULL,
-    user_id character varying(128) NOT NULL,
-    version integer DEFAULT 1 NOT NULL,
-    agreed_at timestamp with time zone DEFAULT now() NOT NULL
-);
-
-
---
 -- Name: account_link_challenge account_link_challenge_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -566,14 +554,6 @@ ALTER TABLE ONLY raw_event
 
 ALTER TABLE ONLY reply_trace
     ADD CONSTRAINT reply_trace_pkey PRIMARY KEY (id);
-
-
---
--- Name: user_agreement user_agreement_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY user_agreement
-    ADD CONSTRAINT user_agreement_pkey PRIMARY KEY (group_id, user_id);
 
 
 --

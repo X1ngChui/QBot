@@ -37,7 +37,7 @@ and standing context.
 ### Applying changes
 
 The application loads and validates one immutable configuration bundle at startup. The
-bundle includes settings, personas, prompts, predicates and the agreement text. A missing
+bundle includes settings, personas, prompts and predicates. A missing
 file, unknown key, duplicate template key or invalid value prevents startup; no partially
 validated configuration becomes active.
 
@@ -250,14 +250,6 @@ Restart to apply.
 | `pool_min`, `pool_max` | Connection pool size |
 | `command_timeout_sec` | Ceiling on any single statement |
 
-### `agreement`
-
-| Key | Meaning |
-| --- | --- |
-| `version` | Acceptances are stored against it; bump it to re-ask everyone |
-| `file` | The agreement text shown by `/terms`, relative to `config/`. Must exist and be non-empty. |
-| `prompt_every_sec` | How often one unconsenting member is re-shown the pointer |
-
 ## Personas
 
 `config/personas/default.yaml` is the default persona. `config/personas/group_<id>.yaml`
@@ -300,11 +292,6 @@ All runtime prompt wording lives in the single versioned
 `qqbot/prompting/templates.py` defines each logical template's role and exact slots;
 extra or malformed. See [config/prompts/README.md](../config/prompts/README.md) for the
 contract and safe generation workflow.
-
-## Agreement
-
-`config/agreement.txt` is shown verbatim by `/terms`. Acceptance is recorded per group,
-account and `agreement.version`.
 
 ## NapCat
 

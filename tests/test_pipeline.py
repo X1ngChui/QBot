@@ -54,7 +54,6 @@ def install_settings(settings):
         settings.model_dump(),
         personas,
         bundle.prompts,
-        bundle.agreement_text,
         bundle.predicates,
     )
     return _settings._bundle.default
@@ -441,13 +440,6 @@ async def seed(group, uid, name, *, n=1, text="随便说说"):
 async def main():
     await init_pool()
     await reset()
-
-    # The whole cast accepts the user agreement up front - consent is its own
-    # section; everywhere else a reply is the thing under test.
-    from qqbot.db import repo as _repo_seed
-
-    for _uid in ("u1", "u7", "u9", "u404", "bad1", "1", "7", "999"):
-        await _repo_seed.record_agreement(GROUP, _uid, 1)
 
     cfg = config().default
     # The reply path will not start without one, which is the point: a half-wired
@@ -2925,7 +2917,6 @@ async def main():
     # that holder; the owner must still be able to remove the now-shared rule.
     block_owner = await _IDS.ensure_account("qq", "block-owner", seen_at=_nl0())
     block_member = await _IDS.ensure_account("qq", "block-member", seen_at=_nl0())
-    await _repo.record_agreement(GROUP, "block-member", 1)
     await _repo.block_holder(GROUP, block_member.entity_id)
     await _IDS.merge_accounts(block_owner.id, block_member.id)
     cfg = install_settings(cfg.model_copy(update={"owners": ["block-owner"]}))
@@ -3026,72 +3017,35 @@ async def main():
     check("a running timed block still blocks", len(bot.sent) == n_live)
     await _repo.unblock(GROUP, "bad1")
 
-    # 16. the consent gate: a member who never accepted the user agreement is
-    # not replied to - they get the agreement text instead, once per cooldown,
-    # with no model call and nothing spent - and /agree opens the door. Their
-    # messages archive like anyone's; only the reply is withheld.
-    from qqbot.core import agreement as _agree
-
-    await REGISTRY.get(GROUP)
+    # 16. A new account needs no agreement. Its message is admitted once, then
+    # the ordinary reply path calls the model and delivers the reply on every address.
     n16 = len(bot.sent)
     calls16 = len(LLM_CALLS)
     ev16 = FakeEvent("小X 在吗", user_id="newbie", nickname="新人", to_me=True)
     await GATEWAY.handle(bot, ev16)
     await drain()
     check(
-        "an unconsenting member draws a one-line pointer, not a reply",
+        "a new member receives a reply without consenting",
         len(bot.sent) == n16 + 1
-        and "/agree" in str(bot.sent[-1])
-        and "/terms" in str(bot.sent[-1])
-        and "【用户协议】" not in str(bot.sent[-1])  # the pointer, never the full text
-        and len(LLM_CALLS) == calls16,
+        and len(LLM_CALLS) == calls16 + 1
+        and "/agree" not in str(bot.sent[n16:])
+        and "/terms" not in str(bot.sent[n16:]),
         str(bot.sent[n16:])[:160],
     )
     check(
-        "and their message still archives",
+        "their message archives before the reply",
         await pool().fetchval(
             "SELECT count(*) FROM raw_event WHERE platform_event_id=$1", str(ev16.message_id)
         )
         == 1,
     )
-    # The platform-reported pointer is observed like every other bot-authored line.
-    st16 = await REGISTRY.get(GROUP)
-    _last16 = st16.recent[-1]
-    check(
-        "the agreement pointer returns through self-observation",
-        _last16.is_bot and _last16.user_id == str(bot.self_id) and _agree.POINTER in _last16.text,
-        f"{_last16.is_bot} {_last16.user_id} {_last16.text!r}",
+    await GATEWAY.handle(
+        bot, FakeEvent("小X 还在吗", user_id="newbie", nickname="新人", to_me=True)
     )
-    await GATEWAY.handle(bot, FakeEvent("小X 在吗", user_id="newbie", nickname="新人", to_me=True))
     await drain()
     check(
-        "the agreement prompt respects its cooldown",
-        len(bot.sent) == n16 + 1,
-        f"{len(bot.sent) - n16} sent",
-    )
-    check(
-        "/agree records a first acceptance as first", await _agree.accept(GROUP, "newbie") is True
-    )
-    check("and a repeat as a repeat", await _agree.accept(GROUP, "newbie") is False)
-    check(
-        "consent in one group says nothing about another",
-        not await _agree.ok(GroupId("456"), "newbie"),
-    )
-    # A version bump voids old acceptances: everyone re-consents to the new
-    # text, and re-accepting registers as a change, not a repeat.
-    _orig_version = _agree.version
-    _agree.version = lambda: 2
-    check("a version bump voids the old acceptance", not await _agree.ok(GROUP, "newbie"))
-    check(
-        "re-accepting the new version counts as a change",
-        await _agree.accept(GROUP, "newbie") is True,
-    )
-    check("and satisfies the gate again", await _agree.ok(GROUP, "newbie"))
-    _agree.version = _orig_version
-    await GATEWAY.handle(bot, FakeEvent("小X 在吗", user_id="newbie", nickname="新人", to_me=True))
-    await drain()
-    check(
-        "after /agree the reply path opens", len(bot.sent) == n16 + 2 and len(LLM_CALLS) > calls16
+        "the same new member can ask again without a consent cooldown",
+        len(bot.sent) == n16 + 2 and len(LLM_CALLS) == calls16 + 2,
     )
 
     # 17. group notices become transcript lines: archived, in the window, and

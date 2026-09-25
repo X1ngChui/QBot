@@ -44,7 +44,7 @@ under `scripts/` do call the real model and are run by hand.
 
 **Language.** Comments, docstrings, log messages and SQL are written in English. Chinese
 appears only in text the model reads (prompts, personas, predicate rules) and text a
-group member reads (command replies, the agreement). `tests/test_logic.py` enforces
+group member reads (command replies). `tests/test_logic.py` enforces
 this over `qqbot/` and `tests/`.
 
 **Comments explain the present.** A comment says what the code does and why it is

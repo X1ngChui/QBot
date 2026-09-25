@@ -16,7 +16,7 @@ linked set:
 
 - Exact account is the default.
 - `--all` explicitly selects the linked account set and its holder-scoped records.
-- An agreed member may target only their own exact account or linked set. An owner may
+- A member may target only their own exact account or linked set. An owner may
   target another account with a structured `@` mention.
 - Bare `/who` therefore means the caller's exact account for everyone. The owner-only
   whole-group directory is the separate `/members` command.
@@ -28,8 +28,7 @@ implicit forms such as `-` for clearing a value are not aliases for the current 
 
 | Level | Who | Commands |
 | --- | --- | --- |
-| Open | Anyone | `/help`, `/terms`, `/agree` |
-| Agreed | A member who accepted this group's current agreement | `/who`, `/note`, `/alias`, `/forget`, `/link`, `/unlink`, `/card`, `/stats`, `/top` |
+| Member | Anyone in the group | `/help`, `/who`, `/note`, `/alias`, `/forget`, `/link`, `/unlink`, `/card`, `/stats`, `/top` |
 | Owner | An account in `owners` | `/members`, `/block`, `/mute`, `/merge`, `/split`, `/debug`, `/log`, plus owner-only sub-actions noted below |
 
 ## My account data
@@ -53,7 +52,7 @@ Member self-service and owner repair use different commands.
 | Command | Meaning |
 | --- | --- |
 | `/link @other-account` | Create a short-lived link request. This command confirms the initiating account. |
-| `/link confirm CODE` | The invited account confirms in the same group. Both current linked sets are then merged. The target account must have accepted the agreement. |
+| `/link confirm CODE` | The invited account confirms in the same group. Both current linked sets are then merged. |
 | `/link cancel CODE` | Either endpoint cancels a pending request. |
 | `/unlink` | Immediately detach only the account sending the command. It accepts no target; every other account in the set stays linked. |
 | `/merge @account-A @account-B` | Owner-only repair: symmetrically merge the two current linked sets. |
@@ -100,13 +99,6 @@ blocked.
 
 Debug captures contain provider-neutral prompt and completed-turn data. Credentials,
 provider wire state and model reasoning are not written.
-
-## Agreement
-
-| Command | Meaning |
-| --- | --- |
-| `/terms` | Show the current group agreement. |
-| `/agree` | Accept its current version for this exact account in this group. Account linking does not transfer agreement. |
 
 Command messages and bot command responses enter the same canonical archive as ordinary
 messages.

@@ -27,10 +27,10 @@ within limits you set.
   boolean query, recall past episodes by meaning, read a web page, and open pictures.
 - **Money is the only limit.** A daily spending cap, a per-reply cap and a monthly
   search allowance. There are no token budgets and no call quotas.
-- **Per-group everything.** Persona, group knowledge, memory, block list, mute switch
-  and user-agreement consent are all scoped to the group.
-- **Consent gate.** Members are answered only after they accept a user agreement, whose
-  text and version you control.
+- **Per-group everything.** Persona, group knowledge, memory, block list and mute switch
+  are all scoped to the group.
+- **Immediate access.** Members can address the bot and use member commands without a
+  separate registration or consent step.
 - **An operator console in chat.** Inspect and correct memory, block or mute, read
   usage, and capture model calls for debugging.
 
@@ -118,10 +118,9 @@ Behaviour lives in `config/`, credentials in `.env`, runtime state in the databa
 | `config/personas/group_<id>.yaml` | Per-group persona: identity, prompt additions and standing context |
 | `config/predicates.yaml` | What may be recorded about a person |
 | `config/prompts/prompts.yaml` | Versioned bundle containing every runtime prompt template |
-| `config/agreement.txt` | The user agreement shown by `/terms` |
 
 The complete configuration bundle is validated at startup. Changes to settings,
-personas, prompts, predicates, or the agreement take effect after a restart. The
+personas, prompts or predicates take effect after a restart. The
 reference is in [docs/configuration.md](docs/configuration.md).
 
 ## Commands
@@ -133,7 +132,6 @@ the current linked account set.
 | Command | Purpose |
 | --- | --- |
 | `/help` | Show the shared command catalogue and authorization labels |
-| `/agree`, `/terms` | Accept or read the user agreement |
 | `/who`, `/note`, `/alias`, `/forget` | Inspect and correct exact-account or explicit linked-set records |
 | `/link`, `/unlink` | Confirm an alternate account or detach the current exact account |
 | `/card`, `/stats`, `/top` | Group memory and usage |
@@ -188,7 +186,7 @@ for what each suite covers.
 | `qqbot/providers/` | Provider abstractions and one module per backend |
 | `qqbot/plugins/` | Thin scheduled-job registration adapters |
 | `qqbot/db/` | Connection pool, schema check, archive and ledger access |
-| `config/` | Configuration templates, prompts, predicates, agreement |
+| `config/` | Configuration templates, prompts and predicates |
 | `sql/` | Database schema and the schema changelog |
 | `scripts/` | Deployment, preflight, model download, evaluations |
 | `tests/` | The test suites |
