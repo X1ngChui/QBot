@@ -8,6 +8,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Never
 
 from qqbot.repositories.groups import GroupRepository
 from qqbot.domain.ids import AccountId
@@ -112,7 +113,7 @@ class UsageError(ValueError):
     pass
 
 
-async def _finish(ctx: CommandContext, message: str) -> None:
+async def _finish(ctx: CommandContext, message: str) -> Never:
     raise _Finished(CommandResult.reply(ctx.request, message))
 
 

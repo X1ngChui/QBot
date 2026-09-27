@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, tzinfo, UTC
 
@@ -57,7 +57,7 @@ def at_mentions(
 
 def number_at_mentions(
     text: str,
-    mentions: list[tuple[str, str]],
+    mentions: Sequence[tuple[str, str]],
     number_for: Callable[[str], int | None],
 ) -> str:
     """Add prompt-local member numbers to the corresponding visible @ tokens."""
@@ -561,7 +561,7 @@ class _Walk:
         # Select known fields rather than copying attacker-sized mappings. A locator
         # is either retained whole or rejected; cutting a URL or file id changes it.
         room = self.remaining(depth)
-        data = {
+        data: dict[str, object] = {
             key: _scalar(raw.get(key), room + 1)
             for key in (
                 "text",
@@ -645,8 +645,9 @@ class _Walk:
                         # Only the number is given, which is meaningless to the model.
                         self.add_ref(parts, AtRef, ident=qq, depth=depth)
             elif stype == "face":
-                raw = data.get("raw") if isinstance(data.get("raw"), dict) else {}
-                name = defang(str(raw.get("faceText") or "")).strip().lstrip("/")
+                face = data.get("raw")
+                raw_face = face if isinstance(face, dict) else {}
+                name = defang(str(raw_face.get("faceText") or "")).strip().lstrip("/")
                 name = name or FACE_NAMES.get(str(data.get("id") or ""), "")
                 self.emit(parts, sysmark(f"表情:{name}") if name else sysmark("表情"), depth=depth)
             elif stype == "mface":
@@ -764,7 +765,8 @@ class _Walk:
             self.steps_left -= 1
             if not isinstance(data, dict):
                 continue
-            sender = data.get("sender") if isinstance(data.get("sender"), dict) else {}
+            raw_sender = data.get("sender")
+            sender = raw_sender if isinstance(raw_sender, dict) else {}
             who = (
                 defang(
                     _scalar(

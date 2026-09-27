@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime
-from typing import Any, Self
+from typing import Any, Self, cast
 
 from qqbot.domain.archive import AuthorKind
 from qqbot.domain.ids import AccountId
@@ -68,14 +68,18 @@ class GroupMessage(InboundEvent):
         )
         # Top-level authorship is authoritative; nested sender metadata is descriptive.
         sender = replace(sender, user_id=author)
-        segments = scrub_nul(
-            [
-                {
-                    "type": str(getattr(segment, "type", "") or ""),
-                    "data": dict(getattr(segment, "data", {}) or {}),
-                }
-                for segment in event.get_message()
-            ]
+        # scrub_nul recursively changes strings but preserves list/dict structure.
+        segments = cast(
+            list[dict],
+            scrub_nul(
+                [
+                    {
+                        "type": str(getattr(segment, "type", "") or ""),
+                        "data": dict(getattr(segment, "data", {}) or {}),
+                    }
+                    for segment in event.get_message()
+                ]
+            ),
         )
         return cls(
             message_id=MessageId(event.message_id),

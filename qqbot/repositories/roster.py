@@ -56,7 +56,11 @@ class RosterRepository:
             facts = await self._memory.current_facts(group_id, roots, _conn=conn)
             by_holder = {}
             for fact in facts:
-                root = fact.subject_entity_id or account_roots[fact.subject_account_id]
+                if fact.subject_entity_id is not None:
+                    root = fact.subject_entity_id
+                else:
+                    assert fact.subject_account_id is not None
+                    root = account_roots[fact.subject_account_id]
                 by_holder.setdefault(root, []).append(fact)
             return tuple(
                 HolderReading(

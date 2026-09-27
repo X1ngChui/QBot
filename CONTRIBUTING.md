@@ -19,8 +19,10 @@ export QBOT_TEST_DATABASE_PASSWORD=testpw
 until docker exec qbot-pgtest pg_isready -h 127.0.0.1 -U qbot_test -d qbot_test; do
   sleep 1
 done
-.venv/bin/python -m pytest
-.venv/bin/python -m ruff check .
+. .venv/bin/activate
+python -m pytest
+python -m ruff check .
+python -m pyright
 ```
 
 On Windows use `.venv\Scripts\python.exe`, a native path in the bind mount, and
@@ -29,15 +31,20 @@ set the explicit test connection. See [tests/README.md](tests/README.md). Databa
 tests skip without `QBOT_TEST_DATABASE_URL`; when set, the guarded fixture verifies
 the disposable test role, database and `qbot_test_guard` marker before any mutation.
 Run database-mutating tests sequentially against a shared test database. Pytest is the
-only supported test entry point; run Ruff separately.
+only supported test entry point; run Ruff and Pyright as independent checks. Pyright
+needs no database, private configuration or paid API. It checks annotations in `bot.py`,
+`qqbot/` and maintained Python scripts under `scripts/` in basic mode, not the tests;
+pytest validates tests. Keep nominal IDs such as `GroupId` distinct from plain `str`
+at API boundaries rather than suppressing type errors wholesale.
 
 Nothing in the test suite talks to QQ or to a paid API. The two evaluation scripts
 under `scripts/` do call the real model and are run by hand.
 
 ## Before opening a pull request
 
-- `python -m pytest` and `python -m ruff check .` pass. Run the guarded database
-  cases with an explicit disposable test URL; a skipped DB case is not a DB pass.
+- `python -m pytest`, `python -m ruff check .` and `python -m pyright` pass as
+  independent checks. Run the guarded database cases with an explicit disposable test
+  URL; a skipped DB case is not a DB pass.
 - New behaviour has a test. Exercise importable command handlers directly in
   `tests/test_commands.py`; `tests/test_scheduled.py` covers durable timer claims and
   wakeups against the guarded test database.

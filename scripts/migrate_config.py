@@ -49,7 +49,8 @@ def render_migration(
     yaml.allow_duplicate_keys = False
     yaml.width = 100
     yaml.indent(mapping=2, sequence=4, offset=2)
-    yaml.line_break = "\r\n" if "\r\n" in text else "\n"
+    # ruamel.yaml infers None here, but its emitter accepts a string line ending.
+    yaml.line_break = "\r\n" if "\r\n" in text else "\n"  # pyright: ignore[reportAttributeAccessIssue]
     original = yaml.load(text)
     if not isinstance(original, CommentedMap):
         raise MigrationError(["<root>"], "expected a YAML mapping")

@@ -19,6 +19,7 @@ so sliding rarely is most of what there is to win.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 import json
 import re
 
@@ -51,6 +52,8 @@ from qqbot.delivery.segments import TextSegment
 from qqbot.delivery.segments import display_text
 from qqbot.delivery.contract import send_arguments_model
 from qqbot.conversation.state import ChatMsg
+from qqbot.conversation.state import TranscriptRendering
+from qqbot.domain.ids import MessageId
 from qqbot.conversation.state import GroupState
 from qqbot.conversation.tools import SEND
 
@@ -214,7 +217,7 @@ def build_system(
     )
 
 
-def history_window(st: GroupState, msg: ChatMsg | None) -> list[ChatMsg]:
+def history_window(st: GroupState, msg: TranscriptRendering | None) -> list[ChatMsg]:
     """The messages that will actually appear in the prompt, oldest first: the
     context before `msg`, the message being answered (None for a bare render
     of the window).
@@ -228,7 +231,11 @@ def history_window(st: GroupState, msg: ChatMsg | None) -> list[ChatMsg]:
         return []
 
     ids = [m.msg_id for m in hist]
-    start = ids.index(st.history_anchor) if st.history_anchor in ids else 0
+    start = (
+        ids.index(st.history_anchor)
+        if st.history_anchor is not None and st.history_anchor in ids
+        else 0
+    )
 
     chunk = st.history.chunk
     while len(hist) - start > st.history.messages:
@@ -238,7 +245,9 @@ def history_window(st: GroupState, msg: ChatMsg | None) -> list[ChatMsg]:
     return hist[start:]
 
 
-def numbered(visible: list[ChatMsg]) -> tuple[dict[str, int], dict[str, str]]:
+def numbered(
+    visible: Sequence[TranscriptRendering],
+) -> tuple[dict[MessageId, int], dict[MessageId, str]]:
     """Line numbers for one prompt's worth of messages, and where each quote points.
 
     A quote is shown as a pointer to a numbered line, not as an excerpt: an excerpt says
@@ -262,7 +271,7 @@ def numbered(visible: list[ChatMsg]) -> tuple[dict[str, int], dict[str, str]]:
     """
     nums = {m.msg_id: i for i, m in enumerate(visible, 1)}
     by_id = {m.msg_id: m for m in visible}
-    marks: dict[str, str] = {}
+    marks: dict[MessageId, str] = {}
     for m in visible:
         if not m.reply_to:
             continue
@@ -275,7 +284,9 @@ def numbered(visible: list[ChatMsg]) -> tuple[dict[str, int], dict[str, str]]:
     return nums, marks
 
 
-def numbered_images(visible: list[ChatMsg]) -> tuple[dict[str, list[int]], dict[int, tuple]]:
+def numbered_images[M: TranscriptRendering](
+    visible: Sequence[M],
+) -> tuple[dict[MessageId, list[int]], dict[int, tuple[M, int]]]:
     """Give every picture in this prompt a number, oldest first.
 
     The reply model reads pictures itself, and a number is how it names the ones it
@@ -288,8 +299,8 @@ def numbered_images(visible: list[ChatMsg]) -> tuple[dict[str, list[int]], dict[
     Returns the numbers per message - the render puts them into the markers - and the
     map back to (message, index into image_refs) that open_images resolves against.
     """
-    per_msg: dict[str, list[int]] = {}
-    by_pic: dict[int, tuple] = {}
+    per_msg: dict[MessageId, list[int]] = {}
+    by_pic: dict[int, tuple[M, int]] = {}
     n = 0
     for m in visible:
         refs = getattr(m, "image_refs", None) or []
@@ -313,7 +324,10 @@ def teach_roster(people: MemberNumbers, profiles: list[dict]) -> None:
 
 
 def number_people(
-    people: MemberNumbers, profiles: list[dict], window: list[ChatMsg], msg: ChatMsg | None
+    people: MemberNumbers,
+    profiles: list[dict],
+    window: Sequence[TranscriptRendering],
+    msg: TranscriptRendering | None,
 ) -> None:
     """Assign member numbers in the order the prompt shows people.
 
@@ -346,7 +360,7 @@ def _call_id(msg_id: str) -> str:
 def _segment_arg(
     segment: HistoricalSegment,
     *,
-    nums: dict[str, int],
+    nums: Mapping[MessageId, int],
     people: MemberNumbers | None,
 ) -> dict | None:
     """One archived outbound segment in the model-facing send schema."""
@@ -363,7 +377,7 @@ def _segment_arg(
             )
         case ReplySegment(message_id):
             return (
-                {"type": "reply", "data": {"line": nums[message_id]}}
+                {"type": "reply", "data": {"line": nums[MessageId(message_id)]}}
                 if message_id in nums
                 else None
             )
@@ -387,11 +401,11 @@ def _segment_arg(
 
 
 def _current_send_args(
-    m: ChatMsg,
+    m: TranscriptRendering,
     *,
     body: str,
     max_text_chars: int,
-    nums: dict[str, int],
+    nums: Mapping[MessageId, int],
     people: MemberNumbers | None,
 ) -> dict | None:
     """Project one archived line only when the current send contract can express it."""
@@ -431,9 +445,9 @@ def _current_send_args(
 
 
 def own_line(
-    m: ChatMsg,
+    m: TranscriptRendering,
     *,
-    nums: dict[str, int],
+    nums: Mapping[MessageId, int],
     people: MemberNumbers | None,
     evidence: str = "",
     max_text_chars: int,
@@ -477,11 +491,11 @@ def own_line(
 
 
 def render_history(
-    window: list[ChatMsg],
-    nums: dict[str, int],
-    marks: dict[str, str],
-    evidence: dict[str, str] | None = None,
-    pics: dict[str, list[int]] | None = None,
+    window: Sequence[TranscriptRendering],
+    nums: Mapping[MessageId, int],
+    marks: Mapping[MessageId, str],
+    evidence: Mapping[str, str] | None = None,
+    pics: Mapping[MessageId, Sequence[int]] | None = None,
     people: MemberNumbers | None = None,
     *,
     max_text_chars: int,
@@ -525,10 +539,10 @@ def build_tail(
     *,
     clock: Clock,
     prompts: PromptCatalog,
-    msg: ChatMsg,
-    nums: dict[str, int] | None = None,
-    marks: dict[str, str] | None = None,
-    pics: dict[str, list[int]] | None = None,
+    msg: TranscriptRendering,
+    nums: Mapping[MessageId, int] | None = None,
+    marks: Mapping[MessageId, str] | None = None,
+    pics: Mapping[MessageId, Sequence[int]] | None = None,
     people: MemberNumbers | None = None,
 ) -> str:
     """Everything after the cache boundary: the clock, then the current message.
@@ -561,16 +575,16 @@ def assemble(
     clock: Clock,
     prompts: PromptCatalog,
     st: GroupState,
-    msg: ChatMsg | None,
+    msg: TranscriptRendering | None,
     profiles: list[dict],
     group_facts: list[str] | None = None,
     task_intent: str | None = None,
     task_initiator: str | None = None,
-    evidence: dict[str, str] | None = None,
-    window: list[ChatMsg] | None = None,
-    nums: dict[str, int] | None = None,
-    marks: dict[str, str] | None = None,
-    pics: dict[str, list[int]] | None = None,
+    evidence: Mapping[str, str] | None = None,
+    window: Sequence[TranscriptRendering] | None = None,
+    nums: Mapping[MessageId, int] | None = None,
+    marks: Mapping[MessageId, str] | None = None,
+    pics: Mapping[MessageId, Sequence[int]] | None = None,
     people: MemberNumbers | None = None,
 ) -> tuple[PromptItem, ...]:
     # One pass over the window for both halves: the marks have to agree across the cache
@@ -583,9 +597,12 @@ def assemble(
         raise ValueError("a reply needs a received message or a scheduled task")
     if window is None:
         window = history_window(st, msg)
-        nums, marks = numbered(window + ([msg] if msg is not None else []))
+    if nums is None or marks is None:
+        numbered_lines, quoted_lines = numbered([*window, *([msg] if msg is not None else [])])
+        nums = numbered_lines if nums is None else nums
+        marks = quoted_lines if marks is None else marks
     if pics is None:
-        pics, _ = numbered_images(window + ([msg] if msg is not None else []))
+        pics, _ = numbered_images([*window, *([msg] if msg is not None else [])])
     if people is None:
         people = MemberNumbers()
         number_people(people, profiles, window, msg)
@@ -607,27 +624,24 @@ def assemble(
             max_text_chars=cfg.conversation.max_text_chars_per_message,
         )
     )
-    messages.append(
-        Message(
-            Role.USER,
-            (
-                prompts.render(
-                    PromptKey.SCHEDULED_USER,
-                    now=clock.describe(),
-                    intent=defang(task_intent),
-                    initiator=task_initiator or "原发起人",
-                )
-                if task_intent is not None
-                else build_tail(
-                    clock=clock,
-                    prompts=prompts,
-                    msg=msg,
-                    nums=nums,
-                    marks=marks,
-                    pics=pics,
-                    people=people,
-                )
-            ),
+    if task_intent is not None:
+        tail = prompts.render(
+            PromptKey.SCHEDULED_USER,
+            now=clock.describe(),
+            intent=defang(task_intent),
+            initiator=task_initiator or "原发起人",
         )
-    )
+    else:
+        if msg is None:
+            raise ValueError("a reply needs a received message or a scheduled task")
+        tail = build_tail(
+            clock=clock,
+            prompts=prompts,
+            msg=msg,
+            nums=nums,
+            marks=marks,
+            pics=pics,
+            people=people,
+        )
+    messages.append(Message(Role.USER, tail))
     return tuple(messages)

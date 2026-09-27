@@ -160,7 +160,11 @@ report, debugging and the behavioural evaluation scripts are described in
 ## Development
 
 The tests use pytest and need no QQ connection or paid API. Database cases require an
-explicit disposable PostgreSQL address; without it, those cases are skipped.
+explicit disposable PostgreSQL address; without it, those cases are skipped. Pyright
+checks annotated production code and maintained Python scripts (`bot.py`, `qqbot/`,
+`scripts/`) in basic mode, including nominal identifiers such as `GroupId` rather
+than treating them as interchangeable with `str`. Tests are exercised by pytest,
+not included in the Pyright scope.
 
 ```bash
 python -m venv .venv
@@ -179,9 +183,14 @@ export QBOT_TEST_DATABASE_PASSWORD=testpw
 until docker exec qbot-pgtest pg_isready -h 127.0.0.1 -U qbot_test -d qbot_test; do
   sleep 1
 done
-.venv/bin/python -m pytest
-.venv/bin/python -m ruff check .
+. .venv/bin/activate
+python -m pytest
+python -m ruff check .
+python -m pyright
 ```
+
+Run pytest, Ruff and Pyright as independent checks. The type check needs no running
+services or provider credentials; database tests use the disposable database above.
 
 Database tests verify the dedicated role, database and safety marker before destructive
 operations. Never point them at production, and do not run them concurrently against

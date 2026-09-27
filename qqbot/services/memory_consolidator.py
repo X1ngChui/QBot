@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 
+from qqbot.db.connection import DbConnection
 from qqbot.repositories.job import Job, fenced_transaction
 from qqbot.domain.ids import GroupId
 from qqbot.domain.identity import ALIAS_MAX_CHARS
@@ -264,6 +265,7 @@ class MemoryConsolidator:
                 ):
                     verdict = Verdict.no(RejectReason.AMBIGUOUS_ALIAS)
                 if not verdict.ok:
+                    assert verdict.reason is not None
                     await self._mem.settle(
                         candidate.rejected(verdict.reason.value),
                         _conn=conn,
@@ -288,6 +290,7 @@ class MemoryConsolidator:
                             group_id,
                             when,
                             source_lines[0].occurred_at,
+                            source_lines[0].event_id,
                             _conn=conn,
                         )
                     elif candidate.candidate_type is CandidateType.ALIAS:
@@ -304,6 +307,7 @@ class MemoryConsolidator:
                             snapshot.codes[candidate.payload["account"]],
                             when,
                             source_lines[0].occurred_at,
+                            source_lines[0].event_id,
                             _conn=conn,
                         )
                 except (KeyError, TypeError, ValueError):
@@ -336,7 +340,7 @@ class MemoryConsolidator:
         group_id: GroupId,
         target_id: uuid.UUID,
         *,
-        _conn: asyncpg.Connection,
+        _conn: DbConnection,
     ) -> None:
         await self._ids.upsert_alias(
             Alias(
@@ -362,7 +366,7 @@ class MemoryConsolidator:
         extraction_id: uuid.UUID,
         sources: tuple[SnapshotLine, ...],
         *,
-        _conn: asyncpg.Connection,
+        _conn: DbConnection,
     ) -> None:
         times = [source.occurred_at for source in sources]
         score = candidate.confidence if candidate.confidence is not None else 0.5
@@ -387,8 +391,9 @@ class MemoryConsolidator:
         group_id: GroupId,
         when: datetime,
         observed_at: datetime,
+        source_event_id: uuid.UUID,
         *,
-        _conn: asyncpg.Connection,
+        _conn: DbConnection,
     ) -> None:
         payload = candidate.payload
         subject = await self._ids.group_entity(group_id, _conn=_conn)
@@ -420,7 +425,7 @@ class MemoryConsolidator:
                 memory_type=MemoryType.GROUP,
                 confidence=earned_confidence(1),
             ),
-            [FactEvidence(candidate.source_event_id)],
+            [FactEvidence(source_event_id)],
             when=when,
             observed_at=observed_at,
             _conn=_conn,
@@ -433,8 +438,9 @@ class MemoryConsolidator:
         target_id: uuid.UUID,
         when: datetime,
         observed_at: datetime,
+        source_event_id: uuid.UUID,
         *,
-        _conn: asyncpg.Connection,
+        _conn: DbConnection,
     ) -> None:
         predicate = candidate.payload["predicate"]
         value = candidate.payload["object"].strip()
@@ -463,7 +469,7 @@ class MemoryConsolidator:
                 memory_type=_fact_kind(predicate, self._predicates),
                 confidence=earned_confidence(1),
             ),
-            [FactEvidence(candidate.source_event_id)],
+            [FactEvidence(source_event_id)],
             when=when,
             observed_at=observed_at,
             _conn=_conn,

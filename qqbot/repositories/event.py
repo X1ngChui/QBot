@@ -6,6 +6,8 @@ from collections.abc import Callable
 
 import asyncpg
 
+from qqbot.db.connection import DbConnection
+
 from qqbot.domain.ids import GroupId
 from qqbot.domain.identity.reading import SpeakerActivity
 
@@ -15,7 +17,7 @@ class EventRepository:
         self._database = database
 
     async def speakers(
-        self, group_id: GroupId, *, _conn: asyncpg.Connection | None = None
+        self, group_id: GroupId, *, _conn: DbConnection | None = None
     ) -> tuple[SpeakerActivity, ...]:
         rows = await (_conn or self._database()).fetch(
             """SELECT platform_user_id AS uid, count(*) AS n, min(occurred_at) AS first

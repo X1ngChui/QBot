@@ -245,6 +245,7 @@ class MemoryWorker:
         notes: dict[int, str] = {}
         exact = await self._mem.current_account_facts(group_id, list(by_account))
         for fact in exact:
+            assert fact.subject_account_id is not None
             code = by_account.get(fact.subject_account_id)
             if code is None:
                 continue
@@ -261,6 +262,7 @@ class MemoryWorker:
         holder_ids = list(accounts_by_holder)
         holder_facts = await self._mem.current_entity_facts(group_id, holder_ids)
         for fact in holder_facts:
+            assert fact.subject_entity_id is not None
             for account_id in accounts_by_holder.get(fact.subject_entity_id, ()):
                 code = by_account[account_id]
                 if fact.predicate == NOTE:
@@ -440,6 +442,7 @@ class MemoryWorker:
         accounts_by_user = {account.platform_user_id: account for account in reading.accounts}
         aliases_by_account: dict[uuid.UUID, list[str]] = {}
         for alias in reading.aliases:
+            assert alias.target_account_id is not None
             aliases_by_account.setdefault(alias.target_account_id, []).append(alias.alias_text)
         names: dict[str, dict[uuid.UUID, object]] = {}
         for account, alias in reading.names:

@@ -12,7 +12,7 @@ from qqbot.conversation.scheduler import ReplyScheduler
 from qqbot.conversation.session import AddressedMessage, ReplyRequest
 
 from qqbot.domain.archive import AuthorKind
-from qqbot.domain.ids import AccountId
+from qqbot.domain.ids import AccountId, MessageId
 from qqbot.domain.ingress import InboundEvent
 from qqbot.gateway.ingest import Ingestor
 from qqbot.gateway.onebot import GroupMessage
@@ -138,15 +138,19 @@ class Gateway:
         )
         if inbound.reply_to_message_id and not parsed.reply_to:
             parsed.reply_to = inbound.reply_to_message_id
+        reply_to = MessageId(parsed.reply_to) if parsed.reply_to else None
         rendered = inbound.plain_text if inbound.event_type == "notice" else parsed.render()
         text = rendered
         command_name = self._command_name(inbound.typed_text)
         is_bot = inbound.author_kind is AuthorKind.BOT
-        direct_mentions = at_mentions(
-            segments,
-            self_id=inbound.self_id,
-            self_name=self_name,
-        )
+        direct_mentions = [
+            (AccountId(account), label)
+            for account, label in at_mentions(
+                segments,
+                self_id=inbound.self_id,
+                self_name=self_name,
+            )
+        ]
 
         st = await self._registry.get(group_id)
         # A replay after restart is already present in this load. The append-once claim
@@ -156,7 +160,7 @@ class Gateway:
         archived = replace(
             inbound,
             plain_text=text,
-            reply_to_message_id=parsed.reply_to,
+            reply_to_message_id=reply_to,
         )
         admitted = await self._ingestor.ingest(
             archived,
@@ -174,7 +178,7 @@ class Gateway:
             return
 
         if is_bot and direct_mentions:
-            accounts = [account for account, _ in direct_mentions]
+            accounts = [str(account) for account, _ in direct_mentions]
             live_names = await self._members.names_of(bot, group_id, accounts)
             direct_mentions = [
                 (account, label or live_names.get(account) or "成员")
@@ -199,7 +203,7 @@ class Gateway:
             raw_event_id=admitted.raw_event_id,
             is_bot=is_bot,
             is_owner=not is_bot and inbound.sender.user_id in cfg.bot.owners,
-            reply_to=parsed.reply_to,
+            reply_to=reply_to,
             image_refs=parsed.pictures,
             mentions=[] if is_bot else direct_mentions,
             at=direct_mentions if is_bot else [],

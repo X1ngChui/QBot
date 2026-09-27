@@ -57,7 +57,9 @@ async def _startup() -> None:
     try:
         await runtime.start()
         tasks.register(runtime)
-        await runtime.scheduled.start(lambda: next(iter(get_bots().values()), None))
+        await runtime.scheduled.start(
+            lambda: next((bot for bot in get_bots().values() if isinstance(bot, Bot)), None)
+        )
     except BaseException:
         await runtime.aclose()
         raise

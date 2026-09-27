@@ -13,7 +13,7 @@ import logging
 import re
 import uuid
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -56,7 +56,19 @@ class TranscriptRendering:
 
     __slots__ = ()
 
-    def numbered_text(self, pic_nums: list[int] | None) -> str:
+    msg_id: MessageId
+    user_id: AccountId
+    nickname: str
+    text: str
+    ts: datetime
+    is_bot: bool
+    is_owner: bool
+    reply_to: MessageId | None
+    mentions: Sequence[tuple[AccountId, str]]
+    at: Sequence[tuple[AccountId, str]]
+    outbound: Sequence[HistoricalSegment]
+
+    def numbered_text(self, pic_nums: Sequence[int] | None) -> str:
         """This message's text with its picture markers carrying their prompt numbers.
 
         The number is how the model names a picture to open_images, and it is a position
@@ -80,7 +92,7 @@ class TranscriptRendering:
         *,
         seq: int = 0,
         quote: str = "",
-        pic_nums: list[int] | None = None,
+        pic_nums: Sequence[int] | None = None,
         member_no: int | None = None,
         mention_number: Callable[[str], int | None] | None = None,
     ) -> str:
@@ -158,7 +170,7 @@ class GroupState:
     persona_name: str = field(default="", kw_only=True)
     custom_persona: bool = field(default=False, kw_only=True)
     recent: deque[ChatMsg] = field(default_factory=deque)
-    history_anchor: str | None = None
+    history_anchor: MessageId | None = None
     muted: bool = False
     loaded: bool = False
     history_loaded: bool = False

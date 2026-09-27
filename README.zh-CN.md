@@ -134,7 +134,9 @@ docker compose up -d bot
 ## 开发
 
 测试统一使用 pytest，不连接 QQ，也不调用付费 API。数据库测试要求显式提供一次性
-PostgreSQL 的地址；未提供时，这些测试会明确跳过。
+PostgreSQL 的地址；未提供时，这些测试会明确跳过。Pyright 以 basic 模式检查有类型标注的
+生产代码和维护中的 Python 脚本（`bot.py`、`qqbot/`、`scripts/`），包括将 `GroupId`
+与普通 `str` 区分开的名义类型。测试由 pytest 验证，不在 Pyright 检查范围内。
 
 ```bash
 python -m venv .venv
@@ -153,9 +155,14 @@ export QBOT_TEST_DATABASE_PASSWORD=testpw
 until docker exec qbot-pgtest pg_isready -h 127.0.0.1 -U qbot_test -d qbot_test; do
   sleep 1
 done
-.venv/bin/python -m pytest
-.venv/bin/python -m ruff check .
+. .venv/bin/activate
+python -m pytest
+python -m ruff check .
+python -m pyright
 ```
+
+pytest、Ruff 和 Pyright 是三个独立检查。类型检查不需要运行中的服务或服务商密钥；
+数据库测试使用上面的一次性数据库。
 
 数据库测试会在破坏性操作前检查专用角色、库名和安全标记。禁止指向生产库，也不要
 针对同一个测试库并行运行这些测试。

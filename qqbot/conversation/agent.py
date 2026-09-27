@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Awaitable, Callable
+import uuid
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 
 from pydantic import ValidationError
 
-from qqbot.domain.ids import GroupId
+from qqbot.domain.ids import AccountId, GroupId, MessageId
 from qqbot.providers.base import QuotaExhausted
 from qqbot.providers.base import TextModel
 from qqbot.providers.contracts import CallContext
@@ -26,6 +27,7 @@ from qqbot.providers.contracts import Role
 from qqbot.providers.contracts import SessionDirective
 from qqbot.providers.contracts import ToolCall
 from qqbot.providers.contracts import ToolResult
+from qqbot.providers.contracts import ToolSpec
 from qqbot.configuration import Settings
 from qqbot.util import why, sysmark
 from qqbot.operations import debug
@@ -60,6 +62,7 @@ from qqbot.delivery.contract import SendSegmentInput
 from qqbot.delivery.contract import TextInput
 from qqbot.delivery.contract import send_arguments_model
 from qqbot.conversation.state import ChatMsg
+from qqbot.conversation.state import TranscriptRendering
 from qqbot.conversation.state import GroupState
 
 log = logging.getLogger("qqbot.agent")
@@ -108,12 +111,13 @@ class MessageDraft:
         return text_content(self.segments)
 
     @property
-    def at(self) -> list[str]:
-        return at_accounts(self.segments)
+    def at(self) -> list[AccountId]:
+        return [AccountId(account) for account in at_accounts(self.segments)]
 
     @property
-    def reply_to(self) -> str | None:
-        return reply_target(self.segments)
+    def reply_to(self) -> MessageId | None:
+        target = reply_target(self.segments)
+        return MessageId(target) if target is not None else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -143,7 +147,7 @@ def _resolve_segment(
     item: SendSegmentInput,
     *,
     people: MemberNumbers,
-    lines: dict[int, ChatMsg],
+    lines: Mapping[int, TranscriptRendering],
     group_id: GroupId,
 ) -> SendSegment | None:
     """Resolve one prompt-local member or line number into a platform identifier."""
@@ -174,7 +178,7 @@ def _resolve_message(
     value: SendMessageInput,
     *,
     people: MemberNumbers,
-    lines: dict[int, ChatMsg],
+    lines: Mapping[int, TranscriptRendering],
     group_id: GroupId,
 ) -> MessageDraft | None:
     segments: list[SendSegment] = []
@@ -204,7 +208,7 @@ def parse_send(
     call: ToolCall,
     *,
     people: MemberNumbers,
-    lines: dict[int, ChatMsg],
+    lines: Mapping[int, TranscriptRendering],
     group_id: GroupId,
     max_text_chars: int,
 ) -> tuple[MessageDraft | None, str]:
@@ -251,9 +255,9 @@ class AgentRun:
         state: GroupState,
         tool_context: tools.ToolCtx,
         people: MemberNumbers,
-        lines: dict[int, ChatMsg],
+        lines: Mapping[int, ChatMsg | MessageSnapshot],
         on_send: Callable[[MessageDraft, tuple[ToolExecution, ...]], Awaitable[SendResult]],
-        seen_messages: set[object],
+        seen_messages: set[uuid.UUID | MessageId],
         initial_cursor: int | None = None,
     ) -> None:
         self._fuel = SessionFuel()
@@ -267,7 +271,10 @@ class AgentRun:
         tool_context.registry = self._registry
         self._people = people
         self._lines = {
-            number: MessageSnapshot.capture(message) for number, message in lines.items()
+            number: message
+            if isinstance(message, MessageSnapshot)
+            else MessageSnapshot.capture(message)
+            for number, message in lines.items()
         }
         self._cursor = (
             initial_cursor
@@ -504,6 +511,12 @@ class AgentRun:
             return False
         return True
 
+    def _action_spec(self, name: str) -> ToolSpec:
+        entry = self._registry.get(name)
+        if entry is None:
+            raise RuntimeError(f"missing session action: {name}")
+        return entry.spec
+
     async def run(self) -> AgentOutcome:
         if self._phase is not AgentPhase.RUNNING:
             raise RuntimeError(f"agent cannot run from {self._phase}")
@@ -573,8 +586,8 @@ class AgentRun:
                         directive = SessionDirective(
                             prompt=arrivals + (Message(Role.USER, WRAP_UP_NOTE),),
                             tools=(
-                                self._registry.get(tools.SEND).spec,
-                                self._registry.get(tools.FINISH).spec,
+                                self._action_spec(tools.SEND),
+                                self._action_spec(tools.FINISH),
                             ),
                         )
                         if not self._fuel.begin_turn():
@@ -590,7 +603,7 @@ class AgentRun:
                     directive = SessionDirective(prompt=arrivals) if arrivals else None
                     if self._sent >= self._cfg.conversation.max_messages_per_reply:
                         directive = SessionDirective(
-                            prompt=arrivals, tools=(self._registry.get(tools.FINISH).spec,)
+                            prompt=arrivals, tools=(self._action_spec(tools.FINISH),)
                         )
                     if not self._fuel.begin_turn():
                         return self._finish()

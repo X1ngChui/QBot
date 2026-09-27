@@ -9,7 +9,7 @@ A substring hit that is not a whole token is not being addressed, and the bot st
 quiet. This match is the entire trigger - nothing downstream reconsiders it - so
 precision here decides whether the bot ever speaks out of turn.
 
-`nicknames` is always a list: a bot is called by several variants (abbreviations,
+`nicknames` is always a sequence: a bot is called by several variants (abbreviations,
 homophones, typos that stuck), and every one of them must be injected and matched.
 """
 
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Sequence
 
 import jieba
 
@@ -37,7 +38,7 @@ def initialize() -> None:
             log.info("jieba initialized")
 
 
-def register(nicknames: list[str]) -> None:
+def register(nicknames: Sequence[str]) -> None:
     """Nicknames are usually coined words outside the dictionary; without injecting them
     jieba splits them apart and the match is missed.
 
@@ -82,7 +83,7 @@ def _has_clean_boundary(norm: str, key: str) -> bool:
     return False
 
 
-def word_hit(text: str, nicknames: list[str]) -> str | None:
+def word_hit(text: str, nicknames: Sequence[str]) -> str | None:
     """Return the nickname variant that appears as a whole token, or None."""
     if not nicknames or not text:
         return None

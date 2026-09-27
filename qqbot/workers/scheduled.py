@@ -75,7 +75,7 @@ class ScheduledTaskWorker:
         await self.flush()
 
     async def _wait(self) -> None:
-        pause = asyncio.create_task(self._pause(POLL_SECONDS))
+        pause = asyncio.ensure_future(self._pause(POLL_SECONDS))
         wake = asyncio.create_task(self._wake.wait())
         try:
             await asyncio.wait((pause, wake), return_when=asyncio.FIRST_COMPLETED)
@@ -164,6 +164,7 @@ class ScheduledTaskWorker:
     async def flush(self) -> None:
         while self._completed:
             request, outcome = self._completed[0]
+            assert isinstance(request.cause, DueTask)
             failed = outcome.end in {
                 ReplyEnd.FAILED,
                 ReplyEnd.TIMEOUT,

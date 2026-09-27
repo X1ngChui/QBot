@@ -3,9 +3,9 @@
 #
 #     .venv/Scripts/python.exe -m pip install -r requirements-dev.txt
 #
-# The linter is part of the test run (tests/run_all.py); without it installed that
-# step reports as skipped rather than failing, so a bare runtime venv still passes.
+# Run pytest, Ruff and Pyright separately; all three are required for validation.
 ruff==0.16.9
+pyright==1.1.414
 pytest==9.1.1
 pytest-asyncio==1.4.0
 hypothesis==6.168.2

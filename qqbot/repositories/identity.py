@@ -13,6 +13,7 @@ from datetime import datetime
 
 import asyncpg
 
+from qqbot.db.connection import DbConnection
 from qqbot.repositories.job import Job, fenced_transaction
 from qqbot.domain.ids import GroupId
 from qqbot.domain.identity import Alias
@@ -74,8 +75,8 @@ def _alias(row) -> Alias:
 @asynccontextmanager
 async def _write_connection(
     database: Callable[[], asyncpg.Pool],
-    conn: asyncpg.Connection | None,
-) -> AsyncIterator[asyncpg.Connection]:
+    conn: DbConnection | None,
+) -> AsyncIterator[DbConnection]:
     """Use a caller transaction or own one for an ordinary repository write."""
 
     if conn is not None:
@@ -85,7 +86,7 @@ async def _write_connection(
         yield owned
 
 
-async def lock_identity_topology(conn: asyncpg.Connection) -> None:
+async def lock_identity_topology(conn: DbConnection) -> None:
     """Serialize the tiny identity graph while a union, detach, or snapshot runs."""
 
     await conn.execute(
@@ -108,7 +109,7 @@ class IdentityRepository:
 
     # -- people and accounts ----------------------------------------------
     async def accounts_by_users(
-        self, platform: str, user_ids: list[str], *, _conn: asyncpg.Connection | None = None
+        self, platform: str, user_ids: list[str], *, _conn: DbConnection | None = None
     ) -> list[IdentityAccount]:
         if not user_ids:
             return []
@@ -121,7 +122,7 @@ class IdentityRepository:
         return [IdentityAccount(**dict(row)) for row in rows]
 
     async def accounts_by_ids(
-        self, account_ids: list[uuid.UUID], *, _conn: asyncpg.Connection | None = None
+        self, account_ids: list[uuid.UUID], *, _conn: DbConnection | None = None
     ) -> list[IdentityAccount]:
         if not account_ids:
             return []
@@ -133,7 +134,7 @@ class IdentityRepository:
         return [IdentityAccount(**dict(row)) for row in rows]
 
     async def accounts_of_many(
-        self, entity_ids: list[uuid.UUID], *, _conn: asyncpg.Connection | None = None
+        self, entity_ids: list[uuid.UUID], *, _conn: DbConnection | None = None
     ) -> list[IdentityAccount]:
         if not entity_ids:
             return []
@@ -149,7 +150,7 @@ class IdentityRepository:
         group_id: GroupId,
         entity_ids: list[uuid.UUID],
         *,
-        _conn: asyncpg.Connection | None = None,
+        _conn: DbConnection | None = None,
     ) -> dict[uuid.UUID, list[Alias]]:
         if not entity_ids:
             return {}
@@ -240,7 +241,7 @@ class IdentityRepository:
         return IdentityAccount(**dict(row)) if row else None
 
     async def account_names(
-        self, group_id: GroupId, *, _conn: asyncpg.Connection | None = None
+        self, group_id: GroupId, *, _conn: DbConnection | None = None
     ) -> list[tuple[IdentityAccount, str]]:
         """Confirmed literal names that identify one exact account in this group."""
 
@@ -276,7 +277,7 @@ class IdentityRepository:
         *,
         seen_at: datetime,
         name: str | None = None,
-        _conn: asyncpg.Connection | None = None,
+        _conn: DbConnection | None = None,
     ) -> IdentityAccount:
         """Seeing an account guarantees it has an owner.
 
@@ -313,7 +314,7 @@ class IdentityRepository:
         *,
         seen_at: datetime,
         name: str | None = None,
-        _conn: asyncpg.Connection | None = None,
+        _conn: DbConnection | None = None,
     ) -> IdentityAccount:
         async with _write_connection(self._database, _conn) as conn:
             await conn.execute(
@@ -334,13 +335,15 @@ class IdentityRepository:
                     row["id"],
                     seen_at,
                 )
-                return IdentityAccount(**dict(row) | {"last_seen_at": seen_at})
+                return replace(IdentityAccount(**dict(row)), last_seen_at=seen_at)
 
             ent = await conn.fetchrow(
                 """INSERT INTO entity (entity_type, canonical_name)
                    VALUES ('person', $1) RETURNING id""",
                 name,
             )
+            if ent is None:
+                raise RuntimeError("entity insert returned no row")
             acc = await conn.fetchrow(
                 """INSERT INTO identity_account
                        (entity_id, platform, platform_user_id, first_seen_at, last_seen_at)
@@ -352,6 +355,8 @@ class IdentityRepository:
                 user_id,
                 seen_at,
             )
+            if acc is None:
+                raise RuntimeError("identity account insert returned no row")
             return IdentityAccount(**dict(acc))
 
     #: The namespace a group's own account lives in. Not "qq": a group id and an account
@@ -363,7 +368,7 @@ class IdentityRepository:
         self,
         group_id: GroupId,
         *,
-        _conn: asyncpg.Connection | None = None,
+        _conn: DbConnection | None = None,
     ) -> uuid.UUID:
         """The group itself, as an entity.
 
@@ -394,6 +399,8 @@ class IdentityRepository:
                    VALUES ('group', $1) RETURNING id""",
                 group_id,
             )
+            if ent is None:
+                raise RuntimeError("group entity insert returned no id")
             await conn.execute(
                 """INSERT INTO identity_account
                        (entity_id, platform, platform_user_id, first_seen_at, last_seen_at)
@@ -455,7 +462,7 @@ class IdentityRepository:
         left: uuid.UUID,
         right: uuid.UUID,
         *,
-        _conn: asyncpg.Connection | None = None,
+        _conn: DbConnection | None = None,
     ) -> uuid.UUID:
         """Union two live holder roots and return the deterministic survivor."""
 
@@ -500,7 +507,7 @@ class IdentityRepository:
         self,
         account: IdentityAccount,
         *,
-        _conn: asyncpg.Connection | None = None,
+        _conn: DbConnection | None = None,
     ) -> uuid.UUID:
         """Detach one exact account while every other linked account stays together."""
 
@@ -522,6 +529,8 @@ class IdentityRepository:
                 "SELECT count(*) FROM identity_account WHERE entity_id=$1",
                 current["entity_id"],
             )
+            if count is None:
+                raise RuntimeError("linked account count returned no row")
             if count < 2:
                 raise ValueError("account is not linked")
             new_id = await conn.fetchval(
@@ -529,6 +538,8 @@ class IdentityRepository:
                    VALUES ('person', $1) RETURNING id""",
                 current["platform_user_id"],
             )
+            if new_id is None:
+                raise RuntimeError("split entity insert returned no id")
             await conn.execute(
                 "UPDATE identity_account SET entity_id=$2 WHERE id=$1",
                 account.id,
@@ -620,6 +631,7 @@ class IdentityRepository:
             if entity_id is None:
                 raise LookupError(f"unknown alias account {alias.target_account_id}")
             return entity_id
+        assert alias.target_entity_id is not None
         live = await self.entity(alias.target_entity_id)
         if live is None:
             raise LookupError(f"unknown alias holder {alias.target_entity_id}")
@@ -634,7 +646,7 @@ class IdentityRepository:
         alias: Alias,
         evidence: list[AliasEvidence],
         *,
-        _conn: asyncpg.Connection | None = None,
+        _conn: DbConnection | None = None,
     ) -> Alias:
         """Write a name, or strengthen one, recording the evidence alongside it.
 
@@ -672,7 +684,7 @@ class IdentityRepository:
         alias: Alias,
         evidence: list[AliasEvidence],
         *,
-        _conn: asyncpg.Connection | None = None,
+        _conn: DbConnection | None = None,
     ) -> Alias:
         async with _write_connection(self._database, _conn) as conn:
             row = await conn.fetchrow(
@@ -978,6 +990,7 @@ class IdentityRepository:
                     status,
                 )
                 out = _alias(row)
+            assert out is not None
             return replace(
                 out,
                 confidence=confidence,

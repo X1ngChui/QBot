@@ -11,6 +11,8 @@ from enum import StrEnum
 
 import asyncpg
 
+from qqbot.db.connection import DbConnection
+
 
 class JobType(StrEnum):
     EXTRACT_MEMORY = "extract_memory"
@@ -36,7 +38,7 @@ class Job:
         return self.retry_count >= self.max_retry
 
 
-async def require_claim(conn: asyncpg.Connection, job: Job) -> None:
+async def require_claim(conn: DbConnection, job: Job) -> None:
     """Validate after acquiring the row lock, not before an unbounded lock wait."""
     if not conn.is_in_transaction():
         raise RuntimeError("claim checks require the side-effect transaction")
@@ -55,7 +57,7 @@ async def require_claim(conn: asyncpg.Connection, job: Job) -> None:
 async def fenced_transaction(
     database: Callable[[], asyncpg.Pool],
     fence: Job | None,
-) -> AsyncIterator[asyncpg.Connection]:
+) -> AsyncIterator[DbConnection]:
     """Fence leased background writes; direct administrative writes have no lease."""
     async with database().acquire() as conn, conn.transaction():
         if fence is not None:
@@ -88,7 +90,7 @@ class JobQueue:
         priority: int = 0,
         delay: timedelta | None = None,
         fence: Job | None = None,
-        _conn: asyncpg.Connection | None = None,
+        _conn: DbConnection | None = None,
     ) -> uuid.UUID | None:
         if _conn is None:
             async with self._database().acquire() as conn, conn.transaction():

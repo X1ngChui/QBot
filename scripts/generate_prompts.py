@@ -45,6 +45,7 @@ from qqbot.providers.contracts import (
     Role,
     SessionDirective,
     ToolResult,
+    ToolCallId,
     ToolSpec,
 )
 from qqbot.clock import Clock
@@ -114,15 +115,15 @@ def write_tool() -> ToolSpec:
         parameters={
             "type": "object",
             "properties": {key: {"type": "string", "minLength": 1} for key in keys},
-            "required": keys,
+            "required": [*keys],
             "additionalProperties": False,
         },
     )
 
 
-def _candidate(turn, cfg, predicates) -> tuple[PromptCatalog | None, str, str]:
+def _candidate(turn, cfg, predicates) -> tuple[PromptCatalog | None, ToolCallId | None, str]:
     if len(turn.tool_calls) != 1 or turn.tool_calls[0].name != WRITE_TOOL:
-        return None, "", "expected exactly one write_prompt_bundle call"
+        return None, None, "expected exactly one write_prompt_bundle call"
     call = turn.tool_calls[0]
     try:
         raw = json.loads(call.arguments)
@@ -130,11 +131,11 @@ def _candidate(turn, cfg, predicates) -> tuple[PromptCatalog | None, str, str]:
             raise TypeError("tool arguments are not an object")
         catalog = PromptCatalog.from_sources(raw, location="DeepSeek candidate")
     except (json.JSONDecodeError, TypeError, TemplateValidationError) as exc:
-        return None, str(call.call_id), str(exc)
+        return None, call.call_id, str(exc)
     errors = lint_catalog(catalog, cfg, predicates)
     if errors:
-        return None, str(call.call_id), json.dumps(errors, ensure_ascii=False)
-    return catalog, str(call.call_id), ""
+        return None, call.call_id, json.dumps(errors, ensure_ascii=False)
+    return catalog, call.call_id, ""
 
 
 def _install(catalog: PromptCatalog) -> None:

@@ -63,9 +63,9 @@ class PromptSnapshot:
     history: tuple[MessageSnapshot, ...]
     current: MessageSnapshot | None
     cursor: int
-    numbers: Mapping[str, int]
-    quotes: Mapping[str, str]
-    image_numbers: Mapping[str, tuple[int, ...]]
+    numbers: Mapping[MessageId, int]
+    quotes: Mapping[MessageId, str]
+    image_numbers: Mapping[MessageId, tuple[int, ...]]
     pictures: Mapping[int, tuple[MessageSnapshot, int]]
 
     @property

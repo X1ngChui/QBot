@@ -62,7 +62,7 @@ from qqbot.gateway.segments import ImageRef
 from qqbot.conversation.state import ChatMsg
 from qqbot.conversation.state import GroupState
 from qqbot.db import Database, dsn
-from qqbot.domain.ids import GroupId
+from qqbot.domain.ids import AccountId, GroupId, MessageId
 from qqbot.gateway.ingest import Ingestor
 from qqbot.gateway.onebot import GroupMessage, Sender
 from qqbot.providers import Providers
@@ -108,14 +108,14 @@ def _message(
     at: list[tuple[str, str]] | None = None,
 ) -> ChatMsg:
     return ChatMsg(
-        msg_id=mid or f"e-{uid}-{mins_ago}-{len(text)}",
-        user_id=uid,
+        msg_id=MessageId(mid or f"e-{uid}-{mins_ago}-{len(text)}"),
+        user_id=AccountId(uid),
         nickname=name,
         text=text,
         ts=clock.now() - timedelta(minutes=mins_ago),
         is_bot=is_bot,
-        reply_to=reply_to,
-        at=list(at or ()),
+        reply_to=MessageId(reply_to) if reply_to is not None else None,
+        at=[(AccountId(account), label) for account, label in at or ()],
     )
 
 
@@ -134,11 +134,11 @@ async def seed_archive(archive: Ingestor, clock: Clock) -> None:
     for uid, name, text, mins_ago, mid in ARCHIVE_SEEDS:
         await archive.ingest(
             GroupMessage(
-                message_id=mid,
+                message_id=MessageId(mid),
                 group_id=GROUP,
-                sender=Sender(user_id=uid, card=name),
+                sender=Sender(user_id=AccountId(uid), card=name),
                 segments=[{"type": "text", "data": {"text": text}}],
-                self_id=EvalBot.self_id,
+                self_id=AccountId(EvalBot.self_id),
                 occurred_at=clock.now() - timedelta(minutes=mins_ago),
                 plain_text=text,
             )
@@ -416,8 +416,8 @@ async def picture_case(capabilities: Providers, cache: MediaCacheRepository, clo
     key = hashlib.sha256(data).hexdigest()[:32]
     await cache.image_cache_set_file(key, stored.handle, provider=store.cache_namespace)
     poster = ChatMsg(
-        msg_id="pic-1",
-        user_id="u2",
+        msg_id=MessageId("pic-1"),
+        user_id=AccountId("u2"),
         nickname="小北",
         text="看看这个 " + sysmark("图片"),
         ts=clock.now() - timedelta(minutes=2),
@@ -466,8 +466,8 @@ def forward_case(clock: Clock) -> dict:
         "the entries are other people's words at another time",
         "window": [
             ChatMsg(
-                msg_id="fw-1",
-                user_id="u2",
+                msg_id=MessageId("fw-1"),
+                user_id=AccountId("u2"),
                 nickname="小北",
                 text=block,
                 ts=t0 - timedelta(minutes=3),

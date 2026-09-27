@@ -17,8 +17,7 @@ import logging
 import uuid
 from datetime import datetime
 
-import asyncpg
-
+from qqbot.db.connection import DbConnection
 from qqbot.domain.ids import GroupId
 from qqbot.domain.identity import Alias
 from qqbot.domain.identity import AliasEvidence
@@ -60,7 +59,7 @@ class IdentityResolver:
         card: str | None = None,
         nickname: str | None = None,
         raw_event_id: uuid.UUID | None = None,
-        _conn: asyncpg.Connection | None = None,
+        _conn: DbConnection | None = None,
     ) -> IdentityAccount:
         """Record that an account was seen speaking, and file its current names.
 
@@ -79,7 +78,7 @@ class IdentityResolver:
             (card, AliasType.GROUP_CARD, EvidenceType.GROUP_CARD),
             (nickname, AliasType.QQ_NICKNAME, EvidenceType.PLATFORM_IDENTITY),
         ):
-            if not (text or "").strip():
+            if not text or not text.strip():
                 continue
             await self._repo.upsert_alias(
                 Alias(

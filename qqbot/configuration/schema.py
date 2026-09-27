@@ -15,9 +15,13 @@ class ConfigModel(BaseModel):
 
 
 class BotCfg(ConfigModel):
-    owners: tuple[str, ...] = Field((), description="Accounts authorized to operate the bot.")
-    timezone: str = Field("Asia/Shanghai", description="IANA timezone for conversation and jobs.")
-    nicknames: tuple[str, ...] = Field((), description="Names matched as complete words.")
+    owners: tuple[str, ...] = Field(
+        default=(), description="Accounts authorized to operate the bot."
+    )
+    timezone: str = Field(
+        default="Asia/Shanghai", description="IANA timezone for conversation and jobs."
+    )
+    nicknames: tuple[str, ...] = Field(default=(), description="Names matched as complete words.")
 
     @field_validator("owners", mode="before")
     @classmethod
@@ -35,16 +39,27 @@ class BotCfg(ConfigModel):
 
 
 class ConversationCfg(ConfigModel):
-    history_messages: int = Field(90, ge=1, description="Recent messages available to a reply.")
-    max_messages_per_reply: int = Field(4, ge=1, description="Confirmed sends allowed per reply.")
+    history_messages: int = Field(
+        default=90, ge=1, description="Recent messages available to a reply."
+    )
+    max_messages_per_reply: int = Field(
+        default=4, ge=1, description="Confirmed sends allowed per reply."
+    )
     reply_deadline_sec: float = Field(
-        180, ge=30, le=900, description="Whole reply deadline, including queue and media waits."
+        default=180,
+        ge=30,
+        le=900,
+        description="Whole reply deadline, including queue and media waits.",
     )
     max_text_chars_per_message: int = Field(
-        2000, ge=400, description="Output text ceiling; never truncates the inbound archive."
+        default=2000,
+        ge=400,
+        description="Output text ceiling; never truncates the inbound archive.",
     )
     evidence_ttl_days: int = Field(
-        30, ge=1, description="Retention of retrieval evidence associated with a sent message."
+        default=30,
+        ge=1,
+        description="Retention of retrieval evidence associated with a sent message.",
     )
 
 
@@ -71,23 +86,33 @@ class NetworkBackend(ConfigModel):
 
 
 class TextUseCfg(ConfigModel):
-    model: str = Field("", description="Optional extraction model on the text account.")
-    reasoning_effort: Effort | None = Field(None, description="Extraction reasoning override.")
-    timeout_sec: float | None = Field(None, gt=0, description="Extraction request deadline.")
+    model: str = Field(default="", description="Optional extraction model on the text account.")
+    reasoning_effort: Effort | None = Field(
+        default=None, description="Extraction reasoning override."
+    )
+    timeout_sec: float | None = Field(
+        default=None, gt=0, description="Extraction request deadline."
+    )
 
 
 class TextCfg(NetworkBackend):
     provider: Literal["deepseek", "openai_responses", "local"] = Field(
         description="Adapter selected for this capability."
     )
-    credential_env: str = Field("TEXT_API_KEY", description="Credential environment-variable name.")
+    credential_env: str = Field(
+        default="TEXT_API_KEY", description="Credential environment-variable name."
+    )
     model: str = Field(min_length=1, description="Model identifier accepted by this adapter.")
     reasoning_effort: Effort = Field(
-        "off", description="Reasoning grade; may incur output charges."
+        default="off", description="Reasoning grade; may incur output charges."
     )
-    max_concurrency: int = Field(3, ge=1, description="Concurrent requests on this text account.")
-    timeout_sec: float = Field(30, gt=0, description="Deadline of one text request.")
-    retries: int = Field(2, ge=0, description="Retries allowed for retryable provider failures.")
+    max_concurrency: int = Field(
+        default=3, ge=1, description="Concurrent requests on this text account."
+    )
+    timeout_sec: float = Field(default=30, gt=0, description="Deadline of one text request.")
+    retries: int = Field(
+        default=2, ge=0, description="Retries allowed for retryable provider failures."
+    )
     extract: TextUseCfg = Field(default_factory=TextUseCfg)
 
     def for_extract(self) -> TextCfg:
@@ -105,43 +130,57 @@ class VisionCfg(NetworkBackend):
     provider: Literal["deepseek", "openai_responses", "local"] = Field(
         description="Adapter selected for this capability."
     )
-    credential_env: str = Field("TEXT_API_KEY", description="Credential environment-variable name.")
+    credential_env: str = Field(
+        default="TEXT_API_KEY", description="Credential environment-variable name."
+    )
     model: str = Field(min_length=1, description="Model identifier accepted by this adapter.")
     reasoning_effort: Effort = Field(
-        "off", description="Reasoning grade; may incur output charges."
+        default="off", description="Reasoning grade; may incur output charges."
     )
-    max_concurrency: int = Field(1, ge=1, le=16, description="Concurrent description requests.")
+    max_concurrency: int = Field(
+        default=1, ge=1, le=16, description="Concurrent description requests."
+    )
     max_output_tokens: int = Field(
-        4096, ge=256, le=8192, description="Description output and reasoning token ceiling."
+        default=4096, ge=256, le=8192, description="Description output and reasoning token ceiling."
     )
-    timeout_sec: float = Field(30, gt=0, description="Deadline of one backend request in seconds.")
+    timeout_sec: float = Field(
+        default=30, gt=0, description="Deadline of one backend request in seconds."
+    )
 
 
 class AsrCfg(ConfigModel):
     model_dir: str = Field(min_length=1, description="Local SenseVoice model directory.")
-    threads: int = Field(2, ge=1, description="Native inference threads in the local recognizer.")
+    threads: int = Field(
+        default=2, ge=1, description="Native inference threads in the local recognizer."
+    )
 
 
 class EmbeddingCfg(NetworkBackend):
     provider: Literal["dashscope"] = Field(description="Adapter selected for this capability.")
     credential_env: str = Field(
-        "MEDIA_API_KEY", description="Credential environment-variable name."
+        default="MEDIA_API_KEY", description="Credential environment-variable name."
     )
     model: str = Field(min_length=1, description="Model identifier accepted by this adapter.")
-    timeout_sec: float = Field(60, gt=0, description="Deadline of one backend request in seconds.")
+    timeout_sec: float = Field(
+        default=60, gt=0, description="Deadline of one backend request in seconds."
+    )
 
 
 class SearchCfg(NetworkBackend):
     provider: Literal["tavily"] = Field(description="Adapter selected for this capability.")
     credential_env: str = Field(
-        "SEARCH_API_KEY", description="Credential environment-variable name."
+        default="SEARCH_API_KEY", description="Credential environment-variable name."
     )
-    monthly_quota: int = Field(1000, ge=0, description="Shared monthly provider-credit allowance.")
-    proxy: str = Field("", description="Search-only HTTP proxy; empty means direct.")
-    timeout_sec: float = Field(20, gt=0, description="Deadline of one backend request in seconds.")
-    count: int = Field(5, ge=1, le=20, description="Results requested for one web search.")
+    monthly_quota: int = Field(
+        default=1000, ge=0, description="Shared monthly provider-credit allowance."
+    )
+    proxy: str = Field(default="", description="Search-only HTTP proxy; empty means direct.")
+    timeout_sec: float = Field(
+        default=20, gt=0, description="Deadline of one backend request in seconds."
+    )
+    count: int = Field(default=5, ge=1, le=20, description="Results requested for one web search.")
     depth: Literal["basic", "advanced"] = Field(
-        "basic", description="Advanced search consumes two provider credits."
+        default="basic", description="Advanced search consumes two provider credits."
     )
 
 
@@ -154,58 +193,76 @@ class BackendsCfg(ConfigModel):
 
 
 class MediaCfg(ConfigModel):
-    max_image_mb: float = Field(8, gt=0, description="Largest decoded/downloaded image payload.")
-    max_audio_sec: int = Field(
-        300, ge=1, description="Longest voice clip admitted for transcription."
+    max_image_mb: float = Field(
+        default=8, gt=0, description="Largest decoded/downloaded image payload."
     )
-    max_images_per_min: int = Field(6, ge=1, description="Per-group automatic description pace.")
-    max_clips_per_min: int = Field(6, ge=1, description="Per-group voice admission pace.")
+    max_audio_sec: int = Field(
+        default=300, ge=1, description="Longest voice clip admitted for transcription."
+    )
+    max_images_per_min: int = Field(
+        default=6, ge=1, description="Per-group automatic description pace."
+    )
+    max_clips_per_min: int = Field(default=6, ge=1, description="Per-group voice admission pace.")
     description_ttl_days: int = Field(
-        15, ge=0, description="Description refresh age; zero disables."
+        default=15, ge=0, description="Description refresh age; zero disables."
     )
 
 
 class MemoryCfg(ConfigModel):
-    episode_ttl_days: float = Field(90, gt=0, description="Availability of semantic event recall.")
-    alias_unused_days: float = Field(30, gt=0, description="Lifetime of unused candidate names.")
+    episode_ttl_days: float = Field(
+        default=90, gt=0, description="Availability of semantic event recall."
+    )
+    alias_unused_days: float = Field(
+        default=30, gt=0, description="Lifetime of unused candidate names."
+    )
     temporary_alias_days: float = Field(
-        7, gt=0, description="Lifetime of temporary candidate names."
+        default=7, gt=0, description="Lifetime of temporary candidate names."
     )
 
 
 class BudgetCfg(ConfigModel):
     daily_cny_cap: float = Field(
-        5, ge=0, description="Global stop-loss on already booked daily spend."
+        default=5, ge=0, description="Global stop-loss on already booked daily spend."
     )
     per_reply_cny: float = Field(
-        0.30, ge=0, description="Per-reply stop-loss, including its media work."
+        default=0.30, ge=0, description="Per-reply stop-loss, including its media work."
     )
 
 
 class TasksCfg(ConfigModel):
-    max_days_ahead: int = Field(30, ge=1, le=365, description="Furthest future wakeup in days.")
-    max_pending_per_account: int = Field(
-        5, ge=1, description="Pending wakeups per account and group."
+    max_days_ahead: int = Field(
+        default=30, ge=1, le=365, description="Furthest future wakeup in days."
     )
-    max_pending_per_group: int = Field(50, ge=1, description="Pending wakeups across a group.")
-    max_chain_depth: int = Field(24, ge=0, description="Follow-up depth from one original task.")
+    max_pending_per_account: int = Field(
+        default=5, ge=1, description="Pending wakeups per account and group."
+    )
+    max_pending_per_group: int = Field(
+        default=50, ge=1, description="Pending wakeups across a group."
+    )
+    max_chain_depth: int = Field(
+        default=24, ge=0, description="Follow-up depth from one original task."
+    )
     max_executions_per_group_day: int = Field(
-        24, ge=1, description="Wakeups per group and local day."
+        default=24, ge=1, description="Wakeups per group and local day."
     )
 
 
 class MaintenanceCfg(ConfigModel):
     nightly_cron: str = Field(
-        "30 2 * * *", description="Nightly maintenance schedule in bot.timezone."
+        default="30 2 * * *", description="Nightly maintenance schedule in bot.timezone."
     )
-    report_cron: str = Field("0 0 * * *", description="Owner report schedule in bot.timezone.")
-    backup_keep: int = Field(14, ge=1, description="Verified database dumps retained.")
-    napcat_cache_days: int = Field(7, ge=1, description="NapCat media-cache retention in days.")
+    report_cron: str = Field(
+        default="0 0 * * *", description="Owner report schedule in bot.timezone."
+    )
+    backup_keep: int = Field(default=14, ge=1, description="Verified database dumps retained.")
+    napcat_cache_days: int = Field(
+        default=7, ge=1, description="NapCat media-cache retention in days."
+    )
     completed_job_keep_days: int = Field(
-        30, ge=1, le=3650, description="Finished memory-job audit retention in days."
+        default=30, ge=1, le=3650, description="Finished memory-job audit retention in days."
     )
     completed_task_keep_days: int = Field(
-        30, ge=1, description="Terminal wakeup retention in days."
+        default=30, ge=1, description="Terminal wakeup retention in days."
     )
 
     @field_validator("nightly_cron", "report_cron")
@@ -219,10 +276,14 @@ class MaintenanceCfg(ConfigModel):
 
 class DatabaseCfg(ConfigModel):
     pool_min: int = Field(
-        2, ge=1, description="Minimum database pool size; cannot exceed pool_max."
+        default=2, ge=1, description="Minimum database pool size; cannot exceed pool_max."
     )
-    pool_max: int = Field(8, ge=1, description="Maximum connections in the application pool.")
-    command_timeout_sec: float = Field(20, gt=0, description="Database command timeout in seconds.")
+    pool_max: int = Field(
+        default=8, ge=1, description="Maximum connections in the application pool."
+    )
+    command_timeout_sec: float = Field(
+        default=20, gt=0, description="Database command timeout in seconds."
+    )
 
     @model_validator(mode="after")
     def _coherent_pool(self) -> DatabaseCfg:
@@ -232,15 +293,21 @@ class DatabaseCfg(ConfigModel):
 
 
 class PathsCfg(ConfigModel):
-    personas_dir: str = Field("personas", description="Persona directory relative to CONFIG_DIR.")
-    prompts_dir: str = Field("prompts", description="Prompt directory relative to CONFIG_DIR.")
+    personas_dir: str = Field(
+        default="personas", description="Persona directory relative to CONFIG_DIR."
+    )
+    prompts_dir: str = Field(
+        default="prompts", description="Prompt directory relative to CONFIG_DIR."
+    )
     predicates_file: str = Field(
-        "predicates.yaml", description="Predicate table relative to CONFIG_DIR."
+        default="predicates.yaml", description="Predicate table relative to CONFIG_DIR."
     )
 
 
 class RuntimeCfg(ConfigModel):
-    reply_capacity: int = Field(32, ge=1, description="Total active and waiting reply snapshots.")
+    reply_capacity: int = Field(
+        default=32, ge=1, description="Total active and waiting reply snapshots."
+    )
     database: DatabaseCfg = Field(default_factory=DatabaseCfg)
     paths: PathsCfg = Field(default_factory=PathsCfg)
 

@@ -3,7 +3,10 @@
 All tests run through pytest. The root modules cover domain behavior and end-to-end
 workflows, `unit/` covers isolated, property and concurrency contracts, and
 `integration/` covers PostgreSQL contracts in per-case schemas. Fixtures own mutable
-resources; there is no separate script runner. Ruff runs as a separate check.
+resources; there is no separate script runner. Ruff and Pyright run as separate checks.
+Pyright checks annotated production code and maintained scripts (`bot.py`, `qqbot/`,
+`scripts/`) in basic mode, including the nominal distinction between `GroupId` and
+`str`; tests are validated by pytest, not included in the Pyright scope.
 
 Database cases skip unless `QBOT_TEST_DATABASE_URL` is explicitly set. A passing run
 with skipped database cases is not the full regression suite.
@@ -24,13 +27,15 @@ export QBOT_TEST_DATABASE_URL=postgresql://qbot_test@127.0.0.1:15432/qbot_test
 export QBOT_TEST_DATABASE_PASSWORD=testpw
 python -m pytest
 python -m ruff check .
+python -m pyright
 python -m pytest tests/test_pipeline.py   # One workflow suite.
 
 docker rm -f -v qbot-pgtest
 ```
 
-No QQ connection is needed. Install `requirements-dev.txt` for pytest,
-pytest-asyncio, Hypothesis, Ruff and the offline migration dependencies.
+No QQ connection is needed. Install `requirements.txt` and `requirements-dev.txt` for
+the three independent checks: pytest, Ruff and Pyright. Pyright needs no database or
+provider credentials; the evaluation scripts are not executed by these checks.
 Do not run database-mutating suites concurrently against the same test database.
 
 Additional contracts cover Runtime-local clocks and database ownership, explicit

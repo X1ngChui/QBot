@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable
 import asyncpg
 
+from qqbot.db.connection import DbConnection
+
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -69,7 +71,7 @@ class Ingestor:
 
     @staticmethod
     async def _record(
-        conn: asyncpg.Connection,
+        conn: DbConnection,
         event: InboundEvent,
     ) -> uuid.UUID | None:
         """Claim the platform event key without mutating an existing row."""

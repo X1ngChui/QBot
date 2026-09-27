@@ -47,7 +47,7 @@ from qqbot.conversation import prompt
 from qqbot.services import retrieval
 from qqbot.conversation import tools
 from qqbot.gateway.botapi import BotApi
-from qqbot.delivery.service import GroupDelivery
+from qqbot.delivery.service import MessageDelivery
 from qqbot.media.service import MediaProcessor
 from qqbot.conversation.member_numbers import MemberNumbers
 from qqbot.services.members import MemberDirectory
@@ -153,7 +153,7 @@ async def generate(
     providers: Providers,
     media: MediaProcessor,
     directory: Directory,
-    delivery: GroupDelivery,
+    delivery: MessageDelivery,
     progress: ReplyProgress,
     window: list[ChatMsg] | None = None,
     scheduled: ScheduledTask | None = None,
@@ -179,8 +179,12 @@ async def generate(
     # The caller normally passes the window in, cut when the message arrived, so
     # later arrivals cannot shift what this reply is looking at. Evidence is fetched by
     # reply id and rendered only for replies still inside this frozen window.
-    if msg is None and scheduled is None:
-        raise ValueError("a reply needs a received message or a scheduled task")
+    if scheduled is None:
+        if msg is None:
+            raise ValueError("a reply needs a received message or a scheduled task")
+        initiator = msg.user_id
+    else:
+        initiator = scheduled.creator_id
     if window is None:
         window = prompt.history_window(st, msg)
     shown = window + ([msg] if msg is not None else [])
@@ -194,8 +198,8 @@ async def generate(
     }
     seen_messages.update(m.raw_event_id or m.msg_id for m in shown)
     snapshot = PromptSnapshot.capture(window, msg, cursor=initial_cursor)
-    window, msg = list(snapshot.history), snapshot.current
-    shown = list(snapshot.shown)
+    frozen_window, frozen_msg = snapshot.history, snapshot.current
+    shown = snapshot.shown
     nums, marks = snapshot.numbers, snapshot.quotes
     pics, by_pic = snapshot.image_numbers, dict(snapshot.pictures)
     lines = {n: m for m in shown if (n := nums.get(m.msg_id))}
@@ -204,11 +208,11 @@ async def generate(
     prompt.teach_roster(people, profiles)
     await people.learn(
         [m.user_id for m in shown]
-        + [a for m in window if m.is_bot for a, _ in m.at]
+        + [a for m in frozen_window if m.is_bot for a, _ in m.at]
         + [a for m in shown if not m.is_bot for a, _ in m.mentions]
         + ([scheduled.creator_id] if scheduled is not None else [])
     )
-    prompt.number_people(people, profiles, window, msg)
+    prompt.number_people(people, profiles, frozen_window, frozen_msg)
 
     registry = tools.tool_registry(cfg, prompts=prompts)
     ctx = tools.ToolCtx(
@@ -219,13 +223,13 @@ async def generate(
         providers=providers,
         media=media,
         bot=bot,
-        initiator=scheduled.creator_id if scheduled is not None else str(msg.user_id),
+        initiator=initiator,
         parent_task=scheduled,
         by_pic=by_pic,
         people=people,
     )
     evidence = await evidence_store.evidence_for(
-        st.group_id, [m.msg_id for m in window if m.is_bot]
+        st.group_id, [m.msg_id for m in frozen_window if m.is_bot]
     )
     messages = prompt.assemble(
         clock=clock,
@@ -233,7 +237,7 @@ async def generate(
         persona=persona,
         cfg=cfg,
         st=st,
-        msg=msg,
+        msg=frozen_msg,
         profiles=profiles,
         task_intent=scheduled.intent if scheduled is not None else None,
         task_initiator=(
@@ -243,21 +247,21 @@ async def generate(
         ),
         group_facts=await retrieval.group_knowledge(st.group_id, database=database, clock=clock),
         evidence=evidence,
-        window=window,
+        window=frozen_window,
         nums=nums,
         marks=marks,
         pics=pics,
         people=people,
     )
-    names = {m.user_id: m.nickname for m in shown if not m.is_bot}
-    names.update({a: n for m in window if m.is_bot for a, n in m.at if n})
+    names = {str(m.user_id): m.nickname for m in shown if not m.is_bot}
+    names.update({str(a): n for m in frozen_window if m.is_bot for a, n in m.at if n})
     first_evidence = True
 
     async def send_one(
         draft: agent.MessageDraft, executed: tuple[agent.ToolExecution, ...]
     ) -> agent.SendResult:
         nonlocal first_evidence
-        accounts = draft.at
+        accounts = [str(account) for account in draft.at]
         live = await members.names_of(bot, st.group_id, accounts) if accounts else {}
         named = {account: live.get(account) or names.get(account) or "成员" for account in accounts}
         segments = _clean_outbound(
@@ -443,7 +447,7 @@ async def respond(
     msg: ChatMsg | None,
     providers: Providers,
     media: MediaProcessor,
-    delivery: GroupDelivery,
+    delivery: MessageDelivery,
     directory: Directory,
     window: list[ChatMsg] | None = None,
     scheduled: ScheduledTask | None = None,

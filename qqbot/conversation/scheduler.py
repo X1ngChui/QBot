@@ -219,7 +219,9 @@ class ReplyScheduler[T]:
         """Join every owned task, including work already aborted after lease loss."""
         self.abort()
         pump, self._pump_task = self._pump_task, None
-        tasks = (*self._running, *((pump,) if pump is not None else ()))
+        tasks: list[asyncio.Task[object]] = [*self._running]
+        if pump is not None:
+            tasks.append(pump)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._idle.set()

@@ -9,6 +9,8 @@ from qqbot.clock import Clock
 
 
 class ErrorRing(logging.Handler):
+    _closed: bool
+
     def __init__(
         self, *, clock: Clock, entries: int, message_chars: int, level: int = logging.WARNING
     ) -> None:

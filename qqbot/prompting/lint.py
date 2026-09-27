@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from qqbot.providers.contracts import JsonObject
 from qqbot.gateway.segments import FACE_NAMES
 from qqbot.conversation.tools import send_def
 from qqbot.conversation.tools import tool_defs
@@ -10,6 +11,15 @@ from qqbot.configuration import PredicateTable, Settings
 from qqbot.prompting.cases import CASES
 from qqbot.prompting.templates import PromptCatalog
 from qqbot.prompting.templates import PromptKey
+
+
+def _object_at(schema: JsonObject, *path: str) -> JsonObject:
+    for key in path:
+        child = schema[key]
+        if not isinstance(child, dict):
+            raise ValueError(f"schema path {path!r} is not an object at {key!r}")
+        schema = child
+    return schema
 
 
 def lint_catalog(catalog: PromptCatalog, cfg: Settings, predicates: PredicateTable) -> list[str]:
@@ -27,11 +37,11 @@ def lint_catalog(catalog: PromptCatalog, cfg: Settings, predicates: PredicateTab
         errors.append("the prompt bundle trusts the retired permanent evidence marker")
 
     send = send_def(cfg, prompts=catalog)
-    properties = send.parameters["properties"]
+    properties = _object_at(send.parameters, "properties")
     if "content" not in properties or "messages" in properties:
         errors.append("send schema must accept one message's content")
     segment_types = set(
-        send.parameters["properties"]["content"]["items"]["discriminator"]["mapping"]
+        _object_at(properties, "content", "items", "discriminator", "mapping")
     )
     if "mface" in segment_types:
         errors.append("the model-facing send schema exposes mface")

@@ -39,7 +39,7 @@ class RuntimeLease:
             if not await conn.fetchval("SELECT pg_try_advisory_lock($1::bigint)", self._key):
                 raise RuntimeAlreadyActive("another Runtime already owns this database")
             conn.add_termination_listener(self._terminated)
-            self._watcher = asyncio.create_task(self._watch(), name="runtime-lease")
+            self._watcher = asyncio.create_task(self._watch(conn), name="runtime-lease")
         except BaseException:
             await self.close()
             raise
@@ -54,11 +54,11 @@ class RuntimeLease:
             if self._on_lost is not None:
                 self._on_lost()
 
-    async def _watch(self) -> None:
+    async def _watch(self, conn: asyncpg.Connection) -> None:
         try:
             while not self._closed:
                 await asyncio.sleep(self._interval)
-                held = await self._connection.fetchval(
+                held = await conn.fetchval(
                     """SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype='advisory'
                        AND pid=pg_backend_pid() AND granted AND objsubid=1
                        AND classid=(($1::bigint >> 32) & 4294967295)::oid

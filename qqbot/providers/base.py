@@ -321,6 +321,7 @@ class PageReader(Protocol):
 
     async def read_page(self, url: str, *, group_id: GroupId | None = None) -> str:
         """Return readable page text, or an empty string when none is available."""
+        ...
 
 
 @dataclass

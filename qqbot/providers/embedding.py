@@ -42,8 +42,14 @@ BATCH = 10
 
 class DashScopeEmbedding(EmbeddingModel):
     name = "dashscope"
-    dimensions = VECTOR_DIMENSIONS
-    batch_size = BATCH
+
+    @property
+    def dimensions(self) -> int:
+        return VECTOR_DIMENSIONS
+
+    @property
+    def batch_size(self) -> int:
+        return BATCH
 
     def __init__(self, cfg: EmbeddingCfg, retry: RetryPolicy, budget: Budget) -> None:
         self._budget = budget

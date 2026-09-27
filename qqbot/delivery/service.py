@@ -6,6 +6,7 @@ import asyncio
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Protocol
 
 from qqbot.domain.ids import GroupId
 from qqbot.domain.ids import MessageId
@@ -30,6 +31,16 @@ class DeliveredMessage:
     message_id: MessageId | None
     segments: tuple[SendSegment, ...]
     reply_to: MessageId | None
+
+
+class MessageDelivery(Protocol):
+    """Single-send capability shared by live delivery and evaluation transport."""
+
+    echo: SelfEcho
+
+    async def deliver_one(
+        self, bot: BotApi, *, group_id: GroupId, segments: tuple[SendSegment, ...]
+    ) -> DeliveredMessage | None: ...
 
 
 class GroupDelivery:

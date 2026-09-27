@@ -162,7 +162,7 @@ def _wire_items(
         match item:
             case Message(role=item_role, content=str() as content):
                 wire.append({"role": role(item_role), "content": content})
-            case Message(role=item_role, content=parts):
+            case Message(role=item_role, content=tuple() as parts):
                 wire.append(
                     {
                         "role": role(item_role),
@@ -182,7 +182,7 @@ def _wire_items(
                 wire.append(
                     {"type": "function_call_output", "call_id": str(call_id), "output": output}
                 )
-            case ToolResult(call_id=call_id, output=parts):
+            case ToolResult(call_id=call_id, output=tuple() as parts):
                 wire.append(
                     {
                         "type": "function_call_output",

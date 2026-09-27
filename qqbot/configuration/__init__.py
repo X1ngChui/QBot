@@ -105,9 +105,9 @@ class HalfLifeCfg(_M):
     for its base lifetime (stretched by how many distinct days supported it, up
     to fourfold) is expired outright - see MemoryRepository.decay."""
 
-    stable: float = Field(90.0, gt=0)
-    default: float = Field(30.0, gt=0)
-    fast: float = Field(14.0, gt=0)
+    stable: float = Field(default=90.0, gt=0)
+    default: float = Field(default=30.0, gt=0)
+    fast: float = Field(default=14.0, gt=0)
 
 
 class PredicateTable(_M):

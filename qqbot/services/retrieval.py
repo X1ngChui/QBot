@@ -24,7 +24,7 @@ import logging
 from datetime import UTC, datetime
 from dataclasses import replace
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 import asyncpg
 from qqbot.clock import Clock
 from qqbot.configuration import PredicateTable
@@ -111,7 +111,7 @@ async def gather(
     gid = group_id
     exclude = {str(bot.self_id)} if bot is not None else set()
 
-    async def _live(uids: list[str]) -> dict[str, str]:
+    async def _live(uids: Sequence[str]) -> dict[str, str]:
         if bot is None:
             return {}
         return await members.names_of(bot, group_id, [u for u in uids if u not in exclude])

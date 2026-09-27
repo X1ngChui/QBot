@@ -11,6 +11,7 @@ from datetime import datetime
 
 import asyncpg
 
+from qqbot.db.connection import DbConnection
 from qqbot.repositories.job import Job, fenced_transaction
 from qqbot.domain.ids import GroupId
 from qqbot.repositories.identity import FAMILY
@@ -27,8 +28,8 @@ from qqbot.domain.memory import earned_confidence
 @asynccontextmanager
 async def _write_connection(
     database: Callable[[], asyncpg.Pool],
-    conn: asyncpg.Connection | None,
-) -> AsyncIterator[asyncpg.Connection]:
+    conn: DbConnection | None,
+) -> AsyncIterator[DbConnection]:
     if conn is not None:
         yield conn
         return
@@ -86,7 +87,7 @@ class MemoryRepository:
         subject_ids: list[uuid.UUID],
         *,
         limit: int = 200,
-        _conn: asyncpg.Connection | None = None,
+        _conn: DbConnection | None = None,
     ) -> list[Fact]:
         """What currently holds about these people. The group filter comes first; that
         is where isolation is enforced.
@@ -136,7 +137,7 @@ class MemoryRepository:
         account_ids: list[uuid.UUID],
         *,
         limit: int = 200,
-        _conn: asyncpg.Connection | None = None,
+        _conn: DbConnection | None = None,
     ) -> list[Fact]:
         """Current facts attached to exact accounts, without holder expansion."""
 
@@ -161,7 +162,7 @@ class MemoryRepository:
         entity_ids: list[uuid.UUID],
         *,
         limit: int = 200,
-        _conn: asyncpg.Connection | None = None,
+        _conn: DbConnection | None = None,
     ) -> list[Fact]:
         """Current holder-scoped facts, excluding exact-account rows."""
 
@@ -197,7 +198,7 @@ class MemoryRepository:
         *,
         when: datetime,
         observed_at: datetime | None = None,
-        _conn: asyncpg.Connection | None = None,
+        _conn: DbConnection | None = None,
     ) -> Fact:
         """Write a new fact and close out the one it overturns.
 
@@ -291,6 +292,8 @@ class MemoryRepository:
                             FROM memory_fact_evidence WHERE fact_id=$1""",
                         prev["id"],
                     )
+                    if counts is None:
+                        raise RuntimeError("fact evidence count returned no row")
                     await conn.execute(
                         """UPDATE memory_fact
                               SET last_confirmed_at=$2,
@@ -334,6 +337,8 @@ class MemoryRepository:
                 fact.confidence,
                 observed_at,
             )
+            if row is None:
+                raise RuntimeError("fact insert returned no row")
             await self._add_evidence(conn, row["id"], evidence)
             return _fact(row)
 
@@ -354,7 +359,7 @@ class MemoryRepository:
         self,
         fact_id: uuid.UUID,
         *,
-        _conn: asyncpg.Connection | None = None,
+        _conn: DbConnection | None = None,
     ) -> None:
         await (_conn or self._database()).execute(
             """UPDATE memory_fact SET status='retracted', valid_to=NOW(),
@@ -457,7 +462,7 @@ class MemoryRepository:
         self,
         candidate: Candidate,
         *,
-        _conn: asyncpg.Connection | None = None,
+        _conn: DbConnection | None = None,
     ) -> None:
         await (_conn or self._database()).execute(
             """UPDATE memory_candidate
@@ -498,7 +503,7 @@ class EpisodeRepository:
         self,
         ep: Episode,
         *,
-        _conn: asyncpg.Connection | None = None,
+        _conn: DbConnection | None = None,
     ) -> Episode:
         """Write one episode, idempotently on its id.
 

@@ -9,6 +9,7 @@ from datetime import timedelta
 
 import asyncpg
 
+from qqbot.db.connection import DbConnection
 from qqbot.repositories.job import Job, fenced_transaction
 from qqbot.domain.ids import GroupId
 from qqbot.domain.memory import Candidate
@@ -140,6 +141,8 @@ class ExtractionRepository:
                    VALUES ($1,'extracting') RETURNING id""",
                 group_id.to_db(),
             )
+            if extraction_id is None:
+                raise RuntimeError("extraction insert returned no id")
             await conn.executemany(
                 """INSERT INTO memory_extraction_event
                        (extraction_id, raw_event_id, ordinal)
@@ -238,7 +241,7 @@ class ExtractionRepository:
         self,
         extraction_id: uuid.UUID,
         *,
-        conn: asyncpg.Connection | None = None,
+        conn: DbConnection | None = None,
     ) -> list[Candidate]:
         executor = conn or self._database()
         rows = await executor.fetch(
@@ -266,7 +269,7 @@ class ExtractionRepository:
         self,
         row,
         *,
-        conn: asyncpg.Connection | None = None,
+        conn: DbConnection | None = None,
     ) -> ExtractionBatch:
         executor = conn or self._database()
         event_rows = await executor.fetch(

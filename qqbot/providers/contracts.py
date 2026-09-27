@@ -92,13 +92,16 @@ class AttachmentStore(Protocol):
     @property
     def cache_namespace(self) -> str:
         """Opaque account-and-endpoint identity for persisted handle reuse."""
+        ...
 
     @property
     def cache_max_age(self) -> timedelta:
         """Maximum safe local reuse age under this adapter's remote retention contract."""
+        ...
 
     async def store(self, data: bytes, media_type: str) -> StoredImage:
         """Return an opaque handle scoped to this provider account."""
+        ...
 
     async def aclose(self) -> None:
         """Release upload resources."""
@@ -172,10 +175,6 @@ class CallContext:
     purpose: CallPurpose = CallPurpose.REPLY
     group_id: GroupId | None = None
 
-    def __post_init__(self) -> None:
-        if self.group_id is not None and not isinstance(self.group_id, GroupId):
-            raise TypeError("group_id must be GroupId or None")
-
 
 @dataclass(frozen=True, slots=True)
 class SessionDirective:
@@ -223,4 +222,4 @@ class ContextBudgetExceeded(ModelFailure):
 def json_object(value: Mapping[str, Any]) -> JsonObject:
     """Narrow a validated JSON-schema mapping for ToolSpec construction."""
 
-    return value  # type: ignore[return-value]
+    return value

@@ -696,13 +696,12 @@ async def execute(
     ctx: ToolCtx | None = None,
     prompts: PromptCatalog | None = None,
 ) -> str | Attachment:
-    if (ctx is None or ctx.registry is None) and prompts is None:
+    if ctx is not None and ctx.registry is not None:
+        registry = ctx.registry
+    elif prompts is not None:
+        registry = tool_registry(cfg, prompts=prompts)
+    else:
         raise ValueError("tool execution requires an explicit registry or prompt catalog")
-    registry = (
-        ctx.registry
-        if ctx is not None and ctx.registry is not None
-        else tool_registry(cfg, prompts=prompts)
-    )
     entry = registry.get(call.name)
     if entry is None or entry.handler is None:
         return Failure(f"（未知工具 {defang(call.name[:64])}）")

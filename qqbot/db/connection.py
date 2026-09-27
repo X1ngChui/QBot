@@ -12,6 +12,8 @@ from qqbot.configuration.schema import DatabaseCfg
 
 log = logging.getLogger("qqbot.db")
 
+type DbConnection = asyncpg.Connection | asyncpg.pool.PoolConnectionProxy
+
 
 async def initialize_connection(conn: asyncpg.Connection) -> None:
     await conn.set_type_codec("jsonb", encoder=json.dumps, decoder=json.loads, schema="pg_catalog")
