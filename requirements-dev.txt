@@ -10,3 +10,5 @@ pytest==9.1.1
 pytest-asyncio==1.4.0
 hypothesis==6.168.2
 ruamel.yaml==0.19.1
+# Optional ASR acceleration must be installed for static analysis of that path.
+numpy==2.5.1
