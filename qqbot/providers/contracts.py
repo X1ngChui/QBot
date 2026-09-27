@@ -172,6 +172,10 @@ class CallContext:
     purpose: CallPurpose = CallPurpose.REPLY
     group_id: GroupId | None = None
 
+    def __post_init__(self) -> None:
+        if self.group_id is not None and not isinstance(self.group_id, GroupId):
+            raise TypeError("group_id must be GroupId or None")
+
 
 @dataclass(frozen=True, slots=True)
 class SessionDirective:

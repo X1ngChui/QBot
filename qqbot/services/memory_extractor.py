@@ -412,7 +412,7 @@ class MemoryExtractor:
                 timeout_sec=self._text_cfg.timeout_sec,
                 retries=self._text_cfg.retries,
             ),
-            context=CallContext(CallPurpose.EXTRACT, str(inp.group_id)),
+            context=CallContext(CallPurpose.EXTRACT, inp.group_id),
         )
         async with self._text.open_session(request) as session:
             turn = await session.start()
