@@ -9,10 +9,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import timedelta
 from enum import StrEnum
-from typing import Any, NewType, Protocol
+from typing import Any, Literal, NewType, Protocol
 
-from ..domain.ids import GroupId
+from qqbot.domain.ids import GroupId
 
 type JsonScalar = str | int | float | bool | None
 type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
@@ -77,7 +78,25 @@ class StoredImage:
     handle: str
 
 
+@dataclass(frozen=True, slots=True)
+class SearchOptions:
+    count: int = 5
+    depth: Literal["basic", "advanced"] = "basic"
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.count <= 20 or self.depth not in {"basic", "advanced"}:
+            raise ValueError("invalid search quality options")
+
+
 class AttachmentStore(Protocol):
+    @property
+    def cache_namespace(self) -> str:
+        """Opaque account-and-endpoint identity for persisted handle reuse."""
+
+    @property
+    def cache_max_age(self) -> timedelta:
+        """Maximum safe local reuse age under this adapter's remote retention contract."""
+
     async def store(self, data: bytes, media_type: str) -> StoredImage:
         """Return an opaque handle scoped to this provider account."""
 
@@ -184,6 +203,17 @@ class ModelFailure(RuntimeError):
         self.kind = kind
         self.charge = charge
         self.retryable = retryable
+
+
+class ContextBudgetExceeded(ModelFailure):
+    """The complete local model projection exceeds its code-owned resource bound."""
+
+    def __init__(self, *, charge: ChargeState = ChargeState.NOT_SENT) -> None:
+        super().__init__(
+            "model context exceeds the local payload budget",
+            kind=FailureKind.REJECTED,
+            charge=charge,
+        )
 
 
 def json_object(value: Mapping[str, Any]) -> JsonObject:

@@ -2,18 +2,38 @@
 
 from __future__ import annotations
 
-from ..db import pool
-from ..domain.ids import GroupId
+from collections.abc import Callable
+
+import asyncpg
+
+from qqbot.domain.ids import GroupId
+from qqbot.domain.identity.reading import SpeakerActivity
 
 
 class EventRepository:
+    def __init__(self, *, database: Callable[[], asyncpg.Pool]) -> None:
+        self._database = database
+
+    async def speakers(
+        self, group_id: GroupId, *, _conn: asyncpg.Connection | None = None
+    ) -> tuple[SpeakerActivity, ...]:
+        rows = await (_conn or self._database()).fetch(
+            """SELECT platform_user_id AS uid, count(*) AS n, min(occurred_at) AS first
+                 FROM raw_event
+                WHERE group_id=$1 AND event_type IN ('message','notice')
+                  AND platform_user_id IS NOT NULL
+                GROUP BY platform_user_id""",
+            group_id.to_db(),
+        )
+        return tuple(SpeakerActivity(row["uid"], row["n"], row["first"]) for row in rows)
+
     async def speaker_counts(self, group_id: GroupId) -> dict[str, int]:
         """Accounts that have spoken in this group, and how often.
 
         Group-scoped by parameter, like every other read here: an account is only in
         this roster because it spoke *here*.
         """
-        rows = await pool().fetch(
+        rows = await self._database().fetch(
             """SELECT platform_user_id AS uid, count(*) AS n
                  FROM raw_event
                 WHERE group_id=$1 AND event_type IN ('message','notice')
@@ -29,7 +49,7 @@ class EventRepository:
         The roster is ordered by this, so a person's place in it - and with it their
         member number - does not move when somebody new turns up.
         """
-        rows = await pool().fetch(
+        rows = await self._database().fetch(
             """SELECT platform_user_id AS uid, min(occurred_at) AS first
                  FROM raw_event
                 WHERE group_id=$1 AND event_type IN ('message','notice')

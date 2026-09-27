@@ -15,6 +15,7 @@ Usage (workstation, test DB up, real keys in .env):
 """
 
 import asyncio
+from contextlib import AsyncExitStack
 import os
 import pathlib
 import re
@@ -23,28 +24,23 @@ import uuid
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-os.environ.setdefault("CONFIG_DIR", str(ROOT / "config"))
 sys.path.insert(0, str(ROOT / "tests"))
 from _db import assert_disposable_database, configure_test_database
 
-configure_test_database()
 
-if not (ROOT / ".env").exists():
-    sys.exit(
-        "eval makes real model calls and needs credentials: "
-        "create .env at the repo root (see .env.example)"
-    )
-from _env import load_dotenv
+from scripts._env import load_dotenv
 
-load_dotenv(ROOT / ".env")
 
-from qqbot.db import close_pool, init_pool
+from qqbot.db import Database, dsn
 from qqbot.domain.ids import GroupId
 from qqbot.domain.memory import SnapshotTarget
 from qqbot.providers.registry import build as build_providers
+from qqbot.services.budget import Budget
+from qqbot.repositories.ledger import LedgerRepository
 from qqbot.services import ExtractionInput, MemoryExtractor
 from qqbot.services.memory_extractor import SourceLine, line_body
-from qqbot.settings import config
+from qqbot.clock import Clock
+from qqbot.configuration import load_bundle
 from qqbot.util import sysmark
 
 #: Same eval-only group as eval_replies, so the ledger rows stay attributable.
@@ -189,49 +185,57 @@ def main_checks(cands: list) -> list[tuple[str, bool, str]]:
 
 
 async def main() -> int:
-    await init_pool()
-    await assert_disposable_database()
 
-    from qqbot.core.budget import BUDGET
-
-    spent0 = await BUDGET.spent_today()
-    cfg = config().default
-    capabilities = build_providers(cfg)
-    extractor = MemoryExtractor(cfg, capabilities.text)
-    account_codes = {1: uuid.uuid4(), 2: uuid.uuid4(), 3: uuid.uuid4()}
-    rendered = [f"{sysmark(f'来源:{index}')} {text}" for index, text in enumerate(LINES, 1)]
-    source_lines = []
-    for ordinal, (raw, text) in enumerate(zip(LINES, rendered, strict=True), 1):
-        match = re.search(r"⟦([0-3])⟧: ", raw)
-        code = int(match.group(1)) if match else 0
-        targets = ()
-        author = None
-        if code:
-            author = account_codes[code]
-            targets = (SnapshotTarget(author, "author"),)
-        if "老王" in line_body(raw):
-            targets += (SnapshotTarget(account_codes[1], "alias", "老王"),)
-        source_lines.append(
-            SourceLine(
-                event_id=uuid.uuid4(),
-                ordinal=ordinal,
-                text=text,
-                own=code == 0,
-                evidence_text="" if code == 0 else line_body(raw),
-                author_account_id=author,
-                targets=targets,
-            )
+    bundle = load_bundle()
+    cfg = bundle.default
+    clock = Clock(cfg.bot.timezone)
+    async with AsyncExitStack() as resources:
+        database = Database(cfg.runtime.database, url=dsn())
+        resources.push_async_callback(database.close)
+        await database.start()
+        await assert_disposable_database(database.pool)
+        budget = Budget(
+            LedgerRepository(database.pool, today=clock.today),
+            daily_cap=cfg.budget.daily_cny_cap,
+            today=clock.today,
         )
-    inp = ExtractionInput(
-        group_id=GROUP,
-        transcript="\n".join(rendered),
-        roster=ROSTER,
-        account_codes=account_codes,
-        lines=tuple(source_lines),
-        known=KNOWN,
-        self_names=SELF_NAMES,
-    )
-    try:
+        capabilities = build_providers(cfg, budget)
+        resources.push_async_callback(capabilities.aclose)
+        spent0 = await budget.spent_today()
+        extractor = MemoryExtractor(bundle, capabilities.text)
+        account_codes = {1: uuid.uuid4(), 2: uuid.uuid4(), 3: uuid.uuid4()}
+        rendered = [f"{sysmark(f'来源:{index}')} {text}" for index, text in enumerate(LINES, 1)]
+        source_lines = []
+        for ordinal, (raw, text) in enumerate(zip(LINES, rendered, strict=True), 1):
+            match = re.search(r"⟦([0-3])⟧: ", raw)
+            code = int(match.group(1)) if match else 0
+            targets = ()
+            author = None
+            if code:
+                author = account_codes[code]
+                targets = (SnapshotTarget(author, "author"),)
+            if "老王" in line_body(raw):
+                targets += (SnapshotTarget(account_codes[1], "alias", "老王"),)
+            source_lines.append(
+                SourceLine(
+                    event_id=uuid.uuid4(),
+                    ordinal=ordinal,
+                    text=text,
+                    own=code == 0,
+                    evidence_text="" if code == 0 else line_body(raw),
+                    author_account_id=author,
+                    targets=targets,
+                )
+            )
+        inp = ExtractionInput(
+            group_id=GROUP,
+            transcript="\n".join(rendered),
+            roster=ROSTER,
+            account_codes=account_codes,
+            lines=tuple(source_lines),
+            known=KNOWN,
+            self_names=SELF_NAMES,
+        )
         cands = await extractor.extract(inp)
         # Keep the originating tool beside each payload for the assertions below.
         for candidate in cands:
@@ -258,14 +262,19 @@ async def main() -> int:
             if not ok:
                 fails.append(label)
 
-        spent = await BUDGET.spent_today() - spent0
+        spent = await budget.spent_today() - spent0
         print(f"\nspend this run: CNY {spent:.4f} (booked to the test ledger)")
         print("RESULT:", "ok" if not fails else f"FAIL ({len(fails)} assertion(s))")
         return 1 if fails else 0
-    finally:
-        await capabilities.aclose()
-        await close_pool()
 
 
 if __name__ == "__main__":
+    os.environ.setdefault("CONFIG_DIR", str(ROOT / "config"))
+    if not (ROOT / ".env").exists():
+        sys.exit(
+            "eval makes real model calls and needs credentials: "
+            "create .env at the repo root (see .env.example)"
+        )
+    load_dotenv(ROOT / ".env")
+    configure_test_database()
     sys.exit(asyncio.run(main()))

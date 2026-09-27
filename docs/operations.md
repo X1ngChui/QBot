@@ -67,13 +67,31 @@ Checks that the database answers, that every credential the configuration names
 resolves, and that each capability completes one real minimal call along its production
 path. Run it after changing keys, models or endpoints.
 
+## Model-created timers
+
+A member asks the bot in chat to schedule, list or cancel a task. The model uses the
+corresponding tool; no scheduling command or process-local timer registration is used.
+Tasks remain pending in PostgreSQL over a restart or OneBot disconnect. A connected
+worker checks them on a code-owned 15-second cadence, wakes with the current group
+window, and can create a bounded follow-up after re-evaluating the task. Muted groups,
+blocked initiators and the shared daily budget suppress due replies. Tasks are claimed
+at most once: a process interruption after the claim marks the task failed on restart
+rather than risking a duplicate message. Finished task rows are retained for
+`maintenance.completed_task_keep_days` days. Check pending and recent outcomes with
+read-only SQL when investigating a missed reminder; do not re-run an already claimed
+row blindly.
+
 ## Backups
 
 The nightly pipeline runs `pg_dump -Fc` into `backups/` and keeps
-`schedule.backup_keep` dumps. Each archive is verified with `pg_restore --list` before
+`maintenance.backup_keep` dumps. Each archive is verified with `pg_restore --list` before
 older ones are rotated out. Point the `backups/` volume at off-box storage; until then
 the dumps share the disk they protect. The daily report shows the newest dump's age and
-flags it when it exceeds `schedule.backup_stale_hours`.
+flags it after the next expected maintenance run plus its bounded completion allowance.
+The dump is written to a unique partial path and published only after catalog/size
+verification. Each subprocess has a deadline and is killed and joined on cancellation.
+A failed backup does not rotate away older dumps. Catalog verification is not a full
+restore rehearsal.
 
 ### Restore
 
@@ -170,7 +188,7 @@ docker exec -i qbot-postgres-1 psql -U qqbot -d qqbot -v gid=<group id> -v model
 
 ## The daily report
 
-Sent to the owners at `schedule.report_cron` (midnight by default), the moment the
+Sent to the owners at `maintenance.report_cron` (midnight by default), the moment the
 ledger day closes. It carries: total spend against the cap, calls and spend by kind and
 model, prefix-cache hit rates by use, the picture cache, the month's search allowance,
 the memory job backlog, new and muted groups, the newest backup and its age, an error

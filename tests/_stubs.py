@@ -161,6 +161,7 @@ class FakeEmbedding(EmbeddingModel):
 
     name = "fake-embed"
     DIMS = 2048
+    batch_size = 10
     EMBED_CALLS = 0
 
     @property

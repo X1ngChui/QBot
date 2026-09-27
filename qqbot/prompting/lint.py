@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-from ..core.segments import FACE_NAMES
-from ..core.tools import send_def, tool_defs
-from ..services.memory_extractor import tools as extraction_tools
-from ..settings import Settings
-from .cases import CASES
-from .templates import PromptCatalog, PromptKey
+from qqbot.gateway.segments import FACE_NAMES
+from qqbot.conversation.tools import send_def
+from qqbot.conversation.tools import tool_defs
+from qqbot.services.memory_extractor import tools as extraction_tools
+from qqbot.configuration import PredicateTable, Settings
+from qqbot.prompting.cases import CASES
+from qqbot.prompting.templates import PromptCatalog
+from qqbot.prompting.templates import PromptKey
 
 
-def lint_catalog(catalog: PromptCatalog, cfg: Settings) -> list[str]:
+def lint_catalog(catalog: PromptCatalog, cfg: Settings, predicates: PredicateTable) -> list[str]:
     errors: list[str] = []
     sources = catalog.sources()
     joined = "\n".join(sources.values())
@@ -24,14 +26,12 @@ def lint_catalog(catalog: PromptCatalog, cfg: Settings) -> list[str]:
     if "⟦依据:" in joined or "⟦依据：" in joined:
         errors.append("the prompt bundle trusts the retired permanent evidence marker")
 
-    send = send_def(cfg)
-    message_schema = send.parameters["properties"]["messages"]
-    if message_schema.get("maxItems") != cfg.tools.send_messages.max_messages_per_call:
-        errors.append("send message batch limit differs from global configuration")
+    send = send_def(cfg, prompts=catalog)
+    properties = send.parameters["properties"]
+    if "content" not in properties or "messages" in properties:
+        errors.append("send schema must accept one message's content")
     segment_types = set(
-        send.parameters["$defs"]["SendMessageInput"]["properties"]["content"]["items"][
-            "discriminator"
-        ]["mapping"]
+        send.parameters["properties"]["content"]["items"]["discriminator"]["mapping"]
     )
     if "mface" in segment_types:
         errors.append("the model-facing send schema exposes mface")
@@ -51,38 +51,42 @@ def lint_catalog(catalog: PromptCatalog, cfg: Settings) -> list[str]:
         )
 
     rendered_send = catalog.render(
-        PromptKey.TOOL_SEND_MESSAGES,
+        PromptKey.TOOL_SEND_MESSAGE,
         face_catalog="、".join(f"{face_id}={label}" for face_id, label in FACE_NAMES.items()),
-        message_limit=str(cfg.tools.send_messages.max_messages_per_call),
+        message_limit=str(cfg.conversation.max_messages_per_reply),
     )
     if "{{face_catalog}}" in rendered_send or "{{message_limit}}" in rendered_send:
-        errors.append("tool_send_messages left a dynamic slot unresolved")
+        errors.append("tool_send_message left a dynamic slot unresolved")
     hidden_segments = ("music", "music_custom", "json")
     exposed_hidden = [name for name in hidden_segments if name in rendered_send]
     if exposed_hidden:
         errors.append(
-            "tool_send_messages exposes hidden historical segment type(s): "
+            "tool_send_message exposes hidden historical segment type(s): "
             + ", ".join(exposed_hidden)
         )
     standalone_segments = ("dice", "rps", "contact_member", "contact_group")
     if not all(name in rendered_send for name in standalone_segments):
-        errors.append("tool_send_messages omits a parameter-only segment type")
+        errors.append("tool_send_message omits a parameter-only segment type")
     if not any(word in rendered_send for word in ("单独", "独占", "唯一消息段")):
-        errors.append("tool_send_messages does not state the standalone segment rule")
+        errors.append("tool_send_message does not state the standalone segment rule")
     if not all(f"{face_id}={label}" in rendered_send for face_id, label in FACE_NAMES.items()):
-        errors.append("tool_send_messages does not expose the complete fixed face catalog")
+        errors.append("tool_send_message does not expose the complete fixed face catalog")
 
-    reply_names = {tool.name for tool in tool_defs(cfg)}
+    reply_names = {tool.name for tool in tool_defs(cfg, prompts=catalog)}
     if reply_names != {
-        "send_messages",
+        "send_message",
+        "finish_reply",
         "web_search",
         "search_history",
         "recall_events",
         "read_url",
         "open_images",
+        "schedule_task",
+        "list_scheduled_tasks",
+        "cancel_scheduled_task",
     }:
         errors.append(f"unexpected reply tool set: {sorted(reply_names)}")
-    extract_names = {tool.name for tool in extraction_tools()}
+    extract_names = {tool.name for tool in extraction_tools(predicates)}
     if extract_names != {
         "record_alias",
         "record_fact",

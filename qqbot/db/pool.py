@@ -1,64 +1,41 @@
-"""asyncpg connection pool."""
+"""Database credential resolution and subprocess-safe connection strings."""
 
 from __future__ import annotations
 
-import json
 import logging
 import os
-from urllib.parse import quote
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
-import asyncpg
 
-from ..settings import config
-from ..util import read_secret
+from qqbot.util import read_secret
 
 log = logging.getLogger("qqbot.db")
 
-_pool: asyncpg.Pool | None = None
+
+def database_password() -> str | None:
+    parts = urlsplit(os.getenv("DATABASE_URL", "postgresql://qqbot@postgres:5432/qqbot"))
+    supplied = [
+        value
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if key.lower() == "password"
+    ]
+    if supplied:
+        return supplied[-1]
+    if parts.password is not None:
+        return unquote(parts.password)
+    return read_secret("DATABASE_PASSWORD_FILE", "DATABASE_PASSWORD")
 
 
 def dsn(*, with_password: bool = True) -> str:
-    """Full DSN with the secret password injected. Also used by the backup job -
-    which passes with_password=False and carries the secret in PGPASSWORD instead,
-    keeping it out of pg_dump's argv (readable in /proc for the dump's duration)."""
-    url = os.getenv("DATABASE_URL", "postgresql://qqbot@postgres:5432/qqbot")
-    if not with_password:
-        return url
-    pwd = read_secret("DATABASE_PASSWORD_FILE", "DATABASE_PASSWORD")
-    if pwd and "@" in url and ":" not in url.split("//", 1)[1].split("@", 1)[0]:
-        head, tail = url.split("//", 1)
-        user, rest = tail.split("@", 1)
-        url = f"{head}//{user}:{quote(pwd, safe='')}@{rest}"
-    return url
-
-
-async def _init_conn(conn: asyncpg.Connection) -> None:
-    await conn.set_type_codec("jsonb", encoder=json.dumps, decoder=json.loads, schema="pg_catalog")
-
-
-async def init_pool() -> asyncpg.Pool:
-    global _pool
-    db = config().default.database
-    if _pool is None:
-        _pool = await asyncpg.create_pool(
-            dsn(),
-            min_size=db.pool_min,
-            max_size=db.pool_max,
-            init=_init_conn,
-            command_timeout=db.command_timeout_sec,
-        )
-        log.info("postgres pool ready")
-    return _pool
-
-
-async def close_pool() -> None:
-    global _pool
-    if _pool is not None:
-        await _pool.close()
-        _pool = None
-
-
-def pool() -> asyncpg.Pool:
-    if _pool is None:
-        raise RuntimeError("connection pool is not initialized")
-    return _pool
+    """Never retain URI-embedded credentials in the subprocess-safe form."""
+    parts = urlsplit(os.getenv("DATABASE_URL", "postgresql://qqbot@postgres:5432/qqbot"))
+    auth, separator, host = parts.netloc.rpartition("@")
+    netloc = auth.partition(":")[0] + "@" + host if separator else parts.netloc
+    query = [
+        (key, value)
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+        if key.lower() != "password"
+    ]
+    if with_password and (password := database_password()) is not None:
+        query.append(("password", password))
+    return urlunsplit((parts.scheme, netloc, parts.path, urlencode(query), parts.fragment))

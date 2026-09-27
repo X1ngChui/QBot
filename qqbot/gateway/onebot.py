@@ -6,10 +6,16 @@ from dataclasses import replace
 from datetime import datetime
 from typing import Any, Self
 
-from ..domain.archive import AuthorKind
-from ..domain.ids import AccountId, GroupId, MessageId
-from ..domain.ingress import GroupRole, InboundEvent, InboundSender
-from ..util import defang, now_local, scrub_nul, tz
+from qqbot.domain.archive import AuthorKind
+from qqbot.domain.ids import AccountId
+from qqbot.domain.ids import GroupId
+from qqbot.domain.ids import MessageId
+from qqbot.domain.ingress import GroupRole
+from qqbot.domain.ingress import InboundEvent
+from qqbot.domain.ingress import InboundSender
+from qqbot.util import defang
+from qqbot.clock import Clock
+from qqbot.util import scrub_nul
 
 Role = GroupRole
 Sender = InboundSender
@@ -48,7 +54,7 @@ class GroupMessage(InboundEvent):
     """Compatibility name for a normalized OneBot group-message event."""
 
     @classmethod
-    def from_event(cls, event: Any, self_id: str) -> Self:
+    def from_event(cls, event: Any, self_id: str, *, clock: Clock) -> Self:
         """Capture one adapter event into settled, detached values exactly once."""
 
         reply = getattr(event, "reply", None)
@@ -77,7 +83,7 @@ class GroupMessage(InboundEvent):
             sender=sender,
             segments=segments,
             self_id=normalized_self,
-            occurred_at=(datetime.fromtimestamp(when, tz()) if when else now_local()),
+            occurred_at=(datetime.fromtimestamp(when, clock.zone) if when else clock.now()),
             sub_type=str(getattr(event, "sub_type", "normal") or "normal"),
             typed_text=_typed_text(segments),
             reply_to_message_id=(
@@ -121,6 +127,7 @@ def notice_from_event(
     *,
     self_id: object,
     plain_text: str,
+    clock: Clock,
 ) -> InboundEvent | None:
     """Normalize one supported notice envelope after its text projection is chosen."""
 
@@ -136,7 +143,7 @@ def notice_from_event(
         sender=Sender(user_id=actor),
         segments=[{"type": "text", "data": {"text": plain_text}}],
         self_id=AccountId(self_id),
-        occurred_at=(datetime.fromtimestamp(when, tz()) if when else now_local()),
+        occurred_at=(datetime.fromtimestamp(when, clock.zone) if when else clock.now()),
         event_type="notice",
         sub_type=str(getattr(event, "sub_type", "") or "notice"),
         notice_type=str(getattr(event, "notice_type", "") or ""),

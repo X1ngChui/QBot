@@ -9,9 +9,11 @@ within limits you set.
 
 ## Features
 
-- **Speaks only when spoken to.** A reply happens on an @, a nickname used as a whole
-  word, or a quote of one of the bot's own messages. Everything else is read and
-  archived in silence.
+- **Speaks when addressed or when a requested timer fires.** An @, a whole-word
+  nickname or a quote submits an independent reply. A member can also ask it to schedule
+  a one-shot group task; at the due time it re-reads the current conversation before
+  deciding whether to reply or schedule another bounded check. Other messages are
+  archived silently.
 - **Structured memory.** Facts about members and about the group are extracted nightly
   by a language model, validated by code against verbatim quotes, and stored with
   evidence, confidence and an expiry. Wrong entries can be deleted by number.
@@ -24,9 +26,14 @@ within limits you set.
   the reply model can fetch the originals it wants to look at. Voice clips are
   transcribed on arrival, on the CPU, at no cost.
 - **Tools.** The reply model can search the web, search the group's own archive with a
-  boolean query, recall past episodes by meaning, read a web page, and open pictures.
-- **Money is the only limit.** A daily spending cap, a per-reply cap and a monthly
-  search allowance. There are no token budgets and no call quotas.
+  boolean query, recall past episodes by meaning, read a web page, open pictures,
+  and create, list or cancel its initiator's group timers without a command.
+- **Spending and timer bounds.** A daily spending cap, a per-reply cap and a monthly
+  search allowance bound paid work. Durable timers have separate limits on frequency,
+  pending count, future horizon and self-renewal. Addressed replies and timers share a
+  bounded inbox and one end-to-end deadline per reply; queueing counts against it.
+  Finite session steps and payload bounds also apply to free backends. Spending caps
+  stop new paid requests based on accounted usage, not strict concurrent prepayment.
 - **Per-group everything.** Persona, group knowledge, memory, block list and mute switch
   are all scoped to the group.
 - **Immediate access.** Members can address the bot and use member commands without a
@@ -113,7 +120,7 @@ Behaviour lives in `config/`, credentials in `.env`, runtime state in the databa
 | File | Purpose |
 | --- | --- |
 | `.env` | Credentials and infrastructure settings read by Docker Compose |
-| `config/settings.yaml` | Global settings: owners, trigger, providers, budget, prompt window, memory, schedule |
+| `config/settings.yaml` | Global settings in nine sections: bot, conversation, backends, media, memory, budget, tasks, maintenance, runtime |
 | `config/personas/default.yaml` | The default persona: name, system prompt, group knowledge |
 | `config/personas/group_<id>.yaml` | Per-group persona: identity, prompt additions and standing context |
 | `config/predicates.yaml` | What may be recorded about a person |
@@ -121,7 +128,10 @@ Behaviour lives in `config/`, credentials in `.env`, runtime state in the databa
 
 The complete configuration bundle is validated at startup. Changes to settings,
 personas, prompts or predicates take effect after a restart. The
-reference is in [docs/configuration.md](docs/configuration.md).
+reference is in [docs/configuration.md](docs/configuration.md), with a generated
+[complete field table](docs/configuration-reference.md) and
+[one-time migration map](docs/configuration-migration.md). Old configuration keys are
+not accepted by the runtime.
 
 ## Commands
 
@@ -149,21 +159,33 @@ report, debugging and the behavioural evaluation scripts are described in
 
 ## Development
 
-The test suite runs against a throwaway PostgreSQL and needs no QQ connection:
+The tests use pytest and need no QQ connection or paid API. Database cases require an
+explicit disposable PostgreSQL address; without it, those cases are skipped.
 
 ```bash
 python -m venv .venv
 .venv/bin/pip install -r requirements.txt -r requirements-dev.txt
 
+ROOT="$(pwd -W 2>/dev/null || pwd)"
 docker run -d --name qbot-pgtest \
   -e POSTGRES_DB=qbot_test -e POSTGRES_USER=qbot_test -e POSTGRES_PASSWORD=testpw \
-  -p 15432:5432 \
-  -v "$PWD/sql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro" \
-  -v "$PWD/tests/fixtures/test_db_marker.sql:/docker-entrypoint-initdb.d/02-test-marker.sql:ro" \
+  -p 127.0.0.1:15432:5432 \
+  -v "$ROOT/sql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro" \
+  -v "$ROOT/tests/fixtures/test_db_marker.sql:/docker-entrypoint-initdb.d/02-test-marker.sql:ro" \
   pgvector/pgvector:0.8.5-pg17
 
-.venv/bin/python tests/run_all.py        # every suite, then ruff
+export QBOT_TEST_DATABASE_URL=postgresql://qbot_test@127.0.0.1:15432/qbot_test
+export QBOT_TEST_DATABASE_PASSWORD=testpw
+until docker exec qbot-pgtest pg_isready -h 127.0.0.1 -U qbot_test -d qbot_test; do
+  sleep 1
+done
+.venv/bin/python -m pytest
+.venv/bin/python -m ruff check .
 ```
+
+Database tests verify the dedicated role, database and safety marker before destructive
+operations. Never point them at production, and do not run them concurrently against
+the same database.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for conventions and [tests/README.md](tests/README.md)
 for what each suite covers.
@@ -175,17 +197,20 @@ for what each suite covers.
 | `bot.py` | Entry point; serves the OneBot reverse WebSocket |
 | `qqbot/plugin.py` | Thin NoneBot lifecycle and event adapter |
 | `qqbot/runtime.py` | Process composition root and ordered lifecycle ownership |
-| `qqbot/scheduled.py` | Framework-independent nightly and reporting job bodies |
-| `qqbot/settings.py` | Startup configuration models and persona merge |
-| `qqbot/gateway/` | OneBot normalization and append-once database admission |
-| `qqbot/core/` | Ingress routing, commands, delivery, trigger, prompt, tools, media and budget |
+| `qqbot/operations/scheduled.py` | Framework-independent nightly and reporting job bodies |
+| `qqbot/configuration/` | Validated immutable settings, prompt/predicate bundles and persona merge |
+| `qqbot/gateway/` | OneBot normalization, bounded parsing and archive-first admission |
+| `qqbot/commands/` | Command catalogue, authorization and handlers |
+| `qqbot/conversation/` | Shared reply inbox, sessions, snapshots, prompts and tools |
+| `qqbot/delivery/` | Protocol sends, output validation and own-message observation |
+| `qqbot/media/` | Bounded media work, downloads, descriptions and transcription coordination |
 | `qqbot/domain/` | Typed ingress plus the memory model: identities, aliases, facts, episodes, evidence |
-| `qqbot/repositories/` | Database access for the memory model |
-| `qqbot/services/` | Extraction, validation, consolidation, the member directory |
-| `qqbot/workers/` | The background memory worker |
+| `qqbot/repositories/` | Narrow archive, identity, memory, ledger, group-policy, media-cache, evidence and job stores |
+| `qqbot/services/` | Extraction, validation, consolidation, budget and member/roster services |
+| `qqbot/workers/` | Background memory worker and durable timer worker |
 | `qqbot/providers/` | Provider abstractions and one module per backend |
 | `qqbot/plugins/` | Thin scheduled-job registration adapters |
-| `qqbot/db/` | Connection pool, schema check, archive and ledger access |
+| `qqbot/db/` | Owned connection pool, exclusive Runtime lease and schema checks |
 | `config/` | Configuration templates, prompts and predicates |
 | `sql/` | Database schema and the schema changelog |
 | `scripts/` | Deployment, preflight, model download, evaluations |

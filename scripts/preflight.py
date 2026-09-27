@@ -14,6 +14,7 @@ configured proxy exactly as it will at runtime, everything else direct.
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
 import os
 import struct
 import sys
@@ -23,6 +24,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from qqbot.providers import Providers
 from qqbot.providers.registry import build as build_providers
+from qqbot.services.budget import Budget
+from qqbot.repositories.ledger import LedgerRepository
+from qqbot.db import Database, dsn
 from qqbot.providers.contracts import (
     CallContext,
     CallPurpose,
@@ -34,7 +38,9 @@ from qqbot.providers.contracts import (
     ToolResult,
     ToolSpec,
 )
-from qqbot.settings import config
+from qqbot.providers.contracts import SearchOptions
+from qqbot.clock import Clock
+from qqbot.configuration import ConfigBundle, load_bundle
 from qqbot.util import read_api_key
 
 
@@ -86,18 +92,17 @@ def silence_wav(seconds: float = 0.4, rate: int = 16000) -> bytes:
     return header + data
 
 
-async def check_db() -> None:
+async def check_db(database: Database) -> None:
     """Opens the pool for the whole run - the capability checks below record their cost
     through it, so closing here would fail every one of them."""
-    from qqbot.db import init_pool, pool
 
     try:
-        await init_pool()
+        await database.start()
         from qqbot.db.repo import ensure_schema
 
-        await ensure_schema()
-        ver = await pool().fetchval("SELECT version()")
-        tables = await pool().fetchval(
+        await ensure_schema(database.pool)
+        ver = await database.pool().fetchval("SELECT version()")
+        tables = await database.pool().fetchval(
             "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'"
         )
         record("postgres", tables > 0, f"{tables} tables, {ver.split(',')[0]}")
@@ -105,8 +110,8 @@ async def check_db() -> None:
         record("postgres", False, repr(e))
 
 
-async def check_text(capabilities: Providers) -> None:
-    cfg = config().default.capabilities.text
+async def check_text(capabilities: Providers, bundle: ConfigBundle) -> None:
+    cfg = bundle.default.backends.text
     label = f"text ({cfg.model})"
     try:
         tool = ToolSpec(
@@ -147,16 +152,15 @@ async def check_text(capabilities: Providers) -> None:
         record(label, False, repr(e))
 
 
-async def check_vision(capabilities: Providers) -> None:
-    cfg = config().default.capabilities.vision
+async def check_vision(capabilities: Providers, bundle: ConfigBundle) -> None:
+    cfg = bundle.default.backends.vision
     label = f"vision, base64 inline ({cfg.model})"
     try:
         from qqbot.prompting import PromptKey
-        from qqbot.settings import prompt_catalog
 
         desc = await capabilities.vision.describe(
             TEST_PNG,
-            prompt=prompt_catalog().render(PromptKey.VISION_SYSTEM),
+            prompt=bundle.prompts.render(PromptKey.VISION_SYSTEM),
             mime="image/png",
         )
         record(label, bool(desc), repr(desc[:40]))
@@ -173,9 +177,9 @@ async def check_asr(capabilities: Providers) -> None:
         record(label, False, repr(e))
 
 
-async def check_search(capabilities: Providers) -> None:
-    cfg = config().default.capabilities.search
-    options = config().default.tools.web_search
+async def check_search(capabilities: Providers, bundle: ConfigBundle) -> None:
+    cfg = bundle.default.backends.search
+    options = SearchOptions(cfg.count, cfg.depth)
     label = f"search ({cfg.provider})"
     try:
         items = await capabilities.search.search("今天天气", options=options)
@@ -184,27 +188,27 @@ async def check_search(capabilities: Providers) -> None:
         record(label, False, repr(e))
 
 
-async def check_embedding(capabilities: Providers) -> None:
+async def check_embedding(capabilities: Providers, bundle: ConfigBundle) -> None:
     """Checked on its own config block, one real call: a wrong embedding endpoint
     otherwise surfaces days later as episode recall quietly degrading, never as
     a boot failure."""
-    cfg = config().default.capabilities.embedding
+    cfg = bundle.default.backends.embedding
     label = f"embedding ({cfg.provider})"
     try:
         vecs = await capabilities.embedding.embed(["预检"])
         record(
             label,
-            bool(vecs) and len(vecs[0]) == cfg.dimensions,
+            bool(vecs) and len(vecs[0]) == capabilities.embedding.dimensions,
             f"{cfg.model}, {len(vecs[0])} dims",
         )
     except Exception as e:
         record(label, False, repr(e))
 
 
-def check_keys(capabilities: Providers) -> None:
+def check_keys(capabilities: Providers, bundle: ConfigBundle) -> None:
     """Check the key each capability actually points at, not a hardcoded list - two
     capabilities may share one name or not, and only the config knows."""
-    settings = config().default.capabilities
+    settings = bundle.default.backends
     record("providers selected", True, capabilities.describe())
     seen: dict[str, str] = {}
     for label, name, provider in (
@@ -228,35 +232,39 @@ def check_keys(capabilities: Providers) -> None:
 
 async def main() -> int:
     try:
-        bundle = config()
+        bundle = load_bundle()
+        clock = Clock(bundle.default.bot.timezone)
         record("config parses", True)
     except Exception:
         record("config parses", False, traceback.format_exc(limit=1))
         return 1
 
-    capabilities = build_providers(bundle.default)
-    try:
-        check_keys(capabilities)
+    async with AsyncExitStack() as resources:
+        database = Database(bundle.default.runtime.database, url=dsn())
+        resources.push_async_callback(database.close)
+        budget = Budget(
+            LedgerRepository(database.pool, today=clock.today),
+            daily_cap=bundle.default.budget.daily_cny_cap,
+            today=clock.today,
+        )
+        capabilities = build_providers(bundle.default, budget)
+        resources.push_async_callback(capabilities.aclose)
+        check_keys(capabilities, bundle)
         await capabilities.asr.start()
-        await check_db()
-        await check_text(capabilities)
-        await check_vision(capabilities)
+        await check_db(database)
+        await check_text(capabilities, bundle)
+        await check_vision(capabilities, bundle)
         await check_asr(capabilities)
-        await check_search(capabilities)
-        await check_embedding(capabilities)
-    finally:
-        from qqbot.db import close_pool
+        await check_search(capabilities, bundle)
+        await check_embedding(capabilities, bundle)
 
-        await capabilities.aclose()
-        await close_pool()
-
-    failed = [n for n, ok, _ in RESULTS if not ok]
-    print()
-    if failed:
-        print(f"{len(failed)} check(s) failed: {', '.join(failed)}")
-        return 1
-    print("all checks passed")
-    return 0
+        failed = [n for n, ok, _ in RESULTS if not ok]
+        print()
+        if failed:
+            print(f"{len(failed)} check(s) failed: {', '.join(failed)}")
+            return 1
+        print("all checks passed")
+        return 0
 
 
 if __name__ == "__main__":

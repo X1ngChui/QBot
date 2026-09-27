@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+import asyncpg
+
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-import asyncpg
 
-from ..db import pool
-from ..domain.archive import AuthorKind
-from ..domain.ingress import InboundEvent
-from ..services import IdentityResolver
+from qqbot.domain.archive import AuthorKind
+from qqbot.domain.ingress import InboundEvent
+from qqbot.services import IdentityResolver
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,7 +24,8 @@ class Ingested:
 
 
 class Ingestor:
-    def __init__(self, identity: IdentityResolver) -> None:
+    def __init__(self, identity: IdentityResolver, *, database: Callable[[], asyncpg.Pool]) -> None:
+        self._database = database
         self._identity = identity
 
     async def ingest(
@@ -38,7 +40,7 @@ class Ingestor:
         final admission denial and perform no window, media, command or reply effects.
         """
 
-        async with pool().acquire() as conn, conn.transaction():
+        async with self._database().acquire() as conn, conn.transaction():
             raw_id = await self._record(conn, event)
             if raw_id is None:
                 return None

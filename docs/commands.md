@@ -9,6 +9,11 @@ the same target and scope for an owner and a member; authorization only allows o
 the action. The QQ group's administrator role is not used. "Owner" means an account in
 the bot's global `owners` setting.
 
+The bot's persistent timed tasks are not slash commands. A member can ask in ordinary
+conversation to schedule, inspect or cancel their own group tasks; the reply model uses
+the corresponding tools, and the bot owner can manage any task in that group. Due tasks
+re-read the current group context before deciding whether to reply.
+
 ## Account scope
 
 Person commands distinguish an exact platform account from the account holder's current

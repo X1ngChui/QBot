@@ -2,37 +2,37 @@
 
 from __future__ import annotations
 
+from qqbot.clock import Clock
+
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime
 
 import asyncpg
 
-from ..db import pool
-from ..domain.ids import GroupId
-from ..util import tz_sql
-from .identity import FAMILY
-from ..domain.memory import (
-    Candidate,
-    Episode,
-    EpisodeType,
-    Fact,
-    FactEvidence,
-    FactStatus,
-    MemoryType,
-    earned_confidence,
-)
+from qqbot.repositories.job import Job, fenced_transaction
+from qqbot.domain.ids import GroupId
+from qqbot.repositories.identity import FAMILY
+from qqbot.domain.memory import Candidate
+from qqbot.domain.memory import Episode
+from qqbot.domain.memory import EpisodeType
+from qqbot.domain.memory import Fact
+from qqbot.domain.memory import FactEvidence
+from qqbot.domain.memory import FactStatus
+from qqbot.domain.memory import MemoryType
+from qqbot.domain.memory import earned_confidence
 
 
 @asynccontextmanager
 async def _write_connection(
+    database: Callable[[], asyncpg.Pool],
     conn: asyncpg.Connection | None,
 ) -> AsyncIterator[asyncpg.Connection]:
     if conn is not None:
         yield conn
         return
-    async with pool().acquire() as owned, owned.transaction():
+    async with database().acquire() as owned, owned.transaction():
         yield owned
 
 
@@ -76,6 +76,10 @@ class MemoryRepository:
     by every caller remembering to read before it writes.
     """
 
+    def __init__(self, *, database: Callable[[], asyncpg.Pool], clock: Clock) -> None:
+        self._clock = clock
+        self._database = database
+
     async def current_facts(
         self,
         group_id: GroupId,
@@ -94,7 +98,7 @@ class MemoryRepository:
         """
         if not subject_ids:
             return []
-        rows = await (_conn or pool()).fetch(
+        rows = await (_conn or self._database()).fetch(
             """WITH RECURSIVE family AS (
                    SELECT id, id AS root FROM entity WHERE id = ANY($2::uuid[])
                    UNION ALL
@@ -138,7 +142,7 @@ class MemoryRepository:
 
         if not account_ids:
             return []
-        rows = await (_conn or pool()).fetch(
+        rows = await (_conn or self._database()).fetch(
             """SELECT * FROM memory_fact
                 WHERE group_id=$1 AND subject_account_id=ANY($2::uuid[])
                   AND status='active' AND valid_to IS NULL
@@ -163,7 +167,7 @@ class MemoryRepository:
 
         if not entity_ids:
             return []
-        rows = await (_conn or pool()).fetch(
+        rows = await (_conn or self._database()).fetch(
             """WITH RECURSIVE family AS (
                    SELECT id, id AS root FROM entity WHERE id=ANY($2::uuid[])
                    UNION ALL
@@ -211,7 +215,7 @@ class MemoryRepository:
         Callers with no source event (a manual note) leave it unset.
         """
         observed_at = observed_at or when
-        async with _write_connection(_conn) as conn:
+        async with _write_connection(self._database, _conn) as conn:
             if fact.subject_account_id is not None:
                 prevs = await conn.fetch(
                     """SELECT * FROM memory_fact
@@ -352,7 +356,7 @@ class MemoryRepository:
         *,
         _conn: asyncpg.Connection | None = None,
     ) -> None:
-        await (_conn or pool()).execute(
+        await (_conn or self._database()).execute(
             """UPDATE memory_fact SET status='retracted', valid_to=NOW(),
                                       revision=revision+1, updated_at=NOW()
                 WHERE id=$1""",
@@ -369,6 +373,7 @@ class MemoryRepository:
         default_days: float,
         fast_days: float,
         keep_predicates: tuple[str, ...] = (),
+        fence: Job | None = None,
     ) -> int:
         """Retire facts nothing has confirmed for a while. Returns how many.
 
@@ -397,54 +402,55 @@ class MemoryRepository:
         simply stopped coming up, and a reader of the history should be able to tell
         the two apart.
         """
-        rows = await pool().fetch(
-            """WITH support AS (
-                   -- Days are counted by when the supporting messages were SENT, not
-                   -- when their evidence was written: a drain that reads several days
-                   -- at once writes all of it in one transaction, and by write time
-                   -- a fact restated every day for a week would count as one day.
-                   -- Bucketed in the configured zone, like the analogous alias
-                   -- stability count: bare ::date buckets in the session zone (UTC
-                   -- here), where an evening conversation straddling local midnight
-                   -- counts as two days of support and evening-heavy traffic
-                   -- systematically inflates the lifetime multiplier.
-                   SELECT f.id,
-                          GREATEST(count(DISTINCT
-                                     (COALESCE(r.occurred_at, e.created_at)
-                                      AT TIME ZONE $8)::date), 1) AS days,
-                          CASE WHEN f.predicate = ANY($2::text[])
-                                 THEN $4::float
-                               WHEN f.predicate = ANY($3::text[])
-                                 THEN $6::float
-                               ELSE $5::float END AS base
-                     FROM memory_fact f
-                     LEFT JOIN memory_fact_evidence e
-                            ON e.fact_id = f.id AND e.relation = 'supports'
-                     LEFT JOIN raw_event r ON r.id = e.raw_event_id
-                    WHERE f.group_id = $1 AND f.status = 'active' AND f.valid_to IS NULL
-                      AND NOT (f.predicate = ANY($7::text[]))
-                    GROUP BY f.id, f.predicate
-               )
-               UPDATE memory_fact f
-                  SET status = $9, valid_to = NOW(),
-                      revision = revision + 1, updated_at = NOW()
-                 FROM support s
-                WHERE f.id = s.id
-                  AND COALESCE(f.last_confirmed_at, f.first_observed_at, f.created_at)
-                      < NOW() - (s.base * LEAST(4.0, 1 + ln(1 + s.days))
-                                 * INTERVAL '1 day')
-             RETURNING f.id""",
-            group_id.to_db(),
-            list(stable),
-            list(fast),
-            stable_days,
-            default_days,
-            fast_days,
-            list(keep_predicates),
-            tz_sql(),
-            FactStatus.EXPIRED.value,
-        )
-        return len(rows)
+        async with fenced_transaction(self._database, fence) as conn:
+            rows = await conn.fetch(
+                """WITH support AS (
+                       -- Days are counted by when the supporting messages were SENT, not
+                       -- when their evidence was written: a drain that reads several days
+                       -- at once writes all of it in one transaction, and by write time
+                       -- a fact restated every day for a week would count as one day.
+                       -- Bucketed in the configured zone, like the analogous alias
+                       -- stability count: bare ::date buckets in the session zone (UTC
+                       -- here), where an evening conversation straddling local midnight
+                       -- counts as two days of support and evening-heavy traffic
+                       -- systematically inflates the lifetime multiplier.
+                       SELECT f.id,
+                              GREATEST(count(DISTINCT
+                                         (COALESCE(r.occurred_at, e.created_at)
+                                          AT TIME ZONE $8)::date), 1) AS days,
+                              CASE WHEN f.predicate = ANY($2::text[])
+                                     THEN $4::float
+                                   WHEN f.predicate = ANY($3::text[])
+                                     THEN $6::float
+                                   ELSE $5::float END AS base
+                         FROM memory_fact f
+                         LEFT JOIN memory_fact_evidence e
+                                ON e.fact_id = f.id AND e.relation = 'supports'
+                         LEFT JOIN raw_event r ON r.id = e.raw_event_id
+                        WHERE f.group_id = $1 AND f.status = 'active' AND f.valid_to IS NULL
+                          AND NOT (f.predicate = ANY($7::text[]))
+                        GROUP BY f.id, f.predicate
+                   )
+                   UPDATE memory_fact f
+                      SET status = $9, valid_to = NOW(),
+                          revision = revision + 1, updated_at = NOW()
+                     FROM support s
+                    WHERE f.id = s.id
+                      AND COALESCE(f.last_confirmed_at, f.first_observed_at, f.created_at)
+                          < NOW() - (s.base * LEAST(4.0, 1 + ln(1 + s.days))
+                                     * INTERVAL '1 day')
+                 RETURNING f.id""",
+                group_id.to_db(),
+                list(stable),
+                list(fast),
+                stable_days,
+                default_days,
+                fast_days,
+                list(keep_predicates),
+                self._clock.timezone,
+                FactStatus.EXPIRED.value,
+            )
+            return len(rows)
 
     # -- candidate audit ----------------------------------------------------
     async def settle(
@@ -453,7 +459,7 @@ class MemoryRepository:
         *,
         _conn: asyncpg.Connection | None = None,
     ) -> None:
-        await (_conn or pool()).execute(
+        await (_conn or self._database()).execute(
             """UPDATE memory_candidate
                   SET status=$2, reject_reason=$3, processed_at=NOW()
                 WHERE id=$1""",
@@ -485,6 +491,9 @@ def _episode(r) -> Episode:
 class EpisodeRepository:
     """Episodic memory with exact extraction and source-event provenance."""
 
+    def __init__(self, *, database: Callable[[], asyncpg.Pool]) -> None:
+        self._database = database
+
     async def add(
         self,
         ep: Episode,
@@ -498,7 +507,7 @@ class EpisodeRepository:
         finds its own row and adds nothing - every insert here tolerates a duplicate.
         The first write's content stands; a retry carries the same content anyway.
         """
-        async with _write_connection(_conn) as conn:
+        async with _write_connection(self._database, _conn) as conn:
             await conn.execute(
                 """INSERT INTO episode
                        (id, group_id, episode_type, title, summary, started_at,
@@ -526,7 +535,7 @@ class EpisodeRepository:
                 )
             return ep
 
-    async def decay(self, group_id: GroupId, *, ttl_days: float) -> int:
+    async def decay(self, group_id: GroupId, *, ttl_days: float, fence: Job | None = None) -> int:
         """Retire old episodes and discard their rebuildable vector projections.
 
         The episode and source-event links remain as the durable account of what happened.
@@ -534,7 +543,7 @@ class EpisodeRepository:
         under one transaction also closes the race with an embed writer, which locks the
         same episode row before adding a projection.
         """
-        async with pool().acquire() as conn, conn.transaction():
+        async with fenced_transaction(self._database, fence) as conn:
             rows = await conn.fetch(
                 """UPDATE episode
                       SET status='expired', revision=revision+1
@@ -557,7 +566,7 @@ class EpisodeRepository:
     async def recent_active(self, group_id: GroupId, *, limit: int) -> list[Episode]:
         """Recent active group episodes used only to suppress duplicate extraction."""
 
-        rows = await pool().fetch(
+        rows = await self._database().fetch(
             """SELECT * FROM episode
                 WHERE group_id=$1 AND status='active'
                 ORDER BY COALESCE(ended_at, started_at, created_at) DESC, id
@@ -581,7 +590,7 @@ class EpisodeRepository:
         """
         if not ids or ctx <= 0:
             return {}
-        rows = await pool().fetch(
+        rows = await self._database().fetch(
             """SELECT h.id AS hit_id, n.* FROM unnest($2::uuid[]) AS h(id)
                  JOIN episode he ON he.id = h.id AND he.group_id=$1
                                 AND he.status='active'
@@ -620,7 +629,7 @@ class EpisodeRepository:
         """
         if not ids:
             return []
-        rows = await pool().fetch(
+        rows = await self._database().fetch(
             """SELECT e.* FROM episode e
                 WHERE e.group_id=$1 AND e.id=ANY($2::uuid[]) AND e.status='active'""",
             group_id.to_db(),

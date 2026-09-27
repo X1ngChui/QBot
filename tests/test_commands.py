@@ -1,51 +1,39 @@
 """Role-independent command catalog, authorization, and strict parsing."""
 
-import asyncio
-import os
-import pathlib
-import sys
+import _db as _test_db
 import types
 import uuid
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-os.environ.setdefault("CONFIG_DIR", str(ROOT / "tests" / "fixtures" / "config"))
+import pytest
 
-from qqbot.core import perms
-from qqbot.core.command_catalog import Access, CATALOG, PREFIXES, detail_text, find, help_text
-from qqbot.core.commands import CommandRequest, CommandRouter, registered_commands
-from qqbot.core.delivery import GroupDelivery
-from qqbot.core.state import Registry
+from _budget import fake_budget
+from _db import clock, fact_card, pool, test_bundle as fixture_bundle
+from qqbot.services.members import MemberDirectory
+from qqbot.commands.catalog import Access, CATALOG, PREFIXES, detail_text, find, help_text
+from qqbot.commands.router import CommandRequest, CommandRouter, registered_commands
+from qqbot.conversation.state import Registry
+from qqbot.delivery.service import GroupDelivery
 from qqbot.domain.ids import AccountId, GroupId, MessageId
-from qqbot.services import FactCard, NameCard, PersonCard
-from qqbot.settings import config
+from qqbot.services import NameCard, PersonCard, permissions as perms
 
-fails: list[str] = []
+
 GROUP = GroupId("8001")
-OWNER = AccountId(config().default.owners[0])
+OWNER = AccountId("10000")
 MEMBER = AccountId("30001")
 TARGET = AccountId("30001")
 OTHER = AccountId("30002")
 BOT_ID = AccountId("999")
 
 
-def check(name: str, condition: bool, detail: str = "") -> None:
-    print(f"[{'ok ' if condition else 'FAIL'}] {name}  {detail}")
-    if not condition:
-        fails.append(name)
-
-
-def text_of(result) -> str:
-    if result is None or not result.messages:
-        return ""
-    return result.messages[0][-1].text
+def text_of(result):
+    return result.messages[0][-1].text if result is not None and result.messages else ""
 
 
 class FakeBot:
     self_id = BOT_ID
 
-    def __init__(self) -> None:
-        self.sent: list[tuple[int, list[dict]]] = []
+    def __init__(self):
+        self.sent = []
 
     async def send_group_msg(self, *, group_id, message):
         self.sent.append((group_id, message))
@@ -53,12 +41,12 @@ class FakeBot:
 
 
 class FakeDirectory:
-    def __init__(self) -> None:
-        self.calls: list[tuple] = []
+    def __init__(self):
+        self.calls = []
         self._account = uuid.uuid4()
         self._holder = uuid.uuid4()
 
-    def exact_card(self, user_id: str) -> PersonCard:
+    def exact_card(self, user_id):
         return PersonCard(
             entity_id=self._holder,
             account_id=self._account,
@@ -67,20 +55,10 @@ class FakeDirectory:
             accounts=(user_id,),
             messages=2,
             names=(NameCard("测试名", "nickname", 1.0),),
-            facts=(
-                FactCard(
-                    1,
-                    uuid.uuid4(),
-                    "likes",
-                    "茶",
-                    "茶",
-                    0.8,
-                    account_id=self._account,
-                ),
-            ),
+            facts=(fact_card(1, uuid.uuid4(), "likes", "茶", "茶", 0.8, account_id=self._account),),
         )
 
-    def holder_card_value(self, user_id: str) -> PersonCard:
+    def holder_card_value(self, user_id):
         return PersonCard(
             entity_id=self._holder,
             account_id=None,
@@ -117,21 +95,13 @@ class FakeDirectory:
         self.calls.append(("unname", group_id, user_id, text, all_linked))
         return True
 
-    async def set_confidence(
-        self,
-        group_id,
-        user_id,
-        text,
-        confidence,
-        *,
-        all_linked=False,
-    ):
+    async def set_confidence(self, group_id, user_id, text, confidence, *, all_linked=False):
         self.calls.append(("confidence", group_id, user_id, text, confidence, all_linked))
         return NameCard(text, "nickname", confidence)
 
     async def forget(self, group_id, user_id, index, *, all_linked=False):
         self.calls.append(("forget", group_id, user_id, index, all_linked))
-        return FactCard(index, uuid.uuid4(), "likes", "茶", "茶", 0.8)
+        return fact_card(index, uuid.uuid4(), "likes", "茶", "茶", 0.8)
 
     async def split(self, user_id):
         self.calls.append(("split", user_id))
@@ -143,8 +113,8 @@ class FakeDirectory:
 
 
 class FakeLinks:
-    def __init__(self) -> None:
-        self.calls: list[tuple] = []
+    def __init__(self):
+        self.calls = []
 
     async def issue(self, **kwargs):
         self.calls.append(("issue", kwargs))
@@ -159,13 +129,7 @@ class FakeLinks:
         return True
 
 
-def request(
-    name: str,
-    *,
-    user: AccountId = OWNER,
-    text: str | None = None,
-    mentions: tuple[AccountId, ...] = (),
-) -> CommandRequest:
+def request(name, *, user=OWNER, text=None, mentions=()):
     return CommandRequest(
         name=name,
         message_id=MessageId(f"message-{uuid.uuid4().hex}"),
@@ -178,221 +142,160 @@ def request(
     )
 
 
-def catalogue() -> None:
-    listing = help_text()
-    check("the command registry exactly matches the catalog", registered_commands() == PREFIXES)
-    check(
-        "every command appears in the shared listing", all(item.name in listing for item in CATALOG)
-    )
-    check("help is role-independent", "仅 owner" in listing and "详细用法" in listing)
-    check(
-        "member-access commands are open without an agreement",
-        {item.name for item in CATALOG if item.access is Access.MEMBER}
-        == {"/help", "/who", "/note", "/alias", "/forget", "/link", "/unlink",
-            "/card", "/stats", "/top"},
-    )
-    check("agreement commands are absent", "/agree" not in PREFIXES and "/terms" not in PREFIXES)
-    check(
-        "owner-only commands are marked as authorization, not alternate semantics",
-        all("仅 bot owner" in detail_text(item) for item in CATALOG if item.access is Access.OWNER),
-    )
-    check(
-        "bare who documents exact-account scope", "默认查看当前精确账号" in detail_text(find("who"))
-    )
-    check("members is separate from who", {"/who", "/members"} <= set(PREFIXES))
-    check(
-        "retired aliases are absent", not ({"/unblock", "/unmute", "/groupstats"} & set(PREFIXES))
-    )
-    check(
-        "every command resolves with or without slash",
-        all(find(item.name) is item and find(item.name[1:]) is item for item in CATALOG),
-    )
-    check("an unknown command is not catalogued", find("nope") is None)
-
-    owners = ["owner-a"]
-    check("owner identity is normalized", perms.is_owner("owner-a", owners))
-    check(
-        "member access admits a new member directly",
-        perms.decide("m", owners=owners, access=Access.MEMBER) is perms.Verdict.MEMBER,
-    )
-    check(
-        "owner access denies a member",
-        perms.decide("m", owners=owners, access=Access.OWNER) is perms.Verdict.DENIED,
-    )
-
-
-async def router_behavior() -> None:
-    directory = FakeDirectory()
-    links = FakeLinks()
+@pytest.fixture
+async def router_case():
+    members = MemberDirectory()
+    bundle = fixture_bundle()
+    assert str(OWNER) in bundle.default.bot.owners
+    directory, links = FakeDirectory(), FakeLinks()
     providers = types.SimpleNamespace(search=types.SimpleNamespace(name="test-search"))
-    router = CommandRouter(GroupDelivery(), Registry(), directory, links, providers)
-    bot = FakeBot()
+    router = CommandRouter(
+        GroupDelivery(),
+        Registry(groups=_test_db.groups, archive=_test_db.archive, bundle=bundle, clock=clock),
+        directory,
+        links,
+        providers,
+        budget=fake_budget(),
+        members=members,
+        groups=_test_db.groups,
+        database=pool,
+        bundle=bundle,
+        clock=clock,
+        diagnostics=types.SimpleNamespace(count=lambda: 0),
+    )
+    try:
+        yield router, FakeBot(), directory, links
+    finally:
+        await members.close()
 
+
+def test_catalog_is_complete_and_role_independent():
+    listing = help_text()
+    assert registered_commands() == PREFIXES
+    assert all(item.name in listing for item in CATALOG)
+    assert "仅 owner" in listing and "详细用法" in listing
+    assert {item.name for item in CATALOG if item.access is Access.MEMBER} == {
+        "/help",
+        "/who",
+        "/note",
+        "/alias",
+        "/forget",
+        "/link",
+        "/unlink",
+        "/card",
+        "/stats",
+        "/top",
+    }
+    assert "/agree" not in PREFIXES and "/terms" not in PREFIXES
+    assert all(
+        "仅 bot owner" in detail_text(item) for item in CATALOG if item.access is Access.OWNER
+    )
+    assert "默认查看当前精确账号" in detail_text(find("who"))
+    assert {"/who", "/members"} <= set(PREFIXES)
+    assert not ({"/unblock", "/unmute", "/groupstats"} & set(PREFIXES))
+    assert all(find(item.name) is item and find(item.name[1:]) is item for item in CATALOG)
+    assert find("nope") is None
+
+
+def test_owner_and_member_decisions_use_single_access_policy():
+    owners = ["owner-a"]
+    assert perms.is_owner("owner-a", owners)
+    assert perms.decide("m", owners=owners, access=Access.MEMBER) is perms.Verdict.MEMBER
+    assert perms.decide("m", owners=owners, access=Access.OWNER) is perms.Verdict.DENIED
+
+
+@pytest.mark.asyncio
+async def test_help_who_and_members_authorization(router_case):
+    router, bot, directory, _ = router_case
     owner_help = await router.handle(bot, request("/help", user=OWNER))
     member_help = await router.handle(bot, request("/help", user=MEMBER))
-    check("owner and member receive the same help", text_of(owner_help) == text_of(member_help))
-    check(
-        "unknown commands have no behavior", await router.handle(bot, request("/nope")) is None
-    )
-
+    assert text_of(owner_help) == text_of(member_help)
+    assert await router.handle(bot, request("/nope")) is None
     await router.handle(bot, request("/who", user=OWNER))
     member_who = await router.handle(bot, request("/who", user=MEMBER))
-    check("a new member can use who without consenting", "账号-" in text_of(member_who))
-    who_calls = [call[0] for call in directory.calls if call[0].endswith("_card")]
-    check(
-        "bare who is exact-account for owner and member",
-        who_calls[-2:] == ["account_card", "account_card"],
-        str(who_calls),
-    )
-
+    assert "账号-" in text_of(member_who)
+    card_calls = [call[0] for call in directory.calls if call[0].endswith("_card")]
+    assert card_calls[-2:] == ["account_card", "account_card"]
     await router.handle(bot, request("/who", user=MEMBER, text="/who --all"))
-    check(
-        "who --all selects the linked holder",
-        directory.calls[-1][0] == "holder_card",
-        str(directory.calls[-1]),
-    )
+    assert directory.calls[-1][0] == "holder_card"
+    assert "bot owner" in text_of(await router.handle(bot, request("/members", user=MEMBER)))
+    assert "本群 1 人" in text_of(await router.handle(bot, request("/members", user=OWNER)))
 
-    member_members = await router.handle(bot, request("/members", user=MEMBER))
-    check("members remains owner-authorized", "bot owner" in text_of(member_members))
-    owner_members = await router.handle(bot, request("/members", user=OWNER))
-    check("the owner roster is not overloaded onto who", "本群 1 人" in text_of(owner_members))
 
-    directory.calls.clear()
+@pytest.mark.asyncio
+async def test_note_scope_is_identical_for_owner_and_member(router_case):
+    router, bot, directory, _ = router_case
     for user in (OWNER, MEMBER):
         await router.handle(
-            bot,
-            request(
-                "/note",
-                user=user,
-                text="/note set 同一段备注",
-                mentions=(TARGET,),
-            ),
+            bot, request("/note", user=user, text="/note set 同一段备注", mentions=(TARGET,))
         )
     note_calls = [call for call in directory.calls if call[0] == "note"]
-    check(
-        "the same note command has the same target and scope for both roles",
-        note_calls == [("note", GROUP, str(TARGET), "同一段备注", False)] * 2,
-        str(note_calls),
-    )
-
+    assert note_calls == [("note", GROUP, str(TARGET), "同一段备注", False)] * 2
     directory.calls.clear()
     await router.handle(
         bot,
-        request(
-            "/note",
-            user=MEMBER,
-            text="/note clear --all",
-            mentions=(TARGET,),
-        ),
+        request("/note", user=MEMBER, text="/note clear --all", mentions=(TARGET,)),
     )
-    check(
-        "note clear is explicit and preserves all-linked scope",
-        ("note", GROUP, str(TARGET), "", True) in directory.calls,
-    )
+    assert ("note", GROUP, str(TARGET), "", True) in directory.calls
 
-    directory.calls.clear()
+
+@pytest.mark.asyncio
+async def test_retired_sentinels_and_unknown_or_duplicate_flags_are_rejected(router_case):
+    router, bot, directory, _ = router_case
     old_note = await router.handle(bot, request("/note", user=MEMBER, text="/note -"))
-    check(
-        "the old dash clear sentinel is rejected",
-        "用法" in text_of(old_note) and not any(call[0] == "note" for call in directory.calls),
-    )
+    assert "用法" in text_of(old_note)
+    assert not any(call[0] == "note" for call in directory.calls)
     old_alias = await router.handle(bot, request("/alias", user=MEMBER, text="/alias -旧称"))
-    check(
-        "the old alias sentinel is rejected",
-        "用法" in text_of(old_alias)
-        and not any(call[0] == "unname" for call in directory.calls),
-    )
-
+    assert "用法" in text_of(old_alias)
+    assert not any(call[0] == "unname" for call in directory.calls)
     bad_flag = await router.handle(bot, request("/who", user=MEMBER, text="/who --every"))
-    check("unknown flags are rejected without fallback", "未知选项" in text_of(bad_flag))
-    duplicate_flag = await router.handle(
-        bot, request("/who", user=MEMBER, text="/who --all --all")
-    )
-    check("duplicate flags are rejected", "只能写一次" in text_of(duplicate_flag))
+    assert "未知选项" in text_of(bad_flag)
+    duplicate = await router.handle(bot, request("/who", user=MEMBER, text="/who --all --all"))
+    assert "只能写一次" in text_of(duplicate)
 
-    directory.calls.clear()
-    confidence_result = await router.handle(
+
+@pytest.mark.asyncio
+async def test_alias_confidence_and_listing(router_case):
+    router, bot, directory, _ = router_case
+    result = await router.handle(
         bot,
-        request(
-            "/alias",
-            user=MEMBER,
-            text="/alias confidence 0.6 新称呼",
-        ),
+        request("/alias", user=MEMBER, text="/alias confidence 0.6 新称呼"),
     )
-    check(
-        "alias confidence has an explicit action and numeric score",
-        ("confidence", GROUP, str(MEMBER), "新称呼", 0.6, False) in directory.calls,
-    )
-    check(
-        "low confidence is context-only, not invisible",
-        "仅作待确认线索" in text_of(confidence_result),
-    )
-    aliases_result = await router.handle(bot, request("/alias", user=MEMBER))
-    check("alias listing marks confirmed names", "已确认" in text_of(aliases_result))
+    assert ("confidence", GROUP, str(MEMBER), "新称呼", 0.6, False) in directory.calls
+    assert "仅作待确认线索" in text_of(result)
+    assert "已确认" in text_of(await router.handle(bot, request("/alias", user=MEMBER)))
 
-    await router.handle(
-        bot,
-        request("/link", user=MEMBER, mentions=(OTHER,)),
-    )
-    issue = next(call for call in links.calls if call[0] == "issue")
-    check(
-        "link issue records both accounts and the admitted raw event",
-        issue[1]["initiator_user_id"] == str(MEMBER)
-        and issue[1]["target_user_id"] == str(OTHER)
-        and isinstance(issue[1]["created_event_id"], uuid.UUID),
-    )
 
-    await router.handle(
-        bot,
-        request("/link", user=OTHER, text="/link confirm 12345678"),
-    )
-    confirm = next(call for call in links.calls if call[0] == "confirm")
-    check(
-        "link confirmation is attributed to the confirming account and event",
-        confirm[1]["actor_user_id"] == str(OTHER)
-        and isinstance(confirm[1]["confirmed_event_id"], uuid.UUID),
-    )
+@pytest.mark.asyncio
+async def test_link_confirmation_preserves_actor_and_event(router_case):
+    router, bot, _, links = router_case
+    await router.handle(bot, request("/link", user=MEMBER, mentions=(OTHER,)))
+    issue = next(call for call in links.calls if call[0] == "issue")[1]
+    assert issue["initiator_user_id"] == str(MEMBER)
+    assert issue["target_user_id"] == str(OTHER)
+    assert isinstance(issue["created_event_id"], uuid.UUID)
+    await router.handle(bot, request("/link", user=OTHER, text="/link confirm 12345678"))
+    confirm = next(call for call in links.calls if call[0] == "confirm")[1]
+    assert confirm["actor_user_id"] == str(OTHER)
+    assert isinstance(confirm["confirmed_event_id"], uuid.UUID)
 
-    directory.calls.clear()
+
+@pytest.mark.asyncio
+async def test_unlink_split_and_merge_use_exact_account_authorization(router_case):
+    router, bot, directory, _ = router_case
     await router.handle(bot, request("/unlink", user=MEMBER))
-    check(
-        "unlink can only detach the authenticated sender",
-        directory.calls == [("split", str(MEMBER))],
-        str(directory.calls),
-    )
-
+    assert directory.calls == [("split", str(MEMBER))]
     directory.calls.clear()
-    await router.handle(
-        bot,
-        request("/split", user=OWNER, mentions=(OTHER,)),
-    )
-    check(
-        "owner split detaches only the mentioned exact account",
-        directory.calls == [("split", str(OTHER))],
-    )
-
+    await router.handle(bot, request("/split", user=OWNER, mentions=(OTHER,)))
+    assert directory.calls == [("split", str(OTHER))]
     denied = await router.handle(bot, request("/merge", user=MEMBER, mentions=(MEMBER, OTHER)))
-    check(
-        "owner-only commands fail by authorization, not by alternate behavior",
-        "bot owner" in text_of(denied),
-    )
+    assert "bot owner" in text_of(denied)
 
-    before = len(bot.sent)
+
+@pytest.mark.asyncio
+async def test_dispatch_uses_typed_group_delivery(router_case):
+    router, bot, _, _ = router_case
     delivered = await router.dispatch(bot, request("/help", user=MEMBER))
-    check(
-        "command output uses typed group delivery",
-        delivered
-        and len(bot.sent) == before + 1
-        and [item["type"] for item in bot.sent[-1][1]] == ["reply", "at", "text"],
-    )
-
-
-async def main() -> int:
-    catalogue()
-    await router_behavior()
-    print()
-    print("FAILED:", fails if fails else "none")
-    return 1 if fails else 0
-
-
-sys.exit(asyncio.run(main()))
+    assert delivered
+    assert len(bot.sent) == 1
+    assert [item["type"] for item in bot.sent[0][1]] == ["reply", "at", "text"]

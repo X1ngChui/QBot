@@ -10,8 +10,11 @@ from enum import StrEnum
 from types import MappingProxyType
 from typing import Any, Literal
 
-from ..util import defang, display_name
-from .ids import AccountId, GroupId, MessageId
+from qqbot.util import defang
+from qqbot.util import display_name
+from qqbot.domain.ids import AccountId
+from qqbot.domain.ids import GroupId
+from qqbot.domain.ids import MessageId
 
 ARCHIVE_SCHEMA = 1
 

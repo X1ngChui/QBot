@@ -7,7 +7,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, ClassVar
 
-from ..util import sysmark
+from qqbot.util import sysmark
 
 
 class EvidenceSource(StrEnum):

@@ -58,25 +58,109 @@ async def _assert_connection(conn) -> None:
         raise RuntimeError("refusing destructive access: disposable database marker is invalid")
 
 
-async def assert_disposable_database() -> None:
+async def assert_disposable_database(database=None) -> None:
     """Verify the live database identity and immutable marker."""
-    from qqbot.db import pool
 
-    async with pool().acquire() as conn:
+    async with (database or pool)().acquire() as conn:
         await _assert_connection(conn)
 
 
-async def reset() -> None:
+async def reset(database=None) -> None:
     """Truncate canonical tables after checking the same guarded connection."""
-    from qqbot.db import pool
     from qqbot.db.repo import check_schema
-    from qqbot.settings import config
+    from qqbot.domain.memory.embedding import VECTOR_DIMENSIONS
 
-    async with pool().acquire() as conn, conn.transaction():
+    async with (database or pool)().acquire() as conn, conn.transaction():
         await _assert_connection(conn)
-        dimensions = config().default.capabilities.embedding.dimensions
+        dimensions = VECTOR_DIMENSIONS
         await check_schema(conn, schema="public", embedding_dimensions=dimensions)
         rows = await conn.fetch("SELECT tablename FROM pg_tables WHERE schemaname = 'public'")
         names = [row["tablename"] for row in rows]
         if names:
             await conn.execute("TRUNCATE " + ", ".join(names))
+
+
+_owner = None
+
+
+async def init_pool():
+    global _owner
+    from _fixtures import config
+    from qqbot.db import Database, dsn
+
+    if _owner is None:
+        configure_test_database()
+        _owner = Database(config().default.runtime.database, url=dsn())
+        try:
+            await _owner.start()
+            await assert_disposable_database()
+        except BaseException:
+            await close_pool()
+            raise
+    return _owner.pool()
+
+
+def pool():
+    if _owner is None:
+        raise RuntimeError("test database is not initialized")
+    return _owner.pool()
+
+
+async def close_pool():
+    global _owner
+    owner, _owner = _owner, None
+    if owner is not None:
+        await owner.close()
+
+
+from _fixtures import clock
+
+from qqbot.repositories.groups import GroupRepository
+from qqbot.repositories.media_cache import MediaCacheRepository
+from qqbot.repositories.evidence import EvidenceRepository
+from qqbot.repositories.archive import ArchiveRepository
+from qqbot.repositories.identity import IdentityRepository
+
+groups = GroupRepository(pool, clock=clock)
+media_cache = MediaCacheRepository(pool, clock=clock)
+evidence = EvidenceRepository(pool)
+archive = ArchiveRepository(database=pool)
+identities = IdentityRepository(database=pool, clock=clock)
+
+
+def test_bundle():
+    from _fixtures import config
+
+    return config()
+
+
+def bundle_for_settings(settings):
+    from qqbot.configuration import ConfigBundle
+
+    base = test_bundle()
+    return ConfigBundle(
+        settings.model_dump(),
+        {"default": base._default_persona, **base.personas},
+        base.prompts,
+        base.predicates,
+    )
+
+
+def fact_card(*args, **kwargs):
+    from dataclasses import replace
+    from qqbot.services.directory import FactCard
+    from qqbot.services.context_builder import render_fact
+
+    card = FactCard(*args, **kwargs)
+    return replace(
+        card,
+        rendered=render_fact(
+            card.predicate, card.object, card.object_key, predicates=test_bundle().predicates
+        ),
+    )
+
+
+def tool_registry(settings):
+    from qqbot.conversation.tools import tool_registry as build
+
+    return build(settings, prompts=test_bundle().prompts)

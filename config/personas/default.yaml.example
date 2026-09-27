@@ -34,6 +34,3 @@ system_prompt: |
 # unless there is something true to put in it - a note to whoever maintains this file is
 # not that. Per-group text goes in group_<gid>.yaml.
 group_knowledge: ""
-
-# Per-group parameter overrides. Same shape as settings.yaml; only list keys you change.
-overrides: {}

@@ -2,52 +2,46 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+import asyncpg
+
 import logging
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
 
-import asyncpg
 
-from ..db import pool
-from ..domain.ids import GroupId
-from ..domain.identity import (
-    ALIAS_MAX_CHARS,
-    Alias,
-    AliasEvidence,
-    AliasType,
-    EvidenceType,
-    normalize,
-)
-from ..domain.memory import (
-    Candidate,
-    CandidateType,
-    Episode,
-    ExtractionSnapshot,
-    Fact,
-    FactEvidence,
-    MemoryType,
-    RejectReason,
-    SnapshotLine,
-    earned_confidence,
-)
-from ..repositories import (
-    EpisodeRepository,
-    ExtractionRepository,
-    IdentityRepository,
-    JobQueue,
-    MemoryRepository,
-)
-from ..repositories.job import JobType
-from ..settings import config
-from .memory_extractor import (
-    ALIAS_KINDS,
-    GROUP_TERM,
-    GROUP_TOPIC,
-    multi_valued,
-    opposites,
-    predicate_names,
-)
+from qqbot.repositories.job import Job, fenced_transaction
+from qqbot.domain.ids import GroupId
+from qqbot.domain.identity import ALIAS_MAX_CHARS
+from qqbot.domain.identity import Alias
+from qqbot.domain.identity import AliasEvidence
+from qqbot.domain.identity import AliasType
+from qqbot.domain.identity import EvidenceType
+from qqbot.domain.identity import normalize
+from qqbot.domain.memory import Candidate
+from qqbot.domain.memory import CandidateType
+from qqbot.domain.memory import Episode
+from qqbot.domain.memory import ExtractionSnapshot
+from qqbot.domain.memory import Fact
+from qqbot.domain.memory import FactEvidence
+from qqbot.domain.memory import MemoryType
+from qqbot.domain.memory import RejectReason
+from qqbot.domain.memory import SnapshotLine
+from qqbot.domain.memory import earned_confidence
+from qqbot.repositories import EpisodeRepository
+from qqbot.repositories import ExtractionRepository
+from qqbot.repositories import IdentityRepository
+from qqbot.repositories import JobQueue
+from qqbot.repositories import MemoryRepository
+from qqbot.repositories.job import JobType
+from qqbot.configuration import PredicateTable
+from qqbot.services.memory_extractor import ALIAS_KINDS
+from qqbot.services.memory_extractor import GROUP_TERM
+from qqbot.services.memory_extractor import GROUP_TOPIC
+from qqbot.services.memory_extractor import multi_valued
+from qqbot.services.memory_extractor import opposites
+from qqbot.services.memory_extractor import predicate_names
 
 log = logging.getLogger("qqbot.consolidate")
 
@@ -57,8 +51,8 @@ def _text(payload: dict, key: str) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
-def _fact_kind(predicate: str) -> MemoryType:
-    entry = config().predicates.person.get(predicate)
+def _fact_kind(predicate: str, predicates: PredicateTable) -> MemoryType:
+    entry = predicates.person.get(predicate)
     return MemoryType(entry.kind) if entry else MemoryType.ATTRIBUTE
 
 
@@ -78,7 +72,8 @@ PASS = Verdict(True)
 class Validator:
     """Pure validation against one immutable account-scoped snapshot."""
 
-    def __init__(self, snapshot: ExtractionSnapshot) -> None:
+    def __init__(self, snapshot: ExtractionSnapshot, *, predicates: PredicateTable) -> None:
+        self._predicates = predicates
         self._snapshot = snapshot
         self._codes = snapshot.codes
 
@@ -149,9 +144,7 @@ class Validator:
         if not isinstance(code, int) or code not in self._codes:
             return Verdict.no(RejectReason.UNKNOWN_ENTITY)
         target_id = self._codes[code]
-        resolutions = [
-            target for target in sources[0].targets if target.account_id == target_id
-        ]
+        resolutions = [target for target in sources[0].targets if target.account_id == target_id]
         if not resolutions or not any(
             not target.marker or target.marker in quote for target in resolutions
         ):
@@ -172,9 +165,8 @@ class Validator:
             return Verdict.no(RejectReason.MALFORMED)
         return PASS if text in quote else Verdict.no(RejectReason.MALFORMED)
 
-    @staticmethod
-    def _check_fact(payload: dict) -> Verdict:
-        if payload.get("predicate") not in predicate_names():
+    def _check_fact(self, payload: dict) -> Verdict:
+        if payload.get("predicate") not in predicate_names(self._predicates):
             return Verdict.no(RejectReason.MALFORMED)
         if not _text(payload, "object"):
             return Verdict.no(RejectReason.EMPTY)
@@ -217,7 +209,12 @@ class MemoryConsolidator:
         eps: EpisodeRepository,
         extractions: ExtractionRepository,
         queue: JobQueue,
+        *,
+        database: Callable[[], asyncpg.Pool],
+        predicates: PredicateTable,
     ) -> None:
+        self._predicates = predicates
+        self._database = database
         self._ids = ids
         self._mem = mem
         self._eps = eps
@@ -230,8 +227,9 @@ class MemoryConsolidator:
         *,
         group_id: GroupId,
         when: datetime,
+        fence: Job | None = None,
     ) -> tuple[int, int]:
-        async with pool().acquire() as conn, conn.transaction():
+        async with fenced_transaction(self._database, fence) as conn:
             row = await conn.fetchrow(
                 """SELECT group_id, status, snapshot
                      FROM memory_extraction WHERE id=$1 FOR UPDATE""",
@@ -252,7 +250,7 @@ class MemoryConsolidator:
 
             snapshot = ExtractionSnapshot.from_payload(row["snapshot"])
             candidates = await self._extractions.candidates(extraction_id, conn=conn)
-            validator = Validator(snapshot)
+            validator = Validator(snapshot, predicates=self._predicates)
             ambiguous = validator.ambiguous_aliases(candidates)
             written = rejected = 0
             episode_written = False
@@ -440,7 +438,7 @@ class MemoryConsolidator:
     ) -> None:
         predicate = candidate.payload["predicate"]
         value = candidate.payload["object"].strip()
-        if opposite := opposites().get(predicate):
+        if opposite := opposites(self._predicates).get(predicate):
             current = await self._mem.current_account_facts(
                 group_id,
                 [target_id],
@@ -459,10 +457,10 @@ class MemoryConsolidator:
                 subject_entity_id=None,
                 subject_account_id=target_id,
                 predicate=predicate,
-                object_key=value if predicate in multi_valued() else None,
+                object_key=value if predicate in multi_valued(self._predicates) else None,
                 object_value=value,
                 group_id=group_id,
-                memory_type=_fact_kind(predicate),
+                memory_type=_fact_kind(predicate, self._predicates),
                 confidence=earned_confidence(1),
             ),
             [FactEvidence(candidate.source_event_id)],

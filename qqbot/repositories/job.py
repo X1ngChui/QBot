@@ -1,29 +1,25 @@
-"""The background job queue.
-
-No message broker: PostgreSQL's `FOR UPDATE SKIP LOCKED` is already enough for
-several workers to contend for one table safely, and one fewer piece of middleware is one
-fewer thing to operate.
-
-What this layer guarantees is that work in progress survives the process being killed:
-every lease, retry and backoff lives in the table, never in the process.
-"""
+"""Durable bounded-retry work with per-claim fencing, renewal and deferral."""
 
 from __future__ import annotations
 
 import uuid
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import StrEnum
 
 import asyncpg
 
-from ..db import pool
-
 
 class JobType(StrEnum):
-    EXTRACT_MEMORY = "extract_memory"  # read a batch of messages into candidates
-    EMBED = "embed"  # fill in missing vectors
-    DECAY = "decay"  # age memories out
+    EXTRACT_MEMORY = "extract_memory"
+    EMBED = "embed"
+    DECAY = "decay"
+
+
+class LeaseLost(RuntimeError):
+    """This execution no longer has permission to publish durable results."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,15 +29,56 @@ class Job:
     payload: dict
     retry_count: int
     max_retry: int
+    claim_token: uuid.UUID
 
     @property
     def exhausted(self) -> bool:
         return self.retry_count >= self.max_retry
 
 
+async def require_claim(conn: asyncpg.Connection, job: Job) -> None:
+    """Validate after acquiring the row lock, not before an unbounded lock wait."""
+    if not conn.is_in_transaction():
+        raise RuntimeError("claim checks require the side-effect transaction")
+    await conn.fetchval("SELECT id FROM memory_job WHERE id=$1 FOR UPDATE", job.id)
+    owned = await conn.fetchval(
+        """SELECT id FROM memory_job WHERE id=$1 AND claim_token=$2
+           AND status='running' AND lease_until > clock_timestamp()""",
+        job.id,
+        job.claim_token,
+    )
+    if owned is None:
+        raise LeaseLost(f"job {job.id} no longer owns its claim")
+
+
+@asynccontextmanager
+async def fenced_transaction(
+    database: Callable[[], asyncpg.Pool],
+    fence: Job | None,
+) -> AsyncIterator[asyncpg.Connection]:
+    """Fence leased background writes; direct administrative writes have no lease."""
+    async with database().acquire() as conn, conn.transaction():
+        if fence is not None:
+            await require_claim(conn, fence)
+        yield conn
+        if fence is not None:
+            await require_claim(conn, fence)
+
+
 class JobQueue:
-    def __init__(self, worker_id: str) -> None:
+    LEASE = timedelta(seconds=60)
+
+    def __init__(self, worker_id: str, database: Callable[[], asyncpg.Pool]) -> None:
         self._worker = worker_id
+        self._database = database
+
+    @staticmethod
+    async def _group_lock(conn, job_type: JobType, payload: dict) -> None:
+        # Producers and retry/deferral coalescing serialize on the deduplication key.
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            f"job-submit:{job_type.value}:{payload.get('group_id', '')}",
+        )
 
     async def submit(
         self,
@@ -50,155 +87,162 @@ class JobQueue:
         *,
         priority: int = 0,
         delay: timedelta | None = None,
+        fence: Job | None = None,
         _conn: asyncpg.Connection | None = None,
     ) -> uuid.UUID | None:
-        """Queue one job. Returns None when an identical job is already pending.
-
-        Deduplicated by a partial unique index on (job_type, group) over pending rows:
-        the same work queued twice is the same work, so concurrent schedulers or a retry
-        cannot buy the same operation twice.
-        """
-        return await (_conn or pool()).fetchval(
+        if _conn is None:
+            async with self._database().acquire() as conn, conn.transaction():
+                return await self.submit(
+                    job_type,
+                    payload,
+                    priority=priority,
+                    delay=delay,
+                    fence=fence,
+                    _conn=conn,
+                )
+        await self._group_lock(_conn, job_type, payload)
+        if fence is not None:
+            await require_claim(_conn, fence)
+        return await _conn.fetchval(
             """INSERT INTO memory_job (job_type, payload, priority, available_at)
-               VALUES ($1,$2,$3, NOW() + $4::interval)
-               ON CONFLICT DO NOTHING
-               RETURNING id""",
+               VALUES ($1,$2,$3, clock_timestamp() + $4::interval)
+               ON CONFLICT DO NOTHING RETURNING id""",
             job_type.value,
             payload,
             priority,
-            delay or timedelta(0),
+            delay or timedelta(),
         )
 
-    async def claim(self, *, lease: timedelta = timedelta(minutes=10)) -> Job | None:
-        """Take one job.
-
-        SKIP LOCKED lets concurrent workers each take their own without blocking each
-        other, and a job whose lease has expired is picked up again - so a worker crashing
-        does not lock a job away forever.
-        """
-        # A running job whose lease keeps expiring is one that kills or hangs its
-        # worker - fail() never runs for it, so without this sweep it would be
-        # reclaimed every lease interval forever: exactly the burn-money-indefinitely
-        # machine the max_retry cap exists to stop.
-        await pool().execute(
-            """UPDATE memory_job
-                  SET status='dead', finished_at=NOW(), locked_by=NULL,
-                      last_error=COALESCE(last_error,'')
-                                 || ' [lease kept expiring past max_retry]'
-                WHERE status='running' AND locked_at < NOW() - $1::interval
-                  AND retry_count >= max_retry""",
-            lease,
+    async def claim(self, *, lease: timedelta = LEASE) -> Job | None:
+        if lease <= timedelta():
+            raise ValueError("job lease must be positive")
+        db = self._database()
+        await db.execute(
+            """WITH expired AS (
+                   SELECT id FROM memory_job WHERE status='running'
+                     AND lease_until <= clock_timestamp() AND retry_count >= max_retry
+                   ORDER BY lease_until FOR UPDATE SKIP LOCKED LIMIT 32
+               )
+               UPDATE memory_job j SET status='dead', finished_at=clock_timestamp(),
+                   locked_by=NULL, locked_at=NULL, claim_token=NULL, lease_until=NULL,
+                   last_error='lease expired after retry exhaustion'
+               FROM expired WHERE j.id=expired.id"""
         )
-        row = await pool().fetchrow(
+        row = await db.fetchrow(
             """WITH picked AS (
                    SELECT id FROM memory_job
-                    WHERE (status='pending' AND available_at <= NOW())
-                       OR (status='running' AND locked_at < NOW() - $2::interval)
-                    ORDER BY priority DESC, available_at
-                    FOR UPDATE SKIP LOCKED
-                    LIMIT 1
+                    WHERE (status='pending' AND available_at <= clock_timestamp())
+                       OR (status='running' AND lease_until <= clock_timestamp()
+                           AND retry_count < max_retry)
+                    ORDER BY priority DESC, available_at, id
+                    FOR UPDATE SKIP LOCKED LIMIT 1
                )
                UPDATE memory_job j
-                  SET status='running', locked_at=NOW(), locked_by=$1,
-                      retry_count = j.retry_count
-                                    + CASE WHEN j.status = 'running' THEN 1 ELSE 0 END
-                 FROM picked
-                WHERE j.id = picked.id
-            RETURNING j.id, j.job_type, j.payload, j.retry_count, j.max_retry""",
+                  SET status='running', locked_at=clock_timestamp(), locked_by=$1,
+                      claim_token=$2, lease_until=clock_timestamp() + $3::interval,
+                      retry_count=j.retry_count + CASE WHEN j.status='running' THEN 1 ELSE 0 END
+                 FROM picked WHERE j.id=picked.id
+               RETURNING j.id, j.job_type, j.payload, j.retry_count, j.max_retry, j.claim_token""",
             self._worker,
+            uuid.uuid4(),
             lease,
         )
-        if row is None:
-            return None
-        return Job(
-            id=row["id"],
-            job_type=JobType(row["job_type"]),
-            payload=row["payload"],
-            retry_count=row["retry_count"],
-            max_retry=row["max_retry"],
-        )
+        return Job(**{**dict(row), "job_type": JobType(row["job_type"])}) if row else None
+
+    async def renew(self, job: Job, *, lease: timedelta = LEASE) -> bool:
+        if lease <= timedelta():
+            raise ValueError("job lease must be positive")
+        try:
+            async with self._database().acquire() as conn, conn.transaction():
+                await require_claim(conn, job)
+                await conn.execute(
+                    "UPDATE memory_job SET lease_until=clock_timestamp()+$2::interval WHERE id=$1",
+                    job.id,
+                    lease,
+                )
+                return True
+        except LeaseLost:
+            return False
+
+    async def done(self, job: Job) -> bool:
+        try:
+            async with self._database().acquire() as conn, conn.transaction():
+                await require_claim(conn, job)
+                await conn.execute(
+                    """UPDATE memory_job SET status='done', finished_at=clock_timestamp(),
+                       locked_by=NULL, locked_at=NULL, claim_token=NULL, lease_until=NULL
+                       WHERE id=$1""",
+                    job.id,
+                )
+                return True
+        except LeaseLost:
+            return False
+
+    async def fail(self, job: Job, error: str, *, backoff: timedelta) -> None:
+        await self._reschedule(job, error, backoff=backoff, failed=True)
+
+    async def defer(self, job: Job, reason: str, *, backoff: timedelta) -> None:
+        """Delay the same logical work without consuming or resetting retry fuel."""
+        await self._reschedule(job, reason, backoff=backoff, failed=False)
+
+    async def _reschedule(self, job: Job, error: str, *, backoff: timedelta, failed: bool) -> None:
+        async with self._database().acquire() as conn, conn.transaction():
+            await self._group_lock(conn, job.job_type, job.payload)
+            await require_claim(conn, job)
+            twin = await conn.fetchrow(
+                """SELECT id, retry_count, max_retry FROM memory_job
+                    WHERE status='pending' AND job_type=$1
+                      AND payload->>'group_id'=$2 AND id<>$3 FOR UPDATE""",
+                job.job_type.value,
+                str(job.payload["group_id"]) if "group_id" in job.payload else None,
+                job.id,
+            )
+            attempts = job.retry_count + int(failed)
+            exhausted = failed and job.exhausted
+            if twin is not None:
+                attempts = max(attempts, twin["retry_count"])
+                maximum = min(job.max_retry, twin["max_retry"])
+                exhausted = exhausted or attempts > maximum
+                await conn.execute(
+                    """UPDATE memory_job SET retry_count=$2, max_retry=$3,
+                           available_at=GREATEST(available_at, clock_timestamp() + $4::interval),
+                           status=$5::text, last_error=$6,
+                           finished_at=CASE WHEN $5='dead' THEN clock_timestamp() ELSE NULL END
+                        WHERE id=$1""",
+                    twin["id"],
+                    attempts,
+                    maximum,
+                    backoff,
+                    "dead" if exhausted else "pending",
+                    error[:2000],
+                )
+                error = "yielded to a newer pending twin: " + error
+            terminal = exhausted or twin is not None
+            await conn.execute(
+                """UPDATE memory_job SET status=$3::text, retry_count=$4,
+                       available_at=clock_timestamp() + $5::interval, last_error=$6,
+                       locked_by=NULL, locked_at=NULL, claim_token=NULL, lease_until=NULL,
+                       finished_at=CASE WHEN $3='dead' THEN clock_timestamp() ELSE NULL END
+                    WHERE id=$1 AND claim_token=$2""",
+                job.id,
+                job.claim_token,
+                "dead" if terminal else "pending",
+                attempts,
+                backoff,
+                error[:2000],
+            )
 
     async def purge_done(self, *, days: int) -> int:
-        """Delete finished jobs older than `days`. Dead rows stay - they are the
-        error record - but 'done' is pure history, and a table nothing prunes is
-        scanned by every claim poll forever."""
-        tag = await pool().execute(
+        tag = await self._database().execute(
             "DELETE FROM memory_job WHERE status='done' AND finished_at < NOW() - $1::interval",
             timedelta(days=days),
         )
-        return int(tag.split()[-1] or 0)
+        return int(tag.split()[-1])
 
-    async def done(self, job_id: uuid.UUID) -> None:
-        """Finish a job this worker still holds. The locked_by guard makes a stale
-        worker's late completion a no-op instead of overwriting a reclaimant's run."""
-        await pool().execute(
-            """UPDATE memory_job SET status='done', finished_at=NOW(), locked_by=NULL
-                WHERE id=$1 AND locked_by=$2""",
-            job_id,
-            self._worker,
+    async def depth(self, *, job_types: tuple[JobType, ...] | None = None) -> dict[str, int]:
+        rows = await self._database().fetch(
+            """SELECT status, count(*) AS n FROM memory_job
+                WHERE $1::text[] IS NULL OR job_type=ANY($1::text[]) GROUP BY status""",
+            [kind.value for kind in job_types] if job_types else None,
         )
-
-    async def fail(self, job: Job, error: str, *, backoff: timedelta) -> None:
-        """Record one failure. Once the retries are exhausted it stops and keeps the last
-        error - retrying forever turns one broken payload into a machine that burns money
-        indefinitely.
-        """
-        if job.exhausted:
-            await pool().execute(
-                """UPDATE memory_job SET status='dead', last_error=$2,
-                                         finished_at=NOW(), locked_by=NULL
-                    WHERE id=$1 AND locked_by=$3""",
-                job.id,
-                error[:2000],
-                self._worker,
-            )
-            return
-        try:
-            # The locked_by guard, like done()'s: a worker that hung past its lease
-            # reports its failure late, after a reclaim - or after the sweep above
-            # buried the job dead - and without the guard that stale report would
-            # resurrect a dead job to pending, buying runs past the max_retry cap
-            # the sweep exists to enforce.
-            await pool().execute(
-                """UPDATE memory_job
-                      SET status='pending', retry_count=retry_count+1,
-                          available_at=NOW() + $3::interval, last_error=$2, locked_by=NULL
-                    WHERE id=$1 AND locked_by=$4""",
-                job.id,
-                error[:2000],
-                backoff,
-                self._worker,
-            )
-        except asyncpg.UniqueViolationError:
-            # A fresh pending twin was legally submitted while this one ran (the
-            # dedupe index only sees pending rows), and demoting this one back to
-            # pending would collide with it. The work is the twin's now: this row
-            # steps aside with its error kept, instead of the exception escaping
-            # step() and leaving the job stuck in 'running' with no error recorded.
-            await pool().execute(
-                """UPDATE memory_job SET status='dead', last_error=$2,
-                                         finished_at=NOW(), locked_by=NULL
-                    WHERE id=$1 AND locked_by=$3""",
-                job.id,
-                ("yielded to a newer pending twin: " + error)[:2000],
-                self._worker,
-            )
-
-    async def depth(
-        self,
-        *,
-        job_types: tuple[JobType, ...] | None = None,
-    ) -> dict[str, int]:
-        """Count jobs by state, optionally for only the named kinds."""
-
-        if job_types:
-            rows = await pool().fetch(
-                """SELECT status, count(*) AS n FROM memory_job
-                    WHERE job_type = ANY($1::text[]) GROUP BY status""",
-                [job_type.value for job_type in job_types],
-            )
-        else:
-            rows = await pool().fetch(
-                "SELECT status, count(*) AS n FROM memory_job GROUP BY status"
-            )
-        return {r["status"]: r["n"] for r in rows}
+        return {row["status"]: row["n"] for row in rows}

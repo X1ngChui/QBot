@@ -14,15 +14,13 @@ from __future__ import annotations
 
 import logging
 
-from ..domain.ids import GroupId
-from ..domain.memory import Episode
-from ..providers.base import EmbeddingModel
-from ..repositories import (
-    EpisodeRepository,
-    IdentityRepository,
-    MemoryRepository,
-    VectorRepository,
-)
+from qqbot.domain.ids import GroupId
+from qqbot.domain.memory import Episode
+from qqbot.providers.base import EmbeddingModel
+from qqbot.repositories import EpisodeRepository
+from qqbot.repositories import IdentityRepository
+from qqbot.repositories import MemoryRepository
+from qqbot.repositories import VectorRepository
 
 log = logging.getLogger("qqbot.retrieve")
 

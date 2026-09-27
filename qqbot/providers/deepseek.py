@@ -3,21 +3,26 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import httpx
 
-from ..settings import TextCfg, VisionCfg
-from ..util import require_key
-from .base import Rate, RetryPolicy, with_retry
-from .contracts import ReasoningEffort, Role, StoredImage
-from .openai_responses import (
-    ResponsesCodec,
-    ResponsesTextModel,
-    ResponsesVisionModel,
-)
+from qqbot.services.budget import Budget
+from qqbot.configuration import TextCfg
+from qqbot.configuration import VisionCfg
+from qqbot.util import require_key
+from qqbot.providers.base import Rate
+from qqbot.providers.base import RetryPolicy
+from qqbot.providers.base import with_retry
+from qqbot.providers.contracts import ReasoningEffort
+from qqbot.providers.contracts import Role
+from qqbot.providers.contracts import StoredImage
+from qqbot.providers.openai_responses import ResponsesCodec
+from qqbot.providers.openai_responses import ResponsesTextModel
+from qqbot.providers.openai_responses import ResponsesVisionModel
 
 log = logging.getLogger("qqbot.deepseek")
 
@@ -111,12 +116,19 @@ class DeepSeekAttachmentStore:
     """Files API storage scoped to one configured DeepSeek text account."""
 
     FILE_TTL_SEC = 30 * 24 * 3600
+    cache_max_age = timedelta(seconds=FILE_TTL_SEC) - timedelta(minutes=5)
 
     def __init__(self, cfg: TextCfg, retry: RetryPolicy) -> None:
         self._endpoint = cfg.endpoint.rstrip("/")
         self._credential_env = cfg.credential_env
         self._retry = retry
         self._client = httpx.AsyncClient(timeout=cfg.timeout_sec)
+
+    @property
+    def cache_namespace(self) -> str:
+        key = require_key(self._credential_env, "text")
+        identity = repr((self._endpoint, key)).encode()
+        return hashlib.sha256(identity).hexdigest()[:32]
 
     async def store(self, data: bytes, media_type: str) -> StoredImage:
         key = require_key(self._credential_env, "text")
@@ -146,22 +158,24 @@ class DeepSeekAttachmentStore:
         await self._client.aclose()
 
 
-def deepseek_text(cfg: TextCfg, retry: RetryPolicy) -> ResponsesTextModel:
+def deepseek_text(cfg: TextCfg, retry: RetryPolicy, budget: Budget) -> ResponsesTextModel:
     return ResponsesTextModel(
         cfg,
         retry,
         name="deepseek",
         codec=DeepSeekResponsesCodec(),
         rate_for=rate_for,
+        budget=budget,
         attachments=DeepSeekAttachmentStore(cfg, retry),
     )
 
 
-def deepseek_vision(cfg: VisionCfg, retry: RetryPolicy) -> ResponsesVisionModel:
+def deepseek_vision(cfg: VisionCfg, retry: RetryPolicy, budget: Budget) -> ResponsesVisionModel:
     return ResponsesVisionModel(
         cfg,
         retry,
         name="deepseek",
         codec=DeepSeekResponsesCodec(),
         rate_for=rate_for,
+        budget=budget,
     )

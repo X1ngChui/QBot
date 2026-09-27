@@ -3,26 +3,29 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import timedelta
 
 import asyncpg
 
-from ..db import pool
-from ..domain.ids import GroupId
-from ..domain.memory import (
-    Candidate,
-    CandidateStatus,
-    CandidateType,
-    ExtractionBatch,
-    ExtractionSnapshot,
-    ExtractionStatus,
-)
-from .archive import archive_columns, archived_messages
+from qqbot.repositories.job import Job, fenced_transaction
+from qqbot.domain.ids import GroupId
+from qqbot.domain.memory import Candidate
+from qqbot.domain.memory import CandidateStatus
+from qqbot.domain.memory import CandidateType
+from qqbot.domain.memory import ExtractionBatch
+from qqbot.domain.memory import ExtractionSnapshot
+from qqbot.domain.memory import ExtractionStatus
+from qqbot.domain.memory.extraction import MAX_MODEL_ATTEMPTS
+from qqbot.repositories.archive import archive_columns
+from qqbot.repositories.archive import archived_messages
 
 
 class ExtractionRepository:
+    def __init__(self, *, database: Callable[[], asyncpg.Pool]) -> None:
+        self._database = database
+
     @asynccontextmanager
     async def model_slot(self, group_id: GroupId) -> AsyncIterator[bool]:
         """Hold the per-group provider slot without holding a transaction.
@@ -35,7 +38,7 @@ class ExtractionRepository:
         """
 
         key = f"memory-provider:{group_id}"
-        async with pool().acquire() as conn:
+        async with self._database().acquire() as conn:
             acquired = bool(
                 await conn.fetchval(
                     "SELECT pg_try_advisory_lock(hashtextextended($1, 0))",
@@ -52,7 +55,7 @@ class ExtractionRepository:
                     )
 
     async def open(self, group_id: GroupId) -> ExtractionBatch | None:
-        row = await pool().fetchrow(
+        row = await self._database().fetchrow(
             """SELECT * FROM memory_extraction
                 WHERE group_id=$1 AND status IN ('extracting','staged')
                 ORDER BY started_at, id LIMIT 1""",
@@ -62,7 +65,7 @@ class ExtractionRepository:
 
     async def unconsumed_count(self, group_id: GroupId) -> int:
         return int(
-            await pool().fetchval(
+            await self._database().fetchval(
                 """SELECT count(*) FROM raw_event r
                 WHERE r.group_id=$1 AND r.event_type IN ('message','notice')
                   AND NOT EXISTS (
@@ -74,6 +77,17 @@ class ExtractionRepository:
             or 0
         )
 
+    async def has_unconsumed(self, group_id: GroupId) -> bool:
+        return bool(
+            await self._database().fetchval(
+                """SELECT EXISTS (SELECT 1 FROM raw_event r
+               WHERE r.group_id=$1 AND r.event_type IN ('message','notice')
+                 AND NOT EXISTS (SELECT 1 FROM memory_extraction_event used
+                                 WHERE used.raw_event_id=r.id))""",
+                group_id.to_db(),
+            )
+        )
+
     async def claim(
         self,
         group_id: GroupId,
@@ -81,10 +95,11 @@ class ExtractionRepository:
         limit: int,
         floor: int,
         gap: timedelta,
+        fence: Job | None = None,
     ) -> ExtractionBatch | None:
         """Reserve one exact batch before any provider call."""
 
-        async with pool().acquire() as conn, conn.transaction():
+        async with fenced_transaction(self._database, fence) as conn:
             await conn.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
                 f"memory-extraction:{group_id}",
@@ -141,15 +156,39 @@ class ExtractionRepository:
                 events=tuple(events),
             )
 
+    async def begin_attempt(self, extraction_id: uuid.UUID, *, fence: Job | None = None) -> bool:
+        """Reserve durable fuel before a model call; crashes cannot refund it."""
+        async with fenced_transaction(self._database, fence) as conn:
+            row = await conn.fetchrow(
+                "SELECT status, model_attempts FROM memory_extraction WHERE id=$1 FOR UPDATE",
+                extraction_id,
+            )
+            if row is None:
+                raise RuntimeError(f"unknown extraction {extraction_id}")
+            if row["status"] != ExtractionStatus.EXTRACTING:
+                return False
+            if row["model_attempts"] >= MAX_MODEL_ATTEMPTS:
+                await conn.execute(
+                    "UPDATE memory_extraction SET status='failed' WHERE id=$1", extraction_id
+                )
+                return False
+            await conn.execute(
+                "UPDATE memory_extraction SET model_attempts=model_attempts+1 WHERE id=$1",
+                extraction_id,
+            )
+            return True
+
     async def stage(
         self,
         extraction_id: uuid.UUID,
         snapshot: ExtractionSnapshot,
         candidates: list[Candidate],
+        *,
+        fence: Job | None = None,
     ) -> None:
         """Checkpoint validated model output without applying any projection."""
 
-        async with pool().acquire() as conn, conn.transaction():
+        async with fenced_transaction(self._database, fence) as conn:
             row = await conn.fetchrow(
                 "SELECT status FROM memory_extraction WHERE id=$1 FOR UPDATE",
                 extraction_id,
@@ -157,6 +196,8 @@ class ExtractionRepository:
             if row is None:
                 raise RuntimeError(f"unknown extraction {extraction_id}")
             status = ExtractionStatus(row["status"])
+            if status is ExtractionStatus.FAILED:
+                raise RuntimeError(f"extraction {extraction_id} exhausted its attempts")
             if status is ExtractionStatus.APPLIED:
                 return
             if status is ExtractionStatus.STAGED:
@@ -199,7 +240,7 @@ class ExtractionRepository:
         *,
         conn: asyncpg.Connection | None = None,
     ) -> list[Candidate]:
-        executor = conn or pool()
+        executor = conn or self._database()
         rows = await executor.fetch(
             """SELECT * FROM memory_candidate
                 WHERE extraction_id=$1 ORDER BY created_at, id""",
@@ -227,7 +268,7 @@ class ExtractionRepository:
         *,
         conn: asyncpg.Connection | None = None,
     ) -> ExtractionBatch:
-        executor = conn or pool()
+        executor = conn or self._database()
         event_rows = await executor.fetch(
             f"""SELECT {archive_columns("r")} FROM memory_extraction_event item
                  JOIN raw_event r ON r.id=item.raw_event_id

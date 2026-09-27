@@ -11,19 +11,20 @@ sys.path.insert(0, str(ROOT))
 
 from scripts._env import load_dotenv
 
-if (ROOT / ".env").exists():
-    load_dotenv(ROOT / ".env")
 
-from qqbot.db import close_pool, init_pool
+from qqbot.db import Database, dsn
+from qqbot.configuration import load_bundle
 from qqbot.db.repo import ensure_schema
 
 
 async def _check() -> None:
-    await init_pool()
+    bundle = load_bundle()
+    database = Database(bundle.default.runtime.database, url=dsn())
     try:
-        await ensure_schema()
+        await database.start()
+        await ensure_schema(database.pool)
     finally:
-        await close_pool()
+        await database.close()
 
 
 def main() -> int:
@@ -37,4 +38,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if (ROOT / ".env").exists():
+        load_dotenv(ROOT / ".env")
     raise SystemExit(main())

@@ -9,26 +9,38 @@ python -m venv .venv
 ROOT="$(pwd -W 2>/dev/null || pwd)"
 docker run -d --name qbot-pgtest \
   -e POSTGRES_DB=qbot_test -e POSTGRES_USER=qbot_test -e POSTGRES_PASSWORD=testpw \
-  -p 15432:5432 \
+  -p 127.0.0.1:15432:5432 \
   -v "$ROOT/sql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro" \
   -v "$ROOT/tests/fixtures/test_db_marker.sql:/docker-entrypoint-initdb.d/02-test-marker.sql:ro" \
   pgvector/pgvector:0.8.5-pg17
 
-.venv/bin/python tests/run_all.py
+export QBOT_TEST_DATABASE_URL=postgresql://qbot_test@127.0.0.1:15432/qbot_test
+export QBOT_TEST_DATABASE_PASSWORD=testpw
+until docker exec qbot-pgtest pg_isready -h 127.0.0.1 -U qbot_test -d qbot_test; do
+  sleep 1
+done
+.venv/bin/python -m pytest
+.venv/bin/python -m ruff check .
 ```
 
-On Windows use `.venv\Scripts\python.exe` and a native path in the bind mount. See
-[tests/README.md](tests/README.md).
+On Windows use `.venv\Scripts\python.exe`, a native path in the bind mount, and
+PowerShell's `$env:QBOT_TEST_DATABASE_URL` / `$env:QBOT_TEST_DATABASE_PASSWORD` to
+set the explicit test connection. See [tests/README.md](tests/README.md). Database
+tests skip without `QBOT_TEST_DATABASE_URL`; when set, the guarded fixture verifies
+the disposable test role, database and `qbot_test_guard` marker before any mutation.
+Run database-mutating tests sequentially against a shared test database. Pytest is the
+only supported test entry point; run Ruff separately.
 
 Nothing in the test suite talks to QQ or to a paid API. The two evaluation scripts
 under `scripts/` do call the real model and are run by hand.
 
 ## Before opening a pull request
 
-- `tests/run_all.py` passes, including the lint step.
-- New behaviour has a test. Command handlers are importable and must be exercised directly
-  in `tests/test_commands.py`; adapter-only scheduler wiring remains covered by the
-  package-wide syntax and attribute guards until it is similarly detached.
+- `python -m pytest` and `python -m ruff check .` pass. Run the guarded database
+  cases with an explicit disposable test URL; a skipped DB case is not a DB pass.
+- New behaviour has a test. Exercise importable command handlers directly in
+  `tests/test_commands.py`; `tests/test_scheduled.py` covers durable timer claims and
+  wakeups against the guarded test database.
 - A changed prompt file has been run through the matching evaluation script
   (`scripts/eval_replies.py` or `scripts/eval_extract.py`) and the result is mentioned
   in the pull request.
@@ -37,15 +49,16 @@ under `scripts/` do call the real model and are run by hand.
 - A schema change updates the sole canonical `sql/init.sql` and the read-only structural
   contract in `qqbot/db/repo.py`; existing installations are updated manually under a
   newly verified backup. Do not add runtime fallback reads or a migration chain.
-- A new command is added to `qqbot/core/command_catalog.py`, handled in
-  `qqbot/core/commands.py`, and listed in [docs/commands.md](docs/commands.md).
+- A new command is added to `qqbot/commands/catalog.py`, handled in
+  `qqbot/commands/router.py`, and listed in [docs/commands.md](docs/commands.md).
 
 ## Conventions
 
 **Language.** Comments, docstrings, log messages and SQL are written in English. Chinese
 appears only in text the model reads (prompts, personas, predicate rules) and text a
 group member reads (command replies). `tests/test_logic.py` enforces
-this over `qqbot/` and `tests/`.
+this over Python sources in `qqbot/`, `scripts/` and `tests/`. The English-comment
+rule also applies to configuration files and shell examples.
 
 **Comments explain the present.** A comment says what the code does and why it is
 shaped that way. It does not narrate how the code got there.

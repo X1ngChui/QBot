@@ -44,7 +44,7 @@ echo "==> sending $(git rev-parse --short HEAD 2>/dev/null || echo 'working tree
 # Land the whole archive first, and extract it beside the tree rather than over it:
 # nothing of the old tree is removed until the new one has extracted whole, so a
 # transfer or extract that dies leaves a server that still builds what it ran before.
-tar czf - --exclude=__pycache__ "${PAYLOAD[@]}" | "${SSH[@]}" "cat > '$REMOTE/.deploy.tar.gz'"
+tar czf - --exclude=__pycache__ --exclude='*.migrating-*' "${PAYLOAD[@]}" | "${SSH[@]}" "cat > '$REMOTE/.deploy.tar.gz'"
 "${SSH[@]}" "cd '$REMOTE' && rm -rf .deploy.new && mkdir .deploy.new && tar xzf .deploy.tar.gz -C .deploy.new && rm -f .deploy.tar.gz \
   && rm -rf ${REPLACE[*]} && for d in ${REPLACE[*]}; do mv .deploy.new/\$d .; done \
   && for f in ${FILES[*]}; do mv -f .deploy.new/\$f .; done"

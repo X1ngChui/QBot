@@ -9,42 +9,41 @@ is now the only way they are written in production - a test with its own INSERT 
 keep passing after the real path broke.
 """
 
-import os
-import pathlib
-import sys
+import pytest
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-os.environ.setdefault("CONFIG_DIR", str(ROOT / "tests" / "fixtures" / "config"))
-from _db import configure_test_database
 
-configure_test_database()
-import asyncio
 import itertools
 
 
-from qqbot.db import init_pool, close_pool, pool
-from qqbot.db import repo
+from _test_owners import fresh_budget
+import _db as _test_db
+from _db import pool
 from qqbot.gateway.ingest import Ingestor
 from qqbot.repositories import IdentityRepository
 from qqbot.services import IdentityResolver
 from qqbot.domain.archive import AuthorKind
 from qqbot.domain.ids import GroupId
 from qqbot.gateway.onebot import GroupMessage, Sender
-from qqbot.util import now_local, today_local
+from _fixtures import now_local, today_local
 from _db import reset
 
-fails = []
 G1 = GroupId("7001")
 G2 = GroupId("7002")
 _SEQ = itertools.count(1)
-_INGESTOR = Ingestor(IdentityResolver(IdentityRepository()))
+_INGESTOR: Ingestor | None = None
 
 
-def check(name, cond, detail=""):
-    print(f"[{'ok ' if cond else 'FAIL'}] {name}  {detail}")
-    if not cond:
-        fails.append(name)
+@pytest.fixture
+def repo_ingestor(test_database, monkeypatch):
+    monkeypatch.setitem(globals(), "_SEQ", itertools.count(1))
+    monkeypatch.setitem(
+        globals(),
+        "_INGESTOR",
+        Ingestor(
+            IdentityResolver(IdentityRepository(database=_test_db.pool, clock=_test_db.clock)),
+            database=_test_db.pool,
+        ),
+    )
 
 
 async def say(group, uid, name, text, *, msg_id=None, at=None):
@@ -64,25 +63,27 @@ async def say(group, uid, name, text, *, msg_id=None, at=None):
     return mid
 
 
-async def main():
-    await init_pool()
+@pytest.mark.database
+@pytest.mark.asyncio
+async def test_repo(repo_ingestor, monkeypatch):
+    BUDGET = fresh_budget()
     await reset()
 
     # -- raw events ---------------------------------------------------------
     await say(G1, "u1", "阿强", "hi", msg_id="m1")
     await say(G1, "u1", "阿强", "dup", msg_id="m1")  # a replay after a reconnect
     n = await pool().fetchval("SELECT count(*) FROM raw_event WHERE platform_event_id='m1'")
-    check("a replayed message id does not land twice", n == 1, f"{n} rows")
+    assert n == 1, ("a replayed message id does not land twice", f"{n} rows")
     original = await pool().fetchval(
         "SELECT plain_text FROM raw_event WHERE platform_event_id='m1'"
     )
-    check("a replay cannot mutate the admitted row", original == "hi", repr(original))
+    assert original == "hi", ("a replay cannot mutate the admitted row", repr(original))
 
     class BrokenIdentity:
         async def seen(self, *_args, **_kwargs):
             raise RuntimeError("identity projection failed")
 
-    broken = Ingestor(BrokenIdentity())
+    broken = Ingestor(BrokenIdentity(), database=_test_db.pool)
     try:
         await broken.ingest(
             GroupMessage(
@@ -98,32 +99,31 @@ async def main():
     except RuntimeError:
         pass
     else:
-        check("identity failure propagates from admission", False)
-    check(
-        "identity failure rolls back the raw event append",
+        pytest.fail("identity failure did not propagate from admission")
+    assert (
         await pool().fetchval(
             "SELECT count(*) FROM raw_event WHERE platform_event_id='atomic-failure'"
         )
-        == 0,
-    )
+        == 0
+    ), "identity failure rolls back the raw event append"
 
-    await repo.backfill_plain_text("m1", "hi [图片:一只猫]")
+    await _test_db.archive.backfill_plain_text("m1", "hi [图片:一只猫]")
     got = await pool().fetchval("SELECT plain_text FROM raw_event WHERE platform_event_id='m1'")
-    check("backfill_plain_text rewrites the reading", got == "hi [图片:一只猫]", str(got))
+    assert got == "hi [图片:一只猫]", ("backfill_plain_text rewrites the reading", str(got))
     segs = await pool().fetchval(
         "SELECT payload->'segments' FROM raw_event WHERE platform_event_id='m1'"
     )
-    check("and leaves the original segments in place", segs is not None, str(segs))
+    assert segs is not None, ("and leaves the original segments in place", str(segs))
 
     # -- image cache --------------------------------------------------------
-    check("image_cache miss", await repo.image_cache_get("k1") is None)
-    await repo.image_cache_put("k1", "[表情:开心]")
-    check("image_cache hit", await repo.image_cache_get("k1") == "[表情:开心]")
-    await repo.image_cache_get("k1")
+    assert await _test_db.media_cache.image_cache_get("k1") is None, "image_cache miss"
+    await _test_db.media_cache.image_cache_put("k1", "[表情:开心]")
+    assert await _test_db.media_cache.image_cache_get("k1") == "[表情:开心]", "image_cache hit"
+    await _test_db.media_cache.image_cache_get("k1")
     hits = await pool().fetchval("SELECT hit_count FROM image_cache WHERE key='k1'")
-    check("image_cache counts hits", hits == 2, str(hits))
-    stats = await repo.image_cache_stats()
-    check("image_cache_stats", stats["n"] == 1 and stats["hits"] == 2, str(dict(stats)))
+    assert hits == 2, ("image_cache counts hits", str(hits))
+    stats = await _test_db.media_cache.image_cache_stats()
+    assert stats["n"] == 1 and stats["hits"] == 2, ("image_cache_stats", str(dict(stats)))
 
     # A description ages out so a better model gets to write it again: the paid
     # describing path asks for one no older than the configured window and treats
@@ -131,125 +131,125 @@ async def main():
     # to replace what they reject, and a stale description beats a bare marker.
     from datetime import timedelta as _td
 
-    check(
-        "a fresh description satisfies the paid path",
-        await repo.image_cache_get("k1", max_age=_td(days=15)) == "[表情:开心]",
-    )
+    assert (
+        await _test_db.media_cache.image_cache_get("k1", max_age=_td(days=15)) == "[表情:开心]"
+    ), "a fresh description satisfies the paid path"
     await pool().execute(
         "UPDATE image_cache SET described_at = now() - interval '20 days' WHERE key='k1'"
     )
-    check(
-        "an aged one is a miss there, so it gets described again",
-        await repo.image_cache_get("k1", max_age=_td(days=15)) is None,
+    assert await _test_db.media_cache.image_cache_get("k1", max_age=_td(days=15)) is None, (
+        "an aged one is a miss there, so it gets described again"
     )
-    check("but the free path still serves it", await repo.image_cache_get("k1") == "[表情:开心]")
+    assert await _test_db.media_cache.image_cache_get("k1") == "[表情:开心]", (
+        "but the free path still serves it"
+    )
     # A description always carries its time: the schema refuses one without it.
     try:
         await pool().execute("UPDATE image_cache SET described_at = NULL WHERE key='k1'")
-        check("a description without a time is refused by the schema", False, "accepted")
+        pytest.fail("schema accepted a description without a timestamp")
     except Exception as e:
-        check(
+        assert "image_cache_described_stamped" in str(e), (
             "a description without a time is refused by the schema",
-            "image_cache_described_stamped" in str(e),
             str(e)[:80],
         )
     # Re-describing stamps the row afresh, which is what ends the expiry.
-    await repo.image_cache_put("k1", "[表情:开心，重描]")
-    check(
-        "a rewrite is current again",
-        await repo.image_cache_get("k1", max_age=_td(days=15)) == "[表情:开心，重描]",
-    )
+    await _test_db.media_cache.image_cache_put("k1", "[表情:开心，重描]")
+    assert (
+        await _test_db.media_cache.image_cache_get("k1", max_age=_td(days=15))
+        == "[表情:开心，重描]"
+    ), "a rewrite is current again"
 
     # A picture the backend's content filter declined is stored as a placeholder, and
     # marked as one: it describes nothing, and a climbing count of them says the
     # backend is turning away more than it looks at. It expires like any other, so a
     # different backend - or the same one with different rules - gets to look again.
-    await repo.image_cache_put("k-refused", "⟦图片⟧", refused=True)
-    _st = await repo.image_cache_stats()
-    check("a refusal is stored as a refusal", _st["refused"] == 1, str(dict(_st)))
-    await repo.image_cache_put("k-refused", "⟦图片:一只猫⟧")
-    _st = await repo.image_cache_stats()
-    check("and stops being one once the backend does look", _st["refused"] == 0, str(dict(_st)))
+    await _test_db.media_cache.image_cache_put("k-refused", "⟦图片⟧", refused=True)
+    _st = await _test_db.media_cache.image_cache_stats()
+    assert _st["refused"] == 1, ("a refusal is stored as a refusal", str(dict(_st)))
+    await _test_db.media_cache.image_cache_put("k-refused", "⟦图片:一只猫⟧")
+    _st = await _test_db.media_cache.image_cache_stats()
+    assert _st["refused"] == 0, ("and stops being one once the backend does look", str(dict(_st)))
 
     # The upload half can land before the describing half, and neither may clobber the
     # other: a row with only a file_id reads as an undescribed picture, and the later
     # description fills the same row in.
-    await repo.image_cache_set_file("k2", "file-api-abc", provider="deepseek")
-    check("a file_id alone is not a description hit", await repo.image_cache_get("k2") is None)
-    await repo.image_cache_put("k2", "[图片:占位测试]")
-    check(
-        "the description fills the same row", await repo.image_cache_get("k2") == "[图片:占位测试]"
+    await _test_db.media_cache.image_cache_set_file("k2", "file-api-abc", provider="deepseek")
+    assert await _test_db.media_cache.image_cache_get("k2") is None, (
+        "a file_id alone is not a description hit"
     )
-    check(
-        "and the file_id survives it",
-        await repo.image_cache_file("k2", provider="deepseek") == "file-api-abc",
+    await _test_db.media_cache.image_cache_put("k2", "[图片:占位测试]")
+    assert await _test_db.media_cache.image_cache_get("k2") == "[图片:占位测试]", (
+        "the description fills the same row"
     )
-    check(
-        "a file handle never crosses provider identity",
-        await repo.image_cache_file("k2", provider="openai_responses") is None,
+    assert (
+        await _test_db.media_cache.image_cache_file("k2", provider="deepseek") == "file-api-abc"
+    ), "and the file_id survives it"
+    assert await _test_db.media_cache.image_cache_file("k2", provider="openai_responses") is None, (
+        "a file handle never crosses provider identity"
     )
     # The backend expires files, so an id is only trusted while young: one older
     # than the window (or stamped before the upload time was recorded) reads as
     # absent and the picture is uploaded again.
     from datetime import timedelta as _td_f
 
-    check(
-        "a fresh file_id is trusted inside the age window",
-        await repo.image_cache_file("k2", provider="deepseek", max_age=_td_f(days=1))
-        == "file-api-abc",
-    )
+    assert (
+        await _test_db.media_cache.image_cache_file(
+            "k2", provider="deepseek", max_age=_td_f(days=1)
+        )
+        == "file-api-abc"
+    ), "a fresh file_id is trusted inside the age window"
     await pool().execute(
         "UPDATE image_cache SET file_uploaded_at = now() - interval '2 days' WHERE key='k2'"
     )
-    check(
-        "an old file_id reads as absent",
-        await repo.image_cache_file("k2", provider="deepseek", max_age=_td_f(days=1)) is None,
-    )
+    assert (
+        await _test_db.media_cache.image_cache_file(
+            "k2", provider="deepseek", max_age=_td_f(days=1)
+        )
+        is None
+    ), "an old file_id reads as absent"
     await pool().execute("UPDATE image_cache SET file_uploaded_at = NULL WHERE key='k2'")
-    check(
-        "an unstamped file_id reads as absent too",
-        await repo.image_cache_file("k2", provider="deepseek", max_age=_td_f(days=1)) is None,
-    )
-    check(
-        "and without an age it is still returned as a hint",
-        await repo.image_cache_file("k2", provider="deepseek") == "file-api-abc",
-    )
-    check(
-        "a picture never uploaded has no file_id",
-        await repo.image_cache_file("k1", provider="deepseek") is None,
+    assert (
+        await _test_db.media_cache.image_cache_file(
+            "k2", provider="deepseek", max_age=_td_f(days=1)
+        )
+        is None
+    ), "an unstamped file_id reads as absent too"
+    assert (
+        await _test_db.media_cache.image_cache_file("k2", provider="deepseek") == "file-api-abc"
+    ), "and without an age it is still returned as a hint"
+    assert await _test_db.media_cache.image_cache_file("k1", provider="deepseek") is None, (
+        "a picture never uploaded has no file_id"
     )
 
     # -- group_state and dynamic block rules -------------------------------
-    check(
-        "a group with no rows reads as all-off",
-        not await repo.group_muted(G1) and not await repo.block_rules(G1),
-    )
-    await repo.set_group_muted(G1, True)
-    await repo.block(G1, "u9")
-    await repo.block(G1, "u8")
-    await repo.block(G1, "u9")  # Replacing one exact rule keeps one row.
-    rules = await repo.block_rules(G1)
-    check(
-        "switches and exact rules round-trip",
-        await repo.group_muted(G1)
+    assert not await _test_db.groups.group_muted(G1) and not await _test_db.groups.block_rules(
+        G1
+    ), "a group with no rows reads as all-off"
+    await _test_db.groups.set_group_muted(G1, True)
+    await _test_db.groups.block(G1, "u9")
+    await _test_db.groups.block(G1, "u8")
+    await _test_db.groups.block(G1, "u9")  # Replacing one exact rule keeps one row.
+    rules = await _test_db.groups.block_rules(G1)
+    assert (
+        await _test_db.groups.group_muted(G1)
         and {row["user_id"] for row in rules} == {"u8", "u9"}
-        and await repo.blocked(G1, "u9"),
-    )
-    check(
-        "unblocking reports whether anything changed",
-        await repo.unblock(G1, "u9") and not await repo.unblock(G1, "u9"),
-    )
-    await repo.set_group_muted(G1, False)
-    await repo.unblock(G1, "u8")
-    check("and can be cleared", not await repo.group_muted(G1) and not await repo.block_rules(G1))
-    await repo.set_group_muted(G2, True)
-    check(
-        "groups_with_state lists every group that has a row",
-        {G1, G2} <= set(await repo.groups_with_state()),
+        and await _test_db.groups.blocked(G1, "u9")
+    ), "switches and exact rules round-trip"
+    assert await _test_db.groups.unblock(G1, "u9") and not await _test_db.groups.unblock(
+        G1, "u9"
+    ), "unblocking reports whether anything changed"
+    await _test_db.groups.set_group_muted(G1, False)
+    await _test_db.groups.unblock(G1, "u8")
+    assert not await _test_db.groups.group_muted(G1) and not await _test_db.groups.block_rules(
+        G1
+    ), "and can be cleared"
+    await _test_db.groups.set_group_muted(G2, True)
+    assert {G1, G2} <= set(await _test_db.groups.groups_with_state()), (
+        "groups_with_state lists every group that has a row"
     )
     # From the table, not the in-memory registry: the daily report must list a
     # group muted before the last restart and quiet ever since.
-    check("muted_groups reads the persisted flag", await repo.muted_groups() == [G2])
+    assert await _test_db.groups.muted_groups() == [G2], "muted_groups reads the persisted flag"
 
     # -- exact extraction admission -----------------------------------------
     from datetime import timedelta as _td
@@ -258,17 +258,17 @@ async def main():
     from qqbot.repositories.job import JobType as _JT
 
     G3 = GroupId("7003")
-    extraction = _ER()
+    extraction = _ER(database=_test_db.pool)
     n0 = await extraction.unconsumed_count(G3)
-    check("a new group has no unconsumed archive events", n0 == 0, str(n0))
+    assert n0 == 0, ("a new group has no unconsumed archive events", str(n0))
     for i in range(4):
         await say(G3, "u1", "阿强", f"第 {i} 句")
     n1 = await extraction.unconsumed_count(G3)
-    check("messages arrive unconsumed", n1 == 4, str(n1))
+    assert n1 == 4, ("messages arrive unconsumed", str(n1))
 
-    await _JQ("t").submit(_JT.EXTRACT_MEMORY, {"group_id": G3}, priority=1)
+    await _JQ("t", pool).submit(_JT.EXTRACT_MEMORY, {"group_id": G3}, priority=1)
     n2 = await extraction.unconsumed_count(G3)
-    check("queueing a pass claims no events", n2 == 4, str(n2))
+    assert n2 == 4, ("queueing a pass claims no events", str(n2))
 
     claimed = await extraction.claim(
         G3,
@@ -276,22 +276,19 @@ async def main():
         floor=1,
         gap=_td(minutes=30),
     )
-    check(
-        "claiming records the exact event set",
-        len(claimed.events) == 4 and await extraction.unconsumed_count(G3) == 0,
+    assert len(claimed.events) == 4 and await extraction.unconsumed_count(G3) == 0, (
+        "claiming records the exact event set"
     )
     reopened = await extraction.open(G3)
-    check(
-        "an open extraction reloads the same ordered ids",
-        [event.raw_event_id for event in reopened.events]
-        == [event.raw_event_id for event in claimed.events],
-    )
+    assert [event.raw_event_id for event in reopened.events] == [
+        event.raw_event_id for event in claimed.events
+    ], "an open extraction reloads the same ordered ids"
     await say(G3, "u1", "阿强", "稍后才到")
-    check("a later event stays outside the open batch", await extraction.unconsumed_count(G3) == 1)
+    assert await extraction.unconsumed_count(G3) == 1, "a later event stays outside the open batch"
 
     # -- cost ledger --------------------------------------------------------
     day = today_local()
-    await repo.ledger_add(
+    await BUDGET.ledger.ledger_add(
         group_id=G1,
         kind="reply",
         model="deepseek-v4-flash",
@@ -300,7 +297,7 @@ async def main():
         out=80,
         cny=0.00036,
     )
-    await repo.ledger_add(
+    await BUDGET.ledger.ledger_add(
         group_id=G1,
         kind="extract",
         model="deepseek-v4-flash",
@@ -309,21 +306,19 @@ async def main():
         out=8,
         cny=0.000042,
     )
-    await repo.ledger_add(group_id=None, kind="search", model="search_std", cny=0.01)
-    total = await repo.day_cost(day)
-    check("day_cost sums", abs(total - 0.010402) < 1e-6, f"{total:.6f}")
-    bd = await repo.day_breakdown(day)
-    check(
+    await BUDGET.ledger.ledger_add(group_id=None, kind="search", model="search_std", cny=0.01)
+    total = await BUDGET.ledger.day_cost(day)
+    assert abs(total - 0.010402) < 1e-6, ("day_cost sums", f"{total:.6f}")
+    bd = await BUDGET.ledger.day_breakdown(day)
+    assert len(bd) == 3 and bd[0]["kind"] == "search", (
         "day_breakdown groups",
-        len(bd) == 3 and bd[0]["kind"] == "search",
         str([r["kind"] for r in bd]),
     )
     # Without a group id the ledger covers every group, which is what the shared cap is
     # measured against - the budget is not per-group.
-    one = await repo.day_breakdown(day, G1)
-    check(
+    one = await BUDGET.ledger.day_breakdown(day, G1)
+    assert {r["kind"] for r in one} == {"reply", "extract"}, (
         "a per-group breakdown leaves out the shared rows",
-        {r["kind"] for r in one} == {"reply", "extract"},
         str([r["kind"] for r in one]),
     )
 
@@ -331,15 +326,17 @@ async def main():
     # The search backend is free within a monthly credit allowance, and the ledger's
     # call count is the meter itself: no separate counter to drift, and a refusal at
     # the allowance that never reaches the vendor.
-    import os as _os
     import httpx as _hx
     from qqbot.providers.tavily import TavilySearch
     from qqbot.providers.base import QuotaExhausted, RetryPolicy
-    from qqbot.settings import config as _config
+    from _fixtures import config as _config
 
-    _os.environ.setdefault("SEARCH_API_KEY", "tvly-test-key")
-    base_search = _config().default.capabilities.search
-    search_options = _config().default.tools.web_search
+    monkeypatch.setenv("SEARCH_API_KEY", "tvly-test-key")
+    base_search = _config().default.backends.search
+    from dataclasses import replace
+    from qqbot.providers.contracts import SearchOptions
+
+    search_options = SearchOptions(base_search.count, base_search.depth)
     seen_reqs = []
 
     def _fake_tavily(req):
@@ -363,83 +360,68 @@ async def main():
 
     async def tavily(quota: int) -> TavilySearch:
         cfg = base_search.model_copy(update={"monthly_quota": quota})
-        search = TavilySearch(cfg, RetryPolicy(0, 30))
+        search = TavilySearch(cfg, RetryPolicy(0, 30), budget=BUDGET)
         await search._client.aclose()
         search._client = _hx.AsyncClient(transport=_hx.MockTransport(_fake_tavily))
         return search
 
     ts = await tavily(1)
-    spent_before = await repo.day_cost(day)
+    spent_before = await BUDGET.ledger.day_cost(day)
     items = await ts.search("天气 上海", options=search_options, group_id=G1)
     req = seen_reqs[0]
-    check(
-        "the request carries the key and the query",
+    assert (
         req.headers.get("authorization", "").startswith("Bearer tvly-")
         and b"search_depth" in req.content
-        and req.url.path == "/search",
-    )
-    check(
+        and req.url.path == "/search"
+    ), "the request carries the key and the query"
+    assert items[0] == {"title": "t1", "link": "https://a.example/1", "content": "spaced out"}, (
         "results are normalised to title/link/content",
-        items[0] == {"title": "t1", "link": "https://a.example/1", "content": "spaced out"},
         str(items[:1]),
     )
-    check(
-        "a free call books a row but no money",
-        await repo.month_calls("search", "tavily") == 1
-        and abs(await repo.day_cost(day) - spent_before) < 1e-9,
-    )
-    check(
-        "rows of another backend do not eat the allowance",
-        await repo.month_calls("search", "search_std") >= 1,
+    assert (
+        await BUDGET.ledger.month_calls("search", "tavily") == 1
+        and abs(await BUDGET.ledger.day_cost(day) - spent_before) < 1e-9
+    ), "a free call books a row but no money"
+    assert await BUDGET.ledger.month_calls("search", "search_std") >= 1, (
+        "rows of another backend do not eat the allowance"
     )
 
-    try:
+    with pytest.raises(QuotaExhausted):
         await ts.search("再来一次", options=search_options, group_id=G1)
-        check("at the allowance the backend refuses", False, "it searched")
-    except QuotaExhausted:
-        check("at the allowance the backend refuses", True)
-    check("and the refusal never reached the vendor", len(seen_reqs) == 1)
+    assert len(seen_reqs) == 1, "and the refusal never reached the vendor"
     await ts.aclose()
 
     # Advanced depth debits two vendor credits per call, and the meter counts what
     # the vendor counts - metered by calls, the real 1000 would be gone at ~500
     # while the meter read half-full, and every search past that would fail as a
     # transport error instead of the clean quota silence.
-    advanced = search_options.model_copy(update={"depth": "advanced"})
+    advanced = replace(search_options, depth="advanced")
     ts = await tavily(2)
-    try:
+    with pytest.raises(QuotaExhausted):
         await ts.search("只剩一个 credit", options=advanced, group_id=G1)
-        check("an advanced search is refused when only one credit remains", False, "it searched")
-    except QuotaExhausted:
-        check("an advanced search is refused when only one credit remains", True)
-    check("credit-aware refusal never reaches the vendor", len(seen_reqs) == 1)
+    assert len(seen_reqs) == 1, "credit-aware refusal never reaches the vendor"
     await ts.aclose()
 
     ts = await tavily(100)
     await ts.search("深度搜一次", options=advanced, group_id=G1)
-    check(
+    assert await BUDGET.ledger.month_calls("search", "tavily") == 3, (
         "an advanced search books two credits",
-        await repo.month_calls("search", "tavily") == 3,
-        str(await repo.month_calls("search", "tavily")),
+        str(await BUDGET.ledger.month_calls("search", "tavily")),
     )
 
     # Page extraction rides the same allowance: same key, same proxy, same meter,
     # same refusal at the ceiling.
     text = await ts.read_page("https://a.example/page", group_id=G1)
-    check("extract returns the page text normalised", text == "正文 开头", repr(text))
-    check(
+    assert text == "正文 开头", ("extract returns the page text normalised", repr(text))
+    assert await BUDGET.ledger.month_calls("search", "tavily") == 4, (
         "and debits the shared allowance",
-        await repo.month_calls("search", "tavily") == 4,
-        str(await repo.month_calls("search", "tavily")),
+        str(await BUDGET.ledger.month_calls("search", "tavily")),
     )
     await ts.aclose()
 
     ts = await tavily(4)
-    try:
+    with pytest.raises(QuotaExhausted):
         await ts.read_page("https://a.example/page", group_id=G1)
-        check("extract refuses at the allowance", False, "it extracted")
-    except QuotaExhausted:
-        check("extract refuses at the allowance", True)
     await ts.aclose()
 
     # -- Responses failures and served-model billing -------------------------
@@ -473,10 +455,11 @@ async def main():
         async def aclose(self):
             pass
 
-    tcfg = _config().default.capabilities.text.model_copy(deep=True)
+    tcfg = _config().default.backends.text.model_copy(deep=True)
 
     async def model_call(transport, *, retries=0, max_tokens=None):
-        model = OpenAIResponses(tcfg, RetryPolicy(0, 30))
+        model = OpenAIResponses(tcfg, RetryPolicy(0, 30), budget=BUDGET)
+        await model._executor._transport.aclose()
         model._executor._transport = transport
         request = ModelRequest(
             prompt=(Message(Role.USER, "你好"),),
@@ -496,16 +479,12 @@ async def main():
         finally:
             await model.aclose()
 
-    before_to = await repo.day_cost(day)
-    try:
+    before_to = await BUDGET.ledger.day_cost(day)
+    with pytest.raises(ModelFailure):
         await model_call(FakeTransport(TimeoutError()), max_tokens=100)
-        check("a timed-out response still raises", False, "it returned")
-    except ModelFailure:
-        check("a timed-out response still raises", True)
-    after_to = await repo.day_cost(day)
-    check(
+    after_to = await BUDGET.ledger.day_cost(day)
+    assert after_to > before_to, (
         "and its estimated spend reaches the ledger",
-        after_to > before_to,
         f"{before_to:.6f} -> {after_to:.6f}",
     )
 
@@ -532,14 +511,13 @@ async def main():
         },
     )
     recovered = await model_call(transient_transport, retries=1)
-    check(
+    assert transient_transport.calls == 2 and recovered.text == "recovered", (
         "a retryable terminal failure follows the configured retry loop",
-        transient_transport.calls == 2 and recovered.text == "recovered",
         f"calls={transient_transport.calls} text={recovered.text!r}",
     )
 
-    before_failed = await repo.day_cost(day)
-    try:
+    before_failed = await BUDGET.ledger.day_cost(day)
+    with pytest.raises(ModelFailure):
         await model_call(
             FakeTransport(
                 {
@@ -551,12 +529,8 @@ async def main():
             ),
             max_tokens=10,
         )
-        check("a non-retryable failed response still raises", False, "it returned")
-    except ModelFailure:
-        check("a non-retryable failed response still raises", True)
-    check(
-        "a failed response without usage is conservatively booked",
-        await repo.day_cost(day) > before_failed,
+    assert await BUDGET.ledger.day_cost(day) > before_failed, (
+        "a failed response without usage is conservatively booked"
     )
 
     await model_call(
@@ -576,10 +550,9 @@ async def main():
             }
         )
     )
-    _models = {r["model"] for r in await repo.day_breakdown(day)}
-    check(
+    _models = {r["model"] for r in await BUDGET.ledger.day_breakdown(day)}
+    assert "served-elsewhere" in _models, (
         "a routed call books under the model that served it",
-        "served-elsewhere" in _models,
         str(sorted(_models)),
     )
 
@@ -588,7 +561,7 @@ async def main():
     # part of thirty seconds earlier knowing nothing - while the archive holds
     # every message, its own replies included. So the window comes back from the
     # archive.
-    from qqbot.core.state import GroupState
+    from qqbot.conversation.state import GroupState
 
     await say(G1, "u1", "阿强", "昨天的图在这 https://x.example/cat.jpg")
     await say(G1, "u2", "阿花", "收到了")
@@ -606,46 +579,48 @@ async def main():
         )
     )
 
-    rows = await repo.recent_messages(G1, limit=50)
+    rows = await _test_db.archive.recent(G1, limit=50)
     _stamps = [message.occurred_at for message in rows]
-    check("recent_messages returns oldest first", _stamps == sorted(_stamps), "")
-    check(
-        "and only this group's",
-        not any(
-            message
-            for message in await repo.recent_messages(G2, limit=50)
-            if "阿强" in message.sender.display_name or "阿强" in message.text
-        ),
-        "",
-    )
+    assert _stamps == sorted(_stamps), ("recent_messages returns oldest first", "")
+    assert not any(
+        message
+        for message in await _test_db.archive.recent(G2, limit=50)
+        if "阿强" in message.sender.display_name or "阿强" in message.text
+    ), ("and only this group's", "")
 
-    st = GroupState(group_id=G1)
+    st = GroupState(
+        group_id=G1,
+        groups=_test_db.groups,
+        archive=_test_db.archive,
+        display_zone=_test_db.clock.zone,
+    )
     await st.load_history(self_id="999", owners={"u1"})
     texts = [m.text for m in st.recent]
-    check(
+    assert "收到了" in texts and any("cat.jpg" in t for t in texts), (
         "the window is rebuilt from the archive",
-        "收到了" in texts and any("cat.jpg" in t for t in texts),
         str(texts[-4:]),
     )
     by_text = {m.text: m for m in st.recent}
-    check(
-        "the bot's own replies come back marked as its own",
-        by_text["我也看看"].is_bot and by_text["我也看看"].nickname == "小X",
+    assert by_text["我也看看"].is_bot and by_text["我也看看"].nickname == "小X", (
+        "the bot's own replies come back marked as its own"
     )
-    check(
-        "and an owner comes back marked as an owner",
-        by_text["收到了"].is_owner is False
-        and any(m.is_owner for m in st.recent if m.user_id == "u1"),
-    )
+    assert by_text["收到了"].is_owner is False and any(
+        m.is_owner for m in st.recent if m.user_id == "u1"
+    ), "and an owner comes back marked as an owner"
     n_before = len(st.recent)
     await st.load_history(self_id="999", owners=set())
-    check("loading twice does not double the window", len(st.recent) == n_before)
+    assert len(st.recent) == n_before, "loading twice does not double the window"
 
     # A line that reached the window before the first chat message must not stand in
     # for the whole archive: the rebuild merges behind it rather than skipping.
-    from qqbot.core.state import ChatMsg as _CMsg
+    from qqbot.conversation.state import ChatMsg as _CMsg
 
-    st_early = GroupState(group_id=G1)
+    st_early = GroupState(
+        group_id=G1,
+        groups=_test_db.groups,
+        archive=_test_db.archive,
+        display_zone=_test_db.clock.zone,
+    )
     st_early.add(
         _CMsg(
             msg_id="cmd-early",
@@ -658,63 +633,83 @@ async def main():
     )
     await st_early.load_history(self_id="999", owners=set())
     _ids_early = [m.msg_id for m in st_early.recent]
-    check(
+    assert "收到了" in [m.text for m in st_early.recent] and "cmd-early" in _ids_early, (
         "a window seeded before the rebuild still gets the archive",
-        "收到了" in [m.text for m in st_early.recent] and "cmd-early" in _ids_early,
         str(len(_ids_early)),
     )
-    check("and the early line stays newest, after the archived ones", _ids_early[-1] == "cmd-early")
+    assert _ids_early[-1] == "cmd-early", "and the early line stays newest, after the archived ones"
 
     # -- the archive, searched ----------------------------------------------
     # The pull half of context: the prompt pushes a fixed window, and everything behind
     # it was unreachable - a link posted yesterday might as well not have existed.
-    from qqbot.core.tools import search_history
+    from qqbot.conversation.tools import search_history
 
-    hit = await search_history(G1, "cat.jpg")
-    check("the archive answers a keyword", "https://x.example/cat.jpg" in hit, hit)
-    check("with when and who", "阿强" in hit and "]" in hit, hit)
-    check(
-        "all keywords must hit, not any", "没有搜到" in await search_history(G1, "阿强 不存在的词")
+    hit = await search_history(
+        G1, "cat.jpg", database=_test_db.pool, identities=_test_db.identities, clock=_test_db.clock
     )
-    check(
-        "another group's archive is out of reach", "没有搜到" in await search_history(G2, "cat.jpg")
-    )
-    check(
-        "LIKE pattern characters are literal, not wildcards",
-        "没有搜到" in await search_history(G1, "%"),
-        "a bare % must not match everything",
-    )
-    check("an empty query is refused", "关键词为空" in await search_history(G1, "  "))
+    assert "https://x.example/cat.jpg" in hit, ("the archive answers a keyword", hit)
+    assert "阿强" in hit and "]" in hit, ("with when and who", hit)
+    assert "没有搜到" in await search_history(
+        G1,
+        "阿强 不存在的词",
+        database=_test_db.pool,
+        identities=_test_db.identities,
+        clock=_test_db.clock,
+    ), "all keywords must hit, not any"
+    assert "没有搜到" in await search_history(
+        G2,
+        "cat.jpg",
+        database=_test_db.pool,
+        identities=_test_db.identities,
+        clock=_test_db.clock,
+    ), "another group's archive is out of reach"
+    assert "没有搜到" in await search_history(
+        G1, "%", database=_test_db.pool, identities=_test_db.identities, clock=_test_db.clock
+    ), ("LIKE pattern characters are literal, not wildcards", "a bare % must not match everything")
+    assert "关键词为空" in await search_history(
+        G1, "  ", database=_test_db.pool, identities=_test_db.identities, clock=_test_db.clock
+    ), "an empty query is refused"
 
     # -- hits wrapped in their surroundings ----------------------------------
     # Chat is fragments: the line after the link is part of the story. Close
     # hits merge into one block; far-apart hits stay apart with an ellipsis
     # line between them, and the window is exactly context_lines each way.
-    check("a hit carries the lines around it", "收到了" in hit and "我也看看" in hit, hit)
+    assert "收到了" in hit and "我也看看" in hit, ("a hit carries the lines around it", hit)
     await say(G1, "u1", "阿强", "上次说的螺丝刀在哪")
     for i in range(12):
         await say(G1, "u2", "阿花", f"填充话题第{i}句")
     await say(G1, "u2", "阿花", "螺丝刀在工具箱第二层")
-    two = await search_history(G1, "螺丝刀")
-    check("far-apart hits render as separate blocks", "……" in two, two)
-    check(
+    two = await search_history(
+        G1, "螺丝刀", database=_test_db.pool, identities=_test_db.identities, clock=_test_db.clock
+    )
+    assert "……" in two, ("far-apart hits render as separate blocks", two)
+    assert "填充话题第0句" in two and "填充话题第11句" in two and "填充话题第5句" not in two, (
         "each block shows its own surroundings, cut at the window",
-        "填充话题第0句" in two and "填充话题第11句" in two and "填充话题第5句" not in two,
         two,
     )
     await say(G1, "u1", "阿强", "今晚麻辣香锅怎么样")
     await say(G1, "u2", "阿花", "麻辣香锅可以")
-    one = await search_history(G1, "麻辣香锅")
-    check(
+    one = await search_history(
+        G1, "麻辣香锅", database=_test_db.pool, identities=_test_db.identities, clock=_test_db.clock
+    )
+    assert "……" not in one and "麻辣香锅怎么样" in one and "麻辣香锅可以" in one, (
         "adjacent hits merge into one block",
-        "……" not in one and "麻辣香锅怎么样" in one and "麻辣香锅可以" in one,
         one,
     )
-    _base_rcfg = _config().default.tools.search_history
+    from qqbot.conversation.limits import HISTORY_LIMITS
+
+    _base_rcfg = HISTORY_LIMITS
     _saved_ctx = _base_rcfg.context_lines
-    _rcfg = _base_rcfg.model_copy(update={"context_lines": 0})
-    bare = await search_history(G1, "cat.jpg", rcfg=_rcfg)
-    check("context_lines 0 restores bare hits", "cat.jpg" in bare and "收到了" not in bare, bare)
+    _rcfg = replace(_base_rcfg, context_lines=0)
+    bare = await search_history(
+        G1,
+        "cat.jpg",
+        rcfg=_rcfg,
+        database=_test_db.pool,
+        identities=_test_db.identities,
+        clock=_test_db.clock,
+    )
+    assert "cat.jpg" in bare and "收到了" not in bare, ("context_lines 0 restores bare hits", bare)
 
     # -- boolean queries ------------------------------------------------------
     # Lucene syntax through luqum: juxtaposition stays AND, OR groups the
@@ -723,18 +718,39 @@ async def main():
     await say(G1, "u1", "阿强", "咖啡机到货了，明天开箱")
     await say(G1, "u2", "阿花", "复印机又坏了，打印机也别想跑")
     await say(G1, "u2", "阿花", "打印机换了新喷头 效果不错")
-    b1 = await search_history(G1, "(咖啡机 OR 打印机) -复印", rcfg=_rcfg)
-    check(
+    b1 = await search_history(
+        G1,
+        "(咖啡机 OR 打印机) -复印",
+        rcfg=_rcfg,
+        database=_test_db.pool,
+        identities=_test_db.identities,
+        clock=_test_db.clock,
+    )
+    assert "到货" in b1 and "喷头" in b1 and "别想跑" not in b1, (
         "an OR group hits either word and the exclusion drops its row",
-        "到货" in b1 and "喷头" in b1 and "别想跑" not in b1,
         b1,
     )
-    b2 = await search_history(G1, "（咖啡机 OR 复印机） 坏了", rcfg=_rcfg)
-    check(
-        "full-width parentheses parse and compose with AND", "别想跑" in b2 and "到货" not in b2, b2
+    b2 = await search_history(
+        G1,
+        "（咖啡机 OR 复印机） 坏了",
+        rcfg=_rcfg,
+        database=_test_db.pool,
+        identities=_test_db.identities,
+        clock=_test_db.clock,
     )
-    b3 = await search_history(G1, '"新喷头 效果"', rcfg=_rcfg)
-    check("a quoted phrase matches whole, space included", "喷头" in b3 and "到货" not in b3, b3)
+    assert "别想跑" in b2 and "到货" not in b2, (
+        "full-width parentheses parse and compose with AND",
+        b2,
+    )
+    b3 = await search_history(
+        G1,
+        '"新喷头 效果"',
+        rcfg=_rcfg,
+        database=_test_db.pool,
+        identities=_test_db.identities,
+        clock=_test_db.clock,
+    )
+    assert "喷头" in b3 and "到货" not in b3, ("a quoted phrase matches whole, space included", b3)
     # A hit comes back whole, and so does the result. The long messages are the
     # substantial ones - a summary, an argument, a piece of writing - and a fixed
     # width cut exactly the part worth searching for, silently and mid-word. There
@@ -742,30 +758,32 @@ async def main():
     # spend, and a character budget would be a second, blinder bound on the same thing.
     _long = "螺丝刀的来历要从头说起，" + "这段话很长很长，".join(str(i) for i in range(60))
     await say(G1, "u1", "阿强", _long)
-    _wide = await search_history(G1, "螺丝刀的来历")
+    _wide = await search_history(
+        G1,
+        "螺丝刀的来历",
+        database=_test_db.pool,
+        identities=_test_db.identities,
+        clock=_test_db.clock,
+    )
     _widest = max(len(line) for line in _wide.splitlines())
-    check(
+    assert _long in _wide, (
         "a long message comes back whole, not cut mid-word",
-        _long in _wide,
         f"{len(_long)} chars in, longest line {_widest}",
     )
-    check(
-        "a broken expression is answered in words, not raised",
-        "检索式有误" in await search_history(G1, "(("),
-    )
-    check(
-        "lucene features outside the boolean subset are refused in words",
-        "检索式有误" in await search_history(G1, "标签:值"),
-    )
+    assert "检索式有误" in await search_history(
+        G1, "((", database=_test_db.pool, identities=_test_db.identities, clock=_test_db.clock
+    ), "a broken expression is answered in words, not raised"
+    assert "检索式有误" in await search_history(
+        G1,
+        "标签:值",
+        database=_test_db.pool,
+        identities=_test_db.identities,
+        clock=_test_db.clock,
+    ), "lucene features outside the boolean subset are refused in words"
 
     # -- schema self-check ---------------------------------------------------
-    await repo.ensure_schema()
-    check("ensure_schema passes on a live schema", True)
+    from qqbot.db.repo import ensure_schema
 
-    await close_pool()
+    await ensure_schema(pool)
+
     print()
-    print("FAILED:", fails if fails else "none")
-    return 1 if fails else 0
-
-
-sys.exit(asyncio.run(main()))

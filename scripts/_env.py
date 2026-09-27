@@ -25,7 +25,7 @@ def load_dotenv(path: pathlib.Path) -> None:
         if not line or line.startswith("#") or "=" not in line:
             continue
         if line.startswith("export "):
-            line = line[len("export "):].lstrip()
+            line = line[len("export ") :].lstrip()
         key, value = line.split("=", 1)
         key, value = key.strip(), value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):

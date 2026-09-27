@@ -9,23 +9,34 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 
-from ..settings import Settings, TextCfg, VisionCfg
-from .base import EmbeddingModel, Providers, RetryPolicy, SearchEngine, TextModel, VisionModel
-from .deepseek import deepseek_text, deepseek_vision
-from .embedding import DashScopeEmbedding
-from .local import local_text, local_vision
-from .openai_responses import OpenAIResponses, openai_vision
-from .sherpa import SherpaAsr
-from .tavily import TavilySearch
+from qqbot.services.budget import Budget
+from qqbot.configuration import Settings
+from qqbot.configuration import TextCfg
+from qqbot.configuration import VisionCfg
+from qqbot.providers.base import EmbeddingModel
+from qqbot.providers.base import Providers
+from qqbot.providers.base import RetryPolicy
+from qqbot.providers.base import SearchEngine
+from qqbot.providers.base import TextModel
+from qqbot.providers.base import VisionModel
+from qqbot.providers.deepseek import deepseek_text
+from qqbot.providers.deepseek import deepseek_vision
+from qqbot.providers.embedding import DashScopeEmbedding
+from qqbot.providers.local import local_text
+from qqbot.providers.local import local_vision
+from qqbot.providers.openai_responses import OpenAIResponses
+from qqbot.providers.openai_responses import openai_vision
+from qqbot.providers.sherpa import SherpaAsr
+from qqbot.providers.tavily import TavilySearch
 
 log = logging.getLogger("qqbot.providers")
 
-TextBuilder = Callable[[TextCfg, RetryPolicy], TextModel]
-VisionBuilder = Callable[[VisionCfg, RetryPolicy], VisionModel]
+TextBuilder = Callable[[TextCfg, RetryPolicy, Budget], TextModel]
+VisionBuilder = Callable[[VisionCfg, RetryPolicy, Budget], VisionModel]
 
 TEXT_PROVIDERS: dict[str, TextBuilder] = {
     "deepseek": deepseek_text,
-    "openai_responses": lambda cfg, retry: OpenAIResponses(cfg, retry),
+    "openai_responses": OpenAIResponses,
     "local": local_text,
 }
 VISION_PROVIDERS: dict[str, VisionBuilder] = {
@@ -46,22 +57,24 @@ def _builder(table: dict[str, Callable], name: str, capability: str) -> Callable
     return build
 
 
-def build(settings: Settings) -> Providers:
-    capabilities = settings.capabilities
+def build(settings: Settings, budget: Budget) -> Providers:
+    capabilities = settings.backends
     retry = RetryPolicy(
-        retries=capabilities.http_retries,
-        retry_after_cap_sec=capabilities.retry_after_cap_sec,
+        retries=2,
+        retry_after_cap_sec=30,
     )
     search_type = _builder(SEARCH_PROVIDERS, capabilities.search.provider, "search")
     embedding_type = _builder(EMBEDDING_PROVIDERS, capabilities.embedding.provider, "embedding")
-    search = search_type(capabilities.search, retry)
+    search = search_type(capabilities.search, retry, budget)
     bundle = Providers(
-        text=_builder(TEXT_PROVIDERS, capabilities.text.provider, "text")(capabilities.text, retry),
-        vision=_builder(VISION_PROVIDERS, capabilities.vision.provider, "vision")(
-            capabilities.vision, retry
+        text=_builder(TEXT_PROVIDERS, capabilities.text.provider, "text")(
+            capabilities.text, retry, budget
         ),
-        asr=SherpaAsr(capabilities.asr),
-        embedding=embedding_type(capabilities.embedding, retry),
+        vision=_builder(VISION_PROVIDERS, capabilities.vision.provider, "vision")(
+            capabilities.vision, retry, budget
+        ),
+        asr=SherpaAsr(capabilities.asr, budget),
+        embedding=embedding_type(capabilities.embedding, retry, budget),
         search=search,
         page_reader=search,
     )

@@ -1,58 +1,14 @@
-"""Small helpers: secret reading, timezones and local time, error rendering."""
+"""Small helpers for secret reading, safe text and error rendering."""
 
 from __future__ import annotations
 
 import logging
 import os
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 log = logging.getLogger("qqbot.util")
-
-# Everything user-visible is in local time: the daily report, the cron jobs, the "what time
-# is it" line in the prompt, and the day boundary the budget resets on. Configurable via
-# `timezone` in settings.yaml; this is only the fallback until config is loaded. A named
-# zone even as the fallback, because a plain offset serialises as "UTC+08:00", which SQL
-# must never see (POSIX reads the sign backwards - tz_sql below). The offset form
-# survives only for an environment with no tzdata at all.
-try:
-    _TZ: timezone | ZoneInfo = ZoneInfo("Asia/Shanghai")
-except ZoneInfoNotFoundError:                            # pragma: no cover
-    _TZ = timezone(timedelta(hours=8))
-
-
-def set_timezone(name: str) -> None:
-    """Called once at startup. An unknown name keeps the previous zone rather than
-    crashing the bot over a typo in a display setting."""
-    global _TZ
-    try:
-        _TZ = ZoneInfo(name)
-    except (ZoneInfoNotFoundError, ValueError) as e:
-        log.error("unknown timezone %r (%s), staying on %s", name, e, _TZ)
-
-
-def tz() -> timezone | ZoneInfo:
-    return _TZ
-
-
-def tz_sql() -> str:
-    """The active zone as text PostgreSQL will read to mean the same time.
-
-    An IANA name passes through as itself. A fixed offset must be *inverted*: bare
-    offset strings are POSIX zone syntax, in which the sign runs the other way -
-    'UTC+08:00' places local time eight hours *behind* Greenwich. Serialising the
-    fallback zone with str() would shift every date derived in SQL by twice the
-    offset, which is enough to move the daily report's day boundary.
-    """
-    z = _TZ
-    if isinstance(z, ZoneInfo):
-        return str(z)
-    total = -int((z.utcoffset(None) or timedelta()).total_seconds())
-    sign = "+" if total >= 0 else "-"
-    total = abs(total)
-    return f"UTC{sign}{total // 3600:02d}:{total % 3600 // 60:02d}"
 
 
 def _read_key_file(path: Path) -> str:
@@ -106,36 +62,6 @@ def require_key(name: str, what: str) -> str:
     if not key:
         raise RuntimeError(f"no {what} API key: {name} resolved to nothing")
     return key
-
-
-def now_local() -> datetime:
-    return datetime.now(_TZ)
-
-
-def today_local() -> str:
-    return now_local().strftime("%Y-%m-%d")
-
-
-WEEKDAYS = ("周一", "周二", "周三", "周四", "周五", "周六", "周日")
-
-
-def describe_now() -> str:
-    """The current moment, for the prompt. Models have no clock of their own."""
-    n = now_local()
-    return f"{n:%Y年%m月%d日} {WEEKDAYS[n.weekday()]} {n:%H:%M}"
-
-
-def fmt_when(dt: datetime) -> str:
-    """A moment as the prompt stamps it on a transcript line ("08-30 14:03").
-
-    One format shared by the history window, the extraction transcript and the
-    search_history results, so a time read in one place matches a time read in another.
-    Aware datetimes are converted to the display zone first - asyncpg hands timestamptz
-    back in UTC, and a UTC wall time beside the local current-time line reads as hours
-    ago. A naive datetime is taken as already local."""
-    if dt.tzinfo is not None:
-        dt = dt.astimezone(_TZ)
-    return f"{dt:%m-%d %H:%M}"
 
 
 #: The system bracket pair, U+27E6/U+27E7. Every marker the system writes into a
@@ -209,7 +135,7 @@ def cut_text(text: str, limit: int) -> str:
     # Repeated because markers can nest (a forwarded record's own markers sit
     # inside its block), and one step back may land inside an outer one.
     while t.count(SYS_L) > t.count(SYS_R):
-        t = t[:t.rfind(SYS_L)]
+        t = t[: t.rfind(SYS_L)]
     return t
 
 

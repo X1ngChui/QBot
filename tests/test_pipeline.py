@@ -1,49 +1,66 @@
 """End-to-end pipeline test: fake protocol side, stubbed LLM, real DB."""
 
-import os
-import pathlib
-import sys
+import pytest
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-os.environ.setdefault("CONFIG_DIR", str(ROOT / "tests" / "fixtures" / "config"))
-from _db import configure_test_database
 
-configure_test_database()
 import asyncio
 import itertools
+from datetime import timedelta
 import re
 import types
 
 
-from qqbot.db import init_pool, close_pool, pool
+import _db as _test_db
+from _db import pool
 from qqbot.domain.ids import GroupId
-from qqbot.settings import ConfigBundle, config
-import qqbot.settings as _settings
+from qqbot.configuration import ConfigBundle
+from _fixtures import config
+import _fixtures as _settings
 from _db import reset
 from _stubs import FakeEmbedding, LegacyTextSession, function_call, response
 
 #: One stub for every bundle in this suite.
 _EMBED = FakeEmbedding()
-from qqbot.core import engine as _engine_module
-from qqbot.core import prompt as prompt_mod
-from qqbot.core.budget import BUDGET
-from qqbot.core.commands import CommandRouter
-from qqbot.core.delivery import GroupDelivery
-from qqbot.core.media import MediaCoordinator, MediaProcessor
-from qqbot.core.pipeline import Gateway
-from qqbot.core.retrieval import build_directory
-from qqbot.core.state import ChatMsg as _CM0, GroupState, Registry
+from qqbot.conversation import engine as _engine_module
+from qqbot.conversation import prompt as prompt_mod
+from qqbot.commands.router import CommandRouter
+from _test_owners import fresh_budget, fresh_members
+from qqbot.delivery.service import GroupDelivery
+from qqbot.media.coordinator import MediaCoordinator
+from qqbot.media.service import MediaProcessor
+from qqbot.gateway.pipeline import Gateway
+from qqbot.conversation.scheduler import ReplyScheduler
+from qqbot.conversation.session import ReplyExecutor
+from qqbot.services.retrieval import build_directory
+from qqbot.conversation.state import ChatMsg as _CM0
+from qqbot.conversation.state import GroupState
+from qqbot.conversation.state import Registry
 from qqbot.gateway.ingest import Ingestor
 from qqbot.repositories import IdentityLinkRepository, IdentityRepository
+from qqbot.services.identity_limits import CHALLENGE_LIMITS
 from qqbot.services import IdentityLinkService, IdentityResolver
 from qqbot.providers import AsrModel, Providers, SearchEngine, TextModel, VisionModel
 from qqbot.providers.base import QuotaExhausted, Rate
 from qqbot.providers.contracts import StoredImage
-from qqbot.util import now_local as _nl0, today_local as _today
+from _fixtures import now_local as _nl0, today_local as _today
 
-fails = []
+BUDGET = None
+MEMBERS = None
 LLM_CALLS = []
+
+# The guarded fixture builds these runtime owners for each workflow invocation.
+providers_bundle: Providers | None = None
+_IDS: IdentityRepository | None = None
+_RESOLVER: IdentityResolver | None = None
+_DIRECTORY: object = None
+_LINKS: IdentityLinkService | None = None
+REGISTRY: Registry | None = None
+_DELIVERY: GroupDelivery | None = None
+_MEDIA_PROCESSOR: MediaProcessor | None = None
+MEDIA: MediaCoordinator | None = None
+_ROUTER: CommandRouter | None = None
+EXECUTOR: ReplyExecutor | None = None
+GATEWAY: Gateway | None = None
 
 
 def install_settings(settings):
@@ -56,10 +73,16 @@ def install_settings(settings):
         bundle.prompts,
         bundle.predicates,
     )
+    if GATEWAY is not None:
+        GATEWAY._bundle = _settings._bundle
+        EXECUTOR.bundle = _settings._bundle
+        _ROUTER._bundle = _settings._bundle
+        REGISTRY._bundle = _settings._bundle
     return _settings._bundle.default
 
 
 def install_budget(settings, **changes):
+    BUDGET._daily_cap = changes.get("daily_cny_cap", settings.budget.daily_cny_cap)
     return install_settings(
         settings.model_copy(
             update={
@@ -67,22 +90,6 @@ def install_budget(settings, **changes):
             }
         )
     )
-
-
-def install_tools(settings, **changes):
-    return install_settings(
-        settings.model_copy(
-            update={
-                "tools": settings.tools.model_copy(update=changes),
-            }
-        )
-    )
-
-
-def check(name, cond, detail=""):
-    print(f"[{'ok ' if cond else 'FAIL'}] {name}  {detail}")
-    if not cond:
-        fails.append(name)
 
 
 # ---- stubs ---------------------------------------------------------------
@@ -113,14 +120,17 @@ def send_to_asker(messages, text):
             break
     return [
         function_call(
-            "send_messages",
-            {"messages": [{"content": content}]},
+            "send_message",
+            {"content": content},
             call_id=f"send-{len(LLM_CALLS)}",
         )
     ]
 
 
 class FakeAttachments:
+    cache_namespace = "fake-light"
+    cache_max_age = timedelta(days=29)
+
     async def store(self, data, media_type):
         return StoredImage("fake-light", f"file-api-fake{len(data)}")
 
@@ -145,17 +155,24 @@ class FakeText(TextModel):
     async def respond(
         self, input, *, cfg, tools=None, max_tokens=None, effort=None, kind="reply", group_id=None
     ):
-        LLM_CALLS.append(
-            {
-                "kind": kind,
-                "input": input,
-                "tools": tools,
-                "effort": effort,
-                "max_tokens": max_tokens,
-                "grade": cfg.reasoning_effort,
-                "timeout": cfg.timeout_sec,
-            }
+        finishing = any(
+            item.get("type") == "function_call_output"
+            and str(item.get("call_id", "")).startswith("send-")
+            for item in input
+            if isinstance(item, dict)
         )
+        if not finishing:
+            LLM_CALLS.append(
+                {
+                    "kind": kind,
+                    "input": input,
+                    "tools": tools,
+                    "effort": effort,
+                    "max_tokens": max_tokens,
+                    "grade": cfg.reasoning_effort,
+                    "timeout": cfg.timeout_sec,
+                }
+            )
         # No production path overrides the grade at the call: each use of the text
         # model carries its settings in its own config. Pinned so the call-site
         # exception does not creep back.
@@ -177,12 +194,16 @@ class FakeText(TextModel):
             group_id=group_id,
         )
         if kind == "reply" and tools:
+            if finishing:
+                outgoing = [function_call("finish_reply", {}, call_id="finish-reply")]
+            else:
+                outgoing = send_to_asker(input, text)
             return response(
                 model=self.MODEL,
                 in_hit=100,
                 in_miss=10,
                 out=20,
-                tool_calls=send_to_asker(input, text),
+                tool_calls=outgoing,
             )
         return response(text=text, model=self.MODEL, in_hit=100, in_miss=10, out=20)
 
@@ -233,62 +254,49 @@ class UnusedSearch(SearchEngine):
         pass
 
 
-providers_bundle = Providers(
-    text=FakeText(), vision=UnusedVision(), asr=UnusedAsr(), embedding=_EMBED, search=UnusedSearch()
-)
-_IDS = IdentityRepository()
-_RESOLVER = IdentityResolver(_IDS)
-_DIRECTORY = build_directory(identities=_IDS, resolver=_RESOLVER)
-_LINKS = IdentityLinkService(
-    config().default.identity_link,
-    _RESOLVER,
-    _IDS,
-    IdentityLinkRepository(),
-)
-REGISTRY = Registry()
-_DELIVERY = GroupDelivery()
-_MEDIA_PROCESSOR = MediaProcessor(config().default.media, providers_bundle, _DIRECTORY)
-MEDIA = MediaCoordinator(_MEDIA_PROCESSOR)
-_ROUTER = CommandRouter(_DELIVERY, REGISTRY, _DIRECTORY, _LINKS, providers_bundle)
-GATEWAY = Gateway(
-    ingestor=Ingestor(IdentityResolver(IdentityRepository())),
-    registry=REGISTRY,
-    router=_ROUTER,
-    delivery=_DELIVERY,
-    media=MEDIA,
-    providers=providers_bundle,
-    directory=_DIRECTORY,
-)
-
-
 def set_providers(bundle):
     global providers_bundle
     providers_bundle = bundle
     _MEDIA_PROCESSOR._providers = bundle
     _ROUTER._providers = bundle
-    GATEWAY._providers = bundle
+    EXECUTOR.providers = bundle
 
 
 def new_gateway():
     return Gateway(
+        replies=ReplyScheduler(
+            EXECUTOR,
+            capacity=config().default.runtime.reply_capacity,
+            concurrency=config().default.backends.text.max_concurrency,
+        ),
+        bundle=config(),
         ingestor=GATEWAY._ingestor,
         registry=REGISTRY,
         router=_ROUTER,
         delivery=_DELIVERY,
         media=MEDIA,
-        providers=providers_bundle,
-        directory=_DIRECTORY,
+        members=MEMBERS,
+        clock=_test_db.clock,
     )
 
 
 async def _respond(**kwargs):
-    return await _engine_module.respond(
+    result = await _engine_module.respond(
+        budget=BUDGET,
         providers=providers_bundle,
         media=_MEDIA_PROCESSOR,
         delivery=_DELIVERY,
         directory=_DIRECTORY,
         **kwargs,
+        members=MEMBERS,
+        database=_test_db.pool,
+        identities=_test_db.identities,
+        evidence_store=_test_db.evidence,
+        archive=_test_db.archive,
+        clock=_test_db.clock,
+        prompts=_test_db.test_bundle().prompts,
     )
+    return result.sent
 
 
 class Seg:
@@ -437,26 +445,170 @@ async def seed(group, uid, name, *, n=1, text="随便说说"):
         )
 
 
-async def main():
-    await init_pool()
+@pytest.fixture
+async def pipeline_state(test_database, monkeypatch):
+    from qqbot.conversation import session as reply_session
+    from qqbot.conversation import tools as loop_tools
+
+    monkeypatch.setitem(globals(), "BUDGET", fresh_budget())
+    monkeypatch.setitem(globals(), "MEMBERS", fresh_members())
+    monkeypatch.setattr(FakeEmbedding, "EMBED_CALLS", 0)
+    monkeypatch.setitem(globals(), "_EMBED", FakeEmbedding())
+    providers_bundle = Providers(
+        text=FakeText(),
+        vision=UnusedVision(),
+        asr=UnusedAsr(),
+        embedding=_EMBED,
+        search=UnusedSearch(),
+    )
+    _IDS = IdentityRepository(database=_test_db.pool, clock=_test_db.clock)
+    _RESOLVER = IdentityResolver(_IDS)
+    _DIRECTORY = build_directory(
+        identities=_IDS,
+        resolver=_RESOLVER,
+        database=_test_db.pool,
+        predicates=_test_db.test_bundle().predicates,
+        clock=_test_db.clock,
+    )
+    _LINKS = IdentityLinkService(
+        CHALLENGE_LIMITS,
+        _RESOLVER,
+        _IDS,
+        IdentityLinkRepository(database=_test_db.pool),
+        clock=_test_db.clock,
+    )
+    REGISTRY = Registry(
+        groups=_test_db.groups,
+        archive=_test_db.archive,
+        bundle=_test_db.test_bundle(),
+        clock=_test_db.clock,
+    )
+    _DELIVERY = GroupDelivery()
+    _MEDIA_PROCESSOR = MediaProcessor(
+        providers_bundle,
+        _DIRECTORY,
+        budget=BUDGET,
+        members=MEMBERS,
+        cache=_test_db.media_cache,
+        prompts=_test_db.test_bundle().prompts,
+    )
+    MEDIA = MediaCoordinator(_MEDIA_PROCESSOR, budget=BUDGET, archive=_test_db.archive)
+    _ROUTER = CommandRouter(
+        _DELIVERY,
+        REGISTRY,
+        _DIRECTORY,
+        _LINKS,
+        providers_bundle,
+        budget=BUDGET,
+        members=MEMBERS,
+        groups=_test_db.groups,
+        database=_test_db.pool,
+        bundle=_test_db.test_bundle(),
+        clock=_test_db.clock,
+        diagnostics=types.SimpleNamespace(count=lambda: 0),
+    )
+    EXECUTOR = ReplyExecutor(
+        bundle=config(),
+        clock=_test_db.clock,
+        database=_test_db.pool,
+        identities=_test_db.identities,
+        evidence_store=_test_db.evidence,
+        archive=_test_db.archive,
+        budget=BUDGET,
+        members=MEMBERS,
+        registry=REGISTRY,
+        delivery=_DELIVERY,
+        media=MEDIA,
+        providers=providers_bundle,
+        directory=_DIRECTORY,
+    )
+    GATEWAY = Gateway(
+        replies=ReplyScheduler(
+            EXECUTOR,
+            capacity=config().default.runtime.reply_capacity,
+            concurrency=config().default.backends.text.max_concurrency,
+        ),
+        bundle=config(),
+        ingestor=Ingestor(
+            IdentityResolver(IdentityRepository(database=_test_db.pool, clock=_test_db.clock)),
+            database=_test_db.pool,
+        ),
+        registry=REGISTRY,
+        router=_ROUTER,
+        delivery=_DELIVERY,
+        media=MEDIA,
+        members=MEMBERS,
+        clock=_test_db.clock,
+    )
+
+    monkeypatch.setitem(globals(), "_IDS", _IDS)
+    monkeypatch.setitem(globals(), "_RESOLVER", _RESOLVER)
+    monkeypatch.setitem(globals(), "_DIRECTORY", _DIRECTORY)
+    monkeypatch.setitem(globals(), "_LINKS", _LINKS)
+    monkeypatch.setitem(globals(), "REGISTRY", REGISTRY)
+    monkeypatch.setitem(globals(), "_DELIVERY", _DELIVERY)
+    monkeypatch.setitem(globals(), "_MEDIA_PROCESSOR", _MEDIA_PROCESSOR)
+    monkeypatch.setitem(globals(), "MEDIA", MEDIA)
+    monkeypatch.setitem(globals(), "_ROUTER", _ROUTER)
+    monkeypatch.setitem(globals(), "EXECUTOR", EXECUTOR)
+    monkeypatch.setitem(globals(), "GATEWAY", GATEWAY)
+    monkeypatch.setitem(globals(), "providers_bundle", providers_bundle)
+    monkeypatch.setitem(globals(), "LLM_CALLS", [])
+    monkeypatch.setitem(globals(), "_SEQ", itertools.count(1))
+    monkeypatch.setattr(FakeEvent, "_ids", itertools.count(1000))
+    monkeypatch.setattr(FakeBot, "_message_ids", itertools.count(90001))
+    monkeypatch.setitem(REPLY_TEXT, "v", REPLY_TEXT["v"])
+    monkeypatch.setitem(KNOWLEDGE, "v", KNOWLEDGE["v"])
+    for target, name in (
+        (_settings, "_bundle"),
+        (BUDGET, "_daily_cap"),
+        (BUDGET, "_loaded"),
+        (GATEWAY, "_bundle"),
+        (EXECUTOR, "bundle"),
+        (EXECUTOR, "providers"),
+        (_ROUTER, "_bundle"),
+        (_ROUTER, "_providers"),
+        (REGISTRY, "_bundle"),
+        (_MEDIA_PROCESSOR, "_providers"),
+        (_MEDIA_PROCESSOR, "_fetch"),
+        (_MEDIA_PROCESSOR, "_local"),
+        (reply_session, "MEDIA_IO"),
+        (loop_tools, "execute"),
+    ):
+        monkeypatch.setattr(target, name, getattr(target, name))
+    yield
+    try:
+        await GATEWAY.shutdown()
+    finally:
+        await GATEWAY._replies.close()
+        await MEDIA.close(timeout=1)
+        await _MEDIA_PROCESSOR.close()
+        await MEMBERS.close()
+        await _DIRECTORY.close()
+
+
+@pytest.mark.database
+@pytest.mark.asyncio
+async def test_pipeline(pipeline_state):
     await reset()
 
     cfg = config().default
     # The reply path will not start without one, which is the point: a half-wired
     # deployment must fail at boot, not quietly degrade recall.
-    from qqbot.core import nickname
+    from qqbot.gateway import nickname
 
     nickname.initialize()
-    nickname.register(cfg.trigger.nicknames)  # the plugin does this at startup
+    nickname.register(cfg.bot.nicknames)  # the plugin does this at startup
     bot = FakeBot()
 
     # 1. direct mention -> must answer, markdown stripped
     ev0 = FakeEvent("小X 在吗")
     await GATEWAY.handle(bot, ev0)
     await drain()
-    check("direct mention replies", len(bot.sent) == 1, str(bot.sent))
-    check(
-        "markdown stripped before send", bot.sent and "**" not in bot.sent[0][1], str(bot.sent[:1])
+    assert len(bot.sent) == 1, ("direct mention replies", str(bot.sent))
+    assert bot.sent and "**" not in bot.sent[0][1], (
+        "markdown stripped before send",
+        str(bot.sent[:1]),
     )
     # NapCat reports the bot's displayed message back through the same gateway, so the
     # receive path owns the window and archive copy.
@@ -465,28 +617,24 @@ async def main():
             WHERE group_id=123 AND platform_user_id=$1""",
         str(bot.self_id),
     )
-    check("the bot's own reply is archived too", len(own) == 1, str([dict(r) for r in own]))
-    check(
+    assert len(own) == 1, ("the bot's own reply is archived too", str([dict(r) for r in own]))
+    assert own and own[0]["plain_text"] == "@阿强 " + bot.sent[0][1], (
         "and it is the text that was actually sent, opened by the @ it carried",
-        own and own[0]["plain_text"] == "@阿强 " + bot.sent[0][1],
         f"{bot.sent[:1]} {own[0]['plain_text'] if own else None!r}",
     )
     # The answer is anchored to its cause: sent as a quote of the message that
     # called, and the same pointer goes into the archive so the rebuilt window
     # renders the bot's line with the ordinary quote mark.
-    check(
+    assert bot.quoted and bot.quoted[0] == str(ev0.message_id), (
         "the reply quotes the message that called",
-        bot.quoted and bot.quoted[0] == str(ev0.message_id),
         str(bot.quoted[:1]),
     )
-    check(
+    assert bot.ats and bot.ats[0] == "u1", (
         "and @-es its sender, the way QQ's own reply button does",
-        bot.ats and bot.ats[0] == "u1",
         str(bot.ats[:1]),
     )
-    check(
+    assert own and (own[0]["payload"] or {}).get("reply_to") == str(ev0.message_id), (
         "and the archive keeps the quote pointer",
-        own and (own[0]["payload"] or {}).get("reply_to") == str(ev0.message_id),
         str((own[0]["payload"] or {}).get("reply_to")) if own else "no row",
     )
 
@@ -502,18 +650,16 @@ async def main():
         ),
     )
     await drain(0.05)
-    check(
-        "a command-shaped self event is observed without replying",
-        len(bot.sent) == _sent_before_self and len(LLM_CALLS) == _calls_before_self,
+    assert len(bot.sent) == _sent_before_self and len(LLM_CALLS) == _calls_before_self, (
+        "a command-shaped self event is observed without replying"
     )
-    check(
-        "self-observation never creates a member identity for the bot",
+    assert (
         await pool().fetchval(
             "SELECT count(*) FROM identity_account WHERE platform_user_id=$1",
             str(bot.self_id),
         )
-        == 0,
-    )
+        == 0
+    ), "self-observation never creates a member identity for the bot"
     await GATEWAY.handle(
         bot,
         FakeEvent(
@@ -527,80 +673,70 @@ async def main():
     _dice_row = await pool().fetchrow(
         "SELECT plain_text, payload FROM raw_event WHERE platform_event_id='99002'"
     )
-    check(
-        "a reported self dice result reaches the window and archive",
+    assert (
         (await REGISTRY.get(GROUP)).recent[-1].text == "⟦骰子:4点⟧"
         and _dice_row["plain_text"] == "⟦骰子:4点⟧"
-        and _dice_row["payload"]["segments"][0]["data"]["result"] == "4",
+        and _dice_row["payload"]["segments"][0]["data"]["result"] == "4"
+    ), (
+        "a reported self dice result reaches the window and archive",
         repr(dict(_dice_row) if _dice_row else None),
     )
 
-    check(
-        "every reply is offered the tools - there is one model and no tier",
-        all(c["tools"] for c in LLM_CALLS if c["kind"] == "reply"),
+    assert all(c["tools"] for c in LLM_CALLS if c["kind"] == "reply"), (
+        "every reply is offered the tools - there is one model and no tier"
     )
 
     first_reply = [c for c in LLM_CALLS if c["kind"] == "reply"][0]
     sys_prompt = first_reply["input"][0]["content"]
     developer_prompt = first_reply["input"][1]["content"]
-    check(
+    assert sys_prompt.startswith(prompt_mod.H_SEND), (
         "global constants lead the prompt, so every group shares that span",
-        sys_prompt.startswith(prompt_mod.H_SEND),
         sys_prompt[:24],
     )
     # The one thing the model does comes before everything it reads: its words reach
     # the group only through the send tool.
-    check(
+    assert "唯一方式是调用 send_message" in sys_prompt[:200], (
         "and the first of them is how to speak",
-        "唯一方式是调用 send_messages" in sys_prompt[:200],
         sys_prompt[:200],
     )
     # Without this the bot denies seeing an image while holding its description - it does
     # not know that the picture marker is its own eyesight rather than something a person
     # typed.
-    check(
-        "the reply prompt explains the numbered markers",
-        "⟦图片N:描述⟧" in sys_prompt and "open_images" in sys_prompt,
+    assert "⟦图片N:描述⟧" in sys_prompt and "open_images" in sys_prompt, (
+        "the reply prompt explains the numbered markers"
     )
     # The transcript carries names but never account ids, so two people with similar names
     # are indistinguishable to the model - three members rearranging the same joke
     # nickname read as one person renaming himself, and it said so out loud. The system
     # knows better on both counts, and now says so.
-    check(
-        "the prompt says identity is judged by member number, not by name",
+    assert (
         "名字后的 ⟦N⟧ 是本次请求分配的正整数目标编号" in sys_prompt
-        and "本身不带编号，不构成身份判断" in sys_prompt,
-    )
-    check(
+        and "本身不带编号，不构成身份判断" in sys_prompt
+    ), "the prompt says identity is judged by member number, not by name"
+    assert "不能据此断言对方从未改名" in sys_prompt, (
         "and that a rename is only a rename when it was recorded",
-        "不能据此断言对方从未改名" in sys_prompt,
         sys_prompt[sys_prompt.find("曾用名") :][:120],
     )
     # A name the account displayed and a name the group calls him are different claims,
     # and the prompt has to say so or the second gets reported as the first.
-    check(
-        "and that a registered alias is not a name he used to display",
-        "不要说成「他以前叫」" in sys_prompt,
+    assert "不要说成「他以前叫」" in sys_prompt, (
+        "and that a registered alias is not a name he used to display"
     )
     # These hold with or without a roster, so they ship apart from the lists: this group
     # has no members configured and still gets them.
-    check(
-        "reading rules ship whether or not anyone is configured",
-        prompt_mod.H_CREDIBILITY in sys_prompt,
+    assert prompt_mod.H_CREDIBILITY in sys_prompt, (
+        "reading rules ship whether or not anyone is configured"
     )
     # Reply and extraction deliberately expose different identity targets. A reply
     # number names the current linked holder, while extraction records exact accounts.
-    check(
-        "the rules separate linked reply targets from exact extraction accounts",
-        "回复路径按当前关联账号集合编号" in sys_prompt and "提取路径按精确账号编号" in sys_prompt,
+    assert (
+        "回复路径按当前关联账号集合编号" in sys_prompt and "提取路径按精确账号编号" in sys_prompt
+    ), "the rules separate linked reply targets from exact extraction accounts"
+    assert "系统没有告知的身份关系" in sys_prompt and "都是未知的，不猜" in sys_prompt, (
+        "and stop short of what is not known"
     )
-    check(
-        "and stop short of what is not known",
-        "系统没有告知的身份关系" in sys_prompt and "都是未知的，不猜" in sys_prompt,
-    )
-    check(
-        "the group-scoped persona follows global policy as developer context",
-        prompt_mod.H_PERSONA in developer_prompt and prompt_mod.H_PERSONA not in sys_prompt,
+    assert prompt_mod.H_PERSONA in developer_prompt and prompt_mod.H_PERSONA not in sys_prompt, (
+        "the group-scoped persona follows global policy as developer context"
     )
     # The whole point of a code-supplied fact is that it is certain. That is worth nothing
     # unless the certain lines are marked apart from the guessed ones - the model had been
@@ -609,26 +745,23 @@ async def main():
     # broke every section boundary should fail loudly, not be quietly re-typed in a test.
     # A transcript is not a document. Every prompt was written as if it meant what it said,
     # which is how a member's throwaway boast about their ancestry became a recorded trait.
-    check(
-        "the reply path is told how a group chat reads",
-        prompt_mod.H_TONE in sys_prompt and "不只看字面" in sys_prompt,
+    assert prompt_mod.H_TONE in sys_prompt and "不只看字面" in sys_prompt, (
+        "the reply path is told how a group chat reads"
     )
-    check("and told not to correct a joke", "不要无故上纲上线或一本正经纠正" in sys_prompt)
+    assert "不要无故上纲上线或一本正经纠正" in sys_prompt, "and told not to correct a joke"
     from qqbot.services import MemoryExtractor
 
-    _CP = MemoryExtractor(cfg, providers_bundle.text).prompt
-    check(
-        "the memory path gets the same reading, minus the part about speaking",
-        "不只看字面" in _CP and "不要无故上纲上线" not in _CP,
+    _CP = MemoryExtractor(_test_db.bundle_for_settings(cfg), providers_bundle.text).prompt
+    assert "不只看字面" in _CP and "不要无故上纲上线" not in _CP, (
+        "the memory path gets the same reading, minus the part about speaking"
     )
     # One discernment, two consequences: the judgment half is the shared
     # tone_rules, and extraction's own note says what not to record.
-    check(
-        "with its own instruction for what to do with a joke", "没有被当真的话不产生任何候选" in _CP
+    assert "没有被当真的话不产生任何候选" in _CP, (
+        "with its own instruction for what to do with a joke"
     )
 
-    check(
-        "the authority sections are marked",
+    assert (
         all(
             h in sys_prompt
             for h in (
@@ -640,14 +773,14 @@ async def main():
                 prompt_mod.H_TONE,
             )
         )
-        and prompt_mod.H_PERSONA in developer_prompt,
-    )
-    check("and says to use visible media directly", "应直接使用" in sys_prompt)
+        and prompt_mod.H_PERSONA in developer_prompt
+    ), "the authority sections are marked"
+    assert "应直接使用" in sys_prompt, "and says to use visible media directly"
     from qqbot.prompting import PromptKey
-    from qqbot.settings import prompt_catalog
+    from _fixtures import prompt_catalog
 
     _LEG = prompt_catalog().source(PromptKey.SHARED_LEGEND)
-    check("one legend, shared by the reply and memory paths", _LEG in sys_prompt and _LEG in _CP)
+    assert _LEG in sys_prompt and _LEG in _CP, "one legend, shared by the reply and memory paths"
 
     # 1b. A real @ arrives as to_me with the segment already stripped by the adapter.
     # Relying on the at segment alone means the must-answer path never fires for @.
@@ -655,35 +788,36 @@ async def main():
     n_at = len(bot.sent)
     await GATEWAY.handle(bot, FakeEvent("你好，介绍一下自己", to_me=True))
     await drain()
-    check(
+    assert len(bot.sent) == n_at + 1, (
         "@ mention replies even with the at segment stripped",
-        len(bot.sent) == n_at + 1,
         str(bot.sent[n_at:]),
     )
     at_call = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]
-    check(
-        "prompt shows the bot was addressed",
-        "⟦0⟧" in at_call["input"][-1]["content"] and "@我" not in at_call["input"][-1]["content"],
-    )
+    assert (
+        "⟦0⟧" in at_call["input"][-1]["content"] and "@我" not in at_call["input"][-1]["content"]
+    ), "prompt shows the bot was addressed"
 
     # 1c. Owner recognition. The prompt only ever carries a display name, so without a
     # tag derived from the account id the bot cannot tell who its owner is the moment
     # they change their group card.
-    cfg = install_settings(cfg.model_copy(update={"owners": ["u9"]}))
+    cfg = install_settings(
+        cfg.model_copy(update={"bot": cfg.bot.model_copy(update={"owners": ("u9",)})})
+    )
     await REGISTRY.get(GROUP)
     await GATEWAY.handle(bot, FakeEvent("在吗", to_me=True, user_id="u9", nickname="随便改的名字"))
     await drain()
     own_tail = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["input"][-1]["content"]
-    check(
+    assert re.search(r"随便改的名字⟦\d+⟧⟦拥有者⟧", own_tail), (
         "owner is tagged in the prompt, behind the member number",
-        re.search(r"随便改的名字⟦\d+⟧⟦拥有者⟧", own_tail),
         own_tail[-90:],
     )
     await GATEWAY.handle(bot, FakeEvent("在吗", to_me=True, user_id="u1", nickname="阿强"))
     await drain()
     plain_tail = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["input"][-1]["content"]
-    check("a non-owner is not tagged", "阿强（拥有者）" not in plain_tail)
-    cfg = install_settings(cfg.model_copy(update={"owners": []}))
+    assert "阿强（拥有者）" not in plain_tail, "a non-owner is not tagged"
+    cfg = install_settings(
+        cfg.model_copy(update={"bot": cfg.bot.model_copy(update={"owners": ()})})
+    )
 
     # 2. A nickname inside a longer word is not being addressed. This is the whole
     # trigger now, so the boundary rule is the only thing standing between the bot and
@@ -692,7 +826,7 @@ async def main():
     st = await REGISTRY.get(GROUP)
     await GATEWAY.handle(bot, FakeEvent("这个小Xbox游戏机不错"))
     await drain()
-    check("substring-only hit does not answer", len(bot.sent) == n0, str(bot.sent[n0:]))
+    assert len(bot.sent) == n0, ("substring-only hit does not answer", str(bot.sent[n0:]))
 
     # 3. Not being addressed at all costs nothing: no reply, and no model call of
     # any kind - being addressed is the entire trigger, and every other message
@@ -700,28 +834,27 @@ async def main():
     calls_before = len(LLM_CALLS)
     await GATEWAY.handle(bot, FakeEvent("今天天气不错"))
     await drain()
-    check("an unaddressed message draws no reply", len(bot.sent) == n0)
-    check(
+    assert len(bot.sent) == n0, "an unaddressed message draws no reply"
+    assert len(LLM_CALLS) == calls_before, (
         "and costs no model call at all",
-        len(LLM_CALLS) == calls_before,
         str([c["kind"] for c in LLM_CALLS[calls_before:]]),
     )
 
     # 4. Being addressed is the only way in, and it goes straight to the reply.
     await GATEWAY.handle(bot, FakeEvent("小X 有人打游戏吗"))
     await drain()
-    check("being addressed answers", len(bot.sent) == n0 + 1, str(bot.sent[n0:]))
+    assert len(bot.sent) == n0 + 1, ("being addressed answers", str(bot.sent[n0:]))
     last_reply = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]
     # Deliberation for replies is a config grade (reasoning_effort), so the call
     # itself carries no override - the backend reads the grade from cfg.
-    check("replies leave deliberation to config", last_reply["effort"] is None)
+    assert last_reply["effort"] is None, "replies leave deliberation to config"
 
     # 5. Muting outranks it. This is the only remaining way to make the bot ignore an @.
     n1 = len(bot.sent)
     st.muted = True
     await GATEWAY.handle(bot, FakeEvent("小X 在吗"))
     await drain()
-    check("a muted group stays silent even when addressed", len(bot.sent) == n1)
+    assert len(bot.sent) == n1, "a muted group stays silent even when addressed"
     st.muted = False
 
     # 6. one message, one verdict: in a burst only the addressed fragment draws a
@@ -733,20 +866,17 @@ async def main():
         await GATEWAY.handle(bot, e)
         await asyncio.sleep(0.05)
     await drain()
-    check(
+    assert len(bot.sent) == n2 + 1, (
         "only the addressed fragment replies",
-        len(bot.sent) == n2 + 1,
         f"{len(bot.sent) - n2} replies",
     )
-    check(
+    assert bot.quoted[-1] == str(ev6.message_id), (
         "and the reply quotes exactly that fragment",
-        bot.quoted[-1] == str(ev6.message_id),
         f"quoted {bot.quoted[-1]}",
     )
     tail6 = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["input"][-1]["content"]
-    check(
+    assert "小X 你看" in tail6 and "怎么样" not in tail6, (
         "the slice ends at the addressed message - later fragments stay out",
-        "小X 你看" in tail6 and "怎么样" not in tail6,
         tail6[-80:],
     )
 
@@ -758,15 +888,15 @@ async def main():
     await GATEWAY.handle(bot, ev_a)
     await GATEWAY.handle(bot, ev_b)
     await drain()
-    check(
+    assert len(bot.sent) == n2b + 2, (
         "two near-simultaneous askers get two replies",
-        len(bot.sent) == n2b + 2,
         f"{len(bot.sent) - n2b} replies",
     )
-    check(
+    assert dict(zip(bot.quoted[-2:], bot.ats[-2:], strict=True)) == {
+        str(ev_a.message_id): "u1",
+        str(ev_b.message_id): "u7",
+    }, (
         "each reply quotes and @s its own asker, whatever the finish order",
-        dict(zip(bot.quoted[-2:], bot.ats[-2:], strict=True))
-        == {str(ev_a.message_id): "u1", str(ev_b.message_id): "u7"},
         f"{bot.quoted[-2:]} {bot.ats[-2:]}",
     )
 
@@ -776,9 +906,8 @@ async def main():
     for i in range(5):
         await GATEWAY.handle(bot, FakeEvent(f"小X 第{i}次"))
     await drain()
-    check(
+    assert len(bot.sent) - n3 == 5, (
         "every ask is answered, none rate-dropped",
-        len(bot.sent) - n3 == 5,
         f"{len(bot.sent) - n3} sent",
     )
 
@@ -792,13 +921,13 @@ async def main():
     rows = await pool().fetchval(
         "SELECT count(*) FROM raw_event WHERE platform_event_id=$1", str(ev.message_id)
     )
-    check("duplicate message archived once", rows == 1, str(rows))
-    check(
+    assert rows == 1, ("duplicate message archived once", str(rows))
+    assert len(bot.sent) == before_duplicate + 1, (
         "a duplicate across gateway instances causes only one reply",
-        len(bot.sent) == before_duplicate + 1,
         f"{len(bot.sent) - before_duplicate} replies",
     )
     await replay_gateway.shutdown()
+    await replay_gateway._replies.close()
 
     # Admission failure is terminal: no command mutation, live line, output or model call.
     admission = GATEWAY._ingestor
@@ -808,7 +937,9 @@ async def main():
         raise RuntimeError("scripted archive failure")
 
     admission.ingest = fail_ingest
-    cfg = install_settings(cfg.model_copy(update={"owners": ["10000"]}))
+    cfg = install_settings(
+        cfg.model_copy(update={"bot": cfg.bot.model_copy(update={"owners": ("10000",)})})
+    )
     failed_event = FakeEvent("/mute on", user_id="10000", nickname="拥有者")
     failed_state = await REGISTRY.get(GROUP)
     before_failed_sent = len(bot.sent)
@@ -823,20 +954,20 @@ async def main():
             failed_raised = False
     finally:
         admission.ingest = original_ingest
-    check(
-        "archive failure stops every downstream side effect",
+    assert (
         failed_raised
         and failed_state.muted == before_failed_muted
         and len(bot.sent) == before_failed_sent
         and len(LLM_CALLS) == before_failed_calls
-        and not any(m.msg_id == str(failed_event.message_id) for m in failed_state.recent),
-    )
+        and not any(m.msg_id == str(failed_event.message_id) for m in failed_state.recent)
+    ), "archive failure stops every downstream side effect"
 
     command_event = FakeEvent("/mute on", user_id="10000", nickname="拥有者")
     command_replay = new_gateway()
     await GATEWAY.handle(bot, command_event)
     await command_replay.handle(bot, command_event)
     await command_replay.shutdown()
+    await command_replay._replies.close()
     command_input = await pool().fetchrow(
         """SELECT id, plain_text FROM raw_event
             WHERE platform_event_id=$1""",
@@ -848,50 +979,50 @@ async def main():
             ORDER BY occurred_at DESC, id DESC LIMIT 1""",
         str(command_event.message_id),
     )
-    check(
-        "a command is admitted before its handler mutates state",
+    assert (
         command_input is not None
         and command_input["plain_text"] == "/mute on"
-        and failed_state.muted,
-        repr(command_input),
-    )
+        and failed_state.muted
+    ), ("a command is admitted before its handler mutates state", repr(command_input))
     command_output_count = await pool().fetchval(
         """SELECT count(*) FROM raw_event
             WHERE payload->>'reply_to'=$1 AND payload->>'author_kind'='bot'""",
         str(command_event.message_id),
     )
-    check(
-        "command input and self-observed output form one archived pair across replays",
+    assert (
         command_output is not None
         and "已静音" in command_output["plain_text"]
-        and command_output_count == 1,
+        and command_output_count == 1
+    ), (
+        "command input and self-observed output form one archived pair across replays",
         f"{command_output!r} count={command_output_count}",
     )
     await GATEWAY.handle(
         bot,
         FakeEvent("/mute off", user_id="10000", nickname="拥有者"),
     )
-    cfg = install_settings(cfg.model_copy(update={"owners": []}))
+    cfg = install_settings(
+        cfg.model_copy(update={"bot": cfg.bot.model_copy(update={"owners": ()})})
+    )
 
     # 9. blocklist: blocked means unanswered, nothing more - the message still
     # archives so the window stays coherent; the reply is what is withheld.
-    from qqbot.db import repo as _repo
 
     await REGISTRY.get(GROUP)
-    await _repo.block(GROUP, "u9")
+    await _test_db.groups.block(GROUP, "u9")
     n5 = len(bot.sent)
     await GATEWAY.handle(bot, FakeEvent("小X 在吗", user_id="u9"))
     await drain()
-    check("a blocked user is dropped", len(bot.sent) == n5)
-    await _repo.unblock(GROUP, "u9")
+    assert len(bot.sent) == n5, "a blocked user is dropped"
+    await _test_db.groups.unblock(GROUP, "u9")
 
     # 11. nothing that changes every turn may sit in the cached system block.
     await REGISTRY.get(GROUP)
     await GATEWAY.handle(bot, FakeEvent("小X 显卡现在多少钱"))
     await drain()
     msgs = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["input"]
-    check("the message being answered is in the tail", "显卡现在多少钱" in msgs[-1]["content"])
-    check("and not in the cached system block", "显卡现在多少钱" not in msgs[0]["content"])
+    assert "显卡现在多少钱" in msgs[-1]["content"], "the message being answered is in the tail"
+    assert "显卡现在多少钱" not in msgs[0]["content"], "and not in the cached system block"
 
     # 12. The daily cap stops the bot, including when it is addressed.
     #
@@ -903,12 +1034,11 @@ async def main():
     n6 = len(bot.sent)
     await GATEWAY.handle(bot, FakeEvent("随便说点什么"))
     await drain()
-    check("over budget: an unaddressed message draws nothing", len(bot.sent) == n6)
+    assert len(bot.sent) == n6, "over budget: an unaddressed message draws nothing"
     await GATEWAY.handle(bot, FakeEvent("小X 你还在吗"))
     await drain()
-    check(
+    assert len(bot.sent) == n6, (
         "over budget: being addressed does not buy an exemption",
-        len(bot.sent) == n6,
         f"{len(bot.sent) - n6} replies past the cap",
     )
 
@@ -921,17 +1051,17 @@ async def main():
     # and it had a loop: an in-joke written down got used in a reply, the reply was
     # archived, and the next rewrite read the bot's own words as evidence that the group
     # still said it.
-    from qqbot.core import retrieval as _r
+    from qqbot.services import retrieval as _r
     from qqbot.domain.memory import Fact as _F, MemoryType as _MT
     from qqbot.repositories import IdentityRepository as _IR, MemoryRepository as _MR
 
     _gid = GROUP
-    _subject = await _IR().group_entity(_gid)
+    _subject = await _IR(database=_test_db.pool, clock=_test_db.clock).group_entity(_gid)
     for _pred, _key, _val in (
         ("topic", None, "做音乐的群"),
         ("term", "切片", "把采样切成小段再重排"),
     ):
-        await _MR().supersede(
+        await _MR(database=_test_db.pool, clock=_test_db.clock).supersede(
             _F(
                 subject_entity_id=_subject,
                 predicate=_pred,
@@ -944,39 +1074,31 @@ async def main():
             [],
             when=_nl0(),
         )
-    _facts = await _r.group_knowledge(_gid)
-    check(
-        "the group's own facts read back",
-        _facts == [
-            "事实：做音乐的群（置信度 0.50）", "事实：切片：把采样切成小段再重排（置信度 0.50）"
-        ],
-        str(_facts),
-    )
-    check("the topic comes first", _facts[0] == "事实：做音乐的群（置信度 0.50）", str(_facts))
+    _facts = await _r.group_knowledge(_gid, database=_test_db.pool, clock=_test_db.clock)
+    assert _facts == [
+        "事实：做音乐的群（置信度 0.50）",
+        "事实：切片：把采样切成小段再重排（置信度 0.50）",
+    ], ("the group's own facts read back", str(_facts))
+    assert _facts[0] == "事实：做音乐的群（置信度 0.50）", ("the topic comes first", str(_facts))
 
     _, persona_k = config().for_group(GROUP)
-    _split = prompt_mod.build_system(persona_k, [], _facts)
-    check(
+    _split = prompt_mod.build_system(persona_k, [], _facts, prompts=_test_db.test_bundle().prompts)
+    assert "未确认线索（可能有误或已过时" in _split and "切片：把采样切成小段再重排" in _split, (
         "they reach the prompt as the bot's own summary",
-        "未确认线索（可能有误或已过时" in _split and "切片：把采样切成小段再重排" in _split,
         _split[-200:],
     )
-    check(
-        "and the hand-written material is kept above them",
-        "已确认（固定资料）" in _split
-        and _split.index("已确认（固定资料）") < _split.index("未确认线索（可能有误或已过时"),
-        _split[-200:],
-    )
+    assert "已确认（固定资料）" in _split and _split.index("已确认（固定资料）") < _split.index(
+        "未确认线索（可能有误或已过时"
+    ), ("and the hand-written material is kept above them", _split[-200:])
 
     # A group is an entity, which is what lets its facts use the whole model. Two accounts
     # merging must never reach it, and it must not turn up in anybody's roster.
-    check(
-        "the group's entity is not an account in the roster",
-        all(c.user_id != str(_gid) for c in await _DIRECTORY.roster(_gid)),
+    assert all(c.user_id != str(_gid) for c in await _DIRECTORY.roster(_gid)), (
+        "the group's entity is not an account in the roster"
     )
     # Redefining a word supersedes; a second word is a second row. Without the word in the
     # predicate a group could hold exactly one term.
-    await _MR().supersede(
+    await _MR(database=_test_db.pool, clock=_test_db.clock).supersede(
         _F(
             subject_entity_id=_subject,
             predicate="term",
@@ -989,7 +1111,7 @@ async def main():
         [],
         when=_nl0(),
     )
-    await _MR().supersede(
+    await _MR(database=_test_db.pool, clock=_test_db.clock).supersede(
         _F(
             subject_entity_id=_subject,
             predicate="term",
@@ -1002,16 +1124,13 @@ async def main():
         [],
         when=_nl0(),
     )
-    _facts2 = await _r.group_knowledge(_gid)
-    check(
-        "redefining a term replaces it rather than adding one",
-        "事实：切片：改了个说法（置信度 0.50）" in _facts2
-        and not any("切片：把采样切成小段再重排" in fact for fact in _facts2),
-        str(_facts2),
-    )
-    check(
+    _facts2 = await _r.group_knowledge(_gid, database=_test_db.pool, clock=_test_db.clock)
+    assert "事实：切片：改了个说法（置信度 0.50）" in _facts2 and not any(
+        "切片：把采样切成小段再重排" in fact for fact in _facts2
+    ), ("redefining a term replaces it rather than adding one", str(_facts2))
+    assert "事实：干声：没加效果的人声（置信度 0.50）" in _facts2, (
         "and a different term is a separate entry",
-        "事实：干声：没加效果的人声（置信度 0.50）" in _facts2, str(_facts2)
+        str(_facts2),
     )
 
     # 12d. Pictures are understood on arrival: the CDN link is freshest then, the
@@ -1065,25 +1184,22 @@ async def main():
     )
     await GATEWAY.handle(bot, img_event)
     await drain(2.0)
-    check("the bot did not answer it", len(bot.sent) == n_before)
-    check(
+    assert len(bot.sent) == n_before, "the bot did not answer it"
+    assert len(VISION_SEEN) == 1, (
         "but the picture was understood the moment it arrived",
-        len(VISION_SEEN) == 1,
         str(VISION_SEEN),
     )
     stored = await pool().fetchval(
         "SELECT plain_text FROM raw_event WHERE platform_event_id=$1", str(img_event.message_id)
     )
-    check(
+    assert "橘猫" in (stored or ""), (
         "and the archive carries the description straight away",
-        "橘猫" in (stored or ""),
         repr(stored),
     )
     # But the free half still runs on arrival - an unresolved mention would archive as an
     # account number, which is the one thing the roster exists to keep out of the prompt.
-    check(
+    assert "群里的阿明" in (stored or "") and "24680" not in (stored or ""), (
         "while the mention was still resolved to a name",
-        "群里的阿明" in (stored or "") and "24680" not in (stored or ""),
         repr(stored),
     )
 
@@ -1091,7 +1207,7 @@ async def main():
     # picture arrived and has been sitting in the history since.
     await GATEWAY.handle(bot, FakeEvent("小X 刚那张图是什么"))
     await drain(2.0)
-    check("a question about it pays nothing more", len(VISION_SEEN) == 1, str(VISION_SEEN))
+    assert len(VISION_SEEN) == 1, ("a question about it pays nothing more", str(VISION_SEEN))
     hist = "\n".join(
         content
         if isinstance((content := m.get("content")), str)
@@ -1102,24 +1218,21 @@ async def main():
         )
         for m in [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["input"]
     )
-    check(
+    assert "橘猫" in hist and "群里的阿明 ⟦图片⟧" not in hist, (
         "and the description lands in the history, where the question points",
-        "橘猫" in hist and "群里的阿明 ⟦图片⟧" not in hist,
         hist[-200:],
     )
     backfilled = await pool().fetchval(
         "SELECT plain_text FROM raw_event WHERE platform_event_id=$1", str(img_event.message_id)
     )
-    check(
+    assert "橘猫" in (backfilled or ""), (
         "the archive is corrected too, so memory keeps the description",
-        "橘猫" in (backfilled or ""),
         repr(backfilled),
     )
     await GATEWAY.handle(bot, FakeEvent("小X 那图呢"))
     await drain(2.0)
-    check(
+    assert len(VISION_SEEN) == 1, (
         "and asking again does not pay for it a second time",
-        len(VISION_SEEN) == 1,
         str(VISION_SEEN),
     )
 
@@ -1133,9 +1246,8 @@ async def main():
         ),
     )
     await drain(2.0)
-    check(
+    assert len(VISION_SEEN) == 1, (
         "a repost of the same picture is answered from the cache",
-        len(VISION_SEEN) == 1,
         str(VISION_SEEN),
     )
 
@@ -1149,27 +1261,24 @@ async def main():
     )
     await GATEWAY.handle(bot, img2)
     await drain(2.0)
-    check("a picture that draws a reply is understood", len(VISION_SEEN) == 2, str(VISION_SEEN))
+    assert len(VISION_SEEN) == 2, ("a picture that draws a reply is understood", str(VISION_SEEN))
     tail_i = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["input"][-1]["content"]
     # Nothing is pushed: the tail stays text, the description line carries a number,
     # and the model opens the original by that number if it wants the pixels.
-    check(
+    assert isinstance(tail_i, str), (
         "the tail stays plain text - no original is pushed",
-        isinstance(tail_i, str),
         str(tail_i)[:160],
     )
     tail_text = tail_i if isinstance(tail_i, str) else ""
-    check(
-        "and its description reaches the model, numbered",
+    assert (
         "橘猫" in tail_text
         and "⟦图片" in tail_text
-        and tail_text.split("⟦图片", 1)[1][:1].isdigit(),
-        tail_text[-120:],
-    )
+        and tail_text.split("⟦图片", 1)[1][:1].isdigit()
+    ), ("and its description reaches the model, numbered", tail_text[-120:])
     stored2 = await pool().fetchval(
         "SELECT plain_text FROM raw_event WHERE platform_event_id=$1", str(img2.message_id)
     )
-    check("and is backfilled into the archive", "橘猫" in (stored2 or ""), repr(stored2))
+    assert "橘猫" in (stored2 or ""), ("and is backfilled into the archive", repr(stored2))
 
     # The money guard on this path is the daily cap, asked inside the describing call
     # itself, because nothing upstream of arrival gates spending any more.
@@ -1182,17 +1291,15 @@ async def main():
     )
     await GATEWAY.handle(bot, capped)
     await drain()
-    check(
+    assert len(VISION_SEEN) == seen_now, (
         "past the daily cap a fresh picture is not described",
-        len(VISION_SEEN) == seen_now,
         str(VISION_SEEN),
     )
     stored_e = await pool().fetchval(
         "SELECT plain_text FROM raw_event WHERE platform_event_id=$1", str(capped.message_id)
     )
-    check(
+    assert "⟦图片⟧" in (stored_e or "") and "橘猫" not in (stored_e or ""), (
         "and its marker stays bare, ready for a cheaper day",
-        "⟦图片⟧" in (stored_e or "") and "橘猫" not in (stored_e or ""),
         repr(stored_e),
     )
     cfg = install_budget(cfg, daily_cny_cap=cap_was)
@@ -1205,15 +1312,14 @@ async def main():
     # pins).
     await GATEWAY.handle(bot, FakeEvent("小X 刚才那张图是什么"))
     await drain(2.0)
-    check(
+    assert len(VISION_SEEN) == seen_now + 1, (
         "with money back, a cap-blocked picture is described on the next ask",
-        len(VISION_SEEN) == seen_now + 1,
         str(VISION_SEEN),
     )
     stored_e2 = await pool().fetchval(
         "SELECT plain_text FROM raw_event WHERE platform_event_id=$1", str(capped.message_id)
     )
-    check("and its archive line is healed", "橘猫" in (stored_e2 or ""), repr(stored_e2))
+    assert "橘猫" in (stored_e2 or ""), ("and its archive line is healed", repr(stored_e2))
 
     # A picture nobody addresses costs exactly one describing call - the whole rule is
     # now pay per unique picture, not per reply that happens to read one.
@@ -1226,17 +1332,15 @@ async def main():
     )
     await GATEWAY.handle(bot, img3)
     await drain(2.0)
-    check(
+    assert len(VISION_SEEN) == n_seen + 1, (
         "a picture nobody asks about is described exactly once",
-        len(VISION_SEEN) == n_seen + 1,
         str(VISION_SEEN),
     )
-    check("and draws no reply", len(bot.sent) == n_sent)
+    assert len(bot.sent) == n_sent, "and draws no reply"
     # But the free half still ran, so the message is in the history as something with a
     # picture in it, ready to be understood if the next line asks about it.
-    check(
-        "while the message itself is still recorded",
-        any(m.msg_id == str(img3.message_id) for m in st_m.recent),
+    assert any(m.msg_id == str(img3.message_id) for m in st_m.recent), (
+        "while the message itself is still recorded"
     )
 
     set_providers(
@@ -1250,15 +1354,11 @@ async def main():
     # left empty cache rows and images that could never be described (a real
     # incident, not a hypothetical). Two sightings of the same key during the flight
     # must also share it - one paid call, not two.
-    # The wait is per-group config, so shorten the one this group resolves to.
-    _waits = cfg.media.wait_sec
-    cfg = install_settings(
-        cfg.model_copy(
-            update={
-                "media": cfg.media.model_copy(update={"wait_sec": 0.2}),
-            }
-        )
-    )
+    from dataclasses import replace as replace_policy
+    from qqbot.conversation import session as reply_session
+
+    _wait_policy = reply_session.MEDIA_IO
+    reply_session.MEDIA_IO = replace_policy(_wait_policy, wait_sec=0.2)
 
     class SlowVision(SeeingVision):
         async def describe(self, data, *, prompt="", mime="image/jpeg", group_id=None):
@@ -1290,43 +1390,32 @@ async def main():
     await asyncio.sleep(0.1)
     await GATEWAY.handle(bot, slow2)  # same picture, mid-flight
     await drain(0.5)  # every wait window has expired by now
-    check(
+    assert len(VISION_SEEN) == _slow_seen + 1, (
         "the slow flight is still in the air, uncancelled",
-        len(VISION_SEEN) == _slow_seen + 1,
         str(VISION_SEEN[_slow_seen:]),
     )
     await drain(1.2)
-    check(
+    assert await _test_db.media_cache.image_cache_get("d" * 32) == "⟦图片:慢速描述完成⟧", (
         "and its description lands after every waiter gave up",
-        await _repo.image_cache_get("d" * 32) == "⟦图片:慢速描述完成⟧",
-        str(await _repo.image_cache_get("d" * 32)),
+        str(await _test_db.media_cache.image_cache_get("d" * 32)),
     )
     _slow_stored = await pool().fetchval(
         "SELECT plain_text FROM raw_event WHERE platform_event_id=$1", str(slow1.message_id)
     )
-    check(
+    assert "慢速描述完成" in (_slow_stored or ""), (
         "the archive is patched by the task itself, no reply needed",
-        "慢速描述完成" in (_slow_stored or ""),
         repr(_slow_stored),
     )
-    check(
+    assert len(VISION_SEEN) == _slow_seen + 1, (
         "two sightings during the flight paid for one call",
-        len(VISION_SEEN) == _slow_seen + 1,
         str(VISION_SEEN[_slow_seen:]),
     )
-    cfg = install_settings(
-        cfg.model_copy(
-            update={
-                "media": cfg.media.model_copy(update={"wait_sec": _waits}),
-            }
-        )
-    )
+    reply_session.MEDIA_IO = _wait_policy
 
-    # A media patch must not undo the arrival truncation: pm.parts holds the full
-    # original text, so an unbounded re-render would put the whole thing back into
-    # the window and the archive - past the one per-line bound the no-token-budget
-    # prompt layout relies on (a regression this pins).
-    _cap_len = cfg.tools.send_messages.max_text_chars_per_message
+    # Incoming media uses its own bounded render, independent of outgoing text.
+    from qqbot.gateway.limits import PARSE_LIMITS
+
+    _cap_len = PARSE_LIMITS.resolved_chars + len("看这张超长描述的图") + 1
 
     class LongVision(SeeingVision):
         async def describe(self, data, *, prompt="", mime="image/jpeg", group_id=None):
@@ -1352,24 +1441,28 @@ async def main():
     await GATEWAY.handle(bot, longe)
     await drain(2.0)
     _lm = next((m for m in st_m.recent if m.msg_id == str(longe.message_id)), None)
-    check(
-        "a media patch respects the per-line bound in the window",
-        _lm is not None and len(_lm.text) <= _cap_len,
+    assert _lm is not None and len(_lm.text) <= _cap_len, (
+        "a media patch respects its inbound render bound in the window",
         str(_lm and len(_lm.text)),
     )
     _lstored = await pool().fetchval(
         "SELECT plain_text FROM raw_event WHERE platform_event_id=$1", str(longe.message_id)
     )
-    check("and in the archive", _lstored and len(_lstored) <= _cap_len, str(len(_lstored or "")))
+    assert _lstored and len(_lstored) <= _cap_len, ("and in the archive", str(len(_lstored or "")))
 
     # open_images: the reply model reads pictures itself, so the tool hands it one by
     # number rather than asking a second model to look. Free - bytes and an upload -
     # and it answers with a content array carrying the file block, which is what lets
     # the picture arrive as the answer to the call instead of a turn appended behind it.
-    from qqbot.core.segments import ImageRef as _IRef
-    from qqbot.core.tools import Attachment, ToolCtx, execute as _texec
+    from qqbot.gateway.segments import ImageRef as _IRef
+    from qqbot.conversation.tools import Attachment
+    from qqbot.conversation.tools import ToolCtx
+    from qqbot.conversation.tools import Failure as _ToolFailure
+    from qqbot.conversation.tools import execute as _texec
 
-    URL_CONTENT_CHARS = config().default.tools.read_url.max_content_chars
+    from qqbot.conversation.limits import PAGE_LIMITS
+
+    URL_CONTENT_CHARS = PAGE_LIMITS.max_content_chars
 
     def _tcall(name, **kw):
         return function_call(name, kw, call_id="t1")
@@ -1396,27 +1489,32 @@ async def main():
         media=_MEDIA_PROCESSOR,
         bot=bot,
         by_pic={4: (_imsg, 0)},
+        identities=_test_db.identities,
+        database=_test_db.pool,
+        clock=_test_db.clock,
     )
     _seen0 = len(VISION_SEEN)
-    out_i = await _texec(_tcall("open_images", ns=[4]), cfg=cfg, group_id=GROUP, ctx=_ictx)
-    check(
-        "open_images hands back the original as a picture part",
-        isinstance(out_i, Attachment)
-        and any(isinstance(part, StoredImage) for part in out_i.parts),
-        str(out_i.parts),
+    out_i = await _texec(
+        _tcall("open_images", ns=[4]),
+        cfg=cfg,
+        group_id=GROUP,
+        ctx=_ictx,
+        prompts=_test_db.test_bundle().prompts,
     )
-    check(
+    assert isinstance(out_i, Attachment) and any(
+        isinstance(part, StoredImage) for part in out_i.parts
+    ), ("open_images hands back the original as a picture part", str(out_i.parts))
+    assert len(VISION_SEEN) == _seen0, (
         "and costs no model call - it is a fetch, not a second opinion",
-        len(VISION_SEEN) == _seen0,
         str(len(VISION_SEEN) - _seen0),
     )
     from qqbot.providers.contracts import Message as _Message, Role as _Role, TextPart as _TextPart
 
     _content = out_i.content()
-    check(
+    assert [type(part) for part in _content] == [_TextPart, StoredImage, _TextPart] and _content[
+        0
+    ].text == "图片4：", (
         "the tool message labels the picture with its number, then the text",
-        [type(part) for part in _content] == [_TextPart, StoredImage, _TextPart]
-        and _content[0].text == "图片4：",
         str(_content),
     )
     # The neutral part never reaches a vendor: the codec renders it at the adapter edge.
@@ -1429,14 +1527,12 @@ async def main():
         ),
     )
     _wired = _ResponsesCodec().encode_items(_neutral)
-    check(
+    assert _wired[0]["content"][1] == {"type": "input_image", "file_id": "file-api-fake2048"}, (
         "the picture part is translated to a Responses input image",
-        _wired[0]["content"][1] == {"type": "input_image", "file_id": "file-api-fake2048"},
         str(_wired[0]["content"][1]),
     )
-    check(
-        "and the caller's neutral value is unchanged",
-        isinstance(_neutral[0].content[1], StoredImage),
+    assert isinstance(_neutral[0].content[1], StoredImage), (
+        "and the caller's neutral value is unchanged"
     )
     # Several at once: a question is often about a set, and one round per picture
     # would spend the loop's bound on fetching. Unknown numbers are reported beside
@@ -1450,32 +1546,48 @@ async def main():
         image_refs=[_IRef(slot=0, key="8" * 32, url="http://x/ins2.png")],
     )
     _ictx.by_pic[5] = (_imsg2, 0)
-    out_m = await _texec(_tcall("open_images", ns=[4, 5, 99]), cfg=cfg, group_id=GROUP, ctx=_ictx)
-    check(
-        "open_images fetches several pictures in one call",
+    out_m = await _texec(
+        _tcall("open_images", ns=[4, 5, 99]),
+        cfg=cfg,
+        group_id=GROUP,
+        ctx=_ictx,
+        prompts=_test_db.test_bundle().prompts,
+    )
+    assert (
         isinstance(out_m, Attachment)
         and [type(part) for part in out_m.content()]
         == [_TextPart, StoredImage, _TextPart, StoredImage, _TextPart]
         and "图片5：" in str(out_m.content())
-        and "99" in str(out_m),
-        str(out_m.content()),
-    )
-    check(
-        "a number outside the prompt is answered, not crashed",
-        "99" in await _texec(_tcall("open_images", ns=[99]), cfg=cfg, group_id=GROUP, ctx=_ictx),
-    )
-    check(
-        "a missing number is answered too",
-        "编号" in await _texec(_tcall("open_images"), cfg=cfg, group_id=GROUP, ctx=_ictx),
-    )
+        and "99" in str(out_m)
+    ), ("open_images fetches several pictures in one call", str(out_m.content()))
+    assert "99" in await _texec(
+        _tcall("open_images", ns=[99]),
+        cfg=cfg,
+        group_id=GROUP,
+        ctx=_ictx,
+        prompts=_test_db.test_bundle().prompts,
+    ), "a number outside the prompt is answered, not crashed"
+    assert isinstance(
+        await _texec(
+            _tcall("open_images"),
+            cfg=cfg,
+            group_id=GROUP,
+            ctx=_ictx,
+            prompts=_test_db.test_bundle().prompts,
+        ),
+        _ToolFailure,
+    ), "a missing number is answered too"
     # "null", "[]" and "42" are valid JSON: a degenerate argument string must get
     # the same in-band answer as an unparsable one, not crash the whole reply.
     out_n = await _texec(
-        function_call("web_search", "null", call_id="t2"), cfg=cfg, group_id=GROUP, ctx=_ictx
+        function_call("web_search", "null", call_id="t2"),
+        cfg=cfg,
+        group_id=GROUP,
+        ctx=_ictx,
+        prompts=_test_db.test_bundle().prompts,
     )
-    check(
+    assert out_n.startswith("（工具参数解析失败"), (
         "non-object tool arguments are answered in-band",
-        out_n.startswith("（工具参数解析失败"),
         repr(out_n),
     )
 
@@ -1502,16 +1614,18 @@ async def main():
         cfg=cfg,
         group_id=GROUP,
         ctx=_ictx,
+        prompts=_test_db.test_bundle().prompts,
     )
-    check(
+    assert out_u.startswith("页") and len(out_u) <= URL_CONTENT_CHARS + 40, (
         "read_url returns page text capped at the limit",
-        out_u.startswith("页") and len(out_u) <= URL_CONTENT_CHARS + 40,
         str(len(out_u)),
     )
-    check(
-        "a non-http url is refused in words",
-        "http" in await _texec(_tcall("read_url", url="ftp://x"), cfg=cfg, group_id=GROUP),
-    )
+    assert "http" in await _texec(
+        _tcall("read_url", url="ftp://x"),
+        cfg=cfg,
+        group_id=GROUP,
+        prompts=_test_db.test_bundle().prompts,
+    ), "a non-http url is refused in words"
     set_providers(
         Providers(
             text=FakeText(),
@@ -1545,16 +1659,15 @@ async def main():
     # Message 555 is not one the bot has seen, so the quote is reported as unavailable
     # rather than fetched: text on screen belonging to no visible line is the ambiguity
     # numbering replaced.
-    check("a quote of something off screen says so", "⟦回复更早的消息⟧" in tail_r, tail_r[-140:])
-    check(
+    assert "⟦回复更早的消息⟧" in tail_r, ("a quote of something off screen says so", tail_r[-140:])
+    assert "群里的阿明" in tail_r and "@24680" not in tail_r, (
         "@someone resolves to a name, not a number",
-        "群里的阿明" in tail_r and "@24680" not in tail_r,
         tail_r[-120:],
     )
     # No name cache of our own any more: the protocol side is asked for the group's
     # member list, which is both simpler and answers for people who never spoke.
     _M = _MEDIA_PROCESSOR
-    check("media keeps no name cache of its own", not hasattr(_M, "_names"))
+    assert not hasattr(_M, "_names"), "media keeps no name cache of its own"
     # The record arrives inline in the segment: no fetch, and the pictures inside
     # are numbered with the carrying message and openable by that number.
     _t12 = int(_nl0().timestamp())
@@ -1596,22 +1709,19 @@ async def main():
     )
     await drain(2.0)
     tail_i = [c for c in LLM_CALLS if c["kind"] == "reply"][-1]["input"][-1]["content"]
-    check(
+    assert "内嵌第一条" in tail_i and "\n  ⟦" in tail_i, (
         "an inline forward renders as an indented block without a fetch",
-        "内嵌第一条" in tail_i and "\n  ⟦" in tail_i,
         tail_i[-200:],
     )
     _fw_line = next(
         m for m in reversed((await REGISTRY.get(GROUP)).recent) if "内嵌第一条" in m.text
     )
-    check(
+    assert len(_fw_line.image_refs) == 1 and _fw_line.image_refs[0].nested, (
         "the forwarded picture is the message's own reference",
-        len(_fw_line.image_refs) == 1 and _fw_line.image_refs[0].nested,
         str(_fw_line.image_refs),
     )
-    check(
+    assert re.search(r"阿花: ⟦图片\d+", tail_i) is not None, (
         "and its marker is numbered in the prompt",
-        re.search(r"阿花: ⟦图片\d+", tail_i) is not None,
         tail_i[-200:],
     )
 
@@ -1641,7 +1751,10 @@ async def main():
         ),
     )
     await drain(2.0)
-    check("a forward that names the bot inside does not trigger", len(_nb.sent) == 0, str(_nb.sent))
+    assert len(_nb.sent) == 0, (
+        "a forward that names the bot inside does not trigger",
+        str(_nb.sent),
+    )
 
     # The roster is the whole group in a fixed order, and the reason is the prefix cache:
     # it sits in the system block ahead of the history, and a cache matches from the
@@ -1649,7 +1762,7 @@ async def main():
     # turn - so it must never be built from whoever spoke most recently. The order is
     # first appearance, because it is also the member numbering: a newcomer joins at
     # the end and nobody else's number moves.
-    from qqbot.core import retrieval as _retr
+    from qqbot.services import retrieval as _retr
 
     _DIR = _DIRECTORY
     for i, uid in enumerate(["a", "b", "c", "d", "e", "f"]):
@@ -1661,49 +1774,37 @@ async def main():
     await _DIR.note(ORD, "tie2", "second of the pair")
     await seed(ORD, "zz", "zz", n=9)  # busiest, last to appear, no record
 
-    _roster_rows = await _retr.gather(
-        group_id=ORD,
-        directory=_DIRECTORY,
-        bot=bot,
-    )
+    _roster_rows = await _retr.gather(group_id=ORD, directory=_DIRECTORY, bot=bot, members=MEMBERS)
     _roster = [row["user_id"] for row in _roster_rows]
-    check(
+    assert _roster == ["a", "b", "c", "d", "e", "f", "tie1", "tie2", "zz"], (
         "the roster is ordered by first appearance, not by activity or recency",
-        _roster == ["a", "b", "c", "d", "e", "f", "tie1", "tie2", "zz"],
         str(_roster),
     )
-    check(
-        "the same call twice gives the same order",
-        [
-            row["user_id"]
-            for row in await _retr.gather(
-                group_id=ORD,
-                directory=_DIRECTORY,
-                bot=bot,
-            )
-        ]
-        == _roster,
-    )
+    assert [
+        row["user_id"]
+        for row in await _retr.gather(group_id=ORD, directory=_DIRECTORY, bot=bot, members=MEMBERS)
+    ] == _roster, "the same call twice gives the same order"
 
     # Someone who has not spoken this turn is in it too - which is what removes the need
     # to work out who a message is about before deciding whose record to load - and so
     # is someone nothing is known about: the roster is where every member number lives.
-    check(
+    assert len(_roster) == 9 and "zz" in _roster, (
         "everyone who has appeared is in it, known about or not",
-        len(_roster) == 9 and "zz" in _roster,
         str(_roster),
     )
     _numbered = prompt_mod.build_system(
         config().for_group(ORD)[1],
-        await _retr.gather(group_id=ORD, directory=_DIRECTORY, bot=bot),
+        await _retr.gather(group_id=ORD, directory=_DIRECTORY, bot=bot, members=MEMBERS),
         "",
+        prompts=_test_db.test_bundle().prompts,
     )
-    check(
-        "the roster carries the member numbers without promoting candidate names",
+    assert (
         "- 成员⟦1⟧，note about a" in _numbered
         and "\n- 成员⟦9⟧\n" in _numbered + "\n"
         and "未确认显示名：a" in _numbered
-        and "未确认显示名：zz" in _numbered,
+        and "未确认显示名：zz" in _numbered
+    ), (
+        "the roster carries the member numbers without promoting candidate names",
         _numbered[_numbered.rfind("【群成员名册】") :][:400],
     )
 
@@ -1711,22 +1812,22 @@ async def main():
     # events in that group, so somebody talkative elsewhere is simply not here.
     await seed(OTHER, "a", "a", n=9)
     await _DIR.note(OTHER, "a", "known only in the other group")
-    _elsewhere = await _retr.gather(group_id=OTHER, directory=_DIRECTORY, bot=bot)
-    check(
+    _elsewhere = await _retr.gather(group_id=OTHER, directory=_DIRECTORY, bot=bot, members=MEMBERS)
+    assert [r["user_id"] for r in _elsewhere] == ["a"], (
         "a roster does not reach into another group",
-        [r["user_id"] for r in _elsewhere] == ["a"],
         str(_elsewhere),
     )
-    check(
-        "and a note written there stays there",
+    assert (
         _elsewhere[0]["manual_note"] == "known only in the other group"
         and next(
             r
-            for r in await _retr.gather(group_id=ORD, directory=_DIRECTORY, bot=bot)
+            for r in await _retr.gather(
+                group_id=ORD, directory=_DIRECTORY, bot=bot, members=MEMBERS
+            )
             if r["user_id"] == "a"
         )["manual_note"]
-        == "note about a",
-    )
+        == "note about a"
+    ), "and a note written there stays there"
 
     # What an owner writes by hand and what the model worked out are two different kinds
     # of claim, and the prompt says so: one undifferentiated list teaches the model
@@ -1734,7 +1835,7 @@ async def main():
     from qqbot.domain.memory import Fact, MemoryType
     from qqbot.repositories import MemoryRepository
 
-    _MEMREPO = MemoryRepository()
+    _MEMREPO = MemoryRepository(database=_test_db.pool, clock=_test_db.clock)
     _eid = (await _DIR.holder_card(ORD, "a")).entity_id
     await _MEMREPO.supersede(
         Fact(
@@ -1749,28 +1850,29 @@ async def main():
         when=_nl0(),
     )
     _card = await _DIR.holder_card(ORD, "a")
-    check(
+    assert _card.note == "note about a" and _card.summary == "喜欢打游戏", (
         "a hand-written note is kept apart from what was extracted",
-        _card.note == "note about a" and _card.summary == "喜欢打游戏",
         f"{_card.note!r} / {_card.summary!r}",
     )
 
     _, _p_o = config().for_group(ORD)
-    _sys = prompt_mod.build_system(_p_o, await _retr.gather(group_id=ORD, directory=_DIRECTORY), "")
-    check("the certain half is labelled certain", "已确认（系统记录的名字" in _sys, _sys[-200:])
-    check(
+    _sys = prompt_mod.build_system(
+        _p_o,
+        await _retr.gather(group_id=ORD, directory=_DIRECTORY, members=MEMBERS),
+        "",
+        prompts=_test_db.test_bundle().prompts,
+    )
+    assert "已确认（系统记录的名字" in _sys, ("the certain half is labelled certain", _sys[-200:])
+    assert "未确认线索（可能有误或已过时" in _sys and "喜欢打游戏" in _sys, (
         "and the guessed half is labelled guessed",
-        "未确认线索（可能有误或已过时" in _sys and "喜欢打游戏" in _sys,
         _sys[-200:],
     )
-    check(
-        "certain sits above guessed",
-        _sys.index("已确认（系统记录的名字") < _sys.index("未确认线索（可能有误或已过时"),
+    assert _sys.index("已确认（系统记录的名字") < _sys.index("未确认线索（可能有误或已过时"), (
+        "certain sits above guessed"
     )
     # Stable first: a daily card rewrite must not also invalidate the constants above it.
-    check(
-        "constants sit above everything that changes",
-        _sys.index(prompt_mod.H_CREDIBILITY) < _sys.index(prompt_mod.H_WHO),
+    assert _sys.index(prompt_mod.H_CREDIBILITY) < _sys.index(prompt_mod.H_WHO), (
+        "constants sit above everything that changes"
     )
 
     # A renamed account keeps the name it used to go by. That is not a column any more -
@@ -1790,16 +1892,16 @@ async def main():
     await seed(ORD, "g", "旧名字")
     await seed(ORD, "g", "新名字")
     _renamed = await _DIR.holder_card(ORD, "g")
-    check(
-        "a rename keeps the confirmed old name without trusting the new candidate",
+    assert (
         set(_renamed.other_names) == {"旧名字"}
         and _renamed.display == "g"
-        and "新名字" in [name.text for name in _renamed.candidates],
+        and "新名字" in [name.text for name in _renamed.candidates]
+    ), (
+        "a rename keeps the confirmed old name without trusting the new candidate",
         f"{_renamed.display} / {_renamed.other_names}",
     )
-    check(
+    assert "新名字" in [n.text for n in _renamed.candidates], (
         "but a card worn only today is not yet a durable name",
-        "新名字" in [n.text for n in _renamed.candidates],
         str([n.text for n in _renamed.candidates]),
     )
 
@@ -1808,20 +1910,18 @@ async def main():
     # as a name the account had once carried - the opposite of the truth.
     await _DIR.name(ORD, "g", "老哥")
     _named = await _DIR.holder_card(ORD, "g")
-    check(
+    assert set(_named.displayed_names) == {"旧名字"} and set(_named.nicknames) == {"老哥"}, (
         "names the account displayed are kept apart from what people call him",
-        set(_named.displayed_names) == {"旧名字"} and set(_named.nicknames) == {"老哥"},
         f"{_named.displayed_names} / {_named.nicknames}",
     )
     _row = next(
         row
-        for row in await _retr.gather(group_id=ORD, directory=_DIRECTORY)
+        for row in await _retr.gather(group_id=ORD, directory=_DIRECTORY, members=MEMBERS)
         if row["user_id"] == "g"
     )
-    _one = prompt_mod.build_system(_p_o, [_row], "")
-    check(
+    _one = prompt_mod.build_system(_p_o, [_row], "", prompts=_test_db.test_bundle().prompts)
+    assert "曾用名：旧名字" in _one and "别名：老哥" in _one, (
         "and the prompt labels them separately",
-        "曾用名：旧名字" in _one and "别名：老哥" in _one,
         _one[-200:],
     )
 
@@ -1830,105 +1930,97 @@ async def main():
     await seed(ORD, "alt", "小号")
     await _DIR.merge("alt", "g")
     _merged = await _DIR.holder_card(ORD, "alt")
-    check(
+    assert _merged.entity_id == _renamed.entity_id and _merged.merged, (
         "a merged account resolves to the same person",
-        _merged.entity_id == _renamed.entity_id and _merged.merged,
         str(_merged.accounts),
     )
-    check(
-        "and the roster shows them once, with the counts added",
+    assert (
         len(
             [
                 r
-                for r in await _retr.gather(group_id=ORD, directory=_DIRECTORY, bot=bot)
+                for r in await _retr.gather(
+                    group_id=ORD, directory=_DIRECTORY, bot=bot, members=MEMBERS
+                )
                 if r["user_id"] in ("g", "alt")
             ]
         )
-        == 1,
-    )
+        == 1
+    ), "and the roster shows them once, with the counts added"
 
     # And the undo, which is the reason evidence is kept on everything.
     await _DIR.split("alt")
     _after = await _DIR.holder_card(ORD, "alt")
-    check(
+    assert _after.entity_id != _renamed.entity_id and not _after.merged, (
         "splitting gives the account its own person again",
-        _after.entity_id != _renamed.entity_id and not _after.merged,
         str(_after.accounts),
     )
-    check(
+    assert "小号" in [
+        name.text for name in _after.candidates
+    ] and "小号" not in _after.other_names + (_after.display,), (
         "an unconfirmed display name stays with the account that produced it",
-        "小号" in [name.text for name in _after.candidates]
-        and "小号" not in _after.other_names + (_after.display,),
         str(_after.other_names),
     )
-    check(
+    assert "新名字" not in _after.other_names + (_after.display,), (
         "names belonging to the other account stay behind",
-        "新名字" not in _after.other_names + (_after.display,),
         str(_after.other_names),
     )
 
     # The protocol side already knows every group card, including for people who have
     # never spoken - so ask it once for the whole group instead of keeping a second cache.
-    from qqbot.core.members import MEMBERS as _MEM
+    _MEM = MEMBERS
 
     _MEM.forget()
     before = bot.member_list_calls
     live = await _MEM.names_of(bot, GROUP, ["7", "24680"])
-    check(
+    assert live == {"7": "小南", "24680": "群里的阿明"}, (
         "the member list answers with current group cards",
-        live == {"7": "小南", "24680": "群里的阿明"},
         str(live),
     )
-    check(
+    assert bot.member_list_calls == before + 1, (
         "one call covers the whole group",
-        bot.member_list_calls == before + 1,
         f"{before} -> {bot.member_list_calls}",
     )
     await _MEM.names_of(bot, GROUP, ["7"])
-    check("a second lookup reuses it", bot.member_list_calls == before + 1)
+    assert bot.member_list_calls == before + 1, "a second lookup reuses it"
 
     # Identity is in the cached prefix, never the per-turn tail: someone can be talked
     # about while absent, and a tail rebuilt every turn would pay for it every turn.
     _one = [_CM0(msg_id="x", user_id="u7", nickname="小南", text="在", ts=_nl0())]
-    check(
-        "identity is in the system block, not the tail",
-        "曾用名" not in prompt_mod.build_tail(msg=_one[0]),
-    )
+    assert "曾用名" not in prompt_mod.build_tail(
+        msg=_one[0], prompts=_test_db.test_bundle().prompts, clock=_test_db.clock
+    ), "identity is in the system block, not the tail"
 
     # The tail carries nothing but the clock and the message on purpose: whatever
     # sits here is the nearest context the incoming message has, and a pushed block
     # of past events once captured an elliptical question that referred to the
     # conversation. The past is pulled through recall_events, never pushed.
-    _tail = prompt_mod.build_tail(msg=_one[0])
-    check(
+    _tail = prompt_mod.build_tail(
+        msg=_one[0], prompts=_test_db.test_bundle().prompts, clock=_test_db.clock
+    )
+    assert _tail.index("下面是刚收到的消息") > 0 and "相关的事" not in _tail, (
         "the tail is the clock and the message, nothing pushed beside them",
-        _tail.index("下面是刚收到的消息") > 0 and "相关的事" not in _tail,
         _tail[:120],
     )
     # The tail has to say which message is the question. The send mechanism stays in the
     # system template instead of being repeated here; this nearest context only anchors the
     # one message the run must answer.
-    check(
+    assert "下面是刚收到的消息" in _tail and "只回应" in _tail, (
         "and the tail says which message to answer",
-        "下面是刚收到的消息" in _tail and "只回应" in _tail,
         _tail[-140:],
     )
-    check(
+    assert _tail.count("下面是刚收到的消息") == 1, (
         "and gives the current message exactly one task anchor",
-        _tail.count("下面是刚收到的消息") == 1,
         _tail[-140:],
     )
     # The exception matters as much as the rule. Being asked to answer something raised
     # earlier is ordinary, and a flat ban on the history would refuse it.
     # The exception lives with the rule, in the fixed rules that open the prompt.
-    check(
-        "while still allowing a question the message points at",
-        "除非刚收到的消息明确要求你代答" in prompt_mod.build_system(persona_k, [], []),
-    )
-    check(
-        "but never in the cached system block",
-        "老周答应周末把切片做完" not in prompt_mod.build_system(persona_k, [], []),
-    )
+    assert "除非刚收到的消息明确要求你代答" in prompt_mod.build_system(
+        persona_k, [], [], prompts=_test_db.test_bundle().prompts
+    ), "while still allowing a question the message points at"
+    assert "老周答应周末把切片做完" not in prompt_mod.build_system(
+        persona_k, [], [], prompts=_test_db.test_bundle().prompts
+    ), "but never in the cached system block"
 
     # 12g. A name is captured when a message arrives, so history would otherwise keep
     # showing whoever renamed themselves under their old name while the roster, the
@@ -1939,17 +2031,15 @@ async def main():
         _CM0(msg_id="r3", user_id="u404", nickname="没在群里", text="?", ts=_nl0()),
     ]
     n = await _MEM.relabel(bot, GROUP, _hist)
-    check(
+    assert n == 1 and _hist[0].nickname == "小南", (
         "a renamed speaker is relabelled in history",
-        n == 1 and _hist[0].nickname == "小南",
         f"{n} {[m.nickname for m in _hist]}",
     )
-    check(
-        "someone the member list does not cover keeps their captured name",
-        _hist[2].nickname == "没在群里",
+    assert _hist[2].nickname == "没在群里", (
+        "someone the member list does not cover keeps their captured name"
     )
-    check("the bot's own lines are left alone", _hist[1].nickname == "")
-    check("re-running it changes nothing", await _MEM.relabel(bot, GROUP, _hist) == 0)
+    assert _hist[1].nickname == "", "the bot's own lines are left alone"
+    assert await _MEM.relabel(bot, GROUP, _hist) == 0, "re-running it changes nothing"
 
     # 13. a group nobody configured. There is no allowlist: the account is a dedicated
     # bot account, so a group it should not serve is a group it is not in. A new group
@@ -1960,37 +2050,34 @@ async def main():
     BUDGET._loaded = False
     n_new = len(bot.sent)
     fresh_gid = GroupId("4242")
-    check(
-        "a group with no config file falls back to the default persona",
-        config().persona_for(fresh_gid).name == config().persona_for(GroupId("999999")).name,
+    assert config().persona_for(fresh_gid).name == config().persona_for(GroupId("999999")).name, (
+        "a group with no config file falls back to the default persona"
     )
-    check("and nothing has claimed it yet", await _repo.note_group_seen(fresh_gid) is True)
-    check(
-        "but claiming it twice reports it only once",
-        await _repo.note_group_seen(fresh_gid) is False,
+    assert await _test_db.groups.note_group_seen(fresh_gid) is True, (
+        "and nothing has claimed it yet"
     )
-    check(
+    assert await _test_db.groups.note_group_seen(fresh_gid) is False, (
+        "but claiming it twice reports it only once"
+    )
+    assert fresh_gid in await _test_db.groups.groups_first_seen_on(_today()), (
         "the day it appeared is on the record for the daily report",
-        fresh_gid in await _repo.groups_first_seen_on(_today()),
-        str(await _repo.groups_first_seen_on(_today())),
+        str(await _test_db.groups.groups_first_seen_on(_today())),
     )
 
     # An unconfigured group is served, archived and answered like any other.
     unconfigured = FakeEvent("小X 在吗", group_id=999)
     await GATEWAY.handle(bot, unconfigured)
     await drain()
-    check("an unconfigured group gets a reply", len(bot.sent) == n_new + 1)
-    check(
-        "and its messages are archived",
+    assert len(bot.sent) == n_new + 1, "an unconfigured group gets a reply"
+    assert (
         await pool().fetchval(
             "SELECT count(*) FROM raw_event WHERE platform_event_id=$1",
             str(unconfigured.message_id),
         )
-        == 1,
-    )
-    check(
-        "first sight of it was recorded when its state loaded",
-        GroupId("999") in await _repo.groups_with_state(),
+        == 1
+    ), "and its messages are archived"
+    assert GroupId("999") in await _test_db.groups.groups_with_state(), (
+        "first sight of it was recorded when its state loaded"
     )
 
     # 14. the money-bounded agent loop. There is no round count and no per-tool quota:
@@ -2005,7 +2092,7 @@ async def main():
     # already fetched. Every number below is arranged so the arithmetic is checkable
     # by hand.
     import json as _j14
-    from qqbot.core import engine as _eng
+    from qqbot.conversation import engine as _eng
 
     ROUND_CHARGE = 0.02  # what the scripted model books per round
     cfg = install_budget(cfg, per_reply_cny=0.10)
@@ -2042,8 +2129,8 @@ async def main():
         content.extend({"type": "at", "data": {"member": member}} for member in (at or ()))
         content.append({"type": "text", "data": {"text": text}})
         return function_call(
-            "send_messages",
-            {"messages": [{"content": content}]},
+            "send_message",
+            {"content": content},
             call_id=f"s{len(LLM_CALLS)}",
         )
 
@@ -2078,7 +2165,7 @@ async def main():
                 }
             )
             await BUDGET.record(kind=kind, model=self.MODEL, cny=ROUND_CHARGE, group_id=group_id)
-            if _names(tools) == ["send_messages"]:  # the wrap-up round
+            if _names(tools) == ["send_message", "finish_reply"]:
                 return response(model=self.MODEL, tool_calls=[_send(text="就查到这些了")])
             return response(
                 model=self.MODEL,
@@ -2097,49 +2184,54 @@ async def main():
     n_llm = len(LLM_CALLS)
     st13 = await REGISTRY.get(GROUP)
     r1 = await _eng.generate(
+        budget=BUDGET,
+        progress=_eng.ReplyProgress(),
         providers=providers_bundle,
         media=_MEDIA_PROCESSOR,
         directory=_DIRECTORY,
+        delivery=_DELIVERY,
         bot=bot,
         st=st13,
         cfg=cfg,
         persona=config().for_group(GROUP)[1],
         msg=_CM0(msg_id="loop1", user_id="u1", nickname="阿强", text="帮我查个东西", ts=_nl0()),
+        members=MEMBERS,
+        database=_test_db.pool,
+        identities=_test_db.identities,
+        evidence_store=_test_db.evidence,
+        archive=_test_db.archive,
+        clock=_test_db.clock,
+        prompts=_test_db.test_bundle().prompts,
     )
     # The scripted allowance dies on the third search, in round two: the limit ends
     # the spending, and a wrap-up round answers from what rounds one and two already
     # fetched (the daily cap, checked before anything is spent, still means silence).
-    check(
+    assert r1.sent and bot.sent[-1][1] == "就查到这些了", (
         "a reply that hits the search allowance wraps up with an answer",
-        r1 is not None and r1.messages[0].text == "就查到这些了",
         repr(r1),
     )
-    check(
+    assert len(LLM_CALLS) - n_llm == 3 and _names(LLM_CALLS[-1]["tools"]) == [
+        "send_message",
+        "finish_reply",
+    ], (
         "the wrap-up is one extra round, offered only the send tool",
-        len(LLM_CALLS) - n_llm == 3 and _names(LLM_CALLS[-1]["tools"]) == ["send_messages"],
         f"{len(LLM_CALLS) - n_llm} rounds, tools={_names(LLM_CALLS[-1]['tools'])}",
     )
-    check(
+    assert _names(LLM_CALLS[n_llm]["tools"])[0] == "send_message", (
         "every ordinary round offers the send tool first",
-        _names(LLM_CALLS[n_llm]["tools"])[0] == "send_messages",
         str(_names(LLM_CALLS[n_llm]["tools"])),
     )
-    check(
-        "the wrap-up round is told the allowance is gone",
-        any(
-            "额度已用完" in (m.get("content") or "")
-            for m in LLM_CALLS[-1]["input"]
-            if m.get("role") == "user"
-        ),
-    )
-    check(
+    assert any(
+        "额度已用完" in (m.get("content") or "")
+        for m in LLM_CALLS[-1]["input"]
+        if m.get("role") == "user"
+    ), "the wrap-up round is told the allowance is gone"
+    assert len(CountingSearch.calls) == 2, (
         "free searches are not gated by the reply's purse",
-        len(CountingSearch.calls) == 2,
         f"{len(CountingSearch.calls)} calls: {CountingSearch.calls}",
     )
-    check(
+    assert CountingSearch.calls.count("话题A") == 1, (
         "a repeated identical call is not re-executed",
-        CountingSearch.calls.count("话题A") == 1,
         str(CountingSearch.calls),
     )
     tool_texts = [
@@ -2147,12 +2239,11 @@ async def main():
         for m in LLM_CALLS[-1]["input"]
         if m.get("type") == "function_call_output"
     ]
-    check(
-        "the model is told about the duplicate in words", any("刚执行过" in t for t in tool_texts)
+    assert any("刚执行过" in t for t in tool_texts), (
+        "the model is told about the duplicate in words"
     )
-    check(
-        "the unexecuted request got its placeholder result",
-        any("没有执行" in t for t in tool_texts),
+    assert any("没有执行" in t for t in tool_texts), (
+        "the unexecuted request got its placeholder result"
     )
 
     # And the other limit the same way: with the allowance out of the picture and the
@@ -2180,30 +2271,40 @@ async def main():
     )
     n_llm2 = len(LLM_CALLS)
     r2 = await _eng.generate(
+        budget=BUDGET,
+        progress=_eng.ReplyProgress(),
         providers=providers_bundle,
         media=_MEDIA_PROCESSOR,
         directory=_DIRECTORY,
+        delivery=_DELIVERY,
         bot=bot,
         st=st13,
         cfg=cfg,
         persona=config().for_group(GROUP)[1],
         msg=_CM0(msg_id="loop2", user_id="u1", nickname="阿强", text="再查个东西", ts=_nl0()),
+        members=MEMBERS,
+        database=_test_db.pool,
+        identities=_test_db.identities,
+        evidence_store=_test_db.evidence,
+        archive=_test_db.archive,
+        clock=_test_db.clock,
+        prompts=_test_db.test_bundle().prompts,
     )
-    check(
-        "a reply that runs out of money wraps up the same way",
-        r2 is not None
-        and r2.messages[0].text == "就查到这些了"
+    assert (
+        r2.sent
+        and bot.sent[-1][1] == "就查到这些了"
         and len(LLM_CALLS) - n_llm2 == 3
-        and _names(LLM_CALLS[-1]["tools"]) == ["send_messages"],
+        and _names(LLM_CALLS[-1]["tools"]) == ["send_message", "finish_reply"]
+    ), (
+        "a reply that runs out of money wraps up the same way",
         f"{r2!r}, {len(LLM_CALLS) - n_llm2} rounds",
     )
-    check(
+    assert len(EndlessSearch.calls) == 2, (
         "and the unaffordable round's tools were never executed",
-        len(EndlessSearch.calls) == 2,
         str(EndlessSearch.calls),
     )
 
-    from qqbot.core import tools as _loop_tools
+    from qqbot.conversation import tools as _loop_tools
 
     _real_execute = _loop_tools.execute
     _mid_batch_calls: list[str] = []
@@ -2217,20 +2318,34 @@ async def main():
 
     _loop_tools.execute = _spending_execute
     try:
-        from qqbot.core import agent as _agent
-        from qqbot.core.member_numbers import MemberNumbers as _MemberNumbers
+        from qqbot.conversation import agent as _agent
+        from qqbot.conversation.member_numbers import MemberNumbers as _MemberNumbers
+
+        async def _never_send(*_):
+            raise AssertionError("retrieval-only round must not send")
 
         _mid_run = _agent.AgentRun(
             model=FakeText(),
-            request=_agent.request_for_reply((), cfg, group_id=GROUP),
+            request=_agent.request_for_reply(
+                (), cfg, group_id=GROUP, registry=_test_db.tool_registry(cfg)
+            ),
             cfg=cfg,
             state=st13,
             tool_context=_loop_tools.ToolCtx(
                 providers=providers_bundle,
                 media=_MEDIA_PROCESSOR,
+                identities=_test_db.identities,
+                database=_test_db.pool,
+                clock=_test_db.clock,
             ),
-            people=_MemberNumbers(self_id=str(bot.self_id)),
+            people=_MemberNumbers(
+                self_id=str(bot.self_id), lookup=_test_db.identities.holder_ids_for_accounts
+            ),
             lines={},
+            on_send=_never_send,
+            seen_messages=set(),
+            budget=BUDGET,
+            registry=_test_db.tool_registry(cfg),
         )
         with BUDGET.scope(0.05) as _mid_spend:
             _mid_answers, _mid_hit = await _mid_run._execute_round(
@@ -2238,16 +2353,16 @@ async def main():
                     function_call("recall_events", {"question": "first"}, call_id="mid-1"),
                     function_call("recall_events", {"question": "second"}, call_id="mid-2"),
                 ),
-                send_notes={},
                 spend=_mid_spend,
             )
     finally:
         _loop_tools.execute = _real_execute
-    check(
-        "a paid tool exhausting the scope blocks later calls in the same batch",
+    assert (
         _mid_batch_calls == ["recall_events"]
         and _mid_hit
-        and "没有执行" in str(_mid_answers[1].output),
+        and "没有执行" in str(_mid_answers[1].output)
+    ), (
+        "a paid tool exhausting the scope blocks later calls in the same batch",
         f"{_mid_batch_calls} {_mid_answers}",
     )
 
@@ -2269,15 +2384,26 @@ async def main():
     try:
         _parallel_run = _agent.AgentRun(
             model=FakeText(),
-            request=_agent.request_for_reply((), cfg, group_id=GROUP),
+            request=_agent.request_for_reply(
+                (), cfg, group_id=GROUP, registry=_test_db.tool_registry(cfg)
+            ),
             cfg=cfg,
             state=st13,
             tool_context=_loop_tools.ToolCtx(
                 providers=providers_bundle,
                 media=_MEDIA_PROCESSOR,
+                identities=_test_db.identities,
+                database=_test_db.pool,
+                clock=_test_db.clock,
             ),
-            people=_MemberNumbers(self_id=str(bot.self_id)),
+            people=_MemberNumbers(
+                self_id=str(bot.self_id), lookup=_test_db.identities.holder_ids_for_accounts
+            ),
             lines={},
+            on_send=_never_send,
+            seen_messages=set(),
+            budget=BUDGET,
+            registry=_test_db.tool_registry(cfg),
         )
         with BUDGET.scope(1) as _parallel_spend:
             _parallel_answers, _ = await _parallel_run._execute_round(
@@ -2285,28 +2411,43 @@ async def main():
                     function_call("web_search", {"query": "first"}, call_id="par-1"),
                     function_call("read_url", {"url": "https://example.invalid"}, call_id="par-2"),
                 ),
-                send_notes={},
                 spend=_parallel_spend,
             )
     finally:
         _loop_tools.execute = _real_execute
-    check(
+    assert _parallel_peak == 2 and [answer.output for answer in _parallel_answers] == [
+        "result",
+        "result",
+    ], (
         "independent free tools in one model turn execute concurrently",
-        _parallel_peak == 2
-        and [answer.output for answer in _parallel_answers] == ["result", "result"],
         f"peak={_parallel_peak} answers={_parallel_answers}",
     )
 
-    # The per-round cap: the scripted round asks for three calls; capped at two,
-    # the third is answered with the overflow note and never reaches the backend.
+    # A model can request more calls than the code-owned per-turn admission bound.
     class CappedSearch(EndlessSearch):
         calls = []
 
-    _cap0 = cfg.tools.max_calls_per_round
-    cfg = install_tools(cfg, max_calls_per_round=2)
+    from qqbot.conversation.fuel import MAX_CALLS_PER_TURN
+
+    class OverflowText(ScriptedText):
+        async def respond(self, input, **kwargs):
+            turn = await super().respond(
+                input,
+                **kwargs,
+            )
+            if _names(kwargs.get("tools")) == ["send_message", "finish_reply"]:
+                return turn
+            return response(
+                model=self.MODEL,
+                tool_calls=[
+                    *[_tc("话题A") for _ in range(MAX_CALLS_PER_TURN)],
+                    _tc("past-the-cap"),
+                ],
+            )
+
     set_providers(
         Providers(
-            text=ScriptedText(),
+            text=OverflowText(),
             vision=UnusedVision(),
             asr=UnusedAsr(),
             embedding=_EMBED,
@@ -2314,53 +2455,58 @@ async def main():
         )
     )
     await _eng.generate(
+        budget=BUDGET,
+        progress=_eng.ReplyProgress(),
         providers=providers_bundle,
         media=_MEDIA_PROCESSOR,
         directory=_DIRECTORY,
+        delivery=_DELIVERY,
         bot=bot,
         st=st13,
         cfg=cfg,
         persona=config().for_group(GROUP)[1],
         msg=_CM0(msg_id="loop3", user_id="u1", nickname="阿强", text="再查一次", ts=_nl0()),
+        members=MEMBERS,
+        database=_test_db.pool,
+        identities=_test_db.identities,
+        evidence_store=_test_db.evidence,
+        archive=_test_db.archive,
+        clock=_test_db.clock,
+        prompts=_test_db.test_bundle().prompts,
     )
-    cfg = install_tools(cfg, max_calls_per_round=_cap0)
     _tool_texts3 = [
         m.get("output") or ""
         for m in LLM_CALLS[-1]["input"]
         if m.get("type") == "function_call_output"
     ]
-    check(
+    assert any("次数已达上限" in t for t in _tool_texts3), (
         "a call past the per-round cap is answered with the overflow note",
-        any("次数已达上限" in t for t in _tool_texts3),
         str(_tool_texts3)[:200],
     )
-    check(
+    assert "past-the-cap" not in CappedSearch.calls, (
         "and was never executed",
-        all(not q.startswith("话题") or q == "话题A" for q in CappedSearch.calls),
         str(CappedSearch.calls),
     )
 
     # Tool results are retained only as bounded structured evidence. The visible reply,
     # window and raw archive all keep exactly what the group read.
-    from qqbot.core.output import clean_reply as _cr
+    from qqbot.delivery.output import clean_reply as _cr
 
     _weather = _agent.ToolExecution("web_search", {"query": "明天 天气"}, "1. T C", True)
-    from qqbot.core.engine import _evidence_memo as _memo_fn
+    from qqbot.conversation.engine import _evidence_memo as _memo_fn
 
-    check("no tools means no evidence memo", _memo_fn((), cfg) is None)
+    assert _memo_fn((), cfg, clock=_test_db.clock) is None, "no tools means no evidence memo"
     _history_execution = _agent.ToolExecution(
         "search_history",
         {"query": "改锥"},
         "⟦09-01 10:00⟧ 张伟⟦3⟧: 改锥在我这",
         True,
     )
-    _memo = _memo_fn((_history_execution,), cfg)
-    check(
-        "evidence keeps no prompt-local member numbers",
+    _memo = _memo_fn((_history_execution,), cfg, clock=_test_db.clock)
+    assert (
         _memo is not None
-        and _memo.render() == "⟦检索记录⟧\n查档“改锥”：[09-01 10:00] 张伟: 改锥在我这",
-        _memo.render() if _memo else "none",
-    )
+        and _memo.render() == "⟦检索记录⟧\n查档“改锥”：[09-01 10:00] 张伟: 改锥在我这"
+    ), ("evidence keeps no prompt-local member numbers", _memo.render() if _memo else "none")
     _page_memo = _memo_fn(
         (
             _agent.ToolExecution(
@@ -2371,12 +2517,14 @@ async def main():
             ),
         ),
         cfg,
+        clock=_test_db.clock,
     )
-    check(
-        "evidence strips URL credentials, queries and fragments",
+    assert (
         _page_memo is not None
         and "https://example.invalid/page" in _page_memo.render()
-        and all(word not in _page_memo.render() for word in ("secret", "hidden", "part")),
+        and all(word not in _page_memo.render() for word in ("secret", "hidden", "part"))
+    ), (
+        "evidence strips URL credentials, queries and fragments",
         _page_memo.render() if _page_memo else "none",
     )
 
@@ -2396,6 +2544,16 @@ async def main():
             kind="reply",
             group_id=None,
         ):
+            finishing = any(
+                str(m.get("output", "")).startswith("已确认发送并收到自身回显")
+                for m in input
+                if isinstance(m, dict)
+            )
+            if finishing:
+                return response(
+                    model="fake-light",
+                    tool_calls=[function_call("finish_reply", {}, call_id="script-finish")],
+                )
             LLM_CALLS.append(
                 {
                     "kind": kind,
@@ -2438,29 +2596,25 @@ async def main():
         persona=config().for_group(GROUP)[1],
         msg=_CM0(msg_id="pv1", user_id="u1", nickname="阿强", text="明天天气怎样", ts=_nl0()),
     )
-    check(
+    assert ok_pv and bot.sent[-1][1] == "明天多云", (
         "the searched reply is sent without the marker",
-        ok_pv and bot.sent[-1][1] == "明天多云",
         str(bot.sent[-1:]),
     )
-    check(
+    assert bot.quoted[-1] is None and bot.ats[-1] is None, (
         "a send with neither at nor reply goes out as a plain message",
-        bot.quoted[-1] is None and bot.ats[-1] is None,
         f"{bot.quoted[-1]} {bot.ats[-1]}",
     )
     _pv_line = st_pv.recent[-1]
-    check(
-        "the window keeps only the visible reply",
+    assert (
         _pv_line.is_bot
         and _pv_line.text == "明天多云"
         and _pv_line.at == []
-        and _pv_line.reply_to is None,
-        repr(_pv_line),
-    )
+        and _pv_line.reply_to is None
+    ), ("the window keeps only the visible reply", repr(_pv_line))
     _pv_row = await pool().fetchval(
         "SELECT plain_text FROM raw_event WHERE platform_event_id=$1", _pv_line.msg_id
     )
-    check("the archive also keeps only the visible reply", _pv_row == "明天多云", repr(_pv_row))
+    assert _pv_row == "明天多云", ("the archive also keeps only the visible reply", repr(_pv_row))
 
     # The send tool: whom to @ and which line to reply to are the model's choice,
     # named by the numbers the prompt showed. Two members share a card here - the
@@ -2470,7 +2624,7 @@ async def main():
         {"user_id": "u61", "card": "李芳", "nickname": "lf1"},
         {"user_id": "u62", "card": "李芳", "nickname": "lf2"},
     ]
-    from qqbot.core.members import MEMBERS as _MEMpv
+    _MEMpv = MEMBERS
 
     _MEMpv.forget(GROUP)
     st_s = type(st_pv)(group_id=GroupId("5601"))
@@ -2513,104 +2667,100 @@ async def main():
     ok_s = await _respond(
         bot=bot, st=st_s, cfg=cfg, persona=_persona, msg=_ask, window=[_w1, _w2, _wm]
     )
-    check(
-        "two members sharing a card wear different member numbers",
+    assert (
         "李芳⟦1⟧: 我是第一个李芳" in _seen.get("prompt", "")
         and "李芳⟦2⟧: 我是第二个李芳" in _seen.get("prompt", "")
-        and "阿强⟦3⟧: 小X 帮我" in _seen.get("prompt", ""),
-        _seen.get("prompt", "")[-300:],
-    )
-    check(
+        and "阿强⟦3⟧: 小X 帮我" in _seen.get("prompt", "")
+    ), ("two members sharing a card wear different member numbers", _seen.get("prompt", "")[-300:])
+    assert "@李芳⟦1⟧ 和 @李芳⟦2⟧ 都看看" in _seen.get("prompt", ""), (
         "same-name @ targets carry the numbers of their accounts",
-        "@李芳⟦1⟧ 和 @李芳⟦2⟧ 都看看" in _seen.get("prompt", ""),
         _seen.get("prompt", "")[-400:],
     )
-    check(
+    assert (
+        ok_s and len(bot.sent) == n_sent + 1 and bot.ats[-1] == "u62" and bot.quoted[-1] == "s-w2"
+    ), (
         "the send @-s the numbered member and replies to the numbered line",
-        ok_s and len(bot.sent) == n_sent + 1 and bot.ats[-1] == "u62" and bot.quoted[-1] == "s-w2",
         f"{bot.ats[-1:]} {bot.quoted[-1:]}",
     )
-    check(
+    assert bot.sent[-1][1] == "你好呀", (
         "a model-written @ and number are taken off the text",
-        bot.sent[-1][1] == "你好呀",
         repr(bot.sent[-1]),
     )
     _s_line = st_s.recent[-1]
-    check(
-        "the window keeps whom it @-ed and which line it replied to",
+    assert (
         _s_line.is_bot
         and _s_line.text == "@李芳 你好呀"
         and _s_line.at == [("u62", "李芳")]
-        and _s_line.reply_to == "s-w2",
-        repr(_s_line),
-    )
+        and _s_line.reply_to == "s-w2"
+    ), ("the window keeps whom it @-ed and which line it replied to", repr(_s_line))
     _s_row = await pool().fetchrow(
         "SELECT plain_text, payload FROM raw_event WHERE platform_event_id=$1", _s_line.msg_id
     )
     _s_payload = (
         _j14.loads(_s_row["payload"]) if isinstance(_s_row["payload"], str) else _s_row["payload"]
     )
-    check(
-        "the archive reads as the group read it, with the @ as a segment",
+    assert (
         _s_row["plain_text"] == "@李芳 你好呀"
         and {"type": "at", "data": {"qq": "u62"}} in _s_payload["segments"]
-        and _s_payload["reply_to"] == "s-w2",
-        repr(_s_row),
-    )
+        and _s_payload["reply_to"] == "s-w2"
+    ), ("the archive reads as the group read it, with the @ as a segment", repr(_s_row))
     # A restart rebuilds the same line from the archive: the @ comes back as data,
     # not as text the next render would show twice.
-    from qqbot.core.state import GroupState as _GS14
+    from qqbot.conversation.state import GroupState as _GS14
 
-    _re = _GS14(group_id=GroupId("5601"))
+    _re = _GS14(
+        group_id=GroupId("5601"),
+        groups=_test_db.groups,
+        archive=_test_db.archive,
+        display_zone=_test_db.clock.zone,
+    )
     await _re.load_history(self_id="999", owners=set())
     _back = next((m for m in _re.recent if m.msg_id == _s_line.msg_id), None)
-    check(
-        "a rebuilt window preserves the structured display and addressee",
+    assert (
         _back is not None
         and _back.text == "@李芳 你好呀"
-        and [account for account, _ in _back.at] == ["u62"],
-        repr(_back),
-    )
+        and [account for account, _ in _back.at] == ["u62"]
+    ), ("a rebuilt window preserves the structured display and addressee", repr(_back))
     # The next prompt shows that line as the send call that made it, so what the
     # model reads of its own output is the shape it should produce.
     _use(_look_then_send)
     _follow = _CM0(msg_id="s-ask2", user_id="u1", nickname="阿强", text="小X 然后呢", ts=_nl0())
     st_s.add(_follow)
     await _eng.generate(
+        budget=BUDGET,
+        progress=_eng.ReplyProgress(),
         providers=providers_bundle,
         media=_MEDIA_PROCESSOR,
         directory=_DIRECTORY,
+        delivery=_DELIVERY,
         bot=bot,
         st=st_s,
         cfg=cfg,
         persona=_persona,
         msg=_follow,
         window=[_w1, _w2, _ask, _s_line],
+        members=MEMBERS,
+        database=_test_db.pool,
+        identities=_test_db.identities,
+        evidence_store=_test_db.evidence,
+        archive=_test_db.archive,
+        clock=_test_db.clock,
+        prompts=_test_db.test_bundle().prompts,
     )
     _hist = LLM_CALLS[-1]["input"]
     _own = [m for m in _hist if m.get("type") == "function_call"]
-    check(
-        "the bot's past message is rendered as its send call",
-        len(_own) == 1
-        and _j14.loads(_own[0]["arguments"])
-        == {
-            "messages": [
-                {
-                    "content": [
-                        {"type": "reply", "data": {"line": 2}},
-                        {"type": "at", "data": {"member": 2}},
-                        {"type": "text", "data": {"text": " 你好呀"}},
-                    ]
-                }
-            ]
-        },
-        repr(_own),
-    )
+    assert len(_own) == 1 and _j14.loads(_own[0]["arguments"]) == {
+        "content": [
+            {"type": "reply", "data": {"line": 2}},
+            {"type": "at", "data": {"member": 2}},
+            {"type": "text", "data": {"text": " 你好呀"}},
+        ]
+    }, ("the bot's past message is rendered as its send call", repr(_own))
     _own_result = next((m for m in _hist if m.get("type") == "function_call_output"), {})
-    check(
+    assert _own_result.get("call_id") == _own[0]["call_id"] and str(
+        _own_result.get("output", "")
+    ).startswith("已发送：#4 "), (
         "followed by its result, carrying the line's number",
-        _own_result.get("call_id") == _own[0]["call_id"]
-        and str(_own_result.get("output", "")).startswith("已发送：#4 "),
         repr(_own_result),
     )
 
@@ -2627,13 +2777,14 @@ async def main():
     _u_tools = [
         m.get("output") for m in LLM_CALLS[-1]["input"] if m.get("type") == "function_call_output"
     ]
-    check(
-        "unknown snapshot numbers are rejected before a corrected send",
+    assert (
         ok_u
         and bot.sent[-1][1] == "好的"
         and bot.ats[-1] is None
         and bot.quoted[-1] is None
-        and any("无效" in str(t) for t in _u_tools),
+        and any("无效" in str(t) for t in _u_tools)
+    ), (
+        "unknown snapshot numbers are rejected before a corrected send",
         f"{bot.sent[-1:]} {_u_tools}",
     )
 
@@ -2646,44 +2797,56 @@ async def main():
     _e_tools = [
         m.get("output") for m in LLM_CALLS[-1]["input"] if m.get("type") == "function_call_output"
     ]
-    check(
-        "an empty send is refused in words and the next round sends",
+    assert (
         ok_e
         and bot.sent[-1][1] == "重新发一遍"
         and bot.ats[-1] == "u1"
-        and any("没有可发送的内容" in str(t) for t in _e_tools),
-        f"{bot.sent[-1:]} {_e_tools}",
-    )
+        and any("没有可发送内容" in str(t) for t in _e_tools)
+    ), ("an empty send is refused in words and the next round sends", f"{bot.sent[-1:]} {_e_tools}")
 
     _use(
         _calls(
-            function_call("send_messages", {"messages": []}, call_id="bad-send"),
+            function_call("send_message", {"content": []}, call_id="bad-send"),
             function_call(
-                "send_messages",
-                {"messages": [{"content": [{"type": "text", "data": {"text": "同轮有效"}}]}]},
+                "send_message",
+                {"content": [{"type": "text", "data": {"text": "同轮有效"}}]},
                 call_id="good-send",
             ),
-        )
+        ),
+        _calls(_send(text="同轮有效")),
     )
     n_multi_send = len(LLM_CALLS)
     ok_multi_send = await _respond(
         bot=bot, st=st_s, cfg=cfg, persona=_persona, msg=_follow, window=[_w1, _w2, _ask]
     )
-    check(
-        "a valid later send in the same response is not hidden by an invalid first send",
-        ok_multi_send and bot.sent[-1][1] == "同轮有效" and len(LLM_CALLS) == n_multi_send + 1,
-        str(bot.sent[-1:]),
-    )
+    assert (
+        ok_multi_send
+        and bot.sent[-1][1] == "同轮有效"
+        and len(LLM_CALLS) == n_multi_send + 2
+        and all(
+            "均未执行" in str(m.get("output"))
+            for m in LLM_CALLS[-1]["input"]
+            if m.get("type") == "function_call_output"
+        )
+    ), ("parallel sends execute neither until a later isolated call", str(bot.sent[-1:]))
 
-    # A send ends the reply: a search asked for in the same round never runs.
+    # Mixed send and retrieval calls are both refused before the next isolated send.
     EndlessSearch.calls.clear()
-    _use(_calls(_tc("顺便查查"), _send(text="先这样")))
+    _use(_calls(_tc("顺便查查"), _send(text="先这样")), _calls(_send(text="先这样")))
     ok_b = await _respond(
         bot=bot, st=st_s, cfg=cfg, persona=_persona, msg=_follow, window=[_w1, _w2, _ask]
     )
-    check(
-        "calls sharing a round with the send are not executed",
-        ok_b and bot.sent[-1][1] == "先这样" and EndlessSearch.calls == [],
+    assert (
+        ok_b
+        and bot.sent[-1][1] == "先这样"
+        and EndlessSearch.calls == []
+        and all(
+            "均未执行" in str(m.get("output"))
+            for m in LLM_CALLS[-1]["input"]
+            if m.get("type") == "function_call_output"
+        )
+    ), (
+        "calls sharing a round with a send execute neither",
         f"{bot.sent[-1:]} {EndlessSearch.calls}",
     )
 
@@ -2701,9 +2864,8 @@ async def main():
         persona=config().for_group(GROUP)[1],
         msg=_CM0(msg_id="pv-bare", user_id="u1", nickname="阿强", text="大后天呢", ts=_nl0()),
     )
-    check(
+    assert not ok_bare and len(bot.sent) == n_bare and len(LLM_CALLS) == n_calls + 1, (
         "bare text sends nothing, and ends the reply",
-        not ok_bare and len(bot.sent) == n_bare and len(LLM_CALLS) == n_calls + 1,
         f"{bot.sent[n_bare:]} {len(LLM_CALLS) - n_calls} round(s)",
     )
 
@@ -2714,20 +2876,28 @@ async def main():
         "SELECT count(*) FROM raw_event WHERE payload->>'author_kind'='bot'"
     )
     ok_accidental = await _respond(
-        bot=bot, st=st_pv, cfg=cfg, persona=config().for_group(GROUP)[1],
+        bot=bot,
+        st=st_pv,
+        cfg=cfg,
+        persona=config().for_group(GROUP)[1],
         msg=_CM0(
-            msg_id="pv-accidental", user_id="u1", nickname="阿强",
-            text="只是名字碰巧触发，不是在叫你，也没有问题要问", ts=_nl0(),
+            msg_id="pv-accidental",
+            user_id="u1",
+            nickname="阿强",
+            text="只是名字碰巧触发，不是在叫你，也没有问题要问",
+            ts=_nl0(),
         ),
     )
-    check(
-        "an accidental address may end without any send, retry or synthetic bot event",
-        not ok_accidental and len(bot.sent) == n_accidental
-        and len(LLM_CALLS) == n_model + 1 and list(st_pv.recent) == window_before
+    assert (
+        not ok_accidental
+        and len(bot.sent) == n_accidental
+        and len(LLM_CALLS) == n_model + 1
+        and list(st_pv.recent) == window_before
         and await pool().fetchval(
             "SELECT count(*) FROM raw_event WHERE payload->>'author_kind'='bot'"
-        ) == own_before,
-    )
+        )
+        == own_before
+    ), "an accidental address may end without any send, retry or synthetic bot event"
 
     _use(lambda m: response(model="fake-light", tool_calls=send_to_asker(m, "@阿强 明天多云")))
     ok_at = await _respond(
@@ -2737,33 +2907,30 @@ async def main():
         persona=config().for_group(GROUP)[1],
         msg=_CM0(msg_id="pv-at", user_id="u1", nickname="阿强", text="后天呢", ts=_nl0()),
     )
-    check(
-        "a send replying to the asker and @-ing them, the @ not doubled",
+    assert (
         ok_at
         and bot.sent[-1][1] == "明天多云"
         and bot.ats[-1] == "u1"
-        and bot.quoted[-1] == "pv-at",
-        str(bot.sent[-1:]),
-    )
-    check(
-        "the window remembers the answer with its addressee",
+        and bot.quoted[-1] == "pv-at"
+    ), ("a send replying to the asker and @-ing them, the @ not doubled", str(bot.sent[-1:]))
+    assert (
         st_pv.recent[-1].is_bot
         and st_pv.recent[-1].text == "@阿强 明天多云"
-        and st_pv.recent[-1].at == [("u1", "阿强")],
-        repr(st_pv.recent[-1]),
-    )
+        and st_pv.recent[-1].at == [("u1", "阿强")]
+    ), ("the window remembers the answer with its addressee", repr(st_pv.recent[-1]))
     _at_row = await pool().fetchval(
         "SELECT plain_text FROM raw_event WHERE platform_event_id=$1", st_pv.recent[-1].msg_id
     )
-    check("and the archive reads as the group read it", _at_row == "@阿强 明天多云", repr(_at_row))
-    check(
+    assert _at_row == "@阿强 明天多云", (
+        "and the archive reads as the group read it",
+        repr(_at_row),
+    )
+    assert _cr("明天多云 ⟦依据:搜索“天气”⟧") == "明天多云", (
         "an imitated provenance marker never reaches the group",
-        _cr("明天多云 ⟦依据:搜索“天气”⟧") == "明天多云",
         repr(_cr("明天多云 ⟦依据:搜索“天气”⟧")),
     )
-    check(
+    assert _cr("李芳⟦2⟧ 你好") == "李芳 你好", (
         "an imitated member number never reaches the group",
-        _cr("李芳⟦2⟧ 你好") == "李芳 你好",
         repr(_cr("李芳⟦2⟧ 你好")),
     )
     # The quote pointer is transcript notation too - the real quote is the reply
@@ -2771,47 +2938,41 @@ async def main():
     # output layer strips it like every other imitated marker - but only at line
     # starts, where format imitation lives; mid-sentence it is likelier the
     # reply's own content, and where the readings collide the guard declines.
-    check(
+    assert _cr("⟦回复 #26⟧ 这波我不评价") == "这波我不评价", (
         "an imitated quote pointer never reaches the group",
-        _cr("⟦回复 #26⟧ 这波我不评价") == "这波我不评价",
         repr(_cr("⟦回复 #26⟧ 这波我不评价")),
     )
-    check(
+    assert _cr("好的\n⟦回复更早的消息⟧ 我看看") == "好的\n我看看", (
         "its lost-message form too, on its own line",
-        _cr("好的\n⟦回复更早的消息⟧ 我看看") == "好的\n我看看",
         repr(_cr("好的\n⟦回复更早的消息⟧ 我看看")),
     )
-    check(
+    assert _cr("他原话就带着 ⟦回复 #3⟧ 这几个字") == "他原话就带着 [回复 #3] 这几个字", (
         "but a mid-sentence mention is content and stays",
-        _cr("他原话就带着 ⟦回复 #3⟧ 这几个字") == "他原话就带着 [回复 #3] 这几个字",
         repr(_cr("他原话就带着 ⟦回复 #3⟧ 这几个字")),
     )
     # The square form is what a member's own imitation looks like after defang, and
     # what the model reads in their lines: quoting it back is content, not markup.
-    check(
+    assert _cr("[回复 #26] 这波我不评价") == "[回复 #26] 这波我不评价", (
         "a square-bracket form is text and stays",
-        _cr("[回复 #26] 这波我不评价") == "[回复 #26] 这波我不评价",
         repr(_cr("[回复 #26] 这波我不评价")),
     )
     # Every strip is counted: the guard doubles as the online sensor, and the
     # daily report reads these to show format discipline regressing at the source.
-    from qqbot.core import output as _out
+    from qqbot.delivery import output as _out
 
     _n0 = _out.STRIPPED["quote_mark"]
     _cr("⟦回复 #5⟧ 好")
-    check(
+    assert _out.STRIPPED["quote_mark"] == _n0 + 1, (
         "a stripper hit is counted for the daily report",
-        _out.STRIPPED["quote_mark"] == _n0 + 1,
         str(dict(_out.STRIPPED)),
     )
     _n1 = _out.STRIPPED["quote_mark"]
     _cr("干净的正文")
-    check("a clean reply counts nothing", _out.STRIPPED["quote_mark"] == _n1)
+    assert _out.STRIPPED["quote_mark"] == _n1, "a clean reply counts nothing"
     # Order matters: the quote mark is stripped first, or a line imitating both
     # markers would shed the quote and keep the uncovered line number.
-    check(
+    assert _cr("⟦回复 #2⟧ #3 阿强: 都别吵了") == "都别吵了", (
         "a quote mark hiding a line number uncovers nothing",
-        _cr("⟦回复 #2⟧ #3 阿强: 都别吵了") == "都别吵了",
         repr(_cr("⟦回复 #2⟧ #3 阿强: 都别吵了")),
     )
 
@@ -2822,27 +2983,34 @@ async def main():
         "SELECT memo, expires_at FROM reply_trace WHERE reply_event_id=$1",
         _pv_line.msg_id,
     )
-    check(
-        "new reply evidence is structured and versioned",
+    assert (
         _memo_row["memo"]["schema"] == 1
         and _memo_row["memo"]["items"][0]["source"] == "web_search"
-        and _memo_row["expires_at"] is not None,
-        repr(dict(_memo_row)),
-    )
-    check(
-        "and the deque holds only conversation",
-        not any(m.text.startswith("⟦检索记录⟧") for m in st_pv.recent),
+        and _memo_row["expires_at"] is not None
+    ), ("new reply evidence is structured and versioned", repr(dict(_memo_row)))
+    assert not any(m.text.startswith("⟦检索记录⟧") for m in st_pv.recent), (
+        "and the deque holds only conversation"
     )
     _use(_calls(_send(text="后天也多云")))
     await _eng.generate(
+        budget=BUDGET,
+        progress=_eng.ReplyProgress(),
         providers=providers_bundle,
         media=_MEDIA_PROCESSOR,
         directory=_DIRECTORY,
+        delivery=_DELIVERY,
         bot=bot,
         st=st_pv,
         cfg=cfg,
         persona=config().for_group(GROUP)[1],
         msg=_CM0(msg_id="pv2", user_id="u1", nickname="阿强", text="后天呢", ts=_nl0()),
+        members=MEMBERS,
+        database=_test_db.pool,
+        identities=_test_db.identities,
+        evidence_store=_test_db.evidence,
+        archive=_test_db.archive,
+        clock=_test_db.clock,
+        prompts=_test_db.test_bundle().prompts,
     )
     _msgs2 = list(LLM_CALLS[-1]["input"])
     _ri = next(
@@ -2857,27 +3025,26 @@ async def main():
         ),
         None,
     )
-    check(
-        "assembly seats rendered evidence with the send call it fed",
+    assert (
         _ri is not None
-        and _msgs2[_ri - 1].get("name") == "send_messages"
+        and _msgs2[_ri - 1].get("name") == "send_message"
         and _msgs2[_ri - 2].get("role") == "assistant"
         and _msgs2[_ri - 2].get("content") == _expected_evidence
-        and "依据" not in str(_msgs2[_ri].get("output", "")),
+        and "依据" not in str(_msgs2[_ri].get("output", ""))
+    ), (
+        "assembly seats rendered evidence with the send call it fed",
         str(_msgs2[_ri - 2 : _ri + 1] if _ri else _msgs2[-3:])[:200],
     )
-    check(
+    assert _cr("⟦检索记录⟧\n搜索“x”：y\n好的") == "搜索“x”：y\n好的", (
         "an imitated evidence marker line never reaches the group",
-        _cr("⟦检索记录⟧\n搜索“x”：y\n好的") == "搜索“x”：y\n好的",
         repr(_cr("⟦检索记录⟧\n搜索“x”：y\n好的")),
     )
     await pool().execute(
         "UPDATE reply_trace SET expires_at=NOW() - INTERVAL '1 second' WHERE reply_event_id=$1",
         _pv_line.msg_id,
     )
-    check(
-        "expired evidence degrades to absence",
-        await _repo.evidence_for(GROUP, [_pv_line.msg_id]) == {},
+    assert await _test_db.evidence.evidence_for(GROUP, [_pv_line.msg_id]) == {}, (
+        "expired evidence degrades to absence"
     )
     set_providers(providers_bundle)
 
@@ -2886,55 +3053,52 @@ async def main():
     # be reads as broken context - and the list survives a restart via its own
     # table. The accepted price is that a blocked account still feeds memory.
     st15 = await REGISTRY.get(GROUP)
-    await _repo.block(GROUP, "bad1")
+    await _test_db.groups.block(GROUP, "bad1")
     n_sent15 = len(bot.sent)
     ev_blocked = FakeEvent("小X 在吗", user_id="bad1", nickname="捣乱的", to_me=True)
     await GATEWAY.handle(bot, ev_blocked)
     await drain()
-    check(
+    assert len(bot.sent) == n_sent15, (
         "a blocked account draws no reply even when it @s the bot",
-        len(bot.sent) == n_sent15,
         f"{len(bot.sent) - n_sent15} sent",
     )
-    check(
-        "but its message still archives, keeping the window coherent",
+    assert (
         await pool().fetchval(
             "SELECT count(*) FROM raw_event WHERE platform_event_id=$1", str(ev_blocked.message_id)
         )
-        == 1,
-    )
-    fresh15 = type(st15)(group_id=GROUP)
+        == 1
+    ), "but its message still archives, keeping the window coherent"
+    fresh15 = type(st15)(group_id=GROUP, groups=_test_db.groups, archive=_test_db.archive)
     await fresh15.load()
-    check("the block rule survives a restart", await fresh15.blocked_now("bad1"))
-    await _repo.unblock(GROUP, "bad1")
+    assert await fresh15.blocked_now("bad1"), "the block rule survives a restart"
+    await _test_db.groups.unblock(GROUP, "bad1")
     await GATEWAY.handle(
         bot, FakeEvent("小X 还在吗", user_id="bad1", nickname="捣乱的", to_me=True)
     )
     await drain()
-    check("unblocking restores replies", len(bot.sent) == n_sent15 + 1)
+    assert len(bot.sent) == n_sent15 + 1, "unblocking restores replies"
 
     # A holder block created before a merge must never silence an owner who joins
     # that holder; the owner must still be able to remove the now-shared rule.
     block_owner = await _IDS.ensure_account("qq", "block-owner", seen_at=_nl0())
     block_member = await _IDS.ensure_account("qq", "block-member", seen_at=_nl0())
-    await _repo.block_holder(GROUP, block_member.entity_id)
+    await _test_db.groups.block_holder(GROUP, block_member.entity_id)
     await _IDS.merge_accounts(block_owner.id, block_member.id)
-    cfg = install_settings(cfg.model_copy(update={"owners": ["block-owner"]}))
-    check(
-        "a holder block dynamically covers both accounts after merge",
-        await _repo.blocked(GROUP, "block-owner")
-        and await _repo.blocked(GROUP, "block-member"),
+    cfg = install_settings(
+        cfg.model_copy(update={"bot": cfg.bot.model_copy(update={"owners": ("block-owner",)})})
     )
+    assert await _test_db.groups.blocked(GROUP, "block-owner") and await _test_db.groups.blocked(
+        GROUP, "block-member"
+    ), "a holder block dynamically covers both accounts after merge"
     n_owner = len(bot.sent)
     await GATEWAY.handle(bot, FakeEvent("小X 还在吗", user_id="block-owner", to_me=True))
     await drain()
-    check(
-        "an owner remains able to receive replies after merging into a block",
-        len(bot.sent) == n_owner + 1,
+    assert len(bot.sent) == n_owner + 1, (
+        "an owner remains able to receive replies after merging into a block"
     )
     await GATEWAY.handle(bot, FakeEvent("小X 还在吗", user_id="block-member", to_me=True))
     await drain()
-    check("other accounts in the blocked holder remain silent", len(bot.sent) == n_owner + 1)
+    assert len(bot.sent) == n_owner + 1, "other accounts in the blocked holder remain silent"
     await GATEWAY.handle(
         bot,
         FakeEvent(
@@ -2945,12 +3109,11 @@ async def main():
             ],
         ),
     )
-    check(
-        "new blocks still reject a holder containing an owner",
-        await _repo.blocked(GROUP, "block-member")
-        and len(await _repo.block_rules(GROUP)) == 1
-        and "不能屏蔽" in bot.sent[-1][1],
-    )
+    assert (
+        await _test_db.groups.blocked(GROUP, "block-member")
+        and len(await _test_db.groups.block_rules(GROUP)) == 1
+        and "不能屏蔽" in bot.sent[-1][1]
+    ), "new blocks still reject a holder containing an owner"
     await GATEWAY.handle(
         bot,
         FakeEvent(
@@ -2961,13 +3124,12 @@ async def main():
             ],
         ),
     )
-    check(
-        "an owner can remove a pre-merge holder rule",
-        not await _repo.blocked(GROUP, "block-owner")
-        and not await _repo.blocked(GROUP, "block-member")
-        and not await _repo.block_rules(GROUP),
-    )
-    await _repo.block(GROUP, "block-owner")
+    assert (
+        not await _test_db.groups.blocked(GROUP, "block-owner")
+        and not await _test_db.groups.blocked(GROUP, "block-member")
+        and not await _test_db.groups.block_rules(GROUP)
+    ), "an owner can remove a pre-merge holder rule"
+    await _test_db.groups.block(GROUP, "block-owner")
     await GATEWAY.handle(
         bot,
         FakeEvent(
@@ -2978,44 +3140,43 @@ async def main():
             ],
         ),
     )
-    check(
-        "an owner can remove an inherited exact rule",
-        not await _repo.blocked(GROUP, "block-owner"),
+    assert not await _test_db.groups.blocked(GROUP, "block-owner"), (
+        "an owner can remove an inherited exact rule"
     )
-    cfg = install_settings(cfg.model_copy(update={"owners": []}))
+    cfg = install_settings(
+        cfg.model_copy(update={"bot": cfg.bot.model_copy(update={"owners": ()})})
+    )
 
     # A timed block lapses dynamically: the first message past its expiry answers
     # normally. The row remains as bounded per-target audit state and is replaced by a
     # later rule for the same scope.
     from datetime import timedelta as _btd
 
-    await _repo.block(GROUP, "bad1", until=_nl0() - _btd(seconds=1))
+    await _test_db.groups.block(GROUP, "bad1", until=_nl0() - _btd(seconds=1))
     n_lapse = len(bot.sent)
     await GATEWAY.handle(
         bot, FakeEvent("小X 醒了吗", user_id="bad1", nickname="捣乱的", to_me=True)
     )
     await drain()
-    check(
+    assert len(bot.sent) == n_lapse + 1, (
         "a lapsed timed block no longer blocks",
-        len(bot.sent) == n_lapse + 1,
         f"{len(bot.sent) - n_lapse} sent",
     )
-    check("and the dynamic rule is no longer active", not await st15.blocked_now("bad1"))
-    check(
-        "and its bounded audit row remains inactive",
+    assert not await st15.blocked_now("bad1"), "and the dynamic rule is no longer active"
+    assert (
         await pool().fetchval(
             "SELECT count(*) FROM group_blocklist WHERE group_id=123"
             " AND user_id='bad1' AND blocked_until <= NOW()"
         )
-        == 1,
-    )
+        == 1
+    ), "and its bounded audit row remains inactive"
     # A still-running timed block behaves like any block.
-    await _repo.block(GROUP, "bad1", until=_nl0() + _btd(hours=1))
+    await _test_db.groups.block(GROUP, "bad1", until=_nl0() + _btd(hours=1))
     n_live = len(bot.sent)
     await GATEWAY.handle(bot, FakeEvent("小X 在么", user_id="bad1", nickname="捣乱的", to_me=True))
     await drain()
-    check("a running timed block still blocks", len(bot.sent) == n_live)
-    await _repo.unblock(GROUP, "bad1")
+    assert len(bot.sent) == n_live, "a running timed block still blocks"
+    await _test_db.groups.unblock(GROUP, "bad1")
 
     # 16. A new account needs no agreement. Its message is admitted once, then
     # the ordinary reply path calls the model and delivers the reply on every address.
@@ -3024,28 +3185,24 @@ async def main():
     ev16 = FakeEvent("小X 在吗", user_id="newbie", nickname="新人", to_me=True)
     await GATEWAY.handle(bot, ev16)
     await drain()
-    check(
-        "a new member receives a reply without consenting",
+    assert (
         len(bot.sent) == n16 + 1
         and len(LLM_CALLS) == calls16 + 1
         and "/agree" not in str(bot.sent[n16:])
-        and "/terms" not in str(bot.sent[n16:]),
-        str(bot.sent[n16:])[:160],
-    )
-    check(
-        "their message archives before the reply",
+        and "/terms" not in str(bot.sent[n16:])
+    ), ("a new member receives a reply without consenting", str(bot.sent[n16:])[:160])
+    assert (
         await pool().fetchval(
             "SELECT count(*) FROM raw_event WHERE platform_event_id=$1", str(ev16.message_id)
         )
-        == 1,
-    )
+        == 1
+    ), "their message archives before the reply"
     await GATEWAY.handle(
         bot, FakeEvent("小X 还在吗", user_id="newbie", nickname="新人", to_me=True)
     )
     await drain()
-    check(
-        "the same new member can ask again without a consent cooldown",
-        len(bot.sent) == n16 + 2 and len(LLM_CALLS) == calls16 + 2,
+    assert len(bot.sent) == n16 + 2 and len(LLM_CALLS) == calls16 + 2, (
+        "the same new member can ask again without a consent cooldown"
     )
 
     # 17. group notices become transcript lines: archived, in the window, and
@@ -3058,38 +3215,38 @@ async def main():
     )
     await GATEWAY.handle_notice(bot, ev_note)
     await drain(0.3)
-    check(
-        "a recall becomes a window line",
-        any(m.text == "⟦撤回了自己的一条消息⟧" and m.user_id == "u9" for m in st17.recent),
+    assert any(m.text == "⟦撤回了自己的一条消息⟧" and m.user_id == "u9" for m in st17.recent), (
+        "a recall becomes a window line"
     )
-    check(
-        "and is archived once",
+    assert (
         await pool().fetchval(
             "SELECT count(*) FROM raw_event WHERE platform_event_id"
             " LIKE 'notice-group_recall-123-u9-%'"
         )
-        == 1,
-    )
-    check(
-        "notice rows retain their normalized archive type",
+        == 1
+    ), "and is archived once"
+    assert (
         await pool().fetchval(
             """SELECT event_type FROM raw_event
                 WHERE platform_event_id LIKE 'notice-group_recall-123-u9-%'
                 LIMIT 1"""
         )
-        == "notice",
-    )
+        == "notice"
+    ), "notice rows retain their normalized archive type"
     await GATEWAY.handle_notice(bot, ev_note)  # the database admission gate rejects it
     await drain(0.2)
-    check(
-        "a replayed notice lands only once",
-        sum(1 for m in st17.recent if m.msg_id.startswith("notice-group_recall")) == 1,
+    assert sum(1 for m in st17.recent if m.msg_id.startswith("notice-group_recall")) == 1, (
+        "a replayed notice lands only once"
     )
-    rebuilt_notice_state = GroupState(group_id=GROUP)
+    rebuilt_notice_state = GroupState(
+        group_id=GROUP,
+        groups=_test_db.groups,
+        archive=_test_db.archive,
+        display_zone=_test_db.clock.zone,
+    )
     await rebuilt_notice_state.load_history(self_id=str(bot.self_id), owners=set())
-    check(
-        "a restart rebuild keeps normalized notice rows in the transcript",
-        any(m.text == "⟦撤回了自己的一条消息⟧" for m in rebuilt_notice_state.recent),
+    assert any(m.text == "⟦撤回了自己的一条消息⟧" for m in rebuilt_notice_state.recent), (
+        "a restart rebuild keeps normalized notice rows in the transcript"
     )
     await GATEWAY.handle_notice(
         bot,
@@ -3124,13 +3281,12 @@ async def main():
         ),
     )
     await drain(0.3)
-    check(
-        "a poke at the bot is transcribed, never answered",
-        any(m.text == "⟦戳了戳你⟧" for m in st17.recent) and len(bot.sent) == n17,
+    assert any(m.text == "⟦戳了戳你⟧" for m in st17.recent) and len(bot.sent) == n17, (
+        "a poke at the bot is transcribed, never answered"
     )
-    check("a join is transcribed", any(m.text == "⟦加入了本群⟧" for m in st17.recent))
-    check(
-        "a ban is transcribed with its span", any(m.text == "⟦被禁言 10 分钟⟧" for m in st17.recent)
+    assert any(m.text == "⟦加入了本群⟧" for m in st17.recent), "a join is transcribed"
+    assert any(m.text == "⟦被禁言 10 分钟⟧" for m in st17.recent), (
+        "a ban is transcribed with its span"
     )
     for mid in ("r1", "r2"):  # an admin mass-recall: one author, same second
         await GATEWAY.handle_notice(
@@ -3171,15 +3327,12 @@ async def main():
         ),
     )
     await drain(0.3)
-    check(
-        "same-second recalls of one author each get their line",
-        sum(1 for m in st17.recent if m.text == "⟦一条消息被管理员撤回⟧" and m.user_id == "u9")
-        == 2,
-    )
-    check("mute-all credits no phantom account", not any(m.user_id == "0" for m in st17.recent))
-    check(
-        "the bot's own events are not transcribed",
-        not any(m.msg_id.startswith("notice") and m.user_id == "999" for m in st17.recent),
+    assert (
+        sum(1 for m in st17.recent if m.text == "⟦一条消息被管理员撤回⟧" and m.user_id == "u9") == 2
+    ), "same-second recalls of one author each get their line"
+    assert not any(m.user_id == "0" for m in st17.recent), "mute-all credits no phantom account"
+    assert not any(m.msg_id.startswith("notice") and m.user_id == "999" for m in st17.recent), (
+        "the bot's own events are not transcribed"
     )
 
     # 17b. quoting the bot's own line is being addressed, even with the reply
@@ -3193,9 +3346,8 @@ async def main():
         bot, FakeEvent("你确定吗", user_id="u1", reply_id=bot_line.msg_id, reply_from="999")
     )
     await drain()
-    check(
+    assert len(bot.sent) == n17b + 1, (
         "a de-@'d quote of the bot's line still draws a reply",
-        len(bot.sent) == n17b + 1,
         f"{len(bot.sent) - n17b} sent",
     )
     await GATEWAY.handle(
@@ -3205,9 +3357,8 @@ async def main():
         ),
     )
     await drain()
-    check(
+    assert len(bot.sent) == n17b + 1, (
         "quoting anybody else without an @ stays silence",
-        len(bot.sent) == n17b + 1,
         f"{len(bot.sent) - n17b - 1} extra",
     )
 
@@ -3218,28 +3369,27 @@ async def main():
     _cmd_ev = FakeEvent("/who", user_id="u1")
     await GATEWAY.handle(bot, _cmd_ev)
     await drain()
-    check(
+    assert len(bot.sent) == n_cmd + 1, (
         "a command receives exactly one routed response",
-        len(bot.sent) == n_cmd + 1,
         f"{len(bot.sent) - n_cmd} sent",
     )
-    check(
-        "a command never enters the model reply path",
-        len([call for call in LLM_CALLS if call["kind"] == "reply"]) == n_cmd_model,
+    assert len([call for call in LLM_CALLS if call["kind"] == "reply"]) == n_cmd_model, (
+        "a command never enters the model reply path"
     )
-    check(
-        "but it enters the window", any(m.msg_id == str(_cmd_ev.message_id) for m in st17b.recent)
+    assert any(m.msg_id == str(_cmd_ev.message_id) for m in st17b.recent), (
+        "but it enters the window"
     )
     _cmd_row = await pool().fetchval(
         "SELECT plain_text FROM raw_event WHERE platform_event_id=$1", str(_cmd_ev.message_id)
     )
-    check("and the archive", _cmd_row is not None and "/who" in _cmd_row, repr(_cmd_row))
+    assert _cmd_row is not None and "/who" in _cmd_row, ("and the archive", repr(_cmd_row))
 
     # 18. member numbers: members sharing a card are told apart by the number each
     # person wears in one render, not by anything stored against the name.
-    from qqbot.core import tools as _tools
-    from qqbot.core.member_numbers import MemberNumbers as _MN18
-    from qqbot.core.members import MEMBERS as _MEM18
+    from qqbot.conversation import tools as _tools
+    from qqbot.conversation.member_numbers import MemberNumbers as _MN18
+
+    _MEM18 = MEMBERS
 
     bot.members += [
         {"user_id": "u31", "card": "张伟", "nickname": "zw"},
@@ -3247,9 +3397,8 @@ async def main():
     ]
     _MEM18.forget(GROUP)
     named = await _MEM18.names_of(bot, GROUP, ["u31", "u32"])
-    check(
+    assert named == {"u31": "张伟", "u32": "张伟"}, (
         "the member list holds plain names, shared ones included",
-        named == {"u31": "张伟", "u32": "张伟"},
         str(named),
     )
     # A merged main and alt are one person: one number between them, while an
@@ -3258,21 +3407,19 @@ async def main():
     await seed(GROUP, "u42", "王大锤", text="小号在此")
     await seed(GROUP, "u43", "王大锤", text="我是另一个王大锤")
     await _DIRECTORY.merge("u42", "u41")
-    _p18 = _MN18(self_id="999")
+    _p18 = _MN18(self_id="999", lookup=_test_db.identities.holder_ids_for_accounts)
     await _p18.learn(["u41", "u42", "u43"])
     n41, n42, n43 = _p18.number("u41"), _p18.number("u42", spoke=True), _p18.number("u43")
-    check(
+    assert n41 == n42 and n43 != n41, (
         "a merged person's accounts share one number; a namesake gets another",
-        n41 == n42 and n43 != n41,
         f"{n41} {n42} {n43}",
     )
-    check(
+    assert _p18.account(n41) == "u42" and _p18.accounts(n41) == ["u41", "u42"], (
         "the account to @ for a person is the one that spoke last",
-        _p18.account(n41) == "u42" and _p18.accounts(n41) == ["u41", "u42"],
         f"{_p18.account(n41)} {_p18.accounts(n41)}",
     )
-    check("the bot is never numbered", _p18.number("999") == 0)
-    check("a number no render showed names nobody", _p18.account(99) is None)
+    assert _p18.number("999") == 0, "the bot is never numbered"
+    assert _p18.account(99) is None, "a number no render showed names nobody"
     # A rename relabels the window: the speaker's line and the bot's own @ of them.
     _line18 = _CM0(msg_id="ns-1", user_id="u31", nickname="旧名", text="改锥在我这", ts=_nl0())
     _own18 = _CM0(
@@ -3285,9 +3432,8 @@ async def main():
         at=[("u31", "旧名")],
     )
     n18 = await _MEM18.relabel(bot, GROUP, [_line18, _own18])
-    check(
+    assert _line18.nickname == "张伟" and _own18.at == [("u31", "张伟")] and n18 == 2, (
         "relabel carries the current card onto lines and onto the bot's @s",
-        _line18.nickname == "张伟" and _own18.at == [("u31", "张伟")] and n18 == 2,
         f"{_line18.nickname} {_own18.at} {n18}",
     )
     # A member the table has never heard of forces one refresh inside the TTL -
@@ -3296,306 +3442,347 @@ async def main():
     # not cost a fetch on every reply.
     calls18 = bot.member_list_calls
     await _MEM18.names_of(bot, GROUP, ["u31", "u-gone"])
-    check(
+    assert bot.member_list_calls == calls18 + 1, (
         "an unknown member forces one refresh inside the TTL",
-        bot.member_list_calls == calls18 + 1,
         str(bot.member_list_calls - calls18),
     )
     await _MEM18.names_of(bot, GROUP, ["u31", "u-gone"])
-    check(
+    assert bot.member_list_calls == calls18 + 1, (
         "and a miss that survived it does not force another",
-        bot.member_list_calls == calls18 + 1,
         str(bot.member_list_calls - calls18),
     )
     bot.members.append({"user_id": "u-new", "card": "新人甲", "nickname": "n"})
-    check(
-        "a newcomer resolves at once, inside the TTL",
-        (await _MEM18.name_of(bot, GROUP, "u-new")) == "新人甲",
+    assert (await _MEM18.name_of(bot, GROUP, "u-new")) == "新人甲", (
+        "a newcomer resolves at once, inside the TTL"
     )
     await seed(GROUP, "u31", "张伟", text="改锥昨天借给阿强了")
     await seed(GROUP, "u32", "张伟", text="改锥我根本没见过")
     # Bare-hit mode: the pin is about which lines are *hits* - with context on,
     # the other namesake's line would legitimately appear as surroundings.
-    _base_rcfg18 = config().default.tools.search_history
+    from dataclasses import replace
+    from qqbot.conversation.limits import HISTORY_LIMITS
+
+    _base_rcfg18 = HISTORY_LIMITS
     _ctx18 = _base_rcfg18.context_lines
-    _rcfg18 = _base_rcfg18.model_copy(update={"context_lines": 0})
-    _p18b = _MN18(self_id="999")
+    _rcfg18 = replace(_base_rcfg18, context_lines=0)
+    _p18b = _MN18(self_id="999", lookup=_test_db.identities.holder_ids_for_accounts)
     n31 = _p18b.number("u31", spoke=True)
-    got = await _tools.search_history(GROUP, "改锥", speaker=n31, rcfg=_rcfg18, people=_p18b)
-    check(
+    got = await _tools.search_history(
+        GROUP,
+        "改锥",
+        speaker=n31,
+        rcfg=_rcfg18,
+        people=_p18b,
+        database=_test_db.pool,
+        identities=_test_db.identities,
+        clock=_test_db.clock,
+    )
+    assert "借给阿强" in got and "没见过" not in got, (
         "search_history narrows by member number, not the shared name",
-        "借给阿强" in got and "没见过" not in got,
         got,
     )
-    got_nums = await _tools.search_history(GROUP, "改锥", rcfg=_rcfg18, people=_p18b)
-    check(
-        "search results number both namesakes, the known one as the prompt did",
+    got_nums = await _tools.search_history(
+        GROUP,
+        "改锥",
+        rcfg=_rcfg18,
+        people=_p18b,
+        database=_test_db.pool,
+        identities=_test_db.identities,
+        clock=_test_db.clock,
+    )
+    assert (
         f"张伟⟦{n31}⟧: 改锥昨天借给阿强了" in got_nums
         and f"张伟⟦{_p18b.known('u32')}⟧: 改锥我根本没见过" in got_nums
-        and _p18b.known("u32") not in (0, n31),
-        got_nums,
+        and _p18b.known("u32") not in (0, n31)
+    ), ("search results number both namesakes, the known one as the prompt did", got_nums)
+    got_miss = await _tools.search_history(
+        GROUP,
+        "改锥",
+        speaker=77,
+        people=_p18b,
+        database=_test_db.pool,
+        identities=_test_db.identities,
+        clock=_test_db.clock,
     )
-    got_miss = await _tools.search_history(GROUP, "改锥", speaker=77, people=_p18b)
-    check(
+    assert not _tools.verified(got_miss) and "77" in got_miss, (
         "a member number the prompt never showed is answered in words",
-        not _tools.verified(got_miss) and "77" in got_miss,
         got_miss,
     )
     got_name = await _tools.search_history(
-        GROUP, "改锥", speaker=77, speaker_name="张伟", people=_p18b
+        GROUP,
+        "改锥",
+        speaker=77,
+        speaker_name="张伟",
+        people=_p18b,
+        database=_test_db.pool,
+        identities=_test_db.identities,
+        clock=_test_db.clock,
     )
-    check(
+    assert "借给阿强" in got_name and "没见过" in got_name, (
         "and with a name given, falls back to matching the name",
-        "借给阿强" in got_name and "没见过" in got_name,
         got_name,
     )
-    got_own = await _tools.search_history(GROUP, "明天多云", self_id="999")
-    check(
+    got_own = await _tools.search_history(
+        GROUP,
+        "明天多云",
+        self_id="999",
+        database=_test_db.pool,
+        identities=_test_db.identities,
+        clock=_test_db.clock,
+    )
+    assert "⟦0⟧: " in got_own, (
         "the bot's own archived line wears the self tag in search results",
-        "⟦0⟧: " in got_own,
         got_own,
     )
     # The answer as a whole is bounded; a cut answer says so.
     _chars18 = _rcfg18.max_result_chars
-    _short_rcfg18 = _rcfg18.model_copy(update={"max_result_chars": 1000})
-    got_cut = await _tools.search_history(GROUP, "改锥", rcfg=_short_rcfg18)
-    check("a short search answer is not cut", "结果过长" not in got_cut, got_cut[-60:])
-    from qqbot.settings import SearchHistoryToolCfg as _RC
-
-    _tiny = _RC(
-        **{
-            **_rcfg18.model_dump(),
-            "max_result_chars": 1000,
-            "context_lines": 0,
-        }
+    _short_rcfg18 = replace(_rcfg18, max_result_chars=1000)
+    got_cut = await _tools.search_history(
+        GROUP,
+        "改锥",
+        rcfg=_short_rcfg18,
+        database=_test_db.pool,
+        identities=_test_db.identities,
+        clock=_test_db.clock,
     )
+    assert "结果过长" not in got_cut, ("a short search answer is not cut", got_cut[-60:])
+    _tiny = replace(_rcfg18, max_result_chars=1000, context_lines=0)
     await seed(GROUP, "u31", "张伟", text="改锥" + "很长的话" * 300)
-    got_cut2 = await _tools.search_history(GROUP, "改锥", rcfg=_tiny)
-    check(
+    got_cut2 = await _tools.search_history(
+        GROUP,
+        "改锥",
+        rcfg=_tiny,
+        database=_test_db.pool,
+        identities=_test_db.identities,
+        clock=_test_db.clock,
+    )
+    assert "结果过长" in got_cut2 and len(got_cut2) < 1200, (
         "an over-long search answer is cut at a line and says so",
-        "结果过长" in got_cut2 and len(got_cut2) < 1200,
         str(len(got_cut2)),
     )
 
-    # 19. One terminal send call can deliver several independent QQ messages. The
-    # delivery lock keeps each batch contiguous while generation remains concurrent.
-    from datetime import timedelta as _td19
-    from qqbot.core.agent import MessageDraft as _MD19, ReplyDraft as _RD19
-    from qqbot.core.outbound import (
-        DiceSegment as _D19,
-        ReplySegment as _R19,
-        TextSegment as _T19,
-    )
-    from qqbot.domain.evidence import (
-        EvidenceItem as _EI19,
-        EvidenceMemo as _EM19,
-        EvidenceOutcome as _EO19,
-        EvidenceSource as _ES19,
-    )
-    from qqbot.db import repo as _repo19
-
-    _created19 = _nl0()
-    _memo19 = _EM19(
-        items=(_EI19(_ES19.WEB_SEARCH, "虚构查询", _EO19.VERIFIED, "虚构结果"),),
-        created_at=_created19,
-        expires_at=_created19 + _td19(days=1),
-    )
-
-    def _draft19(*texts, evidence=None):
-        return _RD19(
-            tuple(_MD19((_T19(text),)) for text in texts),
-            evidence=evidence,
-        )
-
-    _replies19 = {
-        "clean-empty": _draft19("C1", "** **"),
-        "partial": _draft19("P1", "P2", "P3", evidence=_memo19),
-        "retry": _RD19(
-            (
-                _MD19((_R19("recalled"), _T19("R1"))),
-                _MD19((_T19("R2"),)),
-            )
-        ),
-        "evidence": _RD19(
-            (_MD19((_T19("E1"),)), _MD19((_D19(),))),
-            evidence=_memo19,
-        ),
-        "A": _draft19("A1", "A2"),
-        "B": _draft19("B1", "B2"),
-    }
-    _original_generate19 = _eng.generate
-
-    async def _generate19(*, msg, **_kwargs):
-        return _replies19[msg.text]
-
-    class ActionFailed(Exception):
-        pass
-
-    class _BatchBot19(FakeBot):
-        def __init__(self):
+    # 19. A random result is a new observation, not a value supplied on the send.
+    class DiceBot19(FakeBot):
+        def __init__(self, *, echo_result="4", query_result=None):
             super().__init__()
-            self.attempted = []
-            self.fail_text = None
-            self.fail_reply_text = None
-            self.failed_reply = False
+            self.dice_calls = 0
+            self.echo_tasks = []
+            self.echo_result = echo_result
+            self.query_result = query_result
+            self.last_id = None
+            self.last_group = None
+
+        async def call_api(self, api, **params):
+            if api == "get_msg" and self.query_result is not None:
+                return {
+                    "message_id": self.last_id,
+                    "group_id": self.last_group,
+                    "user_id": self.self_id,
+                    "message": [{"type": "dice", "data": {"result": self.query_result}}],
+                }
+            return await super().call_api(api, **params)
 
         async def send_group_msg(self, *, group_id, message):
-            text = "".join(
-                segment["data"].get("text", "") for segment in message if segment["type"] == "text"
-            )
-            self.attempted.append(text)
-            await asyncio.sleep(0.01)
-            if text == self.fail_text:
-                raise RuntimeError("scripted refusal")
-            if (
-                text == self.fail_reply_text
-                and not self.failed_reply
-                and any(segment["type"] == "reply" for segment in message)
-            ):
-                self.failed_reply = True
-                raise ActionFailed("quoted message is gone")
-            return await super().send_group_msg(group_id=group_id, message=message)
+            if message[0]["type"] != "dice":
+                return await super().send_group_msg(group_id=group_id, message=message)
+            self.dice_calls += 1
+            self.sent.append((group_id, "⟦骰子⟧"))
+            message_id = next(self._message_ids)
+            self.last_id = message_id
+            self.last_group = group_id
 
-    _batch_bot19 = _BatchBot19()
-    _batch_state19 = type(st_pv)(group_id=GroupId("5701"))
-    _batch_state19.loaded = _batch_state19.history_loaded = True
-    REGISTRY._groups[GroupId("5701")] = _batch_state19
-    _eng.generate = _generate19
-    try:
-        _before_clean19 = len(_batch_bot19.attempted)
-        _clean_empty19 = await _respond(
-            bot=_batch_bot19,
-            st=_batch_state19,
-            cfg=cfg,
-            persona=_persona,
-            msg=_CM0("batch-c", "u1", "阿强", "clean-empty", _nl0()),
-        )
-        check(
-            "the whole batch is cleaned before its first protocol send",
-            not _clean_empty19 and len(_batch_bot19.attempted) == _before_clean19,
-            repr(_batch_bot19.attempted[_before_clean19:]),
-        )
-
-        _batch_bot19.fail_text = "P2"
-        _partial19 = await _respond(
-            bot=_batch_bot19,
-            st=_batch_state19,
-            cfg=cfg,
-            persona=_persona,
-            msg=_CM0("batch-p", "u1", "阿强", "partial", _nl0()),
-        )
-        check(
-            "an irrecoverable batch failure keeps the prefix and stops the suffix",
-            _partial19
-            and _batch_bot19.attempted[-2:] == ["P1", "P2"]
-            and [message.text for message in list(_batch_state19.recent)[-1:]] == ["P1"],
-            f"{_batch_bot19.attempted} {list(_batch_state19.recent)[-3:]}",
-        )
-        _partial_id19 = _batch_state19.recent[-1].msg_id
-        check(
-            "a delivered prefix is archived before the failed item",
-            await pool().fetchval(
-                "SELECT plain_text FROM raw_event WHERE platform_event_id=$1",
-                _partial_id19,
-            )
-            == "P1",
-        )
-
-        _batch_bot19.fail_text = None
-        _batch_bot19.fail_reply_text = "R1"
-        _retry19 = await _respond(
-            bot=_batch_bot19,
-            st=_batch_state19,
-            cfg=cfg,
-            persona=_persona,
-            msg=_CM0("batch-r", "u1", "阿强", "retry", _nl0()),
-        )
-        _retry_lines19 = list(_batch_state19.recent)[-2:]
-        check(
-            "reply fallback retries only that item and continues the batch",
-            _retry19
-            and _batch_bot19.attempted[-3:] == ["R1", "R1", "R2"]
-            and [message.text for message in _retry_lines19] == ["R1", "R2"]
-            and _retry_lines19[0].reply_to is None,
-            f"{_batch_bot19.attempted[-3:]} {_retry_lines19}",
-        )
-        _batch_bot19.fail_reply_text = None
-
-        _evidence19 = await _respond(
-            bot=_batch_bot19,
-            st=_batch_state19,
-            cfg=cfg,
-            persona=_persona,
-            msg=_CM0("batch-e", "u1", "阿强", "evidence", _nl0()),
-        )
-        _evidence_lines19 = list(_batch_state19.recent)[-2:]
-        _stored19 = await _repo19.evidence_for(
-            GroupId("5701"),
-            [message.msg_id for message in _evidence_lines19],
-        )
-        check(
-            "batch evidence is stored only on the first delivered message",
-            _evidence19
-            and [message.text for message in _evidence_lines19] == ["E1", "⟦骰子⟧"]
-            and list(_stored19) == [_evidence_lines19[0].msg_id],
-            repr(_stored19),
-        )
-
-        _before19 = len(_batch_bot19.attempted)
-        _results19 = await asyncio.gather(
-            *(
-                _respond(
-                    bot=_batch_bot19,
-                    st=_batch_state19,
-                    cfg=cfg,
-                    persona=_persona,
-                    msg=_CM0(f"batch-{name}", "u1", "阿强", name, _nl0()),
+            async def deliver_echo():
+                await asyncio.sleep(0.01)
+                data = {"result": self.echo_result} if self.echo_result is not None else {}
+                await GATEWAY.handle(
+                    self,
+                    FakeEvent(
+                        segments=[Seg("dice", data)],
+                        user_id=str(self.self_id),
+                        nickname="小X",
+                        group_id=group_id,
+                        message_id=message_id,
+                    ),
                 )
-                for name in ("A", "B")
-            )
+
+            self.echo_tasks.append(asyncio.create_task(deliver_echo()))
+            return {"message_id": message_id}
+
+    class DiceText19(FakeText):
+        def __init__(self):
+            self.seen = []
+
+        async def respond(
+            self,
+            input,
+            *,
+            cfg,
+            tools=None,
+            max_tokens=None,
+            effort=None,
+            kind="reply",
+            group_id=None,
+        ):
+            results = [
+                str(m.get("output", ""))
+                for m in input
+                if isinstance(m, dict) and m.get("type") == "function_call_output"
+            ]
+            self.seen.append(results)
+            if not results:
+                return response(
+                    tool_calls=[
+                        function_call(
+                            "send_message",
+                            {"content": [{"type": "dice", "data": {}}]},
+                            call_id="dice-19",
+                        )
+                    ]
+                )
+            if len(results) == 1:
+                return response(
+                    tool_calls=[
+                        function_call(
+                            "send_message",
+                            {"content": [{"type": "text", "data": {"text": "点数是4"}}]},
+                            call_id="explain-19",
+                        )
+                    ]
+                )
+            return response(tool_calls=[function_call("finish_reply", {}, call_id="finish-19")])
+
+    dice_model = DiceText19()
+    set_providers(
+        Providers(
+            text=dice_model,
+            vision=UnusedVision(),
+            asr=UnusedAsr(),
+            embedding=_EMBED,
+            search=EndlessSearch(),
         )
-        _order19 = _batch_bot19.attempted[_before19:]
-        check(
-            "concurrent reply batches do not interleave their messages",
-            all(_results19) and _order19 in (["A1", "A2", "B1", "B2"], ["B1", "B2", "A1", "A2"]),
-            repr(_order19),
+    )
+    dice_bot = DiceBot19()
+    dice_group = GroupId("5701")
+    dice_state = await REGISTRY.get(dice_group)
+    dice_request = _CM0("dice-question", "u1", "阿强", "小X 掷骰子", _nl0())
+    dice_state.add(dice_request)
+    confirmed = await _respond(
+        bot=dice_bot,
+        st=dice_state,
+        cfg=cfg,
+        persona=_persona,
+        msg=dice_request,
+        window=[],
+    )
+    await asyncio.gather(*dice_bot.echo_tasks)
+    assert (
+        confirmed
+        and dice_bot.dice_calls == 1
+        and "4点" in dice_model.seen[1][0]
+        and [m.text for m in dice_state.recent][-2:] == ["⟦骰子:4点⟧", "点数是4"]
+    ), (
+        "response-first dice echo blocks the model until the result is archived",
+        repr(dice_model.seen),
+    )
+    assert (
+        await pool().fetchval(
+            "SELECT count(*) FROM raw_event WHERE group_id=$1 AND platform_user_id=$2",
+            dice_group.to_db(),
+            str(dice_bot.self_id),
         )
-    finally:
-        _eng.generate = _original_generate19
+        == 2
+    ), "both sends are archived without a synthetic echo"
+
+    lookup_model = DiceText19()
+    set_providers(
+        Providers(
+            text=lookup_model,
+            vision=UnusedVision(),
+            asr=UnusedAsr(),
+            embedding=_EMBED,
+            search=EndlessSearch(),
+        )
+    )
+    lookup_bot = DiceBot19(echo_result=None, query_result="4")
+    lookup_group = GroupId("5702")
+    lookup_state = await REGISTRY.get(lookup_group)
+    lookup_request = _CM0("lookup-question", "u1", "阿强", "小X 掷骰子", _nl0())
+    lookup_state.add(lookup_request)
+    looked_up = await _respond(
+        bot=lookup_bot,
+        st=lookup_state,
+        cfg=cfg,
+        persona=_persona,
+        msg=lookup_request,
+        window=[],
+    )
+    await asyncio.gather(*lookup_bot.echo_tasks)
+    assert (
+        looked_up
+        and "结果：4" in lookup_model.seen[1][0]
+        and lookup_bot.dice_calls == 1
+        and lookup_state.recent[-2].text == "⟦骰子:4点⟧"
+        and await pool().fetchval(
+            "SELECT plain_text FROM raw_event WHERE platform_event_id=$1",
+            str(lookup_bot.last_id),
+        )
+        == "⟦骰子:4点⟧"
+    ), ("get_msg supplements a matching but result-free own echo", repr(lookup_model.seen))
+
+    unknown_model = DiceText19()
+    set_providers(
+        Providers(
+            text=unknown_model,
+            vision=UnusedVision(),
+            asr=UnusedAsr(),
+            embedding=_EMBED,
+            search=EndlessSearch(),
+        )
+    )
+    unknown_bot = DiceBot19(echo_result=None)
+    unknown_group = GroupId("5703")
+    unknown_state = await REGISTRY.get(unknown_group)
+    unknown_request = _CM0("unknown-question", "u1", "阿强", "小X 掷骰子", _nl0())
+    unknown_state.add(unknown_request)
+    unknown_sent = await _respond(
+        bot=unknown_bot,
+        st=unknown_state,
+        cfg=cfg,
+        persona=_persona,
+        msg=unknown_request,
+        window=[],
+    )
+    await asyncio.gather(*unknown_bot.echo_tasks)
+    assert (
+        unknown_sent
+        and unknown_bot.dice_calls == 1
+        and len(unknown_model.seen) == 1
+        and len(unknown_bot.sent) == 1
+    ), ("unverifiable random result stops without inventing a roll", repr(unknown_model.seen))
 
     # Last, so every kind of memory write has actually happened by now. Reasoning
     # models bill deliberation as output, so a memory call must ask for a terse
     # direct answer - deliberating under a word limit truncates the answer itself,
     # cutting it off mid-sentence.
-    check(
+    assert not any(c["kind"] in ("knowledge", "summary") for c in LLM_CALLS), (
         "the memory path never asks the model to write prose",
-        not any(c["kind"] in ("knowledge", "summary") for c in LLM_CALLS),
         str({c["kind"] for c in LLM_CALLS}),
     )
     # Each use of the text model brings its own settings: extraction reads a whole
     # chunk of transcript, so it carries a grade and a patience the reply path would
     # never grant, and neither is a call-site exception.
-    _txtcfg = config().default.capabilities.text
-    check(
-        "extraction and replies each run on their own configured settings",
-        all(
-            c["grade"] == _txtcfg.extract.reasoning_effort
-            and c["timeout"] == _txtcfg.extract.timeout_sec
-            for c in LLM_CALLS
-            if c["kind"] == "extract"
-        )
-        and all(
-            c["grade"] == _txtcfg.reasoning_effort and c["timeout"] == _txtcfg.timeout_sec
-            for c in LLM_CALLS
-            if c["kind"] == "reply"
-        ),
-    )
+    _txtcfg = config().default.backends.text
+    assert all(
+        c["grade"] == _txtcfg.extract.reasoning_effort
+        and c["timeout"] == _txtcfg.extract.timeout_sec
+        for c in LLM_CALLS
+        if c["kind"] == "extract"
+    ) and all(
+        c["grade"] == _txtcfg.reasoning_effort and c["timeout"] == _txtcfg.timeout_sec
+        for c in LLM_CALLS
+        if c["kind"] == "reply"
+    ), "extraction and replies each run on their own configured settings"
 
     await GATEWAY.shutdown()
-    await close_pool()
+    await GATEWAY._replies.close()
     print()
-    print("FAILED:", fails if fails else "none")
-    return 1 if fails else 0
-
-
-sys.exit(asyncio.run(main()))

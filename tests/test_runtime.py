@@ -1,70 +1,73 @@
-"""Runtime ownership, teardown ordering, and per-message media coordination."""
+"""Runtime resource ownership, teardown, and per-message media coordination."""
 
-from __future__ import annotations
-
+import ast
 import asyncio
-import os
-import pathlib
-import sys
 import uuid
+from pathlib import Path
 from datetime import timedelta
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-os.environ.setdefault("CONFIG_DIR", str(ROOT / "tests" / "fixtures" / "config"))
+import pytest
 
-from qqbot.core.media import MediaCoordinator, MediaStatus, Unsettled
-from qqbot.core.segments import parse_segments
-from qqbot.core.state import ChatMsg
-from qqbot.domain.ids import AccountId, MessageId
-from qqbot.runtime import Runtime
+from _budget import fake_budget
+import _db as _test_db
+from _fixtures import config, now_local
+from qqbot.conversation.state import ChatMsg
+from qqbot.domain.ids import AccountId, GroupId, MessageId
+from qqbot.gateway.segments import parse_segments
+from qqbot.media.coordinator import MediaCoordinator, MediaStatus
+from qqbot.media.result import Resolution
+from qqbot.operations import scheduled as scheduled_module
 from qqbot.repositories.job import JobType
-from qqbot.settings import config
-from qqbot.util import now_local
-import qqbot.core.media as media_module
+from qqbot.runtime import Runtime
 import qqbot.runtime as runtime_module
-import qqbot.scheduled as scheduled_module
-
-fails: list[str] = []
 
 
-def check(name: str, condition: bool, detail: str = "") -> None:
-    print(f"[{'ok ' if condition else 'FAIL'}] {name}  {detail}")
-    if not condition:
-        fails.append(name)
+@pytest.fixture(autouse=True)
+def fake_database_credentials(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://qbot_test@127.0.0.1:15432/qbot_test")
+    monkeypatch.setenv("DATABASE_PASSWORD", "fake-test-password")
+    monkeypatch.delenv("DATABASE_PASSWORD_FILE", raising=False)
 
 
 class Capability:
     attachments = None
 
-    def __init__(self, name: str, events: list[str]) -> None:
+    def __init__(self, name, events):
         self.name = name
-        self._events = events
+        self.events = events
 
-    async def start(self) -> None:
-        self._events.append("asr-start")
+    async def start(self):
+        self.events.append("asr-start")
 
-    async def aclose(self) -> None:
-        self._events.append(f"{self.name}-close")
+    async def aclose(self):
+        self.events.append(f"{self.name}-close")
 
 
 class Bundle:
-    def __init__(self, events: list[str]) -> None:
+    def __init__(self, events):
         self.text = Capability("text", events)
         self.vision = Capability("vision", events)
         self.asr = Capability("asr", events)
         self.embedding = Capability("embedding", events)
         self.search = Capability("search", events)
         self.page_reader = None
-        self._events = events
+        self.events = events
 
-    async def aclose(self) -> None:
-        self._events.append("providers-close")
+    async def aclose(self):
+        self.events.append("providers-close")
+
+
+class FakeLease:
+    async def acquire(self, on_lost):
+        self.on_lost = on_lost
+
+    async def close(self):
+        pass
 
 
 class ControlledProcessor:
-    def __init__(self, results: list[str], gate: asyncio.Event | None = None) -> None:
-        self.results = list(results)
+    def __init__(self, results, gate=None):
+        self.results = [Resolution(item) if isinstance(item, str) else item for item in results]
         self.gate = gate
         self.calls = 0
         self.cancelled = False
@@ -81,19 +84,23 @@ class ControlledProcessor:
         return {parsed.refs[0].slot: self.results.pop(0)}
 
     @staticmethod
-    def settled(parsed, resolved) -> bool:
+    def settled(parsed, resolved):
         return all(
-            ref.slot in resolved and not isinstance(resolved[ref.slot], Unsettled)
+            ref.slot in resolved and not resolved[ref.slot].retryable
             for ref in parsed.refs
             if not ref.free
         )
 
 
-def picture_message(raw_event_id: uuid.UUID) -> tuple[ChatMsg, object]:
+def picture_message(raw_event_id):
     parsed = parse_segments(
-        [{"type": "image", "data": {"file": "a" * 32 + ".png", "url": "https://x"}}],
+        [
+            {
+                "type": "image",
+                "data": {"file": "a" * 32 + ".png", "url": "https://example.invalid/a"},
+            }
+        ],
         "999",
-        limits=config().default.prompt,
         self_name="小X",
     )
     message = ChatMsg(
@@ -108,130 +115,148 @@ def picture_message(raw_event_id: uuid.UUID) -> tuple[ChatMsg, object]:
     return message, parsed
 
 
-async def media_tests() -> None:
-    original_backfill = media_module.repo.backfill_plain_text
-    backfills: list[tuple[str, str]] = []
+@pytest.mark.asyncio
+async def test_cancelling_one_media_waiter_does_not_cancel_shared_work(monkeypatch):
+    backfills = []
 
     async def backfill(message_id, text):
         backfills.append((str(message_id), text))
 
-    media_module.repo.backfill_plain_text = backfill
+    monkeypatch.setattr(_test_db.archive, "backfill_plain_text", backfill)
+    gate = asyncio.Event()
+    processor = ControlledProcessor(["⟦图片:猫⟧"], gate)
+    coordinator = MediaCoordinator(processor, budget=fake_budget(), archive=_test_db.archive)
+    raw_id = uuid.uuid4()
+    message, parsed = picture_message(raw_id)
     try:
-        gate = asyncio.Event()
-        processor = ControlledProcessor(["⟦图片:猫⟧"], gate)
-        coordinator = MediaCoordinator(processor)
-        raw_id = uuid.uuid4()
-        message, parsed = picture_message(raw_id)
         ticket = coordinator.admit(
             raw_id,
             parsed,
             message,
             bot=object(),
-            group_id=message_id_group(),
+            group_id=GroupId("1"),
             cfg=config().default,
         )
         flight = ticket.task
-        first = asyncio.create_task(
-            coordinator.settle([message], wait_sec=1, who="100")
-        )
-        second = asyncio.create_task(
-            coordinator.settle([message], wait_sec=1, who="100")
-        )
+        first = asyncio.create_task(coordinator.settle([message], wait_sec=1, who="100"))
+        second = asyncio.create_task(coordinator.settle([message], wait_sec=1, who="100"))
         await asyncio.sleep(0)
         first.cancel()
         await asyncio.gather(first, return_exceptions=True)
-        check(
-            "cancelling one media waiter does not cancel shared work",
-            flight is ticket.task and not processor.cancelled,
-        )
+        assert flight is ticket.task
+        assert not processor.cancelled
         gate.set()
         await second
         if flight is not None:
             await flight
-        check(
-            "two media waiters share one per-message task",
-            processor.calls == 1 and ticket.status is MediaStatus.FINAL,
-            f"{processor.calls} calls",
-        )
-        check(
-            "a completed media task patches live text and archive",
-            "猫" in message.text and backfills[-1][1] == message.text,
-        )
-
-        late_gate = asyncio.Event()
-        late_processor = ControlledProcessor(["⟦图片:晚到⟧"], late_gate)
-        late_coordinator = MediaCoordinator(late_processor)
-        late_id = uuid.uuid4()
-        late_message, late_parsed = picture_message(late_id)
-        late_ticket = late_coordinator.admit(
-            late_id,
-            late_parsed,
-            late_message,
-            bot=object(),
-            group_id=message_id_group(),
-            cfg=config().default,
-        )
-        await late_coordinator.settle([late_message], wait_sec=0, who="100")
-        check("a bounded media wait leaves slow work running", not late_ticket.task.done())
-        late_gate.set()
-        late_flight = late_ticket.task
-        if late_flight is not None:
-            await late_flight
-        check("late media completion still patches the message", "晚到" in late_message.text)
-
-        retry_processor = ControlledProcessor([
-            Unsettled("⟦图片⟧"),
-            "⟦图片:重试成功⟧",
-        ])
-        retry_coordinator = MediaCoordinator(retry_processor)
-        retry_id = uuid.uuid4()
-        retry_message, retry_parsed = picture_message(retry_id)
-        retry_ticket = retry_coordinator.admit(
-            retry_id,
-            retry_parsed,
-            retry_message,
-            bot=object(),
-            group_id=message_id_group(),
-            cfg=config().default,
-        )
-        first_retry = retry_ticket.task
-        if first_retry is not None:
-            await first_retry
-        check("a transient media result remains retryable",
-              retry_ticket.status is MediaStatus.RETRYABLE)
-        await retry_coordinator.settle([retry_message], wait_sec=1, who="101")
-        check(
-            "a later settle advances retryable media to final",
-            retry_processor.calls == 2
-            and retry_ticket.status is MediaStatus.FINAL
-            and "重试成功" in retry_message.text,
-        )
+        assert processor.calls == 1
+        assert ticket.status is MediaStatus.FINAL
+        assert "猫" in message.text
+        assert backfills[-1][1] == message.text
     finally:
-        media_module.repo.backfill_plain_text = original_backfill
+        gate.set()
+        await coordinator.close(timeout=1)
 
 
-def message_id_group():
-    from qqbot.domain.ids import GroupId
+@pytest.mark.asyncio
+async def test_media_timeout_allows_late_patch(monkeypatch):
+    backfills = []
 
-    return GroupId("1")
+    async def backfill(message_id, text):
+        backfills.append((str(message_id), text))
+
+    monkeypatch.setattr(_test_db.archive, "backfill_plain_text", backfill)
+    gate = asyncio.Event()
+    processor = ControlledProcessor(["⟦图片:晚到⟧"], gate)
+    coordinator = MediaCoordinator(processor, budget=fake_budget(), archive=_test_db.archive)
+    raw_id = uuid.uuid4()
+    message, parsed = picture_message(raw_id)
+    try:
+        ticket = coordinator.admit(
+            raw_id,
+            parsed,
+            message,
+            bot=object(),
+            group_id=GroupId("1"),
+            cfg=config().default,
+        )
+        await coordinator.settle([message], wait_sec=0, who="100")
+        assert not ticket.task.done()
+        gate.set()
+        await ticket.task
+        assert "晚到" in message.text
+        assert backfills[-1][1] == message.text
+    finally:
+        gate.set()
+        await coordinator.close(timeout=1)
 
 
-async def runtime_tests() -> None:
-    check(
-        "core Runtime and scheduled bodies import without NoneBot",
-        "nonebot" not in sys.modules,
+@pytest.mark.asyncio
+async def test_retryable_media_result_advances_on_later_settle(monkeypatch):
+    async def backfill(message_id, text):
+        del message_id, text
+
+    monkeypatch.setattr(_test_db.archive, "backfill_plain_text", backfill)
+    processor = ControlledProcessor(
+        [
+            Resolution("⟦图片⟧", retryable=True),
+            "⟦图片:重试成功⟧",
+        ]
     )
+    coordinator = MediaCoordinator(processor, budget=fake_budget(), archive=_test_db.archive)
+    raw_id = uuid.uuid4()
+    message, parsed = picture_message(raw_id)
+    try:
+        ticket = coordinator.admit(
+            raw_id,
+            parsed,
+            message,
+            bot=object(),
+            group_id=GroupId("1"),
+            cfg=config().default,
+        )
+        if ticket.task is not None:
+            await ticket.task
+        assert ticket.status is MediaStatus.RETRYABLE
+        await coordinator.settle([message], wait_sec=1, who="101")
+        assert processor.calls == 2
+        assert ticket.status is MediaStatus.FINAL
+        assert "重试成功" in message.text
+    finally:
+        await coordinator.close(timeout=1)
 
-    one = Runtime.build(config(), providers=Bundle([]))
-    two = Runtime.build(config(), providers=Bundle([]))
-    check(
-        "each Runtime owns one independent resource graph",
-        one.gateway is not two.gateway
-        and one.media is not two.media
-        and one.registry is not two.registry
-        and one.delivery is not two.delivery,
-    )
 
+def test_runtime_and_scheduled_modules_have_no_nonebot_imports():
+    for module in (runtime_module, scheduled_module):
+        source = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+        assert not any(
+            isinstance(node, ast.ImportFrom)
+            and (node.module or "").startswith("nonebot")
+            or isinstance(node, ast.Import)
+            and any(alias.name.startswith("nonebot") for alias in node.names)
+            for node in ast.walk(source)
+        )
+
+
+@pytest.mark.asyncio
+async def test_runtime_owns_independent_reply_scheduler_and_resource_graph():
+    first = Runtime.build(config(), providers=Bundle([]), lease=FakeLease())
+    second = Runtime.build(config(), providers=Bundle([]), lease=FakeLease())
+    try:
+        assert first.gateway is not second.gateway
+        assert first.media is not second.media
+        assert first.registry is not second.registry
+        assert first.delivery is not second.delivery
+        assert first.reply_executor is not second.reply_executor
+        assert first.replies is not second.replies
+        assert first.gateway._replies is first.replies
+    finally:
+        await first.aclose()
+        await second.aclose()
+
+
+@pytest.mark.asyncio
+async def test_scheduled_stage_wait_filters_job_types():
     class StageQueue:
         def __init__(self):
             self.filters = []
@@ -240,32 +265,26 @@ async def runtime_tests() -> None:
             self.filters.append(job_types)
             return {}
 
-    stage_queue = StageQueue()
+    queue = StageQueue()
     await scheduled_module._drain_wait(
-        one,
-        stage_queue,
+        queue,
         timedelta(seconds=1),
         "extraction",
         (JobType.EXTRACT_MEMORY,),
     )
-    check(
-        "nightly waits only for the current stage's job type",
-        stage_queue.filters == [(JobType.EXTRACT_MEMORY,)],
-        str(stage_queue.filters),
-    )
+    assert queue.filters == [(JobType.EXTRACT_MEMORY,)]
 
-    events: list[str] = []
-    runtime = Runtime.build(config(), providers=Bundle(events))
-    originals = (
-        runtime_module.init_pool,
-        runtime_module.repo.ensure_schema,
-        runtime_module.close_pool,
-    )
+
+@pytest.mark.asyncio
+async def test_startup_and_idempotent_teardown_preserve_dependency_order(monkeypatch):
+    events = []
+    runtime = Runtime.build(config(), providers=Bundle(events), lease=FakeLease())
 
     async def init_pool():
         events.append("db-start")
 
-    async def ensure_schema():
+    async def ensure_schema(database):
+        del database
         events.append("schema-check")
 
     async def close_pool():
@@ -289,46 +308,28 @@ async def runtime_tests() -> None:
     async def processor_close():
         events.append("processor-close")
 
-    runtime_module.init_pool = init_pool
-    runtime_module.repo.ensure_schema = ensure_schema
-    runtime_module.close_pool = close_pool
-    runtime.worker.run_forever = worker_loop
-    runtime.gateway.shutdown = gateway_close
-    runtime.media.close = coordinator_close
-    runtime.media_processor.close = processor_close
+    monkeypatch.setattr(runtime.database, "start", init_pool)
+    monkeypatch.setattr(runtime_module.repo, "ensure_schema", ensure_schema)
+    monkeypatch.setattr(runtime.database, "close", close_pool)
+    monkeypatch.setattr(runtime.worker, "run_forever", worker_loop)
+    monkeypatch.setattr(runtime.gateway, "shutdown", gateway_close)
+    monkeypatch.setattr(runtime.media, "close", coordinator_close)
+    monkeypatch.setattr(runtime.media_processor, "close", processor_close)
     try:
         await runtime.start()
         await asyncio.sleep(0)
-        check(
-            "ASR is ready before the memory worker starts",
-            events.index("asr-start") < events.index("worker-start"),
-            str(events),
-        )
+        assert events.index("asr-start") < events.index("worker-start")
         await runtime.aclose()
-        check(
-            "teardown keeps dependency order and isolates close failures",
-            events.index("worker-stop") < events.index("gateway-close")
-            < events.index("coordinator-close") < events.index("processor-close")
-            < events.index("providers-close") < events.index("db-close"),
-            str(events),
+        assert (
+            events.index("gateway-close")
+            < events.index("worker-stop")
+            < events.index("coordinator-close")
+            < events.index("processor-close")
+            < events.index("providers-close")
+            < events.index("db-close")
         )
         before = list(events)
         await runtime.aclose()
-        check("Runtime close is idempotent", events == before)
+        assert events == before
     finally:
-        (
-            runtime_module.init_pool,
-            runtime_module.repo.ensure_schema,
-            runtime_module.close_pool,
-        ) = originals
-
-
-async def main() -> int:
-    await media_tests()
-    await runtime_tests()
-    print()
-    print("FAILED:", fails if fails else "none")
-    return 1 if fails else 0
-
-
-raise SystemExit(asyncio.run(main()))
+        await runtime.aclose()

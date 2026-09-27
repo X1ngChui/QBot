@@ -12,10 +12,12 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
-from ..core.budget import BUDGET
-from ..domain.ids import GroupId
-from ..settings import AsrCfg
-from .base import AsrModel, Kind, Rate
+from qqbot.services.budget import Budget
+from qqbot.domain.ids import GroupId
+from qqbot.configuration import AsrCfg
+from qqbot.providers.base import AsrModel
+from qqbot.providers.base import Kind
+from qqbot.providers.base import Rate
 
 log = logging.getLogger("qqbot.providers")
 
@@ -64,7 +66,7 @@ def _pcm_from_wav(data: bytes) -> tuple[Any, int]:
         ints = memoryview(raw).cast("h")
         if channels > 1:
             ints = [
-                sum(ints[index:index + channels]) // channels
+                sum(ints[index : index + channels]) // channels
                 for index in range(0, len(ints), channels)
             ]
         return [sample / 32768.0 for sample in ints], rate
@@ -79,7 +81,11 @@ class SherpaAsr(AsrModel):
     name = "sherpa"
     needs_key = False
 
-    def __init__(self, cfg: AsrCfg) -> None:
+    def __init__(self, cfg: AsrCfg, budget: Budget, *, queue_capacity: int = 8) -> None:
+        if queue_capacity < 1:
+            raise ValueError("ASR queue capacity must be positive")
+        self._queue_capacity = queue_capacity
+        self._budget = budget
         self._cfg = cfg
         self._state = _State.NEW
         self._recognizer: Any = None
@@ -130,14 +136,14 @@ class SherpaAsr(AsrModel):
             self._executor = None
             self._state = _State.CLOSED
             raise
-        self._queue = asyncio.Queue(maxsize=cfg.queue_capacity)
+        self._queue = asyncio.Queue(maxsize=self._queue_capacity)
         self._state = _State.READY
         self._worker = asyncio.create_task(self._serve(), name="qbot-asr-worker")
         log.info(
             "sherpa ASR ready: %s (%d threads, %d queued)",
             cfg.model_dir,
             cfg.threads,
-            cfg.queue_capacity,
+            self._queue_capacity,
         )
 
     @staticmethod
@@ -162,7 +168,7 @@ class SherpaAsr(AsrModel):
                     job.data,
                 )
                 seconds = job.seconds if job.seconds is not None else measured_seconds
-                await BUDGET.record(
+                await self._budget.record(
                     kind=Kind.ASR,
                     model=_MODEL,
                     cny=0.0,

@@ -7,8 +7,10 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
 
-from .archive import AuthorKind
-from .ids import AccountId, GroupId, MessageId
+from qqbot.domain.archive import AuthorKind
+from qqbot.domain.ids import AccountId
+from qqbot.domain.ids import GroupId
+from qqbot.domain.ids import MessageId
 
 
 class GroupRole(StrEnum):

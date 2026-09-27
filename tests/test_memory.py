@@ -11,25 +11,19 @@ is not stubbed: its constraints enforce exact source events, account-scoped pers
 and group-scoped episode recall.
 """
 
-import os
-import pathlib
+import pytest
 import re
-import sys
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-os.environ.setdefault("CONFIG_DIR", str(ROOT / "tests" / "fixtures" / "config"))
-from _db import configure_test_database
-
-configure_test_database()
 
 import asyncio
 
-from qqbot.core import retrieval
-from qqbot.core.media import MediaProcessor
-from qqbot.core.retrieval import build_directory
-from qqbot.core.tools import ToolCtx
-from qqbot.db import close_pool, init_pool, pool
+import _db as _test_db
+from _test_owners import fresh_budget, fresh_members
+from qqbot.services import retrieval
+from qqbot.media.service import MediaProcessor
+from qqbot.services.retrieval import build_directory
+from qqbot.conversation.tools import ToolCtx
+from _db import pool
 from qqbot.gateway.ingest import Ingestor
 from qqbot.repositories.archive import ARCHIVE_COLUMNS, archived_messages
 from qqbot.repositories.extraction import ExtractionRepository
@@ -39,8 +33,8 @@ from qqbot.gateway.onebot import GroupMessage, Sender
 from qqbot.providers import AsrModel, Providers, SearchEngine, TextModel, VisionModel
 from qqbot.providers.base import Rate
 from qqbot.services import IdentityResolver
-from qqbot.settings import config
-from qqbot.util import now_local
+from _fixtures import config
+from _fixtures import now_local
 from qqbot.repositories import (
     IdentityRepository as ids_probe,
     MemoryRepository as mem_probe,
@@ -48,14 +42,17 @@ from qqbot.repositories import (
 from qqbot.workers.memory import MemoryWorker
 
 #: The extraction chunk width, from config - the tests build batches around it.
-WINDOW = config().default.memory.extract_window
+from qqbot.workers.memory import EXTRACTION_EVENT_LIMIT, EXTRACTION_GAP
+
+WINDOW = EXTRACTION_EVENT_LIMIT
 from _db import reset
 from _stubs import FakeEmbedding, LegacyTextSession, function_call, response
 
 #: One stub for every bundle in this suite.
 _EMBED = FakeEmbedding()
 
-fails = []
+BUDGET = None
+MEMBERS = None
 G = GroupId("9001")
 CALLS = []
 #: cfg.model of every FakeText call - what pins the extraction model override.
@@ -65,12 +62,6 @@ SEEN_EXTRACT_CFG = []
 #: What the model was actually handed, so the test can check what it was told rather than
 #: only what came back.
 LAST_PROMPT = [""]
-
-
-def check(name, cond, detail=""):
-    print(f"[{'ok ' if cond else 'FAIL'}] {name}  {detail}")
-    if not cond:
-        fails.append(name)
 
 
 def tool(name, **args):
@@ -183,23 +174,72 @@ class Unused(VisionModel, AsrModel, SearchEngine):
         pass
 
 
-_DIRECTORY = build_directory()
-_INGESTOR = Ingestor(IdentityResolver(ids_probe()))
+_DIRECTORY: object = None
+_INGESTOR: Ingestor | None = None
 _PROVIDERS = None
 _MEDIA = None
+
+
+@pytest.fixture
+async def memory_state(test_database, monkeypatch):
+    monkeypatch.setitem(globals(), "BUDGET", fresh_budget())
+    monkeypatch.setitem(globals(), "MEMBERS", fresh_members())
+    monkeypatch.setitem(
+        globals(),
+        "_DIRECTORY",
+        build_directory(
+            database=_test_db.pool,
+            predicates=_test_db.test_bundle().predicates,
+            clock=_test_db.clock,
+        ),
+    )
+    monkeypatch.setitem(
+        globals(),
+        "_INGESTOR",
+        Ingestor(
+            IdentityResolver(ids_probe(database=_test_db.pool, clock=_test_db.clock)),
+            database=_test_db.pool,
+        ),
+    )
+    monkeypatch.setitem(globals(), "_PROVIDERS", None)
+    monkeypatch.setitem(globals(), "_MEDIA", None)
+    for name in ("CALLS", "SEEN_MODELS", "SEEN_EXTRACT_CFG"):
+        monkeypatch.setitem(globals(), name, [])
+    monkeypatch.setitem(globals(), "LAST_PROMPT", [""])
+    monkeypatch.setattr(FakeEmbedding, "EMBED_CALLS", 0)
+    try:
+        yield
+    finally:
+        if _MEDIA is not None:
+            await _MEDIA.close()
+        await MEMBERS.close()
+        await _DIRECTORY.close()
 
 
 def set_providers(bundle):
     global _PROVIDERS, _MEDIA
     _PROVIDERS = bundle
     if _MEDIA is None:
-        _MEDIA = MediaProcessor(config().default.media, bundle, _DIRECTORY)
+        _MEDIA = MediaProcessor(
+            bundle,
+            _DIRECTORY,
+            budget=BUDGET,
+            members=MEMBERS,
+            cache=_test_db.media_cache,
+            prompts=_test_db.test_bundle().prompts,
+        )
     else:
         _MEDIA._providers = bundle
 
 
 def tool_context():
-    return ToolCtx(providers=_PROVIDERS, media=_MEDIA)
+    return ToolCtx(
+        providers=_PROVIDERS,
+        media=_MEDIA,
+        identities=_test_db.identities,
+        database=_test_db.pool,
+        clock=_test_db.clock,
+    )
 
 
 async def say(uid, name, text, mid, gid=G):
@@ -237,11 +277,12 @@ async def say_at(uid, name, target, target_name, text, mid, gid=G):
     )
 
 
-async def main():
+@pytest.mark.database
+@pytest.mark.asyncio
+async def test_memory(memory_state):
     set_providers(
         Providers(text=FakeText(), vision=Unused(), asr=Unused(), embedding=_EMBED, search=Unused())
     )
-    await init_pool()
     await reset()
 
     await say("u1", "董自豪", "我最近在玩鸣潮", "e1")
@@ -250,21 +291,31 @@ async def main():
     await say("u2", "小北", "这个群是做音乐的", "e4")
     await say_at("u2", "小北", "u3", "李芳", "帮忙看看", "e-at")
 
-    threshold_worker = MemoryWorker(config().default, _PROVIDERS, worker_id="floor")
-    check(
-        "under the drain floor nothing is paid for",
-        await threshold_worker.extract(G) == 0 and CALLS.count("extract") == 0,
+    threshold_worker = MemoryWorker(
+        _test_db.bundle_for_settings(config().default),
+        _PROVIDERS,
+        worker_id="floor",
+        budget=BUDGET,
+        database=_test_db.pool,
+        clock=_test_db.clock,
     )
-    test_cfg = config().default.model_copy(
-        update={"memory": config().default.memory.model_copy(update={"drain_floor": 0})}
+    assert await threshold_worker.extract(GroupId("311")) == 0 and CALLS.count("extract") == 0, (
+        "an empty archive does not call the model"
     )
-    w = MemoryWorker(test_cfg, _PROVIDERS, worker_id="e2e")
+    test_cfg = config().default
+    w = MemoryWorker(
+        _test_db.bundle_for_settings(test_cfg),
+        _PROVIDERS,
+        worker_id="e2e",
+        budget=BUDGET,
+        database=_test_db.pool,
+        clock=_test_db.clock,
+    )
     n = await w.extract(G)
     # Everything the batch is worth comes out of one call. Four kinds of record used to
     # mean three separate passes over the same transcript, two of which wrote prose.
-    check(
+    assert n == 6 and CALLS.count("extract") == 1, (
         "one call produces every kind of record",
-        n == 6 and CALLS.count("extract") == 1,
         f"{n} candidates in {CALLS.count('extract')} call(s)",
     )
     written = await pool().fetchval(
@@ -275,15 +326,14 @@ async def main():
         "SELECT count(*) FROM memory_candidate WHERE group_id=$1 AND status='rejected'",
         G.to_db(),
     )
-    check("what survives validation is written", written == 5, str(written))
-    check("and a quote nobody said is refused", rejected == 1, str(rejected))
+    assert written == 5, ("what survives validation is written", str(written))
+    assert rejected == 1, ("and a quote nobody said is refused", str(rejected))
     reason = await pool().fetchval(
         "SELECT reject_reason FROM memory_candidate WHERE group_id=$1 AND status='rejected'",
         G.to_db(),
     )
-    check(
+    assert reason == "malformed", (
         "with the reason kept, so a recurring mistake is countable",
-        reason == "malformed",
         str(reason),
     )
 
@@ -301,9 +351,8 @@ async def main():
     # gate before the money: everything upstream of it sits in front of a queue, where a
     # retry or two racing jobs can all arrive with the batch already read.
     calls_before = CALLS.count("extract")
-    check(
+    assert await w.extract(G) == 0 and CALLS.count("extract") == calls_before, (
         "a second pass with nothing new does not call the model",
-        await w.extract(G) == 0 and CALLS.count("extract") == calls_before,
         f"{CALLS.count('extract') - calls_before} call(s)",
     )
 
@@ -320,9 +369,8 @@ async def main():
     await say_at("u2", "小北", "u1", "董自豪", "老周你那个切片做完没", "e6")
     await say("u2", "小北", "这个群是做音乐的", "e8")
     n2 = await w.extract(G)
-    check(
+    assert n2 > 0 and CALLS.count("extract") == calls_before + 1, (
         "but new messages are enough to justify one",
-        n2 > 0 and CALLS.count("extract") == calls_before + 1,
         str(n2),
     )
     for i in range(WINDOW + 5):
@@ -345,9 +393,8 @@ async def main():
     # Two rejections now: the invented Mars quote, and the plays quote - said in
     # the first batch but not in this one, and exact membership means "in the batch"
     # is exactly what it says.
-    check(
+    assert rejected2 == 2 and written2 == n2 - 2, (
         "a batch is validated against itself, however much arrived since",
-        rejected2 == 2 and written2 == n2 - 2,
         f"{written2} written, {rejected2} rejected of {n2}",
     )
     after = await pool().fetchval(
@@ -356,8 +403,9 @@ async def main():
     # Same records, re-proposed: confirmed in place rather than rewritten, so the
     # evidence accumulates and the record ages on how often the group said it
     # rather than on when it was last rewritten.
-    check(
-        "re-proposing what is already known adds no rows", after == before, f"{before} -> {after}"
+    assert after == before, (
+        "re-proposing what is already known adds no rows",
+        f"{before} -> {after}",
     )
     confirmed = await pool().fetchval(
         """SELECT count(*) FROM memory_fact f
@@ -366,7 +414,7 @@ async def main():
                     WHERE e.fact_id=f.id AND e.relation='supports') > 1""",
         G.to_db(),
     )
-    check("it accumulates evidence instead", confirmed > 0, f"{confirmed} facts")
+    assert confirmed > 0, ("it accumulates evidence instead", f"{confirmed} facts")
     # Confidence is earned from evidence, not frozen at the write-time guess - but earned
     # from *distinct* supporting events. Both consolidations quoted the same message, so
     # re-reading it must buy nothing: the same premise counted once.
@@ -378,17 +426,16 @@ async def main():
         " AND status='active'",
         G.to_db(),
     )
-    check(
+    assert conf_now is not None and abs(conf_now - earned_confidence(1)) < 1e-3, (
         "re-reading the same message does not raise confidence",
-        conf_now is not None and abs(conf_now - earned_confidence(1)) < 1e-3,
         f"{conf_now} vs {earned_confidence(1):.2f}",
     )
     # A confirmation from a different message is genuinely new evidence, and the number
     # moves: a confidence that only ever kept the larger of two constants would
     # freeze every fact at its initial guess.
-    account = await ids_probe().account_of("qq", "u1")
+    account = await ids_probe(database=_test_db.pool, clock=_test_db.clock).account_of("qq", "u1")
     other_event = await pool().fetchval("SELECT id FROM raw_event WHERE platform_event_id='e3'")
-    await mem_probe().supersede(
+    await mem_probe(database=_test_db.pool, clock=_test_db.clock).supersede(
         Fact(
             subject_entity_id=None,
             subject_account_id=account.id,
@@ -408,18 +455,16 @@ async def main():
         " AND status='active'",
         G.to_db(),
     )
-    check(
+    assert abs(conf_after - earned_confidence(2)) < 1e-3, (
         "a confirmation from a different message raises it",
-        abs(conf_after - earned_confidence(2)) < 1e-3,
         f"{conf_after} vs expected {earned_confidence(2):.2f}",
     )
 
     # And the model is told what is on record, so it can stop re-deriving it. Without
     # this it re-read the same conversation every batch and worded the answer differently
     # each time, which storage could only read as a new fact overturning the old one.
-    check(
+    assert "topic" in LAST_PROMPT[-1] and "plays = 鸣潮" in LAST_PROMPT[-1], (
         "the extractor is shown what is already recorded",
-        "topic" in LAST_PROMPT[-1] and "plays = 鸣潮" in LAST_PROMPT[-1],
         LAST_PROMPT[-1][:120],
     )
 
@@ -437,28 +482,24 @@ async def main():
     }
     # Multi-valued predicates carry their object in the key, so a second game somebody
     # plays is a second row rather than one overwriting the other.
-    check(
+    assert facts.get(("person", "plays", "鸣潮")) == "鸣潮", (
         "a fact about a person is filed under that person",
-        facts.get(("person", "plays", "鸣潮")) == "鸣潮",
         str(facts),
     )
     # The group is an entity, which is what lets what the bot knows about a group use the
     # same evidence, supersession and ageing as everything else.
-    check(
-        "a fact about the group is filed under the group",
+    assert (
         facts.get(("group", "topic", None)) == "做音乐的群"
-        and facts.get(("group", "term", "切片")) == "把采样切成小段再重排",
-        str(facts),
-    )
+        and facts.get(("group", "term", "切片")) == "把采样切成小段再重排"
+    ), ("a fact about the group is filed under the group", str(facts))
 
     # The model's own guess at a name is worth one weak piece of evidence, which does not
     # reach confirmed. Confirming takes an @ or an owner typing it.
     alias = await pool().fetchrow(
         "SELECT status, confidence FROM alias WHERE group_id=$1 AND alias_text='老周'", G.to_db()
     )
-    check(
+    assert alias and alias["status"] == "candidate" and alias["confidence"] < 0.75, (
         "a name the model guessed stays a candidate",
-        alias and alias["status"] == "candidate" and alias["confidence"] < 0.75,
         str(dict(alias) if alias else None),
     )
 
@@ -476,7 +517,7 @@ async def main():
             WHERE a.group_id=$1 AND a.alias_text='老周'""",
         G.to_db(),
     )
-    check("a name cites the message that used it", cited == "e2", str(cited))
+    assert cited == "e2", ("a name cites the message that used it", str(cited))
     cited_fact = await pool().fetchval(
         """SELECT r.platform_event_id
              FROM memory_fact f
@@ -485,7 +526,7 @@ async def main():
             WHERE f.group_id=$1 AND f.predicate='plays'""",
         G.to_db(),
     )
-    check("and a fact cites the message that stated it", cited_fact == "e1", str(cited_fact))
+    assert cited_fact == "e1", ("and a fact cites the message that stated it", str(cited_fact))
 
     # What the bot said is readable but never evidence. It renders into the
     # transcript with the self marker so the extractor reads both halves of
@@ -518,15 +559,14 @@ async def main():
     )
     _own0 = [ln for ln in lines if ln.own]
     _mention_number = re.search(r"李芳⟦(\d+)⟧", _roster)
-    check(
+    assert _mention_number is not None and any(
+        f"@李芳⟦{_mention_number.group(1)}⟧" in line.text for line in lines
+    ), (
         "a mentioned non-speaker enters the extraction roster and keeps identity",
-        _mention_number is not None
-        and any(f"@李芳⟦{_mention_number.group(1)}⟧" in line.text for line in lines),
         f"{_roster} / {[line.text for line in lines]}",
     )
-    check(
+    assert len(_own0) == 1 and "小X⟦0⟧: 我也在玩鸣潮" in _own0[0].text, (
         "the bot's own line is in the transcript, marked as its own",
-        len(_own0) == 1 and "小X⟦0⟧: 我也在玩鸣潮" in _own0[0].text,
         str([ln.text for ln in lines]),
     )
     from qqbot.services import ExtractionInput as _EI0
@@ -534,9 +574,8 @@ async def main():
     _probe = _EI0(
         group_id=G, transcript="", roster=_roster, account_codes=_codes, lines=tuple(lines)
     )
-    check(
+    assert "小X" not in _roster and _probe.source_of(_own0[0].ordinal, "我也在玩鸣潮") is None, (
         "but never on the roster and never a source",
-        "小X" not in _roster and _probe.source_of(_own0[0].ordinal, "我也在玩鸣潮") is None,
         _roster,
     )
 
@@ -547,9 +586,8 @@ async def main():
     events = await pool().fetchval(
         "SELECT count(*) FROM episode_event WHERE episode_id=$1", ep["id"]
     )
-    check(
+    assert ep["extraction_id"] is not None and events == 1, (
         "an episode keeps exact extraction and event provenance",
-        ep["extraction_id"] is not None and events == 1,
         f"extraction={ep['extraction_id']} events={events}",
     )
 
@@ -565,17 +603,16 @@ async def main():
         "SELECT count(*) FROM episode WHERE group_id=$1 AND status='active'", G.to_db()
     )
     # Every active episode receives a vector; no alternate identity index exists.
-    check("every episode gets a vector", stored == live and live > 0, f"{stored}/{live}")
-    check(
+    assert stored == live and live > 0, ("every episode gets a vector", f"{stored}/{live}")
+    assert FakeEmbedding.EMBED_CALLS >= 1, (
         "and it was this backend that produced it",
-        FakeEmbedding.EMBED_CALLS >= 1,
         str(FakeEmbedding.EMBED_CALLS),
     )
 
     # -- the model asking its own memory -------------------------------------
     # Cross-person questions may concern people absent from the current turn, so episode
     # recall is deliberately group-scoped.
-    from qqbot.core import tools as tools_mod
+    from qqbot.conversation import tools as tools_mod
 
     def _call(name, **args):
         return function_call(name, args, call_id="tool-call")
@@ -585,26 +622,23 @@ async def main():
         cfg=config().default,
         group_id=G,
         ctx=tool_context(),
+        prompts=_test_db.test_bundle().prompts,
     )
-    check("recalled events answer a question", "老周答应周末把切片做完" in got, got)
-    check("dated, so the model can say when", "⟦" in got and "⟧" in got, got)
-    check(
-        "another group's memory is out of reach",
-        "没有相关的事"
-        in await tools_mod.execute(
-            _call("recall_events", question="切片的约定"),
-            cfg=config().default,
-            group_id=GroupId("424242"),
-            ctx=tool_context(),
-        ),
-    )
-    check(
-        "an empty question is refused",
-        "问题为空"
-        in await tools_mod.execute(
-            _call("recall_events", question="  "), cfg=config().default, group_id=G
-        ),
-    )
+    assert "老周答应周末把切片做完" in got, ("recalled events answer a question", got)
+    assert "⟦" in got and "⟧" in got, ("dated, so the model can say when", got)
+    assert "没有相关的事" in await tools_mod.execute(
+        _call("recall_events", question="切片的约定"),
+        cfg=config().default,
+        group_id=GroupId("424242"),
+        ctx=tool_context(),
+        prompts=_test_db.test_bundle().prompts,
+    ), "another group's memory is out of reach"
+    assert "问题为空" in await tools_mod.execute(
+        _call("recall_events", question="  "),
+        cfg=config().default,
+        group_id=G,
+        prompts=_test_db.test_bundle().prompts,
+    ), "an empty question is refused"
 
     # A recalled episode arrives framed by its neighbours in group time: the
     # stretches before and after are the story's cause and consequence. The
@@ -616,7 +650,7 @@ async def main():
     from qqbot.repositories import EpisodeRepository as _EpRepo
 
     _anchor = await pool().fetchrow("SELECT started_at FROM episode WHERE group_id=$1", G.to_db())
-    await _EpRepo().add(
+    await _EpRepo(database=_test_db.pool).add(
         _Ep(
             group_id=G,
             summary="大家商量下个月团建去哪",
@@ -624,7 +658,7 @@ async def main():
             ended_at=_anchor["started_at"] - _td(days=1),
         )
     )
-    await _EpRepo().add(
+    await _EpRepo(database=_test_db.pool).add(
         _Ep(
             group_id=G,
             summary="切片如期交上来了",
@@ -637,15 +671,14 @@ async def main():
         cfg=config().default,
         group_id=G,
         ctx=tool_context(),
+        prompts=_test_db.test_bundle().prompts,
     )
-    check(
+    assert "团建" in framed and "如期交上来" in framed, (
         "a recalled event brings its neighbours in time",
-        "团建" in framed and "如期交上来" in framed,
         framed,
     )
-    check(
+    assert framed.index("团建") < framed.index("老周答应") < framed.index("如期交上来"), (
         "and the frame reads chronologically",
-        framed.index("团建") < framed.index("老周答应") < framed.index("如期交上来"),
         framed,
     )
 
@@ -653,51 +686,49 @@ async def main():
     # the word, and "what did X say about Y" needs the person, not the topic.
     # Bare-hit mode for the pin: with context on, the other speaker's line would
     # legitimately come back as the hit's surroundings.
-    _base_search_cfg = config().default
-    _rcfg = _base_search_cfg.tools.search_history.model_copy(update={"context_lines": 0})
-    _bare_search_cfg = _base_search_cfg.model_copy(
-        update={
-            "tools": _base_search_cfg.tools.model_copy(
-                update={
-                    "search_history": _rcfg,
-                }
-            ),
-        }
+    from dataclasses import replace
+    from qqbot.conversation.limits import HISTORY_LIMITS
+
+    by_person = await tools_mod.search_history(
+        G,
+        "切片",
+        speaker_name="小北",
+        rcfg=replace(HISTORY_LIMITS, context_lines=0),
+        database=_test_db.pool,
+        identities=_test_db.identities,
+        clock=_test_db.clock,
     )
-    by_person = await tools_mod.execute(
-        _call("search_history", query="切片", speaker_name="小北"), cfg=_bare_search_cfg, group_id=G
-    )
-    check(
+    assert "老周你那个切片做完没" in by_person and "采样切成小段" not in by_person, (
         "a speaker filter keeps only that person's lines",
-        "老周你那个切片做完没" in by_person and "采样切成小段" not in by_person,
         by_person,
     )
     fresh = await tools_mod.execute(
-        _call("search_history", query="切片", days=7), cfg=config().default, group_id=G
+        _call("search_history", query="切片", days=7),
+        cfg=config().default,
+        group_id=G,
+        ctx=tool_context(),
+        prompts=_test_db.test_bundle().prompts,
     )
-    check("a days filter still finds what was just said", "切片" in fresh, fresh)
+    assert "切片" in fresh, ("a days filter still finds what was just said", fresh)
 
     # -- and how the reply path reads it back --------------------------------
-    check(
+    assert await retrieval.group_knowledge(G, database=_test_db.pool, clock=_test_db.clock) == [
+        f"事实：做音乐的群（置信度 {earned_confidence(2):.2f}）",
+        f"事实：切片：把采样切成小段再重排（置信度 {earned_confidence(2):.2f}）",
+    ], (
         "the group's own facts render for the prompt",
-        await retrieval.group_knowledge(G) == [
-            f"事实：做音乐的群（置信度 {earned_confidence(2):.2f}）",
-            f"事实：切片：把采样切成小段再重排（置信度 {earned_confidence(2):.2f}）",
-        ],
-        str(await retrieval.group_knowledge(G)),
+        str(await retrieval.group_knowledge(G, database=_test_db.pool, clock=_test_db.clock)),
     )
     # Episodes reach a reply only through the recall_events tool (covered above):
     # nothing episodic is pushed per turn, so there is no per-message lookup here.
-    roster = await retrieval.gather(group_id=G, directory=_DIRECTORY)
-    check(
-        "the roster carries the person's fact, not the group's - and lists everyone",
+    roster = await retrieval.gather(group_id=G, directory=_DIRECTORY, members=MEMBERS)
+    assert (
         [r["nickname"] for r in roster] == ["成员", "成员"]
         and any("未确认显示名：董自豪" in hint for hint in roster[0]["memory_hints"])
         and any("未确认显示名：小北" in hint for hint in roster[1]["memory_hints"])
         and any(hint.startswith("事实：在玩鸣潮（置信度 ") for hint in roster[0]["memory_hints"])
-        and not any(hint.startswith("事实：") for hint in roster[1]["memory_hints"]),
-        str(roster),
-    )
+        and not any(hint.startswith("事实：") for hint in roster[1]["memory_hints"])
+    ), ("the roster carries the person's fact, not the group's - and lists everyone", str(roster))
     # A confirmed name rides the extraction roster as a comprehension key: the
     # extractor can resolve in-chat nicknames it would otherwise have to guess
     # at. (Registered after the reply-roster pins above - a new alias row is
@@ -713,9 +744,8 @@ async def main():
             )
         ),
     )
-    check(
+    assert "（也叫：" in _roster2 and "小豪豪" in _roster2, (
         "the extraction roster lists known names beside the current card",
-        "（也叫：" in _roster2 and "小豪豪" in _roster2,
         _roster2,
     )
     # An owner's note reaches extraction read-only, under its own label - a
@@ -723,17 +753,15 @@ async def main():
     # and no quote from a note can validate: it is not a transcript line).
     await _DIRECTORY.note(G, "u1", "只在周末上线")
     _known2 = await w._known(G, _codes2)
-    check(
+    assert "备注：只在周末上线" in _known2, (
         "the owner's note rides the known block under its own label",
-        "备注：只在周末上线" in _known2,
         _known2,
     )
     # The persona's hand-written group background reaches extraction too - the
     # same fixed material the reply path reads, because understanding is
     # upstream of extraction.
-    check(
+    assert "本群固定资料：" in _known2 and "测试群。" in _known2, (
         "the owner's group background heads the known block",
-        "本群固定资料：" in _known2 and "测试群。" in _known2,
         _known2,
     )
 
@@ -763,9 +791,8 @@ async def main():
     )
     _codes3, _roster3, _lines3 = await w._render(G, _rows3)
     _own = [ln for ln in _lines3 if ln.own]
-    check(
+    assert any("小X⟦0⟧: 切片记得用新采样" in ln.text for ln in _own) and "小X" not in _roster3, (
         "the bot's own line renders marked, codeless and off the roster",
-        any("小X⟦0⟧: 切片记得用新采样" in ln.text for ln in _own) and "小X" not in _roster3,
         str(_own),
     )
     _inp3 = _EI(
@@ -776,13 +803,11 @@ async def main():
         lines=tuple(_lines3),
     )
     member_line = next(line for line in _lines3 if "我最近在玩鸣潮" in line.evidence_text)
-    check(
-        "a quote from the bot's own line validates nowhere",
-        _inp3.source_of(_own[0].ordinal, "切片记得用新采样") is None,
+    assert _inp3.source_of(_own[0].ordinal, "切片记得用新采样") is None, (
+        "a quote from the bot's own line validates nowhere"
     )
-    check(
-        "while a member's line still sources",
-        _inp3.source_of(member_line.ordinal, "我最近在玩鸣潮") is not None,
+    assert _inp3.source_of(member_line.ordinal, "我最近在玩鸣潮") is not None, (
+        "while a member's line still sources"
     )
     # Left in place on purpose: the decay pin below reads u2, and u1 is
     # nobody else's subject.
@@ -806,14 +831,16 @@ async def main():
     for _name, _o in zip(("fetch", "fetchrow", "fetchval"), _orig, strict=True):
         setattr(type(pool()), _name, _counting(_o))
     try:
-        await retrieval.gather(group_id=G, directory=_DIRECTORY)
+        await retrieval.gather(group_id=G, directory=_DIRECTORY, members=MEMBERS)
         calls["n"] = 0
-        await retrieval.gather(group_id=G, directory=_DIRECTORY)
+        await retrieval.gather(group_id=G, directory=_DIRECTORY, members=MEMBERS)
         warm = calls["n"]
         from qqbot.domain.memory import Fact, MemoryType
 
-        eid = (await ids_probe().account_of("qq", "u1")).entity_id
-        await mem_probe().supersede(
+        eid = (
+            await ids_probe(database=_test_db.pool, clock=_test_db.clock).account_of("qq", "u1")
+        ).entity_id
+        await mem_probe(database=_test_db.pool, clock=_test_db.clock).supersede(
             Fact(
                 subject_entity_id=eid,
                 predicate="from_place",
@@ -826,13 +853,13 @@ async def main():
             when=now_local(),
         )
         calls["n"] = 0
-        await retrieval.gather(group_id=G, directory=_DIRECTORY)
+        await retrieval.gather(group_id=G, directory=_DIRECTORY, members=MEMBERS)
         after = calls["n"]
     finally:
         for _name, _o in zip(("fetch", "fetchrow", "fetchval"), _orig, strict=True):
             setattr(type(pool()), _name, _o)
-    check("an unchanged roster is not rebuilt", warm <= 3, f"{warm} queries")
-    check("but a new fact rebuilds it", after > warm, f"{after} queries")
+    assert warm <= 3, ("an unchanged roster is not rebuilt", f"{warm} queries")
+    assert after > warm, ("but a new fact rebuilds it", f"{after} queries")
 
     # -- a name the model only observed --------------------------------------
     # The one route by which a guess becomes certain, and it turns on how many *different*
@@ -845,7 +872,7 @@ async def main():
     from qqbot.domain.identity import Alias, AliasEvidence, AliasType, EvidenceType
     from qqbot.repositories import IdentityRepository as _IR
 
-    ids = _IR()
+    ids = _IR(database=_test_db.pool, clock=_test_db.clock)
     target = (await ids.account_of("qq", "u1")).entity_id
     seen = {}
     for i, speaker in enumerate(("u2", "u3", "u4"), start=1):
@@ -862,21 +889,23 @@ async def main():
             ),
             [AliasEvidence(EvidenceType.LLM_INFERENCE, event)],
         )
-    check(
+    assert seen["u2"].status == "candidate", (
         "one person using a name leaves it a guess",
-        seen["u2"].status == "candidate",
         str(seen["u2"].confidence),
     )
-    check("two is still not enough", seen["u3"].status == "candidate", str(seen["u3"].confidence))
-    check(
+    assert seen["u3"].status == "candidate", ("two is still not enough", str(seen["u3"].confidence))
+    assert seen["u4"].status == "confirmed", (
         "three different people make it a name the group uses",
-        seen["u4"].status == "confirmed",
         str(seen["u4"].confidence),
     )
-    roster_now = {r["user_id"]: r for r in await retrieval.gather(group_id=G, directory=_DIRECTORY)}
-    check(
+    roster_now = {
+        r["user_id"]: r
+        for r in await retrieval.gather(group_id=G, directory=_DIRECTORY, members=MEMBERS)
+    }
+    assert (
+        roster_now["u1"]["aliases"] == ["阿豪"] and "阿豪" not in roster_now["u1"]["former_names"]
+    ), (
         "and it reaches the prompt as a name people call him, not a former name",
-        roster_now["u1"]["aliases"] == ["阿豪"] and "阿豪" not in roster_now["u1"]["former_names"],
         str(roster_now["u1"]),
     )
 
@@ -896,9 +925,8 @@ async def main():
             ),
             [AliasEvidence(EvidenceType.LLM_INFERENCE, event)],
         )
-    check(
+    assert alone.status == "candidate", (
         "but one person repeating themselves never does",
-        alone.status == "candidate",
         str(alone.confidence),
     )
 
@@ -923,9 +951,8 @@ async def main():
             G.to_db(),
         )
     )
-    check(
+    assert left == {"正经称呼": "candidate", "玩笑称呼": "inactive"}, (
         "a joke name expires sooner than an ordinary one",
-        left == {"正经称呼": "candidate", "玩笑称呼": "inactive"},
         str(left),
     )
 
@@ -936,14 +963,18 @@ async def main():
     # predicates that would have been most of them.
     from qqbot.services.memory_extractor import multi_valued
 
-    person = (await ids_probe().account_of("qq", "u1")).entity_id
+    person = (
+        await ids_probe(database=_test_db.pool, clock=_test_db.clock).account_of("qq", "u1")
+    ).entity_id
 
     async def record(pred, obj):
-        await mem_probe().supersede(
+        await mem_probe(database=_test_db.pool, clock=_test_db.clock).supersede(
             Fact(
                 subject_entity_id=person,
                 predicate=pred,
-                object_key=obj if pred in multi_valued() else None,
+                object_key=obj
+                if pred in multi_valued(predicates=_test_db.test_bundle().predicates)
+                else None,
                 object_value=obj,
                 group_id=G,
                 memory_type=MemoryType.PREFERENCE,
@@ -956,32 +987,30 @@ async def main():
     async def current():
         return {
             (f.predicate, f.object_key): f.object_value
-            for f in await mem_probe().current_facts(G, [person])
+            for f in await mem_probe(database=_test_db.pool, clock=_test_db.clock).current_facts(
+                G, [person]
+            )
         }
 
     await record("likes", "辣的")
     await record("likes", "咖啡")
     live = await current()
-    check(
+    assert live.get(("likes", "辣的")) == "辣的" and live.get(("likes", "咖啡")) == "咖啡", (
         "a second thing somebody likes does not overturn the first",
-        live.get(("likes", "辣的")) == "辣的" and live.get(("likes", "咖啡")) == "咖啡",
         str(live),
     )
 
     await record("lives_in", "杭州")
     await record("lives_in", "上海")
     live = await current()
-    check(
-        "but moving does overturn where they lived",
-        live.get(("lives_in", None)) == "上海"
-        and len([k for k in live if k[0] == "lives_in"]) == 1,
-        str(live),
-    )
+    assert (
+        live.get(("lives_in", None)) == "上海" and len([k for k in live if k[0] == "lives_in"]) == 1
+    ), ("but moving does overturn where they lived", str(live))
 
     # -- forgetting ----------------------------------------------------------
     # Nothing here is old enough to expire, which is the point: decay must not touch what
     # was just learned.
-    check("a fresh batch survives a decay pass", await w.decay(G) == (0, 0, 0))
+    assert await w.decay(G) == (0, 0, 0), "a fresh batch survives a decay pass"
     await pool().execute(
         "UPDATE memory_fact SET last_confirmed_at = NOW() - INTERVAL '400 days' WHERE group_id=$1",
         G.to_db(),
@@ -999,35 +1028,30 @@ async def main():
     gone_facts, gone_names, gone_episodes = await w.decay(G)
     # Eight names, not three: platform cards now start as candidates until they endure a
     # second day, so a card worn once and never seen again is swept with the guesses.
-    check(
+    assert gone_facts == 7 and gone_names == 8 and gone_episodes == 1, (
         "but what nothing has confirmed for a year is let go",
-        gone_facts == 7 and gone_names == 8 and gone_episodes == 1,
         f"{gone_facts} facts, {gone_names} names, {gone_episodes} episodes",
     )
     expired_ep = await pool().fetchrow("SELECT status, revision FROM episode WHERE id=$1", ep["id"])
-    check(
-        "an old episode leaves recall without losing its provenance",
+    assert (
         expired_ep["status"] == "expired"
         and expired_ep["revision"] == 2
         and await pool().fetchval(
             "SELECT count(*) FROM episode_event WHERE episode_id=$1", ep["id"]
         )
-        == 1,
-        str(dict(expired_ep)),
-    )
-    check(
-        "episode decay removes its rebuildable vector",
+        == 1
+    ), ("an old episode leaves recall without losing its provenance", str(dict(expired_ep)))
+    assert (
         await pool().fetchval("SELECT count(*) FROM embedding_index WHERE object_id=$1", ep["id"])
-        == 0,
-    )
+        == 0
+    ), "episode decay removes its rebuildable vector"
     # A name that reached confirmed is not a guess any more, so it does not expire with
     # them: three people agreed on it, and their agreeing does not stop being true.
     kept = await pool().fetchval(
         "SELECT status FROM alias WHERE group_id=$1 AND alias_text='阿豪'", G.to_db()
     )
-    check(
+    assert kept == "confirmed", (
         "a name the group converged on is not forgotten with the guesses",
-        kept == "confirmed",
         str(kept),
     )
 
@@ -1035,9 +1059,11 @@ async def main():
     # The kind of fact, not the repetition count, is the primary axis: what somebody is
     # currently playing goes stale in weeks, where they live holds for months. A uniform
     # clock got both wrong - much-repeated ephemera outlived once-stated stable facts.
-    subj = (await ids_probe().account_of("qq", "u2")).entity_id
+    subj = (
+        await ids_probe(database=_test_db.pool, clock=_test_db.clock).account_of("qq", "u2")
+    ).entity_id
     for pred, obj in (("plays", "某新游"), ("lives_in", "南京")):
-        await mem_probe().supersede(
+        await mem_probe(database=_test_db.pool, clock=_test_db.clock).supersede(
             Fact(
                 subject_entity_id=subj,
                 predicate=pred,
@@ -1065,9 +1091,8 @@ async def main():
         )
     }
     # Aged out reads as expired, not superseded: nothing contradicted it.
-    check(
+    assert left == {"plays": "expired", "lives_in": "active"}, (
         "at forty days a current-state fact is gone and a stable one holds",
-        left == {"plays": "expired", "lives_in": "active"},
         str(left),
     )
 
@@ -1076,7 +1101,7 @@ async def main():
         async def respond(self, input, **kw):
             raise RuntimeError("model down")
 
-    exact = ExtractionRepository()
+    exact = ExtractionRepository(database=_test_db.pool)
     await say("u1", "董自豪", "批次在失败后仍要保留", "exact-fail-1")
     await say("u2", "小北", "重试必须读取同一批事件", "exact-fail-2")
     before = await exact.unconsumed_count(G)
@@ -1085,7 +1110,14 @@ async def main():
             text=FailingText(), vision=Unused(), asr=Unused(), embedding=_EMBED, search=Unused()
         )
     )
-    failing_worker = MemoryWorker(test_cfg, _PROVIDERS, worker_id="exact-fail")
+    failing_worker = MemoryWorker(
+        _test_db.bundle_for_settings(test_cfg),
+        _PROVIDERS,
+        worker_id="exact-fail",
+        budget=BUDGET,
+        database=_test_db.pool,
+        clock=_test_db.clock,
+    )
     try:
         await failing_worker.extract(G)
         crashed = False
@@ -1094,28 +1126,42 @@ async def main():
     reserved = await exact.open(G)
     reserved_ids = tuple(event.raw_event_id for event in reserved.events)
     after_claim = await exact.unconsumed_count(G)
-    check("a failed extraction propagates to the job layer", crashed)
-    check(
-        "and leaves one durable exact batch for the retry",
+    assert crashed, "a failed extraction propagates to the job layer"
+    assert (
         reserved is not None
         and reserved.status.value == "extracting"
-        and before - after_claim == len(reserved_ids),
+        and before - after_claim == len(reserved_ids)
+    ), (
+        "and leaves one durable exact batch for the retry",
         f"{len(reserved_ids)} reserved, {after_claim}/{before} unconsumed",
     )
     set_providers(
         Providers(text=FakeText(), vision=Unused(), asr=Unused(), embedding=_EMBED, search=Unused())
     )
-    retry_worker = MemoryWorker(test_cfg, _PROVIDERS, worker_id="exact-retry")
+    retry_worker = MemoryWorker(
+        _test_db.bundle_for_settings(test_cfg),
+        _PROVIDERS,
+        worker_id="exact-retry",
+        budget=BUDGET,
+        database=_test_db.pool,
+        clock=_test_db.clock,
+    )
     n_retry = await retry_worker.extract(G)
-    check(
-        "the retry resumes the reserved batch and drains without a watermark",
-        n_retry > 0 and await exact.open(G) is None and await exact.unconsumed_count(G) == 0,
+    assert (
+        n_retry > 0
+        and await exact.open(G) is None
+        and await exact.unconsumed_count(G) == after_claim
+    ), "the retry leaves the next batch for a separate execution"
+    for _ in range((after_claim + WINDOW - 1) // WINDOW):
+        await retry_worker.extract(G)
+    assert n_retry > 0 and await exact.open(G) is None and await exact.unconsumed_count(G) == 0, (
+        "separate executions drain the remaining exact batches without a watermark",
         f"{n_retry} candidates",
     )
 
     from datetime import timedelta as _td
 
-    batch_gap = _td(minutes=config().default.memory.batch_gap_min)
+    batch_gap = EXTRACTION_GAP
 
     # Equal created_at values need no trimming: membership records exact ids, so rows
     # outside the limit remain independently claimable however their timestamps tie.
@@ -1134,9 +1180,8 @@ async def main():
         floor=0,
         gap=batch_gap,
     )
-    check(
+    assert len(tied.events) == WINDOW and await exact.unconsumed_count(G2) == 2, (
         "equal timestamps keep an exact full batch and leave the suffix",
-        len(tied.events) == WINDOW and await exact.unconsumed_count(G2) == 2,
         f"{len(tied.events)} claimed",
     )
 
@@ -1162,9 +1207,8 @@ async def main():
         floor=0,
         gap=batch_gap,
     )
-    check(
+    assert len(gapped.events) == 100, (
         "a full exact batch still cuts at the last tail-half conversation gap",
-        len(gapped.events) == 100,
         f"{len(gapped.events)} events",
     )
 
@@ -1173,9 +1217,14 @@ async def main():
         await say("t3", "阿强", f"积压第 {i} 句", f"backlog{i}", gid=G4)
     calls_before_drain = CALLS.count("extract")
     await w.extract(G4)
-    check(
-        "a backlog wider than one window drains in exactly two exact batches",
-        CALLS.count("extract") == calls_before_drain + 2 and await exact.unconsumed_count(G4) == 0,
+    assert (
+        CALLS.count("extract") == calls_before_drain + 1 and await exact.unconsumed_count(G4) == 25
+    ), "one execution consumes only one bounded extraction batch"
+    await w.extract(G4)
+    assert (
+        CALLS.count("extract") == calls_before_drain + 2 and await exact.unconsumed_count(G4) == 0
+    ), (
+        "a backlog wider than one window drains in two separate executions",
         f"{CALLS.count('extract') - calls_before_drain} calls",
     )
 
@@ -1186,11 +1235,10 @@ async def main():
     frozen_ids = tuple(event.raw_event_id for event in frozen.events)
     await say("t4", "阿花", "冻结后才到", "late-after-claim", gid=G5)
     resumed = await exact.open(G5)
-    check(
-        "events arriving after claim stay out of the frozen batch",
+    assert (
         tuple(event.raw_event_id for event in resumed.events) == frozen_ids
-        and await exact.unconsumed_count(G5) == 1,
-    )
+        and await exact.unconsumed_count(G5) == 1
+    ), "events arriving after claim stay out of the frozen batch"
 
     # Two workers may legally receive twin jobs while one is running. Exact event
     # membership prevents a second batch, and the session lock prevents a second paid
@@ -1215,7 +1263,10 @@ async def main():
                 )
                 self.entered.set()
                 await self.release.wait()
-            return await super().respond(input, **kw)
+            return await super().respond(
+                input,
+                **kw,
+            )
 
     G6 = GroupId("9006")
     await say("t6", "阿文", "并发批次只付一次", "concurrent-claim", gid=G6)
@@ -1223,19 +1274,32 @@ async def main():
     set_providers(
         Providers(text=blocking, vision=Unused(), asr=Unused(), embedding=_EMBED, search=Unused())
     )
-    first_worker = MemoryWorker(test_cfg, _PROVIDERS, worker_id="concurrent-a")
-    second_worker = MemoryWorker(test_cfg, _PROVIDERS, worker_id="concurrent-b")
+    first_worker = MemoryWorker(
+        _test_db.bundle_for_settings(test_cfg),
+        _PROVIDERS,
+        worker_id="concurrent-a",
+        budget=BUDGET,
+        database=_test_db.pool,
+        clock=_test_db.clock,
+    )
+    second_worker = MemoryWorker(
+        _test_db.bundle_for_settings(test_cfg),
+        _PROVIDERS,
+        worker_id="concurrent-b",
+        budget=BUDGET,
+        database=_test_db.pool,
+        clock=_test_db.clock,
+    )
     first_task = asyncio.create_task(first_worker.extract(G6))
     await asyncio.wait_for(blocking.entered.wait(), timeout=2)
     second_result = await asyncio.wait_for(second_worker.extract(G6), timeout=2)
     blocking.release.set()
     await asyncio.wait_for(first_task, timeout=5)
-    check(
+    assert blocking.calls == 1 and second_result == 0, (
         "concurrent workers make one provider call for one exact batch",
-        blocking.calls == 1 and second_result == 0,
         f"{blocking.calls} calls",
     )
-    check("the provider slot holds no database transaction", blocking.slot_without_transaction)
+    assert blocking.slot_without_transaction, "the provider slot holds no database transaction"
 
     set_providers(
         Providers(text=FakeText(), vision=Unused(), asr=Unused(), embedding=_EMBED, search=Unused())
@@ -1262,19 +1326,25 @@ async def main():
     )
     await exact.stage(staged.id, staged_snapshot, [staged_candidate])
     calls_before_stage_resume = CALLS.count("extract")
-    await MemoryWorker(test_cfg, _PROVIDERS, worker_id="staged-resume").extract(G7)
+    await MemoryWorker(
+        _test_db.bundle_for_settings(test_cfg),
+        _PROVIDERS,
+        worker_id="staged-resume",
+        budget=BUDGET,
+        database=_test_db.pool,
+        clock=_test_db.clock,
+    ).extract(G7)
     staged_state = await pool().fetchval(
         "SELECT status FROM memory_extraction WHERE id=$1", staged.id
     )
     staged_audit = await pool().fetchval(
         "SELECT status FROM memory_candidate WHERE id=$1", staged_candidate.id
     )
-    check(
-        "a staged restart applies without paying the provider again",
+    assert (
         CALLS.count("extract") == calls_before_stage_resume
         and staged_state == "applied"
-        and staged_audit == "accepted",
-    )
+        and staged_audit == "accepted"
+    ), "a staged restart applies without paying the provider again"
 
     G8 = GroupId("9008")
     await say("t8", "阿蓝", "这批没有长期信息", "zero-candidate", gid=G8)
@@ -1282,14 +1352,20 @@ async def main():
     _codes, _roster, _lines, empty_snapshot = await w._render_snapshot(empty)
     await exact.stage(empty.id, empty_snapshot, [])
     calls_before_empty = CALLS.count("extract")
-    await MemoryWorker(test_cfg, _PROVIDERS, worker_id="zero-resume").extract(G8)
-    check(
-        "a zero-candidate checkpoint still consumes its exact events",
+    await MemoryWorker(
+        _test_db.bundle_for_settings(test_cfg),
+        _PROVIDERS,
+        worker_id="zero-resume",
+        budget=BUDGET,
+        database=_test_db.pool,
+        clock=_test_db.clock,
+    ).extract(G8)
+    assert (
         CALLS.count("extract") == calls_before_empty
         and await pool().fetchval("SELECT status FROM memory_extraction WHERE id=$1", empty.id)
         == "applied"
-        and await exact.unconsumed_count(G8) == 0,
-    )
+        and await exact.unconsumed_count(G8) == 0
+    ), "a zero-candidate checkpoint still consumes its exact events"
 
     # Inject a failure after a real fact write. The candidate audit and extraction state
     # must roll back with the projection, then the staged checkpoint retries locally.
@@ -1311,7 +1387,14 @@ async def main():
         extraction_id=rollback_batch.id,
     )
     await exact.stage(rollback_batch.id, rollback_snapshot, [rollback_candidate])
-    rollback_worker = MemoryWorker(test_cfg, _PROVIDERS, worker_id="projection-fault")
+    rollback_worker = MemoryWorker(
+        _test_db.bundle_for_settings(test_cfg),
+        _PROVIDERS,
+        worker_id="projection-fault",
+        budget=BUDGET,
+        database=_test_db.pool,
+        clock=_test_db.clock,
+    )
     original_supersede = rollback_worker._mem.supersede
 
     async def write_then_fail(*args, **kwargs):
@@ -1326,8 +1409,7 @@ async def main():
         projection_failed = True
     finally:
         rollback_worker._mem.supersede = original_supersede
-    check(
-        "a projection failure rolls back every write and audit change",
+    assert (
         projection_failed
         and await pool().fetchval(
             "SELECT status FROM memory_extraction WHERE id=$1", rollback_batch.id
@@ -1342,18 +1424,17 @@ async def main():
                   WHERE group_id=$1 AND predicate='term' AND object_key='回滚词'""",
             G10.to_db(),
         )
-        == 0,
-    )
+        == 0
+    ), "a projection failure rolls back every write and audit change"
     calls_before_projection_retry = CALLS.count("extract")
     await rollback_worker.extract(G10)
-    check(
-        "the staged projection retry succeeds without another provider call",
+    assert (
         CALLS.count("extract") == calls_before_projection_retry
         and await pool().fetchval(
             "SELECT status FROM memory_candidate WHERE id=$1", rollback_candidate.id
         )
-        == "accepted",
-    )
+        == "accepted"
+    ), "the staged projection retry succeeds without another provider call"
 
     # The episode, its accepted audit row, the extraction state, and its EMBED job are
     # one commit. Failing after enqueue must leave none of them half-applied.
@@ -1377,7 +1458,14 @@ async def main():
         extraction_id=episode_batch.id,
     )
     await exact.stage(episode_batch.id, episode_snapshot, [episode_candidate])
-    episode_worker = MemoryWorker(test_cfg, _PROVIDERS, worker_id="episode-fault")
+    episode_worker = MemoryWorker(
+        _test_db.bundle_for_settings(test_cfg),
+        _PROVIDERS,
+        worker_id="episode-fault",
+        budget=BUDGET,
+        database=_test_db.pool,
+        clock=_test_db.clock,
+    )
     original_submit = episode_worker._queue.submit
 
     async def enqueue_then_fail(job_type, payload, **kwargs):
@@ -1394,8 +1482,7 @@ async def main():
         enqueue_failed = True
     finally:
         episode_worker._queue.submit = original_submit
-    check(
-        "episode projection and EMBED enqueue roll back together",
+    assert (
         enqueue_failed
         and await pool().fetchval("SELECT count(*) FROM episode WHERE id=$1", episode_candidate.id)
         == 0
@@ -1408,11 +1495,10 @@ async def main():
         and await pool().fetchval(
             "SELECT status FROM memory_candidate WHERE id=$1", episode_candidate.id
         )
-        == "pending",
-    )
+        == "pending"
+    ), "episode projection and EMBED enqueue roll back together"
     await episode_worker.extract(G11)
-    check(
-        "episode, audit, applied state and EMBED job commit together",
+    assert (
         await pool().fetchval("SELECT count(*) FROM episode WHERE id=$1", episode_candidate.id) == 1
         and await pool().fetchval(
             """SELECT count(*) FROM memory_job
@@ -1427,23 +1513,24 @@ async def main():
         and await pool().fetchval(
             "SELECT status FROM memory_extraction WHERE id=$1", episode_batch.id
         )
-        == "applied",
-    )
+        == "applied"
+    ), "episode, audit, applied state and EMBED job commit together"
 
     # Extraction is a use of the text model with its own model, grade and timeout,
     # while the shared wiring (endpoint, key, backend, concurrency) stays the reply
     # path's. The grade and timeout hold for every extraction above; the model
     # override is probed here, last, because it adds an extract call the counting
     # assertions above must not see.
-    _txt = config().default.capabilities.text
-    check(
-        "extraction carries its own grade and timeout, not the reply path's",
+    _txt = config().default.backends.text
+    assert (
         SEEN_EXTRACT_CFG
         and all(
             g == _txt.extract.reasoning_effort and t == _txt.extract.timeout_sec
             for _m, g, t in SEEN_EXTRACT_CFG
         )
-        and _txt.extract.timeout_sec != _txt.timeout_sec,
+        and _txt.extract.timeout_sec != _txt.timeout_sec
+    ), (
+        "extraction carries its own grade and timeout, not the reply path's",
         str(SEEN_EXTRACT_CFG[:2]),
     )
     from qqbot.services import ExtractionInput as _EIovr, MemoryExtractor as _MEovr
@@ -1451,11 +1538,11 @@ async def main():
     _base = config().default
     _covr = _base.model_copy(
         update={
-            "capabilities": _base.capabilities.model_copy(
+            "backends": _base.backends.model_copy(
                 update={
-                    "text": _base.capabilities.text.model_copy(
+                    "text": _base.backends.text.model_copy(
                         update={
-                            "extract": _base.capabilities.text.extract.model_copy(
+                            "extract": _base.backends.text.extract.model_copy(
                                 update={"model": "flash-probe"}
                             )
                         }
@@ -1464,7 +1551,7 @@ async def main():
             )
         }
     )
-    await _MEovr(_covr, _PROVIDERS.text).extract(
+    await _MEovr(_test_db.bundle_for_settings(_covr), _PROVIDERS.text).extract(
         _EIovr(
             group_id=G,
             transcript="⟦09-18 00:00⟧ 成员⟦1⟧: 测试",
@@ -1473,16 +1560,9 @@ async def main():
             lines=(),
         )
     )
-    check(
+    assert SEEN_MODELS[-1] == "flash-probe" and SEEN_MODELS[0] == _txt.model, (
         "the extract model override moves extraction alone",
-        SEEN_MODELS[-1] == "flash-probe" and SEEN_MODELS[0] == _txt.model,
         f"first={SEEN_MODELS[0]} last={SEEN_MODELS[-1]}",
     )
 
-    await close_pool()
     print()
-    print("FAILED:", fails if fails else "none")
-    return 1 if fails else 0
-
-
-sys.exit(asyncio.run(main()))

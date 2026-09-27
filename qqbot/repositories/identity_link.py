@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 
-from ..db import pool
-from ..domain.ids import GroupId
-from ..domain.identity import IdentityAccount
-from .identity import IdentityRepository, lock_identity_topology
+import asyncpg
+
+from qqbot.domain.ids import GroupId
+from qqbot.domain.identity import IdentityAccount
+from qqbot.repositories.identity import IdentityRepository
+from qqbot.repositories.identity import lock_identity_topology
 
 
 class LinkStatus(StrEnum):
@@ -45,6 +48,9 @@ class IdentityChanged(LinkChallengeError):
 class IdentityLinkRepository:
     """Challenge state and atomic finalization around the shared union primitive."""
 
+    def __init__(self, *, database: Callable[[], asyncpg.Pool]) -> None:
+        self._database = database
+
     @staticmethod
     def _challenge(row) -> LinkChallenge:
         return LinkChallenge(
@@ -72,7 +78,7 @@ class IdentityLinkRepository:
         max_pending: int,
         max_pending_per_account: int,
     ) -> LinkChallenge:
-        async with pool().acquire() as conn, conn.transaction():
+        async with self._database().acquire() as conn, conn.transaction():
             await conn.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
                 "account-link-capacity",
@@ -170,7 +176,7 @@ class IdentityLinkRepository:
     ) -> LinkChallenge:
         invalidated: LinkChallengeError | None = None
         applied: LinkChallenge | None = None
-        async with pool().acquire() as conn, conn.transaction():
+        async with self._database().acquire() as conn, conn.transaction():
             await lock_identity_topology(conn)
             row = await conn.fetchrow(
                 """SELECT * FROM account_link_challenge
@@ -250,7 +256,7 @@ class IdentityLinkRepository:
         token_hash: str,
         actor: IdentityAccount,
     ) -> bool:
-        row = await pool().fetchrow(
+        row = await self._database().fetchrow(
             """UPDATE account_link_challenge
                   SET status='cancelled', cancelled_at=NOW()
                 WHERE token_hash=$1 AND group_id=$2 AND status='pending'

@@ -17,15 +17,21 @@ know it exists.
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Sequence
 
 import httpx
 
-from ..core.budget import BUDGET
-from ..domain.ids import GroupId
-from ..settings import EmbeddingCfg
-from ..util import require_key
-from .base import EmbeddingModel, Kind, Rate, RetryPolicy, with_retry
+from qqbot.services.budget import Budget
+from qqbot.domain.ids import GroupId
+from qqbot.domain.memory.embedding import VECTOR_DIMENSIONS
+from qqbot.configuration import EmbeddingCfg
+from qqbot.util import require_key
+from qqbot.providers.base import EmbeddingModel
+from qqbot.providers.base import Kind
+from qqbot.providers.base import Rate
+from qqbot.providers.base import RetryPolicy
+from qqbot.providers.base import with_retry
 
 log = logging.getLogger("qqbot.embed")
 
@@ -36,8 +42,11 @@ BATCH = 10
 
 class DashScopeEmbedding(EmbeddingModel):
     name = "dashscope"
+    dimensions = VECTOR_DIMENSIONS
+    batch_size = BATCH
 
-    def __init__(self, cfg: EmbeddingCfg, retry: RetryPolicy) -> None:
+    def __init__(self, cfg: EmbeddingCfg, retry: RetryPolicy, budget: Budget) -> None:
+        self._budget = budget
         self._cfg = cfg
         self._retry = retry
         self._http = httpx.AsyncClient(timeout=cfg.timeout_sec)
@@ -58,10 +67,11 @@ class DashScopeEmbedding(EmbeddingModel):
             chunk = list(texts[i : i + BATCH])
 
             async def post(chunk=chunk) -> httpx.Response:
+                await self._budget.check()
                 r = await self._http.post(
                     f"{base}/embeddings",
                     headers={"Authorization": f"Bearer {key}"},
-                    json={"model": cfg.model, "input": chunk, "dimensions": cfg.dimensions},
+                    json={"model": cfg.model, "input": chunk, "dimensions": self.dimensions},
                 )
                 r.raise_for_status()
                 return r
@@ -79,15 +89,27 @@ class DashScopeEmbedding(EmbeddingModel):
                 or usage.get("prompt_tokens")
                 or sum(len(t) for t in chunk)
             )
-            await BUDGET.record(
+            await self._budget.record(
                 kind=Kind.EMBED,
                 model=cfg.model,
                 cny=self.rate_for(cfg.model).tokens(0, tokens, 0),
                 group_id=group_id,
                 in_miss=tokens,
             )
-            data = sorted(body["data"], key=lambda d: d.get("index", 0))
-            out.extend(d["embedding"] for d in data)
+            data = body.get("data")
+            if not isinstance(data, list) or len(data) != len(chunk):
+                raise ValueError("embedding response has the wrong number of vectors")
+            by_index = {item.get("index"): item for item in data if isinstance(item, dict)}
+            if set(by_index) != set(range(len(chunk))):
+                raise ValueError("embedding response indexes do not match the input")
+            for index in range(len(chunk)):
+                values = by_index[index].get("embedding")
+                if not isinstance(values, list) or len(values) != self.dimensions:
+                    raise ValueError("embedding response violates the vector width contract")
+                vector = [float(value) for value in values]
+                if not all(math.isfinite(value) for value in vector):
+                    raise ValueError("embedding response contains a non-finite coordinate")
+                out.append(vector)
         return out
 
     async def aclose(self) -> None:

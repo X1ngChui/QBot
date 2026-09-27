@@ -28,7 +28,7 @@ for arg in sys.argv[1:]:
         entries = sorted(
             (f"{p.name}/{f.relative_to(p).as_posix()}", f)
             for f in p.rglob("*" if p.name == "config" else "*.py")
-            if f.is_file() and "__pycache__" not in f.parts
+            if f.is_file() and "__pycache__" not in f.parts and ".migrating-" not in f.name
         )
     for name, f in entries:
         h.update(name.encode())

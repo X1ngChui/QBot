@@ -241,11 +241,13 @@ CREATE TABLE memory_extraction (
     status character varying(32) NOT NULL,
     snapshot jsonb,
     candidate_count integer DEFAULT 0 NOT NULL,
+    model_attempts integer DEFAULT 0 NOT NULL,
+    CONSTRAINT memory_extraction_attempts_valid CHECK (model_attempts >= 0),
     started_at timestamp with time zone DEFAULT now() NOT NULL,
     staged_at timestamp with time zone,
     applied_at timestamp with time zone,
-    CONSTRAINT memory_extraction_live_snapshot_v2 CHECK ((((status)::text = 'applied'::text) OR (((status)::text = 'extracting'::text) AND (snapshot IS NULL)) OR (((status)::text = 'staged'::text) AND (snapshot IS NOT NULL) AND (snapshot @> '{"version": 2}'::jsonb)))),
-    CONSTRAINT memory_extraction_status_valid CHECK (((status)::text = ANY ((ARRAY['extracting'::character varying, 'staged'::character varying, 'applied'::character varying])::text[])))
+    CONSTRAINT memory_extraction_live_snapshot_v2 CHECK ((((status)::text = 'applied'::text) OR ((status)::text = 'failed'::text) OR (((status)::text = 'extracting'::text) AND (snapshot IS NULL)) OR (((status)::text = 'staged'::text) AND (snapshot IS NOT NULL) AND (snapshot @> '{"version": 2}'::jsonb)))),
+    CONSTRAINT memory_extraction_status_valid CHECK (((status)::text = ANY ((ARRAY['extracting'::character varying, 'staged'::character varying, 'applied'::character varying, 'failed'::character varying])::text[])))
 );
 
 
@@ -316,9 +318,40 @@ CREATE TABLE memory_job (
     available_at timestamp with time zone DEFAULT now() NOT NULL,
     locked_at timestamp with time zone,
     locked_by character varying(128),
+    claim_token uuid,
+    lease_until timestamp with time zone,
     last_error text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    finished_at timestamp with time zone
+    finished_at timestamp with time zone,
+    CONSTRAINT memory_job_status_valid CHECK (status IN ('pending', 'running', 'done', 'dead')),
+    CONSTRAINT memory_job_claim_valid CHECK (
+        (status='running' AND num_nonnulls(claim_token, lease_until, locked_at, locked_by)=4)
+        OR (status<>'running' AND num_nonnulls(claim_token, lease_until, locked_at, locked_by)=0)
+    ),
+    CONSTRAINT memory_job_retries_valid CHECK (retry_count >= 0 AND max_retry >= 0)
+);
+
+
+--
+-- Name: scheduled_task; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE scheduled_task (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    group_id bigint NOT NULL,
+    creator_id character varying(128) NOT NULL,
+    intent text NOT NULL,
+    due_at timestamp with time zone NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    status character varying(16) DEFAULT 'pending'::character varying NOT NULL,
+    chain_id uuid NOT NULL,
+    chain_depth integer DEFAULT 0 NOT NULL,
+    started_at timestamp with time zone,
+    finished_at timestamp with time zone,
+    outcome character varying(32),
+    CONSTRAINT scheduled_task_status_valid CHECK (status IN ('pending', 'running', 'done', 'failed', 'cancelled')),
+    CONSTRAINT scheduled_task_depth_valid CHECK (chain_depth >= 0),
+    CONSTRAINT scheduled_task_intent_valid CHECK (char_length(intent) BETWEEN 1 AND 500)
 );
 
 
@@ -541,6 +574,14 @@ ALTER TABLE ONLY memory_job
 
 
 --
+-- Name: scheduled_task scheduled_task_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY scheduled_task
+    ADD CONSTRAINT scheduled_task_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: raw_event raw_event_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -729,6 +770,20 @@ CREATE INDEX job_claimable ON memory_job USING btree (priority DESC, available_a
 --
 
 CREATE UNIQUE INDEX job_pending_once ON memory_job USING btree (job_type, ((payload ->> 'group_id'::text))) WHERE ((status)::text = 'pending'::text);
+
+
+--
+-- Name: scheduled_task_due; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX scheduled_task_due ON scheduled_task USING btree (due_at, id) WHERE ((status)::text = 'pending'::text);
+
+
+--
+-- Name: scheduled_task_pending_creator; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX scheduled_task_pending_creator ON scheduled_task USING btree (group_id, creator_id) WHERE ((status)::text = 'pending'::text);
 
 
 --
@@ -983,3 +1038,5 @@ ALTER TABLE ONLY memory_fact
 --
 -- PostgreSQL database dump complete
 --
+
+CREATE UNIQUE INDEX job_expired ON memory_job (lease_until, id) WHERE status='running';

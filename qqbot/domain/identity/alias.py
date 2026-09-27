@@ -21,7 +21,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 
-from ..ids import GroupId
+from qqbot.domain.ids import GroupId
 
 
 class AliasType(StrEnum):

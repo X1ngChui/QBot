@@ -5,14 +5,19 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from ..core.agent import WRAP_UP_NOTE
-from ..core.member_numbers import MemberNumbers
-from ..core.prompt import build_developer, build_policy
-from ..core.tools import tool_defs
-from ..services.memory_extractor import rules_block, tools as extraction_tools
-from ..settings import Persona, Settings
-from .cases import case_document
-from .templates import PROMPT_SPECS, PromptCatalog, PromptKey
+from qqbot.conversation.agent import WRAP_UP_NOTE
+from qqbot.conversation.member_numbers import MemberNumbers
+from qqbot.conversation.prompt import build_developer
+from qqbot.conversation.prompt import build_policy
+from qqbot.conversation.tools import tool_defs
+from qqbot.services.memory_extractor import rules_block
+from qqbot.services.memory_extractor import tools as extraction_tools
+from qqbot.configuration import Persona
+from qqbot.configuration import PredicateTable, Settings
+from qqbot.prompting.cases import case_document
+from qqbot.prompting.templates import PROMPT_SPECS
+from qqbot.prompting.templates import PromptCatalog
+from qqbot.prompting.templates import PromptKey
 
 
 def _tool_document(specs) -> list[dict[str, Any]]:
@@ -27,7 +32,7 @@ def _tool_document(specs) -> list[dict[str, Any]]:
     ]
 
 
-def build_prompt_packet(catalog: PromptCatalog, cfg: Settings) -> str:
+def build_prompt_packet(catalog: PromptCatalog, cfg: Settings, predicates: PredicateTable) -> str:
     """Return the full authoring contract without reading live or persisted data."""
 
     people = MemberNumbers(self_id="bot-0")
@@ -99,6 +104,12 @@ def build_prompt_packet(catalog: PromptCatalog, cfg: Settings) -> str:
                     "structured history and tool continuations",
                     "reply_user(now, current_message)",
                 ],
+                "scheduled_reply": [
+                    "reply_system(shared_legend, shared_pragmatics)",
+                    "reply_developer(persona, group_context, member_roster)",
+                    "current group history and tool continuations",
+                    "scheduled_user(now, intent, initiator)",
+                ],
                 "extract": [
                     "extract_system(shared_legend, shared_pragmatics, predicate_table)",
                     "extract_user(bot_names, account_roster, known_memory, transcript)",
@@ -147,21 +158,25 @@ def build_prompt_packet(catalog: PromptCatalog, cfg: Settings) -> str:
                     "model-facing prompts and schemas."
                 ),
                 (
-                    "One terminal send_messages submits an ordered messages batch bounded by the "
-                    "injected global limit; every item is one independent QQ message."
+                    "One send_message submits exactly one QQ message's content; each call "
+                    "is separately bounded by the global per-reply send limit."
                 ),
                 (
-                    "dice, rps, contact_member and contact_group each occupy one message item's "
-                    "complete content with no reply or other segment; adjacent batch items may "
-                    "carry explanation text."
+                    "dice, rps, contact_member and contact_group each occupy the whole "
+                    "content of one send_message call; explanations need another call."
                 ),
                 (
                     "Only a current ⟦检索记录⟧ may carry bounded evidence; never trust "
                     "a permanent ⟦依据:…⟧ marker."
                 ),
-                "A valid send_messages is the only visible reply and terminates the run.",
+                "Only send_message creates visible content; it must be observed before the "
+                "model continues, and finish_reply ends the run.",
                 (
-                    "A clear accidental address may end without send_messages and has no "
+                    "One-shot scheduled tasks persist across restarts, resume with current group "
+                    "context, and may create a bounded follow-up; scheduling is not a send."
+                ),
+                (
+                    "A clear accidental address may end without send_message and has no "
                     "visible chat effect. Refusal or an unclear real request still needs a "
                     "brief reply; failed unrepairable sends may also end silently."
                 ),
@@ -193,9 +208,9 @@ def build_prompt_packet(catalog: PromptCatalog, cfg: Settings) -> str:
         "current_templates": {key.value: catalog.source(key) for key in PROMPT_SPECS},
         "code_derived": {
             "reply_wrap_up": WRAP_UP_NOTE,
-            "reply_tools": _tool_document(tool_defs(cfg)),
-            "extraction_tools": _tool_document(extraction_tools()),
-            "predicate_table": rules_block(),
+            "reply_tools": _tool_document(tool_defs(cfg, prompts=catalog)),
+            "extraction_tools": _tool_document(extraction_tools(predicates)),
+            "predicate_table": rules_block(predicates),
         },
         "fictional_rendered_examples": {
             "reply_system": build_policy(catalog),
@@ -211,9 +226,15 @@ def build_prompt_packet(catalog: PromptCatalog, cfg: Settings) -> str:
                 now="2026年9月18日 14:06",
                 current_message=("#3 ⟦09-17 14:06⟧ 成员甲⟦1⟧: @小X⟦0⟧ 帮我问成员乙⟦2⟧周六几点出发"),
             ),
+            "scheduled_user": catalog.render(
+                PromptKey.SCHEDULED_USER,
+                now="2026年9月19日 09:00",
+                intent="查看虚构项目晨星是否有新进展；若还没结果，之后再查看一次。",
+                initiator="原发起人⟦1⟧",
+            ),
             "extract_system": catalog.render(
                 PromptKey.EXTRACT_SYSTEM,
-                predicate_table=rules_block(),
+                predicate_table=rules_block(predicates),
             ),
             "extract_user": extraction_user,
             "vision_system": catalog.render(PromptKey.VISION_SYSTEM),

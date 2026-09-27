@@ -10,31 +10,35 @@ and one set of facts, and no caller has to know the merge happened.
 
 from __future__ import annotations
 
+from qqbot.clock import Clock
+
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 
-from ..domain.ids import GroupId
-from ..domain.identity import (
-    ALIAS_MAX_CHARS,
-    Alias,
-    AliasEvidence,
-    AliasType,
-    EvidenceType,
-    IdentityAccount,
-    normalize,
-)
-from ..domain.memory import Fact, MemoryType
-from ..repositories import (
-    EventRepository,
-    IdentityRepository,
-    MemoryRepository,
-)
-from ..util import now_local
-from .context_builder import NOTE, render_fact, render_hint
-from .identity_resolver import IdentityResolver, UnknownAccount
-from .memory_extractor import GROUP_TOPIC
+from qqbot.domain.ids import GroupId
+from qqbot.domain.identity import ALIAS_MAX_CHARS
+from qqbot.domain.identity import Alias
+from qqbot.domain.identity import AliasEvidence
+from qqbot.domain.identity import AliasType
+from qqbot.domain.identity import EvidenceType
+from qqbot.domain.identity import IdentityAccount
+from qqbot.domain.identity import normalize
+from qqbot.domain.memory import Fact
+from qqbot.domain.memory import MemoryType
+from qqbot.repositories.roster import RosterRepository
+from qqbot.repositories import EventRepository
+from qqbot.repositories import IdentityRepository
+from qqbot.repositories import MemoryRepository
+from qqbot.services.context_builder import NOTE
+from qqbot.configuration import PredicateTable
+from qqbot.services.context_builder import render_fact
+from qqbot.services.context_builder import render_hint
+from qqbot.services.roster_cache import RosterCache
+from qqbot.services.identity_resolver import IdentityResolver
+from qqbot.services.identity_resolver import UnknownAccount
+from qqbot.services.memory_extractor import GROUP_TOPIC
 
 log = logging.getLogger("qqbot.directory")
 
@@ -122,6 +126,7 @@ class FactCard:
     #: "how much evidence" in one unit.
     confidence: float
     account_id: uuid.UUID | None = None
+    rendered: str = ""
 
     @property
     def manual(self) -> bool:
@@ -129,7 +134,7 @@ class FactCard:
 
     @property
     def text(self) -> str:
-        return render_fact(self.predicate, self.object, self.object_key)
+        return self.rendered
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +152,7 @@ class PersonCard:
     #: Unconfirmed names remain visible as scored context, not as identity keys.
     candidates: tuple[NameCard, ...] = ()
     facts: tuple[FactCard, ...] = ()
+    first_seen: datetime | None = None
 
     @property
     def merged(self) -> bool:
@@ -195,10 +201,10 @@ class PersonCard:
         """Current learned facts and candidate names share one scored context view."""
 
         return tuple(
-            render_hint("事实", fact.text, fact.confidence)
-            for fact in self.learned if fact.text
+            render_hint("事实", fact.text, fact.confidence) for fact in self.learned if fact.text
         ) + tuple(
-            name.hint for name in self.candidates
+            name.hint
+            for name in self.candidates
             if not (self.live_display and name.text == self.display)
         )
 
@@ -240,7 +246,12 @@ class Directory:
         ids: IdentityRepository,
         memory: MemoryRepository,
         events: EventRepository,
+        roster: RosterRepository,
+        predicates: PredicateTable,
+        *,
+        clock: Clock,
     ) -> None:
+        self._clock = clock
         """Every collaborator is required.
 
         No optional collaborators backed by runtime None-checks: a check that fires at
@@ -251,6 +262,15 @@ class Directory:
         self._ids = ids
         self._memory = memory
         self._events = events
+        self._predicates = predicates
+        self._roster = roster
+        self.roster_cache = RosterCache()
+
+    async def close(self) -> None:
+        self.roster_cache.close()
+
+    async def roster_revision(self, group_id: GroupId) -> tuple:
+        return await self._roster.revision(group_id)
 
     # -- reads ------------------------------------------------------------
     async def roster(
@@ -271,24 +291,20 @@ class Directory:
         one, only confirmed platform names may label the reply roster; an unconfirmed
         stored display name stays a scored hint instead of becoming a trusted heading.
         """
-        counts = await self._events.speaker_counts(group_id)
-        for uid in exclude or ():
-            counts.pop(uid, None)
-        if not counts:
-            return []
-
-        by_entity: dict[uuid.UUID, list[str]] = {}
-        for uid in counts:
-            acc = await self._ids.account_of("qq", uid)
-            if acc is None:
-                continue
-            # An account's entity is always the live one (merge repoints every
-            # account), so two merged accounts land on one card without a chase.
-            by_entity.setdefault(acc.entity_id, []).append(uid)
-
+        reading = await self._roster.read(group_id, exclude=exclude or set())
         cards = [
-            await self._card(group_id, eid, uids, counts, display or {})
-            for eid, uids in by_entity.items()
+            replace(
+                self._holder_card(
+                    entity_id=holder.entity_id,
+                    accounts=[speaker.user_id for speaker in holder.speakers],
+                    counts={speaker.user_id: speaker.messages for speaker in holder.speakers},
+                    display=display or {},
+                    aliases=holder.aliases,
+                    facts=holder.facts,
+                ),
+                first_seen=min(speaker.first_seen for speaker in holder.speakers),
+            )
+            for holder in reading
         ]
         cards.sort(key=lambda c: (-c.messages, c.user_id))
         return cards
@@ -353,6 +369,25 @@ class Directory:
     ) -> PersonCard:
         aliases = await self._ids.aliases_for(group_id, entity_id)
         facts = await self._memory.current_facts(group_id, [entity_id])
+        return self._holder_card(
+            entity_id=entity_id,
+            accounts=accounts,
+            counts=counts,
+            display=display,
+            aliases=aliases,
+            facts=facts,
+        )
+
+    def _holder_card(
+        self,
+        *,
+        entity_id: uuid.UUID,
+        accounts,
+        counts,
+        display,
+        aliases,
+        facts,
+    ) -> PersonCard:
         primary = max(accounts, key=lambda user: (counts.get(user, 0), user))
         shown = (display.get(primary) or "").strip() or next(
             (display[user] for user in accounts if (display.get(user) or "").strip()),
@@ -373,8 +408,8 @@ class Directory:
             facts=facts,
         )
 
-    @staticmethod
     def _make_card(
+        self,
         *,
         entity_id: uuid.UUID,
         account_id: uuid.UUID | None,
@@ -422,6 +457,12 @@ class Directory:
                     object="" if fact.object_value is None else str(fact.object_value),
                     confidence=fact.confidence,
                     account_id=fact.subject_account_id,
+                    rendered=render_fact(
+                        fact.predicate,
+                        fact.object_value,
+                        fact.object_key,
+                        predicates=self._predicates,
+                    ),
                 )
                 for index, fact in enumerate(ordered, start=1)
             ),
@@ -445,6 +486,9 @@ class Directory:
                 object_key=f.object_key,
                 object="" if f.object_value is None else str(f.object_value),
                 confidence=f.confidence,
+                rendered=render_fact(
+                    f.predicate, f.object_value, f.object_key, predicates=self._predicates
+                ),
             )
             for i, f in enumerate(ordered, start=1)
         )
@@ -494,7 +538,7 @@ class Directory:
                 confidence=MANUAL_CONFIDENCE,
             ),
             [],
-            when=now_local(),
+            when=self._clock.now(),
         )
 
     async def name(

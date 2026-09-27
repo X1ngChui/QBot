@@ -17,6 +17,7 @@ class PromptKey(StrEnum):
     REPLY_SYSTEM = "reply_system"
     REPLY_DEVELOPER = "reply_developer"
     REPLY_USER = "reply_user"
+    SCHEDULED_USER = "scheduled_user"
     EXTRACT_SYSTEM = "extract_system"
     EXTRACT_USER = "extract_user"
     VISION_SYSTEM = "vision_system"
@@ -25,7 +26,11 @@ class PromptKey(StrEnum):
     TOOL_RECALL_EVENTS = "tool_recall_events"
     TOOL_READ_URL = "tool_read_url"
     TOOL_OPEN_IMAGES = "tool_open_images"
-    TOOL_SEND_MESSAGES = "tool_send_messages"
+    TOOL_SEND_MESSAGE = "tool_send_message"
+    TOOL_FINISH_REPLY = "tool_finish_reply"
+    TOOL_SCHEDULE_TASK = "tool_schedule_task"
+    TOOL_LIST_SCHEDULED_TASKS = "tool_list_scheduled_tasks"
+    TOOL_CANCEL_SCHEDULED_TASK = "tool_cancel_scheduled_task"
 
 
 class PromptRole(StrEnum):
@@ -103,6 +108,11 @@ _SPECS = (
         (_slot("now"), _slot("current_message")),
     ),
     TemplateSpec(
+        PromptKey.SCHEDULED_USER,
+        PromptRole.USER,
+        (_slot("now"), _slot("intent"), _slot("initiator")),
+    ),
+    TemplateSpec(
         PromptKey.EXTRACT_SYSTEM,
         PromptRole.SYSTEM,
         (
@@ -146,10 +156,14 @@ _SPECS = (
         PromptRole.TOOL,
     ),
     TemplateSpec(
-        PromptKey.TOOL_SEND_MESSAGES,
+        PromptKey.TOOL_SEND_MESSAGE,
         PromptRole.TOOL,
         (_slot("face_catalog"), _slot("message_limit")),
     ),
+    TemplateSpec(PromptKey.TOOL_FINISH_REPLY, PromptRole.TOOL),
+    TemplateSpec(PromptKey.TOOL_SCHEDULE_TASK, PromptRole.TOOL),
+    TemplateSpec(PromptKey.TOOL_LIST_SCHEDULED_TASKS, PromptRole.TOOL),
+    TemplateSpec(PromptKey.TOOL_CANCEL_SCHEDULED_TASK, PromptRole.TOOL),
 )
 
 PROMPT_SPECS: Mapping[PromptKey, TemplateSpec] = MappingProxyType(

@@ -19,15 +19,13 @@ from datetime import datetime
 
 import asyncpg
 
-from ..domain.ids import GroupId
-from ..domain.identity import (
-    Alias,
-    AliasEvidence,
-    AliasType,
-    EvidenceType,
-    IdentityAccount,
-)
-from ..repositories import IdentityRepository
+from qqbot.domain.ids import GroupId
+from qqbot.domain.identity import Alias
+from qqbot.domain.identity import AliasEvidence
+from qqbot.domain.identity import AliasType
+from qqbot.domain.identity import EvidenceType
+from qqbot.domain.identity import IdentityAccount
+from qqbot.repositories import IdentityRepository
 
 log = logging.getLogger("qqbot.identity")
 

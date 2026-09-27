@@ -8,16 +8,18 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from ..archive import ArchivedMessage
-from ..ids import GroupId
+from qqbot.domain.archive import ArchivedMessage
+from qqbot.domain.ids import GroupId
 
 SNAPSHOT_VERSION = 2
+MAX_MODEL_ATTEMPTS = 6
 
 
 class ExtractionStatus(StrEnum):
     EXTRACTING = "extracting"
     STAGED = "staged"
     APPLIED = "applied"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,10 +85,7 @@ class SnapshotLine:
             event_type=str(payload.get("event_type", "message")),
             own=bool(payload.get("own", False)),
             author_account_id=uuid.UUID(str(author)) if author else None,
-            targets=tuple(
-                SnapshotTarget.from_payload(item)
-                for item in payload.get("targets", [])
-            ),
+            targets=tuple(SnapshotTarget.from_payload(item) for item in payload.get("targets", [])),
         )
 
 
@@ -120,18 +119,14 @@ class ExtractionSnapshot:
         version = int(payload.get("version", 0))
         if version != SNAPSHOT_VERSION:
             raise ValueError(
-                f"unsupported extraction snapshot version {version}; "
-                f"expected {SNAPSHOT_VERSION}"
+                f"unsupported extraction snapshot version {version}; expected {SNAPSHOT_VERSION}"
             )
         return cls(
             account_codes=tuple(
                 (int(item["code"]), uuid.UUID(str(item["account_id"])))
                 for item in payload.get("account_codes", [])
             ),
-            lines=tuple(
-                SnapshotLine.from_payload(item)
-                for item in payload.get("lines", [])
-            ),
+            lines=tuple(SnapshotLine.from_payload(item) for item in payload.get("lines", [])),
         )
 
 

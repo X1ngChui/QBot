@@ -11,12 +11,12 @@ sys.path.insert(0, str(ROOT))
 os.environ.setdefault("CONFIG_DIR", str(ROOT / "config"))
 
 from qqbot.prompting.lint import lint_catalog
-from qqbot.settings import load_bundle
+from qqbot.configuration import load_bundle
 
 
 def main() -> int:
     bundle = load_bundle(ROOT / "config")
-    errors = lint_catalog(bundle.prompts, bundle.default)
+    errors = lint_catalog(bundle.prompts, bundle.default, bundle.predicates)
     if errors:
         for error in errors:
             print(f"ERROR: {error}")

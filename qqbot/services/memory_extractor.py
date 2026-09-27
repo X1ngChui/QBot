@@ -20,44 +20,40 @@ import logging
 import uuid
 from dataclasses import dataclass
 
-from ..domain.ids import GroupId
-from ..domain.identity import AliasType
-from ..domain.memory import Candidate, CandidateType, SnapshotTarget
-from ..prompting import PromptKey
-from ..providers.base import TextModel
-from ..providers.contracts import (
-    CallContext,
-    CallPurpose,
-    GenerationPolicy,
-    Message,
-    ModelRequest,
-    ReasoningEffort,
-    Role,
-    ToolCall,
-    ToolSpec,
-)
-from ..settings import Settings, config, prompt_catalog
-from ..util import SYS_R
+from qqbot.domain.ids import GroupId
+from qqbot.domain.identity import AliasType
+from qqbot.domain.memory import Candidate
+from qqbot.domain.memory import CandidateType
+from qqbot.domain.memory import SnapshotTarget
+from qqbot.prompting import PromptKey
+from qqbot.providers.base import TextModel
+from qqbot.providers.contracts import CallContext
+from qqbot.providers.contracts import CallPurpose
+from qqbot.providers.contracts import GenerationPolicy
+from qqbot.providers.contracts import Message
+from qqbot.providers.contracts import ModelRequest
+from qqbot.providers.contracts import ReasoningEffort
+from qqbot.providers.contracts import Role
+from qqbot.providers.contracts import ToolCall
+from qqbot.providers.contracts import ToolSpec
+from qqbot.configuration import PredicateTable
+from qqbot.configuration import ConfigBundle
+from qqbot.util import SYS_R
 
 log = logging.getLogger("qqbot.extract")
 
 
-def _table() -> dict:
-    """The predicate table from the immutable startup configuration."""
-    return config().predicates.person
-
-
-def predicate_names() -> tuple[str, ...]:
+def predicate_names(predicates: PredicateTable) -> tuple[str, ...]:
     """The closed set the tool schema offers.
 
     Closed because an open string would let one fact be written as likes / like /
     liked on three rows nothing could reconcile. Adding one is an edit to
     predicates.yaml - a deliberate decision, and not one the model can take.
     """
-    return tuple(_table())
+    return tuple(predicates.person)
 
 
-def multi_valued() -> tuple[str, ...]:
+def multi_valued(predicates: PredicateTable) -> tuple[str, ...]:
     """Predicates a person can hold many of at once. Each object is stored as its own
     row - the object doubles as the row's object_key - so a second thing somebody
     likes sits beside the first, and each ages on its own evidence.
@@ -65,17 +61,17 @@ def multi_valued() -> tuple[str, ...]:
     Everything else is single-valued: a new answer overturns the old one, which is
     what makes "he moved" expressible - the previous city gets a valid_to rather than
     sitting alongside the new one."""
-    return tuple(n for n, p in _table().items() if p.cardinality == "multi")
+    return tuple(n for n, p in predicates.person.items() if p.cardinality == "multi")
 
 
-def opposites() -> dict[str, str]:
+def opposites(predicates: PredicateTable) -> dict[str, str]:
     """Recording one retracts the other about the same object: somebody who says they
     have gone off something is not simultaneously a person who likes it. Without this
     the two sit side by side and both reach the prompt."""
-    return {n: p.opposite for n, p in _table().items() if p.opposite}
+    return {n: p.opposite for n, p in predicates.person.items() if p.opposite}
 
 
-def rules_block() -> str:
+def rules_block(predicates: PredicateTable) -> str:
     """The predicate table as the extraction model reads it.
 
     Rendered from the same entries the schema is built from, so a predicate the model
@@ -83,7 +79,7 @@ def rules_block() -> str:
     what keeps it inside the prefix cache.
     """
     lines = []
-    for n, p in _table().items():
+    for n, p in (predicates.person).items():
         # A verb that is nothing but the object slot means the object is the whole
         # phrase, so there is no reading to show alongside the name.
         slot = "{{object}}"
@@ -124,7 +120,7 @@ GROUP_TOPIC = "topic"
 GROUP_TERM = "term"
 
 
-def decay_classes() -> tuple[tuple[str, ...], tuple[str, ...]]:
+def decay_classes(predicates: PredicateTable) -> tuple[tuple[str, ...], tuple[str, ...]]:
     """(stable, fast) predicate names. Everything else takes the middle clock.
 
     The class, not the repetition count, is the primary axis of forgetting: where
@@ -133,12 +129,12 @@ def decay_classes() -> tuple[tuple[str, ...], tuple[str, ...]]:
     rides with the stable ones - what a group is for outlasts what anybody in it is
     playing.
     """
-    table = _table()
+    table = predicates.person
     stable = tuple(n for n, p in table.items() if p.decay == "stable") + (GROUP_TOPIC,)
     return stable, tuple(n for n, p in table.items() if p.decay == "fast")
 
 
-def tools() -> tuple[ToolSpec, ...]:
+def tools(predicates: PredicateTable) -> tuple[ToolSpec, ...]:
     """The tool definitions, built fresh so an edited predicate table applies.
 
     The predicate enum comes from the same entries the prompt block is rendered
@@ -189,7 +185,7 @@ def tools() -> tuple[ToolSpec, ...]:
                         "type": "integer",
                         "description": "主语账号的编号，取自「本群账号」列表",
                     },
-                    "predicate": {"type": "string", "enum": list(predicate_names())},
+                    "predicate": {"type": "string", "enum": list(predicate_names(predicates))},
                     "object": {
                         "type": "string",
                         "description": "宾语，只写值本身。举例：lives_in 写「杭州」，"
@@ -370,20 +366,21 @@ class ExtractionInput:
 
 
 class MemoryExtractor:
-    def __init__(self, cfg: Settings, text: TextModel) -> None:
+    def __init__(self, bundle: ConfigBundle, text: TextModel) -> None:
         """Freeze the complete extraction template family for this worker."""
 
         self._text = text
 
-        self._prompts = prompt_catalog()
+        self._predicates = bundle.predicates
+        self._prompts = bundle.prompts
         self._prompt = self._prompts.render(
             PromptKey.EXTRACT_SYSTEM,
-            predicate_table=rules_block(),
+            predicate_table=rules_block(self._predicates),
         )
         # Extraction's own model, grade and timeout on the reply backend's wiring:
         # same endpoint, same key, its own price tier and its own patience. The
         # resolved policy is fixed for this worker's lifetime.
-        self._text_cfg = cfg.capabilities.text.for_extract()
+        self._text_cfg = bundle.default.backends.text.for_extract()
 
     @property
     def prompt(self) -> str:
@@ -408,7 +405,7 @@ class MemoryExtractor:
                     ),
                 ),
             ),
-            tools=tools(),
+            tools=tools(self._predicates),
             policy=GenerationPolicy(
                 model=self._text_cfg.model,
                 reasoning=ReasoningEffort(self._text_cfg.reasoning_effort),

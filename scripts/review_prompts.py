@@ -7,6 +7,7 @@ review cannot miss a role, dynamic input, schema, slot contract or example that 
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
 import json
 import os
 import pathlib
@@ -15,19 +16,18 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
-os.environ.setdefault("CONFIG_DIR", str(ROOT / "config"))
 
 from _db import assert_disposable_database, configure_test_database
 
-configure_test_database()
 
-from _env import load_dotenv
+from scripts._env import load_dotenv
 
-load_dotenv(ROOT / ".env")
 
-from qqbot.db import close_pool, init_pool
+from qqbot.db import Database, dsn
 from qqbot.prompting.packet import build_prompt_packet
 from qqbot.providers.registry import build as build_providers
+from qqbot.services.budget import Budget
+from qqbot.repositories.ledger import LedgerRepository
 from qqbot.providers.contracts import (
     CallContext,
     CallPurpose,
@@ -38,7 +38,8 @@ from qqbot.providers.contracts import (
     Role,
     ToolSpec,
 )
-from qqbot.settings import config
+from qqbot.clock import Clock
+from qqbot.configuration import load_bundle
 
 REVIEW_MODEL = "deepseek-v4-pro"
 REVIEW_TOOL = "report_prompt_review"
@@ -123,29 +124,38 @@ def _validate_report(value) -> dict:
 
 
 async def main() -> int:
-    await init_pool()
-    await assert_disposable_database()
-    bundle = config()
+    bundle = load_bundle()
     cfg = bundle.default
-    text_cfg = cfg.capabilities.text
-    if text_cfg.provider != "deepseek":
-        raise RuntimeError(f"prompt review requires DeepSeek, got {text_cfg.provider!r}")
-    capabilities = build_providers(cfg)
-    request = ModelRequest(
-        prompt=(
-            Message(Role.SYSTEM, REVIEW_REQUEST),
-            Message(Role.USER, build_prompt_packet(bundle.prompts, cfg)),
-        ),
-        tools=(review_tool(),),
-        policy=GenerationPolicy(
-            model=REVIEW_MODEL,
-            reasoning=ReasoningEffort.LOW,
-            timeout_sec=max(text_cfg.timeout_sec, 600.0),
-            retries=text_cfg.retries,
-        ),
-        context=CallContext(CallPurpose.PREFLIGHT),
-    )
-    try:
+    clock = Clock(cfg.bot.timezone)
+    async with AsyncExitStack() as resources:
+        database = Database(cfg.runtime.database, url=dsn())
+        resources.push_async_callback(database.close)
+        await database.start()
+        await assert_disposable_database(database.pool)
+        text_cfg = cfg.backends.text
+        if text_cfg.provider != "deepseek":
+            raise RuntimeError(f"prompt review requires DeepSeek, got {text_cfg.provider!r}")
+        budget = Budget(
+            LedgerRepository(database.pool, today=clock.today),
+            daily_cap=cfg.budget.daily_cny_cap,
+            today=clock.today,
+        )
+        capabilities = build_providers(cfg, budget)
+        resources.push_async_callback(capabilities.aclose)
+        request = ModelRequest(
+            prompt=(
+                Message(Role.SYSTEM, REVIEW_REQUEST),
+                Message(Role.USER, build_prompt_packet(bundle.prompts, cfg, bundle.predicates)),
+            ),
+            tools=(review_tool(),),
+            policy=GenerationPolicy(
+                model=REVIEW_MODEL,
+                reasoning=ReasoningEffort.LOW,
+                timeout_sec=max(text_cfg.timeout_sec, 600.0),
+                retries=text_cfg.retries,
+            ),
+            context=CallContext(CallPurpose.PREFLIGHT),
+        )
         async with capabilities.text.open_session(request) as session:
             turn = await session.start()
         if len(turn.tool_calls) != 1 or turn.tool_calls[0].name != REVIEW_TOOL:
@@ -157,10 +167,10 @@ async def main() -> int:
         report = _validate_report(report)
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
-    finally:
-        await capabilities.aclose()
-        await close_pool()
 
 
 if __name__ == "__main__":
+    os.environ.setdefault("CONFIG_DIR", str(ROOT / "config"))
+    load_dotenv(ROOT / ".env")
+    configure_test_database()
     raise SystemExit(asyncio.run(main()))

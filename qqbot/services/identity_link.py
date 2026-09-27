@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from qqbot.clock import Clock
+
 import hashlib
 import secrets
 import string
@@ -10,16 +12,13 @@ from datetime import timedelta
 
 import asyncpg
 
-from ..domain.ids import GroupId
-from ..repositories.identity import IdentityRepository
-from ..repositories.identity_link import (
-    IdentityLinkRepository,
-    LinkChallenge,
-    LinkChallengeError,
-)
-from ..settings import IdentityLinkCfg
-from ..util import now_local
-from .identity_resolver import IdentityResolver
+from qqbot.domain.ids import GroupId
+from qqbot.repositories.identity import IdentityRepository
+from qqbot.repositories.identity_link import IdentityLinkRepository
+from qqbot.repositories.identity_link import LinkChallenge
+from qqbot.repositories.identity_link import LinkChallengeError
+from qqbot.services.identity_limits import ChallengeLimits
+from qqbot.services.identity_resolver import IdentityResolver
 
 TOKEN_RETRIES = 5
 
@@ -27,12 +26,15 @@ TOKEN_RETRIES = 5
 class IdentityLinkService:
     def __init__(
         self,
-        cfg: IdentityLinkCfg,
+        policy: ChallengeLimits,
         resolver: IdentityResolver,
         identities: IdentityRepository,
         challenges: IdentityLinkRepository,
+        *,
+        clock: Clock,
     ) -> None:
-        self._cfg = cfg
+        self._clock = clock
+        self._policy = policy
         self._resolver = resolver
         self._identities = identities
         self._challenges = challenges
@@ -43,7 +45,7 @@ class IdentityLinkService:
 
     def _token_hash(self, code: str) -> str:
         if (
-            len(code) != self._cfg.challenge_code_length
+            len(code) != self._policy.challenge_code_length
             or not code.isascii()
             or not code.isdecimal()
         ):
@@ -52,7 +54,7 @@ class IdentityLinkService:
 
     def _code(self) -> str:
         return "".join(
-            secrets.choice(string.digits) for _ in range(self._cfg.challenge_code_length)
+            secrets.choice(string.digits) for _ in range(self._policy.challenge_code_length)
         )
 
     async def issue(
@@ -69,7 +71,7 @@ class IdentityLinkService:
             raise LinkChallengeError("不能把账号与自身关联。")
         if initiator.entity_id == target.entity_id:
             raise LinkChallengeError("这两个账号已经关联。")
-        expires_at = now_local() + timedelta(seconds=self._cfg.challenge_ttl_sec)
+        expires_at = self._clock.now() + timedelta(seconds=self._policy.challenge_ttl_sec)
         for _ in range(TOKEN_RETRIES):
             code = self._code()
             try:
@@ -80,8 +82,8 @@ class IdentityLinkService:
                     target=target,
                     created_event_id=created_event_id,
                     expires_at=expires_at,
-                    max_pending=self._cfg.max_pending_challenges,
-                    max_pending_per_account=self._cfg.max_pending_per_account,
+                    max_pending=self._policy.max_pending_challenges,
+                    max_pending_per_account=self._policy.max_pending_per_account,
                 )
             except asyncpg.UniqueViolationError:
                 continue

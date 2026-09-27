@@ -9,9 +9,10 @@ a phrase.
 
 from __future__ import annotations
 
-from ..settings import config
-from ..util import defang
-from .memory_extractor import GROUP_TERM, GROUP_TOPIC
+from qqbot.configuration import PredicateTable
+from qqbot.util import defang
+from qqbot.services.memory_extractor import GROUP_TERM
+from qqbot.services.memory_extractor import GROUP_TOPIC
 
 #: The predicate a hand-written note is filed under. It renders as itself, with no verb
 #: in front: an authorized user who types a note already wrote the complete sentence.
@@ -24,7 +25,7 @@ def render_hint(kind: str, text: str, confidence: float) -> str:
     return f"{kind}：{defang(text)}（置信度 {confidence:.2f}）"
 
 
-def verb_of(predicate: str) -> str:
+def verb_of(predicate: str, *, predicates: PredicateTable) -> str:
     """How this predicate reads in Chinese, or "" if it is not a configured one.
 
     Prompt-facing text, so it is written the way the group talks rather than the way
@@ -33,11 +34,13 @@ def verb_of(predicate: str) -> str:
     removed leaves rows behind, and the bare English name is not something to put in
     front of the model.
     """
-    entry = config().predicates.person.get(predicate)
+    entry = predicates.person.get(predicate)
     return entry.verb if entry else ""
 
 
-def render_fact(predicate: str, object_value, object_key: str | None = None) -> str:
+def render_fact(
+    predicate: str, object_value, object_key: str | None = None, *, predicates: PredicateTable
+) -> str:
     """One fact as a phrase, or "" if there is nothing to show.
 
     Shared by the prompt and by the ops commands on purpose: /who must show an owner the
@@ -55,7 +58,7 @@ def render_fact(predicate: str, object_value, object_key: str | None = None) -> 
         return f"{object_key}：{obj}"
     if predicate == GROUP_TOPIC:
         return obj
-    entry = config().predicates.person.get(predicate)
+    entry = predicates.person.get(predicate)
     if entry is None:
         return ""
     return entry.render(obj)

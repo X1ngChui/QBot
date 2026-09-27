@@ -12,14 +12,17 @@ complex is the temporal and scope semantics, and those read more clearly as SQL 
 are far easier to follow in an EXPLAIN.
 """
 
-from .archive import ArchiveRepository
-from .event import EventRepository
-from .extraction import ExtractionRepository
-from .identity import IdentityRepository
-from .identity_link import IdentityLinkRepository, LinkChallenge, LinkChallengeError
-from .job import JobQueue
-from .memory import EpisodeRepository, MemoryRepository
-from .vector import VectorRepository
+from qqbot.repositories.archive import ArchiveRepository
+from qqbot.repositories.event import EventRepository
+from qqbot.repositories.extraction import ExtractionRepository
+from qqbot.repositories.identity import IdentityRepository
+from qqbot.repositories.identity_link import IdentityLinkRepository
+from qqbot.repositories.identity_link import LinkChallenge
+from qqbot.repositories.identity_link import LinkChallengeError
+from qqbot.repositories.job import JobQueue
+from qqbot.repositories.memory import EpisodeRepository
+from qqbot.repositories.memory import MemoryRepository
+from qqbot.repositories.vector import VectorRepository
 
 __all__ = [
     "ArchiveRepository",

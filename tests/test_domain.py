@@ -1,171 +1,131 @@
-"""The domain layer: no database, no model, pure logic.
-
-That this layer can be tested like this is one of the points of the architecture:
-every judgement here is checkable on its own, without running the whole chain.
-"""
-import pathlib
-import sys
-import uuid
-
-ROOT = pathlib.Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-
-from qqbot.domain.identity import (
-    Alias, AliasEvidence, AliasStatus, AliasType, Entity, EvidenceType,
-    IdentityAccount, normalize,
-)
-from qqbot.domain.memory import (
-    Candidate, CandidateType, Episode, EpisodeType, Fact, RejectReason,
-)
-
-fails = []
-
-
-def check(name, cond, detail=""):
-    print(f"[{'ok ' if cond else 'FAIL'}] {name}  {detail}")
-    if not cond:
-        fails.append(name)
-
-
-# ---- people and accounts --------------------------------------------------
-# Merging, superseding and group isolation are enforced by SQL in one transaction, and
-# they are checked there - see test_repositories.py. They were also restated as domain
-# methods, tested here, and never called: two versions of one rule where only one runs.
-wang = Entity(id=uuid.uuid4(), canonical_name="老王")
-check("一个新实体默认是人", wang.entity_type == "person" and wang.merged_into is None)
-
-acc = IdentityAccount(entity_id=wang.id, platform="qq", platform_user_id="123456")
-check("账号记的是平台和平台账号号", (acc.platform, acc.platform_user_id) == ("qq", "123456"))
-
-# ---- name normalization ---------------------------------------------------
-# Padding a group card with full-width and zero-width characters is a common enough
-# joke, and it is still the same person underneath.
-check("全角与半角归一", normalize("Ｓｋｙ") == normalize("sky"))
-check("空白不影响匹配", normalize("s k y") == "sky")
-check("零宽字符被去掉", normalize("Sk​y") == "sky")
-check("大小写不影响匹配", normalize("SKY") == normalize("sky"))
-
-# ---- evidence decides status ----------------------------------------------
-# When the model reports that everyone calls somebody by a name, that sentence
-# is a clue, not a conclusion.
-a = Alias(alias_text="老周", target_entity_id=wang.id, group_id=111,
-          alias_type=AliasType.NICKNAME)
-check("新称呼不能直接拿来指认", not a.is_usable and a.status is AliasStatus.CANDIDATE)
-
-only_llm = a.scored([AliasEvidence(EvidenceType.LLM_INFERENCE)])
-check("单凭模型推断升不上确认",
-      only_llm.status is AliasStatus.CANDIDATE and not only_llm.is_usable,
-      f"{only_llm.confidence:.2f}")
-
-with_at = a.scored([AliasEvidence(EvidenceType.LLM_INFERENCE),
-                    AliasEvidence(EvidenceType.EXPLICIT_AT)])
-check("一次显式 @ 足以确认",
-      with_at.status is AliasStatus.CONFIRMED and with_at.is_usable,
-      f"{with_at.confidence:.2f}")
-
-# Within one channel repetition buys nothing - ten sightings of the same kind are one
-# fact about that channel, so they can never sum their way to confirmation.
-many_weak = a.scored([AliasEvidence(EvidenceType.LLM_INFERENCE) for _ in range(10)])
-check("弱证据再多也不叠加成确认", many_weak.status is AliasStatus.CANDIDATE,
-      f"{many_weak.confidence:.2f}")
-check("同渠道重复十次等于一次",
-      abs(many_weak.confidence
-          - a.scored([AliasEvidence(EvidenceType.LLM_INFERENCE)]).confidence) < 1e-9)
-
-# Across channels, independent kinds of support genuinely reinforce: the old max threw
-# this away, and a name with a card AND an @ AND usage scored no higher than the @ alone.
-from qqbot.domain.identity import fused_confidence
-two = fused_confidence([AliasEvidence(EvidenceType.GROUP_CARD),
-                        AliasEvidence(EvidenceType.SELF_CLAIM)])
-check("跨渠道的独立证据互相加强", two > 0.80 - 1e-9,
-      f"{two:.3f} > max alone 0.80")
-# The joke guard: a first-day card (stability-scored 0.5) plus a joking self-claim must
-# still fall short of the line - both showed up in the same evening of rename games.
-joke = fused_confidence([AliasEvidence(EvidenceType.GROUP_CARD, score=0.5),
-                         AliasEvidence(EvidenceType.SELF_CLAIM)])
-check("首日名片加自认仍到不了确认线", joke < 0.75, f"{joke:.3f}")
-
-back = with_at.scored([AliasEvidence(EvidenceType.LLM_INFERENCE)])
-check("确认过的不因一条弱证据退回", back.status is AliasStatus.CONFIRMED)
-
-# ---- earned confidence for facts ------------------------------------------
-from qqbot.domain.memory import earned_confidence
-check("一次观察不是半数确信", 0.1 < earned_confidence(1) < 0.3,
-      f"{earned_confidence(1):.2f}")
-check("重复确认单调抬升", earned_confidence(1) < earned_confidence(3)
-      < earned_confidence(8) < earned_confidence(20))
-check("满口径但样本少，仍然保守",
-      earned_confidence(1) < earned_confidence(45, 5),
-      f"1/1 {earned_confidence(1):.2f} vs 45/50 {earned_confidence(45, 5):.2f}")
-check("矛盾把下界往下拽", earned_confidence(3, 1) < earned_confidence(3),
-      f"{earned_confidence(3, 1):.2f} < {earned_confidence(3):.2f}")
-check("无证据即为零", earned_confidence(0) == 0.0)
-
-check("群内称呼不是全局的", not a.is_global)
-check("只有不带群号的才是全局", Alias(alias_text="小X", target_entity_id=wang.id).is_global)
-
-# ---- facts ----------------------------------------------------------------
-# The one rule this class enforces rather than describes: a fact with no object is not a
-# fact, and saying so at construction is what stops it reaching a table.
-try:
-    Fact(subject_entity_id=wang.id, predicate="likes")
-    check("没有宾语的事实被拦下", False, "没有报错")
-except ValueError:
-    check("没有宾语的事实被拦下", True)
-
-# ---- candidates -----------------------------------------------------------
-cand = Candidate(candidate_type=CandidateType.ALIAS, payload={"alias": "老周"},
-                 group_id=1)
-check("候选默认待处理", cand.status == "pending")
-bad = cand.rejected(RejectReason.AMBIGUOUS_ALIAS)
-check("否掉时记下理由", bad.status == "rejected" and bad.reject_reason == "ambiguous_alias")
-check("否掉不改原对象", cand.status == "pending")
-
-# ---- episodes -------------------------------------------------------------
-ep = Episode(
-    group_id=111,
-    summary="讨论了买哪把键盘",
-    episode_type=EpisodeType.DISCUSSION,
-    extraction_id=uuid.uuid4(),
-    event_ids=(uuid.uuid4(),),
-)
-check("事件挂着原始消息作为凭据", len(ep.event_ids) == 1)
-check("事件记得来自哪个精确归纳批次", ep.extraction_id is not None)
+"""Pure domain rules without database or provider dependencies."""
 
 from datetime import UTC, datetime, timedelta
-from qqbot.domain.evidence import (
-    EvidenceItem,
-    EvidenceMemo,
-    EvidenceOutcome,
-    EvidenceSource,
+from uuid import uuid4
+
+import pytest
+
+from qqbot.domain.evidence import EvidenceItem, EvidenceMemo, EvidenceOutcome, EvidenceSource
+from qqbot.domain.identity import (
+    Alias,
+    AliasEvidence,
+    AliasStatus,
+    AliasType,
+    Entity,
+    EvidenceType,
+    IdentityAccount,
+    fused_confidence,
+    normalize,
+)
+from qqbot.domain.memory import (
+    Candidate,
+    CandidateType,
+    Episode,
+    EpisodeType,
+    Fact,
+    RejectReason,
+    earned_confidence,
 )
 
-_evidence_now = datetime.now(UTC)
-_evidence = EvidenceMemo(
-    items=(
-        EvidenceItem(
-            source=EvidenceSource.HISTORY,
-            request="虚构查询",
-            outcome=EvidenceOutcome.VERIFIED,
-            digest="虚构结果",
+
+def test_entity_and_account_defaults():
+    person = Entity(id=uuid4(), canonical_name="老王")
+    assert person.entity_type == "person"
+    assert person.merged_into is None
+    account = IdentityAccount(entity_id=person.id, platform="qq", platform_user_id="123456")
+    assert (account.platform, account.platform_user_id) == ("qq", "123456")
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [("Ｓｋｙ", "sky"), ("s k y", "sky"), ("Sk​y", "sky"), ("SKY", "sky")],
+)
+def test_normalize_name(name, expected):
+    assert normalize(name) == normalize(expected)
+
+
+def test_alias_evidence_status_and_independent_channels():
+    alias = Alias(
+        alias_text="老周", target_entity_id=uuid4(), group_id=111, alias_type=AliasType.NICKNAME
+    )
+    weak = AliasEvidence(EvidenceType.LLM_INFERENCE)
+    assert alias.status is AliasStatus.CANDIDATE
+    assert not alias.is_usable
+    only_llm = alias.scored([weak])
+    assert only_llm.status is AliasStatus.CANDIDATE
+    assert not only_llm.is_usable
+
+    with_at = alias.scored([weak, AliasEvidence(EvidenceType.EXPLICIT_AT)])
+    assert with_at.status is AliasStatus.CONFIRMED
+    assert with_at.is_usable
+    many_weak = alias.scored([weak] * 10)
+    assert many_weak.status is AliasStatus.CANDIDATE
+    assert many_weak.confidence == pytest.approx(only_llm.confidence)
+    assert with_at.scored([weak]).status is AliasStatus.CONFIRMED
+
+    two = fused_confidence(
+        [AliasEvidence(EvidenceType.GROUP_CARD), AliasEvidence(EvidenceType.SELF_CLAIM)]
+    )
+    assert two > 0.80 - 1e-9
+    joke = fused_confidence(
+        [AliasEvidence(EvidenceType.GROUP_CARD, score=0.5), AliasEvidence(EvidenceType.SELF_CLAIM)]
+    )
+    assert joke < 0.75
+    assert not alias.is_global
+    assert Alias(alias_text="小X", target_entity_id=alias.target_entity_id).is_global
+
+
+def test_fact_confidence_tracks_support_and_conflict():
+    assert 0.1 < earned_confidence(1) < 0.3
+    assert (
+        earned_confidence(1) < earned_confidence(3) < earned_confidence(8) < earned_confidence(20)
+    )
+    assert earned_confidence(1) < earned_confidence(45, 5)
+    assert earned_confidence(3, 1) < earned_confidence(3)
+    assert earned_confidence(0) == 0.0
+
+
+def test_fact_requires_object():
+    with pytest.raises(ValueError):
+        Fact(subject_entity_id=uuid4(), predicate="likes")
+
+
+def test_candidate_rejection_preserves_original():
+    candidate = Candidate(candidate_type=CandidateType.ALIAS, payload={"alias": "老周"}, group_id=1)
+    assert candidate.status == "pending"
+    rejected = candidate.rejected(RejectReason.AMBIGUOUS_ALIAS)
+    assert (rejected.status, rejected.reject_reason) == ("rejected", "ambiguous_alias")
+    assert candidate.status == "pending"
+
+
+def test_episode_retains_provenance():
+    extraction_id, event_id = uuid4(), uuid4()
+    episode = Episode(
+        group_id=111,
+        summary="讨论了买哪把键盘",
+        episode_type=EpisodeType.DISCUSSION,
+        extraction_id=extraction_id,
+        event_ids=(event_id,),
+    )
+    assert episode.event_ids == (event_id,)
+    assert episode.extraction_id == extraction_id
+
+
+def test_evidence_memo_roundtrip_and_projection():
+    now = datetime.now(UTC)
+    memo = EvidenceMemo(
+        items=(
+            EvidenceItem(
+                source=EvidenceSource.HISTORY,
+                request="虚构查询",
+                outcome=EvidenceOutcome.VERIFIED,
+                digest="虚构结果",
+            ),
         ),
-    ),
-    created_at=_evidence_now,
-    expires_at=_evidence_now + timedelta(days=30),
-)
-_evidence_roundtrip = EvidenceMemo.from_dict(_evidence.to_dict())
-check("evidence memo round-trips through versioned JSON", _evidence_roundtrip == _evidence)
-try:
-    EvidenceMemo(items=(), created_at=_evidence_now, expires_at=_evidence_now)
-    check("an invalid evidence memo cannot be constructed", False, "accepted")
-except ValueError:
-    check("an invalid evidence memo cannot be constructed", True)
-check(
-    "evidence has a stable prompt projection",
-    _evidence.render() == "⟦检索记录⟧\n查档“虚构查询”：虚构结果",
-    _evidence.render(),
-)
-
-print()
-print("FAILED:", fails if fails else "none")
-sys.exit(1 if fails else 0)
+        created_at=now,
+        expires_at=now + timedelta(days=30),
+    )
+    assert EvidenceMemo.from_dict(memo.to_dict()) == memo
+    assert memo.render() == "⟦检索记录⟧\n查档“虚构查询”：虚构结果"
+    with pytest.raises(ValueError):
+        EvidenceMemo(items=(), created_at=now, expires_at=now)

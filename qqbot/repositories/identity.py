@@ -2,32 +2,32 @@
 
 from __future__ import annotations
 
+from qqbot.clock import Clock
+from qqbot.domain.identity.reading import ExtractionIdentities
+
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime
 
 import asyncpg
 
-from ..db import pool
-from ..domain.ids import GroupId
-from ..util import now_local, tz, tz_sql
-from ..domain.identity import (
-    Alias,
-    AliasEvidence,
-    AliasStatus,
-    AliasType,
-    Entity,
-    EntityStatus,
-    EntityType,
-    EvidenceType,
-    IdentityAccount,
-    normalize,
-    platform_weight,
-    usage_weight,
-)
-from ..domain.identity.alias import CONFIRM_THRESHOLD
+from qqbot.repositories.job import Job, fenced_transaction
+from qqbot.domain.ids import GroupId
+from qqbot.domain.identity import Alias
+from qqbot.domain.identity import AliasEvidence
+from qqbot.domain.identity import AliasStatus
+from qqbot.domain.identity import AliasType
+from qqbot.domain.identity import Entity
+from qqbot.domain.identity import EntityStatus
+from qqbot.domain.identity import EntityType
+from qqbot.domain.identity import EvidenceType
+from qqbot.domain.identity import IdentityAccount
+from qqbot.domain.identity import normalize
+from qqbot.domain.identity import platform_weight
+from qqbot.domain.identity import usage_weight
+from qqbot.domain.identity.alias import CONFIRM_THRESHOLD
 
 
 #: Every entity id that resolves to a given one: itself, plus everything ever merged
@@ -73,6 +73,7 @@ def _alias(row) -> Alias:
 
 @asynccontextmanager
 async def _write_connection(
+    database: Callable[[], asyncpg.Pool],
     conn: asyncpg.Connection | None,
 ) -> AsyncIterator[asyncpg.Connection]:
     """Use a caller transaction or own one for an ordinary repository write."""
@@ -80,7 +81,7 @@ async def _write_connection(
     if conn is not None:
         yield conn
         return
-    async with pool().acquire() as owned, owned.transaction():
+    async with database().acquire() as owned, owned.transaction():
         yield owned
 
 
@@ -101,9 +102,127 @@ class IdentityRepository:
     through the `group_id IS NULL` in the SQL, so no caller has to know they exist.
     """
 
+    def __init__(self, *, database: Callable[[], asyncpg.Pool], clock: Clock) -> None:
+        self._clock = clock
+        self._database = database
+
     # -- people and accounts ----------------------------------------------
+    async def accounts_by_users(
+        self, platform: str, user_ids: list[str], *, _conn: asyncpg.Connection | None = None
+    ) -> list[IdentityAccount]:
+        if not user_ids:
+            return []
+        rows = await (_conn or self._database()).fetch(
+            """SELECT id, entity_id, platform, platform_user_id, first_seen_at, last_seen_at
+                 FROM identity_account WHERE platform=$1 AND platform_user_id=ANY($2::text[])""",
+            platform,
+            user_ids,
+        )
+        return [IdentityAccount(**dict(row)) for row in rows]
+
+    async def accounts_by_ids(
+        self, account_ids: list[uuid.UUID], *, _conn: asyncpg.Connection | None = None
+    ) -> list[IdentityAccount]:
+        if not account_ids:
+            return []
+        rows = await (_conn or self._database()).fetch(
+            """SELECT id, entity_id, platform, platform_user_id, first_seen_at, last_seen_at
+                 FROM identity_account WHERE id=ANY($1::uuid[])""",
+            account_ids,
+        )
+        return [IdentityAccount(**dict(row)) for row in rows]
+
+    async def accounts_of_many(
+        self, entity_ids: list[uuid.UUID], *, _conn: asyncpg.Connection | None = None
+    ) -> list[IdentityAccount]:
+        if not entity_ids:
+            return []
+        rows = await (_conn or self._database()).fetch(
+            """SELECT id, entity_id, platform, platform_user_id, first_seen_at, last_seen_at
+                 FROM identity_account WHERE entity_id=ANY($1::uuid[])""",
+            entity_ids,
+        )
+        return [IdentityAccount(**dict(row)) for row in rows]
+
+    async def aliases_for_many(
+        self,
+        group_id: GroupId,
+        entity_ids: list[uuid.UUID],
+        *,
+        _conn: asyncpg.Connection | None = None,
+    ) -> dict[uuid.UUID, list[Alias]]:
+        if not entity_ids:
+            return {}
+        rows = await (_conn or self._database()).fetch(
+            """WITH RECURSIVE family AS (
+                   SELECT id, id AS root FROM entity WHERE id=ANY($2::uuid[])
+                   UNION ALL
+                   SELECT e.id, f.root FROM entity e JOIN family f ON e.merged_into=f.id
+               ), selected AS (
+                   SELECT a.*, f.root FROM alias a JOIN family f ON a.target_entity_id=f.id
+                   UNION
+                   SELECT a.*, ia.entity_id AS root FROM alias a
+                     JOIN identity_account ia ON a.target_account_id=ia.id
+                    WHERE ia.entity_id=ANY($2::uuid[])
+               )
+               SELECT * FROM selected WHERE (group_id=$1 OR group_id IS NULL)
+                 AND status<>'inactive' AND valid_to IS NULL
+               ORDER BY confidence DESC, alias_text, id""",
+            group_id.to_db(),
+            entity_ids,
+        )
+        result: dict[uuid.UUID, list[Alias]] = {}
+        for row in rows:
+            result.setdefault(row["root"], []).append(_alias(row))
+        return result
+
+    async def extraction_identities(
+        self, group_id: GroupId, user_ids: list[str]
+    ) -> ExtractionIdentities:
+        async with (
+            self._database().acquire() as conn,
+            conn.transaction(isolation="repeatable_read", readonly=True),
+        ):
+            accounts = await self.accounts_by_users("qq", user_ids, _conn=conn)
+            names = await self.account_names(group_id, _conn=conn)
+            account_ids = sorted({a.id for a in accounts} | {a.id for a, _ in names})
+            rows = await conn.fetch(
+                """SELECT * FROM alias WHERE target_account_id=ANY($2::uuid[])
+                     AND (group_id=$1 OR group_id IS NULL)
+                     AND status='confirmed' AND valid_to IS NULL
+                   ORDER BY confidence DESC, alias_text, id""",
+                group_id.to_db(),
+                account_ids,
+            )
+        return ExtractionIdentities(
+            tuple(accounts), tuple(names), tuple(_alias(row) for row in rows)
+        )
+
+    async def holder_ids_for_accounts(self, user_ids: list[str]) -> dict[str, uuid.UUID]:
+        """Return the current holder id for each known exact account."""
+        want = sorted({u for u in user_ids if u})
+        if not want:
+            return {}
+        rows = await self._database().fetch(
+            """SELECT platform_user_id, entity_id FROM identity_account
+                WHERE platform='qq' AND platform_user_id = ANY($1::text[])""",
+            want,
+        )
+        return {r["platform_user_id"]: r["entity_id"] for r in rows}
+
+    async def linked_account_ids(self, user_id: str) -> list[str]:
+        """Return every exact account currently linked to this one."""
+        rows = await self._database().fetch(
+            """SELECT b.platform_user_id FROM identity_account a
+                 JOIN identity_account b ON b.entity_id = a.entity_id AND b.platform = 'qq'
+                WHERE a.platform='qq' AND a.platform_user_id=$1""",
+            user_id,
+        )
+        found = [r["platform_user_id"] for r in rows]
+        return found if user_id in found else [*found, user_id]
+
     async def account_of(self, platform: str, user_id: str) -> IdentityAccount | None:
-        row = await pool().fetchrow(
+        row = await self._database().fetchrow(
             """SELECT id, entity_id, platform, platform_user_id, first_seen_at, last_seen_at
                  FROM identity_account WHERE platform=$1 AND platform_user_id=$2""",
             platform,
@@ -112,7 +231,7 @@ class IdentityRepository:
         return IdentityAccount(**dict(row)) if row else None
 
     async def account_by_id(self, account_id: uuid.UUID) -> IdentityAccount | None:
-        row = await pool().fetchrow(
+        row = await self._database().fetchrow(
             """SELECT id, entity_id, platform, platform_user_id,
                       first_seen_at, last_seen_at
                  FROM identity_account WHERE id=$1""",
@@ -120,10 +239,12 @@ class IdentityRepository:
         )
         return IdentityAccount(**dict(row)) if row else None
 
-    async def account_names(self, group_id: GroupId) -> list[tuple[IdentityAccount, str]]:
+    async def account_names(
+        self, group_id: GroupId, *, _conn: asyncpg.Connection | None = None
+    ) -> list[tuple[IdentityAccount, str]]:
         """Confirmed literal names that identify one exact account in this group."""
 
-        rows = await pool().fetch(
+        rows = await (_conn or self._database()).fetch(
             """SELECT ia.id, ia.entity_id, ia.platform, ia.platform_user_id,
                       ia.first_seen_at, ia.last_seen_at, a.alias_text
                  FROM alias a
@@ -194,7 +315,7 @@ class IdentityRepository:
         name: str | None = None,
         _conn: asyncpg.Connection | None = None,
     ) -> IdentityAccount:
-        async with _write_connection(_conn) as conn:
+        async with _write_connection(self._database, _conn) as conn:
             await conn.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
                 f"{platform}:{user_id}",
@@ -255,7 +376,7 @@ class IdentityRepository:
         It reuses identity_account rather than inventing a key, so the uniqueness that
         makes an account resolvable makes a group resolvable too.
         """
-        async with _write_connection(_conn) as conn:
+        async with _write_connection(self._database, _conn) as conn:
             # One creator per group at a time: two first calls racing here would
             # both insert an entity, and the loser's would stay behind as an orphan
             # no account references.
@@ -290,7 +411,7 @@ class IdentityRepository:
         records may still reference an old root; centralizing pointer traversal prevents
         one missed call site from splitting an equivalence class.
         """
-        row = await pool().fetchrow(
+        row = await self._database().fetchrow(
             """WITH RECURSIVE chase AS (
                    SELECT * FROM entity WHERE id = $1
                    UNION ALL
@@ -313,7 +434,7 @@ class IdentityRepository:
             if account is None:
                 raise LookupError(f"unknown identity account {left_account_id}")
             return account.entity_id, False
-        async with pool().acquire() as conn, conn.transaction():
+        async with self._database().acquire() as conn, conn.transaction():
             await lock_identity_topology(conn)
             rows = await conn.fetch(
                 """SELECT id, entity_id FROM identity_account
@@ -340,7 +461,7 @@ class IdentityRepository:
 
         if left == right:
             return left
-        async with _write_connection(_conn) as conn:
+        async with _write_connection(self._database, _conn) as conn:
             await lock_identity_topology(conn)
             rows = await conn.fetch(
                 """SELECT id, created_at, merged_into
@@ -383,7 +504,7 @@ class IdentityRepository:
     ) -> uuid.UUID:
         """Detach one exact account while every other linked account stays together."""
 
-        async with _write_connection(_conn) as conn:
+        async with _write_connection(self._database, _conn) as conn:
             await lock_identity_topology(conn)
             current = await conn.fetchrow(
                 """SELECT id, entity_id, platform, platform_user_id,
@@ -422,7 +543,7 @@ class IdentityRepository:
             return new_id
 
     async def accounts_of(self, entity_id: uuid.UUID) -> list[IdentityAccount]:
-        rows = await pool().fetch(
+        rows = await self._database().fetch(
             """SELECT id, entity_id, platform, platform_user_id, first_seen_at, last_seen_at
                  FROM identity_account WHERE entity_id=$1 ORDER BY first_seen_at""",
             entity_id,
@@ -433,7 +554,7 @@ class IdentityRepository:
     async def aliases_for_account(self, group_id: GroupId, account_id: uuid.UUID) -> list[Alias]:
         """Names attached to one exact account, strongest evidence first."""
 
-        rows = await pool().fetch(
+        rows = await self._database().fetch(
             """SELECT * FROM alias
                 WHERE target_account_id=$2
                   AND (group_id=$1 OR group_id IS NULL)
@@ -447,7 +568,7 @@ class IdentityRepository:
     async def aliases_for(self, group_id: GroupId, entity_id: uuid.UUID) -> list[Alias]:
         """Names shared by a holder or attached to any currently linked account."""
 
-        rows = await pool().fetch(
+        rows = await self._database().fetch(
             FAMILY.format(arg="$2")
             + """
                SELECT DISTINCT a.* FROM alias a
@@ -469,7 +590,7 @@ class IdentityRepository:
         caller's decision. Nothing here picks one: the cost of picking wrong - a record
         filed under the wrong person - is far higher than the cost of not answering.
         """
-        rows = await pool().fetch(
+        rows = await self._database().fetch(
             """SELECT * FROM alias
                 WHERE normalized_text=$2
                   AND (group_id=$1 OR group_id IS NULL)
@@ -492,7 +613,7 @@ class IdentityRepository:
         """Resolve either alias target shape to its current holder."""
 
         if alias.target_account_id is not None:
-            entity_id = await pool().fetchval(
+            entity_id = await self._database().fetchval(
                 "SELECT entity_id FROM identity_account WHERE id=$1",
                 alias.target_account_id,
             )
@@ -553,7 +674,7 @@ class IdentityRepository:
         *,
         _conn: asyncpg.Connection | None = None,
     ) -> Alias:
-        async with _write_connection(_conn) as conn:
+        async with _write_connection(self._database, _conn) as conn:
             row = await conn.fetchrow(
                 """SELECT * FROM alias
                     WHERE COALESCE(group_id, 0)=COALESCE($1::bigint, 0)
@@ -588,7 +709,10 @@ class IdentityRepository:
                     row["id"],
                     evidence[0].evidence_type.value,
                 )
-                if last is not None and last.astimezone(tz()).date() == now_local().date():
+                if (
+                    last is not None
+                    and last.astimezone(self._clock.zone).date() == self._clock.now().date()
+                ):
                     await conn.execute("UPDATE alias SET last_used_at=NOW() WHERE id=$1", row["id"])
                     return _alias(row)
 
@@ -744,8 +868,8 @@ class IdentityRepository:
                 )
             return out
 
-    @staticmethod
     async def _stability_scored(
+        self,
         conn,
         alias_id: uuid.UUID | None,
         evidence: list[AliasEvidence],
@@ -761,7 +885,7 @@ class IdentityRepository:
             return evidence
         days = 1
         if alias_id is not None:
-            zone = tz_sql()
+            zone = self._clock.timezone
             days = 1 + (
                 await conn.fetchval(
                     """SELECT count(DISTINCT (created_at AT TIME ZONE $3)::date)
@@ -791,7 +915,7 @@ class IdentityRepository:
     ) -> Alias | None:
         """Set matching aliases across one linked holder view."""
 
-        rows = await pool().fetch(
+        rows = await self._database().fetch(
             FAMILY.format(arg="$2")
             + """
                SELECT DISTINCT a.* FROM alias a
@@ -814,7 +938,7 @@ class IdentityRepository:
     ) -> Alias | None:
         """Set one exact account alias confidence."""
 
-        rows = await pool().fetch(
+        rows = await self._database().fetch(
             """SELECT * FROM alias
                 WHERE group_id=$1 AND target_account_id=$2 AND normalized_text=$3""",
             group_id.to_db(),
@@ -823,12 +947,11 @@ class IdentityRepository:
         )
         return await self._set_alias_confidence(rows, confidence)
 
-    @staticmethod
-    async def _set_alias_confidence(rows, confidence: float) -> Alias | None:
+    async def _set_alias_confidence(self, rows, confidence: float) -> Alias | None:
         if not rows:
             return None
         status = "confirmed" if confidence >= CONFIRM_THRESHOLD else "candidate"
-        async with pool().acquire() as conn, conn.transaction():
+        async with self._database().acquire() as conn, conn.transaction():
             out = None
             for source in rows:
                 row = await conn.fetchrow(
@@ -870,7 +993,7 @@ class IdentityRepository:
         re-reports the name on the very next message, and without the pin that rescore
         would walk the retirement straight back.
         """
-        async with pool().acquire() as conn, conn.transaction():
+        async with self._database().acquire() as conn, conn.transaction():
             await conn.execute(
                 """UPDATE alias SET status='inactive', valid_to=NOW(), updated_at=NOW()
                     WHERE id=$1""",
@@ -889,7 +1012,12 @@ class IdentityRepository:
             )
 
     async def decay_aliases(
-        self, group_id: GroupId, *, unused_days: float, joke_days: float | None = None
+        self,
+        group_id: GroupId,
+        *,
+        unused_days: float,
+        joke_days: float | None = None,
+        fence: Job | None = None,
     ) -> int:
         """Retire names that never became certain and stopped being used.
 
@@ -907,21 +1035,22 @@ class IdentityRepository:
         below the confirmation line on purpose, and that verdict does not lapse for want
         of use.
         """
-        rows = await pool().fetch(
-            """UPDATE alias
-                  SET status = 'inactive', valid_to = NOW(), updated_at = NOW()
-                WHERE group_id = $1 AND status = 'candidate'
-                  AND COALESCE(last_used_at, valid_from, created_at)
-                      < NOW() - (CASE WHEN alias_type = 'joke_name'
-                                      THEN COALESCE($3::float, $2::float)
-                                      ELSE $2::float END * INTERVAL '1 day')
-                  AND NOT EXISTS (SELECT 1 FROM alias_evidence
-                                   WHERE alias_id = alias.id
-                                     AND evidence_type = $4)
-             RETURNING id""",
-            group_id.to_db(),
-            unused_days,
-            joke_days,
-            EvidenceType.MANUAL.value,
-        )
-        return len(rows)
+        async with fenced_transaction(self._database, fence) as conn:
+            rows = await conn.fetch(
+                """UPDATE alias
+                      SET status = 'inactive', valid_to = NOW(), updated_at = NOW()
+                    WHERE group_id = $1 AND status = 'candidate'
+                      AND COALESCE(last_used_at, valid_from, created_at)
+                          < NOW() - (CASE WHEN alias_type = 'joke_name'
+                                          THEN COALESCE($3::float, $2::float)
+                                          ELSE $2::float END * INTERVAL '1 day')
+                      AND NOT EXISTS (SELECT 1 FROM alias_evidence
+                                       WHERE alias_id = alias.id
+                                         AND evidence_type = $4)
+                 RETURNING id""",
+                group_id.to_db(),
+                unused_days,
+                joke_days,
+                EvidenceType.MANUAL.value,
+            )
+            return len(rows)

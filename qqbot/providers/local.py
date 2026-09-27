@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
-from ..settings import TextCfg, VisionCfg
-from .base import Rate, RetryPolicy
-from .openai_responses import ResponsesCodec, ResponsesTextModel, ResponsesVisionModel
+from qqbot.services.budget import Budget
+from qqbot.configuration import TextCfg
+from qqbot.configuration import VisionCfg
+from qqbot.providers.base import Rate
+from qqbot.providers.base import RetryPolicy
+from qqbot.providers.openai_responses import ResponsesCodec
+from qqbot.providers.openai_responses import ResponsesTextModel
+from qqbot.providers.openai_responses import ResponsesVisionModel
 
 _FREE = Rate(
     "Mtoken",
@@ -22,23 +27,25 @@ class LocalResponsesCodec(ResponsesCodec):
         return {} if effort.value == "off" else super().request_extras(effort)
 
 
-def local_text(cfg: TextCfg, retry: RetryPolicy) -> ResponsesTextModel:
+def local_text(cfg: TextCfg, retry: RetryPolicy, budget: Budget) -> ResponsesTextModel:
     return ResponsesTextModel(
         cfg,
         retry,
         name="local",
         codec=LocalResponsesCodec(),
         rate_for=lambda _model: _FREE,
+        budget=budget,
         key_required=False,
     )
 
 
-def local_vision(cfg: VisionCfg, retry: RetryPolicy) -> ResponsesVisionModel:
+def local_vision(cfg: VisionCfg, retry: RetryPolicy, budget: Budget) -> ResponsesVisionModel:
     return ResponsesVisionModel(
         cfg,
         retry,
         name="local",
         codec=LocalResponsesCodec(),
         rate_for=lambda _model: _FREE,
+        budget=budget,
         key_required=False,
     )

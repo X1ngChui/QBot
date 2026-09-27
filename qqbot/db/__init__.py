@@ -1,3 +1,4 @@
-from .pool import close_pool, dsn, init_pool, pool
+from qqbot.db.connection import Database
+from qqbot.db.pool import dsn
 
-__all__ = ["init_pool", "close_pool", "pool", "dsn"]
+__all__ = ["Database", "dsn"]

@@ -12,6 +12,7 @@ models/
 # (deploy.sh packages workspace files, so untracked local configuration will
 # still be included in deployments as usual)
 config/settings.yaml
+config/*.migrating-*
 config/personas/*.yaml
 
 # Python
@@ -21,6 +22,7 @@ __pycache__/
 venv/
 *.egg-info/
 .pytest_cache/
+.hypothesis/
 .mypy_cache/
 
 # Local environment overrides

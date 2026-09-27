@@ -26,17 +26,15 @@ from email.utils import parsedate_to_datetime
 
 import httpx
 
-from ..domain.ids import GroupId
-from ..settings import WebSearchToolCfg
-from ..util import why
-from .contracts import (
-    AttachmentStore,
-    CallPurpose,
-    ModelRequest,
-    ModelTurn,
-    SessionDirective,
-    ToolResult,
-)
+from qqbot.domain.ids import GroupId
+from qqbot.providers.contracts import SearchOptions
+from qqbot.util import why
+from qqbot.providers.contracts import AttachmentStore
+from qqbot.providers.contracts import CallPurpose
+from qqbot.providers.contracts import ModelRequest
+from qqbot.providers.contracts import ModelTurn
+from qqbot.providers.contracts import SessionDirective
+from qqbot.providers.contracts import ToolResult
 
 log = logging.getLogger("qqbot.providers")
 
@@ -289,6 +287,16 @@ class EmbeddingModel(Capability):
     request may carry, and a caller that had to know would be knowing a vendor.
     """
 
+    @property
+    @abstractmethod
+    def dimensions(self) -> int:
+        """Width of every vector returned by this adapter."""
+
+    @property
+    @abstractmethod
+    def batch_size(self) -> int:
+        """Maximum inputs in one provider request and one background work unit."""
+
     @abstractmethod
     async def embed(self, texts, *, group_id: GroupId | None = None) -> list[list[float]]:
         """Vectors for these texts, in the order they were given."""
@@ -302,7 +310,7 @@ class SearchEngine(Capability):
         self,
         query: str,
         *,
-        options: WebSearchToolCfg,
+        options: SearchOptions,
         group_id: GroupId | None = None,
     ) -> list[dict]:
         """Return normalised {title, link, content} results."""

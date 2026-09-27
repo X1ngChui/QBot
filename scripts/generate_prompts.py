@@ -9,6 +9,7 @@ for mechanical validation errors; per-template patching is deliberately unsuppor
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
 import json
 import os
 import pathlib
@@ -20,21 +21,20 @@ import yaml
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
-os.environ.setdefault("CONFIG_DIR", str(ROOT / "config"))
 
 from _db import assert_disposable_database, configure_test_database
 
-configure_test_database()
 
-from _env import load_dotenv
+from scripts._env import load_dotenv
 
-load_dotenv(ROOT / ".env")
 
-from qqbot.db import close_pool, init_pool
+from qqbot.db import Database, dsn
 from qqbot.prompting import PROMPT_SPECS, PromptCatalog, TemplateValidationError
 from qqbot.prompting.lint import lint_catalog
 from qqbot.prompting.packet import build_prompt_packet
 from qqbot.providers.registry import build as build_providers
+from qqbot.services.budget import Budget
+from qqbot.repositories.ledger import LedgerRepository
 from qqbot.providers.contracts import (
     CallContext,
     CallPurpose,
@@ -47,7 +47,8 @@ from qqbot.providers.contracts import (
     ToolResult,
     ToolSpec,
 )
-from qqbot.settings import config
+from qqbot.clock import Clock
+from qqbot.configuration import load_bundle
 
 MODEL = "deepseek-v4-pro"
 WRITE_TOOL = "write_prompt_bundle"
@@ -63,15 +64,17 @@ own only the Chinese wording inside each declared template. Keep the tone profes
 accurate, calm and direct. Do not mention source files, implementation modules or databases in the
 runtime prompts. Examples must remain fictional. Do not expose mface, music, music_custom or
 json, invent tools or fields, add undeclared slots, copy protected markers into visible message
-text, or make display number 0 a legal tool target. One terminal send_messages call carries an
-ordered messages batch whose maximum is supplied through {{message_limit}}. Each item is one
-independent QQ message. The parameter-only dice, rps, contact_member and contact_group segments
-must each be the sole segment in that message item's content: no reply, text, at or any other
-segment may accompany one. Explanation text may be a separate item in the same messages batch;
-never describe explanation and a standalone segment as mutually exclusive choices. Invalid model
-arguments reject the complete batch before delivery, not merely one item. A successful send_messages
-call terminates the run, so include every intended QQ message in that single batch. When describing
-historical sends, preserve the outer messages array and each item's inner content array. A
+text, or make display number 0 a legal tool target. Each send_message call contains one
+QQ message's content, and a reply can issue at most {{message_limit}} separately observed sends.
+The parameter-only dice, rps, contact_member and contact_group segments must each be the
+sole segment of that call: no reply, text, at or any other segment may accompany one.
+Explanation text needs a separate send_message call. Invalid model arguments reject that
+entire message before sending. A successful send does not terminate the run; wait for the
+bot's own archived message before using the actual random result or deciding to send again.
+Only finish_reply terminates a normal run. Scheduling must be a separate tool round; due tasks
+open a fresh session with current group context, never replay the original completion.
+Tasks are bounded in time and chain depth. Historical sends use the single-message content
+array, not the retired messages batch. A
 plain-text `@我` typed by a member is
 ordinary text with no bot-identity semantics; only a structured mention rendered with `⟦0⟧`
 identifies the current bot. Evidence is
@@ -117,7 +120,7 @@ def write_tool() -> ToolSpec:
     )
 
 
-def _candidate(turn, cfg) -> tuple[PromptCatalog | None, str, str]:
+def _candidate(turn, cfg, predicates) -> tuple[PromptCatalog | None, str, str]:
     if len(turn.tool_calls) != 1 or turn.tool_calls[0].name != WRITE_TOOL:
         return None, "", "expected exactly one write_prompt_bundle call"
     call = turn.tool_calls[0]
@@ -128,7 +131,7 @@ def _candidate(turn, cfg) -> tuple[PromptCatalog | None, str, str]:
         catalog = PromptCatalog.from_sources(raw, location="DeepSeek candidate")
     except (json.JSONDecodeError, TypeError, TemplateValidationError) as exc:
         return None, str(call.call_id), str(exc)
-    errors = lint_catalog(catalog, cfg)
+    errors = lint_catalog(catalog, cfg, predicates)
     if errors:
         return None, str(call.call_id), json.dumps(errors, ensure_ascii=False)
     return catalog, str(call.call_id), ""
@@ -151,32 +154,41 @@ def _install(catalog: PromptCatalog) -> None:
 
 
 async def main() -> int:
-    await init_pool()
-    await assert_disposable_database()
-    bundle = config()
+    bundle = load_bundle()
     cfg = bundle.default
-    text_cfg = cfg.capabilities.text
-    if text_cfg.provider != "deepseek":
-        raise RuntimeError(f"prompt generation requires DeepSeek, got {text_cfg.provider!r}")
-    capabilities = build_providers(cfg)
-    request = ModelRequest(
-        prompt=(
-            Message(Role.SYSTEM, WRITER_REQUEST),
-            Message(Role.USER, build_prompt_packet(bundle.prompts, cfg)),
-        ),
-        tools=(write_tool(),),
-        policy=GenerationPolicy(
-            model=MODEL,
-            reasoning=ReasoningEffort.LOW,
-            timeout_sec=max(text_cfg.timeout_sec, 240.0),
-            retries=text_cfg.retries,
-        ),
-        context=CallContext(CallPurpose.PREFLIGHT),
-    )
-    try:
+    clock = Clock(cfg.bot.timezone)
+    async with AsyncExitStack() as resources:
+        database = Database(cfg.runtime.database, url=dsn())
+        resources.push_async_callback(database.close)
+        await database.start()
+        await assert_disposable_database(database.pool)
+        text_cfg = cfg.backends.text
+        if text_cfg.provider != "deepseek":
+            raise RuntimeError(f"prompt generation requires DeepSeek, got {text_cfg.provider!r}")
+        budget = Budget(
+            LedgerRepository(database.pool, today=clock.today),
+            daily_cap=cfg.budget.daily_cny_cap,
+            today=clock.today,
+        )
+        capabilities = build_providers(cfg, budget)
+        resources.push_async_callback(capabilities.aclose)
+        request = ModelRequest(
+            prompt=(
+                Message(Role.SYSTEM, WRITER_REQUEST),
+                Message(Role.USER, build_prompt_packet(bundle.prompts, cfg, bundle.predicates)),
+            ),
+            tools=(write_tool(),),
+            policy=GenerationPolicy(
+                model=MODEL,
+                reasoning=ReasoningEffort.LOW,
+                timeout_sec=max(text_cfg.timeout_sec, 240.0),
+                retries=text_cfg.retries,
+            ),
+            context=CallContext(CallPurpose.PREFLIGHT),
+        )
         async with capabilities.text.open_session(request) as session:
             turn = await session.start()
-            catalog, call_id, error = _candidate(turn, cfg)
+            catalog, call_id, error = _candidate(turn, cfg, bundle.predicates)
             if catalog is None:
                 if not call_id:
                     raise RuntimeError(f"invalid complete prompt bundle: {error}")
@@ -193,16 +205,16 @@ async def main() -> int:
                         tools=(write_tool(),),
                     ),
                 )
-                catalog, _call_id, error = _candidate(turn, cfg)
+                catalog, _call_id, error = _candidate(turn, cfg, bundle.predicates)
                 if catalog is None:
                     raise RuntimeError(f"corrected complete prompt bundle is invalid: {error}")
         _install(catalog)
         print(f"replaced complete {len(catalog.templates)}-template bundle with {MODEL}")
         return 0
-    finally:
-        await capabilities.aclose()
-        await close_pool()
 
 
 if __name__ == "__main__":
+    os.environ.setdefault("CONFIG_DIR", str(ROOT / "config"))
+    load_dotenv(ROOT / ".env")
+    configure_test_database()
     raise SystemExit(asyncio.run(main()))

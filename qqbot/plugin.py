@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 
-from nonebot import get_driver, on, on_message, on_notice, require
+from nonebot import get_bots, get_driver, on, on_message, on_notice, require
 from nonebot.adapters.onebot.v11 import Adapter, Bot, GroupMessageEvent, NoticeEvent
 from nonebot.plugin import PluginMetadata
 
@@ -21,10 +21,10 @@ require("nonebot_plugin_apscheduler")
 
 # Below the require() on purpose: it has to run before anything that imports the
 # scheduler plugin, so these cannot move to the top of the file.
-from .gateway.nonebot_adapter import NapCatGroupMessageSentEvent
-from .plugins import tasks
-from .runtime import Runtime
-from .settings import config
+from qqbot.gateway.nonebot_adapter import NapCatGroupMessageSentEvent
+from qqbot.plugins import tasks
+from qqbot.runtime import Runtime
+from qqbot.configuration import load_bundle
 
 __plugin_meta__ = PluginMetadata(
     name="qqbot",
@@ -53,18 +53,19 @@ def _active() -> Runtime:
 @driver.on_startup
 async def _startup() -> None:
     global _runtime
-    runtime = Runtime.build(config())
+    runtime = Runtime.build(load_bundle())
     try:
         await runtime.start()
         tasks.register(runtime)
-    except Exception:
+        await runtime.scheduled.start(lambda: next(iter(get_bots().values()), None))
+    except BaseException:
         await runtime.aclose()
         raise
     _runtime = runtime
     log.info(
         "qqbot ready (%d persona file(s), timezone %s)",
         len(runtime.bundle.personas),
-        runtime.bundle.default.timezone,
+        runtime.bundle.default.bot.timezone,
     )
 
 

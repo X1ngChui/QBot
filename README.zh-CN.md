@@ -7,8 +7,9 @@ QBot 是一个参与 QQ 群聊的 AI 成员。被 @、被叫到名字或被引�
 
 ## 特性
 
-- **只在被叫到时说话。** @、整词出现的昵称、引用机器人自己的消息，三者之一触发回复。
-  其余消息只读取、存档，不出声。
+- **被叫到或预约到期时说话。** @、整词出现的昵称或引用机器人消息会提交一条独立回复请求。
+  群成员也可用自然语言请它设置一次性定时任务；到期后它读取当时的群聊再判断是否回应，
+  必要时可有界地再次预约。其余消息只读取、存档，不出声。
 - **结构化记忆。** 每晚由模型从聊天记录归纳关于成员和群的事实，由代码依据原文引语
   校验，带证据、置信度和有效期存储。错误条目可按编号删除。
 - **区分账号、称呼与人。** 两个账号可以合并为一个人；提示词里每个人都带成员编号，
@@ -18,9 +19,11 @@ QBot 是一个参与 QQ 群聊的 AI 成员。被 @、被叫到名字或被引�
 - **图片与语音。** 每张图片在到达时写一行描述并以文本存档，回复模型按需取回原图查看。
   语音在到达时于 CPU 上本地转写，不产生费用。
 - **工具。** 回复模型可以搜索网页、用布尔表达式检索本群存档、按语义召回往事、读取网页
-  正文、查看原图。
-- **钱是唯一限制。** 日花费上限、单次回复上限、搜索月额度。没有 token 预算，也没有
-  调用次数配额。
+  正文、查看原图，也可不用指令而通过工具创建、查询或取消当前发起人的本群预约。
+- **花费和定时边界。** 日花费上限、单次回复上限和搜索月额度限制付费调用；定时任务另有
+  最短间隔、待执行数量、最远时距及连续预约次数上限。普通回复和定时任务共用有界队列，
+  排队计入各自的总期限；免费后端同样受有限会话步数和数据量限制。资金上限依据已记账
+  用量阻止新付费请求，不是并发调用的严格预付款上限。
 - **一切按群。** 人设、群知识、记忆、屏蔽名单与静音开关都以群为作用域。
 - **直接使用。** 群成员无需先注册或同意协议，被叫到即可得到回复并使用成员指令。
 - **群内运维控制台。** 查看和修正记忆、屏蔽或静音、查看用量、捕获模型调用以便排查。
@@ -70,17 +73,17 @@ cp config/personas/default.yaml.example config/personas/default.yaml
 然后下载语音识别模型、启动容器、登录 NapCat，并在上线前检查各服务商：
 
 ```bash
-bash scripts/fetch_asr_model.sh          # 一次即可，约 250 MB，存入 models/
+bash scripts/fetch_asr_model.sh          # Once; about 250 MB into models/.
 
 docker compose up -d postgres napcat
-docker compose logs -f napcat             # 扫码，或打开 http://127.0.0.1:6099
+docker compose logs -f napcat             # Scan the QR code, or open http://127.0.0.1:6099.
 
-# 首次登录后，把 NapCat 指向 bot（见 docs/operations.md）：
-#   将 napcat/onebot11.json.template 合并进 data/napcat/config/onebot11_<QQ号>.json
+# After the first login, point NapCat at the bot (see docs/operations.md):
+#   merge napcat/onebot11.json.template into data/napcat/config/onebot11_<QQ>.json
 docker compose restart napcat
 
 docker compose build bot
-docker compose run --rm bot python scripts/preflight.py   # 每个服务商各调用一次
+docker compose run --rm bot python scripts/preflight.py   # One real call per provider.
 docker compose up -d bot
 ```
 
@@ -95,14 +98,16 @@ docker compose up -d bot
 | 文件 | 用途 |
 | --- | --- |
 | `.env` | Docker Compose 读取的凭证与基础设施参数 |
-| `config/settings.yaml` | 全局设置：拥有者、触发、服务商、预算、提示词窗口、记忆、定时任务 |
+| `config/settings.yaml` | 九组全局设置：bot、conversation、backends、media、memory、budget、tasks、maintenance、runtime |
 | `config/personas/default.yaml` | 默认人设：名字、系统提示、群知识 |
 | `config/personas/group_<群号>.yaml` | 单个群的人设：名字、提示词补充与固定群背景 |
 | `config/predicates.yaml` | 可以记录关于一个人的哪些内容 |
 | `config/prompts/prompts.yaml` | 模型读到的全部指令模板 |
 
 完整配置会在启动时统一校验。设置、人设、提示词或谓词表修改后，需要重启进程
-才能生效。参考见 [docs/configuration.md](docs/configuration.md)。
+才能生效。参考见 [docs/configuration.md](docs/configuration.md)，另有从 schema 生成的
+[完整字段表](docs/configuration-reference.md)和[一次性迁移对照](docs/configuration-migration.md)。
+运行时不兼容旧配置键，旧文件须先离线转换。
 
 ## 指令
 
@@ -128,21 +133,32 @@ docker compose up -d bot
 
 ## 开发
 
-测试套件跑在一个一次性的 PostgreSQL 上，不需要连接 QQ：
+测试统一使用 pytest，不连接 QQ，也不调用付费 API。数据库测试要求显式提供一次性
+PostgreSQL 的地址；未提供时，这些测试会明确跳过。
 
 ```bash
 python -m venv .venv
 .venv/bin/pip install -r requirements.txt -r requirements-dev.txt
 
+ROOT="$(pwd -W 2>/dev/null || pwd)"
 docker run -d --name qbot-pgtest \
   -e POSTGRES_DB=qbot_test -e POSTGRES_USER=qbot_test -e POSTGRES_PASSWORD=testpw \
-  -p 15432:5432 \
-  -v "$PWD/sql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro" \
-  -v "$PWD/tests/fixtures/test_db_marker.sql:/docker-entrypoint-initdb.d/02-test-marker.sql:ro" \
+  -p 127.0.0.1:15432:5432 \
+  -v "$ROOT/sql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro" \
+  -v "$ROOT/tests/fixtures/test_db_marker.sql:/docker-entrypoint-initdb.d/02-test-marker.sql:ro" \
   pgvector/pgvector:0.8.5-pg17
 
-.venv/bin/python tests/run_all.py        # 全部套件，然后 ruff
+export QBOT_TEST_DATABASE_URL=postgresql://qbot_test@127.0.0.1:15432/qbot_test
+export QBOT_TEST_DATABASE_PASSWORD=testpw
+until docker exec qbot-pgtest pg_isready -h 127.0.0.1 -U qbot_test -d qbot_test; do
+  sleep 1
+done
+.venv/bin/python -m pytest
+.venv/bin/python -m ruff check .
 ```
+
+数据库测试会在破坏性操作前检查专用角色、库名和安全标记。禁止指向生产库，也不要
+针对同一个测试库并行运行这些测试。
 
 约定见 [CONTRIBUTING.md](CONTRIBUTING.md)，各套件的覆盖范围见
 [tests/README.md](tests/README.md)。
@@ -154,17 +170,20 @@ docker run -d --name qbot-pgtest \
 | `bot.py` | 入口；提供 OneBot 反向 WebSocket |
 | `qqbot/plugin.py` | 薄 NoneBot 生命周期与事件适配层 |
 | `qqbot/runtime.py` | 进程级装配根与有序生命周期所有权 |
-| `qqbot/scheduled.py` | 不依赖框架的夜间与报告任务主体 |
-| `qqbot/settings.py` | 启动配置模型与人设合并 |
-| `qqbot/gateway/` | OneBot 归一化与数据库 append-once 准入 |
-| `qqbot/core/` | 入站路由、指令、投递、触发、提示词、工具、媒体和预算 |
+| `qqbot/operations/scheduled.py` | 不依赖框架的夜间与报告任务主体 |
+| `qqbot/configuration/` | 校验后的只读设置、提示词与谓词 bundle、人设合并 |
+| `qqbot/gateway/` | OneBot 归一化、有界解析与先归档后处理的准入流程 |
+| `qqbot/commands/` | 指令目录、权限判断与处理器 |
+| `qqbot/conversation/` | 共享回复队列、会话、快照、提示词与工具 |
+| `qqbot/delivery/` | 协议发送、输出校验与自身消息观察 |
+| `qqbot/media/` | 有界媒体任务、下载、描述与转写协调 |
 | `qqbot/domain/` | 类型化入站事件与记忆模型：身份、称呼、事实、情景、证据 |
-| `qqbot/repositories/` | 记忆模型的数据库访问 |
-| `qqbot/services/` | 抽取、校验、归并、成员目录 |
-| `qqbot/workers/` | 后台记忆工作器 |
+| `qqbot/repositories/` | 按职责拆分的存档、身份、记忆、账本、群策略、媒体缓存、证据与作业存储 |
+| `qqbot/services/` | 抽取、校验、归并、预算、成员与名册服务 |
+| `qqbot/workers/` | 后台记忆与持久化定时任务工作器 |
 | `qqbot/providers/` | 服务商抽象，每个后端一个模块 |
 | `qqbot/plugins/` | 定时任务的薄注册适配层 |
-| `qqbot/db/` | 连接池、结构检查、存档与账本访问 |
+| `qqbot/db/` | 独立所有权的连接池、Runtime 独占租约与结构检查 |
 | `config/` | 配置模板、提示词与谓词表 |
 | `sql/` | 数据库结构与结构变更记录 |
 | `scripts/` | 部署、上线检查、模型下载、评测 |

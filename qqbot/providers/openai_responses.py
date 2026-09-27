@@ -16,44 +16,46 @@ from typing import Any
 
 import openai
 
-from ..core.budget import BUDGET
-from ..domain.ids import GroupId
-from ..settings import TextCfg, VisionCfg
-from ..util import why
-from .base import (
-    Rate,
-    RetryPolicy,
-    TextModel,
-    TextSession,
-    VisionModel,
-    backoff_delay,
-    retry_after_seconds,
-)
-from .contracts import (
-    AttachmentStore,
-    CallContext,
-    CallPurpose,
-    ChargeState,
-    FailureKind,
-    GenerationPolicy,
-    ImageBytes,
-    Message,
-    ModelFailure,
-    ModelRequest,
-    ModelTurn,
-    ModelUsage,
-    PromptItem,
-    ReasoningEffort,
-    Role,
-    SessionDirective,
-    StoredImage,
-    TextPart,
-    ToolCall,
-    ToolCallId,
-    ToolResult,
-    ToolSpec,
-)
-from .openai_transport import RETRYABLE, ResponsesTransport, StreamError, StreamInterrupted
+from qqbot.services.budget import Budget
+from qqbot.providers.payload import check_projection
+from qqbot.domain.ids import GroupId
+from qqbot.configuration import TextCfg
+from qqbot.configuration import VisionCfg
+from qqbot.util import why
+from qqbot.providers.base import Rate
+from qqbot.providers.base import RetryPolicy
+from qqbot.providers.base import TextModel
+from qqbot.providers.base import TextSession
+from qqbot.providers.base import VisionModel
+from qqbot.providers.base import backoff_delay
+from qqbot.providers.base import retry_after_seconds
+from qqbot.providers.contracts import AttachmentStore
+from qqbot.providers.contracts import CallContext
+from qqbot.providers.contracts import CallPurpose
+from qqbot.providers.contracts import ChargeState
+from qqbot.providers.contracts import ContextBudgetExceeded
+from qqbot.providers.contracts import FailureKind
+from qqbot.providers.contracts import GenerationPolicy
+from qqbot.providers.contracts import ImageBytes
+from qqbot.providers.contracts import Message
+from qqbot.providers.contracts import ModelFailure
+from qqbot.providers.contracts import ModelRequest
+from qqbot.providers.contracts import ModelTurn
+from qqbot.providers.contracts import ModelUsage
+from qqbot.providers.contracts import PromptItem
+from qqbot.providers.contracts import ReasoningEffort
+from qqbot.providers.contracts import Role
+from qqbot.providers.contracts import SessionDirective
+from qqbot.providers.contracts import StoredImage
+from qqbot.providers.contracts import TextPart
+from qqbot.providers.contracts import ToolCall
+from qqbot.providers.contracts import ToolCallId
+from qqbot.providers.contracts import ToolResult
+from qqbot.providers.contracts import ToolSpec
+from qqbot.providers.openai_transport import RETRYABLE
+from qqbot.providers.openai_transport import ResponsesTransport
+from qqbot.providers.openai_transport import StreamError
+from qqbot.providers.openai_transport import StreamInterrupted
 
 log = logging.getLogger("qqbot.responses")
 
@@ -360,6 +362,7 @@ class ResponsesExecutor:
         retry: RetryPolicy,
         codec: ResponsesCodec,
         rate_for: Callable[[str], Rate],
+        budget: Budget,
         key_required: bool = True,
     ) -> None:
         self.provider = provider
@@ -368,6 +371,7 @@ class ResponsesExecutor:
         self.codec = codec
         self.rate_for = rate_for
         self.key_required = key_required
+        self._budget = budget
         self._retry = retry
         self._transport = ResponsesTransport()
         self._gate = asyncio.Semaphore(max_concurrency)
@@ -417,7 +421,7 @@ class ResponsesExecutor:
         model: str,
         context: CallContext,
     ) -> ModelUsage:
-        cny = await BUDGET.record(
+        cny = await self._budget.record(
             kind=context.purpose,
             model=model,
             cny=self.rate_for(model).tokens(usage.input_cached, usage.input_uncached, usage.output),
@@ -473,6 +477,8 @@ class ResponsesExecutor:
         context: CallContext,
         telemetry: _CacheContext | None = None,
     ) -> _CompletedTurn:
+        wire_request = self._request(input_items, tools, policy)
+        check_projection(wire_request, ())
         started_at = time.perf_counter()
         attempt = 0
         while True:
@@ -481,9 +487,10 @@ class ResponsesExecutor:
             retry_after: float | None = None
             try:
                 async with self._gate:
+                    await self._budget.check()
                     terminal = await asyncio.wait_for(
                         self._transport.complete(
-                            self._request(input_items, tools, policy),
+                            wire_request,
                             endpoint=self.endpoint,
                             credential_env=self.credential_env,
                             timeout=policy.timeout_sec,
@@ -492,8 +499,21 @@ class ResponsesExecutor:
                         ),
                         timeout=policy.timeout_sec,
                     )
+                overflow = terminal.overflow
+                if not overflow:
+                    try:
+                        check_projection(
+                            wire_request, (), terminal.data, charge=ChargeState.MAY_HAVE_CHARGED
+                        )
+                    except ContextBudgetExceeded:
+                        overflow = True
+                data = (
+                    {key: terminal.data.get(key) for key in ("model", "status", "usage")}
+                    if overflow
+                    else terminal.data
+                )
                 wire = _parse_wire(
-                    terminal.data,
+                    data,
                     fallback_model=policy.model,
                     status_hint=terminal.status_hint,
                 )
@@ -505,6 +525,8 @@ class ResponsesExecutor:
                 else:
                     usage = await self._book(usage, model=wire.model, context=context)
                 booked = True
+                if overflow:
+                    raise ContextBudgetExceeded(charge=ChargeState.MAY_HAVE_CHARGED)
                 wire = replace(wire, usage=usage)
                 turn = _turn(wire)
                 self._log_cache(
@@ -531,6 +553,16 @@ class ResponsesExecutor:
             except StreamError as exc:
                 if exc.started:
                     await self._book_estimate(input_items, tools, policy=policy, context=context)
+                if exc.overflow:
+                    failure = ContextBudgetExceeded(charge=ChargeState.MAY_HAVE_CHARGED)
+                    self._log_cache(
+                        telemetry,
+                        policy=policy,
+                        context=context,
+                        status=failure.kind.value,
+                        started_at=started_at,
+                    )
+                    raise failure from exc
                 data = exc.data if isinstance(exc.data, Mapping) else {}
                 code = str(data.get("code") or data.get("type") or "")
                 failure = ModelFailure(
@@ -596,6 +628,7 @@ class ResponsesTextSession(TextSession):
 
     def __init__(self, executor: ResponsesExecutor, request: ModelRequest) -> None:
         self._executor = executor
+        check_projection(request.prompt, request.tools)
         stable: list[PromptItem] = []
         for item in request.prompt:
             if isinstance(item, Message) and item.role in (Role.SYSTEM, Role.DEVELOPER):
@@ -664,14 +697,37 @@ class ResponsesTextSession(TextSession):
                 kind=FailureKind.PROTOCOL,
                 charge=ChargeState.NOT_SENT,
             )
-        self._input.extend(self._last_output)
-        self._input.extend(self._executor.codec.encode_items(results))
+        next_tools = (
+            directive.tools
+            if directive is not None and directive.tools is not None
+            else self._tools
+        )
+        check_projection(
+            self._input,
+            next_tools,
+            (self._last_output, results, directive.prompt if directive is not None else ()),
+        )
+        added = [*self._last_output, *self._executor.codec.encode_items(results)]
         if directive is not None:
-            self._input.extend(self._executor.codec.encode_items(directive.prompt))
-            if directive.tools is not None:
-                self._tools = self._executor.codec.encode_tools(directive.tools)
-            if directive.policy is not None:
-                self._policy = directive.policy
+            added.extend(self._executor.codec.encode_items(directive.prompt))
+        wire_tools = (
+            self._executor.codec.encode_tools(directive.tools)
+            if directive is not None and directive.tools is not None
+            else self._tools
+        )
+        next_input = [*self._input, *added]
+        check_projection(next_input, wire_tools)
+        next_policy = (
+            directive.policy
+            if directive is not None and directive.policy is not None
+            else self._policy
+        )
+        # The executor adds model/options and rechecks this complete wire envelope.
+        # Reject it before publishing any continuation state.
+        check_projection(self._executor._request(next_input, wire_tools, next_policy), ())
+        self._input = next_input
+        self._tools = wire_tools
+        self._policy = next_policy
         return await self._step()
 
     async def aclose(self) -> None:
@@ -691,6 +747,7 @@ class ResponsesTextModel(TextModel):
         name: str,
         codec: ResponsesCodec,
         rate_for: Callable[[str], Rate],
+        budget: Budget,
         key_required: bool = True,
         attachments: AttachmentStore | None = None,
     ) -> None:
@@ -706,6 +763,7 @@ class ResponsesTextModel(TextModel):
             retry=retry,
             codec=codec,
             rate_for=rate_for,
+            budget=budget,
             key_required=key_required,
         )
 
@@ -730,6 +788,7 @@ class ResponsesVisionModel(VisionModel):
         name: str,
         codec: ResponsesCodec,
         rate_for: Callable[[str], Rate],
+        budget: Budget,
         key_required: bool = True,
     ) -> None:
         self.name = name
@@ -744,6 +803,7 @@ class ResponsesVisionModel(VisionModel):
             retry=retry,
             codec=codec,
             rate_for=rate_for,
+            budget=budget,
             key_required=key_required,
         )
 
@@ -774,6 +834,7 @@ class ResponsesVisionModel(VisionModel):
                 (ImageBytes(data, mime), TextPart(prompt.strip())),
             ),
         )
+        check_projection(items, ())
         completed = await self._executor.complete(
             self._executor.codec.encode_items(items),
             [],
@@ -789,21 +850,23 @@ class ResponsesVisionModel(VisionModel):
 class OpenAIResponses(ResponsesTextModel):
     """Generic OpenAI-style Responses text backend."""
 
-    def __init__(self, cfg: TextCfg, retry: RetryPolicy) -> None:
+    def __init__(self, cfg: TextCfg, retry: RetryPolicy, budget: Budget) -> None:
         super().__init__(
             cfg,
             retry,
             name="openai_responses",
             codec=ResponsesCodec(),
             rate_for=lambda _model: UNKNOWN_TOKEN_RATE,
+            budget=budget,
         )
 
 
-def openai_vision(cfg: VisionCfg, retry: RetryPolicy) -> ResponsesVisionModel:
+def openai_vision(cfg: VisionCfg, retry: RetryPolicy, budget: Budget) -> ResponsesVisionModel:
     return ResponsesVisionModel(
         cfg,
         retry,
         name="openai_responses",
         codec=ResponsesCodec(),
         rate_for=lambda _model: UNKNOWN_TOKEN_RATE,
+        budget=budget,
     )

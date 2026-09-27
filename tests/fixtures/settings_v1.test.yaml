@@ -1,0 +1,78 @@
+# Fixture config for the test suite.
+#
+# Deliberately separate from config/, which holds real deployment values: a test that
+# reads the live config starts failing the moment someone renames the bot or adds a group,
+# and that failure says nothing about the code. Values here are chosen to be convenient to
+# assert on, not to be realistic.
+
+owners: ["10000", "10001"]
+timezone: "Asia/Shanghai"
+
+tools:
+  max_messages_per_reply: 4
+  send_message:
+    max_text_chars_per_message: 2000
+  web_search:
+    count: 5
+    depth: basic
+
+trigger:
+  nicknames: ["小X", "小x", "X酱"]
+
+media:
+  max_image_mb: 8
+
+capabilities:
+  text:
+    provider: openai_responses
+    endpoint: https://example.invalid/v1
+    credential_env: TEXT_API_KEY
+    model: test-light
+    max_concurrency: 3
+    timeout_sec: 30
+    retries: 2
+    extract:
+      reasoning_effort: low
+      timeout_sec: 120
+  vision:
+    provider: openai_responses
+    endpoint: https://example.invalid/v1
+    credential_env: MEDIA_API_KEY
+    model: test-vision
+    max_images_per_min: 6
+    timeout_sec: 30
+  asr:
+    model_dir: tests/fixtures/models/asr
+    threads: 2
+    queue_capacity: 8
+    max_audio_sec: 300
+    max_clips_per_min: 20
+  embedding:
+    provider: dashscope
+    endpoint: https://dashscope.aliyuncs.com/compatible-mode/v1
+    credential_env: MEDIA_API_KEY
+    model: text-embedding-v4
+    dimensions: 2048
+    timeout_sec: 60
+  search:
+    provider: tavily
+    endpoint: https://api.tavily.com
+    credential_env: SEARCH_API_KEY
+    monthly_quota: 1000
+    timeout_sec: 20
+
+budget:
+  daily_cny_cap: 5.0
+
+schedule:
+  nightly_cron: "30 2 * * *"
+  report_cron:  "0 0 * * *"
+  backup_keep: 14
+  napcat_cache_days: 7
+
+# Borrow the real prompt texts instead of copying every file into fixtures;
+# the path is relative to this fixture config directory.
+prompts_dir: ../../../config/prompts
+# Same reason as the prompts: the predicate table is the shipped one, so a test
+# reads what production reads instead of a copy that drifts from it.
+predicates_file: ../../../config/predicates.yaml

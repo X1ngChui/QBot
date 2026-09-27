@@ -13,10 +13,12 @@ group's content - and vector search is the least noticeable way that can leak.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
-from ..db import pool
-from ..domain.ids import GroupId
+import asyncpg
+
+from qqbot.repositories.job import Job, fenced_transaction
+from qqbot.domain.ids import GroupId
 
 
 def _vec(values: Sequence[float]) -> str:
@@ -26,9 +28,12 @@ def _vec(values: Sequence[float]) -> str:
 
 
 class VectorRepository:
-    def __init__(self, model: str, version: int = 1) -> None:
+    def __init__(
+        self, model: str, version: int = 1, *, database: Callable[[], asyncpg.Pool]
+    ) -> None:
         self._model = model
         self._version = version
+        self._database = database
 
     async def put_episode(
         self,
@@ -36,6 +41,7 @@ class VectorRepository:
         group_id: GroupId,
         episode_id: uuid.UUID,
         embedding: Sequence[float],
+        fence: Job | None = None,
     ) -> bool:
         """Index an episode only while it is active.
 
@@ -43,7 +49,7 @@ class VectorRepository:
         deletes the projection after expiring the episode; if decay wins, this returns
         false without recreating a stale vector.
         """
-        async with pool().acquire() as conn, conn.transaction():
+        async with fenced_transaction(self._database, fence) as conn:
             active = await conn.fetchval(
                 """SELECT TRUE FROM episode
                     WHERE id=$1 AND group_id=$2 AND status='active'
@@ -83,7 +89,7 @@ class VectorRepository:
         than handing back the least dissimilar thing as an answer. Failure in a retrieval
         layer should read as "not found", not as "here is something that looks like it".
         """
-        rows = await pool().fetch(
+        rows = await self._database().fetch(
             """SELECT object_id, embedding <=> $3::vector AS distance
                  FROM embedding_index
                 WHERE group_id=$1 AND object_type=$2
@@ -120,7 +126,7 @@ class VectorRepository:
         store: one job must not hold a lease while it embeds months of episodes in a
         single batch. The caller sees a full page and queues the next one.
         """
-        rows = await pool().fetch(
+        rows = await self._database().fetch(
             """SELECT e.id, e.summary FROM episode e
                  LEFT JOIN embedding_index x
                         ON x.object_type='episode' AND x.object_id=e.id

@@ -5,13 +5,22 @@ particular model backend (providers abstracts those). So every service here can 
 constructed without a bot runtime, which is what makes them testable.
 """
 
-from .context_builder import render_fact
-from .directory import Directory, FactCard, NameCard, NameTaken, NotMerged, PersonCard
-from .identity_link import IdentityLinkService
-from .identity_resolver import IdentityResolver, UnknownAccount
-from .memory_consolidator import MemoryConsolidator, Validator, Verdict
-from .memory_extractor import ExtractionInput, MemoryExtractor
-from .retriever import Retriever
+from qqbot.services.context_builder import render_fact
+from qqbot.services.directory import Directory
+from qqbot.services.directory import FactCard
+from qqbot.services.directory import NameCard
+from qqbot.services.directory import NameTaken
+from qqbot.services.directory import NotMerged
+from qqbot.services.directory import PersonCard
+from qqbot.services.identity_link import IdentityLinkService
+from qqbot.services.identity_resolver import IdentityResolver
+from qqbot.services.identity_resolver import UnknownAccount
+from qqbot.services.memory_consolidator import MemoryConsolidator
+from qqbot.services.memory_consolidator import Validator
+from qqbot.services.memory_consolidator import Verdict
+from qqbot.services.memory_extractor import ExtractionInput
+from qqbot.services.memory_extractor import MemoryExtractor
+from qqbot.services.retriever import Retriever
 
 __all__ = [
     "IdentityResolver",

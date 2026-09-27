@@ -1,114 +1,83 @@
-"""API key resolution.
+"""Local API key precedence and credential configuration."""
 
-Capabilities may share a credential today, but each names its own, so splitting them
-must be reachable from YAML alone. Also pins the resolution order, since a silent
-fallback to the wrong credential is the kind of thing that only shows up as a 401 in
-production.
-"""
+import pytest
 
-import os
-import pathlib
-import sys
-import tempfile
-
-ROOT = pathlib.Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-os.environ.setdefault("CONFIG_DIR", str(ROOT / "config"))
-
+from _fixtures import example_bundle
 from qqbot import util
-from qqbot.settings import load_bundle
-
-fails = []
 
 
-def check(name, cond, detail=""):
-    print(f"[{'ok ' if cond else 'FAIL'}] {name}  {detail}")
-    if not cond:
-        fails.append(name)
+@pytest.mark.parametrize("missing", ["NOPE_API_KEY", "  "])
+def test_missing_key_is_empty(monkeypatch, missing):
+    monkeypatch.delenv("NOPE_API_KEY", raising=False)
+    monkeypatch.delenv("NOPE_API_KEY_FILE", raising=False)
+    assert util.read_api_key(missing) == ""
 
 
-def clear(*names):
-    for n in names:
-        os.environ.pop(n, None)
-
-
-def main() -> int:
-    tmp = pathlib.Path(tempfile.mkdtemp())
-
-    # 1. <NAME>_FILE wins, and the value is stripped
-    secret = tmp / "k.txt"
+def test_key_file_precedes_environment_and_missing_file_falls_back(tmp_path, monkeypatch):
+    secret = tmp_path / "key.txt"
     secret.write_text("  file-key\n", encoding="utf-8")
-    os.environ["ACME_API_KEY_FILE"] = str(secret)
-    os.environ["ACME_API_KEY"] = "env-key"
-    check("<NAME>_FILE takes precedence", util.read_api_key("ACME_API_KEY") == "file-key",
-          repr(util.read_api_key("ACME_API_KEY")))
+    monkeypatch.setenv("ACME_API_KEY_FILE", str(secret))
+    monkeypatch.setenv("ACME_API_KEY", "env-key")
+    assert util.read_api_key("ACME_API_KEY") == "file-key"
+    monkeypatch.delenv("ACME_API_KEY_FILE")
+    assert util.read_api_key("ACME_API_KEY") == "env-key"
+    monkeypatch.setenv("ACME_API_KEY_FILE", str(tmp_path / "missing.txt"))
+    assert util.read_api_key("ACME_API_KEY") == "env-key"
 
-    # 2. plain env var when no file is pointed at
-    clear("ACME_API_KEY_FILE")
-    check("<NAME> env var is the fallback", util.read_api_key("ACME_API_KEY") == "env-key")
 
-    # 3. a dangling _FILE path falls through rather than blowing up
-    os.environ["ACME_API_KEY_FILE"] = str(tmp / "missing.txt")
-    check("dangling _FILE path falls through", util.read_api_key("ACME_API_KEY") == "env-key")
-    clear("ACME_API_KEY_FILE", "ACME_API_KEY")
+def test_bom_and_newline_are_removed(tmp_path, monkeypatch):
+    secret = tmp_path / "bom.txt"
+    secret.write_bytes("﻿bom-key\r\n".encode())
+    monkeypatch.setenv("BOM_API_KEY_FILE", str(secret))
+    assert util.read_api_key("BOM_API_KEY") == "bom-key"
+    monkeypatch.setenv("BOMENV_API_KEY", "﻿env-bom-key")
+    assert util.read_api_key("BOMENV_API_KEY") == "env-bom-key"
 
-    # 4. missing key resolves to empty, so the provider can raise a named error
-    check("missing key is empty", util.read_api_key("NOPE_API_KEY") == "")
-    check("empty name is empty", util.read_api_key("  ") == "")
 
-    # 5. a BOM from a Windows editor must not ride along into the auth header
-    bom_file = tmp / "bom.txt"
-    bom_file.write_bytes("﻿bom-key\r\n".encode())
-    os.environ["BOM_API_KEY_FILE"] = str(bom_file)
-    check("BOM and CRLF stripped from key files",
-          util.read_api_key("BOM_API_KEY") == "bom-key",
-          repr(util.read_api_key("BOM_API_KEY")))
-    clear("BOM_API_KEY_FILE")
-    os.environ["BOMENV_API_KEY"] = "﻿env-bom-key"
-    check("BOM stripped from env vars too",
-          util.read_api_key("BOMENV_API_KEY") == "env-bom-key",
-          repr(util.read_api_key("BOMENV_API_KEY")))
-    clear("BOMENV_API_KEY")
-
-    # 7. shipped config: names describe capabilities, never platforms
-    cfg = load_bundle().default.capabilities
-    names = [cfg.text.credential_env, cfg.vision.credential_env,
-             cfg.search.credential_env, cfg.embedding.credential_env]
-    check("text and vision share one name by default",
-          cfg.text.credential_env == cfg.vision.credential_env == "TEXT_API_KEY",
-          f"{cfg.text.credential_env} / {cfg.vision.credential_env}")
-    check(
-        "local ASR has no provider connection settings",
-        not hasattr(cfg.asr, "provider")
-        and not hasattr(cfg.asr, "endpoint")
-        and not hasattr(cfg.asr, "credential_env"),
+def test_example_capability_credentials_are_provider_neutral():
+    backends = example_bundle().default.backends
+    assert backends.text.credential_env == backends.vision.credential_env == "TEXT_API_KEY"
+    assert not any(
+        hasattr(backends.asr, field) for field in ("provider", "endpoint", "credential_env")
     )
-    VENDORS = ("deepseek", "dashscope", "bailian", "zhipu", "openai", "qwen", "aliyun",
-               "bigmodel", "anthropic", "gemini", "tavily")
-    leaked = [n for n in names if any(v in n.lower() for v in VENDORS)]
-    check("no credential name mentions a platform", not leaked, str(leaked))
+    names = [
+        backends.text.credential_env,
+        backends.vision.credential_env,
+        backends.search.credential_env,
+        backends.embedding.credential_env,
+    ]
+    vendors = (
+        "deepseek",
+        "dashscope",
+        "bailian",
+        "zhipu",
+        "openai",
+        "qwen",
+        "aliyun",
+        "bigmodel",
+        "anthropic",
+        "gemini",
+        "tavily",
+    )
+    assert not [name for name in names if any(v in name.lower() for v in vendors)]
 
-    # 8. Network capabilities can still move credentials independently.
-    split = load_bundle().default
-    split = split.model_copy(update={
-        "capabilities": split.capabilities.model_copy(update={
-            "vision": split.capabilities.vision.model_copy(
-                update={"credential_env": "VISION_API_KEY"}
+
+def test_separate_capabilities_resolve_separate_fake_keys(monkeypatch):
+    settings = example_bundle().default
+    split = settings.model_copy(
+        update={
+            "backends": settings.backends.model_copy(
+                update={
+                    "vision": settings.backends.vision.model_copy(
+                        update={"credential_env": "VISION_API_KEY"}
+                    ),
+                }
             ),
-        }),
-    })
-    os.environ["VISION_API_KEY"] = "vision-only-key"
-    os.environ[split.capabilities.text.credential_env] = "text-key"
-    vkey = util.read_api_key(split.capabilities.vision.credential_env)
-    tkey = util.read_api_key(split.capabilities.text.credential_env)
-    check("split config yields two different network keys",
-          vkey == "vision-only-key" and tkey == "text-key",
-          f"vision={vkey!r} text={tkey!r}")
-    clear("VISION_API_KEY", split.capabilities.text.credential_env)
-
-    print()
-    print("FAILED:", fails if fails else "none")
-    return 1 if fails else 0
-
-
-sys.exit(main())
+        }
+    )
+    monkeypatch.setenv("VISION_API_KEY", "vision-only-key")
+    monkeypatch.setenv(split.backends.text.credential_env, "text-key")
+    monkeypatch.delenv("VISION_API_KEY_FILE", raising=False)
+    monkeypatch.delenv(f"{split.backends.text.credential_env}_FILE", raising=False)
+    assert util.read_api_key(split.backends.vision.credential_env) == "vision-only-key"
+    assert util.read_api_key(split.backends.text.credential_env) == "text-key"

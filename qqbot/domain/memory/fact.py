@@ -19,7 +19,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from ..ids import GroupId
+from qqbot.domain.ids import GroupId
 
 
 def earned_confidence(supports: int, contradicts: int = 0) -> float:

@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 
-from ..ids import GroupId
+from qqbot.domain.ids import GroupId
 
 
 class EpisodeType(StrEnum):

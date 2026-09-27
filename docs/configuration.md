@@ -30,225 +30,99 @@ them; you only touch them when running outside Docker.
 
 ## `config/settings.yaml`
 
-Validated with pydantic. Unknown keys are rejected, so a typo fails the load instead of
-silently doing nothing. Every setting is global. Per-group files contain only persona identity
-and standing context.
+The active schema accepts exactly nine top-level sections. Unknown keys, invalid IANA
+zones, invalid cron expressions and incoherent database pool ranges fail startup.
+Settings, personas, prompts and predicates form one immutable startup bundle. Group
+persona files cannot override runtime behavior.
+
+| Section | Operator decisions |
+| --- | --- |
+| `bot` | Owners, timezone and nickname triggers |
+| `conversation` | History message count, reply deadline, send count, text length and evidence retention |
+| `backends` | Model accounts, providers, request resources and search quality |
+| `media` | Image/audio admission, per-group understanding pace and description freshness |
+| `memory` | Episode and unconfirmed-name retention |
+| `budget` | Daily and per-reply accounted-spend stop-loss |
+| `tasks` | Wakeup horizon, pending ceilings, chain depth and daily group allowance |
+| `maintenance` | Cron schedules and backup/cache/job/task retention |
+| `runtime` | Reply capacity, database pool and nondefault bundle paths |
+
+Start with [the example](../config/settings.yaml.example). The exhaustive
+[field reference](configuration-reference.md) is generated from the active schema;
+it includes defaults and validation constraints. Regenerate it with
+`python scripts/config_reference.py --write`, or run that command without `--write`
+to check for drift. It never loads private settings.
 
 ### Applying changes
 
-The application loads and validates one immutable configuration bundle at startup. The
-bundle includes settings, personas, prompts and predicates. A missing
-file, unknown key, duplicate template key or invalid value prevents startup; no partially
-validated configuration becomes active.
+Restart after changing any part of the bundle. Clients, worker resources and scheduled
+jobs retain the startup configuration. Changes to application code additionally require
+an image rebuild; restarting an old image does not load edited Python source.
 
-Any configuration change requires a process restart. Provider clients, concurrency gates,
-local ASR resources, the memory worker, scheduler jobs and prompt catalogs all retain the
-same validated startup snapshot for their lifetime. Code changes additionally require an
-image rebuild.
+The backend names `deepseek`, `openai_responses` and `local` select Responses adapters;
+there is no Chat Completions fallback. Extraction shares the text account and may override
+only its model, reasoning grade and request deadline. ASR is a fixed local SenseVoice
+service with a model directory and native thread count, not a remote-provider selector.
+Embedding width is an adapter/storage contract, not a YAML setting. Changing the embedding
+model hides old model-tagged vectors until they are rebuilt.
 
-Retired configuration names are not dual-read. Validation names the unsupported key so it
-can be replaced directly: `llm` → `capabilities`, `backend` → `provider`, `base_url` →
-`endpoint`, and `api_key_env` → `credential_env`.
+### Preferences versus mechanism limits
 
-### Top level
+`conversation.history_messages` is the history preference. Chunk size and deque headroom
+are derived from it; it is not a token or byte budget. The single reply deadline includes
+queueing, media, model calls, tools, sends and echo observation. ACKs remain recorded even
+if later work times out. An uncertain send is not automatically replayed.
 
-| Key | Meaning |
-| --- | --- |
-| `owners` | QQ numbers, as strings, of the people who hold the operator console and receive the daily report. |
-| `timezone` | IANA name. Governs the clock line in the prompt, the cron jobs, the daily report and the day boundary the budget resets on. |
-| `personas_dir` | Directory of persona files, relative to `config/`. |
-| `prompts_dir` | Directory containing the versioned `prompts.yaml` template bundle. |
-| `predicates_file` | The predicate table. |
+`runtime.reply_capacity` currently bounds active plus queued addressed replies. Full or
+expired work ends silently. Active slots are also limited by text-backend concurrency.
+Persistent wakeups retain their own worker admission while the common-inbox refactor is
+in progress; this setting must not be treated as a combined timer/reply capacity yet.
 
-### `trigger`
+The program owns finite session turns, total tool calls, result retention, parsing limits,
+ASR queue size, member-cache capacity, echo waits, job claims and maintenance phase waits.
+These are not an alternative advanced configuration tree. A free model still has finite
+session fuel. Attachment expiry comes from the selected provider's contract.
 
-| Key | Meaning |
-| --- | --- |
-| `nicknames` | Every name the bot answers to. Matched as whole words. A nickname that is also an ordinary word will trigger whenever the group talks about that word; handle it in the persona, or keep only unambiguous names. |
+Budget limits are stop-loss thresholds on already recorded spend, not prepaid reservations:
+concurrent calls can overshoot. Every new paid attempt checks the ledger; unreadable totals
+fail closed. An ambiguous accounting write preserves the completed result but blocks later
+paid requests for that Runtime. Restarting does not repair a missing charge. Local ASR is
+not stopped by the paid budget.
 
-### `gateway`
+Maintenance cron uses APScheduler's syntax in `bot.timezone`. Prefer weekday names such as
+`mon` rather than numeric weekdays. Backup freshness follows the next scheduled run plus
+bounded maintenance completion time, not a fixed number of hours. Backup verification
+checks the dump catalog and minimum size; it is not a full restore rehearsal.
 
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `shutdown_wait_sec` | 5 | Seconds shutdown waits for in-flight media patches |
+### One-time migration
 
-### `media`
+Runtime loading accepts only the new schema, without old-key aliases or fallback reads.
+The offline converter supports the frozen pre-refactor contract documented in the
+[130-field migration table](configuration-migration.md). Older, unknown formats require
+an explicit separate conversion; they are not guessed.
 
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `wait_sec` | 25 | Seconds a reply waits for shared media tickets before continuing; slow work keeps running and patches later |
-| `protocol_timeout_sec` | 10 | Seconds allowed for one NapCat media API call |
-| `http_timeout_sec` | 20 | Seconds allowed for one media download |
-| `unreadable_retry_sec` | 600 | Seconds before retrying media marked unreadable |
+Run locally with development dependencies installed:
 
-### `members`
+```sh
+python scripts/migrate_config.py path/to/settings.yaml
+python scripts/migrate_config.py path/to/settings.yaml --apply
+```
 
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `cache_ttl_sec` | 1800 | Seconds a fetched group member list remains fresh |
+The first command only validates and reports field paths and dispositions, never values.
+`--apply` validates again, keeps a recoverable byte-for-byte backup under
+`backups/config-migrations/`, detects concurrent edits, and atomically replaces the YAML.
+Quotes, comments, BOM and line endings are retained. Comments are preserved verbatim, not
+rewritten into new semantic explanations: review notes attached to moved or retired fields.
 
-### `commands`
+Explicit nondefault values of retired settings stop conversion. Accept a retirement only
+when its replacement mechanism is understood, with `--retire old.field` for that field.
+The converter preserves nondefault retained choices and sparse input instead of expanding
+all defaults. The old two history factors are multiplied into one message count; the
+new sliding cadence is derived and need not match the old cadence.
 
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `roster_max_entries` | 60 | Account rows shown by one owner `/members` response |
-| `top_default_entries`, `top_max_entries` | 5, 20 | Default and maximum spending rows shown by `/top` |
-
-### `identity_link`
-
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `challenge_ttl_sec` | 600 | Lifetime of one `/link` confirmation request |
-| `max_pending_challenges` | 1000 | Global ceiling on durable pending requests |
-| `max_pending_per_account` | 3 | Pending requests one initiating account may hold |
-| `challenge_code_length` | 8 | Decimal digits in a newly issued confirmation code |
-
-### `diagnostics`
-
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `debug_max_rounds` | 50 | Largest accepted `/debug start N` capture |
-| `log_tail_default_lines`, `log_tail_max_lines` | 15, 60 | Default and maximum `/log` line count |
-| `log_tail_scan_bytes` | 65536 | Maximum suffix of the log file scanned for one response |
-| `error_ring_entries` | 200 | Process-local recent-error ring capacity |
-| `error_message_chars` | 300 | Stored characters per recent error |
-| `daily_report_recent_errors` | 8 | Recent errors included in the owner report |
-
-### `tools`
-
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `max_calls_per_round` | 8 | Tool calls accepted from one model round |
-| `max_rounds` | 20 | Safety ceiling on model rounds in one tool loop |
-| `send_messages.max_messages_per_call` | 4 | Independent QQ messages allowed in one terminal call |
-| `send_messages.max_text_chars_per_message` | 2000 | Text characters allowed in each QQ message |
-| `web_search.count` | 5 | Results requested from one search |
-| `web_search.depth` | basic | Vendor search depth; `advanced` consumes two credits |
-| `search_history.context_lines` | 5 | Archive lines included before and after each hit |
-| `search_history.max_hits` | 8 | Matching archive messages returned by one search |
-| `search_history.max_query_terms` | 8 | Terms accepted in one search expression |
-| `search_history.max_result_chars` | 12000 | Characters returned by one search |
-| `recall_events.context_episodes` | 2 | Episodes included before and after each hit |
-| `recall_events.max_hits` | 5 | Similarity hits selected before temporal context is added |
-| `read_url.max_content_chars` | 8000 | Page-text characters returned by one read |
-| `open_images.max_images` | 6 | Images accepted by one call |
-
-### `capabilities`
-
-Five capabilities are configured independently. `provider` is a closed schema value, not
-an arbitrary registry string. The provider adapter hides platform-specific request and
-response behavior; core code sees only capability contracts.
-
-| Key | Meaning |
-| --- | --- |
-| `http_retries` | Retries for the plain-HTTP backends (embedding, search, file upload) |
-| `retry_after_cap_sec` | The longest a vendor's `Retry-After` header may hold a call |
-
-**`capabilities.text`** — replies and memory extraction.
-
-| Key | Meaning |
-| --- | --- |
-| `provider`, `endpoint`, `credential_env`, `model` | The account and reply model. `deepseek`, `openai_responses` and `local` all use a Responses endpoint; there is no Chat Completions fallback. |
-| `reasoning_effort` | `off`, `low`, `high` or `max`, translated into the backend's own Responses parameter. Thinking bills at output price. |
-| `max_concurrency` | Concurrent model calls across every group (restart) |
-| `timeout_sec`, `retries` | Per call |
-| `extract.model`, `extract.reasoning_effort`, `extract.timeout_sec` | Extraction's process-owned model, grade and deadline on the same account; empty model means the reply model. Restart to apply. |
-
-**`capabilities.vision`** — picture descriptions for the archive. The backend must expose the
-Responses image-input shape as well as text responses.
-
-| Key | Meaning |
-| --- | --- |
-| `provider`, `endpoint`, `credential_env`, `model`, `reasoning_effort`, `timeout_sec` | As above |
-| `description_ttl_days` | How long a stored description stays current; past it, a reposted picture is described again. 0 disables expiry. |
-| `file_max_age_days` | How long an uploaded original is trusted to still exist at the backend; past it `open_images` uploads again. Keep it under the backend's retention. |
-| `max_images_per_min` | Pace gate for description calls |
-| `max_concurrency` | Concurrent paid description calls across all groups (restart) |
-| `max_output_tokens` | Shared reasoning and visible-output ceiling for one description |
-| `max_image_mb` | Largest picture handled |
-
-**`capabilities.asr`** — fixed in-process SenseVoice CPU transcription. It has no
-provider selector, endpoint, credential, remote model, request timeout or billing mode.
-
-| Key | Meaning |
-| --- | --- |
-| `model_dir` | Model bundle fetched by `scripts/fetch_asr_model.sh` (restart) |
-| `threads` | Native recognizer CPU threads (restart) |
-| `queue_capacity` | Global bounded FIFO admission queue (restart) |
-| `max_audio_sec` | Longest clip accepted |
-| `max_clips_per_min` | Per-group admission guard in front of the global queue |
-
-**`capabilities.embedding`** — vectors for episode recall.
-
-| Key | Meaning |
-| --- | --- |
-| `model`, `dimensions` | `dimensions` must match the `VECTOR(n)` column in `sql/init.sql`. Vectors are stored under the model that produced them and searched only under the current one, so changing the model hides existing vectors until the nightly pass rebuilds them. |
-
-**`capabilities.search`** — web search and page reading.
-
-| Key | Meaning |
-| --- | --- |
-| `monthly_quota` | Credits per calendar month over every group. |
-| `proxy` | HTTP proxy for the search client only; empty means direct |
-
-### `budget`
-
-| Key | Meaning |
-| --- | --- |
-| `daily_cny_cap` | Daily spend over every group. At the cap the bot stops answering until the day rolls over. |
-| `per_reply_cny` | What one reply may spend, tool loop included. Reaching it ends the tool loop with one final round answered from what was already fetched. |
-
-### `prompt`
-
-Counts, not tokens.
-
-| Key | Meaning |
-| --- | --- |
-| `window_chunks`, `evict_chunk` | The history window holds `window_chunks × evict_chunk` messages and evicts a whole chunk at a time |
-| `forward_lines`, `forward_depth`, `forward_chars` | How much of a forwarded chat record is rendered |
-| `evidence_result_chars`, `evidence_total_chars`, `evidence_ttl_days` | Per-item bound, total bound and retention for structured evidence supporting nearby follow-ups |
-| `evidence_request_chars` | Bound on the sanitized request summary stored in each evidence item |
-
-### `memory`
-
-Restart to apply.
-
-| Key | Meaning |
-| --- | --- |
-| `extract_window` | Messages per extraction chunk |
-| `batch_gap_min` | A full chunk is trimmed back to the last conversation gap of at least this many minutes |
-| `drain_floor` | Fewer unconsumed events than this are left for the next night |
-| `max_passes` | Chunks one nightly drain may process |
-| `known_episodes` | Recorded episodes the extractor is reminded of |
-| `roster_aliases_per_account` | Confirmed aliases shown beside one exact account in extraction context |
-| `episode_ttl_days` | Age after which an episode leaves semantic recall and loses its rebuildable vectors; provenance remains |
-| `alias_unused_days`, `joke_unused_days` | How long an unconfirmed name, or one marked as a joke, survives unused |
-| `job_lease_min` | How long a claimed job stays claimed |
-| `worker_idle_sec` | Idle polling interval for the background worker |
-| `embedding_page_size` | Episode rows embedded in one page |
-| `worker_retry_backoff_sec` | Retry delays for failed memory jobs |
-
-### `schedule`
-
-| Key | Meaning |
-| --- | --- |
-| `nightly_cron` | The nightly pipeline: extraction, decay, backup, media cleanup (restart) |
-| `report_cron` | The daily report (restart) |
-| `backup_keep` | Dumps kept |
-| `napcat_cache_days` | Age past which NapCat's media cache is deleted |
-| `extract_drain_hours`, `decay_drain_min`, `drain_poll_sec` | How long the pipeline waits for each stage's own jobs before moving on; embedding drains independently |
-| `misfire_grace_sec` | How late a missed trigger may still fire (restart) |
-| `backup_stale_hours` | Age past which the report flags the newest dump |
-| `completed_job_keep_days` | Age after which completed memory-job audit rows are pruned |
-
-### `database`
-
-Restart to apply.
-
-| Key | Meaning |
-| --- | --- |
-| `pool_min`, `pool_max` | Connection pool size |
-| `command_timeout_sec` | Ceiling on any single statement |
+Configuration conversion does not migrate PostgreSQL. The ownership/attempt-count SQL
+migration is separate. Before production changes, take and verify a fresh backup and
+follow the deployment procedure; a test against an empty schema is not a migration rehearsal.
 
 ## Personas
 

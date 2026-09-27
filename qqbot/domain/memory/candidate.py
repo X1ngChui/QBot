@@ -19,7 +19,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from ..ids import GroupId
+from qqbot.domain.ids import GroupId
 
 
 class CandidateType(StrEnum):
@@ -72,7 +72,7 @@ class RejectReason(StrEnum):
     # Also what catches a record about the bot: nothing gives the bot an entity, so it
     # never takes a code in the roster an extraction is given, and a candidate naming it
     # can only carry an invented one.
-    UNKNOWN_ENTITY = "unknown_entity"           # names an account that does not exist
-    AMBIGUOUS_ALIAS = "ambiguous_alias"         # one name pointing at several people
-    MALFORMED = "malformed"                     # the structure does not hold up
+    UNKNOWN_ENTITY = "unknown_entity"  # names an account that does not exist
+    AMBIGUOUS_ALIAS = "ambiguous_alias"  # one name pointing at several people
+    MALFORMED = "malformed"  # the structure does not hold up
     EMPTY = "empty"

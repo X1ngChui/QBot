@@ -27,12 +27,17 @@ import logging
 
 import httpx
 
-from ..core.budget import BUDGET
-from ..domain.ids import GroupId
-from ..db import repo
-from ..settings import SearchCfg, WebSearchToolCfg
-from ..util import require_key
-from .base import Kind, QuotaExhausted, Rate, RetryPolicy, SearchEngine, with_retry
+from qqbot.services.budget import Budget
+from qqbot.domain.ids import GroupId
+from qqbot.configuration import SearchCfg
+from qqbot.providers.contracts import SearchOptions
+from qqbot.util import require_key
+from qqbot.providers.base import Kind
+from qqbot.providers.base import QuotaExhausted
+from qqbot.providers.base import Rate
+from qqbot.providers.base import RetryPolicy
+from qqbot.providers.base import SearchEngine
+from qqbot.providers.base import with_retry
 
 log = logging.getLogger("qqbot.search")
 
@@ -44,7 +49,8 @@ _FREE = Rate("call", per_unit=0.0, source="tavily free tier, 1000 credits/month"
 class TavilySearch(SearchEngine):
     name = "tavily"
 
-    def __init__(self, cfg: SearchCfg, retry: RetryPolicy) -> None:
+    def __init__(self, cfg: SearchCfg, retry: RetryPolicy, budget: Budget) -> None:
+        self._budget = budget
         self._cfg = cfg
         self._retry = retry
         self._client = httpx.AsyncClient(
@@ -68,7 +74,7 @@ class TavilySearch(SearchEngine):
         previous backend do not eat this one's allowance.
         """
         cfg = self._cfg
-        used = await repo.month_calls(Kind.SEARCH, self.name)
+        used = await self._budget.ledger.month_calls(Kind.SEARCH, self.name)
         if used + credits > cfg.monthly_quota:
             raise QuotaExhausted(f"search allowance used up: {used}/{cfg.monthly_quota} this month")
         return require_key(cfg.credential_env, "search")
@@ -77,6 +83,7 @@ class TavilySearch(SearchEngine):
         cfg = self._cfg
 
         async def once() -> httpx.Response:
+            await self._budget.check()
             r = await self._client.post(
                 f"{cfg.endpoint.rstrip('/')}{path}",
                 headers={"Authorization": f"Bearer {key}"},
@@ -100,7 +107,7 @@ class TavilySearch(SearchEngine):
             key = await self._admit(credits)
             response = await self._post(key, path, body)
             # Booked even at zero cost: calls are the vendor-credit meter.
-            await BUDGET.record(
+            await self._budget.record(
                 kind=Kind.SEARCH,
                 model=self.name,
                 cny=0.0,
@@ -113,7 +120,7 @@ class TavilySearch(SearchEngine):
         self,
         query: str,
         *,
-        options: WebSearchToolCfg,
+        options: SearchOptions,
         group_id: GroupId | None = None,
     ) -> list[dict]:
         credits = 2 if options.depth == "advanced" else 1

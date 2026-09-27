@@ -12,6 +12,11 @@ again, and everything it does is re-entrant.
 
 from __future__ import annotations
 
+from qqbot.clock import Clock
+
+from collections.abc import Callable
+import asyncpg
+
 import asyncio
 import logging
 import re
@@ -21,34 +26,40 @@ from datetime import timedelta
 
 import openai
 
-from ..core.budget import BUDGET
-from ..core.member_numbers import BOT_DISPLAY_NUMBER
-from ..core.segments import number_at_mentions
-from ..domain.archive import AuthorKind
-from ..domain.ids import GroupId
-from ..domain.memory import (
-    ExtractionBatch,
-    ExtractionSnapshot,
-    ExtractionStatus,
-    SnapshotLine,
-    SnapshotTarget,
-)
-from ..providers.base import Providers, QuotaExhausted
-from ..repositories import (
-    EpisodeRepository,
-    ExtractionRepository,
-    IdentityRepository,
-    JobQueue,
-    MemoryRepository,
-    VectorRepository,
-)
-from ..repositories.job import Job, JobType
-from ..services import ExtractionInput, MemoryConsolidator, MemoryExtractor
-from ..services.memory_extractor import SourceLine, decay_classes
-from ..services.context_builder import NOTE, render_hint
-from ..services.directory import NameCard
-from ..settings import Settings, config
-from ..util import defang, fmt_when, now_local, sysmark, why
+from qqbot.services.budget import Budget, BudgetExceeded, BudgetUnavailable
+from qqbot.conversation.member_numbers import BOT_DISPLAY_NUMBER
+from qqbot.gateway.segments import number_at_mentions
+from qqbot.domain.archive import AuthorKind
+from qqbot.domain.ids import GroupId
+from qqbot.domain.memory import ExtractionBatch
+from qqbot.domain.memory import ExtractionSnapshot
+from qqbot.domain.memory import ExtractionStatus
+from qqbot.domain.memory import SnapshotLine
+from qqbot.domain.memory import SnapshotTarget
+from qqbot.providers.base import Providers
+from qqbot.providers.base import QuotaExhausted
+from qqbot.repositories import EpisodeRepository
+from qqbot.repositories import ExtractionRepository
+from qqbot.repositories import IdentityRepository
+from qqbot.repositories import JobQueue
+from qqbot.repositories import MemoryRepository
+from qqbot.repositories import VectorRepository
+from qqbot.workers.lease import ClaimLease, Deferred
+from qqbot.repositories.job import LeaseLost
+from qqbot.repositories.job import Job
+from qqbot.repositories.job import JobType
+from qqbot.services import ExtractionInput
+from qqbot.services import MemoryConsolidator
+from qqbot.services import MemoryExtractor
+from qqbot.services.memory_extractor import SourceLine
+from qqbot.services.memory_extractor import decay_classes
+from qqbot.services.context_builder import NOTE
+from qqbot.services.context_builder import render_hint
+from qqbot.services.directory import NameCard
+from qqbot.configuration import ConfigBundle
+from qqbot.util import defang
+from qqbot.util import sysmark
+from qqbot.util import why
 
 log = logging.getLogger("qqbot.worker")
 
@@ -57,6 +68,8 @@ log = logging.getLogger("qqbot.worker")
 #: says nothing the message does not. Anything else is this code's own fault and
 #: gets the traceback.
 EXPECTED_FAILURES = (TimeoutError, QuotaExhausted, openai.APIError)
+EXTRACTION_EVENT_LIMIT = 120
+EXTRACTION_GAP = timedelta(minutes=30)
 
 _VOICE_TEXT = re.compile(r"⟦语音:([^⟧]+)⟧")
 
@@ -103,41 +116,46 @@ def _transcript(lines: list[SourceLine]) -> str:
 class MemoryWorker:
     def __init__(
         self,
-        cfg: Settings,
+        bundle: ConfigBundle,
         providers: Providers,
         *,
+        clock: Clock,
+        database: Callable[[], asyncpg.Pool],
+        budget: Budget,
         worker_id: str | None = None,
     ) -> None:
+        self._clock = clock
+        self._database = database
+        self._budget = budget
+        self._bundle = bundle
+        cfg = bundle.default
         self._cfg = cfg
         #: The memory mechanism's settings and extraction prompt are fixed at
         #: construction for this worker's lifetime.
         self._m = cfg.memory
-        self._retry_backoff = tuple(
-            timedelta(seconds=seconds) for seconds in self._m.worker_retry_backoff_sec
-        )
-        # Process-unique by default: the job queue's locked_by guards compare this
-        # id, and during a deploy overlap two processes sharing a fixed name could
-        # accept each other's stale fail()/done() calls. Tests pass a fixed id.
-        self._queue = JobQueue(worker_id or f"memory-{uuid.uuid4().hex[:6]}")
-        self._ids = IdentityRepository()
-        self._mem = MemoryRepository()
-        self._eps = EpisodeRepository()
-        self._extractions = ExtractionRepository()
-        self._extractor = MemoryExtractor(cfg, providers.text)
+        self._retry_backoff = tuple(timedelta(seconds=n) for n in (60, 300, 1800, 3600))
+        self._queue = JobQueue(worker_id or f"memory-{uuid.uuid4().hex[:6]}", database)
+        self._ids = IdentityRepository(database=database, clock=clock)
+        self._mem = MemoryRepository(database=database, clock=clock)
+        self._eps = EpisodeRepository(database=database)
+        self._extractions = ExtractionRepository(database=database)
+        self._extractor = MemoryExtractor(bundle, providers.text)
         self._consolidator = MemoryConsolidator(
             self._ids,
             self._mem,
             self._eps,
             self._extractions,
             self._queue,
+            database=database,
+            predicates=bundle.predicates,
         )
         # The bundle's own embedding backend: vectors are stored under the model that
         # produced them, so the store is keyed by the backend answering right now.
         self._embed = providers.embedding
-        self._vec = VectorRepository(self._embed.name)
+        self._vec = VectorRepository(self._embed.name, database=database)
 
     async def run_forever(self, *, idle: float | None = None) -> None:
-        idle = self._m.worker_idle_sec if idle is None else idle
+        idle = 5.0 if idle is None else idle
         while True:
             try:
                 if not await self.step():
@@ -149,41 +167,47 @@ class MemoryWorker:
                 await asyncio.sleep(idle)
 
     async def step(self) -> bool:
-        """Do one job. Returns whether there was one to do."""
-        # The lease (memory.job_lease_min) has to outlast a full drain - several
-        # background model calls - or a deploy overlap reclaims the running job
-        # and pays for the same transcript twice. Its cost is only that a crashed
-        # worker's job waits this long to be retried.
-        job = await self._queue.claim(lease=timedelta(minutes=self._m.job_lease_min))
+        """Execute one renewable claim; busy resources defer rather than finish it."""
+        job = await self._queue.claim()
         if job is None:
             return False
         try:
-            await self._dispatch(job)
-        except Exception as e:
-            log.warning(
-                "job %s (%s) failed: %s",
-                job.id,
-                job.job_type,
-                why(e),
-                exc_info=not isinstance(e, EXPECTED_FAILURES),
-            )
-            await self._queue.fail(
-                job,
-                why(e),
-                backoff=self._retry_backoff[min(job.retry_count, len(self._retry_backoff) - 1)],
-            )
-        else:
-            await self._queue.done(job.id)
+            try:
+                await ClaimLease(self._queue, job).run(lambda: self._dispatch(job))
+            except Deferred as exc:
+                await self._queue.defer(job, str(exc), backoff=exc.delay)
+            except (BudgetExceeded, BudgetUnavailable) as exc:
+                await self._queue.defer(job, str(exc), backoff=timedelta(hours=1))
+            except LeaseLost:
+                raise
+            except Exception as exc:
+                log.warning(
+                    "job %s (%s) failed: %s",
+                    job.id,
+                    job.job_type,
+                    why(exc),
+                    exc_info=not isinstance(exc, EXPECTED_FAILURES),
+                )
+                await self._queue.fail(
+                    job,
+                    why(exc),
+                    backoff=self._retry_backoff[min(job.retry_count, len(self._retry_backoff) - 1)],
+                )
+            else:
+                if not await self._queue.done(job):
+                    raise LeaseLost("claim expired before completion")
+        except LeaseLost:
+            log.info("job %s lost ownership; late results were not committed", job.id)
         return True
 
     async def _dispatch(self, job: Job) -> None:
         match job.job_type:
             case JobType.EXTRACT_MEMORY:
-                await self.extract(GroupId(job.payload["group_id"]))
+                await self.extract(GroupId(job.payload["group_id"]), fence=job)
             case JobType.EMBED:
-                await self.embed(GroupId(job.payload["group_id"]))
+                await self.embed(GroupId(job.payload["group_id"]), fence=job)
             case JobType.DECAY:
-                await self.decay(GroupId(job.payload["group_id"]))
+                await self.decay(GroupId(job.payload["group_id"]), fence=job)
             case _:
                 log.info("ignoring unimplemented job type: %s", job.job_type)
 
@@ -193,13 +217,14 @@ class MemoryWorker:
 
         subject = await self._ids.group_entity(group_id)
         out: list[str] = []
-        if fixed := config().persona_for(group_id).group_knowledge.strip():
+        if fixed := self._bundle.persona_for(group_id).group_knowledge.strip():
             out.append(f"本群固定资料：\n{fixed}")
 
         if group_facts := await self._mem.current_entity_facts(group_id, [subject]):
             out.append("本群未确认线索：")
             out += [
-                "- " + render_hint(
+                "- "
+                + render_hint(
                     "事实",
                     fact.predicate
                     + (f" {fact.object_key}" if fact.object_key else "")
@@ -214,9 +239,7 @@ class MemoryWorker:
 
         by_account = {account_id: code for code, account_id in codes.items()}
         accounts = {
-            account_id: account
-            for account_id in by_account
-            if (account := await self._ids.account_by_id(account_id)) is not None
+            account.id: account for account in await self._ids.accounts_by_ids(list(by_account))
         }
         per: dict[int, list[str]] = {}
         notes: dict[int, str] = {}
@@ -229,9 +252,7 @@ class MemoryWorker:
                 notes[code] = defang(str(fact.object_value))
             else:
                 per.setdefault(code, []).append(
-                    render_hint(
-                        "事实", f"{fact.predicate} = {fact.object_value}", fact.confidence
-                    )
+                    render_hint("事实", f"{fact.predicate} = {fact.object_value}", fact.confidence)
                 )
 
         accounts_by_holder: dict[uuid.UUID, list[uuid.UUID]] = {}
@@ -251,9 +272,9 @@ class MemoryWorker:
                     if rendered not in per.setdefault(code, []):
                         per[code].append(rendered)
 
+        aliases = await self._ids.aliases_for_many(group_id, holder_ids)
         for holder_id, holder_accounts in accounts_by_holder.items():
-            aliases = await self._ids.aliases_for(group_id, holder_id)
-            for alias in aliases:
+            for alias in aliases.get(holder_id, ()):
                 if alias.is_usable:
                     continue
                 if alias.target_account_id is None:
@@ -277,57 +298,43 @@ class MemoryWorker:
 
         episodes = await self._eps.recent_active(
             group_id,
-            limit=self._m.known_episodes,
+            limit=8,
         )
         if episodes:
             out.append("已记过的事：")
             out += [f"- {defang(episode.summary)}" for episode in episodes]
         return "\n".join(out)
 
-    async def extract(self, group_id: GroupId) -> int:
-        """Drain exact durable batches, paying only while this worker owns the slot."""
-
-        total = 0
+    async def extract(self, group_id: GroupId, *, fence: Job | None = None) -> int:
+        """Execute one bounded batch; only successful progress queues its continuation."""
         async with self._extractions.model_slot(group_id) as acquired:
             if not acquired:
-                log.info("group %s: another worker owns the extraction slot", group_id)
+                if fence is not None:
+                    raise Deferred("extraction slot busy", delay=timedelta(seconds=15))
                 return 0
-
-            for _ in range(self._m.max_passes):
-                batch = await self._extractions.open(group_id)
-                if batch is not None and batch.status is ExtractionStatus.STAGED:
-                    await self._apply_batch(batch)
-                    continue
-
-                if await BUDGET.exceeded(self._cfg.budget.daily_cny_cap):
-                    log.info(
-                        "group %s: daily cap reached, extraction waits for tomorrow",
-                        group_id,
-                    )
-                    break
-
+            batch = await self._extractions.open(group_id)
+            if batch is not None and batch.status is ExtractionStatus.STAGED:
+                await self._apply_batch(batch, fence=fence)
+                total = 0
+            else:
+                if await self._budget.exceeded():
+                    raise Deferred("daily budget exhausted", delay=timedelta(hours=1))
                 if batch is None:
-                    unread = await self._extractions.unconsumed_count(group_id)
-                    if unread < self._m.drain_floor:
-                        if not total:
-                            log.info(
-                                "group %s: %d unconsumed, not worth a pass",
-                                group_id,
-                                unread,
-                            )
-                        break
                     batch = await self._extractions.claim(
                         group_id,
-                        limit=self._m.extract_window,
-                        floor=self._m.drain_floor,
-                        gap=timedelta(minutes=self._m.batch_gap_min),
+                        limit=EXTRACTION_EVENT_LIMIT,
+                        floor=1,
+                        gap=EXTRACTION_GAP,
+                        fence=fence,
                     )
-                    if batch is None:
-                        break
-
-                total += await self._extract_batch(batch)
-        if total:
-            log.info("group %s: %d candidates extracted", group_id, total)
+                if batch is None:
+                    return 0
+                total = await self._extract_batch(batch, fence=fence)
+            if await self._extractions.has_unconsumed(group_id):
+                await self._queue.submit(
+                    JobType.EXTRACT_MEMORY, {"group_id": group_id}, fence=fence
+                )
+        log.info("group %s: extraction batch processed (%d candidates)", group_id, total)
         return total
 
     async def _render_snapshot(
@@ -359,12 +366,16 @@ class MemoryWorker:
         )
         return codes, roster, lines, snapshot
 
-    async def _extract_batch(self, batch: ExtractionBatch) -> int:
+    async def _extract_batch(self, batch: ExtractionBatch, *, fence: Job | None = None) -> int:
         """Call the model outside a transaction, checkpoint, then project atomically."""
 
         codes, roster, lines, snapshot = await self._render_snapshot(batch)
         candidates = []
         if codes:
+            known = await self._known(batch.group_id, codes)
+            if not await self._extractions.begin_attempt(batch.id, fence=fence):
+                log.warning("extraction %s cannot start another model attempt", batch.id)
+                return 0
             candidates = await self._extractor.extract(
                 ExtractionInput(
                     group_id=batch.group_id,
@@ -373,11 +384,11 @@ class MemoryWorker:
                     account_codes=codes,
                     lines=tuple(lines),
                     extraction_id=batch.id,
-                    known=await self._known(batch.group_id, codes),
-                    self_names="、".join(self._cfg.trigger.nicknames),
+                    known=known,
+                    self_names="、".join(self._cfg.bot.nicknames),
                 )
             )
-        await self._extractions.stage(batch.id, snapshot, candidates)
+        await self._extractions.stage(batch.id, snapshot, candidates, fence=fence)
         staged = ExtractionBatch(
             id=batch.id,
             group_id=batch.group_id,
@@ -385,18 +396,21 @@ class MemoryWorker:
             events=batch.events,
             snapshot=snapshot,
         )
-        await self._apply_batch(staged)
+        await self._apply_batch(staged, fence=fence)
         if not candidates:
             log.info("group %s: nothing worth extracting in this batch", batch.group_id)
         return len(candidates)
 
-    async def _apply_batch(self, batch: ExtractionBatch) -> tuple[int, int]:
+    async def _apply_batch(
+        self, batch: ExtractionBatch, *, fence: Job | None = None
+    ) -> tuple[int, int]:
         if batch.snapshot is None:
             raise RuntimeError(f"staged extraction {batch.id} has no snapshot")
         written, rejected = await self._consolidator.apply(
             batch.id,
             group_id=batch.group_id,
-            when=now_local(),
+            when=self._clock.now(),
+            fence=fence,
         )
         if written or rejected:
             log.info(
@@ -419,19 +433,24 @@ class MemoryWorker:
         roster: list[str] = []
         bot_accounts: set[str] = set()
 
+        rows = tuple(rows)
+        users = {str(row.sender.account_id) for row in rows}
+        users.update(str(account) for row in rows for account, _ in row.mentions)
+        reading = await self._ids.extraction_identities(group_id, sorted(users))
+        accounts_by_user = {account.platform_user_id: account for account in reading.accounts}
+        aliases_by_account: dict[uuid.UUID, list[str]] = {}
+        for alias in reading.aliases:
+            aliases_by_account.setdefault(alias.target_account_id, []).append(alias.alias_text)
         names: dict[str, dict[uuid.UUID, object]] = {}
-        try:
-            for account, alias in await self._ids.account_names(group_id):
-                names.setdefault(alias, {})[account.id] = account
-        except Exception as exc:
-            log.warning("group %s: account-name scan failed: %s", group_id, why(exc))
+        for account, alias in reading.names:
+            names.setdefault(alias, {})[account.id] = account
         unique_names = [
             (alias, next(iter(accounts.values())))
             for alias, accounts in names.items()
             if len(accounts) == 1
         ]
 
-        async def assign_identity(account, display: str) -> int:
+        def assign_identity(account, display: str) -> int:
             if account.id in by_id:
                 code = by_id[account.id]
                 by_platform.setdefault(account.platform_user_id, code)
@@ -440,7 +459,11 @@ class MemoryWorker:
             codes[code] = account.id
             by_id[account.id] = code
             by_platform[account.platform_user_id] = code
-            aliases = await self._known_names(group_id, account.id, display)
+            aliases = list(
+                dict.fromkeys(
+                    alias for alias in aliases_by_account.get(account.id, ()) if alias != display
+                )
+            )[:4]
             shown = display or (aliases[0] if aliases else "成员")
             roster.append(
                 shown
@@ -449,14 +472,14 @@ class MemoryWorker:
             )
             return code
 
-        async def assign_account(account_id: str, display: str) -> int | None:
+        def assign_account(account_id: str, display: str) -> int | None:
             if account_id in by_platform:
                 return by_platform[account_id]
-            account = await self._ids.account_of("qq", account_id)
+            account = accounts_by_user.get(account_id)
             if account is None:
                 by_platform[account_id] = None
                 return None
-            return await assign_identity(account, display)
+            return assign_identity(account, display)
 
         for archived in rows:
             platform_id = str(archived.sender.account_id)
@@ -471,7 +494,7 @@ class MemoryWorker:
                 by_platform[platform_id] = BOT_DISPLAY_NUMBER
                 speaker_no: int | None = BOT_DISPLAY_NUMBER
             else:
-                speaker_no = await assign_account(platform_id, name)
+                speaker_no = assign_account(platform_id, name)
                 if speaker_no is not None:
                     author_account_id = codes[speaker_no]
 
@@ -481,7 +504,7 @@ class MemoryWorker:
                 if key in bot_accounts or key == self_account:
                     by_platform[key] = BOT_DISPLAY_NUMBER
                 else:
-                    await assign_account(key, display)
+                    assign_account(key, display)
 
             text = number_at_mentions(
                 archived.text,
@@ -508,7 +531,7 @@ class MemoryWorker:
                 for alias, account in unique_names:
                     if alias not in evidence:
                         continue
-                    code = await assign_identity(account, alias)
+                    code = assign_identity(account, alias)
                     targets.append(SnapshotTarget(codes[code], "alias", alias))
 
             unique_targets = tuple(
@@ -527,7 +550,7 @@ class MemoryWorker:
                     own=own,
                     text=(
                         f"{sysmark(f'来源:{ordinal}')} "
-                        f"{sysmark(fmt_when(archived.occurred_at))} {who}: {text}"
+                        f"{sysmark(self._clock.format(archived.occurred_at))} {who}: {text}"
                     ),
                     evidence_text=evidence,
                     author_account_id=author_account_id,
@@ -536,38 +559,16 @@ class MemoryWorker:
             )
         return codes, "\n".join(roster), lines
 
-    async def _known_names(
-        self,
-        group_id: GroupId,
-        account_id: uuid.UUID,
-        current: str,
-    ) -> list[str]:
-        """Usable exact-account names besides the current display name."""
-
-        try:
-            aliases = await self._ids.aliases_for_account(group_id, account_id)
-        except Exception as exc:
-            log.warning(
-                "group %s: alias lookup for the roster failed: %s",
-                group_id,
-                why(exc),
-            )
-            return []
-        out = [
-            alias.alias_text for alias in aliases if alias.is_usable and alias.alias_text != current
-        ]
-        return list(dict.fromkeys(out))[: self._m.roster_aliases_per_account]
-
     # -- forgetting --------------------------------------------------------
-    async def decay(self, group_id: GroupId) -> tuple[int, int, int]:
+    async def decay(self, group_id: GroupId, *, fence: Job | None = None) -> tuple[int, int, int]:
         """Let go of what nothing has confirmed lately. Returns facts, names, episodes.
 
         Free - each store uses set-based database operations and no model call. It runs
         daily because stale facts sit in every reply prompt and stale episodes keep
         participating in semantic recall until they are retired.
         """
-        stable, fast = decay_classes()
-        half = config().predicates.half_life_days
+        stable, fast = decay_classes(self._bundle.predicates)
+        half = self._bundle.predicates.half_life_days
         facts = await self._mem.decay(
             group_id,
             stable=stable,
@@ -576,11 +577,15 @@ class MemoryWorker:
             default_days=half.default,
             fast_days=half.fast,
             keep_predicates=(NOTE,),
+            fence=fence,
         )
         names = await self._ids.decay_aliases(
-            group_id, unused_days=self._m.alias_unused_days, joke_days=self._m.joke_unused_days
+            group_id,
+            unused_days=self._m.alias_unused_days,
+            joke_days=self._m.temporary_alias_days,
+            fence=fence,
         )
-        episodes = await self._eps.decay(group_id, ttl_days=self._m.episode_ttl_days)
+        episodes = await self._eps.decay(group_id, ttl_days=self._m.episode_ttl_days, fence=fence)
         if facts or names or episodes:
             log.info(
                 "group %s: retired %d facts, %d unconfirmed names and %d episodes",
@@ -592,7 +597,7 @@ class MemoryWorker:
         return facts, names, episodes
 
     # -- vectors -----------------------------------------------------------
-    async def embed(self, group_id: GroupId) -> int:
+    async def embed(self, group_id: GroupId, *, fence: Job | None = None) -> int:
         """Fill in vectors for episodes that have none. Incremental, never a full pass.
 
         One page per job. A page that comes back full means more is waiting, so the
@@ -601,28 +606,24 @@ class MemoryWorker:
         across jobs at the queue's pace. The dedup index does not collapse the
         resubmit - this job is running, not pending.
         """
-        if await BUDGET.exceeded(self._cfg.budget.daily_cny_cap):
-            # Not dropped: nothing else queues an embed for episodes already
-            # written, so the job comes back after the longest backoff and keeps
-            # coming back until the ledger day has rolled over.
-            await self._queue.submit(
-                JobType.EMBED,
-                {"group_id": group_id},
-                delay=self._retry_backoff[-1],
-            )
-            return 0
-        page_size = self._m.embedding_page_size
+        if await self._budget.exceeded():
+            raise Deferred("daily budget exhausted", delay=timedelta(hours=1))
+        page_size = self._embed.batch_size
         todo = await self._vec.unembedded_episodes(group_id, limit=page_size)
         if not todo:
             return 0
-        if len(todo) == page_size:
-            await self._queue.submit(JobType.EMBED, {"group_id": group_id})
         vecs = await self._embed.embed([summary for _, summary in todo], group_id=group_id)
         # strict: the vectors are paired with the episodes by position, so a backend
         # that answered with a different number of them would file each summary under
         # somebody else's vector rather than fail.
+        if len(todo) != len(vecs):
+            raise ValueError("embedding response has the wrong number of vectors")
         stored = 0
         for (eid, _), v in zip(todo, vecs, strict=True):
-            stored += await self._vec.put_episode(group_id=group_id, episode_id=eid, embedding=v)
+            stored += await self._vec.put_episode(
+                group_id=group_id, episode_id=eid, embedding=v, fence=fence
+            )
+        if len(todo) == page_size:
+            await self._queue.submit(JobType.EMBED, {"group_id": group_id}, fence=fence)
         log.info("group %s: embedded %d episodes", group_id, stored)
         return stored
