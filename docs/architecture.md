@@ -169,6 +169,15 @@ extends its own stable line, member and picture numbers only when it resumes aft
 New member messages still trigger their own concurrent tasks. They are additional
 observations in the existing task, not a replacement for its original request.
 
+Every admitted tool call executes, including repeated calls with identical arguments;
+there is no session-level tool deduplication. A repeat query can observe changed state,
+and a repeat mutation has its own effect. The model retains the original request and
+the complete ordered call/result replay so it can track its goal and completed steps.
+Parameter and permission validation, money gates, fuel, payload bounds and delivery
+uncertainty rules still apply; an oversized replay fails rather than silently dropping
+prior progress. Independent sessions can still interleave task mutations, so a final
+listing is a current observation rather than an atomic replacement guarantee.
+
 A model sends **one QQ message per `send_message(content=[...])` call**. The model must
 call `finish_reply({})` to end deliberately; a tool-free model turn ends silently.
 Outbound actions are exclusive in their tool round: if either is requested alongside

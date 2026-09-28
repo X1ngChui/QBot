@@ -72,6 +72,14 @@ Predicate prose and the extraction tool enum are derived from the same validated
 
 ## Writing and review
 
+For targeted task-policy changes, first author a complete draft and its non-negotiable
+requirements, then give DeepSeek only the public draft, code-derived contracts and
+fictional cases for polishing. Review the resulting wording before adopting it, validate
+the complete catalog, and run the structural review plus `scripts/eval_tasks.py`.
+Live conversations may inform diagnosis but must never enter the external packet or
+become prompt examples. The task evaluator uses a fictional transport and the real
+reply-model session, not QQ or production task storage.
+
 `scripts/generate_prompts.py` gives `deepseek-v4-pro` one complete fictional audit
 packet and exposes one `write_prompt_bundle` tool requiring every logical key. It does
 not support per-file targets. A mechanically invalid candidate may receive one

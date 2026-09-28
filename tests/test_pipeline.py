@@ -2097,8 +2097,8 @@ async def test_pipeline(pipeline_state):
     ROUND_CHARGE = 0.02  # what the scripted model books per round
     cfg = install_budget(cfg, per_reply_cny=0.10)
     # With a 0.10 purse and 0.02 a round, the money never binds in this scenario:
-    # round one executes two searches, round two's fresh search is the third call
-    # and the scripted allowance dies there.
+    # round one executes both identical searches and its third call exhausts the
+    # scripted allowance.
 
     class CountingSearch(SearchEngine):
         """Free like the real one, and out of allowance from the third call on."""
@@ -2203,14 +2203,14 @@ async def test_pipeline(pipeline_state):
         clock=_test_db.clock,
         prompts=_test_db.test_bundle().prompts,
     )
-    # The scripted allowance dies on the third search, in round two: the limit ends
-    # the spending, and a wrap-up round answers from what rounds one and two already
-    # fetched (the daily cap, checked before anything is spent, still means silence).
+    # The scripted allowance dies on the third search in round one: the limit ends
+    # the spending, and a wrap-up round answers from what round one already fetched
+    # (the daily cap, checked before anything is spent, still means silence).
     assert r1.sent and bot.sent[-1][1] == "就查到这些了", (
         "a reply that hits the search allowance wraps up with an answer",
         repr(r1),
     )
-    assert len(LLM_CALLS) - n_llm == 3 and _names(LLM_CALLS[-1]["tools"]) == [
+    assert len(LLM_CALLS) - n_llm == 2 and _names(LLM_CALLS[-1]["tools"]) == [
         "send_message",
         "finish_reply",
     ], (
@@ -2230,8 +2230,8 @@ async def test_pipeline(pipeline_state):
         "free searches are not gated by the reply's purse",
         f"{len(CountingSearch.calls)} calls: {CountingSearch.calls}",
     )
-    assert CountingSearch.calls.count("话题A") == 1, (
-        "a repeated identical call is not re-executed",
+    assert CountingSearch.calls.count("话题A") == 2, (
+        "every requested identical call is executed",
         str(CountingSearch.calls),
     )
     tool_texts = [
@@ -2239,9 +2239,6 @@ async def test_pipeline(pipeline_state):
         for m in LLM_CALLS[-1]["input"]
         if m.get("type") == "function_call_output"
     ]
-    assert any("刚执行过" in t for t in tool_texts), (
-        "the model is told about the duplicate in words"
-    )
     assert any("没有执行" in t for t in tool_texts), (
         "the unexecuted request got its placeholder result"
     )
@@ -2299,7 +2296,7 @@ async def test_pipeline(pipeline_state):
         "a reply that runs out of money wraps up the same way",
         f"{r2!r}, {len(LLM_CALLS) - n_llm2} rounds",
     )
-    assert len(EndlessSearch.calls) == 2, (
+    assert len(EndlessSearch.calls) == 3, (
         "and the unaffordable round's tools were never executed",
         str(EndlessSearch.calls),
     )

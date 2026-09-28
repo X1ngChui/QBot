@@ -37,8 +37,10 @@ needs no database, private configuration or paid API. It checks annotations in `
 pytest validates tests. Keep nominal IDs such as `GroupId` distinct from plain `str`
 at API boundaries rather than suppressing type errors wholesale.
 
-Nothing in the test suite talks to QQ or to a paid API. The two evaluation scripts
-under `scripts/` do call the real model and are run by hand.
+Nothing in the test suite talks to QQ or to a paid API. Behavioral evaluation scripts
+under `scripts/` call the real model and are run by hand; `eval_tasks.py` uses only
+public inputs and a fictional scheduling transport, with model usage booked to the
+guarded disposable database.
 
 ## Before opening a pull request
 
@@ -49,8 +51,8 @@ under `scripts/` do call the real model and are run by hand.
   `tests/test_commands.py`; `tests/test_scheduled.py` covers durable timer claims and
   wakeups against the guarded test database.
 - A changed prompt file has been run through the matching evaluation script
-  (`scripts/eval_replies.py` or `scripts/eval_extract.py`) and the result is mentioned
-  in the pull request.
+  (`scripts/eval_replies.py`, `scripts/eval_extract.py` or `scripts/eval_tasks.py`)
+  and the result is mentioned in the pull request.
 - A new or renamed configuration key is documented in `config/settings.yaml.example`
   and [docs/configuration.md](docs/configuration.md).
 - A schema change updates the sole canonical `sql/init.sql` and the read-only structural

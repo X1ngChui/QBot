@@ -199,18 +199,20 @@ Routine operation is meant to be: read the report, adjust the configuration.
 
 ## Behavioural evaluations
 
-Three scripts use the real DeepSeek model and cost a few cents per run. They are
-intentionally outside the test suite. After prompt edits, run the structural review and
-the matching behavioral evaluation; run both evaluations after model or reasoning changes.
+The structural reviewer and behavioral evaluators use real DeepSeek models and incur
+provider charges. They are intentionally outside the test suite. After prompt edits,
+run the structural review and the matching behavioral evaluation; include task scenarios
+when changing scheduling instructions or tool orchestration.
 
 ```bash
 docker start qbot-pgtest             # the test database; see tests/README.md
 .venv/bin/python scripts/review_prompts.py
 .venv/bin/python scripts/eval_replies.py
 .venv/bin/python scripts/eval_extract.py
+.venv/bin/python scripts/eval_tasks.py
 ```
 
-All three need real credentials in `.env` at the repository root. `review_prompts.py`
+These scripts need real credentials in `.env` at the repository root. `review_prompts.py`
 refuses non-DeepSeek text providers and sends only the shipped prompt family plus a
 fictional developer-role sample; it reports contradictions, duplication, unclear tool
 contracts and authority leaks.
@@ -225,6 +227,14 @@ stripper caught it) and FAIL; failing cases print the tool-loop trace.
 are not repeated, a reused alias still earns a confirmation, nothing is derived from
 an owner's note, episode summaries stay objective, and the bot's own name never
 becomes a member's alias.
+
+`eval_tasks.py` runs the real reply-model session against public prompts, invented members
+and a fictional scheduling transport. It checks merge/split replacement, live final
+listing, owner/member scope, short-delay refusal, requested recipients, single next
+occurrences and one-shot completion. It never creates production tasks, contacts QQ or
+loads deployment personas. Model usage is written only to the explicitly guarded
+`qbot_test` database; use `--case` to select a scenario. Passing cases are sampled model
+behavior, not a guarantee against concurrent live changes.
 
 ## Known limitations
 

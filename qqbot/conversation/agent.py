@@ -71,7 +71,6 @@ QUOTA_NOTE = "（检索额度已用完，这个查询没有执行。）"
 OVERFLOW_NOTE = (
     "（本轮工具调用次数已达上限，这个调用没有执行；可先用已有结果，如需再查请下一轮再调用。）"
 )
-REPEAT_NOTE = "（这个查询刚执行过，结果就在上面。换个检索词，或用已有结果。）"
 WRAP_UP_NOTE = (
     "（本次回复的检索额度已用完；若尚未发声且需要回应，可单独调用 send_message；"
     "已发送过则调用 finish_reply。不可继续检索，不要提及额度或系统限制。）"
@@ -227,20 +226,6 @@ def parse_send(
     return (message, "") if message is not None else (None, SEND_INVALID_NOTE)
 
 
-def _call_key(call: ToolCall) -> tuple[str, str]:
-    raw = call.arguments.strip()
-    try:
-        arguments = json.loads(raw or "{}")
-    except json.JSONDecodeError:
-        arguments = None
-    canonical = (
-        json.dumps(arguments, sort_keys=True, ensure_ascii=False)
-        if isinstance(arguments, dict)
-        else raw
-    )
-    return call.name, canonical
-
-
 class AgentRun:
     """One addressed message or due task and one private model session."""
 
@@ -285,7 +270,6 @@ class AgentRun:
         self._seen_messages = seen_messages
         self._sent = 0
         self._phase = AgentPhase.RUNNING
-        self._seen: set[tuple[str, str]] = set()
         self._executed: list[ToolExecution] = []
         self._debug_items: list[PromptItem] = list(request.prompt)
 
@@ -396,9 +380,8 @@ class AgentRun:
 
         outputs: list[str | tools.Attachment | None] = [None] * len(calls)
         executions: list[ToolExecution | None] = [None] * len(calls)
-        keyed_locks: dict[tuple[str, str], asyncio.Lock] = {}
-        parallel: list[tuple[int, ToolCall, tuple[str, str]]] = []
-        serial: list[tuple[int, ToolCall, tuple[str, str]]] = []
+        parallel: list[tuple[int, ToolCall]] = []
+        serial: list[tuple[int, ToolCall]] = []
 
         for index, call in enumerate(calls):
             if quota_hit.is_set():
@@ -406,74 +389,62 @@ class AgentRun:
             elif index >= cap:
                 outputs[index] = OVERFLOW_NOTE
             else:
-                key = _call_key(call)
-                keyed_locks.setdefault(key, asyncio.Lock())
                 target = parallel if self._registry.parallel_safe(call.name) else serial
-                target.append((index, call, key))
+                target.append((index, call))
 
-        async def invoke(
-            index: int,
-            call: ToolCall,
-            key: tuple[str, str],
-        ) -> None:
-            async with keyed_locks[key]:
-                if quota_hit.is_set() or spend.exhausted:
-                    quota_hit.set()
-                    outputs[index] = QUOTA_NOTE
-                    return
-                if key in self._seen:
-                    outputs[index] = REPEAT_NOTE
-                    return
-                try:
-                    output = await tools.execute(
-                        call,
-                        cfg=self._cfg,
-                        group_id=self._state.group_id,
-                        ctx=self._tool_context,
-                    )
-                except QuotaExhausted as exc:
-                    log.info(
-                        "group %s: %s - wrapping up on what is already fetched",
-                        self._state.group_id,
-                        why(exc),
-                    )
-                    quota_hit.set()
-                    outputs[index] = QUOTA_NOTE
-                    return
-
-                try:
-                    parsed = json.loads(call.arguments or "{}")
-                except json.JSONDecodeError:
-                    parsed = {}
-                verified = tools.verified(output)
-                text = self._fuel.retain(str(output))
-                if isinstance(output, tools.Attachment):
-                    images = [part for part in output.parts if isinstance(part, StoredImage)]
-                    if len(images) > self._fuel.images_left:
-                        output = QUOTA_NOTE
-                        verified = False
-                        quota_hit.set()
-                    else:
-                        self._fuel.take_images(len(images))
-                        parts = tuple(images) + tuple(
-                            TextPart(self._fuel.retain(part.text))
-                            for part in output.parts
-                            if isinstance(part, TextPart)
-                        )
-                        output = tools.Attachment(text, parts)
-                else:
-                    output = text
-                executions[index] = ToolExecution(
-                    call.name,
-                    parsed if isinstance(parsed, dict) else {},
-                    str(output),
-                    verified,
+        async def invoke(index: int, call: ToolCall) -> None:
+            if quota_hit.is_set() or spend.exhausted:
+                quota_hit.set()
+                outputs[index] = QUOTA_NOTE
+                return
+            try:
+                output = await tools.execute(
+                    call,
+                    cfg=self._cfg,
+                    group_id=self._state.group_id,
+                    ctx=self._tool_context,
                 )
-                outputs[index] = output
-                if verified:
-                    self._seen.add(key)
-                if spend.exhausted or self._fuel.wrapping_up:
+            except QuotaExhausted as exc:
+                log.info(
+                    "group %s: %s - wrapping up on what is already fetched",
+                    self._state.group_id,
+                    why(exc),
+                )
+                quota_hit.set()
+                outputs[index] = QUOTA_NOTE
+                return
+
+            try:
+                parsed = json.loads(call.arguments or "{}")
+            except json.JSONDecodeError:
+                parsed = {}
+            verified = tools.verified(output)
+            text = self._fuel.retain(str(output))
+            if isinstance(output, tools.Attachment):
+                images = [part for part in output.parts if isinstance(part, StoredImage)]
+                if len(images) > self._fuel.images_left:
+                    output = QUOTA_NOTE
+                    verified = False
                     quota_hit.set()
+                else:
+                    self._fuel.take_images(len(images))
+                    parts = tuple(images) + tuple(
+                        TextPart(self._fuel.retain(part.text))
+                        for part in output.parts
+                        if isinstance(part, TextPart)
+                    )
+                    output = tools.Attachment(text, parts)
+            else:
+                output = text
+            executions[index] = ToolExecution(
+                call.name,
+                parsed if isinstance(parsed, dict) else {},
+                str(output),
+                verified,
+            )
+            outputs[index] = output
+            if spend.exhausted or self._fuel.wrapping_up:
+                quota_hit.set()
 
         # Archive/search/page/image reads have no monetary charge and are independent,
         # so execute them together. Potentially paid tools remain serial: this keeps one
