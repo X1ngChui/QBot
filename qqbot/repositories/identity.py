@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from qqbot.domain.ids import AccountId
 from qqbot.clock import Clock
 from qqbot.domain.identity.reading import ExtractionIdentities
 
@@ -41,6 +42,17 @@ FAMILY = """WITH RECURSIVE family AS (
                    UNION ALL
                    SELECT e.id FROM entity e JOIN family f ON e.merged_into = f.id
                )"""
+
+
+def _account(row) -> IdentityAccount:
+    return IdentityAccount(
+        entity_id=row["entity_id"],
+        platform=row["platform"],
+        platform_user_id=AccountId(row["platform_user_id"]),
+        id=row["id"],
+        first_seen_at=row["first_seen_at"],
+        last_seen_at=row["last_seen_at"],
+    )
 
 
 def _entity(row) -> Entity:
@@ -109,7 +121,7 @@ class IdentityRepository:
 
     # -- people and accounts ----------------------------------------------
     async def accounts_by_users(
-        self, platform: str, user_ids: list[str], *, _conn: DbConnection | None = None
+        self, platform: str, user_ids: list[AccountId], *, _conn: DbConnection | None = None
     ) -> list[IdentityAccount]:
         if not user_ids:
             return []
@@ -119,7 +131,7 @@ class IdentityRepository:
             platform,
             user_ids,
         )
-        return [IdentityAccount(**dict(row)) for row in rows]
+        return [_account(row) for row in rows]
 
     async def accounts_by_ids(
         self, account_ids: list[uuid.UUID], *, _conn: DbConnection | None = None
@@ -131,7 +143,7 @@ class IdentityRepository:
                  FROM identity_account WHERE id=ANY($1::uuid[])""",
             account_ids,
         )
-        return [IdentityAccount(**dict(row)) for row in rows]
+        return [_account(row) for row in rows]
 
     async def accounts_of_many(
         self, entity_ids: list[uuid.UUID], *, _conn: DbConnection | None = None
@@ -143,7 +155,7 @@ class IdentityRepository:
                  FROM identity_account WHERE entity_id=ANY($1::uuid[])""",
             entity_ids,
         )
-        return [IdentityAccount(**dict(row)) for row in rows]
+        return [_account(row) for row in rows]
 
     async def aliases_for_many(
         self,
@@ -178,7 +190,7 @@ class IdentityRepository:
         return result
 
     async def extraction_identities(
-        self, group_id: GroupId, user_ids: list[str]
+        self, group_id: GroupId, user_ids: list[AccountId]
     ) -> ExtractionIdentities:
         async with (
             self._database().acquire() as conn,
@@ -199,7 +211,9 @@ class IdentityRepository:
             tuple(accounts), tuple(names), tuple(_alias(row) for row in rows)
         )
 
-    async def holder_ids_for_accounts(self, user_ids: list[str]) -> dict[str, uuid.UUID]:
+    async def holder_ids_for_accounts(
+        self, user_ids: list[AccountId]
+    ) -> dict[AccountId, uuid.UUID]:
         """Return the current holder id for each known exact account."""
         want = sorted({u for u in user_ids if u})
         if not want:
@@ -209,9 +223,9 @@ class IdentityRepository:
                 WHERE platform='qq' AND platform_user_id = ANY($1::text[])""",
             want,
         )
-        return {r["platform_user_id"]: r["entity_id"] for r in rows}
+        return {AccountId(r["platform_user_id"]): r["entity_id"] for r in rows}
 
-    async def linked_account_ids(self, user_id: str) -> list[str]:
+    async def linked_account_ids(self, user_id: AccountId) -> list[AccountId]:
         """Return every exact account currently linked to this one."""
         rows = await self._database().fetch(
             """SELECT b.platform_user_id FROM identity_account a
@@ -219,17 +233,17 @@ class IdentityRepository:
                 WHERE a.platform='qq' AND a.platform_user_id=$1""",
             user_id,
         )
-        found = [r["platform_user_id"] for r in rows]
+        found = [AccountId(r["platform_user_id"]) for r in rows]
         return found if user_id in found else [*found, user_id]
 
-    async def account_of(self, platform: str, user_id: str) -> IdentityAccount | None:
+    async def account_of(self, platform: str, user_id: AccountId) -> IdentityAccount | None:
         row = await self._database().fetchrow(
             """SELECT id, entity_id, platform, platform_user_id, first_seen_at, last_seen_at
                  FROM identity_account WHERE platform=$1 AND platform_user_id=$2""",
             platform,
             user_id,
         )
-        return IdentityAccount(**dict(row)) if row else None
+        return _account(row) if row else None
 
     async def account_by_id(self, account_id: uuid.UUID) -> IdentityAccount | None:
         row = await self._database().fetchrow(
@@ -238,7 +252,7 @@ class IdentityRepository:
                  FROM identity_account WHERE id=$1""",
             account_id,
         )
-        return IdentityAccount(**dict(row)) if row else None
+        return _account(row) if row else None
 
     async def account_names(
         self, group_id: GroupId, *, _conn: DbConnection | None = None
@@ -257,14 +271,7 @@ class IdentityRepository:
         )
         return [
             (
-                IdentityAccount(
-                    id=row["id"],
-                    entity_id=row["entity_id"],
-                    platform=row["platform"],
-                    platform_user_id=row["platform_user_id"],
-                    first_seen_at=row["first_seen_at"],
-                    last_seen_at=row["last_seen_at"],
-                ),
+                _account(row),
                 row["alias_text"],
             )
             for row in rows
@@ -273,7 +280,7 @@ class IdentityRepository:
     async def ensure_account(
         self,
         platform: str,
-        user_id: str,
+        user_id: AccountId,
         *,
         seen_at: datetime,
         name: str | None = None,
@@ -310,7 +317,7 @@ class IdentityRepository:
     async def _ensure_account(
         self,
         platform: str,
-        user_id: str,
+        user_id: AccountId,
         *,
         seen_at: datetime,
         name: str | None = None,
@@ -335,7 +342,7 @@ class IdentityRepository:
                     row["id"],
                     seen_at,
                 )
-                return replace(IdentityAccount(**dict(row)), last_seen_at=seen_at)
+                return replace(_account(row), last_seen_at=seen_at)
 
             ent = await conn.fetchrow(
                 """INSERT INTO entity (entity_type, canonical_name)
@@ -357,7 +364,7 @@ class IdentityRepository:
             )
             if acc is None:
                 raise RuntimeError("identity account insert returned no row")
-            return IdentityAccount(**dict(acc))
+            return _account(acc)
 
     #: The namespace a group's own account lives in. Not "qq": a group id and an account
     #: id are different numbers from different spaces, and one table holding both needs to
@@ -559,7 +566,7 @@ class IdentityRepository:
                  FROM identity_account WHERE entity_id=$1 ORDER BY first_seen_at""",
             entity_id,
         )
-        return [IdentityAccount(**dict(r)) for r in rows]
+        return [_account(r) for r in rows]
 
     # -- names ------------------------------------------------------------
     async def aliases_for_account(self, group_id: GroupId, account_id: uuid.UUID) -> list[Alias]:

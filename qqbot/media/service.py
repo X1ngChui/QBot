@@ -49,7 +49,7 @@ from pathlib import Path
 import httpx
 
 from qqbot.repositories.media_cache import MediaCacheRepository
-from qqbot.domain.ids import GroupId
+from qqbot.domain.ids import AccountId, GroupId
 from qqbot.prompting import PromptKey
 from qqbot.providers.base import Providers
 from qqbot.providers.contracts import StoredImage
@@ -314,7 +314,7 @@ class MediaProcessor:
         return [png] if url == png else [png, url]
 
     # -- per-kind resolution ----------------------------------------------
-    async def _bytes(self, ref: ImageRef, *, bot, max_bytes: int) -> ByteRead:
+    async def _bytes(self, ref: ImageRef, *, bot: BotApi, max_bytes: int) -> ByteRead:
         """Fetch the picture itself, by whichever route answers: the link the
         message carried, then get_image for a fresh copy. Single-flight per
         picture, and a picture no route could read is remembered for a while.
@@ -329,11 +329,11 @@ class MediaProcessor:
         # The cap is part of the key: a flight started under one group's
         # max_image_mb must not hand its oversize verdict to a group with a wider one.
         return await self._work.run(
-            ("bytes", str(bot.self_id), self._resource_key(key), max_bytes),
+            ("bytes", bot.self_id, self._resource_key(key), max_bytes),
             lambda: self._bytes_once(ref, bot=bot, max_bytes=max_bytes),
         )
 
-    async def _bytes_once(self, ref: ImageRef, *, bot, max_bytes: int) -> ByteRead:
+    async def _bytes_once(self, ref: ImageRef, *, bot: BotApi, max_bytes: int) -> ByteRead:
         key = self._resource_key(ref.key or ref.file or ref.url or "")
         hold = self._io.unreadable_retry_sec
         now = time.monotonic()
@@ -561,7 +561,7 @@ class MediaProcessor:
         backend and double billing."""
         key = ref.file or ref.url
         return await self._work.run(
-            ("transcribe", str(bot.self_id), group_id, self._resource_key(key or "")),
+            ("transcribe", bot.self_id, group_id, self._resource_key(key or "")),
             lambda: self._transcribe_once(ref, bot=bot, group_id=group_id, cfg=cfg),
         )
 
@@ -627,7 +627,7 @@ class MediaProcessor:
         group at once rather than keeping a second name cache here. It also answers for
         people who have never spoken, which user_profiles cannot.
         """
-        qq = ref.ident or ""
+        qq = AccountId(ref.ident) if ref.ident else None
         if not qq:
             return None
         name = await self._members.name_of(bot, group_id, qq)

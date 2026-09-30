@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 import asyncpg
 
+from qqbot.domain.ids import AccountId
 from qqbot.db.connection import DbConnection
 
 import uuid
@@ -34,7 +35,7 @@ class Ingestor:
         self,
         event: InboundEvent,
         *,
-        at_accounts: Sequence[str] = (),
+        at_accounts: Sequence[AccountId] = (),
     ) -> Ingested | None:
         """Append once and atomically apply the event's required identity writes.
 

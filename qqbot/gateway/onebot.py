@@ -54,7 +54,7 @@ class GroupMessage(InboundEvent):
     """Compatibility name for a normalized OneBot group-message event."""
 
     @classmethod
-    def from_event(cls, event: Any, self_id: str, *, clock: Clock) -> Self:
+    def from_event(cls, event: Any, self_id: AccountId, *, clock: Clock) -> Self:
         """Capture one adapter event into settled, detached values exactly once."""
 
         reply = getattr(event, "reply", None)

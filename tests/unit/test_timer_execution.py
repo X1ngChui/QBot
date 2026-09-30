@@ -9,6 +9,7 @@ import pytest
 
 from _budget import fake_budget
 import _db as _test_db
+from _test_owners import fresh_tasks
 from qqbot.conversation import engine
 from qqbot.conversation.history import HistoryWindow
 from qqbot.conversation.scheduler import Admission, ReplyScheduler
@@ -22,7 +23,7 @@ from qqbot.workers.scheduled import ScheduledTaskWorker
 
 def task(group):
     return ScheduledTask(
-        uuid.uuid4(), GroupId(group), "101", "Fictional", _test_db.clock.now(), uuid.uuid4(), 0
+        uuid.uuid4(), GroupId(group), "Fictional", _test_db.clock.now(), uuid.uuid4(), 0
     )
 
 
@@ -36,6 +37,7 @@ def runner(bundle, cfg=None, *, capacity=4):
         history_anchor=None,
     )
     executor = ReplyExecutor(
+        tasks=fresh_tasks(),
         bundle=_test_db.bundle_for_settings(cfg or bundle.default),
         clock=_test_db.clock,
         database=_test_db.pool,

@@ -112,7 +112,7 @@ async def test_memory_visibility(visibility_state):
         [AliasEvidence(EvidenceType.LLM_INFERENCE, event.raw_event_id)],
     )
     await directory.name(G, "a", "白舟")
-    await directory.note(G, "a", "只在周末参加活动")
+    await directory.add_note(G, "a", "只在周末参加活动")
     roster = await retrieval.gather(group_id=G, directory=directory, members=MEMBERS)
     a_row = next(row for row in roster if row["user_id"] == "a")
     hints = "\n".join(a_row["memory_hints"])
@@ -176,9 +176,11 @@ async def test_memory_visibility(visibility_state):
     assert "未确认别名：蓝帆（置信度 0.30）" in known and "蓝帆" not in account_roster, (
         "extraction sees candidate context outside its confirmed account roster"
     )
-    assert "事实：likes = 摄影（置信度 0.20）" in known and "备注：只在周末参加活动" in known, (
-        "extraction retains the fact score and the reliable note"
-    )
+    assert (
+        "事实：likes = 摄影（置信度 0.20）" in known
+        and "人工备注：" in known
+        and "精确账号：只在周末参加活动" in known
+    ), "extraction retains the fact score and the reliable note"
     target_line = next(line for line in lines if "蓝帆住在青岛" in line.evidence_text)
     assert all(target.account_id != a.id for target in target_line.targets), (
         "a visible candidate name cannot add a line-local alias target"

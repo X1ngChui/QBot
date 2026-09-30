@@ -9,9 +9,9 @@ behind it, and it costs a SQL query.
 
 from __future__ import annotations
 
+from qqbot.domain.ids import AccountId
 import logging
 import uuid
-from datetime import UTC, datetime, timedelta
 from dataclasses import dataclass, field
 
 from pydantic import ValidationError
@@ -38,10 +38,8 @@ from qqbot.providers.contracts import ToolSpec
 from qqbot.repositories.archive import archive_columns
 from qqbot.repositories.archive import archived_message
 from qqbot.repositories.archive import archived_messages
-from qqbot.repositories.scheduled_task import MIN_DELAY_SECONDS
-from qqbot.repositories.scheduled_task import ScheduledTask
-from qqbot.repositories.scheduled_task import ScheduledTaskRepository
-from qqbot.repositories.scheduled_task import TaskLimit
+from qqbot.services.scheduled_tasks import ScheduledTaskService, TaskInputError
+from qqbot.repositories.scheduled_task import ScheduledTask, TaskLimit
 from qqbot.conversation.limits import (
     HISTORY_LIMITS,
     IMAGE_LIMITS,
@@ -81,7 +79,7 @@ class ToolCtx:
     providers: Providers
     media: MediaProcessor
     bot: BotApi | None = None
-    initiator: str = ""
+    tasks: ScheduledTaskService | None = None
     parent_task: ScheduledTask | None = None
     #: Picture number -> (the message that posted it, its index in image_refs).
     by_pic: dict[int, tuple] = field(default_factory=dict)
@@ -175,7 +173,42 @@ def tool_registry(cfg: Settings, *, prompts: PromptCatalog) -> ToolRegistry:
             ToolEntry(
                 make_tool(
                     "list_scheduled_tasks",
-                    {"type": "object", "properties": {}, "additionalProperties": False},
+                    {
+                        "type": "object",
+                        "properties": {"page": {"type": "integer", "minimum": 1, "maximum": 10000}},
+                        "additionalProperties": False,
+                    },
+                ),
+                _execute_scheduled,
+                parallel_safe=False,
+            ),
+            ToolEntry(
+                make_tool(
+                    "get_scheduled_task",
+                    {
+                        "type": "object",
+                        "properties": {"id": {"type": "string"}},
+                        "required": ["id"],
+                        "additionalProperties": False,
+                    },
+                ),
+                _execute_scheduled,
+                parallel_safe=False,
+            ),
+            ToolEntry(
+                make_tool(
+                    "update_scheduled_task",
+                    {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "intent": {"type": "string", "minLength": 1, "maxLength": 500},
+                            "run_at": {"type": "string"},
+                            "delay_seconds": {"type": "integer"},
+                        },
+                        "required": ["id"],
+                        "additionalProperties": False,
+                    },
                 ),
                 _execute_scheduled,
                 parallel_safe=False,
@@ -389,7 +422,7 @@ async def search_history(
     speaker_name: str | None = None,
     days: int | None = None,
     rcfg: SearchHistoryLimits | None = None,
-    self_id: str | None = None,
+    self_id: AccountId | None = None,
     people: MemberNumbers | None = None,
 ) -> str:
     """The archive, searched. Free - one SQL query, no model involved.
@@ -443,7 +476,7 @@ async def search_history(
     except QueryError as e:
         return Failure(f"（检索式有误：{e}）")
     sp = (speaker_name or "").strip()
-    uids: list[str] | None = None
+    uids: list[AccountId] | None = None
     if speaker is not None:
         account = people.account(speaker) if people is not None else None
         if account is not None:
@@ -505,7 +538,7 @@ async def _learn(
     """Load every displayed speaker and structured at target before numbering."""
     if people is None:
         return
-    accounts: list[str] = []
+    accounts: list[AccountId] = []
     for message in messages:
         accounts.append(message.sender.account_id)
         accounts.extend(account for account, _ in message.mentions if account != message.self_id)
@@ -515,7 +548,7 @@ async def _learn(
 def _render_lines(
     messages: list[ArchivedMessage],
     people: MemberNumbers | None,
-    self_id: str | None,
+    self_id: AccountId | None,
     clock: Clock,
 ) -> str:
     """Canonical archived messages as transcript lines, in the order given."""
@@ -525,7 +558,7 @@ def _render_lines(
 def _history_line(
     message: ArchivedMessage,
     people: MemberNumbers | None,
-    self_id: str | None,
+    self_id: AccountId | None,
     clock: Clock,
 ) -> str:
     uid = message.sender.account_id
@@ -541,7 +574,7 @@ def _history_line(
     mentions = message.mentions
     if mentions:
 
-        def mention_number(account: str) -> int | None:
+        def mention_number(account: AccountId) -> int | None:
             if message.self_id and account == message.self_id:
                 return BOT_DISPLAY_NUMBER
             if people is not None:
@@ -559,7 +592,7 @@ async def _with_context(
     group_id: GroupId,
     hit_ids: list,
     ctx: int,
-    self_id: str | None = None,
+    self_id: AccountId | None = None,
     people: MemberNumbers | None = None,
     *,
     database: Callable[[], asyncpg.Pool],
@@ -714,78 +747,93 @@ async def execute(
     return await entry.handler(call.name, args, cfg=cfg, group_id=group_id, ctx=ctx)
 
 
-async def _execute_scheduled(name, args, *, cfg, group_id, ctx):
-    if ctx is None or not ctx.initiator:
-        return Failure("（没有可核实的任务发起人）")
-    scheduled = ScheduledTaskRepository(database=ctx.database)
-    owner = ctx.initiator in cfg.bot.owners
-    if name == "list_scheduled_tasks":
-        if args:
-            return Failure("（查询定时任务不接收额外参数。）")
-        try:
-            rows = await scheduled.pending(group_id, ctx.initiator, owner=owner)
-        except Exception as exc:
-            log.warning("listing scheduled tasks failed: %s", why(exc))
-            return Failure("（暂时无法读取定时任务。）")
-        if not rows:
-            return "（本群没有你可管理的待执行任务。）"
-        return "待执行任务：" + "；".join(
-            f"{row['id']} {row['due_at'].astimezone(ctx.clock.zone):%Y-%m-%d %H:%M} "
-            f"{defang(row['intent'])}"
-            for row in rows
-        )
-    if name == "cancel_scheduled_task":
-        if set(args) != {"id"}:
-            return Failure("（取消定时任务只需填写 id。）")
-        try:
-            task_id = uuid.UUID(_text(args, "id"))
-        except ValueError:
-            return Failure("（任务 ID 无效。）")
-        try:
-            cancelled = await scheduled.cancel(task_id, group_id, ctx.initiator, owner=owner)
-        except Exception as exc:
-            log.warning("cancelling scheduled task failed: %s", why(exc))
-            return Failure("（暂时无法取消定时任务。）")
-        return "（任务已取消。）" if cancelled else Failure("（任务不存在或无权取消。）")
+def task_payload(task: ScheduledTask, *, clock: Clock) -> dict:
+    """A bounded public read model, independent of an initiating member."""
+    return {
+        "id": str(task.id),
+        "status": task.status.value,
+        "intent": defang(task.intent),
+        "due_at": task.due_at.astimezone(clock.zone).isoformat(timespec="seconds"),
+        "chain_depth": task.chain_depth,
+        "outcome": task.outcome,
+    }
 
-    if set(args) - {"intent", "run_at", "delay_seconds"}:
-        return Failure("（预约任务包含未定义参数。）")
-    intent = _text(args, "intent")
-    if not intent or len(intent) > 500:
-        return Failure("（任务内容须为 1 到 500 字。）")
-    at = args.get("run_at")
-    delay = args.get("delay_seconds")
-    if (at is None) == (delay is None):
-        return Failure("（请在 run_at 和 delay_seconds 中只填一个。）")
-    now = datetime.now(UTC)
-    if delay is not None:
-        if isinstance(delay, bool) or not isinstance(delay, int):
-            return Failure("（delay_seconds 必须是整数。）")
-        if not (MIN_DELAY_SECONDS <= delay <= cfg.tasks.max_days_ahead * 86400):
-            return Failure("（执行时间超出允许的最短间隔或最远时距。）")
-        due = now + timedelta(seconds=delay)
-    else:
-        try:
-            due = datetime.fromisoformat(at) if isinstance(at, str) else None
-        except ValueError:
-            due = None
-        if due is None or due.tzinfo is None or due.utcoffset() is None:
-            return Failure("（run_at 必须是带时区的 ISO 8601 时间。）")
-    duration = (due - now).total_seconds()
-    limits = cfg.tasks
-    if duration < MIN_DELAY_SECONDS or duration > limits.max_days_ahead * 86400:
-        return Failure("（执行时间超出允许的最短间隔或最远时距。）")
-    try:
-        task = await scheduled.create(
-            group_id, ctx.initiator, defang(intent), due, limits, parent=ctx.parent_task
+
+async def _execute_scheduled(name, args, *, cfg, group_id, ctx):
+    import json
+
+    def failure(code: str, message: str) -> Failure:
+        return Failure(
+            json.dumps(
+                {"ok": False, "scope": "current_group", "code": code, "message": message},
+                ensure_ascii=False,
+            )
         )
-    except TaskLimit as exc:
-        return Failure(f"（{exc}。）")
-    except Exception as exc:
-        log.warning("creating scheduled task failed: %s", why(exc))
-        return Failure("（暂时无法创建定时任务。）")
-    local_due = due.astimezone(ctx.clock.zone).isoformat(timespec="minutes")
-    return f"（已预约任务 {task.id}，{local_due} 执行。）"
+
+    if ctx is None or ctx.tasks is None:
+        return failure("unavailable", "本轮没有可用的群任务服务。")
+    tasks = ctx.tasks
+    try:
+        if name == "list_scheduled_tasks":
+            page = await tasks.active(group_id, page=args.get("page", 1))
+            return json.dumps(
+                {
+                    "ok": True,
+                    "scope": "current_group",
+                    "statuses": ["pending", "running"],
+                    "page": page.page,
+                    "has_more": page.has_more,
+                    "next_page": page.page + 1 if page.has_more else None,
+                    "tasks": [task_payload(task, clock=ctx.clock) for task in page.items],
+                },
+                ensure_ascii=False,
+            )
+        if name == "schedule_task":
+            task = await tasks.create(
+                group_id,
+                args["intent"],
+                cfg.tasks,
+                run_at=args.get("run_at"),
+                delay_seconds=args.get("delay_seconds"),
+                parent=ctx.parent_task,
+            )
+        else:
+            try:
+                task_id = uuid.UUID(args["id"])
+            except (ValueError, TypeError) as exc:
+                raise TaskInputError("任务 ID 必须是完整 UUID。") from exc
+            if name == "get_scheduled_task":
+                task = await tasks.get(group_id, task_id)
+            elif name == "update_scheduled_task":
+                task = await tasks.update(
+                    group_id,
+                    task_id,
+                    cfg.tasks,
+                    intent=args.get("intent"),
+                    run_at=args.get("run_at"),
+                    delay_seconds=args.get("delay_seconds"),
+                )
+            else:
+                task = await tasks.cancel(group_id, task_id)
+        if task is None:
+            return failure(
+                "not_found" if name == "get_scheduled_task" else "not_pending_or_not_found",
+                "本群没有该任务，或任务已不处于可修改的待执行状态。",
+            )
+        return json.dumps(
+            {
+                "ok": True,
+                "scope": "current_group",
+                "operation": name,
+                "task": task_payload(task, clock=ctx.clock),
+            },
+            ensure_ascii=False,
+        )
+    except (TaskInputError, TaskLimit) as exc:
+        return failure("rejected", str(exc))
+    except (asyncpg.PostgresError, OSError, TimeoutError) as exc:
+        log.warning("scheduled task operation failed: %s", why(exc))
+        return failure("unknown", "未能确认操作结果；不要声称成功或盲目重试写入。")
 
 
 async def _execute_open_images(name, args, *, cfg, group_id, ctx):
@@ -909,7 +957,7 @@ async def _execute_search_history(name, args, *, cfg, group_id, ctx):
             speaker_name=_text(args, "speaker_name") or None,
             days=_days(args.get("days")),
             rcfg=HISTORY_LIMITS,
-            self_id=str(getattr(ctx.bot, "self_id", "") or "") if ctx else None,
+            self_id=ctx.bot.self_id if ctx and ctx.bot else None,
             people=ctx.people if ctx else None,
         )
     except QuotaExhausted:

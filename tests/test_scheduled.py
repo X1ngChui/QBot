@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import asyncio
+import json
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
@@ -14,7 +15,7 @@ from qqbot.conversation import prompt
 from qqbot.conversation import tools
 from qqbot.delivery.service import GroupDelivery
 from qqbot.conversation.member_numbers import MemberNumbers
-from _test_owners import fresh_budget, fresh_members
+from _test_owners import fresh_budget, fresh_members, fresh_tasks
 from qqbot.conversation.history import HistoryWindow
 from qqbot.conversation.state import ChatMsg
 from qqbot.conversation.state import GroupState
@@ -82,30 +83,21 @@ async def test_scheduled(scheduled_state, monkeypatch):
             [group.to_db(), other_group.to_db()],
         )
     due = datetime.now(UTC) + timedelta(minutes=10)
-    first = await repo.create(group, "111", "Check tomorrow's status", due, cfg.tasks)
-    assert first.creator_id == "111" and first.id == first.chain_id, (
-        "the task stores an exact creator and a unique chain"
+    first = await repo.create(group, "Check tomorrow's status", due, cfg.tasks)
+    assert first.id == first.chain_id, "a group task stores a unique chain"
+    assert not await repo.cancel(first.id, other_group), "another group cannot cancel a task"
+    assert len((await repo.active(group)).items) == 1 and await repo.cancel(first.id, group), (
+        "group management does not require an initiating account"
     )
-    assert not await repo.pending(group, "222", owner=False), "another account cannot list a task"
-    assert not await repo.cancel(first.id, other_group, "111", owner=True), (
-        "another group cannot cancel a task"
-    )
-    assert not await repo.cancel(first.id, group, "222", owner=False), (
-        "another member cannot cancel a task"
-    )
-    assert len(await repo.pending(group, "111", owner=False)) == 1 and await repo.cancel(
-        first.id, group, "111", owner=False
-    ), "the creator can list and cancel their task"
 
-    root = await repo.create(group, "111", "Wait for the decision", due, cfg.tasks)
-    child = await repo.create(group, "111", "Recheck the decision", due, cfg.tasks, parent=root)
-    assert child.chain_id == root.id and child.chain_depth == 1 and child.creator_id == "111", (
-        "a follow-up inherits the original creator and chain"
+    root = await repo.create(group, "Wait for the decision", due, cfg.tasks)
+    child = await repo.create(group, "Recheck the decision", due, cfg.tasks, parent=root)
+    assert child.chain_id == root.id and child.chain_depth == 1, (
+        "a follow-up inherits its original group chain"
     )
     try:
         await repo.create(
             group,
-            "111",
             "Keep checking",
             due,
             cfg.tasks.model_copy(update={"max_chain_depth": 1}),
@@ -137,7 +129,8 @@ async def test_scheduled(scheduled_state, monkeypatch):
         ),
         msg=None,
         task_intent="Check whether the plan is still current",
-        task_initiator="Original requester⟦2⟧",
+        task_id=str(root.id),
+        task_due_at=root.due_at.isoformat(),
         profiles=[],
         window=[history],
         nums=nums,
@@ -149,7 +142,7 @@ async def test_scheduled(scheduled_state, monkeypatch):
     assert (
         "The plan changed today" in str(packet[-2])
         and "Check whether the plan is still current" in str(packet[-1])
-        and "Original requester⟦2⟧" in str(packet[-1])
+        and str(root.id) in str(packet[-1])
         and "#2" not in str(packet[-1])
     ), "scheduled prompt sees fresh history and no fabricated message number"
 
@@ -204,7 +197,7 @@ async def test_scheduled(scheduled_state, monkeypatch):
     ctx = tools.ToolCtx(
         providers=object(),
         media=object(),
-        initiator="333",
+        tasks=fresh_tasks(),
         identities=_test_db.identities,
         database=_test_db.pool,
         clock=_test_db.clock,
@@ -217,10 +210,9 @@ async def test_scheduled(scheduled_state, monkeypatch):
     result = await tools.execute(
         call, cfg=cfg, group_id=other_group, ctx=ctx, prompts=_test_db.test_bundle().prompts
     )
-    assert (
-        "已预约任务" in str(result)
-        and len(await repo.pending(other_group, "333", owner=False)) == 1
-    ), "schedule tool binds account and group outside model arguments"
+    assert json.loads(str(result))["ok"] and len((await repo.active(other_group)).items) == 1, (
+        "schedule tool binds only its group outside model arguments"
+    )
     bad = ToolCall(
         ToolCallId("bad"), "schedule_task", '{"intent":"Wrong time","run_at":"2030-01-01T09:00:00"}'
     )
@@ -238,15 +230,12 @@ async def test_scheduled(scheduled_state, monkeypatch):
         forged, cfg=cfg, group_id=other_group, ctx=ctx, prompts=_test_db.test_bundle().prompts
     )
     assert (
-        isinstance(rejected, tools.Failure)
-        and len(await repo.pending(other_group, "333", owner=True)) == 1
-    ), "a model cannot supply a different initiating account"
+        isinstance(rejected, tools.Failure) and len((await repo.active(other_group)).items) == 1
+    ), "a model cannot supply an account or group scope"
     assert await repo.cancel(
-        (await repo.pending(other_group, "333", owner=True))[0]["id"],
+        (await repo.active(other_group)).items[0].id,
         other_group,
-        "999",
-        owner=True,
-    ), "the owner may cancel another account's task in the same group"
+    ), "any task operation is group-owned, not creator-owned"
 
     limited_group = GroupId("881223")
     await pool().execute("DELETE FROM scheduled_task WHERE group_id=$1", limited_group.to_db())
@@ -254,9 +243,7 @@ async def test_scheduled(scheduled_state, monkeypatch):
 
     async def offer():
         try:
-            return await repo.create(
-                limited_group, "333", "Wait for confirmation", due, one_pending
-            )
+            return await repo.create(limited_group, "Wait for confirmation", due, one_pending)
         except TaskLimit:
             return None
 
@@ -268,7 +255,7 @@ async def test_scheduled(scheduled_state, monkeypatch):
     daily_group = GroupId("881224")
     await pool().execute("DELETE FROM scheduled_task WHERE group_id=$1", daily_group.to_db())
     for _ in range(2):
-        await repo.create(daily_group, "444", "Check once", due, cfg.tasks)
+        await repo.create(daily_group, "Check once", due, cfg.tasks)
     await pool().execute(
         "UPDATE scheduled_task SET due_at=now()-interval '1 second' WHERE group_id=$1",
         daily_group.to_db(),
@@ -310,7 +297,7 @@ async def test_scheduled(scheduled_state, monkeypatch):
         await repo.claim_due(cfg.tasks, day_start=start, day_end=start + timedelta(days=1))
     )[0], "completed tasks are never reclaimed"
 
-    wake = await repo.create(group, "111", "Use the latest group context", due, cfg.tasks)
+    wake = await repo.create(group, "Use the latest group context", due, cfg.tasks)
     await pool().execute(
         "UPDATE scheduled_task SET due_at=now()-interval '1 second' WHERE id=$1", wake.id
     )
@@ -331,6 +318,7 @@ async def test_scheduled(scheduled_state, monkeypatch):
 
     def make_runner():
         executor = ReplyExecutor(
+            tasks=fresh_tasks(),
             bundle=_test_db.bundle_for_settings(cfg),
             clock=_test_db.clock,
             database=_test_db.pool,
@@ -402,9 +390,7 @@ async def test_scheduled(scheduled_state, monkeypatch):
         ), "successful wake-up is completed once"
 
         runner = make_runner()
-        blocked = await repo.create(
-            other_group, "333", "Do not reply while blocked", due, cfg.tasks
-        )
+        blocked = await repo.create(other_group, "Do not reply while blocked", due, cfg.tasks)
         await pool().execute(
             "UPDATE scheduled_task SET due_at=now()-interval '1 second' WHERE id=$1",
             blocked.id,
@@ -415,13 +401,13 @@ async def test_scheduled(scheduled_state, monkeypatch):
         )
         await fire(runner, SimpleNamespace(self_id="999"), claimed)
         assert (
-            len(seen) == 1
+            len(seen) == 2
             and await pool().fetchval("SELECT outcome FROM scheduled_task WHERE id=$1", blocked.id)
-            == "blocked"
-        ), "a blocked initiator cannot trigger a paid reply"
+            == "sent"
+        ), "a group wakeup is independent of member blocking"
         state.blocked = False
 
-        muted = await repo.create(other_group, "333", "Do not reply while muted", due, cfg.tasks)
+        muted = await repo.create(other_group, "Do not reply while muted", due, cfg.tasks)
         await pool().execute(
             "UPDATE scheduled_task SET due_at=now()-interval '1 second' WHERE id=$1",
             muted.id,
@@ -432,13 +418,13 @@ async def test_scheduled(scheduled_state, monkeypatch):
         )
         await fire(runner, SimpleNamespace(self_id="999"), claimed)
         assert (
-            len(seen) == 1
+            len(seen) == 2
             and await pool().fetchval("SELECT outcome FROM scheduled_task WHERE id=$1", muted.id)
             == "muted"
         ), "a muted group cannot trigger a paid reply"
         state.muted = False
 
-        capped = await repo.create(other_group, "333", "Do not spend after the cap", due, cfg.tasks)
+        capped = await repo.create(other_group, "Do not spend after the cap", due, cfg.tasks)
         await pool().execute(
             "UPDATE scheduled_task SET due_at=now()-interval '1 second' WHERE id=$1",
             capped.id,
@@ -457,14 +443,12 @@ async def test_scheduled(scheduled_state, monkeypatch):
         finally:
             BUDGET.exceeded = original_exceeded
         assert (
-            len(seen) == 1
+            len(seen) == 2
             and await pool().fetchval("SELECT outcome FROM scheduled_task WHERE id=$1", capped.id)
             == "budget"
         ), "the daily cost cap suppresses a due task before model spending"
 
-        interrupted = await repo.create(
-            other_group, "333", "Do not retry after crash", due, cfg.tasks
-        )
+        interrupted = await repo.create(other_group, "Do not retry after crash", due, cfg.tasks)
         await pool().execute(
             "UPDATE scheduled_task SET due_at=now()-interval '1 second' WHERE id=$1",
             interrupted.id,
@@ -562,6 +546,7 @@ async def test_scheduled(scheduled_state, monkeypatch):
             )
             delivery = GroupDelivery()
             delivered = await engine.respond(
+                tasks=fresh_tasks(),
                 bot=Bot(),
                 st=genuine_state,
                 cfg=cfg,
@@ -588,10 +573,10 @@ async def test_scheduled(scheduled_state, monkeypatch):
                 and sent_batches[0][1][0]["data"]["text"] == "Updated now"
             ), "the real agent session sends from a scheduled wakeup"
             assert (
-                "原发起人⟦" in str(model_prompts[0][-1])
+                str(wake.id) in str(model_prompts[0][-1])
                 and "Updated just now" in str(model_prompts[0][-2])
                 and "Use the latest group context" in str(model_prompts[0][-1])
-            ), "the due model request binds original requester and new history"
+            ), "the due model request binds its group task and fresh history"
         finally:
             engine.retrieval.gather = original_gather
             engine.retrieval.group_knowledge = original_knowledge

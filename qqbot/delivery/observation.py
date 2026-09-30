@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from qqbot.domain.ids import AccountId
 import asyncio
 import time
 from collections import OrderedDict
@@ -10,7 +11,7 @@ from qqbot.domain.ids import GroupId
 from qqbot.domain.ids import MessageId
 from qqbot.conversation.state import ChatMsg
 
-Key = tuple[str, GroupId, MessageId]
+Key = tuple[AccountId, GroupId, MessageId]
 ECHO_TIMEOUT_SEC = 8
 
 
@@ -22,8 +23,8 @@ class SelfEcho:
         self._waiters: dict[Key, set[asyncio.Future[ChatMsg]]] = {}
         self._closed = False
 
-    def publish(self, self_id: str, group_id: GroupId, msg: ChatMsg) -> None:
-        if self._closed or not msg.is_bot or str(msg.user_id) != self_id:
+    def publish(self, self_id: AccountId, group_id: GroupId, msg: ChatMsg) -> None:
+        if self._closed or not msg.is_bot or msg.user_id != self_id:
             return
         key = (self_id, group_id, msg.msg_id)
         self._recent[key] = (time.monotonic(), msg)
@@ -35,7 +36,7 @@ class SelfEcho:
                 waiter.set_result(msg)
 
     async def wait(
-        self, self_id: str, group_id: GroupId, message_id: MessageId, *, timeout: float
+        self, self_id: AccountId, group_id: GroupId, message_id: MessageId, *, timeout: float
     ) -> ChatMsg | None:
         if self._closed:
             return None

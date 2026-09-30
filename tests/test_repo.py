@@ -22,7 +22,7 @@ from qqbot.gateway.ingest import Ingestor
 from qqbot.repositories import IdentityRepository
 from qqbot.services import IdentityResolver
 from qqbot.domain.archive import AuthorKind
-from qqbot.domain.ids import GroupId
+from qqbot.domain.ids import AccountId, GroupId
 from qqbot.gateway.onebot import GroupMessage, Sender
 from _fixtures import now_local, today_local
 from _db import reset
@@ -226,20 +226,20 @@ async def test_repo(repo_ingestor, monkeypatch):
         G1
     ), "a group with no rows reads as all-off"
     await _test_db.groups.set_group_muted(G1, True)
-    await _test_db.groups.block(G1, "u9")
-    await _test_db.groups.block(G1, "u8")
-    await _test_db.groups.block(G1, "u9")  # Replacing one exact rule keeps one row.
+    await _test_db.groups.block(G1, AccountId("u9"))
+    await _test_db.groups.block(G1, AccountId("u8"))
+    await _test_db.groups.block(G1, AccountId("u9"))  # Replacing one exact rule keeps one row.
     rules = await _test_db.groups.block_rules(G1)
     assert (
         await _test_db.groups.group_muted(G1)
         and {row["user_id"] for row in rules} == {"u8", "u9"}
         and await _test_db.groups.blocked(G1, "u9")
     ), "switches and exact rules round-trip"
-    assert await _test_db.groups.unblock(G1, "u9") and not await _test_db.groups.unblock(
-        G1, "u9"
+    assert await _test_db.groups.unblock(G1, AccountId("u9")) and not await _test_db.groups.unblock(
+        G1, AccountId("u9")
     ), "unblocking reports whether anything changed"
     await _test_db.groups.set_group_muted(G1, False)
-    await _test_db.groups.unblock(G1, "u8")
+    await _test_db.groups.unblock(G1, AccountId("u8"))
     assert not await _test_db.groups.group_muted(G1) and not await _test_db.groups.block_rules(
         G1
     ), "and can be cleared"

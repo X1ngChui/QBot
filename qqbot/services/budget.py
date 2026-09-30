@@ -7,6 +7,7 @@ charges lost before persistence and is not an accounting-repair procedure.
 
 from __future__ import annotations
 
+from qqbot.domain.ids import AccountId
 import asyncio
 import logging
 from contextlib import contextmanager
@@ -62,7 +63,7 @@ _SCOPE: ContextVar[Scope | None] = ContextVar("budget_scope", default=None)
 #: calls deep in a backend that must not learn about accounts. It rides created tasks
 #: too - asyncio copies the context at create_task - so a single-flight describe is
 #: attributed to whoever launched the flight.
-_WHO: ContextVar[str | None] = ContextVar("budget_who", default=None)
+_WHO: ContextVar[AccountId | None] = ContextVar("budget_who", default=None)
 
 
 class LedgerHealth(StrEnum):
@@ -119,8 +120,8 @@ class Budget:
             _SCOPE.reset(token)
 
     @contextmanager
-    def attribute(self, user_id: str | None) -> Iterator[None]:
-        token = _WHO.set((user_id or "").strip() or None)
+    def attribute(self, user_id: AccountId | None) -> Iterator[None]:
+        token = _WHO.set(user_id)
         try:
             yield
         finally:
@@ -186,7 +187,7 @@ class Budget:
                     out=out,
                     calls=calls,
                     cny=cny,
-                    user_id=_WHO.get() or "",
+                    user_id=_WHO.get(),
                 )
         except asyncio.CancelledError:
             self._write_uncertain = True

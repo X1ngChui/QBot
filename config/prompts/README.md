@@ -24,7 +24,7 @@ Although all wording is stored together, role and lifecycle boundaries remain ty
 | `reply_system` | Stable cross-group reply policy | `shared_legend`, `shared_pragmatics` |
 | `reply_developer` | Group persona, background and roster frame | `persona`, `group_context`, `member_roster` |
 | `reply_user` | Volatile clock and newly received message | `now`, `current_message` |
-| `scheduled_user` | Current clock, due task intent and original requester | `now`, `intent`, `initiator` |
+| `scheduled_user` | Current clock and group task identity, intent and due time | `now`, `intent`, `task_id`, `due_at` |
 | `extract_system` | Complete extraction policy | `shared_legend`, `shared_pragmatics`, `predicate_table` |
 | `extract_user` | One extraction batch | `bot_names`, `account_roster`, `known_memory`, `transcript` |
 | `vision_system` | Standalone image description instruction | none |

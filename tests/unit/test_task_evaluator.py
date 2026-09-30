@@ -28,7 +28,7 @@ async def test_each_repeated_task_request_has_a_real_effect_and_live_list(bundle
         )
 
     before = await execute(call("list_scheduled_tasks", {}))
-    assert "没有" in before
+    assert json.loads(before)["tasks"] == []
     args = {"intent": "Fictional task", "delay_seconds": 300}
     await execute(call("schedule_task", args))
     await execute(call("schedule_task", args))
@@ -71,3 +71,62 @@ def test_partial_operation_and_missing_final_query_never_pass_evaluation():
     failures = simulation.failures()
     assert "merge did not retain exactly one replacement plus unrelated reminder" in failures
     assert "missing fresh final verification after mutations" in failures
+
+
+async def test_malformed_model_arguments_are_recoverable_failure(bundle):
+    simulation = FictionalTasks(EvalCase("fictional", "Fictional request"), Clock("Asia/Shanghai"))
+    ctx = SimpleNamespace(registry=tools.tool_registry(bundle.default, prompts=bundle.prompts))
+    invalid = await simulation.execute(
+        call("list_scheduled_tasks", {"page": 0}),
+        cfg=bundle.default,
+        group_id=GroupId("311"),
+        ctx=ctx,
+    )
+    assert isinstance(invalid, tools.Failure)
+    valid = await simulation.execute(
+        call("list_scheduled_tasks", {}), cfg=bundle.default, group_id=GroupId("311"), ctx=ctx
+    )
+    assert json.loads(valid)["ok"] and len(simulation.events) == 2
+
+
+def test_wrong_execution_times_do_not_pass_evaluation():
+    from dataclasses import replace
+    from datetime import timedelta
+    from qqbot.repositories.scheduled_task import ScheduledTask
+
+    case = next(case for case in CASES if case.name == "explicit-rebuild-not-just-list")
+    clock = Clock("Asia/Shanghai", wall=lambda: datetime(2030, 1, 2, tzinfo=UTC))
+    simulation = FictionalTasks(case, clock)
+    initial = next(iter(simulation.storage.tasks))
+    simulation.storage.tasks.clear()
+    for intent in ("换电池", "检查支架"):
+        import uuid
+
+        identifier = uuid.uuid4()
+        simulation.storage.tasks[identifier] = ScheduledTask(
+            identifier,
+            GroupId("311"),
+            intent,
+            clock.now() + timedelta(minutes=5),
+            identifier,
+            0,
+        )
+    simulation.storage.creations = 2
+    simulation.messages.append("Fictional report")
+    simulation.events.extend(
+        [
+            ("cancel_scheduled_task", {"id": str(initial)}, "{}"),
+            ("schedule_task", {}, "{}"),
+            ("list_scheduled_tasks", {}, "{}"),
+        ]
+    )
+    assert "wrong replacement time: 换电池" in simulation.failures()
+    assert "wrong replacement time: 支架" in simulation.failures()
+    tomorrow = clock.now() + timedelta(days=1)
+    for identifier, task in tuple(simulation.storage.tasks.items()):
+        hour = 9 if "换电池" in task.intent else 10
+        simulation.storage.tasks[identifier] = replace(
+            task,
+            due_at=tomorrow.replace(hour=hour, minute=0, second=0, microsecond=0),
+        )
+    assert simulation.failures() == []

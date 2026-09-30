@@ -10,6 +10,7 @@ and one set of facts, and no caller has to know the merge happened.
 
 from __future__ import annotations
 
+from qqbot.domain.ids import AccountId
 from qqbot.clock import Clock
 
 import logging
@@ -26,10 +27,10 @@ from qqbot.domain.identity import EvidenceType
 from qqbot.domain.identity import IdentityAccount
 from qqbot.domain.identity import normalize
 from qqbot.domain.memory import Fact
-from qqbot.domain.memory import MemoryType
 from qqbot.repositories.roster import RosterRepository
 from qqbot.repositories import EventRepository
 from qqbot.repositories import IdentityRepository
+from qqbot.repositories.memory import NOTE_PAGE_SIZE
 from qqbot.repositories import MemoryRepository
 from qqbot.services.context_builder import NOTE
 from qqbot.configuration import PredicateTable
@@ -77,7 +78,7 @@ class NotMerged(ValueError):
     under the old one, so it is refused rather than performed.
     """
 
-    def __init__(self, user_id: str) -> None:
+    def __init__(self, user_id: AccountId) -> None:
         super().__init__(f"account {user_id} is not merged with anything")
         self.user_id = user_id
         #: What the caller is told.
@@ -116,7 +117,7 @@ class FactCard:
     assembling one of them itself.
     """
 
-    index: int
+    index: int | None
     id: uuid.UUID
     predicate: str
     object_key: str | None
@@ -142,11 +143,11 @@ class PersonCard:
     """Everything the group knows about one person."""
 
     entity_id: uuid.UUID
-    user_id: str
+    user_id: AccountId
     display: str
     live_display: bool = False
     account_id: uuid.UUID | None = None
-    accounts: tuple[str, ...] = ()
+    accounts: tuple[AccountId, ...] = ()
     messages: int = 0
     names: tuple[NameCard, ...] = ()
     #: Unconfirmed names remain visible as scored context, not as identity keys.
@@ -187,9 +188,17 @@ class PersonCard:
         )
 
     @property
+    def notes(self) -> tuple[FactCard, ...]:
+        """Manual notes have their own management list, never a forget index."""
+        return tuple(f for f in self.facts if f.manual)
+
+    @property
     def note(self) -> str:
-        """What an owner or the account holder wrote by hand, if anything."""
-        return "；".join(f.object for f in self.facts if f.manual)
+        """All manual notes, retained separately from learned hints."""
+        return "\n".join(
+            ("精确账号：" if f.account_id is not None else "关联身份共享：") + f.object
+            for f in self.notes
+        )
 
     @property
     def learned(self) -> tuple[FactCard, ...]:
@@ -277,8 +286,8 @@ class Directory:
         self,
         group_id: GroupId,
         *,
-        display: dict[str, str] | None = None,
-        exclude: set[str] | None = None,
+        display: dict[AccountId, str] | None = None,
+        exclude: set[AccountId] | None = None,
     ) -> list[PersonCard]:
         """Everyone who has spoken here, most talkative first.
 
@@ -309,7 +318,13 @@ class Directory:
         cards.sort(key=lambda c: (-c.messages, c.user_id))
         return cards
 
-    async def account_card(self, group_id: GroupId, user_id: str) -> PersonCard:
+    async def display_name(self, group_id: GroupId, user_id: AccountId) -> str:
+        """A lightweight confirmed account label, without facts or archive counts."""
+        account = await self._identity.account(user_id)
+        aliases = await self._ids.aliases_for_account(group_id, account.id)
+        return _current_platform_name(aliases) or user_id
+
+    async def account_card(self, group_id: GroupId, user_id: AccountId) -> PersonCard:
         """The record attached to one exact platform account."""
 
         account = await self._identity.account(user_id)
@@ -328,7 +343,7 @@ class Directory:
             facts=facts,
         )
 
-    async def holder_card(self, group_id: GroupId, user_id: str) -> PersonCard:
+    async def holder_card(self, group_id: GroupId, user_id: AccountId) -> PersonCard:
         """The aggregate record for every account linked to the named account."""
 
         account = await self._identity.account(user_id)
@@ -342,7 +357,7 @@ class Directory:
             {},
         )
 
-    async def account(self, user_id: str) -> IdentityAccount:
+    async def account(self, user_id: AccountId) -> IdentityAccount:
         """Resolve one platform account for command and policy services."""
 
         return await self._identity.account(user_id)
@@ -350,7 +365,7 @@ class Directory:
     async def accounts_of_holder(self, entity_id: uuid.UUID) -> list[IdentityAccount]:
         return await self._ids.accounts_of(entity_id)
 
-    async def linked_account_ids(self, user_id: str) -> list[str]:
+    async def linked_account_ids(self, user_id: AccountId) -> list[AccountId]:
         """Every exact account currently linked to this one."""
 
         try:
@@ -363,9 +378,9 @@ class Directory:
         self,
         group_id: GroupId,
         entity_id: uuid.UUID,
-        accounts: list[str],
-        counts: dict[str, int],
-        display: dict[str, str],
+        accounts: list[AccountId],
+        counts: dict[AccountId, int],
+        display: dict[AccountId, str],
     ) -> PersonCard:
         aliases = await self._ids.aliases_for(group_id, entity_id)
         facts = await self._memory.current_facts(group_id, [entity_id])
@@ -413,10 +428,10 @@ class Directory:
         *,
         entity_id: uuid.UUID,
         account_id: uuid.UUID | None,
-        primary: str,
-        accounts: list[str],
+        primary: AccountId,
+        accounts: list[AccountId],
         display: str,
-        counts: dict[str, int],
+        counts: dict[AccountId, int],
         aliases: list[Alias],
         facts: list[Fact],
         live_display: bool = False,
@@ -431,6 +446,10 @@ class Directory:
                 str(fact.id),
             ),
         )
+        numbers = {
+            fact.id: index
+            for index, fact in enumerate((f for f in ordered if f.predicate != NOTE), start=1)
+        }
         return PersonCard(
             entity_id=entity_id,
             account_id=account_id,
@@ -450,7 +469,7 @@ class Directory:
             ),
             facts=tuple(
                 FactCard(
-                    index=index,
+                    index=numbers.get(fact.id),
                     id=fact.id,
                     predicate=fact.predicate,
                     object_key=fact.object_key,
@@ -464,7 +483,7 @@ class Directory:
                         predicates=self._predicates,
                     ),
                 )
-                for index, fact in enumerate(ordered, start=1)
+                for fact in ordered
             ),
         )
 
@@ -503,48 +522,97 @@ class Directory:
         return match
 
     # -- corrections ------------------------------------------------------
-    async def note(
+    @staticmethod
+    def _note_text(text: str) -> str:
+        text = text.strip()
+        if not text or len(text) > 500:
+            raise ValueError("人工备注须为 1 到 500 字。")
+        return text
+
+    async def _note_subject(self, user_id: AccountId, *, all_linked: bool) -> uuid.UUID:
+        account = await self._identity.account(user_id)
+        return account.entity_id if all_linked else account.id
+
+    async def notes(
         self,
         group_id: GroupId,
-        user_id: str,
+        user_id: AccountId,
+        *,
+        all_linked: bool = False,
+        page: int = 1,
+    ) -> tuple[tuple[Fact, ...], bool]:
+        """A page of editable notes; account notes are not shared notes."""
+        if isinstance(page, bool) or not 1 <= page <= 10000:
+            raise ValueError("页码须为 1 到 10000 的整数。")
+        subject = await self._note_subject(user_id, all_linked=all_linked)
+        rows = await self._memory.notes(
+            group_id,
+            subject,
+            holder=all_linked,
+            offset=(page - 1) * NOTE_PAGE_SIZE,
+            limit=NOTE_PAGE_SIZE + 1,
+        )
+        return tuple(rows[:NOTE_PAGE_SIZE]), len(rows) > NOTE_PAGE_SIZE
+
+    async def add_note(
+        self,
+        group_id: GroupId,
+        user_id: AccountId,
         text: str,
         *,
         all_linked: bool = False,
-    ) -> None:
-        """Write, replace, or clear one exact-account or linked-holder note."""
+    ) -> Fact:
+        subject = (await self._identity.account(user_id)).id
+        return await self._memory.add_note(
+            group_id,
+            subject,
+            self._note_text(text),
+            holder=all_linked,
+        )
 
-        account = await self._identity.account(user_id)
-        facts = (
-            await self._memory.current_facts(group_id, [account.entity_id])
-            if all_linked
-            else await self._memory.current_account_facts(group_id, [account.id])
+    async def edit_note(
+        self,
+        group_id: GroupId,
+        user_id: AccountId,
+        index: int,
+        text: str,
+        *,
+        all_linked: bool = False,
+    ) -> Fact | None:
+        subject = (await self._identity.account(user_id)).id
+        return await self._memory.change_note(
+            group_id,
+            subject,
+            holder=all_linked,
+            index=index,
+            text=self._note_text(text),
         )
-        if not text.strip():
-            for fact in facts:
-                if fact.predicate == NOTE and (
-                    (all_linked and fact.subject_entity_id is not None)
-                    or (not all_linked and fact.subject_account_id == account.id)
-                ):
-                    await self._memory.retract(fact.id)
-            return
-        await self._memory.supersede(
-            Fact(
-                subject_entity_id=account.entity_id if all_linked else None,
-                subject_account_id=None if all_linked else account.id,
-                predicate=NOTE,
-                object_value=text.strip(),
-                memory_type=MemoryType.ATTRIBUTE,
-                group_id=group_id,
-                confidence=MANUAL_CONFIDENCE,
-            ),
-            [],
-            when=self._clock.now(),
-        )
+
+    async def remove_note(
+        self,
+        group_id: GroupId,
+        user_id: AccountId,
+        index: int,
+        *,
+        all_linked: bool = False,
+    ) -> Fact | None:
+        subject = (await self._identity.account(user_id)).id
+        return await self._memory.change_note(group_id, subject, holder=all_linked, index=index)
+
+    async def clear_notes(
+        self,
+        group_id: GroupId,
+        user_id: AccountId,
+        *,
+        all_linked: bool = False,
+    ) -> int:
+        subject = (await self._identity.account(user_id)).id
+        return await self._memory.clear_notes(group_id, subject, holder=all_linked)
 
     async def name(
         self,
         group_id: GroupId,
-        user_id: str,
+        user_id: AccountId,
         text: str,
         *,
         all_linked: bool = False,
@@ -576,7 +644,7 @@ class Directory:
     async def set_confidence(
         self,
         group_id: GroupId,
-        user_id: str,
+        user_id: AccountId,
         text: str,
         confidence: float,
         *,
@@ -623,7 +691,7 @@ class Directory:
     async def unname(
         self,
         group_id: GroupId,
-        user_id: str,
+        user_id: AccountId,
         text: str,
         *,
         all_linked: bool = False,
@@ -647,7 +715,7 @@ class Directory:
     async def forget(
         self,
         group_id: GroupId,
-        user_id: str,
+        user_id: AccountId,
         index: int,
         *,
         all_linked: bool = False,
@@ -659,19 +727,26 @@ class Directory:
             if all_linked
             else await self.account_card(group_id, user_id)
         )
-        match = next((fact for fact in card.facts if fact.index == index), None)
+        match = next((fact for fact in card.learned if fact.index == index), None)
         if match is None:
             return None
-        await self._memory.retract(match.id)
+        subject = card.entity_id if all_linked else card.account_id
+        if subject is None or not await self._memory.retract_learned(
+            group_id,
+            match.id,
+            subject=subject,
+            holder=all_linked,
+        ):
+            return None
         log.info("group %s: retracted fact %s (%s)", group_id, match.id, match.predicate)
         return match
 
-    async def merge(self, left: str, right: str) -> bool:
+    async def merge(self, left: AccountId, right: AccountId) -> bool:
         """Union the current holder sets of two exact accounts."""
 
         return await self._identity.merge(left, right)
 
-    async def split(self, user_id: str) -> uuid.UUID:
+    async def split(self, user_id: AccountId) -> uuid.UUID:
         """Give one account its own person again. See IdentityResolver.split.
 
         Raises NotMerged when the account is already alone. Exact-account rows follow
@@ -702,10 +777,6 @@ class Directory:
             )
             or "另一位成员"
         )
-
-    async def _entity(self, user_id: str) -> uuid.UUID:
-        # The live person: merge() repoints every account, so no chase is needed.
-        return (await self._identity.account(user_id)).entity_id
 
 
 __all__ = [

@@ -8,7 +8,7 @@ from collections.abc import Callable
 import asyncpg
 
 from qqbot.domain.evidence import EvidenceMemo
-from qqbot.domain.ids import GroupId
+from qqbot.domain.ids import GroupId, MessageId
 
 
 class EvidenceRepository:
@@ -16,7 +16,7 @@ class EvidenceRepository:
         self._database = database
 
     async def evidence_add(
-        self, group_id: GroupId, reply_event_id: str, memo: EvidenceMemo
+        self, group_id: GroupId, reply_event_id: MessageId, memo: EvidenceMemo
     ) -> None:
         """Store one structured memo; a replayed reply keeps its original evidence."""
 
@@ -31,7 +31,9 @@ class EvidenceRepository:
             memo.expires_at,
         )
 
-    async def evidence_for(self, group_id: GroupId, reply_event_ids: list[str]) -> dict[str, str]:
+    async def evidence_for(
+        self, group_id: GroupId, reply_event_ids: list[MessageId]
+    ) -> dict[MessageId, str]:
         """Render unexpired structured memos for prompt replay."""
 
         if not reply_event_ids:
@@ -43,14 +45,14 @@ class EvidenceRepository:
             _group(group_id),
             reply_event_ids,
         )
-        rendered: dict[str, str] = {}
+        rendered: dict[MessageId, str] = {}
         for row in rows:
             try:
                 content = EvidenceMemo.from_dict(row["memo"]).render()
             except (TypeError, ValueError):
                 continue
             if content:
-                rendered[row["reply_event_id"]] = content
+                rendered[MessageId(row["reply_event_id"])] = content
         return rendered
 
     async def evidence_prune(

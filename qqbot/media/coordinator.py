@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 from qqbot.configuration import Settings
 from qqbot.repositories.archive import ArchiveRepository
-from qqbot.domain.ids import GroupId, MessageId
+from qqbot.domain.ids import AccountId, GroupId, MessageId
 from qqbot.gateway.botapi import BotApi
 from qqbot.gateway.segments import ParsedMessage
 from qqbot.media.result import Resolution
@@ -43,7 +43,7 @@ class MediaTicket:
     bot: BotApi
     group_id: GroupId
     cfg: Settings
-    default_who: str
+    default_who: AccountId
     status: MediaStatus = MediaStatus.PENDING
     task: asyncio.Task[None] | None = None
     resolved: dict[int, Resolution] = field(default_factory=dict)
@@ -105,7 +105,7 @@ class MediaCoordinator:
             bot=bot,
             group_id=group_id,
             cfg=cfg,
-            default_who=str(message.user_id),
+            default_who=message.user_id,
         )
         self._tickets[raw_event_id] = ticket
         self.high_water = max(self.high_water, len(self._tickets))
@@ -119,7 +119,7 @@ class MediaCoordinator:
     def processor(self) -> MediaProcessor:
         return self._processor
 
-    def _start(self, ticket: MediaTicket, *, who: str | None) -> asyncio.Task[None] | None:
+    def _start(self, ticket: MediaTicket, *, who: AccountId | None) -> asyncio.Task[None] | None:
         if self._closed or ticket.status is MediaStatus.FINAL:
             return None
         if ticket.task is not None and not ticket.task.done():
@@ -127,7 +127,7 @@ class MediaCoordinator:
         if ticket.message_ref() is None:
             self._tickets.pop(ticket.raw_event_id, None)
             return None
-        task = asyncio.create_task(self._resolve(ticket, who=who or ticket.default_who))
+        task = asyncio.create_task(self._resolve(ticket, who=who))
         ticket.task = task
 
         def finished(done: asyncio.Task[None]) -> None:
@@ -139,7 +139,7 @@ class MediaCoordinator:
         task.add_done_callback(finished)
         return task
 
-    async def _resolve(self, ticket: MediaTicket, *, who: str) -> None:
+    async def _resolve(self, ticket: MediaTicket, *, who: AccountId | None) -> None:
         message = ticket.message_ref()
         if message is None:
             ticket.status = MediaStatus.FINAL
@@ -183,7 +183,7 @@ class MediaCoordinator:
         messages: list[ChatMsg],
         *,
         wait_sec: float,
-        who: str | None,
+        who: AccountId | None,
         cfg: Settings | None = None,
     ) -> None:
         """Start retryable work in a frozen reply window and wait once, bounded."""

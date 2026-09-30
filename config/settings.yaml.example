@@ -74,7 +74,6 @@ budget:
 
 tasks:
   max_days_ahead: 30
-  max_pending_per_account: 5
   max_pending_per_group: 50
   max_chain_depth: 24
   max_executions_per_group_day: 24

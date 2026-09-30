@@ -13,6 +13,7 @@ the two are always comparable.
 
 from __future__ import annotations
 
+from qqbot.domain.ids import AccountId
 import logging
 import uuid
 from datetime import datetime
@@ -39,7 +40,7 @@ class UnknownAccount(LookupError):
     "something broke".
     """
 
-    def __init__(self, user_id: str) -> None:
+    def __init__(self, user_id: AccountId) -> None:
         super().__init__(f"account {user_id} has not been seen")
         self.user_id = user_id
 
@@ -52,7 +53,7 @@ class IdentityResolver:
 
     async def seen(
         self,
-        user_id: str,
+        user_id: AccountId,
         *,
         group_id: GroupId,
         at: datetime,
@@ -97,14 +98,14 @@ class IdentityResolver:
             )
         return acc
 
-    async def account(self, user_id: str) -> IdentityAccount:
+    async def account(self, user_id: AccountId) -> IdentityAccount:
         """The account row, or UnknownAccount if this one has never been seen."""
         acc = await self._repo.account_of(PLATFORM, user_id)
         if acc is None:
             raise UnknownAccount(user_id)
         return acc
 
-    async def merge(self, left_account: str, right_account: str) -> bool:
+    async def merge(self, left_account: AccountId, right_account: AccountId) -> bool:
         """Union the two account equivalence classes using deterministic root choice."""
 
         left = await self.account(left_account)
@@ -119,7 +120,7 @@ class IdentityResolver:
             )
         return changed
 
-    async def split(self, account_id: str) -> uuid.UUID:
+    async def split(self, account_id: AccountId) -> uuid.UUID:
         """Undo a merge for one account: give it a person of its own again.
 
         Used by owner repair and authenticated self-service unlink. Returns the new

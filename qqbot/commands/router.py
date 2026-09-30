@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import os
 import uuid
 from collections.abc import Awaitable, Callable
@@ -19,6 +20,9 @@ from qqbot.providers import Kind
 from qqbot.providers.base import Providers
 from qqbot.repositories.extraction import ExtractionRepository
 from qqbot.repositories.identity_link import LinkChallengeError
+from qqbot.services.scheduled_tasks import ScheduledTaskService, TaskInputError
+from qqbot.repositories.scheduled_task import ScheduledTask, TaskLimit
+from qqbot.services.directory import NOTE_PAGE_SIZE
 from qqbot.services import Directory
 from qqbot.services import IdentityLinkService
 from qqbot.services import NameTaken
@@ -101,6 +105,7 @@ class CommandContext:
     bundle: ConfigBundle
     clock: Clock
     diagnostics: errors.ErrorRing
+    tasks: ScheduledTaskService
 
 
 class _Finished(Exception):
@@ -114,7 +119,45 @@ class UsageError(ValueError):
 
 
 async def _finish(ctx: CommandContext, message: str) -> Never:
-    raise _Finished(CommandResult.reply(ctx.request, message))
+    limit = ctx.bundle.default.conversation.max_text_chars_per_message - 2
+    pieces: list[str] = []
+    current = ""
+    for line in message.splitlines(keepends=True):
+        if len(current) + len(line) > limit and current:
+            pieces.append(current)
+            current = ""
+        while len(line) > limit:
+            pieces.append(line[:limit])
+            line = line[limit:]
+        current += line
+    if current or not pieces:
+        pieces.append(current)
+    raise _Finished(
+        CommandResult(
+            tuple(
+                part
+                for piece in pieces
+                for part in CommandResult.reply(ctx.request, piece).messages
+            )
+        )
+    )
+
+
+def _body(text: str) -> tuple[str, str | None]:
+    """Separate a bounded option header from untouched free text."""
+    if match := re.search(r"(?:^|\s)--(?:\s|$)", text):
+        return text[: match.start()].strip(), text[match.end() :].strip()
+    return text, None
+
+
+def _positive(value: str, *, maximum: int = 10000) -> int:
+    if not value.isdecimal() or len(value) > 5 or not 1 <= int(value) <= maximum:
+        raise UsageError(f"编号或页码须为 1 到 {maximum} 的整数。用法见 /help。")
+    return int(value)
+
+
+def _scope_label(all_linked: bool) -> str:
+    return "关联身份共享" if all_linked else "精确账号"
 
 
 type CommandHandler = Callable[[CommandContext], Awaitable[None]]
@@ -155,7 +198,9 @@ class CommandRouter:
         bundle: ConfigBundle,
         clock: Clock,
         diagnostics: errors.ErrorRing,
+        tasks: ScheduledTaskService,
     ) -> None:
+        self._tasks = tasks
         self._diagnostics = diagnostics
         self._database = database
         self._groups = groups
@@ -200,6 +245,7 @@ class CommandRouter:
             bundle=self._bundle,
             clock=self._clock,
             diagnostics=self._diagnostics,
+            tasks=self._tasks,
         )
         try:
             await handler(ctx)
@@ -207,6 +253,14 @@ class CommandRouter:
             return CommandResult.reply(request, str(exc))
         except _Finished as done:
             return done.result
+        except UnknownAccount:
+            return CommandResult.reply(request, "目标账号暂无资料，无法执行此操作。")
+        except (asyncpg.PostgresError, OSError, TimeoutError):
+            log.warning("command result could not be confirmed", exc_info=True)
+            return CommandResult.reply(
+                request,
+                "未能确认操作结果。请查询当前状态，不要盲目重复提交写入。",
+            )
         raise RuntimeError(f"command handler returned without a result: {spec.name}")
 
     async def dispatch(self, bot: BotApi, request: CommandRequest) -> bool:
@@ -242,8 +296,10 @@ def _args(event: CommandRequest, name: str) -> list[str]:
     return _strip_cmd(event.text, name).split()
 
 
-def _mentions(event: CommandRequest, *, exact: int | None = None, maximum: int = 1) -> list[str]:
-    mentions = [str(account) for account in event.mentions]
+def _mentions(
+    event: CommandRequest, *, exact: int | None = None, maximum: int = 1
+) -> list[AccountId]:
+    mentions = list(event.mentions)
     if exact is not None and len(mentions) != exact:
         raise UsageError(f"需要准确 @ {exact} 个账号。")
     if exact is None and len(mentions) > maximum:
@@ -263,15 +319,13 @@ def _scope(tokens: list[str]) -> tuple[bool, list[str]]:
 async def _target(
     ctx: CommandContext,
     event: CommandRequest,
-    *,
-    all_linked: bool,
-) -> str:
+) -> AccountId:
     mentioned = _mentions(event)
-    target = mentioned[0] if mentioned else str(event.user_id)
+    target = mentioned[0] if mentioned else event.user_id
     if not ctx.owner:
-        own = await ctx.directory.linked_account_ids(str(event.user_id))
+        own = await ctx.directory.linked_account_ids(event.user_id)
         if target not in own:
-            await _finish(ctx, "普通成员只能操作自己的账号记录。")
+            await _finish(ctx, "只能操作当前账号或已确认关联账号的资料。")
     return target
 
 
@@ -280,13 +334,13 @@ async def _owner_action(ctx: CommandContext) -> None:
         await _finish(ctx, "该操作需要 bot owner 权限。")
 
 
-async def _name(ctx: CommandContext, group_id: GroupId, user_id: str) -> str:
+async def _name(ctx: CommandContext, group_id: GroupId, user_id: AccountId) -> str:
     if name := await ctx.members.name_of(ctx.bot, group_id, user_id):
         return name
     try:
-        card = await ctx.directory.account_card(group_id, user_id)
-        if card.display and card.display not in card.accounts:
-            return card.display
+        name = await ctx.directory.display_name(group_id, user_id)
+        if name and name != user_id:
+            return name
     except UnknownAccount:
         pass
     return f"账号 {user_id}"
@@ -308,33 +362,40 @@ def _one_line(card: PersonCard) -> str:
 
 
 def _one_person(card: PersonCard) -> str:
-    lines = [f"{card.display}（{card.messages} 条发言）"]
+    scope = "精确账号" if card.account_id is not None else "关联身份聚合"
+    lines = [f"账号资料｜{card.display}｜{scope}", f"本群发言：{card.messages} 条"]
     if card.merged:
-        lines.append(f"　账号：{len(card.accounts)} 个，已关联")
+        lines.append(f"关联账号：{len(card.accounts)} 个")
     if named := [name for name in card.names if name.text != card.display]:
         lines.append(
-            "　称呼：" + "、".join(f"{name.text}（{name.confidence:.2f}）" for name in named)
+            "已确认称呼："
+            + "、".join(f"{name.text}（置信度 {name.confidence:.2f}）" for name in named)
         )
     if card.candidates:
         lines.append(
-            "　未确认："
-            + "、".join(f"{name.text}（{name.confidence:.2f}）" for name in card.candidates)
+            "未确认线索（不可用于指认）："
+            + "、".join(f"{name.text}（置信度 {name.confidence:.2f}）" for name in card.candidates)
         )
-    lines.append("　记录：")
-    if not card.facts:
-        lines.append("　　（暂无）")
-    for fact in card.facts:
-        if not fact.text:
-            continue
-        tail = "（人工）" if fact.manual else f"（{fact.confidence:.2f}）"
-        lines.append(f"　　{fact.index}. {fact.text}{tail}")
+    lines.append(f"人工备注：{len(card.notes)} 条" if card.notes else "人工备注：暂无")
+    for note in card.notes:
+        label = "精确账号" if note.account_id is not None else "关联身份共享"
+        text = note.object[:80] + "…" if len(note.object) > 80 else note.object
+        lines.append(f"· {label}：{defang(text)}")
+    if card.notes:
+        lines.append("完整人工备注与管理编号：/note（共享备注用 --all）。")
+    lines.append(f"自动归纳：{len(card.learned)} 条" if card.learned else "自动归纳：暂无")
+    for fact in card.learned:
+        value = fact.text or f"{fact.predicate}：{fact.object}"
+        text = value[:120] + "…" if len(value) > 120 else value
+        lines.append(f"{fact.index}. {defang(text)}（置信度 {fact.confidence:.2f}）")
+    lines.append("/forget 仅使用同范围自动归纳区的当前编号，不删除人工备注或称呼。")
     return "\n".join(lines)
 
 
 async def _card_of(
     ctx: CommandContext,
     group_id: GroupId,
-    user_id: str,
+    user_id: AccountId,
     *,
     all_linked: bool,
 ) -> PersonCard:
@@ -345,7 +406,7 @@ async def _card_of(
             else await ctx.directory.account_card(group_id, user_id)
         )
     except UnknownAccount:
-        await _finish(ctx, "本群还没有该账号的记录。")
+        await _finish(ctx, "本群暂无该账号资料。")
     if not card.display or card.display in card.accounts:
         card = replace(card, display=await _name(ctx, group_id, user_id))
     return card
@@ -357,13 +418,13 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
         raise UsageError("用法：/help [指令名]")
     tokens = _args(event, "help")
     if not tokens:
-        await _finish(ctx, _fit(command_catalog.help_text(), cfg=ctx.bundle.default))
+        await _finish(ctx, command_catalog.help_text())
     if len(tokens) != 1:
         raise UsageError("用法：/help [指令名]")
     command = command_catalog.find(tokens[0])
     if command is None:
         await _finish(ctx, f"没有「{tokens[0]}」这条指令。")
-    await _finish(ctx, _fit(command_catalog.detail_text(command), cfg=ctx.bundle.default))
+    await _finish(ctx, command_catalog.detail_text(command))
 
 
 @_handler("/who")
@@ -371,7 +432,7 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
     all_linked, rest = _scope(_args(event, "who"))
     if rest:
         raise UsageError("用法：/who [--all] [@账号]")
-    target = await _target(ctx, event, all_linked=all_linked)
+    target = await _target(ctx, event)
     card = await _card_of(ctx, event.group_id, target, all_linked=all_linked)
     await _finish(ctx, _fit(_one_person(card), cfg=ctx.bundle.default))
 
@@ -382,7 +443,7 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
         raise UsageError("用法：/members")
     rows = await ctx.directory.roster(event.group_id)
     if not rows:
-        await _finish(ctx, "本群还没有任何成员记录。")
+        await _finish(ctx, "本群暂无成员资料。")
     limit = COMMAND_LIMITS.roster_max_entries
     head = f"本群 {len(rows)} 人有记录（发言数｜记录节选）："
     body = "\n".join("· " + _one_line(card) for card in rows[:limit])
@@ -391,28 +452,236 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
 
 @_handler("/note")
 async def _(ctx: CommandContext, event: CommandRequest) -> None:
-    tokens = _args(event, "note")
-    action = tokens.pop(0) if tokens and tokens[0] in {"set", "clear"} else "show"
+    header, content = _body(_strip_cmd(event.text, "note"))
+    tokens = header.split()
+    action = (
+        tokens.pop(0)
+        if tokens
+        and tokens[0]
+        in {
+            "list",
+            "add",
+            "edit",
+            "remove",
+            "clear",
+        }
+        else "list"
+    )
     all_linked, rest = _scope(tokens)
-    target = await _target(ctx, event, all_linked=all_linked)
-    card = await _card_of(ctx, event.group_id, target, all_linked=all_linked)
-    if action == "show":
+    target = await _target(ctx, event)
+    label = f"{await _name(ctx, event.group_id, target)}｜{_scope_label(all_linked)}"
+    try:
+        if action == "list":
+            if content is not None or len(rest) > 1:
+                raise UsageError("用法：/note list [--all] [@账号] [页码]")
+            page = _positive(rest[0]) if rest else 1
+            rows, more = await ctx.directory.notes(
+                event.group_id,
+                target,
+                all_linked=all_linked,
+                page=page,
+            )
+            if not rows:
+                await _finish(
+                    ctx,
+                    f"人工备注｜{label}\n"
+                    + ("此范围暂无人工备注。" if page == 1 else "此页没有备注，请查看前面的页码。"),
+                )
+            lines = [f"人工备注｜{label}｜第 {page} 页"]
+            lines.extend(
+                f"{(page - 1) * NOTE_PAGE_SIZE + index}. {defang(str(note.object_value))}"
+                for index, note in enumerate(rows, start=1)
+            )
+            if more:
+                flag = " --all" if all_linked else ""
+                lines.append(f"下一页：/note list{flag} {page + 1}（保持相同目标账号）")
+            lines.append("修改/删除请用 /note edit 或 /note remove；这些编号不用于 /forget。")
+            await _finish(ctx, "\n".join(lines))
+        if action == "clear":
+            if rest or content is not None:
+                raise UsageError("用法：/note clear [--all] [@账号]")
+            count = await ctx.directory.clear_notes(event.group_id, target, all_linked=all_linked)
+            await _finish(
+                ctx,
+                (
+                    f"已清除 {label} 的 {count} 条人工备注。"
+                    if count
+                    else f"{label} 暂无人工备注，无需清除。"
+                ),
+            )
+        if action == "remove":
+            if len(rest) != 1 or content is not None:
+                raise UsageError("用法：/note remove [--all] [@账号] 备注编号")
+            index = _positive(rest[0])
+            gone = await ctx.directory.remove_note(
+                event.group_id,
+                target,
+                index,
+                all_linked=all_linked,
+            )
+            await _finish(
+                ctx,
+                (
+                    f"已删除 {label} 的人工备注 {index}：\n{defang(str(gone.object_value))}"
+                    if gone is not None
+                    else f"{label} 没有当前编号为 {index} 的人工备注。"
+                ),
+            )
+        if content is None or not content:
+            raise UsageError(
+                f"用法：/note {action} [--all] [@账号] "
+                + ("备注编号 -- 内容" if action == "edit" else "-- 内容")
+            )
+        if action == "edit":
+            if len(rest) != 1:
+                raise UsageError("用法：/note edit [--all] [@账号] 备注编号 -- 内容")
+            index = _positive(rest[0])
+            updated = await ctx.directory.edit_note(
+                event.group_id,
+                target,
+                index,
+                content,
+                all_linked=all_linked,
+            )
+            await _finish(
+                ctx,
+                (
+                    f"已修改 {label} 的人工备注 {index}：\n{defang(str(updated.object_value))}"
+                    if updated is not None
+                    else f"{label} 没有当前编号为 {index} 的人工备注。"
+                ),
+            )
         if rest:
-            raise UsageError("用法：/note [--all] [@账号]")
+            raise UsageError("用法：/note add [--all] [@账号] -- 内容")
+        added = await ctx.directory.add_note(event.group_id, target, content, all_linked=all_linked)
+        await _finish(ctx, f"已为 {label} 新增一条人工备注：\n{defang(str(added.object_value))}")
+    except ValueError as exc:
+        raise UsageError(str(exc)) from exc
+
+
+_TASK_STATES = {
+    "pending": "待执行",
+    "running": "执行中",
+    "done": "已结束",
+    "failed": "执行失败",
+    "cancelled": "已取消",
+}
+
+
+def _task_text(task: ScheduledTask, *, clock: Clock, preview: bool = False) -> str:
+    intent = task.intent[:60] + "…" if preview and len(task.intent) > 60 else task.intent
+    due = task.due_at.astimezone(clock.zone).isoformat(timespec="seconds")
+    result = f"\n执行结果：{task.outcome}" if task.outcome is not None else ""
+    return (
+        f"{task.id}\n状态：{_TASK_STATES[task.status.value]}｜预约时间：{due}\n"
+        f"{defang(intent)}{result}"
+    )
+
+
+@_handler("/tasks")
+async def _(ctx: CommandContext, event: CommandRequest) -> None:
+    if event.mentions:
+        raise UsageError("/tasks 只管理本群任务，不接收成员目标。")
+    header, content = _body(_strip_cmd(event.text, "tasks"))
+    tokens = header.split()
+    action = tokens.pop(0) if tokens else "list"
+    cfg, _persona = ctx.bundle.for_group(event.group_id)
+    try:
+        if action == "list":
+            if content is not None or len(tokens) > 1:
+                raise UsageError("用法：/tasks list [页码]")
+            page = await ctx.tasks.active(
+                event.group_id,
+                page=_positive(tokens[0]) if tokens else 1,
+            )
+            if not page.items:
+                await _finish(
+                    ctx,
+                    (
+                        "本群暂无待执行或执行中的任务。"
+                        if page.page == 1
+                        else "此页没有任务，请查看前面的页码。"
+                    ),
+                )
+            lines = [f"本群活动任务｜第 {page.page} 页（待执行、执行中）"]
+            lines.extend(_task_text(task, clock=ctx.clock, preview=True) for task in page.items)
+            if page.has_more:
+                lines.append(f"下一页：/tasks list {page.page + 1}")
+            lines.append("完整内容与结果：/tasks show UUID")
+            await _finish(ctx, "\n\n".join(lines))
+        if action in {"show", "cancel"}:
+            if len(tokens) != 1 or content is not None:
+                raise UsageError(f"用法：/tasks {action} UUID")
+            task_id = uuid.UUID(tokens[0])
+            task = (
+                await ctx.tasks.get(event.group_id, task_id)
+                if action == "show"
+                else await ctx.tasks.cancel(event.group_id, task_id)
+            )
+            if task is None:
+                await _finish(ctx, "本群没有该任务，或任务已不处于可取消的待执行状态。")
+            prefix = "本群任务详情：" if action == "show" else "已取消本群任务："
+            await _finish(ctx, prefix + "\n" + _task_text(task, clock=ctx.clock))
+        if action not in {"add", "edit"}:
+            raise UsageError("未知任务操作。用法见 /help tasks。")
+        task_id = None
+        if action == "edit":
+            if not tokens:
+                raise UsageError("用法：/tasks edit UUID [--at 时间 | --in 时长] [-- 内容]")
+            task_id = uuid.UUID(tokens.pop(0))
+        options: dict[str, str] = {}
+        if len(tokens) % 2:
+            raise UsageError("时间选项必须包含一个值。")
+        for index in range(0, len(tokens), 2):
+            flag, value = tokens[index : index + 2]
+            if flag not in {"--at", "--in"} or flag in options:
+                raise UsageError("只接受一次 --at 或 --in，不接受其它选项。")
+            options[flag] = value
+        if len(options) > 1:
+            raise UsageError("--at 与 --in 只能选一个。")
+        delay = None
+        if "--in" in options:
+            span = parse_duration(options["--in"])
+            if span is None:
+                raise UsageError("时长格式无效，请使用 30m、12h 或 3d。")
+            delay = int(span.total_seconds())
+        if content is not None and not content:
+            raise UsageError("任务内容不能为空。")
+        if action == "add":
+            if content is None:
+                raise UsageError("用法：/tasks add (--at 时间 | --in 时长) -- 内容")
+            task = await ctx.tasks.create(
+                event.group_id,
+                content,
+                cfg.tasks,
+                run_at=options.get("--at"),
+                delay_seconds=delay,
+            )
+        else:
+            if task_id is None:
+                raise UsageError("修改任务需要完整 UUID。")
+            task = await ctx.tasks.update(
+                event.group_id,
+                task_id,
+                cfg.tasks,
+                intent=content,
+                run_at=options.get("--at"),
+                delay_seconds=delay,
+            )
+        if task is None:
+            await _finish(ctx, "本群没有该任务，或任务已不处于可修改的待执行状态。")
         await _finish(
             ctx,
-            f"{card.display} 的备注：\n{card.note}" if card.note else f"{card.display} 暂无备注。",
+            ("已创建" if action == "add" else "已修改")
+            + "本群任务：\n"
+            + _task_text(task, clock=ctx.clock),
         )
-    if action == "clear":
-        if rest:
-            raise UsageError("用法：/note clear [--all] [@账号]")
-        await ctx.directory.note(event.group_id, target, "", all_linked=all_linked)
-        await _finish(ctx, f"已清除 {card.display} 的备注。")
-    if not rest:
-        raise UsageError("用法：/note set [--all] [@账号] 内容")
-    text = " ".join(rest)
-    await ctx.directory.note(event.group_id, target, text, all_linked=all_linked)
-    await _finish(ctx, f"已写入 {card.display} 的备注：\n{text}")
+    except (TaskInputError, TaskLimit) as exc:
+        raise UsageError(str(exc)) from exc
+    except UsageError:
+        raise
+    except ValueError as exc:
+        raise UsageError("任务 ID 或参数格式无效。用法见 /help tasks。") from exc
 
 
 @_handler("/alias")
@@ -420,7 +689,7 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
     tokens = _args(event, "alias")
     action = tokens.pop(0) if tokens and tokens[0] in {"add", "remove", "confidence"} else "list"
     all_linked, rest = _scope(tokens)
-    target = await _target(ctx, event, all_linked=all_linked)
+    target = await _target(ctx, event)
     card = await _card_of(ctx, event.group_id, target, all_linked=all_linked)
     if action == "list":
         if rest:
@@ -428,9 +697,9 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
         names = list(card.names) + list(card.candidates)
         if not names:
             await _finish(ctx, f"{card.display} 暂无记录在案的称呼。")
-        lines = [f"· {name.text}（{name.confidence:.2f}，已确认）" for name in card.names] + [
-            f"· {name.text}（{name.confidence:.2f}，待确认线索）" for name in card.candidates
-        ]
+        lines = [
+            f"· {name.text}（已确认，置信度 {name.confidence:.2f}）" for name in card.names
+        ] + [f"· {name.text}（未确认，置信度 {name.confidence:.2f}）" for name in card.candidates]
         await _finish(
             ctx, _fit(f"{card.display} 的称呼：\n" + "\n".join(lines), cfg=ctx.bundle.default)
         )
@@ -441,7 +710,7 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
         if action == "remove":
             if await ctx.directory.unname(event.group_id, target, name, all_linked=all_linked):
                 await _finish(ctx, f"已撤销 {card.display} 的称呼「{name}」。")
-            await _finish(ctx, f"{card.display} 名下没有「{name}」这个称呼。")
+            await _finish(ctx, f"{card.display} 在此范围没有可撤销的称呼「{name}」。")
         try:
             await ctx.directory.name(event.group_id, target, name, all_linked=all_linked)
         except NameTaken as exc:
@@ -471,7 +740,7 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
     state = (
         "已确认，可用于称呼和指认" if result.confidence >= CONFIRM_THRESHOLD else "仅作待确认线索"
     )
-    await _finish(ctx, f"已设置「{result.text}」为 {result.confidence:.2f}（{state}）。")
+    await _finish(ctx, f"已将「{result.text}」的置信度设为 {result.confidence:.2f}（{state}）。")
 
 
 @_handler("/forget")
@@ -479,7 +748,7 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
     all_linked, rest = _scope(_args(event, "forget"))
     if len(rest) != 1 or not rest[0].isdecimal() or int(rest[0]) < 1:
         raise UsageError("用法：/forget [--all] [@账号] 编号")
-    target = await _target(ctx, event, all_linked=all_linked)
+    target = await _target(ctx, event)
     dropped = await ctx.directory.forget(
         event.group_id,
         target,
@@ -487,7 +756,7 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
         all_linked=all_linked,
     )
     if dropped is None:
-        await _finish(ctx, f"没有编号为 {rest[0]} 的记录。")
+        await _finish(ctx, f"此范围没有当前编号为 {rest[0]} 的自动归纳事实。")
     await _finish(ctx, f"已删除：{dropped.text}")
 
 
@@ -502,16 +771,18 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
         await _owner_action(ctx)
         dropped = await ctx.directory.forget_group_fact(event.group_id, int(tokens[1]))
         if dropped is None:
-            await _finish(ctx, f"没有编号为 {tokens[1]} 的群记录。")
+            await _finish(ctx, f"本群没有当前编号为 {tokens[1]} 的自动归纳事实。")
         await _finish(ctx, f"已删除：{dropped.text}")
     _cfg, persona = ctx.bundle.for_group(event.group_id)
     learned = await ctx.directory.group_facts(event.group_id)
     parts = []
     if fixed := persona.group_knowledge.strip():
-        parts.append("固定资料（写在人设文件里）：\n" + fixed)
+        parts.append("本群固定资料：\n" + fixed)
     parts.append(
         "自动归纳：\n"
-        + "\n".join(f"　{fact.index}. {fact.text}（{fact.confidence:.2f}）" for fact in learned)
+        + "\n".join(
+            f"　{fact.index}. {fact.text}（置信度 {fact.confidence:.2f}）" for fact in learned
+        )
         if learned
         else "自动归纳：（暂无）"
     )
@@ -521,44 +792,54 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
 @_handler("/link")
 async def _(ctx: CommandContext, event: CommandRequest) -> None:
     tokens = _args(event, "link")
-    mentions = [str(account) for account in event.mentions]
-    if tokens and tokens[0] in {"confirm", "cancel"}:
-        if len(tokens) != 2 or mentions:
-            raise UsageError(f"用法：/link {tokens[0]} 验证码")
-        code = tokens[1]
+    mentions = list(event.mentions)
+    if tokens == ["confirm"]:
+        if mentions:
+            raise UsageError("用法：/link confirm")
         try:
-            if tokens[0] == "confirm":
-                await ctx.links.confirm(
-                    group_id=event.group_id,
-                    actor_user_id=str(event.user_id),
-                    code=code,
-                    confirmed_event_id=event.raw_event_id,
-                )
-                await _finish(ctx, "已确认，两个账号集合现已关联。")
-            cancelled = await ctx.links.cancel(
+            await ctx.links.confirm(
                 group_id=event.group_id,
-                actor_user_id=str(event.user_id),
-                code=code,
+                actor_user_id=event.user_id,
+                confirmed_event_id=event.raw_event_id,
             )
-            await _finish(ctx, "已取消。" if cancelled else "没有可取消的验证。")
         except LinkChallengeError as exc:
             await _finish(ctx, str(exc))
+        await _finish(ctx, "已确认关联邀请，双方账号现已关联。")
+    if tokens == ["cancel"]:
+        if mentions:
+            raise UsageError("用法：/link cancel")
+        try:
+            cancelled = await ctx.links.cancel(
+                group_id=event.group_id,
+                actor_user_id=event.user_id,
+                cancelled_event_id=event.raw_event_id,
+            )
+        except (LinkChallengeError, UnknownAccount) as exc:
+            await _finish(ctx, str(exc))
+        await _finish(
+            ctx,
+            "已取消本群待处理的关联邀请。" if cancelled else "本群没有与当前账号相关的待处理邀请。",
+        )
     if tokens or len(mentions) != 1:
-        raise UsageError("用法：/link @另一个账号")
+        raise UsageError("用法：/link @另一个账号、/link confirm 或 /link cancel")
     target = mentions[0]
-    if target == str(event.self_id):
+    if target == event.self_id:
         await _finish(ctx, "不能关联机器人账号。")
     try:
-        _challenge, code = await ctx.links.issue(
+        await ctx.links.issue(
             group_id=event.group_id,
-            initiator_user_id=str(event.user_id),
+            initiator_user_id=event.user_id,
             target_user_id=target,
             created_event_id=event.raw_event_id,
         )
     except (LinkChallengeError, UnknownAccount) as exc:
         await _finish(ctx, str(exc))
     ttl = CHALLENGE_LIMITS.challenge_ttl_sec
-    await _finish(ctx, f"请目标账号在 {ttl} 秒内发送：/link confirm {code}")
+    await _finish(
+        ctx,
+        f"已向 {await _name(ctx, event.group_id, target)} 发出关联邀请。\n"
+        f"请受邀账号在本群 {ttl} 秒内发送：/link confirm",
+    )
 
 
 @_handler("/unlink")
@@ -566,10 +847,10 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
     if _args(event, "unlink") or event.mentions:
         raise UsageError("用法：/unlink")
     try:
-        await ctx.directory.split(str(event.user_id))
+        await ctx.directory.split(event.user_id)
     except NotMerged as exc:
         await _finish(ctx, exc.message)
-    await _finish(ctx, "已将当前账号从关联集合中剥离。")
+    await _finish(ctx, "已解除当前账号的关联，其余账号保持关联。")
 
 
 @_handler("/merge")
@@ -577,13 +858,13 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
     if _args(event, "merge"):
         raise UsageError("用法：/merge @账号A @账号B")
     left, right = _mentions(event, exact=2)
-    if str(event.self_id) in {left, right}:
+    if event.self_id in {left, right}:
         await _finish(ctx, "不能合并机器人账号。")
     try:
         changed = await ctx.directory.merge(left, right)
     except UnknownAccount as exc:
         await _finish(ctx, f"账号 {exc.user_id} 没有记录，无法合并。")
-    await _finish(ctx, "已合并。" if changed else "这两个账号已经关联。")
+    await _finish(ctx, "已关联两个账号的身份资料。" if changed else "这两个账号已经关联。")
 
 
 @_handler("/split")
@@ -591,7 +872,7 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
     if _args(event, "split"):
         raise UsageError("用法：/split @账号")
     [target] = _mentions(event, exact=1)
-    if target == str(event.self_id):
+    if target == event.self_id:
         await _finish(ctx, "不能拆分机器人账号。")
     try:
         await ctx.directory.split(target)
@@ -599,7 +880,7 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
         await _finish(ctx, f"账号 {exc.user_id} 没有记录，无法拆分。")
     except NotMerged as exc:
         await _finish(ctx, exc.message)
-    await _finish(ctx, "已剥离该账号，其余关联账号保持不变。")
+    await _finish(ctx, "已解除所选账号的关联，其余账号保持关联。")
 
 
 @_handler("/block")
@@ -609,14 +890,16 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
     if not tokens and not mentions:
         rules = await ctx.groups.block_rules(event.group_id)
         if not rules:
-            await _finish(ctx, "本群没有屏蔽规则。")
-        lines = ["本群屏蔽规则："]
+            await _finish(ctx, "本群暂无回复屏蔽规则。")
+        lines = ["本群回复屏蔽规则："]
         for rule in rules:
             if rule["user_id"]:
                 label = await _name(ctx, event.group_id, rule["user_id"])
             else:
-                accounts = await ctx.directory.accounts_of_holder(rule["entity_id"])
-                label = "关联账号 " + "、".join(account.platform_user_id for account in accounts)
+                entity = rule["entity_id"]
+                assert entity is not None
+                accounts = await ctx.directory.accounts_of_holder(entity)
+                label = "关联身份：" + "、".join(account.platform_user_id for account in accounts)
             until = (
                 f"（至 {ctx.clock.format(rule['blocked_until'])}）" if rule["blocked_until"] else ""
             )
@@ -638,28 +921,37 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
             if all_linked
             else await ctx.groups.unblock(event.group_id, target)
         )
-        await _finish(ctx, "已解除屏蔽。" if changed else "没有对应的屏蔽规则。")
+        label = await _name(ctx, event.group_id, target)
+        await _finish(
+            ctx,
+            (
+                f"已解除本群回复屏蔽：{label}｜{_scope_label(all_linked)}。"
+                if changed
+                else f"本群没有 {label} 在{_scope_label(all_linked)}范围的屏蔽规则。"
+            ),
+        )
     if len(rest) > 1:
         raise UsageError("用法：/block add [--all] @账号 [30m|12h|3d]")
     cfg = ctx.bundle.default
     accounts = await ctx.directory.linked_account_ids(target)
-    if target == str(event.self_id) or any(
+    if target == event.self_id or any(
         perms.is_owner(linked, cfg.bot.owners) for linked in accounts
     ):
-        await _finish(ctx, "不能屏蔽机器人或 owner。")
+        await _finish(ctx, "不能屏蔽机器人或 bot owner。")
     account = await ctx.directory.account(target)
     until = None
     if rest:
         span = parse_duration(rest[0])
         if span is None:
-            raise UsageError("时长格式无效，支持 m、h、d。")
+            raise UsageError("时长格式无效，请使用 30m、12h 或 3d。")
         until = ctx.clock.now() + span
     if all_linked:
         await ctx.groups.block_holder(event.group_id, account.entity_id, until=until)
     else:
         await ctx.groups.block(event.group_id, target, until=until)
-    lapse = f"，{ctx.clock.format(until)} 自动解除" if until else ""
-    await _finish(ctx, f"已屏蔽{lapse}。")
+    lapse = f"至 {ctx.clock.format(until)}" if until else "持续生效"
+    label = await _name(ctx, event.group_id, target)
+    await _finish(ctx, f"已设置本群回复屏蔽：{label}｜{_scope_label(all_linked)}｜{lapse}。")
 
 
 @_handler("/mute")
@@ -673,9 +965,12 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
     state = await ctx.registry.get(event.group_id)
     if action == "status":
         await _finish(ctx, "本群已静音。" if state.muted else "本群未静音。")
+    unchanged = state.muted == (action == "on")
     state.muted = action == "on"
     await state.persist()
-    await _finish(ctx, "已静音。" if state.muted else "已解除静音。")
+    if unchanged:
+        await _finish(ctx, "本群已处于静音状态。" if state.muted else "本群已处于启用回复状态。")
+    await _finish(ctx, "已将本群设为静音。" if state.muted else "已恢复本群回复。")
 
 
 def _calls(rows: list[dict], kind: str) -> int:
@@ -705,9 +1000,9 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
             spending = f"账本 {ctx.budget.health.value}，付费调用已暂停"
 
         lines = [
-            "全局用量（所有群合计）",
-            f"预算　　{spending} / ¥{cfg.budget.daily_cny_cap:.2f}",
-            f"回复　　{_calls(rows, Kind.REPLY)} 次",
+            "今日用量｜全部群",
+            f"费用　　{spending}｜每日止损 ¥{cfg.budget.daily_cny_cap:.2f}",
+            f"回复模型　{_calls(rows, Kind.REPLY)} 次调用",
             (
                 f"搜索　　今日 {_calls(rows, Kind.SEARCH)} 次　本月 "
                 f"{month_search}/{cfg.backends.search.monthly_quota}"
@@ -727,13 +1022,13 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
     state = await ctx.registry.get(event.group_id)
     rules = await ctx.groups.block_rules(event.group_id)
     lines = [
-        f"本群用量（{event.group_id}）",
+        f"今日用量｜本群 {event.group_id}",
         f"人设　　{persona.name}",
         f"花费　　¥{sum(float(row['cny']) for row in rows):.3f}",
-        f"回复　　{_calls(rows, Kind.REPLY)} 次",
+        f"回复模型　{_calls(rows, Kind.REPLY)} 次调用",
         "记忆　　待归纳 "
         f"{await ExtractionRepository(database=ctx.database).unconsumed_count(event.group_id)} 条",
-        f"状态　　{'已静音' if state.muted else '正常'}",
+        f"群回复　{'已静音' if state.muted else '已启用'}",
     ]
     if rules:
         lines.append(f"屏蔽　　{len(rules)} 条规则")
@@ -751,8 +1046,8 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
     count = min(int(rest[0]), cfg.top_max_entries) if rest else cfg.top_default_entries
     rows = await ctx.budget.ledger.top_spenders(event.group_id, k=count, all_linked=all_linked)
     if not rows:
-        await _finish(ctx, "本群本月尚无可归因的花费。")
-    lines = ["本群本月花费排行"]
+        await _finish(ctx, "本群本月暂无可归属账号的费用。")
+    lines = ["本群本月费用排行｜" + ("关联身份聚合" if all_linked else "精确账号")]
     for index, row in enumerate(rows, 1):
         accounts = list(row["accounts"])
         name = await _name(ctx, event.group_id, accounts[0])
@@ -770,14 +1065,14 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
     maximum = DIAGNOSTIC_LIMITS.debug_max_rounds
     if action == "status" and len(tokens) <= 1:
         left = debug.armed()
-        await _finish(ctx, f"捕获中：还剩 {left} 轮。" if left else "未在捕获。")
+        await _finish(ctx, f"模型调试捕获｜剩余 {left} 轮。" if left else "模型调试捕获｜未启用。")
     if action == "stop" and len(tokens) == 1:
         debug.arm(0, max_rounds=maximum)
-        await _finish(ctx, "已关闭捕获。")
+        await _finish(ctx, "已停止模型调试捕获。")
     if action != "start" or len(tokens) != 2 or not tokens[1].isdecimal():
         raise UsageError(f"用法：/debug start 轮数（最多 {maximum}），或 /debug stop")
     took = debug.arm(int(tokens[1]), max_rounds=maximum)
-    await _finish(ctx, f"已开启：接下来 {took} 轮写入 logs/debug/。")
+    await _finish(ctx, f"已启用模型调试捕获，接下来 {took} 轮写入 logs/debug/。")
 
 
 @_handler("/log")
@@ -803,7 +1098,9 @@ async def _(ctx: CommandContext, event: CommandRequest) -> None:
     lines = [line for line in tail.splitlines() if line.strip()][-count:]
     await _finish(
         ctx,
-        _fit("\n".join(lines) if lines else "日志为空。", head=False, cfg=ctx.bundle.default),
+        _fit(
+            "\n".join(lines) if lines else "应用日志暂无记录。", head=False, cfg=ctx.bundle.default
+        ),
     )
 
 

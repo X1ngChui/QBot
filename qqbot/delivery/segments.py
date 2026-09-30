@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from qqbot.domain.ids import AccountId, GroupId, MessageId
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -18,12 +19,12 @@ class TextSegment:
 
 @dataclass(frozen=True, slots=True)
 class AtSegment:
-    account: str
+    account: AccountId
 
 
 @dataclass(frozen=True, slots=True)
 class ReplySegment:
-    message_id: str
+    message_id: MessageId
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,7 +58,7 @@ class ContactKind(StrEnum):
 @dataclass(frozen=True, slots=True)
 class ContactSegment:
     kind: ContactKind
-    target_id: str
+    target_id: AccountId | GroupId
 
 
 class MusicPlatform(StrEnum):
@@ -113,9 +114,9 @@ def from_onebot(items: list[dict]) -> tuple[HistoricalSegment, ...]:
             if kind == "text" and isinstance(data.get("text"), str):
                 out.append(TextSegment(data["text"]))
             elif kind == "at" and data.get("qq"):
-                out.append(AtSegment(str(data["qq"])))
+                out.append(AtSegment(AccountId(data["qq"])))
             elif kind == "reply" and data.get("id"):
-                out.append(ReplySegment(str(data["id"])))
+                out.append(ReplySegment(MessageId(data["id"])))
             elif kind == "face":
                 out.append(FaceSegment(int(data["id"])))
             elif kind == "mface" and data.get("emoji_package_id") and data.get("emoji_id"):
@@ -137,7 +138,14 @@ def from_onebot(items: list[dict]) -> tuple[HistoricalSegment, ...]:
                     if data.get("type", "qq") == "qq"
                     else ContactKind.CURRENT_GROUP
                 )
-                out.append(ContactSegment(contact_kind, str(data["id"])))
+                out.append(
+                    ContactSegment(
+                        contact_kind,
+                        AccountId(data["id"])
+                        if contact_kind is ContactKind.MEMBER
+                        else GroupId(data["id"]),
+                    )
+                )
             elif kind == "music" and data.get("type") == "custom":
                 out.append(
                     CustomMusicSegment(
@@ -199,11 +207,11 @@ def text_content(segments: Sequence[HistoricalSegment]) -> str:
     return "".join(segment.text for segment in segments if isinstance(segment, TextSegment))
 
 
-def at_accounts(segments: Sequence[HistoricalSegment]) -> list[str]:
+def at_accounts(segments: Sequence[HistoricalSegment]) -> list[AccountId]:
     return [segment.account for segment in segments if isinstance(segment, AtSegment)]
 
 
-def reply_target(segments: Sequence[HistoricalSegment]) -> str | None:
+def reply_target(segments: Sequence[HistoricalSegment]) -> MessageId | None:
     return next(
         (segment.message_id for segment in segments if isinstance(segment, ReplySegment)),
         None,
@@ -213,7 +221,7 @@ def reply_target(segments: Sequence[HistoricalSegment]) -> str | None:
 def display_text(
     segments: Sequence[HistoricalSegment],
     *,
-    names: dict[str, str] | None = None,
+    names: dict[AccountId, str] | None = None,
 ) -> str:
     """Return a stable textual reading for current or historical segments."""
 

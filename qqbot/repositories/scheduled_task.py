@@ -1,34 +1,71 @@
-"""Durable, single-attempt group wakeups with account-scoped management."""
+"""Durable, group-owned single-attempt wakeups."""
 
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from enum import StrEnum
+from typing import Any
 
 import asyncpg
 
 from qqbot.domain.ids import GroupId
 from qqbot.configuration import TasksCfg
 
-
 MIN_DELAY_SECONDS = 300
+TASK_PAGE_SIZE = 5
 
 
 class TaskLimit(ValueError):
-    """A task exceeds a durable group or account limit."""
+    """A task exceeds a durable group or chain limit."""
+
+
+class TaskStatus(StrEnum):
+    PENDING = "pending"
+    RUNNING = "running"
+    DONE = "done"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 @dataclass(frozen=True, slots=True)
 class ScheduledTask:
     id: uuid.UUID
     group_id: GroupId
-    creator_id: str
     intent: str
     due_at: datetime
     chain_id: uuid.UUID
     chain_depth: int
+    status: TaskStatus = TaskStatus.PENDING
+    created_at: datetime | None = None
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    outcome: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TaskPage:
+    items: tuple[ScheduledTask, ...]
+    page: int
+    has_more: bool
+
+
+def _task(row: Mapping[str, Any]) -> ScheduledTask:
+    return ScheduledTask(
+        row["id"],
+        GroupId(row["group_id"]),
+        row["intent"],
+        row["due_at"],
+        row["chain_id"],
+        row["chain_depth"],
+        TaskStatus(row["status"]),
+        row["created_at"],
+        row["started_at"],
+        row["finished_at"],
+        row["outcome"],
+    )
 
 
 class ScheduledTaskRepository:
@@ -38,71 +75,96 @@ class ScheduledTaskRepository:
     async def create(
         self,
         group_id: GroupId,
-        creator_id: str,
         intent: str,
         due_at: datetime,
         limits: TasksCfg,
         *,
         parent: ScheduledTask | None = None,
     ) -> ScheduledTask:
-        if parent is not None and (parent.group_id != group_id or parent.creator_id != creator_id):
-            raise ValueError("a follow-up must keep its original group and creator")
+        if parent is not None and parent.group_id != group_id:
+            raise ValueError("a follow-up must keep its original group")
         depth = parent.chain_depth + 1 if parent is not None else 0
         if depth > limits.max_chain_depth:
-            raise TaskLimit("连续定时次数已达上限")
+            raise TaskLimit("本群任务续链深度已达上限")
         task_id = uuid.uuid4()
         chain_id = parent.chain_id if parent is not None else task_id
         async with self._database().acquire() as conn, conn.transaction():
             await conn.execute("SELECT pg_advisory_xact_lock($1::bigint)", group_id.to_db())
-            counts = await conn.fetchrow(
-                """SELECT count(*) AS group_count,
-                          count(*) FILTER (WHERE creator_id=$2) AS account_count
-                     FROM scheduled_task WHERE group_id=$1 AND status='pending'""",
+            count = await conn.fetchval(
+                """SELECT count(*) FROM scheduled_task
+                     WHERE group_id=$1 AND status='pending'""",
                 group_id.to_db(),
-                creator_id,
             )
-            if counts["group_count"] >= limits.max_pending_per_group:
-                raise TaskLimit("本群待执行任务已达上限")
-            if counts["account_count"] >= limits.max_pending_per_account:
-                raise TaskLimit("你的待执行任务已达上限")
-            await conn.execute(
+            if count >= limits.max_pending_per_group:
+                raise TaskLimit("本群待执行任务数量已达上限")
+            row = await conn.fetchrow(
                 """INSERT INTO scheduled_task
-                       (id, group_id, creator_id, intent, due_at, chain_id, chain_depth)
-                     VALUES ($1,$2,$3,$4,$5,$6,$7)""",
+                       (id, group_id, intent, due_at, chain_id, chain_depth)
+                     VALUES ($1,$2,$3,$4,$5,$6) RETURNING *""",
                 task_id,
                 group_id.to_db(),
-                creator_id,
                 intent,
                 due_at,
                 chain_id,
                 depth,
             )
-        return ScheduledTask(task_id, group_id, creator_id, intent, due_at, chain_id, depth)
+        if row is None:
+            raise RuntimeError("task insert returned no row")
+        return _task(row)
 
-    async def pending(self, group_id: GroupId, creator_id: str, *, owner: bool) -> list:
-        return await self._database().fetch(
-            """SELECT id, creator_id, intent, due_at FROM scheduled_task
-                 WHERE group_id=$1 AND status='pending' AND ($3 OR creator_id=$2)
-                 ORDER BY due_at, id LIMIT 50""",
+    async def active(self, group_id: GroupId, *, page: int = 1) -> TaskPage:
+        if not 1 <= page <= 10000:
+            raise ValueError("page must be between 1 and 10000")
+        rows = await self._database().fetch(
+            """SELECT * FROM scheduled_task
+                 WHERE group_id=$1 AND status IN ('pending','running')
+                 ORDER BY due_at, id LIMIT $2 OFFSET $3""",
             group_id.to_db(),
-            creator_id,
-            owner,
+            TASK_PAGE_SIZE + 1,
+            (page - 1) * TASK_PAGE_SIZE,
+        )
+        return TaskPage(
+            tuple(_task(row) for row in rows[:TASK_PAGE_SIZE]), page, len(rows) > TASK_PAGE_SIZE
         )
 
-    async def cancel(
-        self, task_id: uuid.UUID, group_id: GroupId, creator_id: str, *, owner: bool
-    ) -> bool:
-        row = await self._database().fetchval(
+    async def get(self, group_id: GroupId, task_id: uuid.UUID) -> ScheduledTask | None:
+        row = await self._database().fetchrow(
+            "SELECT * FROM scheduled_task WHERE group_id=$1 AND id=$2",
+            group_id.to_db(),
+            task_id,
+        )
+        return None if row is None else _task(row)
+
+    async def update(
+        self,
+        group_id: GroupId,
+        task_id: uuid.UUID,
+        *,
+        intent: str | None = None,
+        due_at: datetime | None = None,
+    ) -> ScheduledTask | None:
+        if intent is None and due_at is None:
+            raise ValueError("an update needs at least one field")
+        row = await self._database().fetchrow(
+            """UPDATE scheduled_task
+                  SET intent=COALESCE($3,intent), due_at=COALESCE($4,due_at)
+                 WHERE group_id=$1 AND id=$2 AND status='pending' RETURNING *""",
+            group_id.to_db(),
+            task_id,
+            intent,
+            due_at,
+        )
+        return None if row is None else _task(row)
+
+    async def cancel(self, task_id: uuid.UUID, group_id: GroupId) -> ScheduledTask | None:
+        row = await self._database().fetchrow(
             """UPDATE scheduled_task SET status='cancelled', finished_at=now(),
                       outcome='cancelled'
-                 WHERE id=$1 AND group_id=$2 AND status='pending'
-                   AND ($4 OR creator_id=$3) RETURNING id""",
+                 WHERE id=$1 AND group_id=$2 AND status='pending' RETURNING *""",
             task_id,
             group_id.to_db(),
-            creator_id,
-            owner,
         )
-        return row is not None
+        return None if row is None else _task(row)
 
     async def claim_due(
         self,
@@ -114,8 +176,8 @@ class ScheduledTaskRepository:
     ) -> tuple[ScheduledTask | None, bool]:
         async with self._database().acquire() as conn, conn.transaction():
             row = await conn.fetchrow(
-                """SELECT id, group_id, creator_id, intent, due_at, chain_id, chain_depth
-                     FROM scheduled_task WHERE status='pending' AND due_at <= now()
+                """SELECT * FROM scheduled_task
+                     WHERE status='pending' AND due_at <= now()
                        AND NOT (group_id = ANY($1::bigint[]))
                      ORDER BY due_at, id FOR UPDATE SKIP LOCKED LIMIT 1""",
                 [group.to_db() for group in exclude_groups],
@@ -138,23 +200,14 @@ class ScheduledTaskRepository:
                     row["id"],
                 )
                 return None, True
-            await conn.execute(
+            row = await conn.fetchrow(
                 """UPDATE scheduled_task SET status='running', started_at=now()
-                     WHERE id=$1""",
+                     WHERE id=$1 RETURNING *""",
                 row["id"],
             )
-        return (
-            ScheduledTask(
-                row["id"],
-                group,
-                row["creator_id"],
-                row["intent"],
-                row["due_at"],
-                row["chain_id"],
-                row["chain_depth"],
-            ),
-            False,
-        )
+        if row is None:
+            raise RuntimeError("claimed task disappeared")
+        return _task(row), False
 
     async def finish(self, task_id: uuid.UUID, outcome: str, *, failed: bool = False) -> None:
         await self._database().execute(

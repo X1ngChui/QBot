@@ -61,7 +61,6 @@ for ownership, restart and migration semantics.
 | `budget.daily_cny_cap` | `5` | type="number"; minimum=0 | Global stop-loss on already booked daily spend. |
 | `budget.per_reply_cny` | `0.3` | type="number"; minimum=0 | Per-reply stop-loss, including its media work. |
 | `tasks.max_days_ahead` | `30` | type="integer"; minimum=1; maximum=365 | Furthest future wakeup in days. |
-| `tasks.max_pending_per_account` | `5` | type="integer"; minimum=1 | Pending wakeups per account and group. |
 | `tasks.max_pending_per_group` | `50` | type="integer"; minimum=1 | Pending wakeups across a group. |
 | `tasks.max_chain_depth` | `24` | type="integer"; minimum=0 | Follow-up depth from one original task. |
 | `tasks.max_executions_per_group_day` | `24` | type="integer"; minimum=1 | Wakeups per group and local day. |

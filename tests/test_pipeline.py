@@ -1,3 +1,5 @@
+from qqbot.domain.ids import AccountId
+
 """End-to-end pipeline test: fake protocol side, stubbed LLM, real DB."""
 
 import pytest
@@ -24,7 +26,7 @@ _EMBED = FakeEmbedding()
 from qqbot.conversation import engine as _engine_module
 from qqbot.conversation import prompt as prompt_mod
 from qqbot.commands.router import CommandRouter
-from _test_owners import fresh_budget, fresh_members
+from _test_owners import fresh_budget, fresh_members, fresh_tasks
 from qqbot.delivery.service import GroupDelivery
 from qqbot.media.coordinator import MediaCoordinator
 from qqbot.media.service import MediaProcessor
@@ -282,6 +284,7 @@ def new_gateway():
 
 async def _respond(**kwargs):
     result = await _engine_module.respond(
+        tasks=fresh_tasks(),
         budget=BUDGET,
         providers=providers_bundle,
         media=_MEDIA_PROCESSOR,
@@ -499,6 +502,7 @@ async def pipeline_state(test_database, monkeypatch):
         _DIRECTORY,
         _LINKS,
         providers_bundle,
+        tasks=fresh_tasks(),
         budget=BUDGET,
         members=MEMBERS,
         groups=_test_db.groups,
@@ -508,6 +512,7 @@ async def pipeline_state(test_database, monkeypatch):
         diagnostics=types.SimpleNamespace(count=lambda: 0),
     )
     EXECUTOR = ReplyExecutor(
+        tasks=fresh_tasks(),
         bundle=config(),
         clock=_test_db.clock,
         database=_test_db.pool,
@@ -991,7 +996,7 @@ async def test_pipeline(pipeline_state):
     )
     assert (
         command_output is not None
-        and "已静音" in command_output["plain_text"]
+        and "设为静音" in command_output["plain_text"]
         and command_output_count == 1
     ), (
         "command input and self-observed output form one archived pair across replays",
@@ -1009,12 +1014,12 @@ async def test_pipeline(pipeline_state):
     # archives so the window stays coherent; the reply is what is withheld.
 
     await REGISTRY.get(GROUP)
-    await _test_db.groups.block(GROUP, "u9")
+    await _test_db.groups.block(GROUP, AccountId("u9"))
     n5 = len(bot.sent)
     await GATEWAY.handle(bot, FakeEvent("小X 在吗", user_id="u9"))
     await drain()
     assert len(bot.sent) == n5, "a blocked user is dropped"
-    await _test_db.groups.unblock(GROUP, "u9")
+    await _test_db.groups.unblock(GROUP, AccountId("u9"))
 
     # 11. nothing that changes every turn may sit in the cached system block.
     await REGISTRY.get(GROUP)
@@ -1767,11 +1772,11 @@ async def test_pipeline(pipeline_state):
     _DIR = _DIRECTORY
     for i, uid in enumerate(["a", "b", "c", "d", "e", "f"]):
         await seed(ORD, uid, uid, n=6 - i)  # a is busiest, f quietest
-        await _DIR.note(ORD, uid, f"note about {uid}")
+        await _DIR.add_note(ORD, uid, f"note about {uid}")
     await seed(ORD, "tie1", "tie1")  # equal counts, must not swap
     await seed(ORD, "tie2", "tie2")
-    await _DIR.note(ORD, "tie1", "first of the pair")
-    await _DIR.note(ORD, "tie2", "second of the pair")
+    await _DIR.add_note(ORD, "tie1", "first of the pair")
+    await _DIR.add_note(ORD, "tie2", "second of the pair")
     await seed(ORD, "zz", "zz", n=9)  # busiest, last to appear, no record
 
     _roster_rows = await _retr.gather(group_id=ORD, directory=_DIRECTORY, bot=bot, members=MEMBERS)
@@ -1799,7 +1804,7 @@ async def test_pipeline(pipeline_state):
         prompts=_test_db.test_bundle().prompts,
     )
     assert (
-        "- 成员⟦1⟧，note about a" in _numbered
+        "- 成员⟦1⟧，精确账号：note about a" in _numbered
         and "\n- 成员⟦9⟧\n" in _numbered + "\n"
         and "未确认显示名：a" in _numbered
         and "未确认显示名：zz" in _numbered
@@ -1811,14 +1816,14 @@ async def test_pipeline(pipeline_state):
     # Isolation, at the level the whole design turns on: a group's roster is built from
     # events in that group, so somebody talkative elsewhere is simply not here.
     await seed(OTHER, "a", "a", n=9)
-    await _DIR.note(OTHER, "a", "known only in the other group")
+    await _DIR.add_note(OTHER, "a", "known only in the other group")
     _elsewhere = await _retr.gather(group_id=OTHER, directory=_DIRECTORY, bot=bot, members=MEMBERS)
     assert [r["user_id"] for r in _elsewhere] == ["a"], (
         "a roster does not reach into another group",
         str(_elsewhere),
     )
     assert (
-        _elsewhere[0]["manual_note"] == "known only in the other group"
+        _elsewhere[0]["manual_note"] == "精确账号：known only in the other group"
         and next(
             r
             for r in await _retr.gather(
@@ -1826,7 +1831,7 @@ async def test_pipeline(pipeline_state):
             )
             if r["user_id"] == "a"
         )["manual_note"]
-        == "note about a"
+        == "精确账号：note about a"
     ), "and a note written there stays there"
 
     # What an owner writes by hand and what the model worked out are two different kinds
@@ -1850,7 +1855,7 @@ async def test_pipeline(pipeline_state):
         when=_nl0(),
     )
     _card = await _DIR.holder_card(ORD, "a")
-    assert _card.note == "note about a" and _card.summary == "喜欢打游戏", (
+    assert _card.note == "精确账号：note about a" and _card.summary == "喜欢打游戏", (
         "a hand-written note is kept apart from what was extracted",
         f"{_card.note!r} / {_card.summary!r}",
     )
@@ -2004,7 +2009,7 @@ async def test_pipeline(pipeline_state):
     # The tail has to say which message is the question. The send mechanism stays in the
     # system template instead of being repeated here; this nearest context only anchors the
     # one message the run must answer.
-    assert "下面是刚收到的消息" in _tail and "只回应" in _tail, (
+    assert "下面是刚收到的消息" in _tail and "响应来源" in _tail, (
         "and the tail says which message to answer",
         _tail[-140:],
     )
@@ -2015,7 +2020,7 @@ async def test_pipeline(pipeline_state):
     # The exception matters as much as the rule. Being asked to answer something raised
     # earlier is ordinary, and a flat ban on the history would refuse it.
     # The exception lives with the rule, in the fixed rules that open the prompt.
-    assert "除非刚收到的消息明确要求你代答" in prompt_mod.build_system(
+    assert "结合群聊" in prompt_mod.build_system(
         persona_k, [], [], prompts=_test_db.test_bundle().prompts
     ), "while still allowing a question the message points at"
     assert "老周答应周末把切片做完" not in prompt_mod.build_system(
@@ -2184,6 +2189,7 @@ async def test_pipeline(pipeline_state):
     n_llm = len(LLM_CALLS)
     st13 = await REGISTRY.get(GROUP)
     r1 = await _eng.generate(
+        tasks=fresh_tasks(),
         budget=BUDGET,
         progress=_eng.ReplyProgress(),
         providers=providers_bundle,
@@ -2268,6 +2274,7 @@ async def test_pipeline(pipeline_state):
     )
     n_llm2 = len(LLM_CALLS)
     r2 = await _eng.generate(
+        tasks=fresh_tasks(),
         budget=BUDGET,
         progress=_eng.ReplyProgress(),
         providers=providers_bundle,
@@ -2452,6 +2459,7 @@ async def test_pipeline(pipeline_state):
         )
     )
     await _eng.generate(
+        tasks=fresh_tasks(),
         budget=BUDGET,
         progress=_eng.ReplyProgress(),
         providers=providers_bundle,
@@ -2724,6 +2732,7 @@ async def test_pipeline(pipeline_state):
     _follow = _CM0(msg_id="s-ask2", user_id="u1", nickname="阿强", text="小X 然后呢", ts=_nl0())
     st_s.add(_follow)
     await _eng.generate(
+        tasks=fresh_tasks(),
         budget=BUDGET,
         progress=_eng.ReplyProgress(),
         providers=providers_bundle,
@@ -2990,6 +2999,7 @@ async def test_pipeline(pipeline_state):
     )
     _use(_calls(_send(text="后天也多云")))
     await _eng.generate(
+        tasks=fresh_tasks(),
         budget=BUDGET,
         progress=_eng.ReplyProgress(),
         providers=providers_bundle,
@@ -3050,7 +3060,7 @@ async def test_pipeline(pipeline_state):
     # be reads as broken context - and the list survives a restart via its own
     # table. The accepted price is that a blocked account still feeds memory.
     st15 = await REGISTRY.get(GROUP)
-    await _test_db.groups.block(GROUP, "bad1")
+    await _test_db.groups.block(GROUP, AccountId("bad1"))
     n_sent15 = len(bot.sent)
     ev_blocked = FakeEvent("小X 在吗", user_id="bad1", nickname="捣乱的", to_me=True)
     await GATEWAY.handle(bot, ev_blocked)
@@ -3068,7 +3078,7 @@ async def test_pipeline(pipeline_state):
     fresh15 = type(st15)(group_id=GROUP, groups=_test_db.groups, archive=_test_db.archive)
     await fresh15.load()
     assert await fresh15.blocked_now("bad1"), "the block rule survives a restart"
-    await _test_db.groups.unblock(GROUP, "bad1")
+    await _test_db.groups.unblock(GROUP, AccountId("bad1"))
     await GATEWAY.handle(
         bot, FakeEvent("小X 还在吗", user_id="bad1", nickname="捣乱的", to_me=True)
     )
@@ -3126,7 +3136,7 @@ async def test_pipeline(pipeline_state):
         and not await _test_db.groups.blocked(GROUP, "block-member")
         and not await _test_db.groups.block_rules(GROUP)
     ), "an owner can remove a pre-merge holder rule"
-    await _test_db.groups.block(GROUP, "block-owner")
+    await _test_db.groups.block(GROUP, AccountId("block-owner"))
     await GATEWAY.handle(
         bot,
         FakeEvent(
@@ -3149,7 +3159,7 @@ async def test_pipeline(pipeline_state):
     # later rule for the same scope.
     from datetime import timedelta as _btd
 
-    await _test_db.groups.block(GROUP, "bad1", until=_nl0() - _btd(seconds=1))
+    await _test_db.groups.block(GROUP, AccountId("bad1"), until=_nl0() - _btd(seconds=1))
     n_lapse = len(bot.sent)
     await GATEWAY.handle(
         bot, FakeEvent("小X 醒了吗", user_id="bad1", nickname="捣乱的", to_me=True)
@@ -3168,12 +3178,12 @@ async def test_pipeline(pipeline_state):
         == 1
     ), "and its bounded audit row remains inactive"
     # A still-running timed block behaves like any block.
-    await _test_db.groups.block(GROUP, "bad1", until=_nl0() + _btd(hours=1))
+    await _test_db.groups.block(GROUP, AccountId("bad1"), until=_nl0() + _btd(hours=1))
     n_live = len(bot.sent)
     await GATEWAY.handle(bot, FakeEvent("小X 在么", user_id="bad1", nickname="捣乱的", to_me=True))
     await drain()
     assert len(bot.sent) == n_live, "a running timed block still blocks"
-    await _test_db.groups.unblock(GROUP, "bad1")
+    await _test_db.groups.unblock(GROUP, AccountId("bad1"))
 
     # 16. A new account needs no agreement. Its message is admitted once, then
     # the ordinary reply path calls the model and delivers the reply on every address.

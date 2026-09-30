@@ -2,15 +2,24 @@
 
 from __future__ import annotations
 
+from qqbot.domain.ids import AccountId
 from qqbot.clock import Clock
 
 from collections.abc import Callable
-from datetime import date
+from datetime import date, datetime
+from typing import TypedDict
 import uuid
 
 import asyncpg
 
 from qqbot.domain.ids import GroupId
+
+
+class BlockRule(TypedDict):
+    id: uuid.UUID
+    user_id: AccountId | None
+    entity_id: uuid.UUID | None
+    blocked_until: datetime | None
 
 
 class GroupRepository:
@@ -34,10 +43,12 @@ class GroupRepository:
             muted,
         )
 
-    async def block(self, group_id: GroupId, user_ids: list[str] | str, *, until=None) -> None:
+    async def block(
+        self, group_id: GroupId, user_ids: list[AccountId] | AccountId, *, until=None
+    ) -> None:
         """Create or replace exact-account block rules."""
 
-        ids = [user_ids] if isinstance(user_ids, str) else list(user_ids)
+        ids = [user_ids] if isinstance(user_ids, AccountId) else list(user_ids)
         if not ids:
             return
         await self._database().executemany(
@@ -61,10 +72,10 @@ class GroupRepository:
             until,
         )
 
-    async def unblock(self, group_id: GroupId, user_ids: list[str] | str) -> bool:
+    async def unblock(self, group_id: GroupId, user_ids: list[AccountId] | AccountId) -> bool:
         """Delete exact-account block rules."""
 
-        ids = [user_ids] if isinstance(user_ids, str) else list(user_ids)
+        ids = [user_ids] if isinstance(user_ids, AccountId) else list(user_ids)
         if not ids:
             return False
         tag = await self._database().execute(
@@ -90,7 +101,7 @@ class GroupRepository:
         )
         return not tag.endswith(" 0")
 
-    async def blocked(self, group_id: GroupId, user_id: str) -> bool:
+    async def blocked(self, group_id: GroupId, user_id: AccountId) -> bool:
         """Resolve exact and linked-holder rules against current identity membership."""
 
         return bool(
@@ -112,7 +123,7 @@ class GroupRepository:
             )
         )
 
-    async def block_rules(self, group_id: GroupId) -> list[dict]:
+    async def block_rules(self, group_id: GroupId) -> list[BlockRule]:
         """Return active rules in their current exact-account or holder scope."""
 
         rows = await self._database().fetch(
@@ -137,10 +148,14 @@ class GroupRepository:
                 ORDER BY created_at, rule_id""",
             _group(group_id),
         )
-        combined: dict[tuple[str | None, uuid.UUID | None], dict] = {}
+        combined: dict[tuple[AccountId | None, uuid.UUID | None], BlockRule] = {}
         for row in rows:
-            item = dict(row)
-            item.pop("created_at")
+            item = BlockRule(
+                id=row["id"],
+                user_id=AccountId(row["user_id"]) if row["user_id"] is not None else None,
+                entity_id=row["entity_id"],
+                blocked_until=row["blocked_until"],
+            )
             key = (item["user_id"], item["entity_id"])
             previous = combined.get(key)
             if previous is None:

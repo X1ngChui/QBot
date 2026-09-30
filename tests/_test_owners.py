@@ -17,3 +17,13 @@ def fresh_budget() -> Budget:
 
 def fresh_members() -> MemberDirectory:
     return MemberDirectory()
+
+
+def fresh_tasks():
+    from qqbot.repositories.scheduled_task import ScheduledTaskRepository
+    from qqbot.services.scheduled_tasks import ScheduledTaskService
+
+    return ScheduledTaskService(
+        ScheduledTaskRepository(database=test_db.pool),
+        clock=test_db.clock,
+    )

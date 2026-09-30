@@ -9,11 +9,11 @@ within limits you set.
 
 ## Features
 
-- **Speaks when addressed or when a requested timer fires.** An @, a whole-word
-  nickname or a quote submits an independent reply. A member can also ask it to schedule
-  a one-shot group task; at the due time it re-reads the current conversation before
-  deciding whether to reply or schedule another bounded check. Other messages are
-  archived silently.
+- **Speaks when addressed or when a scheduled group task fires.** An @, a whole-word
+  nickname or a quote submits an independent reply. Group-scoped tasks can be managed
+  autonomously by the model or directly through owner commands. At the due time it reads
+  the current conversation before deciding whether to reply or make a bounded follow-up.
+  Other messages are archived without independently triggering a reply.
 - **Structured memory.** Facts about members and about the group are extracted nightly
   by a language model, validated by code against verbatim quotes, and stored with
   evidence, confidence and an expiry. Wrong entries can be deleted by number.
@@ -27,7 +27,7 @@ within limits you set.
   transcribed on arrival, on the CPU, at no cost.
 - **Tools.** The reply model can search the web, search the group's own archive with a
   boolean query, recall past episodes by meaning, read a web page, open pictures,
-  and create, list or cancel its initiator's group timers without a command.
+  and autonomously create, inspect, edit or cancel group tasks without a command.
 - **Spending and timer bounds.** A daily spending cap, a per-reply cap and a monthly
   search allowance bound paid work. Durable timers have separate limits on frequency,
   pending count, future horizon and self-renewal. Addressed replies and timers share a
@@ -136,13 +136,15 @@ not accepted by the runtime.
 ## Commands
 
 Commands use one meaning for every caller; authorization only permits or rejects the
-action. Person commands target the exact account by default and use explicit `--all` for
-the current linked account set.
+action. Person commands target the exact account by default and use explicit `--all`
+for the current linked identity. `/note --all` manages shared identity notes only,
+without changing any linked account's individual notes.
 
 | Command | Purpose |
 | --- | --- |
 | `/help` | Show the shared command catalogue and authorization labels |
-| `/who`, `/note`, `/alias`, `/forget` | Inspect and correct exact-account or explicit linked-set records |
+| `/who`, `/note`, `/alias`, `/forget` | Inspect personal records; manage independent manual notes, aliases and learned facts |
+| `/tasks` | Owner management of group tasks: list, show, add, edit, cancel |
 | `/link`, `/unlink` | Confirm an alternate account or detach the current exact account |
 | `/card`, `/stats`, `/top` | Group memory and usage |
 | `/members`, `/merge`, `/split` | Owner directory and identity repair |

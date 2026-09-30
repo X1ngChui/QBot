@@ -88,8 +88,8 @@ async def test_bulk_read_preserves_group_notes_candidates_and_linked_accounts(da
     for group, value in ((311, "Fictional note"), (312, "Other group note")):
         await database.pool.execute(
             """INSERT INTO memory_fact(group_id,subject_account_id,predicate,object_value,
-                                       memory_type,confidence)
-               VALUES ($1,$2,'note',$3,'attribute',1)""",
+                                       memory_type,confidence,object_key)
+               VALUES ($1,$2,'note',$3,'attribute',1,gen_random_uuid()::text)""",
             group,
             second_account,
             value,

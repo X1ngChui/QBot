@@ -1,6 +1,7 @@
 """Operator decisions, separate from protocol and implementation safety policies."""
 
 from __future__ import annotations
+from qqbot.domain.ids import AccountId
 
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -15,7 +16,7 @@ class ConfigModel(BaseModel):
 
 
 class BotCfg(ConfigModel):
-    owners: tuple[str, ...] = Field(
+    owners: tuple[AccountId, ...] = Field(
         default=(), description="Accounts authorized to operate the bot."
     )
     timezone: str = Field(
@@ -232,9 +233,6 @@ class BudgetCfg(ConfigModel):
 class TasksCfg(ConfigModel):
     max_days_ahead: int = Field(
         default=30, ge=1, le=365, description="Furthest future wakeup in days."
-    )
-    max_pending_per_account: int = Field(
-        default=5, ge=1, description="Pending wakeups per account and group."
     )
     max_pending_per_group: int = Field(
         default=50, ge=1, description="Pending wakeups across a group."

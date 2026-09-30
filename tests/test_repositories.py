@@ -60,11 +60,13 @@ GROUP_B = GroupId("222")
 from _db import reset
 
 
-async def an_event(group_id: GroupId) -> uuid.UUID:
+async def an_event(group_id: GroupId, user_id: str | None = None) -> uuid.UUID:
     return await pool().fetchval(
-        """INSERT INTO raw_event (platform, event_type, group_id, occurred_at, payload)
-           VALUES ('qq','message',$1,NOW(),'{}'::jsonb) RETURNING id""",
+        """INSERT INTO raw_event
+               (platform,event_type,group_id,platform_user_id,occurred_at,payload)
+           VALUES ('qq','message',$1,$2,NOW(),'{}'::jsonb) RETURNING id""",
         group_id.to_db(),
+        user_id,
     )
 
 
@@ -206,7 +208,7 @@ async def test_repositories(test_database):
         IdentityLinkRepository(database=_test_db.pool),
         clock=_test_db.clock,
     )
-    challenge, code = await link_service.issue(
+    challenge = await link_service.issue(
         group_id=GROUP_A,
         initiator_user_id="link-a",
         target_user_id="link-b",
@@ -215,11 +217,10 @@ async def test_repositories(test_database):
     assert (
         challenge.initiator_account_id == link_a.id and challenge.target_account_id == link_b.id
     ), "a link challenge binds exact endpoint accounts"
-    confirm_event = await an_event(GROUP_A)
+    confirm_event = await an_event(GROUP_A, "link-b")
     applied = await link_service.confirm(
         group_id=GROUP_A,
         actor_user_id="link-b",
-        code=code,
         confirmed_event_id=confirm_event,
     )
     assert applied.status.value == "applied", "target confirmation atomically applies the union"
@@ -227,7 +228,6 @@ async def test_repositories(test_database):
         await link_service.confirm(
             group_id=GROUP_A,
             actor_user_id="link-b",
-            code=code,
             confirmed_event_id=confirm_event,
         )
     ).status.value == "applied", "replaying the same target confirmation is idempotent"
@@ -237,7 +237,7 @@ async def test_repositories(test_database):
 
     for name in ("lock-a", "lock-b", "parallel-a", "parallel-b"):
         await ids.ensure_account("qq", name, seen_at=now)
-    locked, locked_code = await link_service.issue(
+    locked = await link_service.issue(
         group_id=GROUP_A,
         initiator_user_id="lock-a",
         target_user_id="lock-b",
@@ -249,8 +249,7 @@ async def test_repositories(test_database):
             link_service.confirm(
                 group_id=GROUP_A,
                 actor_user_id="lock-b",
-                code=locked_code,
-                confirmed_event_id=await an_event(GROUP_A),
+                confirmed_event_id=await an_event(GROUP_A, "lock-b"),
             )
         )
         waiting = False
@@ -282,7 +281,7 @@ async def test_repositories(test_database):
                 created_event_id=await an_event(GROUP_A),
             )
         )
-    applied, (parallel_challenge, parallel_code) = await asyncio.wait_for(
+    applied, parallel_challenge = await asyncio.wait_for(
         asyncio.gather(confirmation, parallel_issue), timeout=5
     )
     assert applied.status.value == "applied" and parallel_challenge.status.value == "pending", (
@@ -296,8 +295,7 @@ async def test_repositories(test_database):
         await link_service.confirm(
             group_id=GROUP_A,
             actor_user_id="parallel-b",
-            code=parallel_code,
-            confirmed_event_id=await an_event(GROUP_A),
+            confirmed_event_id=await an_event(GROUP_A, "parallel-b"),
         )
         expired_rejected = False
     except LinkChallengeError:
@@ -313,13 +311,13 @@ async def test_repositories(test_database):
     for user_id in ("limit-a", "limit-b", "limit-c"):
         await ids.ensure_account("qq", user_id, seen_at=now)
     limited_service = IdentityLinkService(
-        ChallengeLimits(max_pending_per_account=1),
+        ChallengeLimits(),
         IdentityResolver(ids),
         ids,
         IdentityLinkRepository(database=_test_db.pool),
         clock=_test_db.clock,
     )
-    _pending, pending_code = await limited_service.issue(
+    _pending = await limited_service.issue(
         group_id=GROUP_A,
         initiator_user_id="limit-a",
         target_user_id="limit-b",
@@ -339,14 +337,14 @@ async def test_repositories(test_database):
     await limited_service.cancel(
         group_id=GROUP_A,
         actor_user_id="limit-a",
-        code=pending_code,
+        cancelled_event_id=await an_event(GROUP_A, "limit-a"),
     )
 
     changing_a = await ids.ensure_account("qq", "changing-a", seen_at=now)
     changing_peer = await ids.ensure_account("qq", "changing-peer", seen_at=now)
     await ids.ensure_account("qq", "changing-b", seen_at=now)
     await ids.merge_accounts(changing_a.id, changing_peer.id)
-    changing_challenge, changing_code = await link_service.issue(
+    changing_challenge = await link_service.issue(
         group_id=GROUP_A,
         initiator_user_id="changing-a",
         target_user_id="changing-b",
@@ -358,8 +356,7 @@ async def test_repositories(test_database):
         await link_service.confirm(
             group_id=GROUP_A,
             actor_user_id="changing-b",
-            code=changing_code,
-            confirmed_event_id=await an_event(GROUP_A),
+            confirmed_event_id=await an_event(GROUP_A, "changing-b"),
         )
         changed_rejected = False
     except LinkChallengeError:

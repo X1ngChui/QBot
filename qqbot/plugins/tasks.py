@@ -9,6 +9,7 @@ import nonebot
 from apscheduler.triggers.cron import CronTrigger
 from nonebot_plugin_apscheduler import scheduler
 
+from qqbot.domain.ids import AccountId
 from qqbot.operations import scheduled
 from qqbot.runtime import Runtime
 from zoneinfo import ZoneInfo
@@ -29,8 +30,8 @@ async def _report(runtime: Runtime) -> None:
         log.exception("daily report: no bot connected, nothing sent")
         return
 
-    async def send_private(user_id: int, message: str) -> None:
-        await bot.send_private_msg(user_id=user_id, message=message)
+    async def send_private(user_id: AccountId, message: str) -> None:
+        await bot.send_private_msg(user_id=int(user_id), message=message)
 
     await scheduled.daily_report(runtime, send_private)
 

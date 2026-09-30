@@ -5,8 +5,10 @@ workflows, `unit/` covers isolated, property and concurrency contracts, and
 `integration/` covers PostgreSQL contracts in per-case schemas. Fixtures own mutable
 resources; there is no separate script runner. Ruff and Pyright run as separate checks.
 Pyright checks annotated production code and maintained scripts (`bot.py`, `qqbot/`,
-`scripts/`) in basic mode, including the nominal distinction between `GroupId` and
-`str`; tests are validated by pytest, not included in the Pyright scope.
+`scripts/`) in basic mode, including the nominal distinctions among `AccountId`,
+`GroupId`, `MessageId` and `str`. Regressions verify protocol normalization, typed SQL
+read models and rejection of erased or interchanged IDs. Tests are validated by pytest,
+not included in the Pyright scope.
 
 Database cases skip unless `QBOT_TEST_DATABASE_URL` is explicitly set. A passing run
 with skipped database cases is not the full regression suite.
@@ -52,7 +54,7 @@ startup or a rejected disposable-database guard must still close owned resources
 | --- | --- | --- |
 | `test_domain.py` | no | The domain model: alias evidence and confirmation, fact validity windows, candidates, episodes |
 | `test_schema.py` | yes | Fresh canonical schema and read-only structural drift checks, including same-name bad indexes and constraints in a disposable schema |
-| `test_scheduled.py` | yes | Durable one-shot tasks, account scope, concurrent claims, chain bounds, offline safety and fresh-context wakeups |
+| `test_scheduled.py` | yes | Durable one-shot tasks, group scope, concurrent claims, chain bounds, offline safety and fresh-context wakeups |
 | `test_deploy.py` | no | Local fake-host build, staged-config schema gate, stopped-bot switch, startup failure rollback and code/config fingerprint |
 | `test_logic.py` | no | Configuration merge, output cleaning, budget arithmetic, segment parsing, prompt ordering, history eviction, the permission table, the source-language guard |
 | `test_nickname.py` | no | Whole-word nickname matching and its boundary cases |

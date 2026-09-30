@@ -9,12 +9,12 @@ from __future__ import annotations
 from collections.abc import Iterable
 from enum import StrEnum
 
+from qqbot.domain.ids import AccountId
 from qqbot.commands.catalog import Access
 
 
-def is_owner(user_id: str, owners: Iterable[str]) -> bool:
-    listed = {str(owner).strip() for owner in owners if str(owner).strip()}
-    return str(user_id) in listed
+def is_owner(user_id: AccountId, owners: Iterable[AccountId]) -> bool:
+    return user_id in owners
 
 
 class Verdict(StrEnum):
@@ -23,7 +23,7 @@ class Verdict(StrEnum):
     DENIED = "denied"
 
 
-def decide(user_id: str, *, owners: Iterable[str], access: Access) -> Verdict:
+def decide(user_id: AccountId, *, owners: Iterable[AccountId], access: Access) -> Verdict:
     if is_owner(user_id, owners):
         return Verdict.OWNER
     if access is Access.MEMBER:

@@ -1,6 +1,7 @@
 """Role-independent command catalog, authorization, and strict parsing."""
 
 import _db as _test_db
+from _test_owners import fresh_tasks
 import types
 import uuid
 
@@ -45,6 +46,7 @@ class FakeDirectory:
         self.calls = []
         self._account = uuid.uuid4()
         self._holder = uuid.uuid4()
+        self._notes = {}
 
     def exact_card(self, user_id):
         return PersonCard(
@@ -68,6 +70,10 @@ class FakeDirectory:
             messages=5,
         )
 
+    async def display_name(self, group_id, user_id):
+        self.calls.append(("display_name", group_id, user_id))
+        return f"账号-{user_id}"
+
     async def account_card(self, group_id, user_id):
         self.calls.append(("account_card", group_id, user_id))
         return self.exact_card(user_id)
@@ -84,8 +90,34 @@ class FakeDirectory:
         self.calls.append(("linked_account_ids", user_id))
         return [user_id, str(TARGET), "linked-alt"]
 
-    async def note(self, group_id, user_id, text, *, all_linked=False):
-        self.calls.append(("note", group_id, user_id, text, all_linked))
+    async def notes(self, group_id, user_id, *, all_linked=False, page=1):
+        self.calls.append(("notes", group_id, user_id, all_linked, page))
+        rows = self._notes.get((group_id, user_id, all_linked), [])
+        offset = (page - 1) * 5
+        return tuple(rows[offset : offset + 5]), len(rows) > offset + 5
+
+    async def add_note(self, group_id, user_id, text, *, all_linked=False):
+        self.calls.append(("add_note", group_id, user_id, text, all_linked))
+        note = types.SimpleNamespace(object_value=text, object_key=str(uuid.uuid4()))
+        self._notes.setdefault((group_id, user_id, all_linked), []).append(note)
+        return note
+
+    async def edit_note(self, group_id, user_id, index, text, *, all_linked=False):
+        self.calls.append(("edit_note", group_id, user_id, index, text, all_linked))
+        rows = self._notes.get((group_id, user_id, all_linked), [])
+        if not 1 <= index <= len(rows):
+            return None
+        rows[index - 1].object_value = text
+        return rows[index - 1]
+
+    async def remove_note(self, group_id, user_id, index, *, all_linked=False):
+        self.calls.append(("remove_note", group_id, user_id, index, all_linked))
+        rows = self._notes.get((group_id, user_id, all_linked), [])
+        return rows.pop(index - 1) if 1 <= index <= len(rows) else None
+
+    async def clear_notes(self, group_id, user_id, *, all_linked=False):
+        self.calls.append(("clear_notes", group_id, user_id, all_linked))
+        return len(self._notes.pop((group_id, user_id, all_linked), []))
 
     async def name(self, group_id, user_id, text, *, all_linked=False):
         self.calls.append(("name", group_id, user_id, text, all_linked))
@@ -118,7 +150,7 @@ class FakeLinks:
 
     async def issue(self, **kwargs):
         self.calls.append(("issue", kwargs))
-        return object(), "12345678"
+        return object()
 
     async def confirm(self, **kwargs):
         self.calls.append(("confirm", kwargs))
@@ -155,6 +187,7 @@ async def router_case():
         directory,
         links,
         providers,
+        tasks=fresh_tasks(),
         budget=fake_budget(),
         members=members,
         groups=_test_db.groups,
@@ -227,16 +260,16 @@ async def test_note_scope_is_identical_for_owner_and_member(router_case):
     router, bot, directory, _ = router_case
     for user in (OWNER, MEMBER):
         await router.handle(
-            bot, request("/note", user=user, text="/note set 同一段备注", mentions=(TARGET,))
+            bot, request("/note", user=user, text="/note add -- 同一段备注", mentions=(TARGET,))
         )
-    note_calls = [call for call in directory.calls if call[0] == "note"]
-    assert note_calls == [("note", GROUP, str(TARGET), "同一段备注", False)] * 2
+    note_calls = [call for call in directory.calls if call[0] == "add_note"]
+    assert note_calls == [("add_note", GROUP, str(TARGET), "同一段备注", False)] * 2
     directory.calls.clear()
     await router.handle(
         bot,
         request("/note", user=MEMBER, text="/note clear --all", mentions=(TARGET,)),
     )
-    assert ("note", GROUP, str(TARGET), "", True) in directory.calls
+    assert ("clear_notes", GROUP, str(TARGET), True) in directory.calls
 
 
 @pytest.mark.asyncio
@@ -274,7 +307,7 @@ async def test_link_confirmation_preserves_actor_and_event(router_case):
     assert issue["initiator_user_id"] == str(MEMBER)
     assert issue["target_user_id"] == str(OTHER)
     assert isinstance(issue["created_event_id"], uuid.UUID)
-    await router.handle(bot, request("/link", user=OTHER, text="/link confirm 12345678"))
+    await router.handle(bot, request("/link", user=OTHER, text="/link confirm"))
     confirm = next(call for call in links.calls if call[0] == "confirm")[1]
     assert confirm["actor_user_id"] == str(OTHER)
     assert isinstance(confirm["confirmed_event_id"], uuid.UUID)

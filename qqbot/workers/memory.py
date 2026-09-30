@@ -30,7 +30,7 @@ from qqbot.services.budget import Budget, BudgetExceeded, BudgetUnavailable
 from qqbot.conversation.member_numbers import BOT_DISPLAY_NUMBER
 from qqbot.gateway.segments import number_at_mentions
 from qqbot.domain.archive import AuthorKind
-from qqbot.domain.ids import GroupId
+from qqbot.domain.ids import AccountId, GroupId
 from qqbot.domain.memory import ExtractionBatch
 from qqbot.domain.memory import ExtractionSnapshot
 from qqbot.domain.memory import ExtractionStatus
@@ -242,7 +242,7 @@ class MemoryWorker:
             account.id: account for account in await self._ids.accounts_by_ids(list(by_account))
         }
         per: dict[int, list[str]] = {}
-        notes: dict[int, str] = {}
+        notes: dict[int, list[str]] = {}
         exact = await self._mem.current_account_facts(group_id, list(by_account))
         for fact in exact:
             assert fact.subject_account_id is not None
@@ -250,7 +250,7 @@ class MemoryWorker:
             if code is None:
                 continue
             if fact.predicate == NOTE:
-                notes[code] = defang(str(fact.object_value))
+                notes.setdefault(code, []).append("精确账号：" + defang(str(fact.object_value)))
             else:
                 per.setdefault(code, []).append(
                     render_hint("事实", f"{fact.predicate} = {fact.object_value}", fact.confidence)
@@ -266,7 +266,9 @@ class MemoryWorker:
             for account_id in accounts_by_holder.get(fact.subject_entity_id, ()):
                 code = by_account[account_id]
                 if fact.predicate == NOTE:
-                    notes.setdefault(code, defang(str(fact.object_value)))
+                    notes.setdefault(code, []).append(
+                        "关联身份共享：" + defang(str(fact.object_value))
+                    )
                 else:
                     rendered = "关联集合共享：" + render_hint(
                         "事实", f"{fact.predicate} = {fact.object_value}", fact.confidence
@@ -292,8 +294,10 @@ class MemoryWorker:
                     per.setdefault(by_account[account_id], []).append(hint)
 
         for code in sorted(per.keys() | notes.keys()):
-            note = f"备注：{notes[code]}" if code in notes else ""
-            out.append(f"{sysmark(str(code))}：{note}")
+            out.append(f"{sysmark(str(code))}：")
+            if manual := notes.get(code):
+                out.append("人工备注：")
+                out.extend("- " + text for text in sorted(manual))
             if hints := sorted(per.get(code, [])):
                 out.append("未确认线索：")
                 out.extend(f"- {hint}" for hint in hints)
@@ -429,15 +433,15 @@ class MemoryWorker:
         """Render source-numbered lines and a stable code for each exact account."""
 
         codes: dict[int, uuid.UUID] = {}
-        by_platform: dict[str, int | None] = {}
+        by_platform: dict[AccountId, int | None] = {}
         by_id: dict[uuid.UUID, int] = {}
         lines: list[SourceLine] = []
         roster: list[str] = []
-        bot_accounts: set[str] = set()
+        bot_accounts: set[AccountId] = set()
 
         rows = tuple(rows)
-        users = {str(row.sender.account_id) for row in rows}
-        users.update(str(account) for row in rows for account, _ in row.mentions)
+        users = {row.sender.account_id for row in rows}
+        users.update(account for row in rows for account, _ in row.mentions)
         reading = await self._ids.extraction_identities(group_id, sorted(users))
         accounts_by_user = {account.platform_user_id: account for account in reading.accounts}
         aliases_by_account: dict[uuid.UUID, list[str]] = {}
@@ -475,7 +479,7 @@ class MemoryWorker:
             )
             return code
 
-        def assign_account(account_id: str, display: str) -> int | None:
+        def assign_account(account_id: AccountId, display: str) -> int | None:
             if account_id in by_platform:
                 return by_platform[account_id]
             account = accounts_by_user.get(account_id)
@@ -485,9 +489,9 @@ class MemoryWorker:
             return assign_identity(account, display)
 
         for archived in rows:
-            platform_id = str(archived.sender.account_id)
+            platform_id = archived.sender.account_id
             name = archived.sender.display_name
-            self_account = str(archived.self_id or "")
+            self_account = archived.self_id
             if self_account:
                 bot_accounts.add(self_account)
             own = archived.author_kind is AuthorKind.BOT
@@ -503,7 +507,7 @@ class MemoryWorker:
 
             mentions = archived.mentions
             for account_id, display in mentions:
-                key = str(account_id)
+                key = account_id
                 if key in bot_accounts or key == self_account:
                     by_platform[key] = BOT_DISPLAY_NUMBER
                 else:
@@ -511,7 +515,7 @@ class MemoryWorker:
 
             text = number_at_mentions(
                 archived.text,
-                [(str(account), display) for account, display in mentions],
+                list(mentions),
                 lambda account: by_platform.get(account),
             )
             if not text:
@@ -527,7 +531,7 @@ class MemoryWorker:
                 if author_account_id is not None:
                     targets.append(SnapshotTarget(author_account_id, "author"))
                 for account_id, _display in mentions:
-                    code = by_platform.get(str(account_id))
+                    code = by_platform.get(account_id)
                     if code is None or code == BOT_DISPLAY_NUMBER:
                         continue
                     targets.append(SnapshotTarget(codes[code], "mention", sysmark(str(code))))

@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import datetime
+from qqbot.domain.ids import AccountId
 import uuid
 
 from qqbot.domain.identity.alias import Alias
@@ -11,7 +12,7 @@ from qqbot.domain.memory.fact import Fact
 
 @dataclass(frozen=True, slots=True)
 class SpeakerActivity:
-    user_id: str
+    user_id: AccountId
     messages: int
     first_seen: datetime
 

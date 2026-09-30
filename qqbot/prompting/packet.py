@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from qqbot.domain.ids import AccountId
 from qqbot.conversation.agent import WRAP_UP_NOTE
 from qqbot.conversation.member_numbers import MemberNumbers
 from qqbot.conversation.prompt import build_developer
@@ -35,11 +36,11 @@ def _tool_document(specs) -> list[dict[str, Any]]:
 def build_prompt_packet(catalog: PromptCatalog, cfg: Settings, predicates: PredicateTable) -> str:
     """Return the full authoring contract without reading live or persisted data."""
 
-    people = MemberNumbers(self_id="bot-0")
-    people.teach("member-1", "person-1")
-    people.teach("member-2", "person-2")
-    people.number("member-1", spoke=True)
-    people.number("member-2")
+    people = MemberNumbers(self_id=AccountId("bot-0"))
+    people.teach(AccountId("member-1"), "person-1")
+    people.teach(AccountId("member-2"), "person-2")
+    people.number(AccountId("member-1"), spoke=True)
+    people.number(AccountId("member-2"))
     persona = Persona(
         name="小X",
         system_prompt="你是虚构测试群中的成员小X。",
@@ -108,7 +109,7 @@ def build_prompt_packet(catalog: PromptCatalog, cfg: Settings, predicates: Predi
                     "reply_system(shared_legend, shared_pragmatics)",
                     "reply_developer(persona, group_context, member_roster)",
                     "current group history and tool continuations",
-                    "scheduled_user(now, intent, initiator)",
+                    "scheduled_user(now, intent, task_id, due_at)",
                 ],
                 "extract": [
                     "extract_system(shared_legend, shared_pragmatics, predicate_table)",
@@ -230,7 +231,8 @@ def build_prompt_packet(catalog: PromptCatalog, cfg: Settings, predicates: Predi
                 PromptKey.SCHEDULED_USER,
                 now="2026年9月19日 09:00",
                 intent="查看虚构项目晨星是否有新进展；若还没结果，之后再查看一次。",
-                initiator="原发起人⟦1⟧",
+                task_id="00000000-0000-0000-0000-000000000001",
+                due_at="2026-09-19T09:00:00+08:00",
             ),
             "extract_system": catalog.render(
                 PromptKey.EXTRACT_SYSTEM,

@@ -69,17 +69,22 @@ path. Run it after changing keys, models or endpoints.
 
 ## Model-created timers
 
-A member asks the bot in chat to schedule, list or cancel a task. The model uses the
-corresponding tool; no scheduling command or process-local timer registration is used.
-Tasks remain pending in PostgreSQL over a restart or OneBot disconnect. A connected
-worker checks them on a code-owned 15-second cadence, wakes with the current group
-window, and can create a bounded follow-up after re-evaluating the task. Muted groups,
-blocked initiators and the shared daily budget suppress due replies. Tasks are claimed
-at most once: a process interruption after the claim marks the task failed on restart
-rather than risking a duplicate message. Finished task rows are retained for
-`maintenance.completed_task_keep_days` days. Check pending and recent outcomes with
-read-only SQL when investigating a missed reminder; do not re-run an already claimed
-row blindly.
+Tasks are group-scoped durable work. The model can create, inspect, edit or cancel them
+from an ordinary reply or due wakeup. Owners can use `/tasks` directly; see [commands](commands.md).
+Tasks remain pending in PostgreSQL over restart or OneBot disconnect. A connected worker
+checks on a code-owned 15-second cadence, reserves reply capacity before claiming, and uses
+the current group window. Group mute, shared budgets and deadlines gate execution; member
+blocking applies to addressed messages, not group wakeups. Due work has group-only billing
+attribution. Claims are single-attempt; interrupted work is not replayed.
+
+`/tasks list` pages through pending and running work, `/tasks show UUID` inspects a retained
+record, and edit/cancel operate only on pending rows. The shared task service validates
+times and content for both commands and model tools. Conditional SQL resolves races with
+claiming; multiple edits or merge/split operations are not one transaction. Inspect current
+state when a write result is uncertain rather than blindly repeating it.
+
+Finished rows remain for `maintenance.completed_task_keep_days`. Group pending/day limits
+and inherited chain depth bound follow-ups. Scheduled time is not guaranteed delivery time.
 
 ## Backups
 
@@ -229,10 +234,11 @@ an owner's note, episode summaries stay objective, and the bot's own name never
 becomes a member's alias.
 
 `eval_tasks.py` runs the real reply-model session against public prompts, invented members
-and a fictional scheduling transport. It checks merge/split replacement, live final
-listing, owner/member scope, short-delay refusal, requested recipients, single next
-occurrences and one-shot completion. It never creates production tasks, contacts QQ or
-loads deployment personas. Model usage is written only to the explicitly guarded
+and fictional task storage through the real task service and tool dispatcher. It checks
+merge/split replacement, fresh final queries, group scope, in-place edits, exact requested
+times, short-delay refusal, requested recipients, single next occurrences and one-shot
+completion. It never creates production tasks, contacts QQ or loads deployment personas.
+Model usage is written only to the explicitly guarded
 `qbot_test` database; use `--case` to select a scenario. Passing cases are sampled model
 behavior, not a guarantee against concurrent live changes.
 
@@ -244,3 +250,14 @@ behavior, not a guarantee against concurrent live changes.
   slightly.
 - Once the monthly search allowance is spent, questions that would need a search are
   answered from the material at hand for the rest of the month.
+
+## Group-contract schema conversion
+
+Apply `sql/migrations/20260930_group_tasks_notes.sql` offline only after stopping the
+runtime and verifying a fresh backup. It retains task history but terminates old pending
+arrangements with `scope_changed`, since creator-dependent recipients cannot be converted
+reliably into group-only goals. Establish needed work again under the current contract.
+Existing manual-note history gains stable per-scope logical keys without losing content.
+Pending identity invitations expire and can be issued again; applied history remains.
+Remove `tasks.max_pending_per_account` from settings before starting the current schema.
+The runtime accepts only the canonical schema and has no startup compatibility migration.

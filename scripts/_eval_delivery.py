@@ -70,5 +70,5 @@ class EvaluationDelivery:
         )
         self._state.add(message)
         self.messages.append(draft)
-        self.echo.publish(str(bot.self_id), group_id, message)
+        self.echo.publish(bot.self_id, group_id, message)
         return DeliveredMessage(identifier, segments, draft.reply_to)

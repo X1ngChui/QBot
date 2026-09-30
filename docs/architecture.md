@@ -66,6 +66,17 @@ There is no automatic fallback between backends. A failed call is logged and the
 is dropped; being addressed and staying silent gets its own log line so it can be told
 apart from a message that was not addressed at all.
 
+### Platform identifiers
+
+`AccountId`, `GroupId` and `MessageId` are distinct nominal value types throughout
+core records, services, cache keys and repository read models. Ingress and SQL reads
+construct them at the boundary; only protocol and SQL encoding turn them into wire
+values. Identity-account keys and raw-event keys remain UUIDs, not platform identifiers.
+The NoneBot adapter supplies a small `OneBotClient` that wraps the framework bot account
+once and forwards protocol I/O; the core `BotApi` contract never exposes an untyped
+`self_id`. Pyright checks these contracts, with regressions rejecting erased or
+interchanged platform identifiers.
+
 ### Runtime ownership
 
 `qqbot/runtime.py` is the process composition root. The plugin loads one immutable
@@ -156,15 +167,18 @@ incoming QQ message or enter the archive.
 
 ### Gates
 
-Before reply-model or tool spending, the task checks the daily cap (silence when reached)
-and the group's block list (a blocked member is read and remembered as always, but is not
-answered). The mute switch is checked earlier by the trigger. Any other member can use
-the bot immediately, without an acceptance step.
+Before reply-model or tool spending, an addressed task checks the daily cap and its
+initiator's current group block status. A blocked account cannot independently trigger
+an ordinary reply, but its messages remain in context; another triggered session may
+refer or respond to them. There is no blocked-recipient send filter or guarantee of
+semantic silence. Group task wakeups have no member initiator or member block gate.
+The mute switch and budget still apply. Other members can use the bot immediately,
+without an acceptance step.
 
 ## Reply engine
 
-Each addressed message or due timer owns an independent model session and the money
-scope of its original initiator. A session begins with the arrival-time window, then
+Each addressed message or due timer owns an independent model session and stop-loss scope.
+Addressed work retains its causing AccountId; group timers have no single-account attribution. A session begins with the arrival-time window, then
 extends its own stable line, member and picture numbers only when it resumes after tools.
 New member messages still trigger their own concurrent tasks. They are additional
 observations in the existing task, not a replacement for its original request.
@@ -213,7 +227,8 @@ deadline can end that wait sooner. If retrieval allowance is exhausted before se
 a final round can send or end without searching. After an already confirmed send,
 exhaustion ends immediately; it never retracts a visible message. Retrieval evidence
 is attached to the first platform-acknowledged message ID. Timers use the same send
-loop and keep the original initiator, mute, block and daily-cap checks.
+loop with group mute, budget, deadline and fuel checks. Member blocking gates addressed
+message causes, not group tasks; context remains available to every private session.
 
 ### Model payload safety
 
@@ -239,7 +254,7 @@ carries them.
 | Tool | What it does |
 | --- | --- |
 | `send_message`, `finish_reply` | Sends one QQ message with an observed result, or ends the session without another send. |
-| `schedule_task`, `list_scheduled_tasks`, `cancel_scheduled_task` | Store, inspect and cancel persistent one-shot tasks in this group. The initiator comes from the inbound message or original timer, not the model's arguments. Ordinary members manage their own tasks; owners can manage this group's tasks. Scheduling and sending must occupy separate model rounds. |
+| `schedule_task`, `list_scheduled_tasks`, `get_scheduled_task`, `update_scheduled_task`, `cancel_scheduled_task` | Group-scoped persistent work. The model autonomously creates, inspects, edits or cancels tasks; scope is supplied by the runtime, never by model arguments. Active lists include pending and running, with explicit paging. Editing and cancellation are pending-only conditional SQL mutations; edit preserves ID and chain. Task operations and sending occupy separate model rounds. |
 | `web_search` | Web search through the configured search backend. Debits the monthly allowance. |
 | `read_url` | The readable text of one page, bounded in characters. Debits the same allowance. |
 | `search_history` | Boolean search over this group's archive. Lucene syntax parsed by luqum: space means AND, `OR`, `-` exclusion, parentheses, quoted phrases. Only the boolean subset is accepted; fields and ranges are refused in words. The query compiles to one parameterised `ILIKE` expression. Narrowable by speaker (a member number, or a display name for someone the prompt shows no number for) and by days. Each hit is returned with surrounding lines, touching windows merged, and the whole answer is bounded in characters with a note when cut. |
@@ -613,7 +628,7 @@ line.
 Model-created timers persist across restarts in a separate `scheduled_task` table;
 `memory_job` cannot hold them because it deduplicates pending work by type and group.
 A due timer loads the latest archived messages even after a restart and rechecks the
-current group mute, initiator block and shared daily budget before generation. Its original short intent
+current group mute and shared daily budget before generation. Its original short intent
 is lower-trust historical input, not a new group message; the model decides anew whether
 to speak, retrieve facts, or create a bounded follow-up. Pending tasks wait for the
 OneBot connection. The worker must reserve inbox capacity before claiming a task;

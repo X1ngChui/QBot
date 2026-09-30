@@ -14,7 +14,7 @@ import asyncpg
 from qqbot.db.connection import DbConnection
 from qqbot.repositories.job import Job, fenced_transaction
 from qqbot.domain.ids import GroupId
-from qqbot.repositories.identity import FAMILY
+from qqbot.repositories.identity import FAMILY, lock_identity_topology
 from qqbot.domain.memory import Candidate
 from qqbot.domain.memory import Episode
 from qqbot.domain.memory import EpisodeType
@@ -23,6 +23,10 @@ from qqbot.domain.memory import FactEvidence
 from qqbot.domain.memory import FactStatus
 from qqbot.domain.memory import MemoryType
 from qqbot.domain.memory import earned_confidence
+
+
+NOTE_PAGE_SIZE = 5
+NOTE_LIMIT = 20
 
 
 @asynccontextmanager
@@ -111,7 +115,11 @@ class MemoryRepository:
                )
                SELECT top.* FROM (SELECT DISTINCT root FROM family) r
                CROSS JOIN LATERAL (
-                   SELECT m.*, r.root
+                   SELECT ranked.* FROM (
+                   SELECT m.*, r.root, row_number() OVER (
+                       PARTITION BY (m.predicate='note')
+                       ORDER BY m.confidence DESC, m.last_confirmed_at DESC NULLS LAST, m.id
+                   ) AS fact_rank
                      FROM memory_fact m
                     WHERE m.group_id=$1 AND m.status='active' AND m.valid_to IS NULL
                       AND (
@@ -122,8 +130,7 @@ class MemoryRepository:
                               SELECT id FROM holder_accounts WHERE root=r.root
                           )
                       )
-                    ORDER BY m.confidence DESC, m.last_confirmed_at DESC NULLS LAST, m.id
-                    LIMIT $3
+                   ) ranked WHERE predicate='note' OR fact_rank<=$3
                ) top""",
             group_id.to_db(),
             subject_ids,
@@ -144,15 +151,18 @@ class MemoryRepository:
         if not account_ids:
             return []
         rows = await (_conn or self._database()).fetch(
-            """SELECT * FROM memory_fact
-                WHERE group_id=$1 AND subject_account_id=ANY($2::uuid[])
-                  AND status='active' AND valid_to IS NULL
-                ORDER BY subject_account_id, confidence DESC,
-                         last_confirmed_at DESC NULLS LAST, id
-                LIMIT $3""",
+            """SELECT * FROM (
+                   SELECT m.*, row_number() OVER (
+                       PARTITION BY subject_account_id, (predicate='note')
+                       ORDER BY confidence DESC, last_confirmed_at DESC NULLS LAST, id
+                   ) AS fact_rank FROM memory_fact m
+                    WHERE group_id=$1 AND subject_account_id=ANY($2::uuid[])
+                      AND status='active' AND valid_to IS NULL
+               ) ranked WHERE predicate='note' OR fact_rank<=$3
+               ORDER BY subject_account_id, predicate, object_key, id""",
             group_id.to_db(),
             account_ids,
-            limit * len(account_ids),
+            limit,
         )
         return [_fact(row) for row in rows]
 
@@ -176,14 +186,16 @@ class MemoryRepository:
                )
                SELECT top.* FROM (SELECT DISTINCT root FROM family) r
                CROSS JOIN LATERAL (
-                   SELECT m.*, r.root FROM memory_fact m
+                   SELECT ranked.* FROM (
+                   SELECT m.*, r.root, row_number() OVER (
+                       PARTITION BY (m.predicate='note')
+                       ORDER BY m.confidence DESC, m.last_confirmed_at DESC NULLS LAST, m.id
+                   ) AS fact_rank FROM memory_fact m
                     WHERE m.group_id=$1 AND m.status='active' AND m.valid_to IS NULL
                       AND m.subject_entity_id IN (
                           SELECT id FROM family WHERE root=r.root
                       )
-                    ORDER BY m.confidence DESC,
-                             m.last_confirmed_at DESC NULLS LAST, m.id
-                    LIMIT $3
+                   ) ranked WHERE predicate='note' OR fact_rank<=$3
                ) top""",
             group_id.to_db(),
             entity_ids,
@@ -341,6 +353,201 @@ class MemoryRepository:
                 raise RuntimeError("fact insert returned no row")
             await self._add_evidence(conn, row["id"], evidence)
             return _fact(row)
+
+    async def notes(
+        self,
+        group_id: GroupId,
+        subject: uuid.UUID,
+        *,
+        holder: bool,
+        offset: int = 0,
+        limit: int = 6,
+        _conn: DbConnection | None = None,
+    ) -> list[Fact]:
+        """Current notes in one editable scope, ordered by stable logical key."""
+        scope = (
+            "subject_entity_id IN (SELECT id FROM family)" if holder else "subject_account_id=$2"
+        )
+        rows = await (_conn or self._database()).fetch(
+            FAMILY.format(arg="$2")
+            + f"""
+                SELECT * FROM memory_fact WHERE group_id=$1 AND {scope}
+                  AND predicate='note' AND status='active' AND valid_to IS NULL
+                ORDER BY object_key,id LIMIT $3 OFFSET $4""",
+            group_id.to_db(),
+            subject,
+            limit,
+            offset,
+        )
+        return [_fact(row) for row in rows]
+
+    async def add_note(
+        self,
+        group_id: GroupId,
+        account_id: uuid.UUID,
+        text: str,
+        *,
+        holder: bool,
+    ) -> Fact:
+        """Allocate an independent note key under a serialized scope count."""
+        async with self._database().acquire() as conn, conn.transaction():
+            subject = await self._note_write_subject(conn, account_id, holder=holder)
+            await self._note_lock(conn, group_id, subject)
+            scope = (
+                "subject_entity_id IN (SELECT id FROM family)"
+                if holder
+                else "subject_account_id=$2"
+            )
+            count = await conn.fetchval(
+                FAMILY.format(arg="$2")
+                + f"""
+                SELECT count(*) FROM (SELECT 1 FROM memory_fact
+                    WHERE group_id=$1 AND {scope} AND predicate='note'
+                      AND status='active' AND valid_to IS NULL LIMIT $3) current_notes""",
+                group_id.to_db(),
+                subject,
+                NOTE_LIMIT,
+            )
+            if count >= NOTE_LIMIT:
+                raise ValueError("此范围最多保留 20 条人工备注，请先删除不需要的条目。")
+            return await self.supersede(
+                Fact(
+                    subject_entity_id=subject if holder else None,
+                    subject_account_id=None if holder else subject,
+                    predicate="note",
+                    object_key=str(uuid.uuid4()),
+                    object_value=text,
+                    group_id=group_id,
+                    confidence=1.0,
+                ),
+                [],
+                when=self._clock.now(),
+                _conn=conn,
+            )
+
+    async def change_note(
+        self,
+        group_id: GroupId,
+        account_id: uuid.UUID,
+        *,
+        holder: bool,
+        index: int,
+        text: str | None = None,
+    ) -> Fact | None:
+        """Edit or retract only a current NOTE selected in the matching scope."""
+        if index < 1:
+            return None
+        async with self._database().acquire() as conn, conn.transaction():
+            subject = await self._note_write_subject(conn, account_id, holder=holder)
+            await self._note_lock(conn, group_id, subject)
+            rows = await self.notes(
+                group_id,
+                subject,
+                holder=holder,
+                offset=index - 1,
+                limit=1,
+                _conn=conn,
+            )
+            if not rows:
+                return None
+            fact = rows[0]
+            current = await conn.fetchrow(
+                """SELECT * FROM memory_fact WHERE id=$1 AND group_id=$2
+                      AND predicate='note' AND status='active' AND valid_to IS NULL
+                      AND revision=$3 FOR UPDATE""",
+                fact.id,
+                group_id.to_db(),
+                fact.revision,
+            )
+            if current is None:
+                return None
+            if text is None:
+                await self.retract(fact.id, _conn=conn)
+                return fact
+            return await self.supersede(
+                Fact(
+                    subject_entity_id=fact.subject_entity_id,
+                    subject_account_id=fact.subject_account_id,
+                    predicate="note",
+                    object_key=fact.object_key,
+                    object_value=text,
+                    group_id=group_id,
+                    confidence=1.0,
+                ),
+                [],
+                when=self._clock.now(),
+                _conn=conn,
+            )
+
+    async def clear_notes(self, group_id: GroupId, account_id: uuid.UUID, *, holder: bool) -> int:
+        """Retract only manual notes in this exact or shared scope."""
+        scope = (
+            "subject_entity_id IN (SELECT id FROM family)" if holder else "subject_account_id=$2"
+        )
+        async with self._database().acquire() as conn, conn.transaction():
+            subject = await self._note_write_subject(conn, account_id, holder=holder)
+            await self._note_lock(conn, group_id, subject)
+            rows = await conn.fetch(
+                FAMILY.format(arg="$2")
+                + f"""
+                UPDATE memory_fact SET status='retracted',valid_to=$3,
+                       revision=revision+1,updated_at=now()
+                 WHERE group_id=$1 AND {scope} AND predicate='note'
+                   AND status='active' AND valid_to IS NULL RETURNING id""",
+                group_id.to_db(),
+                subject,
+                self._clock.now(),
+            )
+            return len(rows)
+
+    @staticmethod
+    async def _note_write_subject(
+        conn: DbConnection,
+        account_id: uuid.UUID,
+        *,
+        holder: bool,
+    ) -> uuid.UUID:
+        await lock_identity_topology(conn)
+        root = await conn.fetchval("SELECT entity_id FROM identity_account WHERE id=$1", account_id)
+        if root is None:
+            raise ValueError("账号记录已变化，请重新查询。")
+        return root if holder else account_id
+
+    @staticmethod
+    async def _note_lock(conn: DbConnection, group_id: GroupId, subject: uuid.UUID) -> None:
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            f"notes:{group_id}:{subject}",
+        )
+
+    async def retract_learned(
+        self,
+        group_id: GroupId,
+        fact_id: uuid.UUID,
+        *,
+        subject: uuid.UUID,
+        holder: bool,
+    ) -> bool:
+        """Never forget a manual note, a stale row, or a fact outside the selected scope."""
+        scope = (
+            "subject_entity_id IN (SELECT id FROM family) OR subject_account_id IN "
+            "(SELECT id FROM identity_account WHERE entity_id=$3)"
+            if holder
+            else "subject_account_id=$3"
+        )
+        value = await self._database().fetchval(
+            FAMILY.format(arg="$3")
+            + f"""
+                UPDATE memory_fact SET status='retracted',valid_to=$4,
+                       revision=revision+1,updated_at=now()
+                 WHERE id=$1 AND group_id=$2 AND ({scope}) AND predicate<>'note'
+                   AND status='active' AND valid_to IS NULL RETURNING id""",
+            fact_id,
+            group_id.to_db(),
+            subject,
+            self._clock.now(),
+        )
+        return value is not None
 
     @staticmethod
     async def _add_evidence(conn, fact_id: uuid.UUID, evidence: list[FactEvidence]) -> None:

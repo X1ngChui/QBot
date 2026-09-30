@@ -25,6 +25,7 @@ import re
 
 from pydantic import ValidationError
 
+from qqbot.domain.ids import AccountId
 from qqbot.providers.payload import measure
 from qqbot.prompting import PromptCatalog
 from qqbot.prompting import PromptKey
@@ -88,7 +89,7 @@ def _name(p: dict, people: MemberNumbers) -> tuple[int, str]:
     """A roster row's member number, and its name wearing that number. defang on
     render as well as at ingest: names are stored as the platform reported them, and
     the render is where the grammar must hold."""
-    n = people.number(str(p.get("user_id") or ""))
+    n = people.number(p["user_id"])
     if n is None or n <= 0:
         raise ValueError("member profile has no addressable user_id")
     return n, defang(p.get("nickname") or "") + sysmark(str(n))
@@ -340,7 +341,7 @@ def number_people(
     """
     teach_roster(people, profiles)
     for p in profiles:
-        people.number(str(p.get("user_id") or ""))
+        people.number(p["user_id"])
     for m in [*window, *([msg] if msg is not None else [])]:
         if m.is_bot:
             for account, _ in m.at:
@@ -351,7 +352,7 @@ def number_people(
                 people.number(account)
 
 
-def _call_id(msg_id: str) -> str:
+def _call_id(msg_id: MessageId) -> str:
     """A stable tool-call id for one of the bot's past messages: derived from the
     message id, so the rendered history is byte-identical between turns."""
     return SEND + "_" + re.sub(r"[^A-Za-z0-9_-]", "_", msg_id)
@@ -388,7 +389,11 @@ def _segment_arg(
         case RpsSegment():
             return {"type": "rps", "data": {}}
         case ContactSegment(ContactKind.MEMBER, target_id):
-            number = people.number(target_id) if people is not None else None
+            number = (
+                people.number(target_id)
+                if people is not None and isinstance(target_id, AccountId)
+                else None
+            )
             return (
                 {"type": "contact_member", "data": {"member": number}}
                 if number is not None and number > 0
@@ -494,7 +499,7 @@ def render_history(
     window: Sequence[TranscriptRendering],
     nums: Mapping[MessageId, int],
     marks: Mapping[MessageId, str],
-    evidence: Mapping[str, str] | None = None,
+    evidence: Mapping[MessageId, str] | None = None,
     pics: Mapping[MessageId, Sequence[int]] | None = None,
     people: MemberNumbers | None = None,
     *,
@@ -579,8 +584,9 @@ def assemble(
     profiles: list[dict],
     group_facts: list[str] | None = None,
     task_intent: str | None = None,
-    task_initiator: str | None = None,
-    evidence: Mapping[str, str] | None = None,
+    task_id: str | None = None,
+    task_due_at: str | None = None,
+    evidence: Mapping[MessageId, str] | None = None,
     window: Sequence[TranscriptRendering] | None = None,
     nums: Mapping[MessageId, int] | None = None,
     marks: Mapping[MessageId, str] | None = None,
@@ -625,11 +631,14 @@ def assemble(
         )
     )
     if task_intent is not None:
+        if task_id is None or task_due_at is None:
+            raise ValueError("a scheduled prompt needs its task ID and due time")
         tail = prompts.render(
             PromptKey.SCHEDULED_USER,
             now=clock.describe(),
             intent=defang(task_intent),
-            initiator=task_initiator or "原发起人",
+            task_id=task_id,
+            due_at=task_due_at,
         )
     else:
         if msg is None:

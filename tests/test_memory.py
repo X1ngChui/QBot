@@ -751,9 +751,9 @@ async def test_memory(memory_state):
     # An owner's note reaches extraction read-only, under its own label - a
     # comprehension key, never a source of candidates (the prompt forbids it,
     # and no quote from a note can validate: it is not a transcript line).
-    await _DIRECTORY.note(G, "u1", "只在周末上线")
+    await _DIRECTORY.add_note(G, "u1", "只在周末上线")
     _known2 = await w._known(G, _codes2)
-    assert "备注：只在周末上线" in _known2, (
+    assert "人工备注：" in _known2 and "精确账号：只在周末上线" in _known2, (
         "the owner's note rides the known block under its own label",
         _known2,
     )

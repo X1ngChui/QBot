@@ -59,9 +59,9 @@ Unknown input keys fail conversion. Retained values are validated by the new sch
 | `schedule.misfire_grace_sec` | `3600` | retired | — | The maintenance scheduler owns missed-trigger handling. |
 | `schedule.backup_stale_hours` | `26.0` | retired | — | Backup health follows expected scheduled completion. |
 | `schedule.completed_job_keep_days` | `30` | retained | `maintenance.completed_job_keep_days` | Maintenance timing or storage retention. |
-| `scheduled_tasks.min_delay_sec` | `300` | retired | — | The scheduling tool enforces its fixed minimum delay. |
+| `scheduled_tasks.min_delay_sec` | `300` | retired | — | The scheduling service enforces its fixed minimum delay. |
 | `scheduled_tasks.max_days_ahead` | `30` | retained | `tasks.max_days_ahead` | Durable task admission policy. |
-| `scheduled_tasks.max_pending_per_account` | `5` | retained | `tasks.max_pending_per_account` | Durable task admission policy. |
+| `scheduled_tasks.max_pending_per_account` | `5` | retired | — | Tasks are group-owned; account admission is retired. |
 | `scheduled_tasks.max_pending_per_group` | `50` | retained | `tasks.max_pending_per_group` | Durable task admission policy. |
 | `scheduled_tasks.max_chain_depth` | `24` | retained | `tasks.max_chain_depth` | Durable task admission policy. |
 | `scheduled_tasks.max_executions_per_group_day` | `24` | retained | `tasks.max_executions_per_group_day` | Durable task admission policy. |
@@ -99,10 +99,10 @@ Unknown input keys fail conversion. Retained values are validated by the new sch
 | `commands.roster_max_entries` | `60` | retired | — | Command pagination and rendering enforce their own output bounds. |
 | `commands.top_default_entries` | `5` | retired | — | Command pagination and rendering enforce their own output bounds. |
 | `commands.top_max_entries` | `20` | retired | — | Command pagination and rendering enforce their own output bounds. |
-| `identity_link.challenge_ttl_sec` | `600` | retired | — | Challenge lifetime, entropy and admission are security invariants. |
-| `identity_link.max_pending_challenges` | `1000` | retired | — | Challenge lifetime, entropy and admission are security invariants. |
-| `identity_link.max_pending_per_account` | `3` | retired | — | Challenge lifetime, entropy and admission are security invariants. |
-| `identity_link.challenge_code_length` | `8` | retired | — | Challenge lifetime, entropy and admission are security invariants. |
+| `identity_link.challenge_ttl_sec` | `600` | retired | — | Invitation lifetime and admission are code-owned invariants. |
+| `identity_link.max_pending_challenges` | `1000` | retired | — | Invitation lifetime and admission are code-owned invariants. |
+| `identity_link.max_pending_per_account` | `3` | retired | — | Invitation lifetime and admission are code-owned invariants. |
+| `identity_link.challenge_code_length` | `8` | retired | — | Invitation lifetime and admission are code-owned invariants. |
 | `diagnostics.debug_max_rounds` | `50` | retired | — | Bounded diagnostic buffers and output projection own these limits. |
 | `diagnostics.log_tail_default_lines` | `15` | retired | — | Bounded diagnostic buffers and output projection own these limits. |
 | `diagnostics.log_tail_max_lines` | `60` | retired | — | Bounded diagnostic buffers and output projection own these limits. |

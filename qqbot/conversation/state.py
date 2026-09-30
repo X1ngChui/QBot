@@ -13,7 +13,7 @@ import logging
 import re
 import uuid
 from collections import deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -94,7 +94,7 @@ class TranscriptRendering:
         quote: str = "",
         pic_nums: Sequence[int] | None = None,
         member_no: int | None = None,
-        mention_number: Callable[[str], int | None] | None = None,
+        mention_number: Callable[[AccountId], int | None] | None = None,
     ) -> str:
         """One line of transcript, as the model will read it.
 
@@ -199,7 +199,7 @@ class GroupState:
             raise RuntimeError("this pure conversation state has no storage capability")
         return self.groups
 
-    async def blocked_now(self, user_id: str) -> bool:
+    async def blocked_now(self, user_id: AccountId) -> bool:
         """Resolve exact-account and linked-holder rules against current identity."""
 
         return await self.policy.blocked(self.group_id, user_id)
@@ -224,13 +224,13 @@ class GroupState:
         self.muted = await self.policy.group_muted(self.group_id)
         self.loaded = True
 
-    async def load_history(self, *, self_id: str, owners) -> None:
+    async def load_history(self, *, self_id: AccountId, owners: Collection[AccountId]) -> None:
         """Load one complete archive snapshot before any concurrent caller uses it."""
         async with self._history_lock:
             if not self.history_loaded:
                 await self._hydrate_history(self_id=self_id, owners=owners)
 
-    async def _hydrate_history(self, *, self_id: str, owners) -> None:
+    async def _hydrate_history(self, *, self_id: AccountId, owners: Collection[AccountId]) -> None:
         """Rebuild the conversation window from the archive, once per process.
 
         This is what lets the bot rejoin a conversation after a deploy knowing what was
@@ -274,7 +274,7 @@ class GroupState:
                 parsed = (
                     parse_segments(
                         segs,
-                        str(archived.self_id or self_id),
+                        archived.self_id or self_id,
                         display_zone=display_zone,
                         self_name=self.persona_name,
                     )

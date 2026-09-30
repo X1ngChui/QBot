@@ -27,8 +27,9 @@ from dataclasses import replace
 from collections.abc import Callable, Sequence
 import asyncpg
 from qqbot.clock import Clock
+from qqbot.gateway.botapi import BotApi
 from qqbot.configuration import PredicateTable
-from qqbot.domain.ids import GroupId
+from qqbot.domain.ids import AccountId, GroupId
 from qqbot.conversation.limits import RecallEventsLimits, RECALL_LIMITS
 from qqbot.util import defang
 from qqbot.util import merge_overlapping
@@ -93,7 +94,7 @@ async def gather(
     group_id: GroupId,
     directory: Directory,
     members: MemberDirectory,
-    bot=None,
+    bot: BotApi | None = None,
 ) -> list[dict]:
     """This group's roster, one row per person, in order of first appearance.
 
@@ -109,14 +110,14 @@ async def gather(
     Historical platform display names and conversational aliases are distinct claims.
     """
     gid = group_id
-    exclude = {str(bot.self_id)} if bot is not None else set()
+    exclude = {bot.self_id} if bot is not None else set()
 
-    async def _live(uids: Sequence[str]) -> dict[str, str]:
+    async def _live(uids: Sequence[AccountId]) -> dict[AccountId, str]:
         if bot is None:
             return {}
         return await members.names_of(bot, group_id, [u for u in uids if u not in exclude])
 
-    cache_key = (str(bot.self_id) if bot is not None else "", group_id)
+    cache_key = (bot.self_id if bot is not None else None, group_id)
     cached = directory.roster_cache.get(cache_key)
     revision = await directory.roster_revision(gid)
     if cached is not None and cached.revision == revision:

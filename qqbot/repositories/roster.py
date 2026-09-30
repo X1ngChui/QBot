@@ -4,7 +4,7 @@ from collections.abc import Callable
 
 import asyncpg
 
-from qqbot.domain.ids import GroupId
+from qqbot.domain.ids import AccountId, GroupId
 from qqbot.domain.identity.reading import HolderReading
 from qqbot.repositories.event import EventRepository
 from qqbot.repositories.identity import IdentityRepository
@@ -35,7 +35,9 @@ class RosterRepository:
         )
         return row["facts"], row["names"], row["people"]
 
-    async def read(self, group_id: GroupId, *, exclude: set[str]) -> tuple[HolderReading, ...]:
+    async def read(
+        self, group_id: GroupId, *, exclude: set[AccountId]
+    ) -> tuple[HolderReading, ...]:
         async with (
             self._database().acquire() as conn,
             conn.transaction(isolation="repeatable_read", readonly=True),

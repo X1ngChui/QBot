@@ -78,7 +78,6 @@ def run(bundle, session=None, *, budget=None, model=None):
         tool_context=tools.ToolCtx(
             object(),
             object(),
-            initiator="101",
             people=people,
             identities=_test_db.identities,
             database=_test_db.pool,
@@ -118,7 +117,6 @@ async def test_listing_returns_fresh_results_after_create_and_cancel(bundle, mon
     )
 
     async def execute(call, **kwargs):
-        assert kwargs["ctx"].initiator == "101"
         if call.name == "list_scheduled_tasks":
             assert json.loads(call.arguments) == {}
             return json.dumps(tasks, sort_keys=True)

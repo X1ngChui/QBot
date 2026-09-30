@@ -10,6 +10,7 @@ holder-scoped records remain attached to the entity equivalence class.
 
 from __future__ import annotations
 
+from qqbot.domain.ids import AccountId
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -66,7 +67,7 @@ class IdentityAccount:
 
     entity_id: uuid.UUID
     platform: str
-    platform_user_id: str
+    platform_user_id: AccountId
     id: uuid.UUID = field(default_factory=uuid.uuid4)
     first_seen_at: datetime | None = None
     last_seen_at: datetime | None = None

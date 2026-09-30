@@ -6,6 +6,7 @@ import pytest
 
 from _budget import fake_budget
 import _db as _test_db
+from _test_owners import fresh_tasks
 from qqbot.services.members import MemberDirectory
 from qqbot.conversation import engine
 from qqbot.conversation.member_numbers import MemberNumbers
@@ -23,6 +24,7 @@ async def test_ack_survives_later_timeout(monkeypatch, bundle):
 
     monkeypatch.setattr(engine, "generate", generate)
     outcome = await engine.respond(
+        tasks=fresh_tasks(),
         bot=object(),
         st=GroupState(
             GroupId("311"),
@@ -92,6 +94,7 @@ async def test_arrival_during_media_wait_is_not_premarked_seen(monkeypatch, bund
 
     with pytest.raises(Captured):
         await engine.generate(
+            tasks=fresh_tasks(),
             bot=Bot(),
             st=state,
             cfg=bundle.default,

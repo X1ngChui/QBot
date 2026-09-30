@@ -64,6 +64,9 @@ async def test_nonempty_schema_migration_preserves_domain_data_and_job_history(d
         "SELECT bool_and(locked_at IS NULL AND locked_by IS NULL) "
         "FROM memory_job WHERE status<>'running'"
     )
+    await database.control.execute(
+        (MIGRATION.parent / "20260930_group_tasks_notes.sql").read_text(encoding="utf-8")
+    )
     await check_schema(
         database.control, schema=database.schema, embedding_dimensions=VECTOR_DIMENSIONS
     )

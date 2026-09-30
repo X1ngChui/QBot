@@ -21,7 +21,7 @@ require("nonebot_plugin_apscheduler")
 
 # Below the require() on purpose: it has to run before anything that imports the
 # scheduler plugin, so these cannot move to the top of the file.
-from qqbot.gateway.nonebot_adapter import NapCatGroupMessageSentEvent
+from qqbot.gateway.nonebot_adapter import NapCatGroupMessageSentEvent, OneBotClient
 from qqbot.plugins import tasks
 from qqbot.runtime import Runtime
 from qqbot.configuration import load_bundle
@@ -58,7 +58,9 @@ async def _startup() -> None:
         await runtime.start()
         tasks.register(runtime)
         await runtime.scheduled.start(
-            lambda: next((bot for bot in get_bots().values() if isinstance(bot, Bot)), None)
+            lambda: next(
+                (OneBotClient(bot) for bot in get_bots().values() if isinstance(bot, Bot)), None
+            )
         )
     except BaseException:
         await runtime.aclose()
@@ -85,7 +87,7 @@ group_message = on_message(priority=10, block=False)
 
 @group_message.handle()
 async def _(bot: Bot, event: GroupMessageEvent) -> None:
-    await _active().gateway.handle(bot, event)
+    await _active().gateway.handle(OneBotClient(bot), event)
 
 
 # Self-authored messages are observations, not ordinary inbound commands. They use a
@@ -96,7 +98,7 @@ group_message_sent = on("message_sent", priority=10, block=False)
 
 @group_message_sent.handle()
 async def _(bot: Bot, event: NapCatGroupMessageSentEvent) -> None:
-    await _active().gateway.handle(bot, event)
+    await _active().gateway.handle(OneBotClient(bot), event)
 
 
 group_notice = on_notice(priority=10, block=False)
@@ -106,4 +108,4 @@ group_notice = on_notice(priority=10, block=False)
 async def _(bot: Bot, event: NoticeEvent) -> None:
     # Recalls, joins, leaves, bans and pokes become transcript lines; the
     # gateway ignores every other notice kind.
-    await _active().gateway.handle_notice(bot, event)
+    await _active().gateway.handle_notice(OneBotClient(bot), event)

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime
 
 import asyncpg
 
 from qqbot.db.connection import DbConnection
 
-from qqbot.domain.ids import GroupId
+from qqbot.domain.ids import AccountId, GroupId
 from qqbot.domain.identity.reading import SpeakerActivity
 
 
@@ -27,9 +28,9 @@ class EventRepository:
                 GROUP BY platform_user_id""",
             group_id.to_db(),
         )
-        return tuple(SpeakerActivity(row["uid"], row["n"], row["first"]) for row in rows)
+        return tuple(SpeakerActivity(AccountId(row["uid"]), row["n"], row["first"]) for row in rows)
 
-    async def speaker_counts(self, group_id: GroupId) -> dict[str, int]:
+    async def speaker_counts(self, group_id: GroupId) -> dict[AccountId, int]:
         """Accounts that have spoken in this group, and how often.
 
         Group-scoped by parameter, like every other read here: an account is only in
@@ -43,9 +44,9 @@ class EventRepository:
                 GROUP BY platform_user_id""",
             group_id.to_db(),
         )
-        return {r["uid"]: r["n"] for r in rows}
+        return {AccountId(r["uid"]): r["n"] for r in rows}
 
-    async def first_appearances(self, group_id: GroupId) -> dict[str, object]:
+    async def first_appearances(self, group_id: GroupId) -> dict[AccountId, datetime]:
         """When each account first appeared in this group's archive.
 
         The roster is ordered by this, so a person's place in it - and with it their
@@ -59,4 +60,4 @@ class EventRepository:
                 GROUP BY platform_user_id""",
             group_id.to_db(),
         )
-        return {r["uid"]: r["first"] for r in rows}
+        return {AccountId(r["uid"]): r["first"] for r in rows}

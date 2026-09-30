@@ -12,6 +12,7 @@ tested by calling a function.
 
 from __future__ import annotations
 
+from qqbot.domain.ids import AccountId, MessageId
 import json
 import logging
 import re
@@ -33,7 +34,7 @@ _SEEN_UNKNOWN: set[str] = set()
 def at_mentions(
     segments: list,
     *,
-    self_id: str = "",
+    self_id: AccountId | None = None,
     self_name: str = "",
 ) -> list[tuple[str, str]]:
     """Direct @ targets as (account, displayed name), in message order."""
@@ -57,8 +58,8 @@ def at_mentions(
 
 def number_at_mentions(
     text: str,
-    mentions: Sequence[tuple[str, str]],
-    number_for: Callable[[str], int | None],
+    mentions: Sequence[tuple[AccountId, str]],
+    number_for: Callable[[AccountId], int | None],
 ) -> str:
     """Add prompt-local member numbers to the corresponding visible @ tokens."""
 
@@ -174,9 +175,9 @@ class ParsedMessage:
     parts: list = field(default_factory=list)  # str | Ref
     refs: list[Ref] = field(default_factory=list)
     at_bot: bool = False
-    reply_to: str | None = None
+    reply_to: MessageId | None = None
     #: Accounts this message addressed, by id. Not the bot itself - that is at_bot.
-    mentions: list[str] = field(default_factory=list)
+    mentions: list[AccountId] = field(default_factory=list)
     #: The text segments alone - what somebody actually typed. The trigger reads
     #: this rather than the render: a share card's title, another bot's markdown
     #: body or a file name can carry the nickname without anyone addressing the
@@ -507,7 +508,7 @@ class _Walk:
     def __init__(
         self,
         pm: ParsedMessage,
-        self_id: str,
+        self_id: AccountId | None,
         limits: ParseLimits,
         self_name: str,
         display_zone: tzinfo,
@@ -638,7 +639,7 @@ class _Walk:
                     # Recorded whether or not the name came with it: being addressed
                     # is what makes someone part of this exchange, and their profile
                     # is worth loading even though they have not spoken.
-                    pm.mentions.append(qq)
+                    pm.mentions.append(AccountId(qq))
                     if data.get("name"):
                         self.emit(parts, f"@{defang(str(data['name']))}", depth=depth)
                     else:
@@ -699,7 +700,7 @@ class _Walk:
                 # ordinary in a group. See prompt.numbered. Inside a forward the
                 # quoted line is not on screen at all, so the pointer is dropped.
                 if not nested:
-                    pm.reply_to = str(data.get("id") or "") or None
+                    pm.reply_to = MessageId(data["id"]) if data.get("id") else None
             elif stype == "forward":
                 # The protocol side delivers the record inline, nested records
                 # included, so it is read here without a call. A segment without
@@ -798,7 +799,7 @@ class _Walk:
 
 def parse_segments(
     segments: list[dict],
-    self_id: str,
+    self_id: AccountId | None,
     limits: ParseLimits = PARSE_LIMITS,
     *,
     self_name: str = "",

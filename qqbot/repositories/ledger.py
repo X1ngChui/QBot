@@ -2,10 +2,26 @@
 
 from collections.abc import Callable
 from datetime import date
+from typing import TypedDict
 
+from qqbot.domain.ids import AccountId
 import asyncpg
 
 from qqbot.domain.ids import GroupId
+
+
+class Spender(TypedDict):
+    accounts: list[AccountId]
+    cny: float
+    calls: int
+
+
+def _spender(row: asyncpg.Record) -> Spender:
+    return Spender(
+        accounts=[AccountId(account) for account in row["accounts"]],
+        cny=float(row["cny"]),
+        calls=int(row["calls"]),
+    )
 
 
 class LedgerRepository:
@@ -27,7 +43,7 @@ class LedgerRepository:
         out: int = 0,
         calls: int = 1,
         cny: float = 0.0,
-        user_id: str = "",
+        user_id: AccountId | None = None,
     ) -> None:
         """Add one call to the day's running total.
 
@@ -66,7 +82,7 @@ class LedgerRepository:
 
     async def top_spenders(
         self, group_id: GroupId, *, k: int, all_linked: bool = False
-    ) -> list[dict]:
+    ) -> list[Spender]:
         """This group's costliest exact accounts or explicitly linked holders."""
 
         today = _as_date(self._today())
@@ -85,7 +101,7 @@ class LedgerRepository:
                 today,
                 k,
             )
-            return [dict(row) for row in rows]
+            return [_spender(row) for row in rows]
         rows = await self._database().fetch(
             """SELECT COALESCE(ia.entity_id::text, l.user_id) AS person,
                       array_agg(DISTINCT l.user_id) AS accounts,
@@ -103,7 +119,7 @@ class LedgerRepository:
             today,
             k,
         )
-        return [dict(row) for row in rows]
+        return [_spender(row) for row in rows]
 
     async def month_calls(self, kind: str, model: str) -> int:
         """Calls of one kind and model booked in the calendar month holding today.

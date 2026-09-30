@@ -91,7 +91,7 @@ class Gateway:
     async def handle(self, bot: BotApi, event) -> None:
         """Normalize an ordinary or self-authored message and route it once."""
 
-        inbound = GroupMessage.from_event(event, str(bot.self_id), clock=self._clock)
+        inbound = GroupMessage.from_event(event, bot.self_id, clock=self._clock)
         cfg, _persona = self._bundle.for_group(inbound.group_id)
         self_name = self._bundle.persona_for(inbound.group_id).name or (
             cfg.bot.nicknames[0] if cfg.bot.nicknames else "机器人"
@@ -155,7 +155,7 @@ class Gateway:
         st = await self._registry.get(group_id)
         # A replay after restart is already present in this load. The append-once claim
         # below then rejects it before this event can enter the live deque a second time.
-        await st.load_history(self_id=str(bot.self_id), owners=set(cfg.bot.owners))
+        await st.load_history(self_id=bot.self_id, owners=set(cfg.bot.owners))
 
         archived = replace(
             inbound,
@@ -178,7 +178,7 @@ class Gateway:
             return
 
         if is_bot and direct_mentions:
-            accounts = [str(account) for account, _ in direct_mentions]
+            accounts = [account for account, _ in direct_mentions]
             live_names = await self._members.names_of(bot, group_id, accounts)
             direct_mentions = [
                 (account, label or live_names.get(account) or "成员")
@@ -211,7 +211,7 @@ class Gateway:
         )
         st.add(msg)
         if is_bot:
-            self._delivery.echo.publish(str(bot.self_id), group_id, msg)
+            self._delivery.echo.publish(bot.self_id, group_id, msg)
 
         if parsed.refs:
             self._media.admit(
@@ -239,7 +239,7 @@ class Gateway:
                     user_id=inbound.sender.user_id,
                     self_id=inbound.self_id,
                     text=inbound.typed_text,
-                    mentions=tuple(AccountId(account) for account in parsed.mentions),
+                    mentions=tuple(parsed.mentions),
                 ),
             )
             return
@@ -264,7 +264,7 @@ class Gateway:
         window = tuple(prompt.history_window(st, msg))
         if not self._closing:
             self._replies.submit(
-                ReplyRequest(bot, group_id, AddressedMessage(msg, decision.initiator, window)),
+                ReplyRequest(bot, group_id, AddressedMessage(msg, msg.user_id, window)),
                 deadline=asyncio.get_running_loop().time() + cfg.conversation.reply_deadline_sec,
             )
 
@@ -281,7 +281,7 @@ class Gateway:
     async def handle_notice(self, bot: BotApi, event) -> None:
         """Normalize supported notices and send them through the same admission route."""
 
-        text = self._notice_line(str(bot.self_id), event)
+        text = self._notice_line(bot.self_id, event)
         if not text:
             return
         notice = notice_from_event(
@@ -290,7 +290,7 @@ class Gateway:
             self_id=bot.self_id,
             plain_text=text,
         )
-        if notice is None or notice.sender.user_id in {"0", str(bot.self_id)}:
+        if notice is None or notice.sender.user_id in {"0", bot.self_id}:
             return
         group_id = notice.group_id
         cfg, _persona = self._bundle.for_group(group_id)
@@ -300,7 +300,7 @@ class Gateway:
         await self._admit(bot, notice, cfg=cfg, self_name=self_name)
 
     @staticmethod
-    def _notice_line(self_id: str, event) -> str:
+    def _notice_line(self_id: AccountId, event) -> str:
         """Return the stable transcript projection for one supported notice."""
 
         ntype = str(getattr(event, "notice_type", "") or "")

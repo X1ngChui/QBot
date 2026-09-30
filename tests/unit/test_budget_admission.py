@@ -104,7 +104,7 @@ async def test_scope_reuse_and_attribution_charge_only_the_owner_once():
     assert owner is nested and owner.spent == 0.2
     assert budget.ledger.ledger_add.call_args.kwargs["user_id"] == "fictional-account"
     await budget.record(kind="asr", model="fictional", cny=0)
-    assert budget.ledger.ledger_add.call_args.kwargs["user_id"] == ""
+    assert budget.ledger.ledger_add.call_args.kwargs["user_id"] is None
 
 
 @pytest.mark.parametrize("invalid", [float("nan"), float("inf"), -1])

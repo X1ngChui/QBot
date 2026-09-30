@@ -1,109 +1,171 @@
 # Commands
 
-Commands are sent in a group and start with `/`. The command name must end or be
-followed by a space; `/who@someone` is not a command. `/help` shows the same catalogue
-to everyone, with authorization labels, and `/help <name>` shows the exact syntax.
+Send commands in a group, starting with `/`. The name must end or be followed by
+whitespace: `/who@someone` is not a command. `/help` shows the same catalogue and
+permission labels to everyone; `/help NAME` shows the current syntax.
 
-Authorization never changes an action's meaning. The same command and arguments select
-the same target and scope for an owner and a member; authorization only allows or rejects
-the action. The QQ group's administrator role is not used. "Owner" means an account in
-the bot's global `owners` setting.
+**Owner means the bot owner configured in `bot.owners`, not a QQ group administrator.**
+Permissions allow or reject the same operation; they do not reinterpret its target.
+Commands run directly, without a model call. Their requests and replies are archived.
 
-The bot's persistent timed tasks are not slash commands. A member can ask in ordinary
-conversation to schedule, inspect or cancel their own group tasks; the reply model uses
-the corresponding tools, and the bot owner can manage any task in that group. Due tasks
-re-read the current group context before deciding whether to reply.
+## Scope and permissions
 
-## Account scope
+- Personal commands default to one **exact account**.
+- `/who --all` aggregates the current linked identity. `/alias --all` manages linked
+  aliases; `/note --all` manages **shared identity notes only**, not each account's notes.
+- A member can target their own account or a verified linked account. An owner can target
+  another account through a structured `@` mention. No target means the sending account.
+- Group commands operate in the **current group**. `--all` never means all groups.
+- Unknown or duplicate options, surplus arguments, and surplus mentions are rejected.
 
-Person commands distinguish an exact platform account from the account holder's current
-linked set:
 
-- Exact account is the default.
-- `--all` explicitly selects the linked account set and its holder-scoped records.
-- A member may target only their own exact account or linked set. An owner may
-  target another account with a structured `@` mention.
-- Bare `/who` therefore means the caller's exact account for everyone. The owner-only
-  whole-group directory is the separate `/members` command.
-
-Unknown flags, duplicate flags, surplus text and surplus mentions are rejected. Retired
-implicit forms such as `-` for clearing a value are not aliases for the current syntax.
-
-## Permission levels
-
-| Level | Who | Commands |
-| --- | --- | --- |
-| Member | Anyone in the group | `/help`, `/who`, `/note`, `/alias`, `/forget`, `/link`, `/unlink`, `/card`, `/stats`, `/top` |
-| Owner | An account in `owners` | `/members`, `/block`, `/mute`, `/merge`, `/split`, `/debug`, `/log`, plus owner-only sub-actions noted below |
-
-## My account data
-
-| Command | Meaning |
+| Access | Commands |
 | --- | --- |
-| `/who [--all] [@account]` | Show the exact account by default, or the linked aggregate with `--all`. Fact indexes belong to this view. |
-| `/note [--all] [@account]` | Show the note at the selected scope. |
-| `/note set [--all] [@account] TEXT` | Replace the note at the selected scope. Notes are explicit confirmed context and are never rewritten automatically. |
-| `/note clear [--all] [@account]` | Clear the selected note. |
-| `/alias [--all] [@account]` | List aliases at the selected scope, marked confirmed or unconfirmed. |
-| `/alias add [--all] [@account] NAME` | Add a confirmed alias. |
-| `/alias remove [--all] [@account] NAME` | Retire an alias. Historical messages remain unchanged. |
-| `/alias confidence [--all] [@account] SCORE NAME` | Set manual confidence from 0 through 1. At least 0.75 confirms the alias; below that it remains visible only as an unconfirmed hint, not an identity key. |
-| `/forget [--all] [@account] N` | Retract fact N from the matching `/who` view. |
+| Member | `/help`, `/who`, `/note`, `/alias`, `/forget`, `/link`, `/unlink`, `/card`, `/stats`, `/top` |
+| Bot owner | `/tasks`, `/members`, `/block`, `/mute`, `/merge`, `/split`, `/debug`, `/log`, plus the owner-only sub-actions below |
+
+## Personal records
+
+### Viewing and forgetting
+
+| Command | Result |
+| --- | --- |
+| `/who [--all] [@account]` | Exact-account or linked-identity records, with separate manual notes, learned facts, confirmed names, and unconfirmed hints. Long views are explicitly previews. |
+| `/forget [--all] [@account] N` | Retract learned fact N in the matching `/who` automatic-facts section. Never retracts a manual note or alias. |
+| `/members` | Owner-only whole-group directory, not an alternate meaning of `/who`. |
+
+Numbers are positions in the **current matching list**, not persistent record IDs.
+Refresh the same view after records change. Manual notes are not part of `/forget`
+numbering; a note-management number is not an automatic-fact number.
+
+### Multiple manual notes
+
+```text
+/note [--all] [@account]
+/note list [--all] [@account] [PAGE]
+/note add [--all] [@account] -- TEXT
+/note edit [--all] [@account] N -- TEXT
+/note remove [--all] [@account] N
+/note clear [--all] [@account]
+```
+
+Bare `/note` lists page 1. Each page contains up to five notes; numbers continue across
+pages. `--` ends the option header and preserves the text that follows it, including
+internal whitespace. Add creates one independent note, even if another has identical
+text. Edit changes one note and preserves its logical key and history. Remove retracts
+one note; clear retracts all current notes in the selected management scope and reports
+the actual count. Neither operation physically deletes history.
+
+The default scope is exact-account notes. With `--all`, **every** note action targets only
+shared holder-scoped notes, including inherited shared notes from merged identities.
+Clearing shared notes preserves all linked accounts' individual notes. `/who --all`
+may display both scopes, with labels; use the appropriate `/note` view to manage them.
+
+New additions allow 20 current notes per management scope and 500 characters per note.
+Existing inherited records above the count limit are preserved and remain manageable;
+further additions are rejected until below the limit. Automatic extraction and decay do
+not overwrite or age manual notes. Use `/alias`, not notes or forgetting, for names.
+
+### Names
+
+| Command | Result |
+| --- | --- |
+| `/alias [--all] [@account]` | Confirmed aliases and unconfirmed hints, with labelled confidence. |
+| `/alias add [--all] [@account] NAME` | Add a manually confirmed alias. |
+| `/alias remove [--all] [@account] NAME` | Retire an alias; historical messages stay unchanged. |
+| `/alias confidence [--all] [@account] SCORE NAME` | Set confidence from 0 to 1. At least 0.75 confirms it; lower values remain hints and cannot identify a person. |
+
+## Group scheduled tasks
+
+Tasks belong to the group, **not a creator or the current conversation participant**.
+The reply model can autonomously create, inspect, edit, or cancel appropriate group tasks
+in an ordinary reply or scheduled wakeup. Direct `/tasks` commands remain owner-only.
+Member block rules still apply to ordinary addressed replies, while group wakeups use
+group-level eligibility. Group mute, budgets, deadlines, and execution limits still apply.
+
+```text
+/tasks
+/tasks list [PAGE]
+/tasks show UUID
+/tasks add (--at OFFSET_ISO8601 | --in DURATION) -- INTENT
+/tasks edit UUID [--at OFFSET_ISO8601 | --in DURATION] [-- INTENT]
+/tasks cancel UUID
+```
+
+- Bare `/tasks` lists active tasks on page 1: **pending and running**, up to five per page.
+  Follow the next-page instruction rather than assuming a preview is the full list.
+- Show queries a complete UUID in the current group, including retained terminal records.
+- Add requires one time and nonempty intent. Edit requires at least one changed field;
+  omitted fields stay unchanged. Both time options together are invalid.
+- `--in` uses `30m`, `12h`, or `3d`, not bare seconds or natural-language times. `--at`
+  requires an offset-aware ISO timestamp, such as `2030-01-02T09:00:00+08:00`.
+- The minimum is 300 seconds; the horizon and group/chain/day limits come from `tasks`.
+  Rejection never silently postpones a task. An intent-only edit does not revalidate the
+  unchanged old time against a new minimum delay.
+- Only pending tasks can be edited or cancelled. Editing preserves UUID, creation time,
+  and chain; cancellation is a terminal transition, not physical deletion. Neither
+  operation resurrects running or terminal records.
+- All operations bind the current group, even for a global owner. Do not use list positions
+  or guessed UUID prefixes. A scheduled time is not a punctual-delivery guarantee.
+- Repetition creates only the next occurrence and remains bounded. Multi-task merge or
+  split workflows are not atomic; confirm each result and query again afterward.
+
+If an operation's result is unknown, query the current state before deciding what to do.
+Do not treat a timeout as successful deletion or blindly repeat a create request.
 
 ## Linking accounts
 
-Member self-service and owner repair use different commands.
-
-| Command | Meaning |
+| Command | Result |
 | --- | --- |
-| `/link @other-account` | Create a short-lived link request. This command confirms the initiating account. |
-| `/link confirm CODE` | The invited account confirms in the same group. Both current linked sets are then merged. |
-| `/link cancel CODE` | Either endpoint cancels a pending request. |
-| `/unlink` | Immediately detach only the account sending the command. It accepts no target; every other account in the set stays linked. |
-| `/merge @account-A @account-B` | Owner-only repair: symmetrically merge the two current linked sets. |
-| `/split @account` | Owner-only repair: detach only the mentioned exact account. |
+| `/link @other-account` | Issue a short-lived request; the sending account confirms its side. |
+| `/link confirm` | Confirm the invitation addressed to the sending account in this group, merging the two current identities. |
+| `/link cancel` | Cancel this group's pending invitation involving the sending account. |
+| `/unlink` | Detach only the sending account; the remaining accounts stay linked. |
+| `/merge @account-A @account-B` | Owner repair: merge the two current identities. |
+| `/split @account` | Owner repair: detach only that exact account. |
 
-Link codes prevent mix-ups and replay; ownership is proven by the invited platform account
-sending the confirmation. A request expires or becomes invalid if either linked set
-changes before confirmation.
+Each account can participate in only one pending invitation in each group, as either endpoint.
+Invitations in different groups are independent.
+Only the invited exact account can confirm, and either endpoint can cancel in the same
+group. Invitations expire after ten minutes; changes to either linked identity invalidate
+confirmation. An admitted confirmation is bound to its authenticated account and cannot
+select an invitation issued after that message arrived. Replaying an applied confirmation
+event is idempotent.
 
-## Group data and usage
+Exact-account records follow a detached account; shared records remain with the original
+linked identity because their exact-account provenance is unknown.
 
-| Command | Meaning |
+## Group records and usage
+
+| Command | Result |
 | --- | --- |
-| `/card` | Show structured facts about this group, such as its topic and local terminology. |
-| `/card forget N` | Owner-only: retract group fact N. |
-| `/stats` | Show this group's usage and state. |
-| `/stats global` | Owner-only: show global usage and diagnostics. |
-| `/top [N]` | Show up to N spending rows for exact accounts. |
-| `/top --all [N]` | Aggregate spending by current linked account sets. |
-| `/members` | Owner-only: show the whole-group account directory. This is never an alternate meaning of `/who`. |
+| `/card` | Fixed group context and separately numbered learned group facts. |
+| `/card forget N` | Owner-only retraction of a learned group fact. |
+| `/stats` | Today's group costs, calls, extraction backlog, and mute state. |
+| `/stats global` | Owner-only totals across all groups and budget/ledger health. |
+| `/top [N]` | This month's attributable account costs. |
+| `/top --all [N]` | The same costs aggregated by current linked identity. |
 
-## Blocking and muting
+Group-only work can have no single causing account; its costs still appear in the group
+and global ledger, but are not invented as somebody's personal spending. Monetary limits
+are stop-loss on accounted spend, not a strict concurrency-safe prepaid cap. An uncertain
+ledger is a protected state, distinct from an ordinary exhausted daily budget.
 
-| Command | Meaning |
+## Blocking, muting, and diagnostics
+
+| Command | Result |
 | --- | --- |
-| `/block` | List the group's current exact-account and linked-set rules. |
-| `/block add @account [30m\|12h\|3d]` | Add or replace an exact-account rule, optionally with an expiry. |
-| `/block add --all @account [30m\|12h\|3d]` | Add or replace a rule for the account's linked set. The rule follows later links and splits dynamically. |
-| `/block remove [--all] @account` | Remove the matching exact-account or linked-set rule. |
-| `/mute [status]` | Show this group's mute state. |
-| `/mute on` / `/mute off` | Enable or disable group mute. |
+| `/block` | Current-group exact-account and linked-identity block rules. |
+| `/block add @account [30m\|12h\|3d]` | Set an exact-account rule, optionally expiring. |
+| `/block add --all @account [30m\|12h\|3d]` | Set a linked-identity rule; later links/splits dynamically affect membership. |
+| `/block remove [--all] @account` | Remove the matching rule, without claiming unrelated rules disappeared. |
+| `/mute [status\|on\|off]` | Inspect or change current-group mute. |
+| `/debug [status\|start N\|stop]` | Owner-only bounded model-round capture. |
+| `/log [N]` | Owner-only bounded application-log tail. |
 
-Blocked and muted messages are still admitted to the canonical archive. Owners cannot be
-blocked.
-
-## Maintenance
-
-| Command | Meaning |
-| --- | --- |
-| `/debug [status]` | Show debug capture state. |
-| `/debug start N` | Capture the next N model rounds, bounded by `diagnostics.debug_max_rounds`. |
-| `/debug stop` | Stop capture. |
-| `/log [N]` | Show the configured bounded tail of the application log. |
-
-Debug captures contain provider-neutral prompt and completed-turn data. Credentials,
-provider wire state and model reasoning are not written.
-
-Command messages and bot command responses enter the same canonical archive as ordinary
-messages.
+Blocked messages cannot independently trigger ordinary response tasks. They remain in archived
+and generated conversation context; another triggered session may freely refer or respond to
+them. Blocking is not a structural-send filter or a promise of semantic silence. Muted messages
+are also archived. Owners cannot be blocked. Diagnostic
+limits are code-owned; debug captures contain provider-neutral prompts and completed turns,
+not credentials, provider wire state, or model reasoning.

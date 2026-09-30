@@ -33,8 +33,8 @@ CATALOG: tuple[Command, ...] = (
     ),
     Command(
         "/note",
-        "查看或修改备注",
-        "/note [--all] [@账号]\n/note set [--all] [@账号] 内容\n/note clear [--all] [@账号]",
+        "管理多条人工备注",
+        "/note [--all] [@账号]\n/note list [--all] [@账号] [页码]\n/note add [--all] [@账号] -- 内容\n/note edit [--all] [@账号] 备注编号 -- 内容\n/note remove [--all] [@账号] 备注编号\n/note clear [--all] [@账号]\n默认管理精确账号备注；--all 只管理关联身份共享备注，不清除各账号备注。编号来自同范围的 /note list，不用于 /forget。",
         "我的资料",
         Access.MEMBER,
     ),
@@ -47,15 +47,15 @@ CATALOG: tuple[Command, ...] = (
     ),
     Command(
         "/forget",
-        "删除账号记录",
-        "/forget [--all] [@账号] 编号\n编号来自相同范围的 /who。",
+        "删除自动归纳事实",
+        "/forget [--all] [@账号] 编号\n编号来自相同范围的 /who 自动归纳区；不删除人工备注或称呼。编号是当前列表的位置，资料变动后请重新查询。",
         "我的资料",
         Access.MEMBER,
     ),
     Command(
         "/link",
         "确认自己的关联账号",
-        "/link @另一个账号\n/link confirm 验证码\n/link cancel 验证码",
+        "/link @另一个账号\n/link confirm\n/link cancel\n向对方账号发出关联邀请；受邀账号在本群确认，任一方可在本群取消。每个账号在本群同时至多参与一份待确认邀请。",
         "身份",
         Access.MEMBER,
     ),
@@ -76,6 +76,13 @@ CATALOG: tuple[Command, ...] = (
         "/top [--all] [数量]\n默认按账号；--all 按关联账号聚合。",
         "本群",
         Access.MEMBER,
+    ),
+    Command(
+        "/tasks",
+        "管理本群定时任务",
+        "/tasks\n/tasks list [页码]\n/tasks show UUID\n/tasks add (--at 带时区ISO8601 | --in 30m|12h|3d) -- 内容\n/tasks edit UUID [--at 时间 | --in 时长] [-- 内容]\n/tasks cancel UUID\n列表包含待执行和执行中的任务；只能修改或取消待执行项。预约时间不保证准点送达。",
+        "管理",
+        Access.OWNER,
     ),
     Command("/members", "查看全群成员目录", "/members（仅 owner）", "管理", Access.OWNER),
     Command(

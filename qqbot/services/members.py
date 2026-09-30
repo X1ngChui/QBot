@@ -8,7 +8,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 
 from qqbot.concurrency import SharedWork, WorkRejected
-from qqbot.domain.ids import GroupId
+from qqbot.domain.ids import AccountId, GroupId
 from qqbot.gateway.botapi import BotApi
 from qqbot.util import display_name, why
 
@@ -18,14 +18,14 @@ CACHE_TTL = 1800
 MAX_GROUP_NAMES = 16_384
 MAX_MISSING_NAMES = 1024
 
-type CacheKey = tuple[str, GroupId]
+type CacheKey = tuple[AccountId, GroupId]
 
 
 @dataclass(slots=True)
 class MemberNames:
-    names: dict[str, str]
+    names: dict[AccountId, str]
     fetched: float
-    missing: set[str] = field(default_factory=set)
+    missing: set[AccountId] = field(default_factory=set)
 
 
 class MemberDirectory:
@@ -73,9 +73,9 @@ class MemberDirectory:
                     continue
                 raw = row.get("user_id")
                 if isinstance(raw, int) and not isinstance(raw, bool) and raw.bit_length() <= 64:
-                    account = str(raw)
+                    account = AccountId(raw)
                 elif isinstance(raw, str) and len(raw) <= 32:
-                    account = raw.strip()
+                    account = AccountId(raw.strip()) if raw.strip() else None
                 else:
                     continue
                 card, nickname = row.get("card"), row.get("nickname")
@@ -97,10 +97,12 @@ class MemberDirectory:
             self._store(key, entry)
         return entry
 
-    async def _current(self, bot: BotApi, group_id: GroupId, wanted: list[str]) -> dict[str, str]:
+    async def _current(
+        self, bot: BotApi, group_id: GroupId, wanted: list[AccountId]
+    ) -> dict[AccountId, str]:
         if self._closed:
             return {}
-        key = (str(bot.self_id), group_id)
+        key = (bot.self_id, group_id)
         entry = self._cache.get(key)
         fresh = entry is not None and self._clock() - entry.fetched < CACHE_TTL
         unknown = (
@@ -126,13 +128,15 @@ class MemberDirectory:
                 entry.missing.add(account)
         return entry.names
 
-    async def name_of(self, bot: BotApi, group_id: GroupId, qq: str) -> str | None:
+    async def name_of(self, bot: BotApi, group_id: GroupId, qq: AccountId) -> str | None:
         """The display name for one member - see _current for when the list is refetched."""
         if not qq:
             return None
         return (await self._current(bot, group_id, [qq])).get(qq)
 
-    async def names_of(self, bot: BotApi, group_id: GroupId, qqs: list[str]) -> dict[str, str]:
+    async def names_of(
+        self, bot: BotApi, group_id: GroupId, qqs: list[AccountId]
+    ) -> dict[AccountId, str]:
         """Display names for several members in one go - at most one API call."""
         wanted = [q for q in qqs if q]
         if not wanted:

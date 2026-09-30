@@ -3,6 +3,7 @@
 from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass
+from qqbot.domain.ids import AccountId
 import time
 import uuid
 
@@ -11,9 +12,9 @@ from qqbot.domain.ids import GroupId
 
 @dataclass(frozen=True, slots=True)
 class RosterRow:
-    user_id: str
+    user_id: AccountId
     entity_id: uuid.UUID
-    accounts: tuple[str, ...]
+    accounts: tuple[AccountId, ...]
     nickname: str
     former_names: tuple[str, ...]
     aliases: tuple[str, ...]
@@ -38,13 +39,13 @@ class RosterRow:
 @dataclass(frozen=True, slots=True)
 class CachedRoster:
     revision: tuple
-    live: tuple[tuple[str, str], ...]
+    live: tuple[tuple[AccountId, str], ...]
     rows: tuple[RosterRow, ...]
     expires: float
     text_bytes: int
 
     @property
-    def speakers(self) -> tuple[str, ...]:
+    def speakers(self) -> tuple[AccountId, ...]:
         return tuple(account for row in self.rows for account in row.accounts)
 
     def project(self) -> list[dict]:
@@ -68,7 +69,7 @@ class RosterCache:
         self._max_text_bytes = max_text_bytes
         self._ttl = ttl
         self._clock = clock
-        self._entries: OrderedDict[tuple[str, GroupId], CachedRoster] = OrderedDict()
+        self._entries: OrderedDict[tuple[AccountId | None, GroupId], CachedRoster] = OrderedDict()
         self._closed = False
         self.rows = 0
         self.text_bytes = 0
@@ -91,7 +92,7 @@ class RosterCache:
         self._closed = True
         self.clear()
 
-    def get(self, key: tuple[str, GroupId]) -> CachedRoster | None:
+    def get(self, key: tuple[AccountId | None, GroupId]) -> CachedRoster | None:
         if self._closed:
             return None
         entry = self._entries.get(key)
@@ -102,7 +103,9 @@ class RosterCache:
             self._entries.move_to_end(key)
         return entry
 
-    def put(self, key: tuple[str, GroupId], revision: tuple, live: dict, rows: list[dict]) -> None:
+    def put(
+        self, key: tuple[AccountId | None, GroupId], revision: tuple, live: dict, rows: list[dict]
+    ) -> None:
         if self._closed:
             return
         self._drop(key)

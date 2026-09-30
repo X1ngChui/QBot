@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from qqbot.domain.ids import AccountId
 import asyncpg
 
 from qqbot.clock import Clock
@@ -22,6 +23,7 @@ from qqbot.providers.base import Providers
 from qqbot.repositories.identity import IdentityRepository
 from qqbot.repositories.evidence import EvidenceRepository
 from qqbot.repositories.archive import ArchiveRepository
+from qqbot.services.scheduled_tasks import ScheduledTaskService
 from qqbot.repositories.scheduled_task import ScheduledTask
 from qqbot.services import Directory
 from qqbot.services.budget import Budget, BudgetExceeded, BudgetUnavailable
@@ -31,7 +33,7 @@ from qqbot.services.members import MemberDirectory
 @dataclass(frozen=True, slots=True)
 class AddressedMessage:
     message: ChatMsg
-    initiator: str
+    initiator: AccountId
     window: tuple[ChatMsg, ...]
 
 
@@ -67,7 +69,9 @@ class ReplyExecutor:
         media: MediaCoordinator,
         providers: Providers,
         directory: Directory,
+        tasks: ScheduledTaskService,
     ) -> None:
+        self.tasks = tasks
         self.bundle = bundle
         self.clock = clock
         self.database = database
@@ -100,12 +104,16 @@ class ReplySession:
             case AddressedMessage(message, initiator, history):
                 current, window, scheduled = message, list(history), None
             case DueTask(task):
-                await state.load_history(self_id=str(request.bot.self_id), owners=cfg.bot.owners)
+                await state.load_history(self_id=request.bot.self_id, owners=cfg.bot.owners)
                 current, window, scheduled = None, prompt.history_window(state, None), task
-                initiator = task.creator_id
+                initiator = None
         if state.muted:
             return work.progress.finish(ReplyEnd.MUTED)
-        if initiator not in cfg.bot.owners and await state.blocked_now(initiator):
+        if (
+            initiator is not None
+            and initiator not in cfg.bot.owners
+            and await state.blocked_now(initiator)
+        ):
             return work.progress.finish(ReplyEnd.BLOCKED)
         try:
             if await owner.budget.exceeded():
@@ -134,6 +142,7 @@ class ReplySession:
                     providers=owner.providers,
                     media=owner.media.processor,
                     directory=owner.directory,
+                    tasks=owner.tasks,
                     delivery=owner.delivery,
                     progress=work.progress,
                     window=window,

@@ -21,9 +21,10 @@ render that assigned it.
 
 from __future__ import annotations
 
+from qqbot.domain.ids import AccountId
 import logging
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence, Mapping
 from qqbot.util import why
 
 log = logging.getLogger("qqbot.numbers")
@@ -35,26 +36,29 @@ class MemberNumbers:
     """The numbering of one prompt: person -> number, and back to accounts."""
 
     def __init__(
-        self, self_id: str = "", *, lookup: Callable[[list[str]], Awaitable[dict]] | None = None
+        self,
+        self_id: AccountId | None = None,
+        *,
+        lookup: Callable[[list[AccountId]], Awaitable[Mapping[AccountId, object]]] | None = None,
     ) -> None:
         self._lookup = lookup
-        self._self = str(self_id or "")
+        self._self = self_id
         #: account -> the person it belongs to; an account missing here is a
         #: person of its own.
-        self._person: dict[str, object] = {}
+        self._person: dict[AccountId, object] = {}
         self._number: dict[object, int] = {}
         #: number -> that person's accounts, in the order they were numbered.
-        self._accounts: dict[int, list[str]] = {}
+        self._accounts: dict[int, list[AccountId]] = {}
         #: number -> the account that most recently spoke in the conversation.
-        self._latest: dict[int, str] = {}
+        self._latest: dict[int, AccountId] = {}
 
-    def teach(self, account: str, person: object) -> None:
+    def teach(self, account: AccountId, person: object) -> None:
         """Record which person an account belongs to. Only effective before the
         account is numbered: a number, once shown, keeps meaning what it meant."""
         if account and account not in self._person:
             self._person[account] = person
 
-    async def learn(self, accounts: list[str]) -> None:
+    async def learn(self, accounts: Sequence[AccountId]) -> None:
         """Look up the person behind every account not yet known, in one query.
 
         A lookup failure degrades to one number per account: merged accounts then
@@ -76,13 +80,12 @@ class MemberNumbers:
         for account, person in found.items():
             self.teach(account, person)
 
-    def number(self, account: str, *, spoke: bool = False) -> int | None:
+    def number(self, account: AccountId, *, spoke: bool = False) -> int | None:
         """Assign and return this account's display number.
 
         Zero is the bot's reserved display identity, positive values are people,
         and ``None`` is the only representation of an absent account.
         """
-        account = str(account or "")
         if not account:
             return None
         if account == self._self:
@@ -101,9 +104,8 @@ class MemberNumbers:
             self._latest[n] = account
         return n
 
-    def known(self, account: str) -> int | None:
+    def known(self, account: AccountId) -> int | None:
         """Return an existing display number without assigning one."""
-        account = str(account or "")
         if not account:
             return None
         if account == self._self:
@@ -111,14 +113,14 @@ class MemberNumbers:
         person = self._person.get(account, ("account", account))
         return self._number.get(person)
 
-    def account(self, n: int) -> str | None:
+    def account(self, n: int) -> AccountId | None:
         """The account to address for number `n`: the one that spoke last in the
         conversation, else the first one numbered. None for a number not shown."""
         if n <= BOT_DISPLAY_NUMBER or n not in self._accounts:
             return None
         return self._latest.get(n) or self._accounts[n][0]
 
-    def accounts(self, n: int) -> list[str]:
+    def accounts(self, n: int) -> list[AccountId]:
         """Every account shown under number `n`."""
         if n <= BOT_DISPLAY_NUMBER:
             return []

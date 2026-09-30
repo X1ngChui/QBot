@@ -16,6 +16,7 @@ from apscheduler.triggers.cron import CronTrigger
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from qqbot.domain.ids import AccountId
 from qqbot.operations.limits import DIAGNOSTIC_LIMITS
 from qqbot.delivery import output
 from qqbot.services.budget import hit_split
@@ -34,7 +35,7 @@ if TYPE_CHECKING:
     from qqbot.runtime import Runtime
 
 log = logging.getLogger("qqbot.operations.scheduled")
-PrivateSender = Callable[[int, str], Awaitable[None]]
+PrivateSender = Callable[[AccountId, str], Awaitable[None]]
 EXTRACTION_STAGE_TIMEOUT = timedelta(hours=3)
 DECAY_STAGE_TIMEOUT = timedelta(minutes=30)
 STAGE_POLL_SEC = 30
@@ -229,7 +230,7 @@ async def daily_report(runtime: Runtime, send_private: PrivateSender) -> None:
     """Build the closed ledger report and send it independently to each owner."""
 
     cfg = runtime.bundle.default
-    owners = [owner.strip() for owner in cfg.bot.owners if owner.strip()]
+    owners = cfg.bot.owners
     if not owners:
         log.info("no owners configured, daily report skipped")
         return
@@ -306,7 +307,7 @@ async def daily_report(runtime: Runtime, send_private: PrivateSender) -> None:
     sent = 0
     for owner in owners:
         try:
-            await send_private(int(owner), text)
+            await send_private(owner, text)
             sent += 1
         except Exception:
             log.exception("daily report: could not reach owner %s", owner)

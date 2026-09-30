@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
+from qqbot.domain.ids import MessageId
 import asyncpg
 
 from qqbot.domain.archive import ArchivedMessage
@@ -45,7 +46,7 @@ class ArchiveRepository:
     def __init__(self, *, database: Callable[[], asyncpg.Pool]) -> None:
         self._database = database
 
-    async def backfill_plain_text(self, msg_id: str, plain_text: str) -> None:
+    async def backfill_plain_text(self, msg_id: MessageId, plain_text: str) -> None:
         """Fill in the reading once media has been understood.
 
         Updates the derived plain_text column and nothing else: payload is the append-only

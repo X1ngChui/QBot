@@ -45,7 +45,6 @@ _REQUIRED_SCHEMA_COLUMNS = {
         "target_account_id",
         "initiator_entity_revision",
         "target_entity_revision",
-        "token_hash",
     },
     "alias": {"target_entity_id", "target_account_id"},
     "episode": {"extraction_id", "summary"},
@@ -58,7 +57,6 @@ _REQUIRED_SCHEMA_COLUMNS = {
     "scheduled_task": {
         "id",
         "group_id",
-        "creator_id",
         "intent",
         "due_at",
         "status",
@@ -73,7 +71,6 @@ _REQUIRED_NOT_NULL_COLUMNS = {
     "memory_extraction": {"model_attempts"},
     "account_link_challenge": {
         "group_id",
-        "token_hash",
         "initiator_account_id",
         "target_account_id",
         "initiator_entity_id",
@@ -89,7 +86,6 @@ _REQUIRED_NOT_NULL_COLUMNS = {
     "scheduled_task": {
         "id",
         "group_id",
-        "creator_id",
         "intent",
         "due_at",
         "created_at",
@@ -103,11 +99,14 @@ _SCHEMA_CONSTRAINTS = {
     "memory_job_status_valid": ("memory_job", "c"),
     "memory_job_claim_valid": ("memory_job", "c"),
     "memory_job_retries_valid": ("memory_job", "c"),
+    "account_link_created_event_key": ("account_link_challenge", "u"),
+    "account_link_confirmed_event_key": ("account_link_challenge", "u"),
     "account_link_distinct_accounts": ("account_link_challenge", "c"),
     "account_link_revision_valid": ("account_link_challenge", "c"),
     "account_link_status_valid": ("account_link_challenge", "c"),
     "alias_exactly_one_target": ("alias", "c"),
     "fact_exactly_one_subject": ("memory_fact", "c"),
+    "fact_note_key_valid": ("memory_fact", "c"),
     "group_blocklist_exactly_one_target": ("group_blocklist", "c"),
     "identity_account_platform_platform_user_id_key": ("identity_account", "u"),
     "memory_extraction_event_extraction_id_ordinal_key": ("memory_extraction_event", "u"),
@@ -121,6 +120,10 @@ _SCHEMA_CONSTRAINTS = {
     "scheduled_task_pkey": ("scheduled_task", "p"),
 }
 _SCHEMA_CHECK_DEFINITIONS = {
+    "fact_note_key_valid": (
+        "CHECK (predicate <> 'note' OR object_key IS NOT NULL AND object_key ~ "
+        "'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')"
+    ),
     "memory_extraction_attempts_valid": "CHECK (model_attempts >= 0)",
     "memory_job_status_valid": "CHECK (status = ANY (ARRAY['pending', 'running', 'done', 'dead']))",
     "memory_job_claim_valid": (
@@ -129,6 +132,8 @@ _SCHEMA_CHECK_DEFINITIONS = {
         "OR status<>'running' AND num_nonnulls(claim_token, lease_until, locked_at, locked_by)=0)"
     ),
     "memory_job_retries_valid": "CHECK (retry_count >= 0 AND max_retry >= 0)",
+    "account_link_created_event_key": "UNIQUE (created_event_id)",
+    "account_link_confirmed_event_key": "UNIQUE (confirmed_event_id)",
     "account_link_distinct_accounts": "CHECK (initiator_account_id <> target_account_id)",
     "account_link_revision_valid": (
         "CHECK (initiator_entity_revision >= 1 AND target_entity_revision >= 1)"
@@ -163,6 +168,16 @@ _SCHEMA_CHECK_DEFINITIONS = {
 }
 _SCHEMA_INDEXES = {
     "job_expired": ("memory_job", ("lease_until", "id"), "status='running'"),
+    "account_link_pending_initiator": (
+        "account_link_challenge",
+        ("group_id", "initiator_account_id"),
+        "status='pending'",
+    ),
+    "account_link_pending_target": (
+        "account_link_challenge",
+        ("group_id", "target_account_id"),
+        "status='pending'",
+    ),
     "account_link_pending_pair": (
         "account_link_challenge",
         (
@@ -209,9 +224,19 @@ _SCHEMA_INDEXES = {
     ),
     "reply_trace_reply": ("reply_trace", ("group_id", "reply_event_id"), ""),
     "scheduled_task_due": ("scheduled_task", ("due_at", "id"), "status='pending'"),
+    "scheduled_task_active_group": (
+        "scheduled_task",
+        ("group_id", "due_at", "id"),
+        "status=ANY(ARRAY['pending','running'])",
+    ),
 }
+_NON_UNIQUE_INDEXES = {"scheduled_task_active_group"}
 _RETIRED_SCHEMA_TABLES = {"episode_participant", "schema_migration", "user_agreement"}
-_RETIRED_SCHEMA_COLUMNS = {"reply_trace": {"content"}}
+_RETIRED_SCHEMA_COLUMNS = {
+    "reply_trace": {"content"},
+    "scheduled_task": {"creator_id"},
+    "account_link_challenge": {"token_hash"},
+}
 
 
 def _schema_expression(value: str | None) -> str:
@@ -294,7 +319,7 @@ async def check_schema(conn, *, schema: str, embedding_dimensions: int) -> None:
             row is None
             or row["table_name"] != table
             or row["amname"] != "btree"
-            or not row["indisunique"]
+            or row["indisunique"] != (name not in _NON_UNIQUE_INDEXES)
             or not row["indisvalid"]
             or not row["indisready"]
             or not row["indislive"]

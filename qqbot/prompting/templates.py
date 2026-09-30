@@ -30,6 +30,8 @@ class PromptKey(StrEnum):
     TOOL_FINISH_REPLY = "tool_finish_reply"
     TOOL_SCHEDULE_TASK = "tool_schedule_task"
     TOOL_LIST_SCHEDULED_TASKS = "tool_list_scheduled_tasks"
+    TOOL_GET_SCHEDULED_TASK = "tool_get_scheduled_task"
+    TOOL_UPDATE_SCHEDULED_TASK = "tool_update_scheduled_task"
     TOOL_CANCEL_SCHEDULED_TASK = "tool_cancel_scheduled_task"
 
 
@@ -110,7 +112,7 @@ _SPECS = (
     TemplateSpec(
         PromptKey.SCHEDULED_USER,
         PromptRole.USER,
-        (_slot("now"), _slot("intent"), _slot("initiator")),
+        (_slot("now"), _slot("intent"), _slot("task_id"), _slot("due_at")),
     ),
     TemplateSpec(
         PromptKey.EXTRACT_SYSTEM,
@@ -163,6 +165,8 @@ _SPECS = (
     TemplateSpec(PromptKey.TOOL_FINISH_REPLY, PromptRole.TOOL),
     TemplateSpec(PromptKey.TOOL_SCHEDULE_TASK, PromptRole.TOOL),
     TemplateSpec(PromptKey.TOOL_LIST_SCHEDULED_TASKS, PromptRole.TOOL),
+    TemplateSpec(PromptKey.TOOL_GET_SCHEDULED_TASK, PromptRole.TOOL),
+    TemplateSpec(PromptKey.TOOL_UPDATE_SCHEDULED_TASK, PromptRole.TOOL),
     TemplateSpec(PromptKey.TOOL_CANCEL_SCHEDULED_TASK, PromptRole.TOOL),
 )
 

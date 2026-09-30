@@ -16,8 +16,8 @@ async def test_busy_groups_are_filtered_before_a_task_is_claimed(database, bundl
     ids = [uuid.uuid4() for _ in range(3)]
     for identifier, group in zip(ids, (311, 311, 312), strict=True):
         await database.pool.execute(
-            """INSERT INTO scheduled_task(id,group_id,creator_id,intent,due_at,chain_id,chain_depth)
-               VALUES ($1,$2,'101','Fictional',now()-interval '1 second',$1,0)""",
+            """INSERT INTO scheduled_task(id,group_id,intent,due_at,chain_id,chain_depth)
+               VALUES ($1,$2,'Fictional',now()-interval '1 second',$1,0)""",
             identifier,
             group,
         )

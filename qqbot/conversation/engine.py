@@ -30,6 +30,8 @@ from qqbot.domain.reply import ReplyEnd
 from qqbot.domain.reply import ReplyOutcome
 from qqbot.domain.reply import ReplyProgress
 from qqbot.providers.base import Providers
+from qqbot.domain.ids import AccountId
+from qqbot.services.scheduled_tasks import ScheduledTaskService
 from qqbot.repositories.scheduled_task import ScheduledTask
 from qqbot.services import Directory
 from qqbot.configuration import Persona
@@ -154,6 +156,7 @@ async def generate(
     media: MediaProcessor,
     directory: Directory,
     delivery: MessageDelivery,
+    tasks: ScheduledTaskService,
     progress: ReplyProgress,
     window: list[ChatMsg] | None = None,
     scheduled: ScheduledTask | None = None,
@@ -179,12 +182,8 @@ async def generate(
     # The caller normally passes the window in, cut when the message arrived, so
     # later arrivals cannot shift what this reply is looking at. Evidence is fetched by
     # reply id and rendered only for replies still inside this frozen window.
-    if scheduled is None:
-        if msg is None:
-            raise ValueError("a reply needs a received message or a scheduled task")
-        initiator = msg.user_id
-    else:
-        initiator = scheduled.creator_id
+    if scheduled is None and msg is None:
+        raise ValueError("a reply needs a received message or a scheduled task")
     if window is None:
         window = prompt.history_window(st, msg)
     shown = window + ([msg] if msg is not None else [])
@@ -204,13 +203,12 @@ async def generate(
     pics, by_pic = snapshot.image_numbers, dict(snapshot.pictures)
     lines = {n: m for m in shown if (n := nums.get(m.msg_id))}
 
-    people = MemberNumbers(self_id=str(bot.self_id), lookup=identities.holder_ids_for_accounts)
+    people = MemberNumbers(self_id=bot.self_id, lookup=identities.holder_ids_for_accounts)
     prompt.teach_roster(people, profiles)
     await people.learn(
         [m.user_id for m in shown]
         + [a for m in frozen_window if m.is_bot for a, _ in m.at]
         + [a for m in shown if not m.is_bot for a, _ in m.mentions]
-        + ([scheduled.creator_id] if scheduled is not None else [])
     )
     prompt.number_people(people, profiles, frozen_window, frozen_msg)
 
@@ -223,7 +221,7 @@ async def generate(
         providers=providers,
         media=media,
         bot=bot,
-        initiator=initiator,
+        tasks=tasks,
         parent_task=scheduled,
         by_pic=by_pic,
         people=people,
@@ -240,8 +238,9 @@ async def generate(
         msg=frozen_msg,
         profiles=profiles,
         task_intent=scheduled.intent if scheduled is not None else None,
-        task_initiator=(
-            "原发起人" + sysmark(str(people.number(scheduled.creator_id)))
+        task_id=str(scheduled.id) if scheduled is not None else None,
+        task_due_at=(
+            scheduled.due_at.astimezone(clock.zone).isoformat(timespec="seconds")
             if scheduled is not None
             else None
         ),
@@ -253,15 +252,15 @@ async def generate(
         pics=pics,
         people=people,
     )
-    names = {str(m.user_id): m.nickname for m in shown if not m.is_bot}
-    names.update({str(a): n for m in frozen_window if m.is_bot for a, n in m.at if n})
+    names = {m.user_id: m.nickname for m in shown if not m.is_bot}
+    names.update({a: n for m in frozen_window if m.is_bot for a, n in m.at if n})
     first_evidence = True
 
     async def send_one(
         draft: agent.MessageDraft, executed: tuple[agent.ToolExecution, ...]
     ) -> agent.SendResult:
         nonlocal first_evidence
-        accounts = [str(account) for account in draft.at]
+        accounts = draft.at
         live = await members.names_of(bot, st.group_id, accounts) if accounts else {}
         named = {account: live.get(account) or names.get(account) or "成员" for account in accounts}
         segments = _clean_outbound(
@@ -288,12 +287,12 @@ async def generate(
             if evidence_memo := _evidence_memo(executed, cfg, clock):
                 try:
                     await evidence_store.evidence_add(
-                        st.group_id, str(delivered.message_id), evidence_memo
+                        st.group_id, delivered.message_id, evidence_memo
                     )
                 except Exception:
                     log.exception("failed to persist reply evidence in group %s", st.group_id)
         echoed = await delivery.echo.wait(
-            str(bot.self_id),
+            bot.self_id,
             st.group_id,
             delivered.message_id,
             timeout=ECHO_TIMEOUT_SEC,
@@ -316,9 +315,9 @@ async def generate(
                 )
                 if (
                     isinstance(fetched, dict)
-                    and str(fetched.get("message_id")) == str(delivered.message_id)
+                    and str(fetched.get("message_id")) == delivered.message_id
                     and str(fetched.get("group_id")) == str(st.group_id)
-                    and str(fetched.get("user_id")) == str(bot.self_id)
+                    and str(fetched.get("user_id")) == bot.self_id
                 ):
                     kind = "dice" if isinstance(segments[0], DiceSegment) else "rps"
                     for item in fetched.get("message", ()):
@@ -331,15 +330,13 @@ async def generate(
                             ):
                                 actual = parse_segments(
                                     [item],
-                                    str(bot.self_id),
+                                    bot.self_id,
                                     display_zone=ZoneInfo(cfg.bot.timezone),
                                     self_name=persona.name,
                                 ).render()
                                 echoed.text = actual
                                 try:
-                                    await archive.backfill_plain_text(
-                                        str(delivered.message_id), actual
-                                    )
+                                    await archive.backfill_plain_text(delivered.message_id, actual)
                                 except Exception:
                                     log.exception(
                                         "failed to persist observed random result in group %s",
@@ -400,7 +397,7 @@ def _strip_addresses(text: str, names: list[str]) -> str:
 def _clean_outbound(
     segments: tuple[SendSegment, ...],
     *,
-    names: dict[str, str],
+    names: dict[AccountId, str],
     max_text_chars: int,
 ) -> tuple[SendSegment, ...]:
     """Clean and bound text parts without changing control-segment order."""
@@ -449,6 +446,7 @@ async def respond(
     media: MediaProcessor,
     delivery: MessageDelivery,
     directory: Directory,
+    tasks: ScheduledTaskService,
     window: list[ChatMsg] | None = None,
     scheduled: ScheduledTask | None = None,
     progress: ReplyProgress | None = None,
@@ -477,6 +475,7 @@ async def respond(
                 providers=providers,
                 media=media,
                 directory=directory,
+                tasks=tasks,
                 delivery=delivery,
                 progress=progress,
                 window=window,

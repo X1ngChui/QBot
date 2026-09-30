@@ -106,7 +106,7 @@ def field_rules() -> dict[str, FieldRule]:
         "media.": "Owned work deadlines, bounded retries and backend attachment expiry.",
         "members.": "A size-bounded member cache owns its refresh policy.",
         "commands.": "Command pagination and rendering enforce their own output bounds.",
-        "identity_link.": "Challenge lifetime, entropy and admission are security invariants.",
+        "identity_link.": "Invitation lifetime and admission are code-owned invariants.",
         "diagnostics.": "Bounded diagnostic buffers and output projection own these limits.",
         "tools.": "Session fuel and bounded tool result projection replace independent knobs.",
         "prompt.": "Bounded parsing, stable window projection and evidence rendering.",
@@ -128,7 +128,10 @@ def field_rules() -> dict[str, FieldRule]:
         "schedule.drain_poll_sec": "Worker completion is an execution mechanism, not user policy.",
         "schedule.misfire_grace_sec": "The maintenance scheduler owns missed-trigger handling.",
         "schedule.backup_stale_hours": "Backup health follows expected scheduled completion.",
-        "scheduled_tasks.min_delay_sec": "The scheduling tool enforces its fixed minimum delay.",
+        "scheduled_tasks.max_pending_per_account": (
+            "Tasks are group-owned; account admission is retired."
+        ),
+        "scheduled_tasks.min_delay_sec": "The scheduling service enforces its fixed minimum delay.",
         "scheduled_tasks.poll_sec": "The durable worker owns bounded polling.",
         "scheduled_tasks.max_concurrency": "The execution scheduler owns task slots.",
     }

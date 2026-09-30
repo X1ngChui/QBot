@@ -42,6 +42,8 @@ from qqbot.providers.registry import build as build_providers
 from qqbot.repositories import IdentityLinkRepository, IdentityRepository
 from qqbot.services import Directory, IdentityLinkService, IdentityResolver, retrieval
 from qqbot.workers import MemoryWorker
+from qqbot.services.scheduled_tasks import ScheduledTaskService
+from qqbot.repositories.scheduled_task import ScheduledTaskRepository
 from qqbot.workers.scheduled import ScheduledTaskWorker
 
 log = logging.getLogger("qqbot.runtime")
@@ -60,6 +62,7 @@ class Runtime:
     archive: ArchiveRepository
     identities: IdentityRepository
     budget: Budget
+    tasks: ScheduledTaskService
     members: MemberDirectory
     providers: Providers
     directory: Directory
@@ -131,6 +134,7 @@ class Runtime:
             daily_cap=bundle.default.budget.daily_cny_cap,
             today=clock.today,
         )
+        tasks = ScheduledTaskService(ScheduledTaskRepository(database=pool), clock=clock)
         capabilities = providers or build_providers(bundle.default, budget)
         members = MemberDirectory()
         identities = IdentityRepository(database=pool, clock=clock)
@@ -180,6 +184,7 @@ class Runtime:
             bundle=bundle,
             clock=clock,
             diagnostics=diagnostics,
+            tasks=tasks,
         )
         reply_executor = ReplyExecutor(
             bundle=bundle,
@@ -195,6 +200,7 @@ class Runtime:
             media=media,
             providers=capabilities,
             directory=directory,
+            tasks=tasks,
         )
         replies = ReplyScheduler(
             reply_executor,
@@ -226,6 +232,7 @@ class Runtime:
             bundle=bundle,
             clock=clock,
             diagnostics=diagnostics,
+            tasks=tasks,
             database=database,
             groups=groups,
             media_cache=media_cache,

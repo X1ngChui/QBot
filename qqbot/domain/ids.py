@@ -3,10 +3,19 @@
 from __future__ import annotations
 
 
+from typing import Any
+
+from pydantic_core import core_schema
+
+
 class _TextId(str):
     """A non-empty immutable identifier with canonical string behavior."""
 
     label = "identifier"
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source: Any, handler: Any) -> core_schema.CoreSchema:
+        return core_schema.no_info_after_validator_function(cls, core_schema.str_schema())
 
     def __new__(cls, value: object):
         parsed = str(value or "").strip()

@@ -15,7 +15,6 @@ SET default_table_access_method = heap;
 CREATE TABLE account_link_challenge (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     group_id bigint NOT NULL,
-    token_hash character varying(64) NOT NULL,
     initiator_account_id uuid NOT NULL,
     target_account_id uuid NOT NULL,
     initiator_entity_id uuid NOT NULL,
@@ -285,7 +284,9 @@ CREATE TABLE memory_fact (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     subject_account_id uuid,
-    CONSTRAINT fact_exactly_one_subject CHECK ((num_nonnulls(subject_entity_id, subject_account_id) = 1))
+    CONSTRAINT fact_exactly_one_subject CHECK ((num_nonnulls(subject_entity_id, subject_account_id) = 1)),
+    CONSTRAINT fact_note_key_valid CHECK (predicate <> 'note' OR
+        (object_key IS NOT NULL AND object_key ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'))
 );
 
 
@@ -339,7 +340,6 @@ CREATE TABLE memory_job (
 CREATE TABLE scheduled_task (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     group_id bigint NOT NULL,
-    creator_id character varying(128) NOT NULL,
     intent text NOT NULL,
     due_at timestamp with time zone NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
@@ -398,11 +398,14 @@ ALTER TABLE ONLY account_link_challenge
 
 
 --
--- Name: account_link_challenge account_link_challenge_token_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+-- Name: account_link_challenge account_link_created_event_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY account_link_challenge
-    ADD CONSTRAINT account_link_challenge_token_hash_key UNIQUE (token_hash);
+    ADD CONSTRAINT account_link_created_event_key UNIQUE (created_event_id);
+
+ALTER TABLE ONLY account_link_challenge
+    ADD CONSTRAINT account_link_confirmed_event_key UNIQUE (confirmed_event_id);
 
 
 --
@@ -601,7 +604,7 @@ ALTER TABLE ONLY reply_trace
 -- Name: account_link_pending_initiator; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX account_link_pending_initiator ON account_link_challenge USING btree (initiator_account_id, expires_at) WHERE ((status)::text = 'pending'::text);
+CREATE UNIQUE INDEX account_link_pending_initiator ON account_link_challenge USING btree (group_id, initiator_account_id) WHERE ((status)::text = 'pending'::text);
 
 
 --
@@ -615,7 +618,7 @@ CREATE UNIQUE INDEX account_link_pending_pair ON account_link_challenge USING bt
 -- Name: account_link_pending_target; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX account_link_pending_target ON account_link_challenge USING btree (target_account_id, expires_at) WHERE ((status)::text = 'pending'::text);
+CREATE UNIQUE INDEX account_link_pending_target ON account_link_challenge USING btree (group_id, target_account_id) WHERE ((status)::text = 'pending'::text);
 
 
 --
@@ -780,10 +783,10 @@ CREATE UNIQUE INDEX scheduled_task_due ON scheduled_task USING btree (due_at, id
 
 
 --
--- Name: scheduled_task_pending_creator; Type: INDEX; Schema: public; Owner: -
+-- Name: scheduled_task_active_group; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX scheduled_task_pending_creator ON scheduled_task USING btree (group_id, creator_id) WHERE ((status)::text = 'pending'::text);
+CREATE INDEX scheduled_task_active_group ON scheduled_task USING btree (group_id, due_at, id) WHERE status IN ('pending', 'running');
 
 
 --

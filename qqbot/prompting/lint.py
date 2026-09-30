@@ -40,9 +40,7 @@ def lint_catalog(catalog: PromptCatalog, cfg: Settings, predicates: PredicateTab
     properties = _object_at(send.parameters, "properties")
     if "content" not in properties or "messages" in properties:
         errors.append("send schema must accept one message's content")
-    segment_types = set(
-        _object_at(properties, "content", "items", "discriminator", "mapping")
-    )
+    segment_types = set(_object_at(properties, "content", "items", "discriminator", "mapping"))
     if "mface" in segment_types:
         errors.append("the model-facing send schema exposes mface")
     expected_segments = {
@@ -93,6 +91,8 @@ def lint_catalog(catalog: PromptCatalog, cfg: Settings, predicates: PredicateTab
         "open_images",
         "schedule_task",
         "list_scheduled_tasks",
+        "get_scheduled_task",
+        "update_scheduled_task",
         "cancel_scheduled_task",
     }:
         errors.append(f"unexpected reply tool set: {sorted(reply_names)}")

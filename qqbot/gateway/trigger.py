@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from qqbot.domain.ids import AccountId, MessageId
 from qqbot.configuration import Settings
 from qqbot.gateway import nickname
 from qqbot.conversation.state import ChatMsg
@@ -28,9 +29,9 @@ class Decision:
     reply: bool
     reason: str = ""
     #: The account whose @ or name-call caused this reply; set exactly when reply is.
-    initiator: str = ""
+    initiator: AccountId | None = None
     #: The platform id of the message that did the calling, for the reply to quote.
-    initiator_msg_id: str = ""
+    initiator_msg_id: MessageId | None = None
 
 
 def decide(msg: ChatMsg, at_bot: bool, *, st: GroupState, cfg: Settings) -> Decision:

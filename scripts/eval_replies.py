@@ -50,6 +50,8 @@ from scripts._env import load_dotenv
 
 from scripts._eval_delivery import EvaluationDelivery, EvaluationSends
 from qqbot.conversation import engine
+from qqbot.repositories.scheduled_task import ScheduledTaskRepository
+from qqbot.services.scheduled_tasks import ScheduledTaskService
 from qqbot.repositories.groups import GroupRepository
 from qqbot.repositories.media_cache import MediaCacheRepository
 from qqbot.repositories.evidence import EvidenceRepository
@@ -84,7 +86,7 @@ GROUP = GroupId("424242")
 
 
 class EvalBot:
-    self_id = "999"
+    self_id = AccountId("999")
 
     async def call_api(self, api, **kw):
         if api == "get_group_member_list":
@@ -512,6 +514,10 @@ async def run_case(
         with budget.attribute(case["trigger"].user_id), budget.scope(cfg.budget.per_reply_cny):
             async with asyncio.timeout(cfg.conversation.reply_deadline_sec):
                 outcome = await engine.generate(
+                    tasks=ScheduledTaskService(
+                        ScheduledTaskRepository(database=database.pool),
+                        clock=clock,
+                    ),
                     database=database.pool,
                     identities=identities,
                     evidence_store=evidence_store,
