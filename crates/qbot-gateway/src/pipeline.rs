@@ -339,7 +339,7 @@ fn archive_form(m: &GroupMessage, ctx: &RenderContext) -> Option<(Incoming, Medi
             .items
             .iter()
             .map(|item| MediaRefRow {
-                kind: item.kind.marker().to_owned(),
+                kind: item.kind,
                 index: u32::try_from(item.index).unwrap_or(u32::MAX),
                 key: item.reference.key.clone(),
                 file: item.reference.file.clone(),

@@ -50,7 +50,7 @@ async fn ordinal_of(db: &TestDb, group: GroupId, message: i64) -> i64 {
 #[tokio::test]
 async fn ordinals_are_dense_per_group_even_under_concurrency_and_duplicates_use_none() {
     let db = db!();
-    let archive = Arc::new(PgArchive::new(db.pool().clone(), ManualClock::new(T0)));
+    let archive = Arc::new(PgArchive::new(db.pool().clone()));
     let g = group(1);
     let tasks: Vec<_> = (0..30)
         .map(|i| {
@@ -105,7 +105,7 @@ async fn ordinals_are_dense_per_group_even_under_concurrency_and_duplicates_use_
 #[tokio::test]
 async fn a_line_from_a_new_account_creates_its_account_and_holder_atomically() {
     let db = db!();
-    let archive = PgArchive::new(db.pool().clone(), ManualClock::new(T0));
+    let archive = PgArchive::new(db.pool().clone());
     let identity = PgIdentityStore::new(db.pool().clone(), IdentityPolicy::default());
     let g = group(1);
     archive
@@ -342,7 +342,7 @@ async fn pgvector_ranks_by_cosine_distance_in_a_real_exact_scan() {
 async fn deleting_an_episode_removes_its_embedding_and_lines_carry_member_numbers() {
     use qbot_memory::conformance::episode;
     let db = db!();
-    let archive = PgArchive::new(db.pool().clone(), ManualClock::new(T0));
+    let archive = PgArchive::new(db.pool().clone());
     let store = PgEpisodeStore::new(db.pool().clone(), ManualClock::new(T0));
     let g = group(1);
     archive.append(member(g, 1, 10, "from ten")).await.unwrap();
@@ -424,7 +424,7 @@ fn answer(slice: usize) -> Step {
 async fn lines_become_episodes_which_recall_finds_and_read_episode_opens() {
     let db = db!();
     let clock = ManualClock::new(T0);
-    let archive = PgArchive::new(db.pool().clone(), clock.clone());
+    let archive = PgArchive::new(db.pool().clone());
     let g = group(1);
     for n in 1..=100u64 {
         archive
@@ -636,5 +636,152 @@ async fn the_postgres_note_store_satisfies_the_note_contract() {
     }
     qbot_memory::notes_conformance::run(&qbot_store::PgNoteStore::new(db.pool().clone()), accounts)
         .await;
+    db.drop_db().await;
+}
+
+// ----- member numbers and the people of a group -----
+
+/// Each account's number in `g`, read straight from the table.
+async fn numbers(db: &TestDb, g: GroupId) -> Vec<(i64, i32)> {
+    sqlx::query(
+        "SELECT account_id, number FROM member_number WHERE group_id = $1 ORDER BY account_id",
+    )
+    .bind(g.get())
+    .fetch_all(db.pool())
+    .await
+    .unwrap()
+    .iter()
+    .map(|r| (r.get("account_id"), r.get("number")))
+    .collect()
+}
+
+#[tokio::test]
+async fn a_member_number_survives_everything_that_happens_to_its_account() {
+    use qbot_memory::{AliasTarget, IdentityStore};
+    let db = db!();
+    let clock = ManualClock::new(T0);
+    let archive = PgArchive::new(db.pool().clone());
+    let identity = PgIdentityStore::new(db.pool().clone(), IdentityPolicy::default());
+    let policy = qbot_store::PgGroupPolicy::new(db.pool().clone(), clock.clone());
+    let (g, other) = (group(50), group(51));
+    let account = |n: i64| AccountId::new(n).unwrap();
+
+    // 601 speaks first, 603 is mentioned before it ever speaks, 602 speaks after that.
+    archive.append(member(g, 1, 601, "hi")).await.unwrap();
+    archive
+        .append_with_mentions(member(g, 2, 601, "hey [at:603]"), &[account(603)])
+        .await
+        .unwrap();
+    archive.append(member(g, 3, 602, "hello")).await.unwrap();
+    let assigned = numbers(&db, g).await;
+    assert_eq!(assigned, [(601, 1), (602, 3), (603, 2)]);
+
+    // None of these may move a number.
+    archive
+        .append(member(g, 3, 604, "replayed id"))
+        .await
+        .unwrap();
+    archive
+        .append(member(other, 1, 603, "elsewhere"))
+        .await
+        .unwrap();
+    identity.merge(account(601), account(602)).await.unwrap();
+    identity
+        .split(account(602), UnixMillis::new(T0))
+        .await
+        .unwrap();
+    identity.merge(account(601), account(603)).await.unwrap();
+    policy.block(g, account(602), None).await.unwrap();
+    policy.unblock(g, account(602)).await.unwrap();
+    identity
+        .set_name(
+            g,
+            "Tester",
+            AliasTarget::Account(account(601)),
+            UnixMillis::new(T0),
+        )
+        .await
+        .unwrap();
+    for i in 0..5 {
+        archive
+            .append(member(g, 10 + i, 601, "more"))
+            .await
+            .unwrap();
+    }
+    assert_eq!(numbers(&db, g).await, assigned);
+    assert_eq!(
+        numbers(&db, other).await,
+        [(603, 1)],
+        "numbers are per group"
+    );
+
+    // A fresh archive (as after a restart) reads the same numbers.
+    let restarted = PgArchive::new(db.pool().clone());
+    let (lines, _) = restarted.recent(g, 50).await.unwrap();
+    assert!(lines.iter().all(|l| match l.speaker {
+        qbot_context::Speaker::Member { account, number } =>
+            assigned.contains(&(account.get(), number.get() as i32)),
+        qbot_context::Speaker::Bot => true,
+    }));
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn people_shows_current_blocks_and_linked_accounts_by_member_number() {
+    use qbot_core::MemberNo;
+    use qbot_memory::IdentityStore;
+    let db = db!();
+    let clock = ManualClock::new(T0);
+    let archive = PgArchive::new(db.pool().clone());
+    let identity = PgIdentityStore::new(db.pool().clone(), IdentityPolicy::default());
+    let policy = qbot_store::PgGroupPolicy::new(db.pool().clone(), clock.clone());
+    let g = group(60);
+    let account = |n: i64| AccountId::new(n).unwrap();
+    let no = |n: u32| MemberNo::new(n);
+    for (i, a) in [701, 702, 703, 704, 705].into_iter().enumerate() {
+        archive
+            .append(member(g, i as i64 + 1, a, "hi"))
+            .await
+            .unwrap();
+    }
+    // 706 speaks only in another group: no number here.
+    archive
+        .append(member(group(61), 1, 706, "hi"))
+        .await
+        .unwrap();
+
+    let now = UnixMillis::new(T0);
+    assert_eq!(archive.people(g, now).await.unwrap(), Default::default());
+
+    policy.block(g, account(704), None).await.unwrap();
+    policy
+        .block(g, account(702), Some(UnixMillis::new(T0 + 60_000)))
+        .await
+        .unwrap();
+    policy.block(g, account(706), None).await.unwrap();
+    policy.block(group(61), account(701), None).await.unwrap();
+    identity.merge(account(705), account(703)).await.unwrap();
+    identity.merge(account(701), account(706)).await.unwrap();
+
+    let people = archive.people(g, now).await.unwrap();
+    assert_eq!(people.blocked, [no(2), no(4)], "ascending, this group only");
+    assert_eq!(
+        people.same_person,
+        [vec![no(3), no(5)]],
+        "a linked account without a number here is not shown"
+    );
+
+    let later = UnixMillis::new(T0 + 60_001);
+    identity.merge(account(701), account(702)).await.unwrap();
+    let people = archive.people(g, later).await.unwrap();
+    assert_eq!(people.blocked, [no(4)], "an expired block is gone");
+    assert_eq!(people.same_person, [vec![no(1), no(2)], vec![no(3), no(5)]]);
+
+    identity.split(account(703), later).await.unwrap();
+    assert_eq!(
+        archive.people(g, later).await.unwrap().same_person,
+        [vec![no(1), no(2)]],
+        "unlinking ends the set"
+    );
     db.drop_db().await;
 }

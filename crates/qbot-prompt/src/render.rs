@@ -1,8 +1,6 @@
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
-use qbot_context::{
-    ChatBatch, ChatLine, ErrorKind, MemberStanding, Outcome, RefusalReason, Speaker,
-};
+use qbot_context::{ChatBatch, ChatLine, ErrorKind, Outcome, RefusalReason, Speaker};
 use qbot_core::UnixMillis;
 use qbot_llm::Renderer;
 use qbot_wording::{Text, say};
@@ -28,12 +26,7 @@ impl PromptRenderer {
     pub fn line(&self, line: &ChatLine) -> String {
         let who = match line.speaker {
             Speaker::Bot => "you".to_owned(),
-            Speaker::Member {
-                number, standing, ..
-            } => match standing {
-                MemberStanding::Normal => format!("member:{}", number.get()),
-                MemberStanding::Blocked => format!("member:{} (blocked)", number.get()),
-            },
+            Speaker::Member { number, .. } => format!("member:{}", number.get()),
         };
         format!(
             "[msg:{}] {} {}: {}",

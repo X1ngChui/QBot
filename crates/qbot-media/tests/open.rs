@@ -6,11 +6,12 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use qbot_agent::{ChatView, RunState, Tool, ToolCx, ToolError, Trigger};
-use qbot_context::{ChatLine, MemberStanding, Part, Speaker};
+use qbot_context::{ChatLine, Part, Speaker};
+use qbot_core::MediaKind;
 use qbot_core::{AccountId, GroupId, MemberNo, MessageId, RunId, SystemClock, UnixMillis};
 use qbot_llm::MediaStore;
 use qbot_media::{
-    ArchivedMedia, FetchError, Fetcher, Kind, MediaRef, MediaRefs, OpenImages, OpenImagesArgs,
+    ArchivedMedia, FetchError, Fetcher, MediaRef, MediaRefs, OpenImages, OpenImagesArgs,
     PictureArg, RefsError,
 };
 
@@ -26,7 +27,7 @@ impl MediaRefs for Refs {
         &self,
         _: GroupId,
         message: MessageId,
-        kind: Kind,
+        kind: MediaKind,
         index: u32,
     ) -> Result<Option<MediaRef>, RefsError> {
         Ok(self.0.get(&(message.get(), kind.marker(), index)).cloned())
@@ -69,7 +70,6 @@ fn line(id: i64) -> ChatLine {
         speaker: Speaker::Member {
             account: AccountId::new(5).unwrap(),
             number: MemberNo::new(1),
-            standing: MemberStanding::Normal,
         },
         at: UnixMillis::new(0),
         text: "[image] [image] [sticker]".into(),

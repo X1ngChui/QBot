@@ -46,18 +46,9 @@ pub fn evidence(scenario: &Scenario, run: &RunResult, lines: &[ChatLine]) -> Str
     let mut out = format!("Situation: {}\n\nGroup chat:\n", scenario.description);
     for (i, line) in lines.iter().enumerate().take(before) {
         let who = match line.speaker {
-            Speaker::Member {
-                number, standing, ..
-            } => format!(
-                "member:{}{}{}",
-                number.get(),
-                name(number.get()),
-                if standing == qbot_context::MemberStanding::Blocked {
-                    " [blocked]"
-                } else {
-                    ""
-                }
-            ),
+            Speaker::Member { number, .. } => {
+                format!("member:{}{}", number.get(), name(number.get()))
+            }
             Speaker::Bot => "the bot".to_owned(),
         };
         out.push_str(&format!(
@@ -65,6 +56,25 @@ pub fn evidence(scenario: &Scenario, run: &RunResult, lines: &[ChatLine]) -> Str
             i + 1,
             time(line.at),
             line.text
+        ));
+    }
+    let blocked: Vec<String> = scenario
+        .members
+        .iter()
+        .filter(|m| m.blocked)
+        .map(|m| format!("member:{}", m.number))
+        .collect();
+    if !blocked.is_empty() {
+        out.push_str(&format!(
+            "\nBlocked (cannot start a conversation with the bot): {}\n",
+            blocked.join(", ")
+        ));
+    }
+    for set in &scenario.same_person {
+        let set: Vec<String> = set.iter().map(|n| format!("member:{n}")).collect();
+        out.push_str(&format!(
+            "Linked accounts of one person: {}\n",
+            set.join(", ")
         ));
     }
     out.push_str("\nWhat started the run: ");

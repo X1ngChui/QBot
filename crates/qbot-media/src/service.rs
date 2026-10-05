@@ -12,10 +12,11 @@ use tokio_util::task::TaskTracker;
 
 use crate::clean::{clean_description, sniff_mime};
 use crate::flight::Flights;
-use crate::item::{Kind, MediaItem, MediaJob, MediaRef};
+use crate::item::{MediaItem, MediaJob, MediaRef};
 use crate::ports::{
     DescribeError, Describer, DescriptionCache, FetchError, Fetcher, LineEditor, Transcriber,
 };
+use qbot_core::MediaKind;
 
 /// Bytes per second of 16 kHz 16-bit mono WAV, the only audio the service handles. The clip
 /// length limit is stated in seconds and enforced as a byte cap through this.
@@ -116,9 +117,9 @@ impl std::fmt::Debug for MediaService {
 }
 
 /// The cache key of a platform id. Sticker ids and picture file ids are different namespaces.
-fn platform_key(kind: Kind, key: &str) -> String {
+fn platform_key(kind: MediaKind, key: &str) -> String {
     match kind {
-        Kind::Sticker => format!("p:sticker:{key}"),
+        MediaKind::Sticker => format!("p:sticker:{key}"),
         _ => format!("p:{key}"),
     }
 }
@@ -148,7 +149,7 @@ fn take(rate: &GroupRate, group: GroupId) -> bool {
 }
 
 impl Inner {
-    fn flight_key(kind: Kind, reference: &MediaRef) -> Option<String> {
+    fn flight_key(kind: MediaKind, reference: &MediaRef) -> Option<String> {
         let source = reference
             .key
             .as_deref()
@@ -185,7 +186,7 @@ impl Inner {
     async fn describe(
         self: &Arc<Self>,
         group: GroupId,
-        kind: Kind,
+        kind: MediaKind,
         reference: &MediaRef,
     ) -> Option<String> {
         let describer = self.deps.describer.clone()?;
@@ -284,7 +285,7 @@ impl Inner {
             // refused before fetching; the exact cap is enforced on the converted audio.
             return None;
         }
-        let flight_key = Self::flight_key(Kind::Voice, reference)?;
+        let flight_key = Self::flight_key(MediaKind::Voice, reference)?;
         if self.held(&flight_key) {
             return None;
         }
@@ -331,7 +332,7 @@ impl Inner {
     }
 
     /// A description already paid for, by platform id. Costs nothing.
-    async fn cached_description(&self, kind: Kind, reference: &MediaRef) -> Option<String> {
+    async fn cached_description(&self, kind: MediaKind, reference: &MediaRef) -> Option<String> {
         let key = reference.key.as_ref()?;
         self.cached(&platform_key(kind, key)).await
     }
@@ -339,15 +340,15 @@ impl Inner {
     async fn process(self: &Arc<Self>, job: &MediaJob, item: &MediaItem) {
         let marker = item.kind.marker();
         let replacement = match item.kind {
-            Kind::Image | Kind::Sticker if item.nested => self
+            MediaKind::Image | MediaKind::Sticker if item.nested => self
                 .cached_description(item.kind, &item.reference)
                 .await
                 .map(|text| format!("[{marker}:{text}]")),
-            Kind::Image | Kind::Sticker => self
+            MediaKind::Image | MediaKind::Sticker => self
                 .describe(job.group, item.kind, &item.reference)
                 .await
                 .map(|text| format!("[{marker}:{text}]")),
-            Kind::Voice => self
+            MediaKind::Voice => self
                 .transcribe(job.group, &item.reference)
                 .await
                 .map(|text| format!("[{marker}:{text}]")),
@@ -403,8 +404,10 @@ impl MediaService {
             .iter()
             .filter(|item| match item.kind {
                 // A nested picture only reads the cache, which needs no describer.
-                Kind::Image | Kind::Sticker => item.nested || inner.deps.describer.is_some(),
-                Kind::Voice => inner.deps.transcriber.is_some(),
+                MediaKind::Image | MediaKind::Sticker => {
+                    item.nested || inner.deps.describer.is_some()
+                }
+                MediaKind::Voice => inner.deps.transcriber.is_some(),
             })
             .cloned()
             .collect();

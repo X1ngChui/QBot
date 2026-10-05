@@ -11,7 +11,9 @@ use crate::report_sink::OneBotReportSink;
 use qbot_agent::{Archive, ContextSource, GroupPolicy, RunDeps, RunLog, Supervisor};
 use qbot_asr::{AsrConfig, AsrError, SherpaTranscriber};
 use qbot_commands::{CommandRouter, CommandSettings, Deps, PgGroupAdmin};
-use qbot_config::{ConfigErrors, Env, Loaded, SecretKey, SecretResolver, prepare_directories};
+use qbot_config::{
+    ConfigErrors, Env, Loaded, SecretKey, SecretResolver, Service, prepare_directories,
+};
 use qbot_core::{Clock, GroupId, SystemClock};
 use qbot_gateway::bridge::Bridge;
 use qbot_gateway::delivery::{DeliveryTimeouts, OneBotDelivery};
@@ -23,7 +25,7 @@ use qbot_gateway::server::{GatewayServer, serve};
 use qbot_gateway::trigger::Nicknames;
 use qbot_i18n::{LocaleErrors, Locales, Msg};
 use qbot_llm::embedding::HttpEmbedder;
-use qbot_llm::responses::{CONNECT_TIMEOUT, KeySource, ReqwestTransport, ResponsesProvider};
+use qbot_llm::responses::{KeySource, ReqwestTransport, ResponsesProvider};
 use qbot_llm::search::TavilySearch;
 use qbot_llm::{Embedder, LlmError, Provider};
 use qbot_media::{
@@ -192,7 +194,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
 
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let pool = store.pool().clone();
-    let archive = PgArchive::new(pool.clone(), clock.clone());
+    let archive = PgArchive::new(pool.clone());
     let policy = PgGroupPolicy::new(pool.clone(), clock.clone());
     let admin = PgAdmin::new(pool.clone(), clock.clone());
     let run_log = PgRunLog::new(pool.clone(), clock.clone());
@@ -220,7 +222,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     let text_transport = ReqwestTransport::new(
         config.providers.text.endpoint.clone(),
         http_key(&config.providers.text.api_key_secret, &resolver),
-        CONNECT_TIMEOUT,
+        &config.route(Service::Text),
     )?;
     let provider: Arc<dyn Provider> = Arc::new(ResponsesProvider::new(
         config.text_provider(),
@@ -229,7 +231,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     let embed_transport = ReqwestTransport::new(
         config.providers.embedding.endpoint.clone(),
         http_key(&config.providers.embedding.api_key_secret, &resolver),
-        CONNECT_TIMEOUT,
+        &config.route(Service::Embedding),
     )?;
     let embedder: Arc<dyn Embedder> = Arc::new(HttpEmbedder::new(
         config.embedding_provider(),
@@ -257,8 +259,12 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     );
     // Pictures and clips are fetched through the platform connection.
     let fetcher: Arc<OneBotFetcher> = Arc::new(
-        OneBotFetcher::new(bridge.clone(), FetchSettings::default())
-            .map_err(|e| RunError::Media(e.to_string()))?,
+        OneBotFetcher::new(
+            bridge.clone(),
+            FetchSettings::default(),
+            &config.route(Service::Media),
+        )
+        .map_err(|e| RunError::Media(e.to_string()))?,
     );
     let archive_port: Arc<dyn Archive> = Arc::new(archive.clone());
     let tools = qbot_tools::standard_tools(
@@ -304,11 +310,10 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
 
     // Web search and page reading are offered only when a search provider is configured.
     let tools = if config.providers.search.enabled {
-        let transport = ReqwestTransport::with_proxy(
+        let transport = ReqwestTransport::new(
             qbot_llm::search::ENDPOINT,
             http_key(&config.providers.search.api_key_secret, &resolver),
-            CONNECT_TIMEOUT,
-            config.search_proxy(),
+            &config.route(Service::Search),
         )
         .map_err(|e| RunError::Tools(e.to_string()))?;
         let search = Arc::new(TavilySearch::new(
@@ -342,6 +347,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         facts.clone(),
         qbot_prompt::FactKnowledge::MAX_TERMS,
     )))
+    .with_people(Arc::new(archive.clone()))
     .with_episodes(episodes.clone());
     let renderer = Arc::new(PromptRenderer::new(prompt.zone().clone()));
     let deps = Arc::new(RunDeps {
@@ -435,7 +441,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         let transport = ReqwestTransport::new(
             config.providers.vision.endpoint.clone(),
             http_key(&config.providers.vision.api_key_secret, &resolver),
-            CONNECT_TIMEOUT,
+            &config.route(Service::Vision),
         )?;
         let vision = Arc::new(ResponsesProvider::new(
             config.vision_provider(),

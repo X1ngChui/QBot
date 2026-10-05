@@ -44,7 +44,7 @@ async fn a_real_model_writes_a_valid_episode_with_findings() {
     let transport = ReqwestTransport::new(
         endpoint,
         KeySource::Static(secret("text_api_key")),
-        Duration::from_secs(10),
+        &qbot_llm::net::Route::Direct,
     )
     .unwrap();
     let mut cfg = ResponsesConfig::deepseek(model);

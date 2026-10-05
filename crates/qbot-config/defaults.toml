@@ -38,6 +38,14 @@ user = "qbot"
 ssl_mode = "prefer"
 password_secret = "DATABASE_PASSWORD"
 
+[network]
+# An HTTP(S) proxy for outbound traffic, for hosts that cannot reach a provider directly; empty
+# connects directly. Proxy variables in the environment are not used.
+proxy = ""
+# Which outbound services go through the proxy: text, vision, embedding, search, media (picture
+# downloads). The others connect directly.
+proxy_for = ["text", "vision", "embedding", "search", "media"]
+
 [replies]
 # Replies calling the model at once. More waiting replies are queued; a queue ten times this
 # size is full, and further triggers are dropped silently.
@@ -120,9 +128,6 @@ api_key_secret = "SEARCH_API_KEY"
 depth = "basic"
 # How pages are read: basic | advanced (advanced handles harder pages, two credits)
 extract_depth = "basic"
-# HTTP(S) proxy for the search client only, where Tavily is not reachable directly; empty
-# connects directly. Model traffic never uses it.
-proxy = ""
 
 [maintenance]
 # Five-field cron expressions in bot.timezone: the nightly run (memory extraction, embedding,

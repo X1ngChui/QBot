@@ -5,6 +5,37 @@
 //! archive as ASCII brackets ([`neutralize`]), so every ASCII bracket in archived text is a real
 //! marker.
 
+/// The kinds of media a line can carry that the system fetches and fills in later. Each is a
+/// marker name in archived text (`[image]`, `[sticker]`, `[voice]`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MediaKind {
+    Image,
+    /// A marketplace sticker: described like a picture, cached by its sticker id.
+    Sticker,
+    Voice,
+}
+
+impl MediaKind {
+    /// The marker name, also the stored form.
+    pub fn marker(self) -> &'static str {
+        match self {
+            MediaKind::Image => "image",
+            MediaKind::Sticker => "sticker",
+            MediaKind::Voice => "voice",
+        }
+    }
+
+    /// The kind a marker name stands for.
+    pub fn from_marker(name: &str) -> Option<Self> {
+        match name {
+            "image" => Some(MediaKind::Image),
+            "sticker" => Some(MediaKind::Sticker),
+            "voice" => Some(MediaKind::Voice),
+            _ => None,
+        }
+    }
+}
+
 const FULLWIDTH_OPEN: char = '\u{FF3B}';
 const FULLWIDTH_CLOSE: char = '\u{FF3D}';
 

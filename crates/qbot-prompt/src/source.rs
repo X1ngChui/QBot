@@ -7,10 +7,10 @@ use qbot_agent::{
     ArchiveCursor, ContextSource, EnvError, OpenedContext, Recap, RecapWhen, Trigger,
 };
 use qbot_context::{ChatLine, Instruction, InstructionRole, Speaker};
-use qbot_core::{Clock, GroupId, HistoryWindow};
+use qbot_core::{Clock, GroupId, HistoryWindow, MemberNo, UnixMillis};
 use qbot_memory::facts::{FactStore, GROUP_TERM, GROUP_TOPIC};
 use qbot_memory::{EpisodeStore, HistoryPart, compose};
-use qbot_store::PgArchive;
+use qbot_store::{GroupPeople, PgArchive};
 use qbot_wording::{Text, say};
 
 use crate::persona::Personas;
@@ -128,6 +128,21 @@ impl HistorySource for PgArchive {
     }
 }
 
+/// Who in a group is blocked and which members are one person, from the store of record.
+#[async_trait]
+pub trait PeopleSource: Send + Sync {
+    async fn people(&self, group: GroupId, now: UnixMillis) -> Result<GroupPeople, EnvError>;
+}
+
+#[async_trait]
+impl PeopleSource for PgArchive {
+    async fn people(&self, group: GroupId, now: UnixMillis) -> Result<GroupPeople, EnvError> {
+        PgArchive::people(self, group, now)
+            .await
+            .map_err(|e| EnvError(e.to_string()))
+    }
+}
+
 /// A run's chat: every line it loads, and the episode recaps over some of them.
 struct History {
     lines: Vec<(u64, ChatLine)>,
@@ -144,6 +159,7 @@ pub struct PromptSettings {
 
 pub struct PromptContext {
     knowledge: Option<Arc<dyn KnowledgeSource>>,
+    people: Option<Arc<dyn PeopleSource>>,
     episodes: Option<Arc<dyn EpisodeStore>>,
     history: Arc<dyn HistorySource>,
     personas: Personas,
@@ -176,6 +192,7 @@ impl PromptContext {
             .map_err(|_| UnknownZone(settings.timezone.clone()))?;
         Ok(Self {
             knowledge: None,
+            people: None,
             episodes: None,
             history,
             personas,
@@ -189,6 +206,12 @@ impl PromptContext {
     /// Add what the group has taught the bot to every run's instructions.
     pub fn with_knowledge(mut self, source: Arc<dyn KnowledgeSource>) -> Self {
         self.knowledge = Some(source);
+        self
+    }
+
+    /// Tell every run who in the group is blocked and which members are one person.
+    pub fn with_people(mut self, source: Arc<dyn PeopleSource>) -> Self {
+        self.people = Some(source);
         self
     }
 
@@ -290,6 +313,42 @@ impl PromptContext {
             cursor,
             recaps,
         })
+    }
+
+    /// The people instruction, if anyone in the group is blocked or has several accounts.
+    async fn people_instruction(&self, group: GroupId) -> Result<Option<Instruction>, EnvError> {
+        let Some(source) = &self.people else {
+            return Ok(None);
+        };
+        let people = source.people(group, self.clock.now()).await?;
+        let members = |numbers: &[MemberNo]| {
+            numbers
+                .iter()
+                .map(|n| format!("member:{}", n.get()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let mut entries = Vec::new();
+        if !people.blocked.is_empty() {
+            entries.push(say(Text::PromptBlocked {
+                members: members(&people.blocked),
+            }));
+        }
+        entries.extend(people.same_person.iter().map(|set| {
+            say(Text::PromptSamePerson {
+                members: members(set),
+            })
+        }));
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        let text = render_template(Template::PeopleBlock, &[("entries", &entries.join("\n"))])
+            .map_err(|e| EnvError(e.to_string()))?;
+        Ok(Some(Instruction {
+            role: InstructionRole::System,
+            text,
+            template_hash: Template::PeopleBlock.hash(),
+        }))
     }
 
     /// The learned-knowledge instruction, if the group has any knowledge.
@@ -448,7 +507,11 @@ impl ContextSource for PromptContext {
         } = self.history(group, trigger).await?;
         let window: Vec<ChatLine> = lines.into_iter().map(|(_, line)| line).collect();
         let env = |e: PromptError| EnvError(e.to_string());
+        // Most stable first, so runs share the longest prefix the provider can cache: the
+        // persona's fixed instructions, then who is blocked or linked (changes when a member
+        // command does), then learned knowledge (changes nightly).
         let mut instructions = self.instructions(group).map_err(env)?;
+        instructions.extend(self.people_instruction(group).await?);
         instructions.extend(self.knowledge_instruction(group).await?);
         let undelivered_note = Instruction {
             role: InstructionRole::Developer,

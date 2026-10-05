@@ -79,7 +79,7 @@ fn provider(model: &str) -> Result<Arc<ResponsesProvider>, String> {
     let transport = ReqwestTransport::new(
         env_or("QBOT_EVAL_ENDPOINT", "https://api.deepseek.com"),
         KeySource::Static(key),
-        Duration::from_secs(10),
+        &qbot_llm::net::Route::Direct,
     )
     .map_err(|e| e.to_string())?;
     let mut cfg = ResponsesConfig::deepseek(model);

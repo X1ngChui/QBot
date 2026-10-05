@@ -1,23 +1,4 @@
-use qbot_core::{GroupId, MessageId};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Kind {
-    Image,
-    /// A marketplace sticker: described like a picture, cached by its sticker id.
-    Sticker,
-    Voice,
-}
-
-impl Kind {
-    /// The marker name in archived text: `[image]`, `[voice]`.
-    pub fn marker(self) -> &'static str {
-        match self {
-            Kind::Image => "image",
-            Kind::Sticker => "sticker",
-            Kind::Voice => "voice",
-        }
-    }
-}
+use qbot_core::{GroupId, MediaKind, MessageId};
 
 /// How to get at one picture or clip. Any of the three may be missing; the fetcher tries what
 /// it has.
@@ -35,7 +16,7 @@ pub struct MediaRef {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaItem {
-    pub kind: Kind,
+    pub kind: MediaKind,
     /// Which marker of its kind in the message this is (0 for the first `[image]`).
     pub index: usize,
     pub reference: MediaRef,

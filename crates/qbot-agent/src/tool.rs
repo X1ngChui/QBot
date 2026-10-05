@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
-use qbot_context::{ChatLine, MemberStanding, Part, RefusalReason, Speaker};
+use qbot_context::{ChatLine, Part, RefusalReason, Speaker};
 use qbot_core::{AccountId, Clock, GroupId, MemberNo, MessageId, RunId};
 use qbot_llm::ToolSpec;
 use schemars::JsonSchema;
@@ -71,17 +71,11 @@ impl ToolOutput {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Participant {
-    pub account: AccountId,
-    pub standing: MemberStanding,
-}
-
 /// What a run has seen of the chat: who the member numbers are and which messages exist.
 /// Tools validate model-supplied references against it.
 #[derive(Debug, Clone, Default)]
 pub struct ChatView {
-    roster: BTreeMap<MemberNo, Participant>,
+    roster: BTreeMap<MemberNo, AccountId>,
     messages: HashMap<MessageId, Speaker>,
 }
 
@@ -89,19 +83,14 @@ impl ChatView {
     pub fn absorb(&mut self, lines: &[ChatLine]) {
         for line in lines {
             self.messages.insert(line.message, line.speaker);
-            if let Speaker::Member {
-                account,
-                number,
-                standing,
-            } = line.speaker
-            {
-                self.roster
-                    .insert(number, Participant { account, standing });
+            if let Speaker::Member { account, number } = line.speaker {
+                self.roster.insert(number, account);
             }
         }
     }
 
-    pub fn participant(&self, number: MemberNo) -> Option<Participant> {
+    /// The account behind a member number seen in this run.
+    pub fn account_of(&self, number: MemberNo) -> Option<AccountId> {
         self.roster.get(&number).copied()
     }
 

@@ -82,7 +82,8 @@ paid API. Build the image with `docker build -f deploy/Dockerfile .`; deployment
   operators need it, and the conversion in `qbot-config`; credentials are never configuration.
 - **Every local limit needs a concrete reason** and must not duplicate a provider-side or
   already-implied bound; `docs/architecture.md` section 14 lists them.
-- **Schema:** `crates/qbot-store/migrations/` (one file today). The in-memory store implementations
+- **Schema:** `crates/qbot-store/migrations/`, forward-only: production runs it, so a change is a
+  new numbered file, never an edit to an applied one. The in-memory store implementations
   define the semantics, and shared conformance suites run against both.
 - **New command:** catalog in `qbot-commands/src/catalog.rs`, handler, `Msg` texts in both catalogs,
   a test in `crates/qbot-commands/tests/commands.rs`, and the table in `docs/architecture.md`.

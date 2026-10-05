@@ -85,9 +85,12 @@ an incomplete catalog is refused at startup, listing what is missing.
   default: pictures stay bare `[image]` markers.
 - **Web search and page reading** (the `web_search` and `read_url` tools, through Tavily) are
   offered when `providers.search.enabled = true`; they need `secrets/search_api_key` and a
-  matching entry under `secrets:` in the compose file. `providers.search.proxy` routes only the
-  search client through an HTTP proxy, for hosts that cannot reach the provider directly. Off by
-  default: the tools are then not offered. A used-up plan allowance is reported to the model as
+  matching entry under `secrets:` in the compose file. Off by default: the tools are then not
+  offered.
+- **Outbound proxy.** `network.proxy` sends outbound traffic through one HTTP(S) proxy, for hosts
+  that cannot reach a provider directly; `network.proxy_for` lists which services use it (text,
+  vision, embedding, search, media), and the rest connect directly. Proxy variables in the
+  environment are ignored, so the configuration alone decides the route. A used-up plan allowance is reported to the model as
   unavailable search; no local quota is kept on top of the provider's.
 - A message's media is worked on when it arrives. A reply triggered by such a message waits up to
   25 seconds for the result, then goes ahead with whatever is ready. Descriptions are cached by

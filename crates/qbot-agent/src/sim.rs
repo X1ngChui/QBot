@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use qbot_context::{ChatLine, Instruction, InstructionRole, Item, MemberStanding, Speaker};
+use qbot_context::{ChatLine, Instruction, InstructionRole, Item, Speaker};
 use qbot_core::{AccountId, GroupId, ItemSeq, MemberNo, MessageId, RunId, UnixMillis};
 use qbot_llm::Renderer;
 
@@ -95,21 +95,15 @@ impl SimWorld {
         line
     }
 
-    /// A member says something. Their standing is whatever the block list says right now.
+    /// A member says something.
     pub fn say(&self, account: i64, number: u32, text: &str) -> ChatLine {
         let account = AccountId::new(account).unwrap_or_else(|_| unreachable!("positive account"));
         let mut world = self.lock();
-        let standing = if world.blocked.contains(&account) {
-            MemberStanding::Blocked
-        } else {
-            MemberStanding::Normal
-        };
         Self::push(
             &mut world,
             Speaker::Member {
                 account,
                 number: MemberNo::new(number),
-                standing,
             },
             text.to_owned(),
         )
@@ -326,20 +320,7 @@ impl Delivery for SimWorld {
         let text = render_segments(&mut world, &segments);
         let echo = Self::push(&mut world, Speaker::Bot, text);
         for (account, number, text) in std::mem::take(&mut world.pending_chatter) {
-            let standing = if world.blocked.contains(&account) {
-                MemberStanding::Blocked
-            } else {
-                MemberStanding::Normal
-            };
-            Self::push(
-                &mut world,
-                Speaker::Member {
-                    account,
-                    number,
-                    standing,
-                },
-                text,
-            );
+            Self::push(&mut world, Speaker::Member { account, number }, text);
         }
         Ok(Delivered { echo })
     }

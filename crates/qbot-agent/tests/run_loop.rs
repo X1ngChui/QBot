@@ -284,7 +284,7 @@ async fn dice_results_are_observed_through_the_echo() {
 }
 
 #[tokio::test]
-async fn a_blocked_member_stays_visible_as_marked_context() {
+async fn a_blocked_members_lines_stay_in_the_chat() {
     let h = harness(vec![reply_ok(say("hi"))]);
     h.world.block(9);
     h.world.say(9, 9, "spam from blocked");
@@ -299,10 +299,7 @@ async fn a_blocked_member_stays_visible_as_marked_context() {
         _ => None,
     });
     let chat = chat.unwrap();
-    assert!(
-        chat.contains("member:9 (blocked: do not reply): spam from blocked"),
-        "{chat}"
-    );
+    assert!(chat.contains("member:9: spam from blocked"), "{chat}");
 }
 
 #[tokio::test(start_paused = true)]

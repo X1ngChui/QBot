@@ -64,6 +64,23 @@ async fn constraints_reject_invalid_rows() {
         .await
         .unwrap();
     assert!(rejected(&db, "INSERT INTO member_number VALUES (1, 11, 1)").await);
+    // ... and, once assigned, never changed or removed.
+    assert!(
+        rejected(
+            &db,
+            "UPDATE member_number SET number = 2 WHERE account_id = 10"
+        )
+        .await
+    );
+    assert!(
+        rejected(
+            &db,
+            "UPDATE member_number SET account_id = 11 WHERE number = 1"
+        )
+        .await
+    );
+    assert!(rejected(&db, "DELETE FROM member_number WHERE account_id = 10").await);
+    assert!(rejected(&db, "TRUNCATE member_number").await);
 
     // run: ended_ms and end_reason are set together; items need a run.
     assert!(rejected(&db, "INSERT INTO run (group_id, trigger_kind, trigger, started_ms, ended_ms) VALUES (1, 'addressed', '{}', 0, 5)").await);

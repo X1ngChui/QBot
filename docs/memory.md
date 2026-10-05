@@ -79,8 +79,15 @@ Terms. A member's *group nickname* is the name they set for one group (OneBot `c
 name (OneBot `nickname`). Their *group display name* is what the group shows: the group nickname,
 else the account nickname. These docs say "group nickname" and "group display name" only.
 
-- *Account* (a platform login) belongs to a *holder* (a person). New accounts get their own
-  holder in the same transaction as their first line.
+- *Account* (a platform login, the QQ number) belongs to a *holder* (a person). New accounts get
+  their own holder in the same transaction as their first line.
+- *Member number*: an account's number in one group (`member:N` to the model), assigned densely
+  the first time the account appears there (speaks or is mentioned) and never changed, reused or
+  removed: a trigger on `member_number` rejects every update, delete and truncate. Linking,
+  splitting, blocks, names and other groups do not touch it. Account ids are global and never
+  reach the model; member numbers are group-local, and two accounts of one person keep two
+  numbers. The model learns which numbers are one person, and who is blocked, from the "People in
+  this group" instruction, read from the block list and the holders on every run.
 - *Linking* merges holders (older wins, then lower id; accounts re-point; the loser keeps a
   `merged_into` pointer). *Splitting* moves one account to a fresh holder. Every change bumps the
   holders' revisions; holder-scoped records stay with the original holder after a split and follow

@@ -117,8 +117,8 @@ async fn a_run_round_trips_exactly_and_ids_survive_across_runs() {
     let record = log.record(run).await.unwrap().unwrap();
     assert_eq!(record.group, group());
     assert_eq!(
-        (record.trigger_kind.as_str(), record.end),
-        ("addressed", Some(RunEnd::Delivered))
+        (record.trigger_kind, record.end),
+        (qbot_store::TriggerKind::Addressed, Some(RunEnd::Delivered))
     );
     assert_eq!(record.ended.unwrap().get() - record.started.get(), 3000);
     assert_eq!(

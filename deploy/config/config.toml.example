@@ -29,11 +29,15 @@ locale = "en"
 # enabled = true
 
 # Web search and page reading through Tavily. Needs secrets/search_api_key and a
-# `search_api_key` entry under `secrets:` in the compose file. Set a proxy only where Tavily is
-# not reachable directly.
+# `search_api_key` entry under `secrets:` in the compose file.
 # [providers.search]
 # enabled = true
+
+# An outbound proxy, for providers this host cannot reach directly; list the services that need
+# it (text, vision, embedding, search, media). The others connect directly.
+# [network]
 # proxy = "http://172.17.0.1:7890"
+# proxy_for = ["search"]
 
 # Voice clips are transcribed in the process: run deploy/fetch_asr_model.sh once, or switch it
 # off to leave clips as bare markers.

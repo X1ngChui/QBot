@@ -118,7 +118,6 @@ done = "done"
 cancelled = "cancelled"
 interrupted = "interrupted"
 run_at_format = "run_at must be an RFC 3339 timestamp with an offset, got {text}"
-run_at_range = "run_at is out of range"
 both_times = "give run_at or delay_seconds, not both"
 no_time = "give run_at or delay_seconds"
 empty_intent = "the intent must not be empty"
@@ -187,6 +186,8 @@ unknown_tool = "there is no tool named {name}"
 [prompt]
 group_term = "- \"{term}\" means: {text}"
 group_topic = "- The group is about: {text}"
+blocked = "- Blocked: {members}. They cannot start a conversation with you; do not reply to them or mention them with [at:N]."
+same_person = "- One person with several accounts: {members}. Their numbers differ, but it is the same person."
 recap = "{start} - {end}: {title}\n{summary}"
 
 # Memory extraction (the instructions are prompts/extract.md).

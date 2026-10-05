@@ -1,6 +1,7 @@
 //! HTTP boundary. Adapters talk to a [`Transport`]; production uses [`ReqwestTransport`] and
 //! tests use a simulator, so the adapter's wire handling runs without a network.
 
+use crate::net::{Route, client_builder};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,10 +27,6 @@ impl std::fmt::Debug for HttpBody {
         }
     }
 }
-
-/// How long establishing a connection to a provider may take: an endpoint that does not answer
-/// within this is down, and the caller's retry policy or deadline takes over.
-pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug)]
 pub struct HttpResponse {
@@ -111,32 +108,14 @@ impl std::fmt::Debug for ReqwestTransport {
 }
 
 impl ReqwestTransport {
-    /// `connect_timeout` bounds only establishing the connection; the caller's deadline bounds
-    /// the rest.
+    /// A transport to `base_url` on `route` (see [`crate::net`]). Only establishing the
+    /// connection is bounded here; the caller's deadline bounds the rest.
     pub fn new(
         base_url: impl Into<String>,
         key: KeySource,
-        connect_timeout: Duration,
+        route: &Route,
     ) -> Result<Self, LlmError> {
-        Self::with_proxy(base_url, key, connect_timeout, None)
-    }
-
-    /// As [`ReqwestTransport::new`], sending every request through `proxy` (an `http://` or
-    /// `https://` URL) when given. The proxy applies to this client only.
-    pub fn with_proxy(
-        base_url: impl Into<String>,
-        key: KeySource,
-        connect_timeout: Duration,
-        proxy: Option<&str>,
-    ) -> Result<Self, LlmError> {
-        let mut builder = reqwest::Client::builder().connect_timeout(connect_timeout);
-        if let Some(proxy) = proxy {
-            builder = builder.proxy(
-                reqwest::Proxy::all(proxy)
-                    .map_err(|e| LlmError::InvalidRequest(format!("proxy: {e}")))?,
-            );
-        }
-        let client = builder
+        let client = client_builder(route)?
             .build()
             .map_err(|e| LlmError::Network(e.to_string()))?;
         Ok(Self {

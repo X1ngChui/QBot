@@ -42,7 +42,6 @@ fn line(msg: i64, account: i64, text: &str) -> ChatLine {
         speaker: Speaker::Member {
             account: AccountId::new(account).unwrap(),
             number: MemberNo::new(account as u32),
-            standing: MemberStanding::Normal,
         },
         at: UnixMillis::new(msg),
         text: text.into(),
@@ -50,20 +49,22 @@ fn line(msg: i64, account: i64, text: &str) -> ChatLine {
 }
 
 #[test]
-fn blocked_members_stay_in_context_with_their_standing() {
-    let mut blocked = line(2, 2, "from blocked");
-    if let Speaker::Member { standing, .. } = &mut blocked.speaker {
-        *standing = MemberStanding::Blocked;
-    }
-    let batch = ChatBatch::new(vec![line(1, 1, "a"), blocked.clone()]);
-    assert_eq!(batch.lines()[1], blocked);
-    assert!(matches!(
-        batch.lines()[1].speaker,
+fn a_stored_line_with_the_former_standing_field_still_reads() {
+    // Run transcripts written before block state moved out of chat lines carry `standing`.
+    let stored = json!({
+        "message": 1,
+        "speaker": {"member": {"account": 7, "number": 3, "standing": "blocked"}},
+        "at": 5,
+        "text": "hi"
+    });
+    let line: ChatLine = serde_json::from_value(stored).unwrap();
+    assert_eq!(
+        line.speaker,
         Speaker::Member {
-            standing: MemberStanding::Blocked,
-            ..
+            account: AccountId::new(7).unwrap(),
+            number: MemberNo::new(3),
         }
-    ));
+    );
 }
 
 #[test]

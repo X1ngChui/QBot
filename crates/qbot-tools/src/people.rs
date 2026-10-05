@@ -97,15 +97,14 @@ impl Tool for LookupMember {
     }
 
     async fn call(&self, cx: &ToolCx<'_>, args: LookupArgs) -> Result<ToolOutput, ToolError> {
-        let participant = cx
+        let account = cx
             .view
-            .participant(MemberNo::new(args.member))
+            .account_of(MemberNo::new(args.member))
             .ok_or_else(|| {
                 ToolError::InvalidArguments(say(Text::LookupMemberNoMember {
                     member: args.member.to_string(),
                 }))
             })?;
-        let account = participant.account;
         let now = cx.clock.now();
         let holder = self
             .identity

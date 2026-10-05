@@ -187,9 +187,9 @@ impl Config {
         let s = &self.providers.search;
         if s.enabled {
             c.secret_name(&s.api_key_secret, "providers.search.api_key_secret");
-            if !s.proxy.is_empty() {
-                c.endpoint(&s.proxy, "providers.search.proxy");
-            }
+        }
+        if !self.network.proxy.is_empty() {
+            c.endpoint(&self.network.proxy, "network.proxy");
         }
 
         let mt = &self.maintenance;

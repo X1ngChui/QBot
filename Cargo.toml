@@ -40,7 +40,6 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 tracing = "0.1"
 mimalloc = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
-time = { version = "0.3", features = ["formatting", "parsing"] }
 qbot-core = { path = "crates/qbot-core" }
 qbot-context = { path = "crates/qbot-context" }
 qbot-llm = { path = "crates/qbot-llm" }

@@ -35,7 +35,7 @@ async fn a_blocked_members_message_never_creates_a_run() {
     assert_eq!(sup.active(), 0, "no capacity consumed");
     assert_eq!(h.fake.remaining_steps(), 1);
 
-    // Their line is still context for someone else's run, marked as blocked.
+    // Their line is still context for someone else's run.
     h.world.say(1, 1, "what did they say?");
     let report = sup
         .submit(request(1, 102))
@@ -46,13 +46,11 @@ async fn a_blocked_members_message_never_creates_a_run() {
         .unwrap();
     assert_eq!(report.end, RunEnd::Delivered);
     let conv = &h.fake.recorded()[0].conversation;
-    let has_marked_line = conv.items().iter().any(|i| match i {
-        ConvItem::Message(m) => {
-            format!("{m:?}").contains("member:9 (blocked: do not reply): hey bot")
-        }
+    let has_line = conv.items().iter().any(|i| match i {
+        ConvItem::Message(m) => format!("{m:?}").contains("member:9: hey bot"),
         _ => false,
     });
-    assert!(has_marked_line);
+    assert!(has_line);
 }
 
 #[tokio::test]

@@ -11,6 +11,7 @@ pub struct Config {
     pub bot: Bot,
     pub gateway: Gateway,
     pub database: Database,
+    pub network: Network,
     pub replies: Replies,
     pub history: History,
     pub memory: Memory,
@@ -76,6 +77,27 @@ pub struct Database {
     pub ssl_mode: SslMode,
     /// The NAME of the secret holding the password, never the password.
     pub password_secret: String,
+}
+
+/// An outbound service, for choosing which of them use the proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Service {
+    Text,
+    Vision,
+    Embedding,
+    Search,
+    /// Downloading pictures from the platform's links.
+    Media,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Network {
+    /// An `http://` or `https://` proxy; empty connects directly.
+    pub proxy: String,
+    /// The services that use the proxy; the others connect directly.
+    pub proxy_for: Vec<Service>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,8 +228,6 @@ pub struct SearchProvider {
     pub api_key_secret: String,
     pub depth: SearchDepth,
     pub extract_depth: SearchDepth,
-    /// HTTP(S) proxy for the search client only; empty connects directly.
-    pub proxy: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

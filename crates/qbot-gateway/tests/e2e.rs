@@ -13,7 +13,7 @@ use qbot_agent::{
     Archive, ContextSource, Delivery, DeliveryError, EnvError, GroupPolicy, OutSegment, RunDeps,
     RunLimits, RunLog, Supervisor, SupervisorConfig, ToolSet,
 };
-use qbot_context::{ChatLine, MemberStanding, Speaker};
+use qbot_context::{ChatLine, Speaker};
 use qbot_core::{AccountId, GroupId, MemberNo, MessageId, SystemClock};
 use qbot_gateway::bridge::Bridge;
 use qbot_gateway::delivery::{DeliveryTimeouts, OneBotDelivery};
@@ -52,7 +52,6 @@ impl Intake for MemoryIntake {
         let speaker = line.author.map_or(Speaker::Bot, |account| Speaker::Member {
             account,
             number: MemberNo::new(1),
-            standing: MemberStanding::Normal,
         });
         let stored = ChatLine {
             message: line.message,

@@ -18,6 +18,7 @@ pub mod conversation;
 pub mod embedding;
 pub mod error;
 pub mod fake;
+pub mod net;
 pub mod provider;
 pub mod request;
 pub mod response;

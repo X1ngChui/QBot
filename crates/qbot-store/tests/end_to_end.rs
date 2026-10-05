@@ -144,7 +144,7 @@ struct Stack {
 fn stack_on(db: TestDb, script: Vec<Step>) -> Stack {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let pool = db.pool().clone();
-    let archive = PgArchive::new(pool.clone(), clock.clone());
+    let archive = PgArchive::new(pool.clone());
     let policy = PgGroupPolicy::new(pool.clone(), clock.clone());
     let log = PgRunLog::new(pool.clone(), clock.clone());
     let timers = Arc::new(PgTimerStore::new(pool.clone(), clock.clone()));
@@ -366,10 +366,7 @@ async fn a_blocked_member_never_creates_a_run_but_stays_in_context() {
     let question = s.say(2, 501, "what was that?").await;
     s.ask(question, 501).await.unwrap();
     let prompt = format!("{:?}", s.fake.recorded()[0].conversation);
-    assert!(
-        prompt.contains("member:1 (blocked: do not reply): buy my stuff"),
-        "{prompt}"
-    );
+    assert!(prompt.contains("member:1: buy my stuff"), "{prompt}");
     s.finish().await;
 }
 

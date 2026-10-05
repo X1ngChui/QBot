@@ -3,9 +3,10 @@ use qbot_core::marker::fill;
 use qbot_core::{GroupId, MessageId};
 use qbot_store::{PgArchive, PgMediaCache};
 
-use crate::item::{Kind, MediaRef};
+use crate::item::MediaRef;
 use crate::open::{MediaRefs, RefsError};
 use crate::ports::{CacheError, DescriptionCache, EditError, LineEditor};
+use qbot_core::MediaKind;
 
 #[async_trait]
 impl DescriptionCache for PgMediaCache {
@@ -32,7 +33,7 @@ impl LineEditor for PgLineEditor {
         &self,
         group: GroupId,
         message: MessageId,
-        kind: Kind,
+        kind: MediaKind,
         index: usize,
         replacement: &str,
     ) -> Result<bool, EditError> {
@@ -51,10 +52,10 @@ impl MediaRefs for PgArchive {
         &self,
         group: GroupId,
         message: MessageId,
-        kind: Kind,
+        kind: MediaKind,
         index: u32,
     ) -> Result<Option<MediaRef>, RefsError> {
-        let row = PgArchive::media_ref(self, group, message, kind.marker(), index)
+        let row = PgArchive::media_ref(self, group, message, kind, index)
             .await
             .map_err(|e| RefsError(e.to_string()))?;
         Ok(row.map(|r| MediaRef {

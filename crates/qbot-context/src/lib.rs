@@ -10,7 +10,7 @@ mod item;
 mod project;
 mod transcript;
 
-pub use chat::{ChatBatch, ChatLine, MemberStanding, Speaker};
+pub use chat::{ChatBatch, ChatLine, Speaker};
 pub use error::{AppendError, LoadError, ProjectError};
 pub use item::{
     AssistantPart, AssistantTurn, ErrorKind, Instruction, InstructionRole, Item, Meta,

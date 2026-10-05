@@ -6,11 +6,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use qbot_core::MediaKind;
 use qbot_core::marker::fill;
 use qbot_core::{GroupId, MessageId};
 use qbot_media::{
     Admission, CacheError, DescribeError, Describer, DescriptionCache, EditError, FetchError,
-    Fetcher, Kind, LineEditor, MediaConfig, MediaDeps, MediaItem, MediaJob, MediaRef, MediaService,
+    Fetcher, LineEditor, MediaConfig, MediaDeps, MediaItem, MediaJob, MediaRef, MediaService,
     TranscribeError, Transcriber,
 };
 
@@ -141,7 +142,7 @@ impl LineEditor for Lines {
         &self,
         _: GroupId,
         message: MessageId,
-        kind: Kind,
+        kind: MediaKind,
         index: usize,
         replacement: &str,
     ) -> Result<bool, EditError> {
@@ -161,7 +162,7 @@ impl LineEditor for Lines {
 
 fn image(index: usize, key: &str) -> MediaItem {
     MediaItem {
-        kind: Kind::Image,
+        kind: MediaKind::Image,
         index,
         reference: MediaRef {
             key: Some(key.into()),
@@ -173,7 +174,7 @@ fn image(index: usize, key: &str) -> MediaItem {
 
 fn voice(index: usize, key: &str) -> MediaItem {
     MediaItem {
-        kind: Kind::Voice,
+        kind: MediaKind::Voice,
         index,
         reference: MediaRef {
             key: Some(key.into()),
@@ -611,7 +612,7 @@ async fn stickers_are_described_once_per_sticker_id_in_their_own_namespace() {
         &[(1, "[sticker:shy]"), (2, "[sticker]")],
     );
     let sticker = |index| MediaItem {
-        kind: Kind::Sticker,
+        kind: MediaKind::Sticker,
         index,
         reference: MediaRef {
             key: Some("e9".into()),

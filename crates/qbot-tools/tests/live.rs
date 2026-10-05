@@ -55,11 +55,11 @@ async fn the_model_searches_the_web_and_answers_from_the_results() {
             },
         },
         Arc::new(
-            ReqwestTransport::with_proxy(
+            ReqwestTransport::new(
                 "https://api.tavily.com",
                 KeySource::Static(secret("search_api_key")),
-                Duration::from_secs(10),
-                std::env::var("QBOT_LIVE_SEARCH_PROXY").ok().as_deref(),
+                &std::env::var("QBOT_LIVE_SEARCH_PROXY")
+                    .map_or(qbot_llm::net::Route::Direct, qbot_llm::net::Route::Proxy),
             )
             .unwrap(),
         ),
@@ -75,7 +75,7 @@ async fn the_model_searches_the_web_and_answers_from_the_results() {
             ReqwestTransport::new(
                 "https://api.deepseek.com",
                 KeySource::Static(secret("text_api_key")),
-                Duration::from_secs(10),
+                &qbot_llm::net::Route::Direct,
             )
             .unwrap(),
         ),
@@ -177,11 +177,11 @@ fn tavily_reader() -> Arc<TavilySearch> {
             },
         },
         Arc::new(
-            ReqwestTransport::with_proxy(
+            ReqwestTransport::new(
                 "https://api.tavily.com",
                 KeySource::Static(secret("search_api_key")),
-                Duration::from_secs(10),
-                std::env::var("QBOT_LIVE_SEARCH_PROXY").ok().as_deref(),
+                &std::env::var("QBOT_LIVE_SEARCH_PROXY")
+                    .map_or(qbot_llm::net::Route::Direct, qbot_llm::net::Route::Proxy),
             )
             .unwrap(),
         ),

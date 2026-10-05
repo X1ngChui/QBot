@@ -1,24 +1,16 @@
 use qbot_core::{AccountId, MemberNo, MessageId, UnixMillis};
 use serde::{Deserialize, Serialize};
 
-/// Whether the bot may reply to a member. Blocked members stay visible as context; the marker
-/// lets the prompt tell the model not to address them. Blocking itself is enforced at admission.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MemberStanding {
-    Normal,
-    Blocked,
-}
-
 /// Who wrote a chat line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Speaker {
     Bot,
+    /// A member: the platform account, and its number in this group (assigned on the account's
+    /// first appearance in the group and never changed).
     Member {
         account: AccountId,
         number: MemberNo,
-        standing: MemberStanding,
     },
 }
 

@@ -8,7 +8,8 @@ use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use futures_util::StreamExt;
-use qbot_media::{FetchError, Fetcher, Kind, MediaItem, MediaJob, MediaRef};
+use qbot_core::MediaKind;
+use qbot_media::{FetchError, Fetcher, MediaItem, MediaJob, MediaRef};
 use serde_json::{Value, json};
 
 use crate::bridge::Bridge;
@@ -42,7 +43,7 @@ impl Walk {
             match segment {
                 Segment::Image { file, url, size } => {
                     self.items.push(MediaItem {
-                        kind: Kind::Image,
+                        kind: MediaKind::Image,
                         index: self.images,
                         reference: MediaRef {
                             key: file.clone().or_else(|| url.clone()),
@@ -56,7 +57,7 @@ impl Walk {
                 }
                 Segment::Sticker { url, key, .. } => {
                     self.items.push(MediaItem {
-                        kind: Kind::Sticker,
+                        kind: MediaKind::Sticker,
                         index: self.stickers,
                         reference: MediaRef {
                             key: key.clone().or_else(|| url.clone()),
@@ -73,7 +74,7 @@ impl Walk {
                     // here, and recognition has no cache to reuse.
                     if !nested {
                         self.items.push(MediaItem {
-                            kind: Kind::Voice,
+                            kind: MediaKind::Voice,
                             index: self.clips,
                             reference: MediaRef {
                                 key: file.clone().or_else(|| url.clone()),
@@ -153,10 +154,15 @@ impl std::fmt::Debug for OneBotFetcher {
 }
 
 impl OneBotFetcher {
-    pub fn new(bridge: Arc<Bridge>, settings: FetchSettings) -> Result<Self, reqwest::Error> {
-        let http = reqwest::Client::builder()
+    pub fn new(
+        bridge: Arc<Bridge>,
+        settings: FetchSettings,
+        route: &qbot_llm::net::Route,
+    ) -> Result<Self, qbot_llm::LlmError> {
+        let http = qbot_llm::net::client_builder(route)?
             .timeout(settings.http_timeout)
-            .build()?;
+            .build()
+            .map_err(|e| qbot_llm::LlmError::Network(e.to_string()))?;
         Ok(Self {
             bridge,
             http,

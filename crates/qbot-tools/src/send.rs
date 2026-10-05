@@ -138,14 +138,11 @@ fn lower(cx: &ToolCx<'_>, text: &str) -> Result<Vec<OutSegment>, ToolError> {
     let invalid = ToolError::InvalidArguments;
     let pieces = parse(text).map_err(invalid)?;
     let member = |n: u32| {
-        cx.view
-            .participant(MemberNo::new(n))
-            .map(|p| p.account)
-            .ok_or_else(|| {
-                refused(say(Text::SendMessageNoMember {
-                    member: n.to_string(),
-                }))
-            })
+        cx.view.account_of(MemberNo::new(n)).ok_or_else(|| {
+            refused(say(Text::SendMessageNoMember {
+                member: n.to_string(),
+            }))
+        })
     };
     let meaningful = pieces.iter().filter(|p| !blank(p)).count();
     if meaningful == 0 {

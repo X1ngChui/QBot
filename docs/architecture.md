@@ -128,8 +128,8 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
 - Chat arrives as `Chat` items between turns: the window at trigger time first, then lines that
   arrived since, including echoes of the run's own sends. Lines carry stable message ids and
   member numbers; nothing is positional.
-- Blocking never removes context: a blocked member's lines are shown, marked, and the block is
-  enforced at admission.
+- Blocking never removes context: a blocked member's lines are shown as anyone's, the block is
+  enforced at admission, and the instructions list who is blocked.
 - Projection is pure: the visible view of the transcript, lowered by the provider adapter. A
   `Summary` stands in for a range of chat items (the summary history tier, and the
   `ContextTooLong` fallback); the originals stay in the transcript. An earlier turn's view never
@@ -171,9 +171,16 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
 
 - **Instructions** are minijinja templates in `prompts/*.md` with a closed set of slots per
   template (a test holds them equal): the reply rules, the guide to reading chat markers, the
-  persona block, the learned group knowledge, the trigger note, picture description, extraction.
-  They are the same for every run of a group, which keeps the prefix cacheable; what varies (the
-  time, the trigger, a task's intent) is a separate trigger note.
+  persona block, the people block, the learned group knowledge, the trigger note, picture
+  description, extraction.
+- **Order is stable to volatile**, so runs of a group share the longest prefix the provider can
+  cache: reply rules, legend, persona and its group background (fixed per deployment), then the
+  people block (changes when a block or link does), then learned knowledge (changes nightly),
+  then the chat (grows by whole batches), and last the trigger note (the time, the trigger, a
+  task's intent), which is different for every run.
+- **People block**: who is blocked (blocks in force now) and which member numbers are one person
+  (holders with two or more numbered accounts in the group), from the store on every run, by
+  member number only, in ascending order. Omitted when there is neither.
 - **Personas** are TOML files: `default.toml`, or `group_<id>.toml` replacing it for one group.
 - **History tiers.** A run sees whole batches counted back from the batch being filled: the newest
   `history.raw_batches` verbatim, the `history.summary_batches` before them as the summaries of
@@ -264,7 +271,11 @@ a derived index the nightly run keeps complete for the configured embedding mode
   vectors normalized and checked for width.
 - **Web search and page reading** (Tavily, the only search vendor): five results a search; a page
   read as Markdown, either the passages relevant to a question or the whole page cut at 8,000
-  characters, marked as outside text. An optional proxy serves the search client alone.
+  characters, marked as outside text.
+- **Network**: every outbound client (the providers, web search, picture downloads) is built by
+  `qbot_llm::net`, on a route the configuration decides: directly, or through the one proxy
+  (`network.proxy`) for the services listed in `network.proxy_for`. Proxy variables in the
+  environment are ignored, so nothing reroutes traffic behind the configuration's back.
 - **Fakes**: `FakeProvider` implements the whole contract offline (validation, prefix-cache
   simulation, recorded requests); `SimServer` is a Responses server for adapter tests.
 
@@ -309,7 +320,8 @@ The schema holds only what a deployment may choose:
 | `history` | batch lines, raw and summary batches |
 | `memory` | slice batches; recall's max distance and half-life; fact half-lives per decay class |
 | `media` | voice transcription on or off; pictures and clips per minute per group |
-| `providers.*` | text (kind, endpoint, model, reasoning), vision, embedding (model, width, batch), search (depth, proxy) |
+| `network` | an outbound proxy and the services that use it |
+| `providers.*` | text (kind, endpoint, model, reasoning), vision, embedding (model, width, batch), search (depths) |
 | `maintenance` | nightly and report schedules, backups kept, client tools directory, run retention, NapCat cache cleanup |
 
 Derived rather than configured: the reply queue (ten waiting replies per model slot), the
@@ -349,13 +361,14 @@ spend.
 
 ## 15. Persistence (`qbot-store`)
 
-- Postgres 17 with pgvector, through sqlx; one schema file (`migrations/0001_schema.sql`), with
-  CHECK constraints for every closed set and cross-column rule. Instants are bigint milliseconds;
+- Postgres 17 with pgvector, through sqlx; forward-only migrations in `migrations/` (`0001_schema.sql`
+  is the base schema, later files change it), with CHECK constraints for every closed set and cross-column rule. Instants are bigint milliseconds;
   every group table carries `group_id` and every query filters by it.
 - One adapter per port. The in-memory implementations in the domain crates define the semantics;
   shared conformance suites (`qbot_memory::conformance`, `qbot_sched::conformance`, ...) run
   against both.
-- Member numbers are assigned densely under a per-group advisory lock. Episodes cannot overlap
+- Member numbers are assigned densely under a per-group advisory lock and are immutable: a
+  trigger rejects any update, delete or truncate of `member_number`. Episodes cannot overlap
   (a range exclusion constraint). One active fact per subject, predicate and key (a partial
   unique index).
 - **Single instance**: the process holds a Postgres advisory-lock session lease and shuts down if

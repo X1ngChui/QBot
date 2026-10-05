@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use qbot_agent::{ChatView, RunState, Tool, ToolCx, ToolError, Trigger};
-use qbot_context::{ChatLine, MemberStanding, Speaker};
+use qbot_context::{ChatLine, Speaker};
 use qbot_core::{AccountId, Clock, GroupId, MemberNo, MessageId, RunId, UnixMillis};
 use qbot_memory::episode::EpisodeId;
 use qbot_memory::facts::{DecayPolicy, FactStore, MemoryFactStore, Observation};
@@ -123,7 +123,6 @@ async fn a_member_lookup_lists_names_and_current_facts_of_the_whole_person() {
         speaker: Speaker::Member {
             account: account(11),
             number: MemberNo::new(2),
-            standing: MemberStanding::Normal,
         },
         at: UnixMillis::new(0),
         text: "hi".into(),

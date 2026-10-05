@@ -13,4 +13,5 @@ pub use clock::{Clock, SystemClock};
 pub use ids::{
     AccountId, CallId, ChainId, GroupId, IdError, ItemSeq, MemberNo, MessageId, RunId, TimerId,
 };
+pub use marker::MediaKind;
 pub use time::UnixMillis;

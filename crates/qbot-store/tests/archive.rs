@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use common::*;
 use qbot_agent::{Archive, ArchiveCursor};
-use qbot_context::{MemberStanding, Speaker};
-use qbot_core::{AccountId, GroupId, MemberNo, MessageId, UnixMillis};
+use qbot_context::Speaker;
+use qbot_core::{AccountId, GroupId, MediaKind, MemberNo, MessageId, UnixMillis};
 use qbot_store::{Appended, NewLine, NewSpeaker, PgArchive, PgGroupPolicy};
 
 fn group(n: i64) -> GroupId {
@@ -44,7 +44,7 @@ fn number_of(line: &qbot_context::ChatLine) -> u32 {
 #[tokio::test]
 async fn members_get_stable_dense_numbers_per_group_on_first_appearance() {
     let db = db!();
-    let archive = PgArchive::new(db.pool().clone(), ManualClock::new(T0));
+    let archive = PgArchive::new(db.pool().clone());
     let g = group(100);
     let first = archive.append(member(g, 1, 501, "hi")).await.unwrap();
     let second = archive.append(member(g, 2, 502, "hello")).await.unwrap();
@@ -74,7 +74,7 @@ async fn members_get_stable_dense_numbers_per_group_on_first_appearance() {
 #[tokio::test]
 async fn concurrent_first_appearances_get_unique_gapless_numbers() {
     let db = db!();
-    let archive = Arc::new(PgArchive::new(db.pool().clone(), ManualClock::new(T0)));
+    let archive = Arc::new(PgArchive::new(db.pool().clone()));
     let g = group(300);
     let tasks: Vec<_> = (0..24)
         .map(|i| {
@@ -105,7 +105,7 @@ async fn concurrent_first_appearances_get_unique_gapless_numbers() {
 #[tokio::test]
 async fn a_duplicate_message_stores_nothing_and_consumes_no_number() {
     let db = db!();
-    let archive = PgArchive::new(db.pool().clone(), ManualClock::new(T0));
+    let archive = PgArchive::new(db.pool().clone());
     let g = group(400);
     assert!(matches!(
         archive.append(member(g, 1, 501, "once")).await.unwrap(),
@@ -135,7 +135,7 @@ async fn a_duplicate_message_stores_nothing_and_consumes_no_number() {
 #[tokio::test]
 async fn since_and_recent_follow_the_cursor_and_isolate_groups() {
     let db = db!();
-    let archive = PgArchive::new(db.pool().clone(), ManualClock::new(T0));
+    let archive = PgArchive::new(db.pool().clone());
     let (g, h) = (group(500), group(501));
     for i in 1..=5 {
         archive
@@ -187,7 +187,7 @@ async fn since_and_recent_follow_the_cursor_and_isolate_groups() {
 #[tokio::test]
 async fn search_is_case_insensitive_literal_newest_first_and_group_scoped() {
     let db = db!();
-    let archive = PgArchive::new(db.pool().clone(), ManualClock::new(T0));
+    let archive = PgArchive::new(db.pool().clone());
     let g = group(600);
     archive
         .append(member(g, 1, 700, "The Deploy failed"))
@@ -241,10 +241,10 @@ async fn search_is_case_insensitive_literal_newest_first_and_group_scoped() {
 }
 
 #[tokio::test]
-async fn blocked_members_stay_in_the_archive_marked_with_their_current_standing() {
+async fn a_block_never_removes_lines_or_changes_numbers() {
     let db = db!();
     let clock = ManualClock::new(T0);
-    let archive = PgArchive::new(db.pool().clone(), clock.clone());
+    let archive = PgArchive::new(db.pool().clone());
     let policy = PgGroupPolicy::new(db.pool().clone(), clock.clone());
     let g = group(700);
     archive
@@ -252,11 +252,7 @@ async fn blocked_members_stay_in_the_archive_marked_with_their_current_standing(
         .await
         .unwrap();
     policy
-        .block(
-            g,
-            AccountId::new(800).unwrap(),
-            Some(UnixMillis::new(T0 + 60_000)),
-        )
+        .block(g, AccountId::new(800).unwrap(), None)
         .await
         .unwrap();
     archive
@@ -268,43 +264,17 @@ async fn blocked_members_stay_in_the_archive_marked_with_their_current_standing(
         .await
         .unwrap();
 
-    let standing = |lines: &[qbot_context::ChatLine]| -> Vec<MemberStanding> {
-        lines
-            .iter()
-            .map(|l| match l.speaker {
-                Speaker::Member { standing, .. } => standing,
-                Speaker::Bot => MemberStanding::Normal,
-            })
-            .collect()
-    };
     let (lines, _) = archive.recent(g, 10).await.unwrap();
     assert_eq!(lines.len(), 3, "a block never removes lines");
-    assert_eq!(
-        standing(&lines),
-        [
-            MemberStanding::Blocked,
-            MemberStanding::Blocked,
-            MemberStanding::Normal
-        ],
-        "standing is the author's current state, including their earlier lines"
-    );
-
-    clock.advance(Duration::from_secs(61));
-    let (lines, _) = archive.recent(g, 10).await.unwrap();
-    assert!(
-        standing(&lines)
-            .iter()
-            .all(|s| *s == MemberStanding::Normal),
-        "an expired block no longer marks"
-    );
-    assert_eq!(MemberNo::new(1).get(), number_of(&lines[0]));
+    let numbers: Vec<u32> = lines.iter().map(number_of).collect();
+    assert_eq!(numbers, [1, 1, 2]);
     db.drop_db().await;
 }
 
 #[tokio::test]
 async fn mentions_get_member_numbers_and_the_marker_is_rewritten() {
     let db = db!();
-    let archive = PgArchive::new(db.pool().clone(), ManualClock::new(T0));
+    let archive = PgArchive::new(db.pool().clone());
     let g = group(300);
     archive.append(member(g, 1, 501, "hi")).await.unwrap();
     let mentioned = [AccountId::new(777).unwrap(), AccountId::new(501).unwrap()];
@@ -351,7 +321,7 @@ async fn mentions_get_member_numbers_and_the_marker_is_rewritten() {
 #[tokio::test]
 async fn logical_queries_run_as_parameterized_sql_on_postgres() {
     let db = db!();
-    let archive = PgArchive::new(db.pool().clone(), ManualClock::new(T0));
+    let archive = PgArchive::new(db.pool().clone());
     let g = group(620);
     let printer = "\u{6253}\u{5370}\u{673a}";
     let copier = "\u{590d}\u{5370}";
@@ -421,7 +391,7 @@ async fn logical_queries_run_as_parameterized_sql_on_postgres() {
 #[tokio::test]
 async fn lines_are_read_from_an_ordinal_with_their_ordinals() {
     let db = db!();
-    let archive = PgArchive::new(db.pool().clone(), ManualClock::new(T0));
+    let archive = PgArchive::new(db.pool().clone());
     let g = group(400);
     assert_eq!(archive.last_ordinal(g).await.unwrap(), 0);
     assert!(archive.lines_from(g, 1).await.unwrap().0.is_empty());
@@ -444,7 +414,7 @@ async fn lines_are_read_from_an_ordinal_with_their_ordinals() {
 #[tokio::test]
 async fn a_stored_line_can_be_rewritten_under_a_lock() {
     let db = db!();
-    let archive = PgArchive::new(db.pool().clone(), ManualClock::new(T0));
+    let archive = PgArchive::new(db.pool().clone());
     let g = group(500);
     archive
         .append(member(g, 1, 501, "look [image] and [voice]"))
@@ -514,10 +484,10 @@ async fn the_media_cache_stores_replaces_and_expires_descriptions() {
 async fn media_references_are_stored_with_the_line_and_found_by_position() {
     use qbot_store::MediaRefRow;
     let db = db!();
-    let archive = PgArchive::new(db.pool().clone(), ManualClock::new(T0));
+    let archive = PgArchive::new(db.pool().clone());
     let g = group(600);
-    let row = |kind: &str, index: u32, key: &str| MediaRefRow {
-        kind: kind.into(),
+    let row = |kind: MediaKind, index: u32, key: &str| MediaRefRow {
+        kind,
         index,
         key: Some(key.into()),
         file: Some(format!("{key}.jpg")),
@@ -529,30 +499,30 @@ async fn media_references_are_stored_with_the_line_and_found_by_position() {
             member(g, 1, 501, "[image][image][sticker]"),
             &[],
             &[
-                row("image", 0, "a"),
-                row("image", 1, "b"),
-                row("sticker", 0, "s"),
+                row(MediaKind::Image, 0, "a"),
+                row(MediaKind::Image, 1, "b"),
+                row(MediaKind::Sticker, 0, "s"),
             ],
         )
         .await
         .unwrap();
     assert!(matches!(stored, Appended::Stored { .. }));
     let found = archive
-        .media_ref(g, MessageId::new(1).unwrap(), "image", 1)
+        .media_ref(g, MessageId::new(1).unwrap(), MediaKind::Image, 1)
         .await
         .unwrap()
         .unwrap();
     assert_eq!((found.key.as_deref(), found.size), (Some("b"), Some(1234)));
     assert!(
         archive
-            .media_ref(g, MessageId::new(1).unwrap(), "image", 2)
+            .media_ref(g, MessageId::new(1).unwrap(), MediaKind::Image, 2)
             .await
             .unwrap()
             .is_none()
     );
     assert_eq!(
         archive
-            .media_ref(g, MessageId::new(1).unwrap(), "sticker", 0)
+            .media_ref(g, MessageId::new(1).unwrap(), MediaKind::Sticker, 0)
             .await
             .unwrap()
             .unwrap()
@@ -563,7 +533,11 @@ async fn media_references_are_stored_with_the_line_and_found_by_position() {
 
     // A redelivered event stores nothing twice, and does not fail on the references.
     let again = archive
-        .append_line(member(g, 1, 501, "[image]"), &[], &[row("image", 0, "a")])
+        .append_line(
+            member(g, 1, 501, "[image]"),
+            &[],
+            &[row(MediaKind::Image, 0, "a")],
+        )
         .await
         .unwrap();
     assert_eq!(again, Appended::Duplicate);

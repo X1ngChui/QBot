@@ -5,14 +5,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use qbot_agent::{ArchiveCursor, Chain, ContextSource, EnvError, RecapWhen, Trigger};
-use qbot_context::{ChatBatch, ChatLine, InstructionRole, MemberStanding, Outcome, Speaker};
+use qbot_context::{ChatBatch, ChatLine, InstructionRole, Outcome, Speaker};
 use qbot_core::{
     AccountId, ChainId, GroupId, HistoryWindow, MemberNo, MessageId, TimerId, UnixMillis,
 };
 use qbot_llm::Renderer;
 use qbot_prompt::{
-    HistorySource, Persona, PersonaError, Personas, PromptContext, PromptError, PromptRenderer,
-    PromptSettings, Template, render_template,
+    GroupPeople, HistorySource, PeopleSource, Persona, PersonaError, Personas, PromptContext,
+    PromptError, PromptRenderer, PromptSettings, Template, render_template,
 };
 
 #[test]
@@ -53,20 +53,12 @@ fn rendering_demands_the_exact_slot_set_and_never_rescans_values() {
     assert!(text.ends_with("call me {{persona}}"), "{text}");
 }
 
-fn line(
-    message: i64,
-    account: i64,
-    number: u32,
-    standing: MemberStanding,
-    at: i64,
-    text: &str,
-) -> ChatLine {
+fn line(message: i64, account: i64, number: u32, at: i64, text: &str) -> ChatLine {
     ChatLine {
         message: MessageId::new(message).unwrap(),
         speaker: Speaker::Member {
             account: AccountId::new(account).unwrap(),
             number: MemberNo::new(number),
-            standing,
         },
         at: UnixMillis::new(at),
         text: text.into(),
@@ -74,13 +66,13 @@ fn line(
 }
 
 #[test]
-fn chat_lines_show_id_local_time_member_and_standing() {
+fn chat_lines_show_id_local_time_and_member_number() {
     // 2023-11-14 22:13:20 UTC is 2023-11-15 06:13 in Shanghai.
     let renderer = PromptRenderer::new(jiff::tz::TimeZone::get("Asia/Shanghai").unwrap());
     let at = 1_700_000_000_000;
     let batch = ChatBatch::new(vec![
-        line(5, 1, 3, MemberStanding::Normal, at, "hello [at:bot]"),
-        line(6, 2, 4, MemberStanding::Blocked, at, "rude"),
+        line(5, 1, 3, at, "hello [at:bot]"),
+        line(6, 2, 4, at, "rude"),
         ChatLine {
             message: MessageId::new(7).unwrap(),
             speaker: Speaker::Bot,
@@ -90,7 +82,7 @@ fn chat_lines_show_id_local_time_member_and_standing() {
     ]);
     assert_eq!(
         renderer.chat(&batch),
-        "[msg:5] 11-15 06:13 member:3: hello [at:bot]\n[msg:6] 11-15 06:13 member:4 (blocked): rude\n[msg:7] 11-15 06:13 you: ok"
+        "[msg:5] 11-15 06:13 member:3: hello [at:bot]\n[msg:6] 11-15 06:13 member:4: rude\n[msg:7] 11-15 06:13 you: ok"
     );
     assert_eq!(renderer.outcome_note(&Outcome::Ok), None);
     assert!(
@@ -138,14 +130,7 @@ impl qbot_core::Clock for Clock0 {
 }
 
 fn context(personas: Personas) -> PromptContext {
-    let history = FixedHistory(vec![line(
-        5,
-        1,
-        3,
-        MemberStanding::Normal,
-        1_700_000_000_000,
-        "hi",
-    )]);
+    let history = FixedHistory(vec![line(5, 1, 3, 1_700_000_000_000, "hi")]);
     PromptContext::new(
         Arc::new(history),
         personas,
@@ -368,6 +353,54 @@ async fn learned_group_knowledge_joins_the_stable_instructions() {
     );
 }
 
+struct FixedPeople(GroupPeople);
+
+#[async_trait]
+impl PeopleSource for FixedPeople {
+    async fn people(&self, _: GroupId, _: UnixMillis) -> Result<GroupPeople, EnvError> {
+        Ok(self.0.clone())
+    }
+}
+
+#[tokio::test]
+async fn blocked_and_linked_members_are_listed_by_member_number() {
+    let g = GroupId::new(900).unwrap();
+    let trigger = Trigger::Addressed {
+        message: MessageId::new(5).unwrap(),
+        sender: AccountId::new(1).unwrap(),
+    };
+    let with = |people: GroupPeople| {
+        context(Personas::single(persona("Bobo", ""))).with_people(Arc::new(FixedPeople(people)))
+    };
+    let no = MemberNo::new;
+    assert_eq!(
+        with(GroupPeople::default())
+            .open(g, &trigger)
+            .await
+            .unwrap()
+            .instructions
+            .len(),
+        3,
+        "nobody blocked or linked, no block"
+    );
+
+    let opened = with(GroupPeople {
+        blocked: vec![no(4), no(17)],
+        same_person: vec![vec![no(2), no(9)], vec![no(3), no(5), no(8)]],
+    })
+    .open(g, &trigger)
+    .await
+    .unwrap();
+    assert_eq!(opened.instructions.len(), 4);
+    let block = &opened.instructions[3].text;
+    assert!(block.starts_with("## People in this group"), "{block}");
+    let entries: Vec<&str> = block.lines().filter(|l| l.starts_with("- ")).collect();
+    assert_eq!(entries.len(), 3, "{block}");
+    assert!(entries[0].starts_with("- Blocked: member:4, member:17."));
+    assert!(entries[1].contains("member:2, member:9."));
+    assert!(entries[2].contains("member:3, member:5, member:8."));
+}
+
 #[tokio::test]
 async fn only_the_most_recently_confirmed_terms_are_shown_in_a_stable_order() {
     use qbot_memory::episode::EpisodeId;
@@ -434,16 +467,7 @@ async fn tiered(n: i64, episodes: &[(u64, u64, &str)]) -> PromptContext {
 
     let g = GroupId::new(900).unwrap();
     let lines: Vec<ChatLine> = (1..=n)
-        .map(|m| {
-            line(
-                m,
-                1,
-                3,
-                MemberStanding::Normal,
-                1_700_000_000_000,
-                &format!("line {m}"),
-            )
-        })
+        .map(|m| line(m, 1, 3, 1_700_000_000_000, &format!("line {m}")))
         .collect();
     let store = Arc::new(MemoryEpisodeStore::default());
     for (first, last, title) in episodes {

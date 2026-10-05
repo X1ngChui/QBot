@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use qbot_core::{GroupId, MessageId};
 
-use crate::item::{Kind, MediaRef};
+use crate::item::MediaRef;
+use qbot_core::MediaKind;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FetchError {
@@ -67,7 +68,7 @@ pub trait LineEditor: Send + Sync {
         &self,
         group: GroupId,
         message: MessageId,
-        kind: Kind,
+        kind: MediaKind,
         index: usize,
         replacement: &str,
     ) -> Result<bool, EditError>;

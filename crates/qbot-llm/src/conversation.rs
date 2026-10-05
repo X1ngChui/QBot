@@ -82,21 +82,12 @@ impl Renderer for PlainRenderer {
             .iter()
             .map(|line| match line.speaker {
                 Speaker::Bot => format!("[msg:{}] bot: {}", line.message.get(), line.text),
-                Speaker::Member {
-                    number, standing, ..
-                } => {
-                    let flag = match standing {
-                        qbot_context::MemberStanding::Normal => "",
-                        qbot_context::MemberStanding::Blocked => " (blocked: do not reply)",
-                    };
-                    format!(
-                        "[msg:{}] member:{}{}: {}",
-                        line.message.get(),
-                        number.get(),
-                        flag,
-                        line.text
-                    )
-                }
+                Speaker::Member { number, .. } => format!(
+                    "[msg:{}] member:{}: {}",
+                    line.message.get(),
+                    number.get(),
+                    line.text
+                ),
             })
             .collect::<Vec<_>>()
             .join("\n")

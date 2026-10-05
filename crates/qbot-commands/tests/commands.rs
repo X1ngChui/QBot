@@ -212,7 +212,7 @@ fn run_record(run: u64, group: i64) -> qbot_store::RunRecord {
     qbot_store::RunRecord {
         run: qbot_core::RunId::new(run),
         group: GroupId::new(group).unwrap(),
-        trigger_kind: "addressed".into(),
+        trigger_kind: qbot_store::TriggerKind::Addressed,
         started: UnixMillis::new(T0),
         ended: Some(UnixMillis::new(T0 + 5_000)),
         end: Some(qbot_context::RunEnd::Delivered),

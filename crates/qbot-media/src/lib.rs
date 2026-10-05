@@ -19,7 +19,7 @@ mod service;
 
 pub use clean::{clean_description, sniff_mime};
 pub use describe::LlmDescriber;
-pub use item::{Kind, MediaItem, MediaJob, MediaRef};
+pub use item::{MediaItem, MediaJob, MediaRef};
 pub use open::{
     ArchivedMedia, MediaRefs, OpenError, OpenImages, OpenImagesArgs, PictureArg, RefsError,
 };

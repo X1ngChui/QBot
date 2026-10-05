@@ -53,8 +53,12 @@ fn env_or(name: &str, default: &str) -> String {
 fn deepseek_with(key_file: &str, key: Option<String>) -> ResponsesProvider {
     let endpoint = env_or("QBOT_LIVE_TEXT_ENDPOINT", "https://api.deepseek.com");
     let key = key.unwrap_or_else(|| secret(key_file));
-    let transport =
-        ReqwestTransport::new(endpoint, KeySource::Static(key), Duration::from_secs(10)).unwrap();
+    let transport = ReqwestTransport::new(
+        endpoint,
+        KeySource::Static(key),
+        &qbot_llm::net::Route::Direct,
+    )
+    .unwrap();
     let mut cfg = ResponsesConfig::deepseek(env_or("QBOT_LIVE_TEXT_MODEL", "deepseek-flash"));
     cfg.timeout = Some(Duration::from_secs(120));
     ResponsesProvider::new(cfg, Arc::new(transport)).unwrap()
@@ -459,7 +463,7 @@ async fn dashscope_embeddings_have_the_configured_width_and_rank_by_meaning() {
     let transport = ReqwestTransport::new(
         endpoint,
         KeySource::Static(secret("embedding_api_key")),
-        Duration::from_secs(10),
+        &qbot_llm::net::Route::Direct,
     )
     .unwrap();
     let embedder = HttpEmbedder::new(EmbeddingConfig::dashscope_v4(2048), Arc::new(transport));
@@ -512,7 +516,7 @@ async fn provider_errors_are_normalized() {
     let transport = ReqwestTransport::new(
         endpoint,
         KeySource::Static(secret("text_api_key")),
-        Duration::from_secs(10),
+        &qbot_llm::net::Route::Direct,
     )
     .unwrap();
     let mut cfg = ResponsesConfig::deepseek("no-such-model-qbot");
@@ -536,7 +540,7 @@ async fn provider_errors_are_normalized() {
     let transport = ReqwestTransport::new(
         endpoint,
         KeySource::Static(secret("text_api_key")),
-        Duration::from_secs(10),
+        &qbot_llm::net::Route::Direct,
     )
     .unwrap();
     let mut cfg = ResponsesConfig::deepseek(env_or("QBOT_LIVE_TEXT_MODEL", "deepseek-flash"));
@@ -584,7 +588,7 @@ async fn a_transient_failure_is_retried_and_the_retry_reaches_the_real_provider(
         let inner = ReqwestTransport::new(
             endpoint,
             KeySource::Static(secret("text_api_key")),
-            Duration::from_secs(10),
+            &qbot_llm::net::Route::Direct,
         )
         .unwrap();
         let transport = FailFirst {
@@ -610,11 +614,10 @@ async fn a_transient_failure_is_retried_and_the_retry_reaches_the_real_provider(
 fn tavily_with(key: String) -> qbot_llm::search::TavilySearch {
     let endpoint = env_or("QBOT_LIVE_SEARCH_ENDPOINT", "https://api.tavily.com");
     let proxy = std::env::var("QBOT_LIVE_SEARCH_PROXY").ok();
-    let transport = ReqwestTransport::with_proxy(
+    let transport = ReqwestTransport::new(
         endpoint,
         KeySource::Static(key),
-        Duration::from_secs(10),
-        proxy.as_deref(),
+        &proxy.map_or(qbot_llm::net::Route::Direct, qbot_llm::net::Route::Proxy),
     )
     .unwrap();
     qbot_llm::search::TavilySearch::new(

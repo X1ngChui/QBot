@@ -8,10 +8,11 @@ use axum::Router;
 use axum::http::StatusCode;
 use axum::routing::get;
 use base64::Engine;
+use qbot_core::MediaKind;
 use qbot_gateway::bridge::Bridge;
 use qbot_gateway::media::{FetchSettings, OneBotFetcher, job_for};
 use qbot_gateway::wire::{Frame, parse_frame};
-use qbot_media::{FetchError, Fetcher, Kind, MediaRef};
+use qbot_media::{FetchError, Fetcher, MediaRef};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
@@ -64,6 +65,7 @@ fn fetcher(bridge: &Arc<Bridge>) -> OneBotFetcher {
             http_timeout: Duration::from_secs(5),
             protocol_timeout: Duration::from_secs(2),
         },
+        &qbot_llm::net::Route::Direct,
     )
     .unwrap()
 }
@@ -111,9 +113,9 @@ fn a_message_lists_its_pictures_and_clips_by_position() {
     assert_eq!(
         summary,
         [
-            (Kind::Image, 0, "A.jpg".into(), Some(1234)),
-            (Kind::Voice, 0, "r.amr".into(), None),
-            (Kind::Image, 1, "B.jpg".into(), None)
+            (MediaKind::Image, 0, "A.jpg".into(), Some(1234)),
+            (MediaKind::Voice, 0, "r.amr".into(), None),
+            (MediaKind::Image, 1, "B.jpg".into(), None)
         ]
     );
 }

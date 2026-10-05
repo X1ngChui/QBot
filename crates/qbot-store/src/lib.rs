@@ -22,7 +22,7 @@ use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 
 pub use admin::{BlockRule, PgAdmin, ReportData, RosterRow, TopRow, UsageTotals};
-pub use archive::{Appended, MediaRefRow, NewLine, NewSpeaker, PgArchive};
+pub use archive::{Appended, GroupPeople, MediaRefRow, NewLine, NewSpeaker, PgArchive};
 pub use episodes::PgEpisodeStore;
 pub use error::StoreError;
 pub use facts::PgFactStore;
@@ -31,7 +31,7 @@ pub use lease::{DEFAULT_KEY, LeaseError, LeaseWatch, RuntimeLease};
 pub use media::PgMediaCache;
 pub use notes::PgNoteStore;
 pub use policy::PgGroupPolicy;
-pub use runlog::{PgRunLog, RunRecord};
+pub use runlog::{PgRunLog, RunRecord, TriggerKind};
 pub use timers::PgTimerStore;
 pub use usage::{PgUsageSink, UsageRecorder};
 

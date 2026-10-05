@@ -10,6 +10,7 @@ pub enum Template {
     Legend,
     PersonaBlock,
     KnowledgeBlock,
+    PeopleBlock,
     TriggerAddressed,
     TriggerWake,
     DescribeImage,
@@ -18,11 +19,12 @@ pub enum Template {
 }
 
 impl Template {
-    pub const ALL: [Template; 9] = [
+    pub const ALL: [Template; 10] = [
         Template::ReplySystem,
         Template::Legend,
         Template::PersonaBlock,
         Template::KnowledgeBlock,
+        Template::PeopleBlock,
         Template::TriggerAddressed,
         Template::TriggerWake,
         Template::DescribeImage,
@@ -36,6 +38,7 @@ impl Template {
             Template::Legend => include_str!("../../../prompts/legend.md"),
             Template::PersonaBlock => include_str!("../../../prompts/persona_block.md"),
             Template::KnowledgeBlock => include_str!("../../../prompts/knowledge_block.md"),
+            Template::PeopleBlock => include_str!("../../../prompts/people_block.md"),
             Template::TriggerAddressed => include_str!("../../../prompts/trigger_addressed.md"),
             Template::TriggerWake => include_str!("../../../prompts/trigger_wake.md"),
             Template::DescribeImage => include_str!("../../../prompts/describe_image.md"),
@@ -51,6 +54,7 @@ impl Template {
             Template::Legend => &[],
             Template::PersonaBlock => &["persona"],
             Template::KnowledgeBlock => &["knowledge"],
+            Template::PeopleBlock => &["entries"],
             Template::TriggerAddressed => &["now", "timezone", "sender", "message"],
             Template::TriggerWake => &["now", "timezone", "task", "depth", "intent"],
             Template::DescribeImage => &["language"],
@@ -81,6 +85,7 @@ impl Template {
             Template::Legend => "legend",
             Template::PersonaBlock => "persona_block",
             Template::KnowledgeBlock => "knowledge_block",
+            Template::PeopleBlock => "people_block",
             Template::TriggerAddressed => "trigger_addressed",
             Template::TriggerWake => "trigger_wake",
             Template::DescribeImage => "describe_image",

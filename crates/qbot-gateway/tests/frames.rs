@@ -198,7 +198,7 @@ fn stickers_show_their_label_until_described_and_carry_their_id() {
     assert_eq!(render(&m.segments, &ctx()), "[sticker:\u{FF3B}shy\u{FF3D}]");
     let job = qbot_gateway::media::job_for(&m, &ctx());
     assert_eq!(job.items.len(), 1);
-    assert_eq!(job.items[0].kind, qbot_media::Kind::Sticker);
+    assert_eq!(job.items[0].kind, qbot_core::MediaKind::Sticker);
     assert_eq!(job.items[0].reference.key.as_deref(), Some("e9"));
 }
 

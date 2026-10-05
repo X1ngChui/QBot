@@ -13,6 +13,9 @@ pub struct Scenario {
     #[serde(default = "default_start")]
     pub start: String,
     pub members: Vec<Member>,
+    /// Sets of member numbers whose accounts are linked as one person.
+    #[serde(default)]
+    pub same_person: Vec<Vec<u32>>,
     pub chat: Vec<Line>,
     pub trigger: TriggerSpec,
     #[serde(default)]

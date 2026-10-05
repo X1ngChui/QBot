@@ -23,12 +23,43 @@ impl std::fmt::Debug for PgRunLog {
     }
 }
 
+/// What started a run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerKind {
+    Addressed,
+    Wake,
+}
+
+impl TriggerKind {
+    fn of(trigger: &Trigger) -> Self {
+        match trigger {
+            Trigger::Addressed { .. } => TriggerKind::Addressed,
+            Trigger::Wake { .. } => TriggerKind::Wake,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TriggerKind::Addressed => "addressed",
+            TriggerKind::Wake => "wake",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            "addressed" => Some(TriggerKind::Addressed),
+            "wake" => Some(TriggerKind::Wake),
+            _ => None,
+        }
+    }
+}
+
 /// The row of one run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunRecord {
     pub run: RunId,
     pub group: GroupId,
-    pub trigger_kind: String,
+    pub trigger_kind: TriggerKind,
     pub started: UnixMillis,
     pub ended: Option<UnixMillis>,
     pub end: Option<RunEnd>,
@@ -41,20 +72,18 @@ pub struct RunRecord {
     pub sends: Option<i32>,
 }
 
-fn trigger_json(trigger: &Trigger) -> (&'static str, Value) {
+fn trigger_json(trigger: &Trigger) -> Value {
     match trigger {
-        Trigger::Addressed { message, sender } => (
-            "addressed",
-            json!({ "message": message.get(), "sender": sender.get() }),
-        ),
+        Trigger::Addressed { message, sender } => {
+            json!({ "message": message.get(), "sender": sender.get() })
+        }
         Trigger::Wake {
             timer,
             intent,
             chain,
-        } => (
-            "wake",
-            json!({ "timer": timer.get(), "intent": intent, "chain": chain.id.get(), "depth": chain.depth }),
-        ),
+        } => {
+            json!({ "timer": timer.get(), "intent": intent, "chain": chain.id.get(), "depth": chain.depth })
+        }
     }
 }
 
@@ -73,7 +102,11 @@ fn to_record(row: &sqlx::postgres::PgRow) -> Result<RunRecord, StoreError> {
                 .map_err(|_| StoreError::corrupt("negative run id"))?,
         ),
         group: GroupId::new(row.get("group_id")).map_err(|e| StoreError::corrupt(e.to_string()))?,
-        trigger_kind: row.get("trigger_kind"),
+        trigger_kind: {
+            let kind: String = row.get("trigger_kind");
+            TriggerKind::parse(&kind)
+                .ok_or_else(|| StoreError::corrupt(format!("unknown trigger kind {kind:?}")))?
+        },
         started: UnixMillis::new(row.get("started_ms")),
         ended: row.get::<Option<i64>, _>("ended_ms").map(UnixMillis::new),
         end: end
@@ -225,7 +258,7 @@ async fn insert_item(
 #[async_trait]
 impl RunLog for PgRunLog {
     async fn begin(&self, group: GroupId, trigger: &Trigger) -> Result<RunId, EnvError> {
-        let (kind, payload) = trigger_json(trigger);
+        let (kind, payload) = (TriggerKind::of(trigger).as_str(), trigger_json(trigger));
         let row = sqlx::query(
             "INSERT INTO run (group_id, trigger_kind, trigger, started_ms) VALUES ($1, $2, $3, $4) \
              RETURNING run_id",

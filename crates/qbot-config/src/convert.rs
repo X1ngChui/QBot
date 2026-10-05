@@ -11,6 +11,7 @@ use qbot_agent::SupervisorConfig;
 use qbot_core::{AccountId, HistoryWindow, SliceGrid};
 use qbot_llm::ReasoningEffort;
 use qbot_llm::embedding::EmbeddingConfig;
+use qbot_llm::net::Route;
 use qbot_llm::responses::{ResponsesConfig, StateMode};
 use qbot_llm::search::TavilyConfig;
 use qbot_media::MediaConfig;
@@ -21,7 +22,7 @@ use qbot_tools::ToolSettings;
 
 use crate::error::{ConfigError, ConfigErrors};
 use crate::load::Layout;
-use crate::model::{Config, ProviderKind, Reasoning, SearchDepth};
+use crate::model::{Config, ProviderKind, Reasoning, SearchDepth, Service};
 
 /// Replies that may wait for a model slot, per slot. Beyond that a trigger is dropped: a reply
 /// that waits longer than the queue drains would mostly miss its deadline anyway.
@@ -207,9 +208,15 @@ impl Config {
         TavilyConfig::new(depth(s.depth), depth(s.extract_depth))
     }
 
-    /// The search-only proxy, `None` for a direct connection.
-    pub fn search_proxy(&self) -> Option<&str> {
-        Some(self.providers.search.proxy.as_str()).filter(|p| !p.is_empty())
+    /// How `service` reaches the network: through the proxy if one is set and the service is
+    /// listed for it, else directly.
+    pub fn route(&self, service: Service) -> Route {
+        let n = &self.network;
+        if n.proxy.is_empty() || !n.proxy_for.contains(&service) {
+            Route::Direct
+        } else {
+            Route::Proxy(n.proxy.clone())
+        }
     }
 
     /// The recurring schedules: the nightly run always, the report when someone receives it.

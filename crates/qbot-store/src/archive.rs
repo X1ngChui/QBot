@@ -1,11 +1,9 @@
 //! The chat archive and stable member numbers.
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use qbot_agent::{Archive, ArchiveCursor, ArchivedLine, EnvError, HistoryQuery, TextQuery};
-use qbot_context::{ChatLine, MemberStanding, Speaker};
-use qbot_core::{AccountId, Clock, GroupId, MemberNo, MessageId, UnixMillis};
+use qbot_context::{ChatLine, Speaker};
+use qbot_core::{AccountId, GroupId, MediaKind, MemberNo, MessageId, UnixMillis};
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
 
@@ -29,8 +27,7 @@ pub struct NewLine {
 /// A platform reference to one picture, sticker, clip or forwarded record of a line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaRefRow {
-    /// `image`, `sticker`, `voice` or `forward`.
-    pub kind: String,
+    pub kind: MediaKind,
     /// Position among the markers of this kind in the line, from 0.
     pub index: u32,
     pub key: Option<String>,
@@ -51,30 +48,67 @@ pub enum Appended {
     Duplicate,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct PgArchive {
     pool: PgPool,
-    clock: Arc<dyn Clock>,
 }
 
-impl std::fmt::Debug for PgArchive {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PgArchive").finish_non_exhaustive()
-    }
+/// Who in a group is blocked and whose accounts belong to one person, by member number.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupPeople {
+    /// Numbered members whose block is in force, ascending.
+    pub blocked: Vec<MemberNo>,
+    /// Members whose accounts belong to one person: each set ascending and of at least two
+    /// numbered members of this group, the sets ordered by their lowest number.
+    pub same_person: Vec<Vec<MemberNo>>,
 }
 
-/// Lines with the member number and the *current* block standing of their author.
+/// Lines with their author's member number.
 const SELECT_LINES: &str = "\
-    SELECT l.seq, l.ordinal, l.message_id, l.speaker, l.account_id, l.at_ms, l.text, m.number, \
-           (b.account_id IS NOT NULL) AS blocked \
+    SELECT l.seq, l.ordinal, l.message_id, l.speaker, l.account_id, l.at_ms, l.text, m.number \
     FROM chat_line l \
-    LEFT JOIN member_number m ON m.group_id = l.group_id AND m.account_id = l.account_id \
-    LEFT JOIN group_block b ON b.group_id = l.group_id AND b.account_id = l.account_id \
-         AND (b.until_ms IS NULL OR b.until_ms > $1) ";
+    LEFT JOIN member_number m ON m.group_id = l.group_id AND m.account_id = l.account_id ";
 
 impl PgArchive {
-    pub fn new(pool: PgPool, clock: Arc<dyn Clock>) -> Self {
-        Self { pool, clock }
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// The group's blocked members and same-person sets as of `now`, from the block list and
+    /// the identity store. Accounts that have no number in this group do not appear.
+    pub async fn people(&self, group: GroupId, now: UnixMillis) -> Result<GroupPeople, StoreError> {
+        let blocked: Vec<i32> = sqlx::query_scalar(
+            "SELECT m.number FROM group_block b \
+             JOIN member_number m ON m.group_id = b.group_id AND m.account_id = b.account_id \
+             WHERE b.group_id = $1 AND (b.until_ms IS NULL OR b.until_ms > $2) \
+             ORDER BY m.number",
+        )
+        .bind(group.get())
+        .bind(now.get())
+        .fetch_all(&self.pool)
+        .await?;
+        let same_person: Vec<Vec<i32>> = sqlx::query_scalar(
+            "SELECT array_agg(m.number ORDER BY m.number) FROM member_number m \
+             JOIN account a ON a.account_id = m.account_id \
+             WHERE m.group_id = $1 \
+             GROUP BY a.holder_id HAVING count(*) > 1 \
+             ORDER BY min(m.number)",
+        )
+        .bind(group.get())
+        .fetch_all(&self.pool)
+        .await?;
+        let number = |n: i32| {
+            u32::try_from(n)
+                .map(MemberNo::new)
+                .map_err(|e| StoreError::corrupt(e.to_string()))
+        };
+        Ok(GroupPeople {
+            blocked: blocked.into_iter().map(number).collect::<Result<_, _>>()?,
+            same_person: same_person
+                .into_iter()
+                .map(|set| set.into_iter().map(number).collect::<Result<_, _>>())
+                .collect::<Result<_, _>>()?,
+        })
     }
 
     /// Archive one line. Members get a stable number on first appearance, assigned densely per
@@ -164,7 +198,7 @@ impl PgArchive {
             )
             .bind(new.group.get())
             .bind(new.message.get())
-            .bind(&item.kind)
+            .bind(item.kind.marker())
             .bind(i32::try_from(item.index).map_err(|e| StoreError::corrupt(e.to_string()))?)
             .bind(&item.key)
             .bind(&item.file)
@@ -188,21 +222,21 @@ impl PgArchive {
         &self,
         group: GroupId,
         message: MessageId,
-        kind: &str,
+        kind: MediaKind,
         index: u32,
     ) -> Result<Option<MediaRefRow>, StoreError> {
         let row = sqlx::query(
-            "SELECT kind, idx, key, file, url, size_bytes FROM media_ref \
+            "SELECT idx, key, file, url, size_bytes FROM media_ref \
              WHERE group_id = $1 AND message_id = $2 AND kind = $3 AND idx = $4",
         )
         .bind(group.get())
         .bind(message.get())
-        .bind(kind)
+        .bind(kind.marker())
         .bind(i32::try_from(index).unwrap_or(i32::MAX))
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| MediaRefRow {
-            kind: r.get("kind"),
+            kind,
             index: u32::try_from(r.get::<i32, _>("idx")).unwrap_or(0),
             key: r.get("key"),
             file: r.get("file"),
@@ -274,11 +308,10 @@ impl PgArchive {
         limit: i64,
     ) -> Result<(Vec<ChatLine>, ArchiveCursor), StoreError> {
         let sql = format!(
-            "SELECT * FROM ({SELECT_LINES} WHERE l.group_id = $2 ORDER BY l.seq DESC LIMIT $3) recent \
+            "SELECT * FROM ({SELECT_LINES} WHERE l.group_id = $1 ORDER BY l.seq DESC LIMIT $2) recent \
              ORDER BY seq"
         );
         let rows = sqlx::query(&sql)
-            .bind(self.clock.now().get())
             .bind(group.get())
             .bind(limit)
             .fetch_all(&self.pool)
@@ -308,9 +341,8 @@ impl PgArchive {
     ) -> Result<(Vec<(u64, ChatLine)>, ArchiveCursor), StoreError> {
         let start = i64::try_from(first).map_err(|e| StoreError::corrupt(e.to_string()))?;
         let sql =
-            format!("{SELECT_LINES} WHERE l.group_id = $2 AND l.ordinal >= $3 ORDER BY l.ordinal");
+            format!("{SELECT_LINES} WHERE l.group_id = $1 AND l.ordinal >= $2 ORDER BY l.ordinal");
         let rows = sqlx::query(&sql)
-            .bind(self.clock.now().get())
             .bind(group.get())
             .bind(start)
             .fetch_all(&self.pool)
@@ -331,12 +363,8 @@ impl PgArchive {
     }
 
     async fn line_by_seq(&self, seq: i64) -> Result<ArchivedLine, StoreError> {
-        let sql = format!("{SELECT_LINES} WHERE l.seq = $2");
-        let row = sqlx::query(&sql)
-            .bind(self.clock.now().get())
-            .bind(seq)
-            .fetch_one(&self.pool)
-            .await?;
+        let sql = format!("{SELECT_LINES} WHERE l.seq = $1");
+        let row = sqlx::query(&sql).bind(seq).fetch_one(&self.pool).await?;
         to_line(&row)
     }
 }
@@ -379,15 +407,9 @@ fn to_line(row: &PgRow) -> Result<ArchivedLine, StoreError> {
             let number = number
                 .and_then(|n| u32::try_from(n).ok())
                 .ok_or_else(|| StoreError::corrupt("member line without a member number"))?;
-            let standing = if row.get::<bool, _>("blocked") {
-                MemberStanding::Blocked
-            } else {
-                MemberStanding::Normal
-            };
             Speaker::Member {
                 account,
                 number: MemberNo::new(number),
-                standing,
             }
         }
         other => return Err(StoreError::corrupt(format!("unknown speaker {other:?}"))),
@@ -414,9 +436,8 @@ impl Archive for PgArchive {
         group: GroupId,
         cursor: ArchiveCursor,
     ) -> Result<Vec<ArchivedLine>, EnvError> {
-        let sql = format!("{SELECT_LINES} WHERE l.group_id = $2 AND l.seq > $3 ORDER BY l.seq");
+        let sql = format!("{SELECT_LINES} WHERE l.group_id = $1 AND l.seq > $2 ORDER BY l.seq");
         let rows = sqlx::query(&sql)
-            .bind(self.clock.now().get())
             .bind(group.get())
             .bind(i64::try_from(cursor.0).map_err(env)?)
             .fetch_all(&self.pool)
@@ -436,23 +457,21 @@ impl Archive for PgArchive {
         query: &HistoryQuery,
         limit: usize,
     ) -> Result<Vec<ChatLine>, EnvError> {
-        // $1 and $2 are taken by SELECT_LINES and the group; terms follow, then the speaker and
-        // the limit. Only placeholders and fixed text go into the SQL.
+        // $1 is the group; terms follow, then the speaker and the limit. Only placeholders and
+        // fixed text go into the SQL.
         let mut terms = Vec::new();
-        let condition = text_condition(&query.text, &mut terms, 3);
-        let mut next = 3 + terms.len();
+        let condition = text_condition(&query.text, &mut terms, 2);
+        let mut next = 2 + terms.len();
         let speaker = query.speaker.map(|_| {
             let clause = format!(" AND m.number = ${next}");
             next += 1;
             clause
         });
         let sql = format!(
-            "{SELECT_LINES} WHERE l.group_id = $2 AND ({condition}){} ORDER BY l.seq DESC LIMIT ${next}",
+            "{SELECT_LINES} WHERE l.group_id = $1 AND ({condition}){} ORDER BY l.seq DESC LIMIT ${next}",
             speaker.as_deref().unwrap_or("")
         );
-        let mut statement = sqlx::query(&sql)
-            .bind(self.clock.now().get())
-            .bind(group.get());
+        let mut statement = sqlx::query(&sql).bind(group.get());
         for term in terms {
             statement = statement.bind(term);
         }

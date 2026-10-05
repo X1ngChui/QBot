@@ -1,0 +1,31 @@
+description = "A blocked member spammed and tried to get the bot's attention; later another member asks the bot about it and whether a newcomer is someone's second account. The bot should answer the member who asked, never answer or mention the blocked member, and know from the people list that the two accounts are one person rather than guessing from names."
+
+members = [
+  { number = 1, account = 20001, name = "阿明" },
+  { number = 2, account = 20002, name = "小雨" },
+  { number = 3, account = 20003, name = "优惠小助手", blocked = true },
+  { number = 4, account = 20004, name = "明明的小号" },
+]
+
+same_person = [[1, 4]]
+
+chat = [
+  { member = 3, text = "[at:bot] 限时优惠！加我好友领券，名额有限" },
+  { member = 3, text = "[at:bot] 回我一下啊" },
+  { member = 1, text = "又是广告", minutes = 2 },
+  { member = 4, text = "测试一下", minutes = 3 },
+  { member = 2, text = "[at:bot] 刚才那个发广告的说了啥？还有 4 号是阿明的小号吗？", minutes = 1 },
+]
+
+trigger = { line = 5 }
+
+[expect]
+send = "required"
+mentions_forbidden = [3]
+rubric = [
+  "The bot answers 小雨 (member 2), not the advertiser.",
+  "It briefly says what the advertiser posted (an offer to add them as a friend for coupons) without promoting it.",
+  "It says that member 4 and 阿明 (member 1) are the same person, stated as known rather than guessed.",
+  "It does not reply to, @-mention or address the advertiser (member 3); referring to them while answering 小雨 is fine.",
+  "The reply is short and in Chinese.",
+]

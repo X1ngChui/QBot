@@ -38,7 +38,7 @@ async fn blocks_roster_and_mute_state_are_readable() {
     let clock = ManualClock::new(T0);
     let admin = PgAdmin::new(db.pool().clone(), clock.clone());
     let policy = PgGroupPolicy::new(db.pool().clone(), clock.clone());
-    let archive = PgArchive::new(db.pool().clone(), clock.clone());
+    let archive = PgArchive::new(db.pool().clone());
     let g = group(10);
 
     assert!(!admin.is_muted(g).await.unwrap());
@@ -142,7 +142,7 @@ async fn the_daily_report_and_housekeeping_read_what_happened() {
     let db = db!();
     let clock = ManualClock::new(T0);
     let admin = PgAdmin::new(db.pool().clone(), clock.clone());
-    let archive = PgArchive::new(db.pool().clone(), clock.clone());
+    let archive = PgArchive::new(db.pool().clone());
     let log = PgRunLog::new(db.pool().clone(), clock.clone());
     let (g1, g2) = (group(21), group(22));
 

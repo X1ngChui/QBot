@@ -19,8 +19,9 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::clean::sniff_mime;
-use crate::item::{Kind, MediaRef};
+use crate::item::MediaRef;
 use crate::ports::{FetchError, Fetcher};
+use qbot_core::MediaKind;
 
 /// How much fetched picture data is kept in memory, and for how long after its last use. Internal
 /// tuning: enough for the pictures of the runs in flight, not a deployment choice.
@@ -38,7 +39,7 @@ pub trait MediaRefs: Send + Sync {
         &self,
         group: GroupId,
         message: MessageId,
-        kind: Kind,
+        kind: MediaKind,
         index: u32,
     ) -> Result<Option<MediaRef>, RefsError>;
 }
@@ -48,7 +49,7 @@ pub trait MediaRefs: Send + Sync {
 struct Address {
     group: GroupId,
     message: MessageId,
-    kind: Kind,
+    kind: MediaKind,
     index: u32,
 }
 
@@ -67,11 +68,8 @@ impl Address {
         let mut parts = key.split('/');
         let group = GroupId::new(parts.next()?.parse().ok()?).ok()?;
         let message = MessageId::new(parts.next()?.parse().ok()?).ok()?;
-        let kind = match parts.next()? {
-            "image" => Kind::Image,
-            "sticker" => Kind::Sticker,
-            _ => return None,
-        };
+        // Only pictures can be opened.
+        let kind = MediaKind::from_marker(parts.next()?).filter(|k| *k != MediaKind::Voice)?;
         let index = parts.next()?.parse().ok()?;
         parts.next().is_none().then_some(Self {
             group,
@@ -231,9 +229,9 @@ impl Tool for OpenImages {
                 )));
             };
             let kind = if picture.sticker {
-                Kind::Sticker
+                MediaKind::Sticker
             } else {
-                Kind::Image
+                MediaKind::Image
             };
             let address = Address {
                 group: cx.group,

@@ -854,7 +854,6 @@ fn web_search_needs_its_key_only_when_enabled_and_converts_every_setting() {
     let env = MapEnv::new([
         ("QBOT__PROVIDERS__SEARCH__ENABLED", "true"),
         ("QBOT__PROVIDERS__SEARCH__DEPTH", "advanced"),
-        ("QBOT__PROVIDERS__SEARCH__PROXY", "http://172.17.0.1:7890"),
     ]);
     let on = load(&root, &env).unwrap();
     let missing = on
@@ -883,20 +882,69 @@ fn web_search_needs_its_key_only_when_enabled_and_converts_every_setting() {
             qbot_llm::search::SearchDepth::Basic,
         )
     );
-    assert_eq!(c.search_proxy(), Some("http://172.17.0.1:7890"));
-    assert_eq!(off.config.search_proxy(), None, "empty means direct");
+}
+
+#[test]
+fn one_proxy_serves_the_services_listed_for_it_and_the_rest_connect_directly() {
+    use qbot_config::Service;
+    use qbot_llm::net::Route;
+    let root = scratch();
+    let none = load(&root, &MapEnv::default()).unwrap().config;
+    for service in [
+        Service::Text,
+        Service::Vision,
+        Service::Embedding,
+        Service::Search,
+        Service::Media,
+    ] {
+        assert_eq!(none.route(service), Route::Direct, "no proxy, all direct");
+    }
+
+    let proxy = "http://172.17.0.1:7890";
+    let all = load(&root, &MapEnv::new([("QBOT__NETWORK__PROXY", proxy)]))
+        .unwrap()
+        .config;
+    assert_eq!(
+        all.route(Service::Media),
+        Route::Proxy(proxy.into()),
+        "a proxy serves every service by default"
+    );
+
+    let some = load(
+        &root,
+        &MapEnv::new([
+            ("QBOT__NETWORK__PROXY", proxy),
+            ("QBOT__NETWORK__PROXY_FOR", "[\"search\"]"),
+        ]),
+    )
+    .unwrap()
+    .config;
+    assert_eq!(some.route(Service::Search), Route::Proxy(proxy.into()));
+    assert_eq!(some.route(Service::Text), Route::Direct);
+    assert_eq!(some.route(Service::Media), Route::Direct);
 
     let bad = errors(load(
         &root,
         &MapEnv::new([
-            ("QBOT__PROVIDERS__SEARCH__ENABLED", "true"),
-            ("QBOT__PROVIDERS__SEARCH__PROXY", "not a url"),
+            ("QBOT__NETWORK__PROXY", "not a url"),
+            ("QBOT__NETWORK__PROXY_FOR", "[\"search\", \"ftp\"]"),
         ]),
     ));
-    let keys: Vec<_> = bad.iter().map(ToString::to_string).collect();
+    let text: Vec<_> = bad.iter().map(ToString::to_string).collect();
     assert!(
-        keys.iter().any(|k| k.contains("providers.search.proxy")),
-        "{keys:?}"
+        text.iter()
+            .any(|k| k.contains("proxy_for") || k.contains("ftp")),
+        "an unknown service is refused: {text:?}"
+    );
+    let bad_url = errors(load(
+        &root,
+        &MapEnv::new([("QBOT__NETWORK__PROXY", "not a url")]),
+    ));
+    assert!(
+        bad_url
+            .iter()
+            .any(|e| matches!(e, ConfigError::Invalid { key, .. } if key == "network.proxy")),
+        "{bad_url:?}"
     );
 }
 

@@ -26,7 +26,8 @@ use qbot_memory::{
     Recall, RecallParams,
 };
 use qbot_prompt::{
-    FactKnowledge, HistorySource, Personas, PromptContext, PromptRenderer, PromptSettings,
+    FactKnowledge, GroupPeople, HistorySource, PeopleSource, Personas, PromptContext,
+    PromptRenderer, PromptSettings,
 };
 use qbot_sched::{MemoryTimerStore, TaskLimits, TaskService};
 use qbot_tools::{
@@ -83,6 +84,16 @@ impl HistorySource for WorldHistory {
             (1u64..).zip(lines).filter(|(o, _)| *o >= first).collect(),
             cursor,
         ))
+    }
+}
+
+/// The scenario's blocked members, as the store would report them.
+struct ScenarioPeople(GroupPeople);
+
+#[async_trait]
+impl PeopleSource for ScenarioPeople {
+    async fn people(&self, _: GroupId, _: UnixMillis) -> Result<GroupPeople, EnvError> {
+        Ok(self.0.clone())
     }
 }
 
@@ -173,9 +184,22 @@ impl Runner {
                 .map(|(_, a)| *a)
                 .ok_or_else(|| format!("unknown member {n}"))
         };
+        let mut people = GroupPeople::default();
         for m in scenario.members.iter().filter(|m| m.blocked) {
             world.block(m.account);
+            people.blocked.push(qbot_core::MemberNo::new(m.number));
         }
+        people.blocked.sort();
+        people.same_person = scenario
+            .same_person
+            .iter()
+            .map(|set| {
+                let mut set: Vec<_> = set.iter().map(|n| qbot_core::MemberNo::new(*n)).collect();
+                set.sort();
+                set
+            })
+            .collect();
+        people.same_person.sort();
 
         // The chat, with times.
         let mut at = timestamp(&scenario.start)?;
@@ -358,7 +382,8 @@ impl Runner {
         .with_knowledge(Arc::new(FactKnowledge::new(
             facts.clone(),
             FactKnowledge::MAX_TERMS,
-        )));
+        )))
+        .with_people(Arc::new(ScenarioPeople(people)));
         let trigger = match (&scenario.trigger.line, &scenario.trigger.wake) {
             (Some(n), _) => {
                 let line = &lines[n - 1];

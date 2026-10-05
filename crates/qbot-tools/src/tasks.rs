@@ -11,29 +11,24 @@ use qbot_sched::{Origin, TaskError, TaskService, Timer, TimerState, When};
 use qbot_wording::{Text, say};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use time::OffsetDateTime;
-use time::format_description::well_known::Rfc3339;
 
 /// Tasks per page in listings. A presentation size, not a limit on tasks.
 const PAGE: usize = 5;
 
+/// RFC 3339 in UTC.
 pub(crate) fn format_time(at: UnixMillis) -> String {
-    let nanos = i128::from(at.get()) * 1_000_000;
-    OffsetDateTime::from_unix_timestamp_nanos(nanos)
-        .ok()
-        .and_then(|t| t.format(&Rfc3339).ok())
-        .unwrap_or_else(|| format!("{}ms", at.get()))
+    jiff::Timestamp::from_millisecond(at.get())
+        .map_or_else(|_| format!("{}ms", at.get()), |t| t.to_string())
 }
 
+/// An RFC 3339 instant; the offset is required.
 fn parse_time(text: &str) -> Result<UnixMillis, ToolError> {
-    let parsed = OffsetDateTime::parse(text, &Rfc3339).map_err(|_| {
+    let parsed: jiff::Timestamp = text.parse().map_err(|_| {
         ToolError::InvalidArguments(say(Text::TasksRunAtFormat {
             text: format!("{text:?}"),
         }))
     })?;
-    let millis = i64::try_from(parsed.unix_timestamp_nanos() / 1_000_000)
-        .map_err(|_| ToolError::InvalidArguments(say(Text::TasksRunAtRange {})))?;
-    Ok(UnixMillis::new(millis))
+    Ok(UnixMillis::new(parsed.as_millisecond()))
 }
 
 fn when(run_at: Option<&str>, delay_seconds: Option<u64>) -> Result<Option<When>, ToolError> {

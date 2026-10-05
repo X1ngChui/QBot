@@ -3,17 +3,16 @@
 use qbot_context::{AssistantPart, Item, Outcome, Part};
 use qbot_core::RunId;
 use qbot_i18n::Msg;
-use qbot_store::RunRecord;
+use qbot_store::{RunRecord, TriggerKind};
 
 use super::Reply;
 use crate::args;
 use crate::router::Cx;
 
 fn trigger_label(cx: &Cx<'_>, record: &RunRecord) -> String {
-    cx.t(&if record.trigger_kind == "wake" {
-        Msg::RunsTriggerWake {}
-    } else {
-        Msg::RunsTriggerAddressed {}
+    cx.t(&match record.trigger_kind {
+        TriggerKind::Wake => Msg::RunsTriggerWake {},
+        TriggerKind::Addressed => Msg::RunsTriggerAddressed {},
     })
 }
 

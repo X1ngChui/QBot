@@ -2,19 +2,18 @@
 
 use qbot_context::{
     AssistantPart, AssistantTurn, ChatBatch, ChatLine, ErrorKind, Instruction, InstructionRole,
-    Item, MemberStanding, Outcome, Part, Speaker, ToolCall, ToolResult, Transcript, project,
+    Item, Outcome, Part, Speaker, ToolCall, ToolResult, Transcript, project,
 };
 use qbot_core::{AccountId, CallId, MemberNo, MessageId, UnixMillis};
 use qbot_llm::{Content, ConvItem, Conversation, PlainRenderer, Role, ToolStatus};
 use serde_json::json;
 
-fn line(msg: i64, account: i64, standing: MemberStanding, text: &str) -> ChatLine {
+fn line(msg: i64, account: i64, text: &str) -> ChatLine {
     ChatLine {
         message: MessageId::new(msg).unwrap(),
         speaker: Speaker::Member {
             account: AccountId::new(account).unwrap(),
             number: MemberNo::new(account as u32),
-            standing,
         },
         at: UnixMillis::new(msg),
         text: text.into(),
@@ -53,8 +52,8 @@ fn a_run_lowers_to_a_valid_provider_conversation() {
     }))
     .unwrap();
     t.append(Item::Chat(ChatBatch::new(vec![
-        line(1, 1, MemberStanding::Normal, "hello"),
-        line(2, 2, MemberStanding::Blocked, "spam"),
+        line(1, 1, "hello"),
+        line(2, 2, "spam"),
     ])))
     .unwrap();
     t.append(call("a")).unwrap();
@@ -78,10 +77,7 @@ fn a_run_lowers_to_a_valid_provider_conversation() {
         panic!()
     };
     assert!(text.contains("[msg:1] member:1: hello"));
-    assert!(
-        text.contains("[msg:2] member:2 (blocked: do not reply): spam"),
-        "blocked members are marked, not hidden"
-    );
+    assert!(text.contains("[msg:2] member:2: spam"));
 
     let outputs: Vec<_> = conv
         .items()
@@ -109,13 +105,8 @@ fn a_run_lowers_to_a_valid_provider_conversation() {
 fn prefix_digests_pin_a_continuation_to_unchanged_history() {
     let build = |old: &str| {
         let mut t = Transcript::new();
-        t.append(Item::Chat(ChatBatch::new(vec![line(
-            1,
-            1,
-            MemberStanding::Normal,
-            old,
-        )])))
-        .unwrap();
+        t.append(Item::Chat(ChatBatch::new(vec![line(1, 1, old)])))
+            .unwrap();
         t.append(call("a")).unwrap();
         t.append(result("a", Outcome::Ok, "x")).unwrap();
         Conversation::lower(&project(&t).unwrap(), &PlainRenderer)
