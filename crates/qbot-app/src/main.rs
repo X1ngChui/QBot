@@ -23,9 +23,6 @@ commands:
   check-config     load, validate and report where every layer came from; exit 0 if valid
   print-config     print the effective configuration (secret names, never secret values)
   print-defaults   print the baked-in defaults
-  import-history FILE [--dry-run]
-                   import the Python bot's chat history from an export made with
-                   deploy/export_python_history.sql; the bot must not be running
 
 environment:
   QBOT_CONFIG_DIR   configuration directory   (default /etc/qbot)
@@ -95,57 +92,6 @@ fn main() -> ExitCode {
             });
             match outcome {
                 Ok(()) => ExitCode::SUCCESS,
-                Err(error) => {
-                    eprintln!("{error}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
-        Some("import-history") => {
-            let args: Vec<String> = std::env::args().skip(2).collect();
-            let dry_run = args.iter().any(|a| a == "--dry-run");
-            let files: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
-            let ([file], true) = (
-                files.as_slice(),
-                args.len() == files.len() + usize::from(dry_run),
-            ) else {
-                eprintln!("{USAGE}");
-                return ExitCode::from(2);
-            };
-            let loaded = match load() {
-                Ok(loaded) => loaded,
-                Err(errors) => {
-                    eprint!("{errors}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-                )
-                .init();
-            let runtime = match tokio::runtime::Runtime::new() {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    eprintln!("cannot start the async runtime: {error}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            let outcome = runtime.block_on(qbot_app::import::import_history(
-                loaded,
-                Arc::new(ProcessEnv),
-                std::path::Path::new(file.as_str()),
-                dry_run,
-            ));
-            match outcome {
-                Ok(stats) => {
-                    if dry_run {
-                        println!("dry run: nothing written");
-                    }
-                    println!("{stats}");
-                    ExitCode::SUCCESS
-                }
                 Err(error) => {
                     eprintln!("{error}");
                     ExitCode::FAILURE

@@ -322,7 +322,7 @@ impl Pipeline {
 /// What a message is archived as: its line, and the media work it carries (each picture, sticker
 /// and clip with its reference and its position in the line). `None` when the message renders to
 /// nothing.
-pub fn archive_form(m: &GroupMessage, ctx: &RenderContext) -> Option<(Incoming, MediaJob)> {
+fn archive_form(m: &GroupMessage, ctx: &RenderContext) -> Option<(Incoming, MediaJob)> {
     let text = render::render(&m.segments, ctx);
     if text.is_empty() {
         return None;

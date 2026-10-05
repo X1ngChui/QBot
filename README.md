@@ -41,7 +41,7 @@ start), recovers what a previous process left open, then listens for NapCat's re
 on `gateway.listen`, path `/onebot/v11/ws`, with the token named by `gateway.access_token_secret`.
 
 How it works: [docs/architecture.md](docs/architecture.md), and [docs/memory.md](docs/memory.md)
-for memory. Replacing the earlier Python bot in production: [docs/cutover.md](docs/cutover.md).
+for memory.
 
 ## Development
 

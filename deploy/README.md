@@ -128,29 +128,3 @@ The bot runs its own maintenance; nothing outside the container is needed.
   it is down the job retries. With no owners there is no report.
 - **Retention.** `maintenance.runs_keep_days` (0 keeps them) bounds the run transcripts, the one
   table that grows with every reply; the rest of the upkeep above has fixed periods.
-
-## Importing the Python bot's chat history
-
-Cutover tooling, deleted after the cutover (docs/cutover.md). Only the chat history
-is imported, with the Python bot's picture descriptions; episodes, facts and group knowledge are
-built from it by the nightly extraction.
-
-1. Export from the Python bot's database, read-only, to a private file:
-
-   ```bash
-   docker exec -i -e PGOPTIONS="-c default_transaction_read_only=on" <python-postgres> \
-     psql -X -q -A -t -v ON_ERROR_STOP=1 -U qqbot -d qqbot < export_python_history.sql > history.jsonl
-   chmod 600 history.jsonl
-   ```
-
-2. Check it against the Rust deployment without writing (the bot must not be running; the import
-   takes the same database lease):
-
-   ```bash
-   docker compose run --rm -v "$PWD/history.jsonl:/tmp/history.jsonl:ro" qbot \
-     import-history /tmp/history.jsonl --dry-run
-   ```
-
-3. Run the same command without `--dry-run`. A rerun skips what is already archived; a group that
-   already has lines the export does not contain is refused.
-4. Delete `history.jsonl` and start the bot. The next nightly run extracts what was imported.

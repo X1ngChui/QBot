@@ -19,8 +19,7 @@
 #   ./secrets -> /run/secrets    read-only   one file per secret, named in lower case
 #   ./data/postgres              the database's own volume
 
-# Distinct from the Python bot's project (`qbot`), so both can live on one host.
-name: qbot-rust
+name: qbot
 
 services:
   postgres:

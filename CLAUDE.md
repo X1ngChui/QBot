@@ -5,9 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 QBot is an AI member for QQ group chats: a Rust service (`qbot run`) that NapCat (OneBot v11)
 connects to over a reverse WebSocket, backed by PostgreSQL 17 + pgvector. Read
 `docs/architecture.md` before larger changes; it is the authoritative design doc, with
-`docs/memory.md` for identity, episodes, extraction and recall. `docs/cutover.md` lists what is
-left of replacing the earlier Python bot in production (that implementation is on the `py` branch,
-for reference only). Develop on `dev`; `main` is the released line.
+`docs/memory.md` for identity, episodes, extraction and recall. Develop on `dev`; `main` is the
+released line. The earlier Python implementation is kept on the `py` branch for reference only.
 
 ## Commands
 

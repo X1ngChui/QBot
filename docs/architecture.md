@@ -4,8 +4,7 @@ QBot is an AI member of QQ group chats. NapCat (OneBot v11) connects to it over 
 WebSocket; it archives every group message, answers when it is addressed or when one of its own
 scheduled tasks comes due, remembers what the group talks about, and keeps out of the way
 otherwise. This document describes how it works and why. Memory (identity,
-episodes, recall) has its own document, [memory.md](memory.md). The remaining steps to replace
-the earlier Python bot in production are in [cutover.md](cutover.md).
+episodes, recall) has its own document, [memory.md](memory.md).
 
 ## 1. What the product does
 
@@ -63,7 +62,7 @@ R13. Localization: member-facing text comes from message catalogs.
 A Cargo workspace. Arrows point from dependent to dependency; there are no cycles.
 
 ```text
-qbot-app       the `qbot` binary: configuration, wiring, signals, cutover import
+qbot-app       the `qbot` binary: configuration, wiring, signals
 qbot-commands  chat commands
 qbot-gateway   OneBot server, rendering, the message pipeline, delivery and echoes
 qbot-ops       nightly run, backups, report, NapCat cache
@@ -360,7 +359,7 @@ spend.
   (a range exclusion constraint). One active fact per subject, predicate and key (a partial
   unique index).
 - **Single instance**: the process holds a Postgres advisory-lock session lease and shuts down if
-  it loses it. Commands that write the archive (the cutover import) take the same lease.
+  it loses it.
 - Database tests need a disposable server in `QBOT_TEST_DATABASE_URL`; each test creates and
   drops its own database.
 

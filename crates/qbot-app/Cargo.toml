@@ -24,7 +24,6 @@ qbot-llm.workspace = true
 qbot-media.workspace = true
 qbot-asr.workspace = true
 qbot-ops.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 qbot-memory.workspace = true
 qbot-prompt.workspace = true
