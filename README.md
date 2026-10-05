@@ -1,4 +1,7 @@
-# QBot
+# QBot (Python, archived)
+
+> This branch preserves the Python implementation for reference and rollback. QBot is now
+> developed in Rust on `main` and `dev`; nothing further is developed here.
 
 QBot is an AI member for QQ group chats. It answers when it is @-mentioned, called by
 name, or quoted; it keeps a structured, per-group memory of the people and events it
