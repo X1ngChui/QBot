@@ -97,18 +97,24 @@ Deploy with `scripts/deploy.sh` (always rebuilds; `docker compose restart` does 
 
 ## Rust rewrite (in progress)
 
-`rust/` holds a ground-up Rust rewrite; the Python code stays until cutover. Start with
-`docs/rust-rewrite/design.md` (architecture, decisions, limits policy), `docs/rust-rewrite/memory.md`
-(identity, episodes, recall), `rust/README.md` (commands; the database tests need a disposable
-pgvector Postgres) and `rust/deploy/README.md` (configuration layers, Docker layout, secrets).
-Workspace crates: `qbot-core` (ids, batch grid), `qbot-context` (canonical transcript), `qbot-llm`
-(provider contract, Responses/DeepSeek adapter, embeddings, fakes), `qbot-agent` (run loop, tools,
-supervisor), `qbot-sched` (timers), `qbot-tools`, `qbot-memory` (identity, episodes), `qbot-store`
-(Postgres), `qbot-config` (typed layered configuration), `qbot-i18n` (member-facing text),
-`qbot-prompt` (instruction templates, personas, chat rendering), `qbot-gateway` (OneBot), `qbot-media` (pictures and voice), `qbot-asr` (speech recognition), `qbot-ops` (nightly pipeline, backups, reports),
-`qbot-commands` (chat commands), `qbot-app` (the `qbot` binary and `qbot run`), `qbot-eval` (reply-quality
-evaluation against the real model; run by hand, see `rust/eval/`).
-Conventions: no CJK in Rust code or comments (it lives only in locale catalogs, resources and
-fixtures); a value that is policy or varies by deployment is configuration, not a constant (and a
-test pins config defaults to the consuming crate's default); local limits must be justified (design
-4.13) and must not duplicate provider-side or already-implied bounds; credentials are never config.
+`rust/` holds the Rust implementation that replaces the Python bot at the cutover; the Python code
+stays until then. Start with `docs/rust-rewrite/design.md` (architecture, configuration, every limit
+and its reason), `docs/rust-rewrite/memory.md` (identity, episodes, extraction, recall),
+`docs/rust-rewrite/cutover.md` (the remaining steps and the transition tooling deleted afterwards),
+`rust/README.md` (commands; the database tests need a disposable pgvector Postgres) and
+`rust/deploy/README.md` (configuration layers, Docker layout, secrets).
+Workspace crates: `qbot-core` (ids, batch grid, markers), `qbot-context` (canonical transcript),
+`qbot-llm` (provider contract, Responses/DeepSeek adapter, embeddings, web search, fakes),
+`qbot-agent` (run loop, tools, supervisor), `qbot-sched` (timers, tasks, recurring schedules),
+`qbot-tools`, `qbot-memory` (identity, episodes, facts, recall, notes), `qbot-store` (Postgres),
+`qbot-config` (typed layered configuration), `qbot-i18n` (member-facing text), `qbot-wording`
+(model-facing short texts), `qbot-prompt` (instruction templates, personas, chat rendering),
+`qbot-gateway` (OneBot), `qbot-media` (pictures and voice), `qbot-asr` (speech recognition),
+`qbot-ops` (nightly run, backups, report), `qbot-commands` (chat commands), `qbot-app` (the `qbot`
+binary), `qbot-eval` (reply-quality evaluation against the real model; run by hand, see `rust/eval/`).
+Conventions: no CJK in Rust code or comments (it lives only in locale catalogs, prompts and
+fixtures); configuration holds only what a deployment may choose, and internal tuning is the
+`Default` of the owning crate's settings; every local limit needs a concrete reason (design.md 14)
+and must not duplicate a provider-side or already-implied bound (no local output-token caps);
+credentials are never config; the schema is one migration file until the Rust schema is in
+production; model-facing wording lives in `rust/prompts/`.

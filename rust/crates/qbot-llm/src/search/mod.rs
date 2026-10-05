@@ -14,7 +14,7 @@ use crate::capability::ProviderId;
 use crate::error::LlmError;
 
 pub use fake::FakeSearch;
-pub use tavily::{ExtractConfig, SearchDepth, TavilyConfig, TavilySearch};
+pub use tavily::{ENDPOINT, ExtractConfig, SearchDepth, TavilyConfig, TavilySearch};
 
 /// One result: where it is, what it is called, and the provider's extract of the page.
 #[derive(Debug, Clone, PartialEq, Eq)]

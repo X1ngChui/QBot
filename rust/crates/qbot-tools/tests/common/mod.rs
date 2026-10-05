@@ -10,8 +10,8 @@ use qbot_agent::{
 };
 use qbot_context::{Item, ToolResult};
 use qbot_core::{AccountId, GroupId, MessageId, TimerId, UnixMillis};
+use qbot_llm::ReasoningEffort;
 use qbot_llm::fake::{FakeProvider, FakeReply, Step};
-use qbot_llm::{Params, ReasoningEffort};
 use qbot_sched::{
     JobError, JobKind, JobRunner, MemoryTimerStore, Scheduler, SchedulerConfig, TaskLimits,
     TaskService, Timer, TimerStore, TokioClock,
@@ -84,11 +84,7 @@ pub fn rig(script: Vec<Step>) -> Rig {
         renderer: renderer(),
         clock: clock.clone(),
         limits: RunLimits::default(),
-        params: Params {
-            max_output_tokens: 1000,
-            reasoning: ReasoningEffort::Low,
-            temperature: None,
-        },
+        reasoning: ReasoningEffort::Low,
         media: None,
     });
     let supervisor = Supervisor::new(

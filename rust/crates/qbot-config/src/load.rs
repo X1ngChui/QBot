@@ -13,7 +13,7 @@
 //! `QBOT__DATABASE__NAME='"2024"'`. Secrets are not configuration and never come through here.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use figment::providers::{Env as FigmentEnv, Format, Toml};
 use figment::{Figment, Metadata, Profile, Provider, value};
@@ -197,11 +197,3 @@ pub fn load_in(layout: Layout) -> Result<Loaded, ConfigErrors> {
 
 /// Environment variables with this prefix override configuration keys.
 const ENV_PREFIX: &str = "QBOT__";
-
-pub(crate) fn resolve_dir(base: &Path, configured: &Path) -> PathBuf {
-    if configured.is_absolute() {
-        configured.to_path_buf()
-    } else {
-        base.join(configured)
-    }
-}

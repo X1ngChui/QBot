@@ -87,7 +87,6 @@ impl ResponsesProvider {
             } else {
                 ForcedToolChoice::Always
             },
-            temperature: !deepseek,
         };
         let id = ProviderId::new(if deepseek { "deepseek" } else { "openai" });
         let info = ProviderInfo {

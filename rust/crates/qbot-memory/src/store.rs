@@ -16,6 +16,8 @@ pub enum MemoryError {
     /// The range is reversed (first after last).
     #[error("episode range is invalid")]
     InvalidRange,
+    #[error("no such episode")]
+    NotFound,
     #[error("storage failure: {0}")]
     Backend(String),
 }
@@ -68,6 +70,25 @@ pub trait EpisodeStore: Send + Sync {
         first_ordinal: u64,
         last_ordinal: u64,
     ) -> Result<Vec<Episode>, MemoryError>;
+
+    /// Episodes of the group that have no embedding from `embed_model` at width `dims`, oldest
+    /// first, at most `limit`: what recall cannot find until they are embedded.
+    async fn unembedded(
+        &self,
+        group: GroupId,
+        embed_model: &str,
+        dims: usize,
+        limit: usize,
+    ) -> Result<Vec<Episode>, MemoryError>;
+
+    /// Make `vector` (from `embed_model`) the episode's embedding. An episode has one: another
+    /// model's is replaced.
+    async fn set_embedding(
+        &self,
+        id: EpisodeId,
+        embed_model: &str,
+        vector: &[f32],
+    ) -> Result<(), MemoryError>;
 
     /// Every episode of the group no farther than `max_distance` (cosine) from `query`, closest
     /// first. Which of them are returned to the model, and in what order, is decided by
@@ -199,6 +220,44 @@ impl EpisodeStore for MemoryEpisodeStore {
             .episodes
             .push((stored.clone(), embed_model.to_owned(), vector.to_vec()));
         Ok(stored)
+    }
+
+    async fn unembedded(
+        &self,
+        group: GroupId,
+        embed_model: &str,
+        dims: usize,
+        limit: usize,
+    ) -> Result<Vec<Episode>, MemoryError> {
+        let mut found: Vec<Episode> = self
+            .lock()
+            .episodes
+            .iter()
+            .filter(|(e, model, v)| {
+                e.episode.group == group && (model != embed_model || v.len() != dims)
+            })
+            .map(|(e, _, _)| e.clone())
+            .collect();
+        found.sort_by_key(|e| e.id);
+        found.truncate(limit);
+        Ok(found)
+    }
+
+    async fn set_embedding(
+        &self,
+        id: EpisodeId,
+        embed_model: &str,
+        vector: &[f32],
+    ) -> Result<(), MemoryError> {
+        let mut inner = self.lock();
+        let entry = inner
+            .episodes
+            .iter_mut()
+            .find(|(e, _, _)| e.id == id)
+            .ok_or(MemoryError::NotFound)?;
+        entry.1 = embed_model.to_owned();
+        entry.2 = vector.to_vec();
+        Ok(())
     }
 
     async fn unconsolidated(&self, group: GroupId) -> Result<Vec<Episode>, MemoryError> {

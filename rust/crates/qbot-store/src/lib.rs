@@ -43,14 +43,13 @@ pub struct Store {
 
 impl Store {
     /// `acquire_timeout` bounds both opening a connection and waiting for a free one.
-    pub async fn connect(
-        url: &str,
-        max_connections: u32,
-        acquire_timeout: std::time::Duration,
-    ) -> Result<Self, StoreError> {
+    /// Connect a pool of 16: replies, media work, commands and jobs each hold a connection for
+    /// one query at a time, so this is well above what runs at once. A connection not available
+    /// within 10 seconds means the database is down or saturated.
+    pub async fn connect(url: &str) -> Result<Self, StoreError> {
         let pool = PgPoolOptions::new()
-            .max_connections(max_connections)
-            .acquire_timeout(acquire_timeout)
+            .max_connections(16)
+            .acquire_timeout(std::time::Duration::from_secs(10))
             .connect(url)
             .await?;
         Ok(Self { pool })

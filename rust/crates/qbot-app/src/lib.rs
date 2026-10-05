@@ -2,7 +2,6 @@
 
 pub mod import;
 pub mod logs;
-pub mod rebuild;
 mod report_sink;
 mod run;
 

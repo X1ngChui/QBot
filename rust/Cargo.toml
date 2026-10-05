@@ -64,7 +64,8 @@ axum = { version = "0.8", features = ["ws"] }
 jieba-rs = "0.11"
 tokio-tungstenite = "0.30"
 toml = "0.8"
-moka = { version = "0.12", features = ["future"] }
+moka = { version = "0.12", features = ["future", "sync"] }
+governor = "0.10"
 figment = { version = "0.10", features = ["toml", "env"] }
 croner = "3"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }

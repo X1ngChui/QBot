@@ -23,7 +23,7 @@ pub use tasks::{
     CancelScheduledTask, GetScheduledTask, ListArgs, ListScheduledTasks, ScheduleArgs,
     ScheduleTask, TaskRef, UpdateArgs, UpdateScheduledTask,
 };
-pub use web::{ReadUrl, ReadUrlArgs, WebSearchArgs, WebSearchTool};
+pub use web::{READ_URL_MAX_CHARS, ReadUrl, ReadUrlArgs, WebSearchArgs, WebSearchTool};
 
 /// Deployment settings of the standard tools.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

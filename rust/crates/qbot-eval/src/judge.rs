@@ -2,8 +2,8 @@
 
 use qbot_context::{ChatLine, Speaker};
 use qbot_llm::{
-    Content, ConvItem, Conversation, Message, Params, Provider, ReasoningEffort, Request, Role,
-    ToolChoice, ToolSpec,
+    Content, ConvItem, Conversation, Message, Provider, ReasoningEffort, Request, Role, ToolChoice,
+    ToolSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -162,11 +162,7 @@ pub async fn judge(
                 tools: &tools,
                 tool_choice: ToolChoice::Auto,
                 parallel_tool_calls: false,
-                params: Params {
-                    max_output_tokens: 4000,
-                    reasoning: ReasoningEffort::Medium,
-                    temperature: None,
-                },
+                reasoning: ReasoningEffort::Medium,
                 continuation: None,
                 media: None,
             })

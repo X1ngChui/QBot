@@ -11,7 +11,7 @@ use std::time::Duration;
 use qbot_core::{AccountId, MessageId, UnixMillis};
 use qbot_llm::responses::{KeySource, ReqwestTransport, ResponsesConfig, ResponsesProvider};
 use qbot_memory::findings::KnowledgeFinding;
-use qbot_memory::{EpisodeExtractor, ExtractorConfig, SliceContext, SliceLine};
+use qbot_memory::{EpisodeExtractor, SliceContext, SliceLine};
 
 fn secret(file: &str) -> String {
     let dir = std::env::var_os("QBOT_LIVE_SECRETS_DIR").map_or_else(
@@ -50,13 +50,7 @@ async fn a_real_model_writes_a_valid_episode_with_findings() {
     let mut cfg = ResponsesConfig::deepseek(model);
     cfg.timeout = Some(Duration::from_secs(180));
     let provider = Arc::new(ResponsesProvider::new(cfg, Arc::new(transport)).unwrap());
-    let extractor = EpisodeExtractor::new(
-        provider,
-        ExtractorConfig {
-            max_output_tokens: 4_000,
-            max_attempts: 3,
-        },
-    );
+    let extractor = EpisodeExtractor::new(provider);
     let target = vec![
         line(
             1,

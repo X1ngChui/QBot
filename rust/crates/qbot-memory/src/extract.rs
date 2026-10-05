@@ -11,8 +11,8 @@ use std::sync::Arc;
 use qbot_context::{AssistantPart, AssistantTurn};
 use qbot_core::CallId;
 use qbot_llm::{
-    Content, ConvItem, Conversation, FinishReason, LlmError, Message, Params, Provider,
-    ReasoningEffort, Request, Role, ToolChoice, ToolOutput, ToolSpec, ToolStatus, Usage,
+    Content, ConvItem, Conversation, FinishReason, LlmError, Message, Provider, ReasoningEffort,
+    Request, Role, ToolChoice, ToolOutput, ToolSpec, ToolStatus, Usage,
 };
 use qbot_wording::{Text, say};
 use schemars::JsonSchema;
@@ -30,22 +30,9 @@ pub const METHOD: &str = "slice-v3";
 /// The extraction instructions; `{language}` and `{predicates}` are filled per call.
 const SYSTEM: &str = include_str!("../../../prompts/extract.md");
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExtractorConfig {
-    pub max_output_tokens: u32,
-    /// How many times a rejected answer is sent back for correction: a bound on a model that
-    /// never produces a valid answer.
-    pub max_attempts: u32,
-}
-
-impl Default for ExtractorConfig {
-    fn default() -> Self {
-        Self {
-            max_output_tokens: 8192,
-            max_attempts: 3,
-        }
-    }
-}
+/// Model calls for one slice: the first answer and up to two corrections or retries. Bounds a
+/// model that never produces a valid answer, so one bad slice cannot stall a group.
+pub const MAX_ATTEMPTS: u32 = 3;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SubmitArgs {
@@ -94,10 +81,8 @@ pub struct Extracted {
 pub enum ExtractError {
     #[error("model error: {0}")]
     Model(#[from] LlmError),
-    #[error(
-        "the answer was cut off at {limit} output tokens (memory.extraction.max_output_tokens)"
-    )]
-    CutOff { limit: u32 },
+    #[error("the answer was cut off at the provider's output limit on every attempt")]
+    CutOff,
     #[error("the model gave no valid answer after {attempts} attempts: {problems:?}")]
     Invalid {
         attempts: u32,
@@ -107,7 +92,6 @@ pub enum ExtractError {
 
 pub struct EpisodeExtractor {
     provider: Arc<dyn Provider>,
-    cfg: ExtractorConfig,
     predicates: Arc<Predicates>,
 }
 
@@ -118,10 +102,9 @@ impl std::fmt::Debug for EpisodeExtractor {
 }
 
 impl EpisodeExtractor {
-    pub fn new(provider: Arc<dyn Provider>, cfg: ExtractorConfig) -> Self {
+    pub fn new(provider: Arc<dyn Provider>) -> Self {
         Self {
             provider,
-            cfg,
             predicates: Arc::new(Predicates::builtin()),
         }
     }
@@ -174,7 +157,7 @@ impl EpisodeExtractor {
         // A valid episode whose findings were partly rejected: sent back once for the findings,
         // and kept if the correction does not come back valid.
         let mut accepted: Option<Extracted> = None;
-        for attempt in 1..=self.cfg.max_attempts {
+        for attempt in 1..=MAX_ATTEMPTS {
             let conversation = Conversation::new(items.clone());
             let response = self
                 .provider
@@ -183,11 +166,7 @@ impl EpisodeExtractor {
                     tools: &tools,
                     tool_choice: ToolChoice::Auto,
                     parallel_tool_calls: false,
-                    params: Params {
-                        max_output_tokens: self.cfg.max_output_tokens,
-                        reasoning: ReasoningEffort::Low,
-                        temperature: None,
-                    },
+                    reasoning: ReasoningEffort::Low,
                     continuation: None,
                     media: None,
                 })
@@ -199,7 +178,7 @@ impl EpisodeExtractor {
                 }
                 // An answer that came back unreadable (arguments that are not JSON) is lost,
                 // not wrong: the model can do it right on another try.
-                (Err(LlmError::Protocol(detail)), kept) if attempt < self.cfg.max_attempts => {
+                (Err(LlmError::Protocol(detail)), kept) if attempt < MAX_ATTEMPTS => {
                     accepted = kept;
                     tracing::warn!(attempt, %detail, "extraction answer unreadable; asking again");
                     continue;
@@ -216,23 +195,16 @@ impl EpisodeExtractor {
             let response_finish = response.finish.clone();
             let turn = response.turn;
 
-            // An answer cut off at the output limit is lost. How much the model reasons varies
-            // from try to try, so it is asked again; only when every attempt is cut off is the
-            // limit itself the problem, a setting to raise rather than something to correct.
+            // An answer cut off at the provider's output limit is lost, not wrong. How much the
+            // model reasons varies from try to try, so the same request is sent again.
             if calls.is_empty() && response_finish == FinishReason::Length {
-                if attempt < self.cfg.max_attempts {
-                    tracing::warn!(
-                        attempt,
-                        limit = self.cfg.max_output_tokens,
-                        "extraction answer cut off at the output limit; asking again"
-                    );
+                if attempt < MAX_ATTEMPTS {
+                    tracing::warn!(attempt, "extraction answer cut off; asking again");
                     continue;
                 }
                 return match accepted {
                     Some(kept) => Ok(Extracted { usage, ..kept }),
-                    None => Err(ExtractError::CutOff {
-                        limit: self.cfg.max_output_tokens,
-                    }),
+                    None => Err(ExtractError::CutOff),
                 };
             }
             let mut feedback: Vec<(CallId, String)> = Vec::new();
@@ -272,7 +244,7 @@ impl EpisodeExtractor {
                                 // One correction round for findings: they are optional, the episode is not.
                                 if extracted.dropped.is_empty()
                                     || accepted.is_some()
-                                    || attempt == self.cfg.max_attempts
+                                    || attempt == MAX_ATTEMPTS
                                 {
                                     return Ok(extracted);
                                 }
@@ -344,7 +316,7 @@ impl EpisodeExtractor {
         match accepted {
             Some(kept) => Ok(Extracted { usage, ..kept }),
             None => Err(ExtractError::Invalid {
-                attempts: self.cfg.max_attempts,
+                attempts: MAX_ATTEMPTS,
                 problems,
             }),
         }
@@ -460,10 +432,7 @@ mod tests {
             .collect();
         assert_eq!(slots, ["language", "predicates"]);
 
-        let extractor = EpisodeExtractor::new(
-            Arc::new(qbot_llm::fake::FakeProvider::new([])),
-            ExtractorConfig::default(),
-        );
+        let extractor = EpisodeExtractor::new(Arc::new(qbot_llm::fake::FakeProvider::new([])));
         let text = extractor.instructions("English");
         assert!(!text.contains('{'), "every slot is filled");
         assert!(text.contains("in this language: English."));

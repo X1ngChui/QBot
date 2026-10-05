@@ -19,7 +19,8 @@ use std::time::Duration;
 pub use adapter::ResponsesProvider;
 pub use retry::post_with_retry;
 pub use transport::{
-    ByteStream, HttpBody, HttpResponse, KeyResolver, KeySource, ReqwestTransport, Transport, Upload,
+    ByteStream, CONNECT_TIMEOUT, HttpBody, HttpResponse, KeyResolver, KeySource, ReqwestTransport,
+    Transport, Upload,
 };
 
 /// Vendor dialect differences the wire layer handles.

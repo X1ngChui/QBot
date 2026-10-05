@@ -35,7 +35,7 @@ impl PgMediaCache {
     /// Remember a description. A later description for the same key replaces the earlier one.
     pub async fn put(&self, key: &str, description: &str) -> Result<(), StoreError> {
         sqlx::query(
-            "INSERT INTO media_cache (key, kind, description, created_ms) VALUES ($1, 'image', $2, $3) \
+            "INSERT INTO media_cache (key, description, created_ms) VALUES ($1, $2, $3) \
              ON CONFLICT (key) DO UPDATE SET description = EXCLUDED.description, created_ms = EXCLUDED.created_ms",
         )
         .bind(key)

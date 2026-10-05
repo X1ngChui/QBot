@@ -1,5 +1,7 @@
 # English catalog (Fluent): the source of truth. Every message id the code uses must appear here,
 # and may use only the variables the code supplies for it. See https://projectfluent.org/
+# The language the bot writes its memory and picture descriptions in, as a model reads it.
+writing-language = English
 command-owner_only = This action needs bot-owner permission.
 command-outcome_unknown = Could not confirm the result of that action. It may or may not have happened; check before repeating it.
 command-unknown_account = That account has no record yet, so this cannot be done.

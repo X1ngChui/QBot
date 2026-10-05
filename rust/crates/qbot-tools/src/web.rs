@@ -95,6 +95,10 @@ pub struct ReadUrlArgs {
     pub question: Option<String>,
 }
 
+/// The most characters of a page `read_url` shows: a web page is the one tool input with no size
+/// of its own, and the page enters every later turn of the run.
+pub const READ_URL_MAX_CHARS: usize = 8000;
+
 /// Reads one web page as Markdown through the configured page reader.
 #[derive(Clone)]
 pub struct ReadUrl {

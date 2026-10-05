@@ -8,7 +8,7 @@ use qbot_llm::{ConvItem, Embedder, FakeEmbedder, LlmError, Provider};
 use qbot_memory::extract::{SubmitArgs, validate};
 use qbot_memory::{
     BuildError, BuilderConfig, EpisodeBuilder, EpisodeExtractor, EpisodeJobs, EpisodeStore,
-    ExtractError, Extracted, ExtractorConfig, METHOD, MemoryEpisodeStore, SliceContext, SliceLine,
+    ExtractError, Extracted, METHOD, MemoryEpisodeStore, SliceContext, SliceLine,
 };
 use serde_json::json;
 
@@ -39,10 +39,7 @@ fn good_answer() -> serde_json::Value {
 
 fn extractor(steps: Vec<Step>) -> (Arc<FakeProvider>, EpisodeExtractor) {
     let fake = Arc::new(FakeProvider::new(steps));
-    (
-        fake.clone(),
-        EpisodeExtractor::new(fake, ExtractorConfig::default()),
-    )
+    (fake.clone(), EpisodeExtractor::new(fake))
 }
 
 fn answer(args: serde_json::Value) -> Step {
@@ -388,6 +385,61 @@ fn jobs(
     let store = Arc::new(MemoryEpisodeStore::new());
     let grid = slice_grid(batch_lines, slice_batches, 1, 1);
     (fake, store.clone(), EpisodeJobs::new(store, b, grid))
+}
+
+#[tokio::test]
+async fn a_new_embedding_model_re_embeds_episodes_without_extracting_them_again() {
+    let store = Arc::new(MemoryEpisodeStore::new());
+    store.add_lines(group(), lines(1..=30));
+    let (fake, _, b) = builder(answers(3));
+    EpisodeJobs::new(store.clone(), b, slice_grid(10, 1, 0, 0))
+        .extract_group(group())
+        .await
+        .unwrap();
+    assert_eq!(fake.recorded().len(), 3, "three slices extracted");
+
+    // The same episodes, a different embedding model: nothing to extract, everything to embed.
+    let (fake, _) = extractor(vec![]);
+    let embedder = Arc::new(FakeEmbedder::new(64).named("other-embed"));
+    let job = EpisodeJobs::new(
+        store.clone(),
+        EpisodeBuilder::new(
+            EpisodeExtractor::new(fake.clone()),
+            embedder.clone(),
+            BuilderConfig::default(),
+        ),
+        slice_grid(10, 1, 0, 0),
+    );
+    assert_eq!(
+        store
+            .unembedded(group(), "other-embed", 64, 10)
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(
+        job.extract_group(group()).await.unwrap(),
+        0,
+        "no new episode"
+    );
+    assert!(fake.recorded().is_empty(), "no extraction call");
+    assert_eq!(
+        embedder.calls().concat().len(),
+        3,
+        "each episode embedded once"
+    );
+    assert!(
+        embedder.calls().concat()[0].starts_with("Deploy pipeline\n"),
+        "from the stored title and summary"
+    );
+    assert!(
+        store
+            .unembedded(group(), "other-embed", 64, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 fn answers(n: usize) -> Vec<Step> {
@@ -1151,18 +1203,9 @@ async fn a_lost_answer_is_asked_for_again_and_a_later_good_one_is_kept() {
 }
 
 #[tokio::test]
-async fn an_answer_cut_off_on_every_attempt_names_the_limit() {
+async fn an_answer_cut_off_on_every_attempt_is_an_error() {
     let (fake, ex) = extractor(vec![cut_off(), cut_off(), cut_off()]);
     let error = extract_lines(&ex).await.unwrap_err();
-    assert!(
-        matches!(error, ExtractError::CutOff { limit: 8192 }),
-        "{error}"
-    );
-    assert!(
-        error
-            .to_string()
-            .contains("memory.extraction.max_output_tokens"),
-        "names the setting"
-    );
+    assert!(matches!(error, ExtractError::CutOff), "{error}");
     assert_eq!(fake.recorded().len(), 3, "every attempt was used");
 }

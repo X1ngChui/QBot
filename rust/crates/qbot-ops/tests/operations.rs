@@ -173,7 +173,7 @@ fn rig(owners: Vec<AccountId>) -> Rig {
         cfg: OpsConfig {
             backup: None,
             alias_unused: Duration::from_secs(30 * 86_400),
-            description_ttl: Some(Duration::from_secs(15 * 86_400)),
+            description_ttl: Duration::from_secs(15 * 86_400),
             timers_keep: Duration::from_secs(30 * 86_400),
             runs_keep: Some(Duration::from_secs(90 * 86_400)),
             owners,

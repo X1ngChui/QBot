@@ -1,7 +1,8 @@
-# QBot (Rust rewrite)
+# QBot (Rust)
 
-Design: [`docs/rust-rewrite/design.md`](../docs/rust-rewrite/design.md). The Python
-implementation in the repository root stays in place until cutover.
+Architecture: [`docs/rust-rewrite/design.md`](../docs/rust-rewrite/design.md); memory:
+[`memory.md`](../docs/rust-rewrite/memory.md). The Python implementation in the repository root
+stays until the cutover ([`cutover.md`](../docs/rust-rewrite/cutover.md)).
 
 ```bash
 cargo fmt --all --check
@@ -12,7 +13,7 @@ cargo test --workspace
 ## Database tests
 
 The `qbot-store` tests need a disposable PostgreSQL server with the pgvector and btree_gist extensions
-(the `pgvector/pgvector:pg17` image). Each test creates its own database
+(the `pgvector/pgvector:0.8.5-pg17` image). Each test creates its own database
 and drops it afterwards. The database named in the URL must start with `qbot_test`; the tests
 refuse anything else.
 
@@ -20,7 +21,7 @@ refuse anything else.
 docker run -d --name qbot-pgtest \
   -e POSTGRES_USER=qbot_test -e POSTGRES_PASSWORD=testpw -e POSTGRES_DB=qbot_test_admin \
   -p 127.0.0.1:15432:5432 --tmpfs /var/lib/postgresql/data \
-  pgvector/pgvector:pg17 -c fsync=off -c synchronous_commit=off -c max_connections=400
+  pgvector/pgvector:0.8.5-pg17 -c fsync=off -c synchronous_commit=off -c max_connections=400
 
 export QBOT_TEST_DATABASE_URL=postgres://qbot_test:testpw@127.0.0.1:15432/qbot_test_admin
 cargo test --workspace
@@ -52,7 +53,8 @@ qbot run            # serve the platform connection until SIGINT/SIGTERM
 
 `qbot run` takes the database lease first (a second instance on the same database refuses to
 start), recovers what the previous process left open, then listens for NapCat's reverse WebSocket
-(`gateway.listen`, `gateway.path`, bearer `gateway.access_token_secret`). It needs `bot.account`.
+(`gateway.listen`, path `/onebot/v11/ws`, bearer `gateway.access_token_secret`). It needs
+`bot.account`.
 The end-to-end test in `crates/qbot-app/tests/run_e2e.rs` runs all of it against a real Postgres,
 a mock Responses server and a simulated NapCat.
 
@@ -60,21 +62,22 @@ a mock Responses server and a simulated NapCat.
 
 | crate | what it is |
 |---|---|
-| `qbot-core` | ids, clock, the chat-batch grid |
+| `qbot-core` | ids, clock, the chat-batch grid, markers |
 | `qbot-context` | the canonical transcript and its projection |
-| `qbot-llm` | provider contract, Responses/DeepSeek adapter, embeddings, fakes |
+| `qbot-llm` | provider contract, Responses/DeepSeek adapter, embeddings, web search, fakes |
 | `qbot-agent` | run loop, tool contract, supervisor |
 | `qbot-sched` | timers: group tasks and background jobs |
 | `qbot-tools` | the model's tools |
-| `qbot-memory` | identity and episodic memory |
+| `qbot-memory` | identity, episodes, extraction, facts, recall, notes |
 | `qbot-store` | Postgres (archive, run log, usage, timers, identity, episodes, admin reads) |
 | `qbot-config` | layered, typed configuration and secrets |
 | `qbot-i18n` | member-facing text: typed messages and validated catalogs (`locales/`) |
+| `qbot-wording` | model-facing short texts (`prompts/wording.toml`) |
 | `qbot-prompt` | instruction templates (`prompts/`), personas, chat rendering, run context |
 | `qbot-media` | pictures and voice: fetch, describe, transcribe, fill the archived markers |
-| `qbot-ops` | the nightly pipeline, verified backups, the daily report |
+| `qbot-ops` | the nightly run, verified backups, the daily report |
 | `qbot-asr` | in-process speech recognition (SenseVoice via sherpa-onnx) |
 | `qbot-gateway` | OneBot v11: frames, rendering, triggers, delivery, the WebSocket server |
 | `qbot-commands` | `/who /note /name /forget /group /link /unlink /stats /top /tasks /members /block /mute /runs /logs /help` |
 | `qbot-eval` | reply-quality evaluation: `cargo run -p qbot-eval -- [--only NAME] [--repeat N]` (calls the real model; scenarios in `eval/scenarios/`) |
-| `qbot-app` | the `qbot` binary and the composition root |
+| `qbot-app` | the `qbot` binary and the composition root; `import-history` for the cutover |

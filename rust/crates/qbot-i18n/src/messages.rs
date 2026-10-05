@@ -69,6 +69,8 @@ macro_rules! messages {
 }
 
 messages! {
+    // The language the bot writes its memory and picture descriptions in, named for a model.
+    "writing-language" => WritingLanguage {},
     "command-owner_only" => OwnerOnly {},
     "command-outcome_unknown" => OutcomeUnknown {},
     "command-unknown_account" => UnknownAccount {},

@@ -16,8 +16,8 @@ use qbot_llm::responses::{
 };
 use qbot_llm::search::{SearchDepth, TavilyConfig, TavilySearch};
 use qbot_llm::{
-    Content, ConvItem, Conversation, FinishReason, Message, Params, Provider, ReasoningEffort,
-    Request, Role, ToolChoice, ToolOutput as WireOutput, ToolStatus,
+    Content, ConvItem, Conversation, FinishReason, Message, Provider, ReasoningEffort, Request,
+    Role, ToolChoice, ToolOutput as WireOutput, ToolStatus,
 };
 use qbot_tools::{WebSearchArgs, WebSearchTool};
 
@@ -86,11 +86,7 @@ async fn the_model_searches_the_web_and_answers_from_the_results() {
         tools: &specs,
         tool_choice: ToolChoice::Auto,
         parallel_tool_calls: true,
-        params: Params {
-            max_output_tokens: 600,
-            reasoning: ReasoningEffort::Low,
-            temperature: None,
-        },
+        reasoning: ReasoningEffort::Low,
         continuation: None,
         media: None,
     };

@@ -29,13 +29,6 @@ pub enum ReasoningEffort {
     High,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Params {
-    pub max_output_tokens: u32,
-    pub reasoning: ReasoningEffort,
-    pub temperature: Option<f32>,
-}
-
 /// Image bytes for [`Content::Image`] keys.
 #[async_trait]
 pub trait MediaStore: Send + Sync {
@@ -57,7 +50,9 @@ pub struct Request<'a> {
     pub tools: &'a [ToolSpec],
     pub tool_choice: ToolChoice,
     pub parallel_tool_calls: bool,
-    pub params: Params,
+    /// How much the model reasons before answering. The output length is left to the provider:
+    /// a local cap only adds a way for a long but valid answer to be cut off.
+    pub reasoning: ReasoningEffort,
     pub continuation: Option<&'a Continuation>,
     pub media: Option<&'a dyn MediaStore>,
 }

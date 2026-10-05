@@ -229,7 +229,7 @@ async fn real_main() -> Result<bool, String> {
     let runner = Runner {
         provider: provider(&model)?,
         personas: persona(args.persona.as_deref())?,
-        params: Runner::default_params(),
+        reasoning: qbot_llm::ReasoningEffort::Low,
     };
     let judge = provider(&judge_model)?;
     let scenarios = scenarios(&args.scenarios, &args.only)?;

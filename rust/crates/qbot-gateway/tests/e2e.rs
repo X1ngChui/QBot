@@ -22,8 +22,8 @@ use qbot_gateway::intake::{Incoming, Intake, Stored};
 use qbot_gateway::pipeline::{CommandRequest, Commands, Pipeline, PipelineConfig};
 use qbot_gateway::server::{GatewayServer, serve};
 use qbot_gateway::trigger::Nicknames;
+use qbot_llm::ReasoningEffort;
 use qbot_llm::fake::{FakeProvider, FakeReply, Step};
-use qbot_llm::{Params, ReasoningEffort};
 use qbot_tools::SendMessage;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -132,11 +132,7 @@ async fn rig_with(script: Vec<Step>, echo: Duration) -> Rig {
         renderer: renderer(),
         clock: Arc::new(SystemClock),
         limits: RunLimits::default(),
-        params: Params {
-            max_output_tokens: 1000,
-            reasoning: ReasoningEffort::Low,
-            temperature: None,
-        },
+        reasoning: ReasoningEffort::Low,
         media: None,
     });
     let supervisor = Arc::new(Supervisor::new(

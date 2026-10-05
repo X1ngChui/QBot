@@ -126,6 +126,12 @@ pub struct SlicePlan {
 }
 
 impl SliceGrid {
+    /// Slices of `slice_batches` over `window`, each read with one batch of context on either
+    /// side: enough to resolve what crosses a slice's edge, without paying for a second slice.
+    pub fn for_window(window: HistoryWindow, slice_batches: u32) -> Self {
+        Self::from_window(window, slice_batches, 1, 1)
+    }
+
     pub fn from_window(
         window: HistoryWindow,
         slice_batches: u32,

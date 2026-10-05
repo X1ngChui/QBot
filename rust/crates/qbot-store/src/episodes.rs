@@ -214,6 +214,56 @@ impl EpisodeStore for PgEpisodeStore {
         Ok(stored)
     }
 
+    async fn unembedded(
+        &self,
+        group: GroupId,
+        embed_model: &str,
+        dims: usize,
+        limit: usize,
+    ) -> Result<Vec<Episode>, MemoryError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {EPISODE_COLS} FROM episode e WHERE e.group_id = $1 AND NOT EXISTS ( \
+                SELECT 1 FROM episode_embedding m \
+                WHERE m.episode_id = e.episode_id AND m.model = $2 AND m.dims = $3) \
+             ORDER BY e.episode_id LIMIT $4"
+        ))
+        .bind(group.get())
+        .bind(embed_model)
+        .bind(i32::try_from(dims).map_err(backend)?)
+        .bind(i64::try_from(limit).map_err(backend)?)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        rows.iter().map(to_episode).collect()
+    }
+
+    async fn set_embedding(
+        &self,
+        id: EpisodeId,
+        embed_model: &str,
+        vector: &[f32],
+    ) -> Result<(), MemoryError> {
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        sqlx::query("DELETE FROM episode_embedding WHERE episode_id = $1")
+            .bind(id.get())
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+        sqlx::query("INSERT INTO episode_embedding (episode_id, model, dims, embedding) VALUES ($1, $2, $3, $4::vector)")
+            .bind(id.get())
+            .bind(embed_model)
+            .bind(i32::try_from(vector.len()).map_err(backend)?)
+            .bind(vector_text(vector))
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| match error {
+                sqlx::Error::Database(db) if db.is_foreign_key_violation() => MemoryError::NotFound,
+                other => backend(other),
+            })?;
+        tx.commit().await.map_err(backend)?;
+        Ok(())
+    }
+
     async fn unconsolidated(&self, group: GroupId) -> Result<Vec<Episode>, MemoryError> {
         let rows = sqlx::query(&format!(
             "SELECT {EPISODE_COLS} FROM episode e WHERE e.group_id = $1 AND e.consolidated_ms IS NULL ORDER BY e.episode_id"

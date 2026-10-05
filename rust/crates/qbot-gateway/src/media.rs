@@ -130,6 +130,15 @@ pub struct FetchSettings {
     pub protocol_timeout: Duration,
 }
 
+impl Default for FetchSettings {
+    fn default() -> Self {
+        Self {
+            http_timeout: Duration::from_secs(20),
+            protocol_timeout: Duration::from_secs(10),
+        }
+    }
+}
+
 /// Fetches pictures and clips by whichever route answers.
 pub struct OneBotFetcher {
     bridge: Arc<Bridge>,

@@ -24,7 +24,7 @@ use qbot_llm::embedding::{EmbeddingConfig, HttpEmbedder};
 use qbot_llm::responses::{KeySource, ReqwestTransport, ResponsesConfig, ResponsesProvider};
 use qbot_llm::{
     CacheUsage, Content, ConvItem, Conversation, Embedder, FinishReason, LlmError, LoadedMedia,
-    MediaStore, Message, Params, Provider, ReasoningEffort, Request, Response, Role, StreamEvent,
+    MediaStore, Message, Provider, ReasoningEffort, Request, Response, Role, StreamEvent,
     ToolChoice, ToolOutput, ToolSpec, ToolStatus, collect,
 };
 use serde_json::json;
@@ -64,14 +64,6 @@ fn deepseek() -> ResponsesProvider {
     deepseek_with("text_api_key", None)
 }
 
-fn params(max_output_tokens: u32) -> Params {
-    Params {
-        max_output_tokens,
-        reasoning: ReasoningEffort::Low,
-        temperature: None,
-    }
-}
-
 fn msg(role: Role, text: &str) -> ConvItem {
     ConvItem::Message(Message {
         role,
@@ -85,7 +77,7 @@ fn request<'a>(conversation: &'a Conversation, tools: &'a [ToolSpec]) -> Request
         tools,
         tool_choice: ToolChoice::Auto,
         parallel_tool_calls: true,
-        params: params(400),
+        reasoning: ReasoningEffort::Low,
         continuation: None,
         media: None,
     }
@@ -728,7 +720,7 @@ async fn deepseek_forces_tools_only_without_reasoning_and_cannot_return_to_reaso
     ));
     let mut req = request(&conv, &tools);
     req.tool_choice = ToolChoice::Required;
-    req.params.reasoning = ReasoningEffort::Off;
+    req.reasoning = ReasoningEffort::Off;
     let forced = provider.respond(req).await.unwrap();
     report("forced, no reasoning", &forced);
     assert!(forced.calls().any(|c| c.name == "get_weather"));
@@ -745,7 +737,7 @@ async fn deepseek_forces_tools_only_without_reasoning_and_cannot_return_to_reaso
     }
     let next = Conversation::new(items);
     let mut req = request(&next, &tools);
-    req.params.reasoning = ReasoningEffort::Off;
+    req.reasoning = ReasoningEffort::Off;
     let ok = provider.respond(req).await.unwrap();
     report("after, no reasoning", &ok);
     let thinking = provider.respond(request(&next, &tools)).await.unwrap_err();

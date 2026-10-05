@@ -343,18 +343,13 @@ pub async fn import_history(
     };
     let ctx = RenderContext {
         bot,
-        forward_max_lines: config.media.forward_max_lines,
+        forward_max_lines: qbot_gateway::render::FORWARD_MAX_LINES,
     };
     let text = std::fs::read_to_string(export)?;
     let Prepared { lines, mut stats } = prepare(&text, bot, &ctx)?;
 
     let url = config.database_url(secrets.database_password.expose());
-    let store = Store::connect(
-        &url,
-        config.database.max_connections,
-        config.database_connect_timeout(),
-    )
-    .await?;
+    let store = Store::connect(&url).await?;
     store.migrate().await?;
     // The bot must not be running: its live lines would interleave with the history.
     let lease = RuntimeLease::acquire(&url, DEFAULT_KEY).await?;

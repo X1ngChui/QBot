@@ -19,6 +19,9 @@ use crate::bridge::Bridge;
 use crate::pipeline::Pipeline;
 use crate::wire::{Frame, parse_frame};
 
+/// Where NapCat's reverse WebSocket connects: the path OneBot v11 implementations use.
+pub const PATH: &str = "/onebot/v11/ws";
+
 #[derive(Clone)]
 pub struct GatewayServer {
     pub pipeline: Arc<Pipeline>,

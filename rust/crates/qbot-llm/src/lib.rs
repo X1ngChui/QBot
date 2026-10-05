@@ -36,8 +36,7 @@ pub use embedding::{Embedder, EmbedderInfo, Embeddings, FakeEmbedder, HttpEmbedd
 pub use error::LlmError;
 pub use provider::{EventStream, Provider, ReplayPlan, collect, plan_replay};
 pub use request::{
-    LoadedMedia, MediaStore, Params, ReasoningEffort, Request, ToolChoice, ToolSpec,
-    validate_request,
+    LoadedMedia, MediaStore, ReasoningEffort, Request, ToolChoice, ToolSpec, validate_request,
 };
 pub use response::{
     CacheUsage, Continuation, FinishReason, Response, ResponseMeta, StreamEvent, Usage,

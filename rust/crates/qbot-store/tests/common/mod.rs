@@ -57,9 +57,7 @@ impl TestDb {
             .unwrap();
         let (prefix, _) = base.rsplit_once('/').expect("a URL with a database name");
         let url = format!("{prefix}/{name}");
-        let store = Store::connect(&url, 16, Duration::from_secs(10))
-            .await
-            .unwrap();
+        let store = Store::connect(&url).await.unwrap();
         store.migrate().await.unwrap();
         Some(TestDb {
             store,

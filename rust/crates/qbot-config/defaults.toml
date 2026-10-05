@@ -1,61 +1,35 @@
-# Image-baked defaults: the base layer of the configuration, compiled into the binary and
-# copied to /usr/share/qbot/defaults.toml in the image as a reference.
+# The base configuration layer, compiled into the binary and copied to
+# /usr/share/qbot/defaults.toml in the image for reference. It lists every setting a deployment
+# can choose. Do not edit it: override keys in /etc/qbot/config.toml, in /etc/qbot/conf.d/*.toml,
+# or with environment variables (QBOT__SECTION__KEY). Internal tuning such as timeouts, retries
+# and bounds on untrusted input is not configuration; it lives with the code it governs.
 #
-# Every key the application reads appears here, so this file is the complete schema. Do not
-# edit it in a deployment. Override a key in /etc/qbot/config.toml, in /etc/qbot/conf.d/*.toml,
-# or with an environment variable (QBOT__SECTION__KEY). Credentials never appear in any of
-# these: a `*_secret` key holds only the NAME of a secret, which is read from the environment
-# or a mounted secret file.
-#
-# Durations carry their unit in the key name (`_secs`, `_ms`).
-
-[paths]
-# Relative paths are resolved under the data directory (QBOT_DATA_DIR, default /var/lib/qbot).
-models_dir = "models"
-backups_dir = "backups"
-# Relative paths are resolved under the config directory (QBOT_CONFIG_DIR, default /etc/qbot).
-personas_dir = "personas"
-locales_dir = "locales"
+# Credentials never appear here: a `*_secret` key holds the NAME of a secret, which is read
+# from the environment or a mounted secret file. Durations carry their unit in the key name.
 
 [bot]
-# The bot's own QQ account. There is no sensible default: it must be set in config.toml, and
-# `check-config` and `run` refuse to start while it is 0.
+# The bot's own QQ account. It must be set; `check-config` and `run` refuse to start while it
+# is 0.
 account = 0
-# QQ accounts of the bot's owners. Owners may use owner-only commands and cannot be blocked.
+# Accounts that may use owner commands and receive the daily report. Owners cannot be blocked.
 owners = []
-# Names that address the bot as a whole word, in addition to an @ and quoting one of its lines.
+# Names that address the bot as a whole word, besides an @ and quoting one of its messages.
 nicknames = []
-# IANA time zone for times shown to members and to the model.
+# IANA time zone for times shown to members and to the model, and for the schedules below.
 timezone = "UTC"
-# Wording of member-facing text: a built-in tag (en, zh-CN) or a Fluent file <locales_dir>/<tag>.ftl.
+# en | zh-CN, or a Fluent catalog <config dir>/locales/<tag>.ftl. The catalog words what
+# members read and names the language the bot writes its memory and picture descriptions in.
 locale = "en"
 
 [gateway]
-# The address NapCat's reverse WebSocket connects to.
+# Where NapCat's reverse WebSocket connects (path /onebot/v11/ws).
 listen = "0.0.0.0:6199"
-path = "/onebot/v11/ws"
-# NAME of the secret holding the access token NapCat presents. Empty disables authentication,
-# which is only sensible on a private network.
+# NAME of the secret holding the token NapCat presents. Empty disables authentication, which is
+# only sensible on a private network.
 access_token_secret = "ONEBOT_ACCESS_TOKEN"
-# How long the platform may take to accept a send.
-action_timeout_secs = 10
-# How long after acceptance the bot's own message may take to be reported back.
-echo_timeout_secs = 15
-# The platform's cap on one message, in characters. Command replies are split to fit.
-max_message_chars = 2000
-
-[commands]
-# Rows /members lists and the most rows /top shows.
-members_max_rows = 60
-top_max_rows = 20
-# Runs /runs lists.
-runs_max_rows = 10
-# Most notes about one account in a group. Notes reach the model in member lookups, so this
-# bounds what one member's notes can add to a reply's context.
-notes_per_account = 20
 
 [database]
-# The compose service name; change for an external server.
+# The compose service name; change it for an external server.
 host = "postgres"
 port = 5432
 name = "qbot"
@@ -63,41 +37,50 @@ user = "qbot"
 # disable | prefer | require | verify-ca | verify-full
 ssl_mode = "prefer"
 password_secret = "DATABASE_PASSWORD"
-max_connections = 16
-connect_timeout_secs = 10
 
-[runtime]
-# Recent warnings and errors kept in memory for /logs (0 keeps none). They also go to the
-# normal log output.
-log_buffer_lines = 200
-# Active plus waiting runs, timers included. Overload and expiry end silently.
-reply_capacity = 32
-# Runs allowed to call the model at the same time.
-reply_concurrency = 3
-# One deadline per run, from admission; queue time counts against it.
-reply_deadline_secs = 180
-
-[agent]
-# Model turns per run: a guard against a model that never stops calling tools.
-max_turns = 20
-# Messages one run may send: a rule against flooding the group.
-max_sends_per_run = 4
-# Per model call.
-max_output_tokens = 4096
-# off | low | medium | high
-reasoning = "low"
+[replies]
+# Replies calling the model at once. More waiting replies are queued; a queue ten times this
+# size is full, and further triggers are dropped silently.
+concurrency = 3
+# A reply not finished this long after its trigger is abandoned; time in the queue counts.
+deadline_secs = 180
+# Messages one reply may send.
+max_messages = 4
 
 [history]
-# What a reply is shown of the chat, in batches (the unit history is appended and dropped in;
-# memory slices are whole batches too). Line counts, not a token budget.
-# Lines per batch.
+# What a reply is shown of the chat, in batches of lines. Batches are also the unit memory is
+# extracted in.
 batch_lines = 30
-# The newest batches, shown verbatim, counting the one being filled.
+# The newest batches, shown line by line (counting the one being filled).
 raw_batches = 4
-# The batches before those, shown as the summaries of the episodes that end there (a batch no
-# episode covers yet stays verbatim). Older chat is left out of the prompt and reached through
-# the history and memory tools. 0 shows no summaries.
+# The batches before those, shown as summaries of the episodes that cover them (a batch no
+# episode covers yet stays verbatim). 0 shows none. Older chat is reached through tools.
 summary_batches = 9
+
+[memory]
+# Batches summarized into one episode.
+slice_batches = 3
+
+[memory.recall]
+# Cosine distance beyond which an episode is not a candidate at all (below 1). Tuned to the
+# embedding model.
+max_distance = 0.45
+# Candidates rank by similarity times 0.5^(age / half-life), age counted from the episode's
+# end: an older episode weighs less, never nothing. 0 ranks by similarity alone.
+half_life_days = 180
+
+[memory.facts]
+# A learned fact's confidence halves every half-life since it was last confirmed, by its
+# predicate's decay class; facts that fade away are expired by the nightly run.
+half_life_days = { stable = 90, default = 30, fast = 14 }
+
+[media]
+# Transcribe voice clips in the process (SenseVoice on the CPU; the model is fetched once with
+# deploy/fetch_asr_model.sh). Off, clips stay `[voice]`.
+transcribe_voice = true
+# Per group: one busy group cannot use up the describing and transcribing capacity of all.
+images_per_minute = 6
+clips_per_minute = 20
 
 [providers.text]
 # deepseek | openai_responses
@@ -105,187 +88,55 @@ kind = "deepseek"
 endpoint = "https://api.deepseek.com"
 model = "deepseek-flash"
 api_key_secret = "TEXT_API_KEY"
-# stateless | server_state (the deepseek kind is always stateless)
-state = "stateless"
-request_timeout_secs = 120
-connect_timeout_secs = 10
-retries = 2
-retry_base_ms = 500
-retry_jitter = true
+# The reasoning effort of replies: off | low | medium | high
+reasoning = "low"
 
 [providers.vision]
-# Describes pictures. Off by default: pictures then stay as bare `[image]` markers.
+# Describes pictures. Off, pictures stay bare `[image]` markers.
 enabled = false
-# deepseek (images are uploaded through its Files API) | openai_responses (sent inline)
+# deepseek (images go through its Files API) | openai_responses (sent inline)
 kind = "deepseek"
 endpoint = "https://api.deepseek.com"
 model = "deepseek-flash"
 api_key_secret = "VISION_API_KEY"
-max_output_tokens = 300
-request_timeout_secs = 60
-connect_timeout_secs = 10
-retries = 2
-retry_base_ms = 500
-retry_jitter = true
 
 [providers.embedding]
+# An OpenAI-compatible embeddings endpoint.
 endpoint = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 model = "text-embedding-v4"
-# Vector width. Changing the model or the width hides old vectors until they are rebuilt.
+# Vector width. After changing the model or the width, the nightly run re-embeds the existing
+# episodes; until then recall finds only those already embedded.
 dims = 2048
 # Inputs per request the endpoint accepts.
 max_batch = 10
 api_key_secret = "EMBEDDING_API_KEY"
-request_timeout_secs = 30
-connect_timeout_secs = 10
-retries = 2
-retry_base_ms = 500
-retry_jitter = true
-
 
 [providers.search]
-# Web search and page reading through Tavily, for the web_search and read_url tools. Off by
-# default: the tools are then not offered.
+# Web search and page reading through Tavily (the web_search and read_url tools). Off, the
+# tools are not offered.
 enabled = false
-endpoint = "https://api.tavily.com"
 api_key_secret = "SEARCH_API_KEY"
-# Results per search (1 to 20); each costs reading time and context, not credits.
-max_results = 5
-# basic | advanced (advanced costs two credits per search)
+# basic | advanced (advanced costs two credits a search)
 depth = "basic"
-# Page reading for read_url: basic | advanced (advanced handles harder pages, two credits).
+# How pages are read: basic | advanced (advanced handles harder pages, two credits)
 extract_depth = "basic"
-# Passages of a page returned when read_url is given a question (1 to 5).
-chunks_per_source = 3
-# HTTP(S) proxy for the search client only (where the provider is not reachable directly);
-# empty connects directly. Model traffic never uses it.
+# HTTP(S) proxy for the search client only, where Tavily is not reachable directly; empty
+# connects directly. Model traffic never uses it.
 proxy = ""
-request_timeout_secs = 20
-connect_timeout_secs = 10
-retries = 2
-retry_base_ms = 500
-retry_jitter = true
-[media]
-# Pictures are described and voice clips transcribed when a message arrives; these bound that.
-# Per group, per minute.
-images_per_minute = 6
-clips_per_minute = 20
-max_image_mb = 8
-max_audio_secs = 300
-# Fetches, model calls and recognitions at once, and messages with media in flight or waiting.
-# Beyond the capacity, media stays a bare marker.
-concurrency = 4
-capacity = 32
-# How long a reply waits for the triggering message's media before it goes ahead without.
-wait_secs = 25
-http_timeout_secs = 20
-# One platform action. A file the platform can no longer serve hangs rather than failing.
-protocol_timeout_secs = 10
-# How long a picture that could not be read, or was declined, is not tried again.
-unreadable_hold_secs = 600
-# The language picture descriptions are written in.
-description_language = "English"
-# Messages of a forwarded record shown in its line; the rest are only counted. A record can
-# hold hundreds of messages, and every prompt that shows the line would carry them all.
-forward_max_lines = 30
-
-[asr]
-# Voice transcription in the process (SenseVoice on CPU). With it off, clips stay `[voice]`.
-enabled = true
-# Under paths.models_dir; holds model.int8.onnx and tokens.txt (deploy/fetch_asr_model.sh).
-model_dir = "asr/sense-voice"
-# auto | zh | en | ja | ko | yue
-language = "auto"
-threads = 2
-# Recognitions at once.
-workers = 1
 
 [maintenance]
-# When the nightly pipeline (memory extraction, decay, backup, cleanup) and the daily report to
-# the owners run: five-field cron expressions evaluated in bot.timezone. A run missed while the
-# bot was down happens once when it comes back.
+# Five-field cron expressions in bot.timezone: the nightly run (memory extraction, embedding,
+# fact decay, backup, cleanup) and the daily report to the owners. A run missed while the bot
+# was down happens once when it comes back.
 nightly_cron = "30 2 * * *"
 report_cron = "0 0 * * *"
-# Verified pg_dump backups into paths.backups_dir. Needs the PostgreSQL client tools.
-backups_enabled = true
-backup_keep = 14
-backup_timeout_secs = 900
-# The directory holding pg_dump and pg_restore; empty finds them on PATH.
+# Verified database backups kept under the data directory; 0 makes none.
+backups = 14
+# The directory holding pg_dump and pg_restore (of the server's major version); empty finds them
+# on PATH, as in the image.
 postgres_bin_dir = ""
-# A name candidate nobody vouched for and no evidence supported for this long is dropped.
-alias_unused_days = 30
-# Picture descriptions older than this are forgotten and redone when next needed; 0 keeps them.
-description_ttl_days = 15
-# Finished timers older than this are deleted.
-timers_keep_days = 30
-# Finished runs (the full transcripts) older than this are deleted; 0 keeps them forever.
+# Finished runs (their full transcripts) older than this are deleted; 0 keeps them.
 runs_keep_days = 90
-# Ask NapCat to clean its own file cache (its clean_cache action: downloaded pictures, voice,
-# videos, files and its logs) in the nightly cleanup. NapCat has no age-based retention, so its
-# cache otherwise grows without bound.
+# Ask NapCat to clear its own file cache in the nightly cleanup. NapCat keeps every downloaded
+# picture, clip and file otherwise.
 napcat_clean_cache = true
-
-[tasks]
-# Group tasks. These bound a model scheduling itself in a loop.
-min_delay_secs = 300
-max_pending_per_group = 50
-max_chain_depth = 24
-
-[scheduler]
-job_lease_secs = 900
-max_job_attempts = 5
-# Delay before retry n; the last entry repeats.
-job_backoff_secs = [60, 300, 1800, 3600]
-max_concurrent_jobs = 2
-
-[tools.search_history]
-default_limit = 8
-max_limit = 50
-
-[tools.read_url]
-# Most characters of a page shown to the model; a longer page is cut and says so. A web page is
-# the one tool input with no size of its own.
-max_chars = 8000
-
-[memory]
-# Language the episode summaries are written in.
-language = "English"
-# Batches per episode slice: the one memory-slicing setting.
-slice_batches = 3
-# Batches of neighboring chat shown to the extractor as context only.
-previous_context_batches = 1
-# Capped by the retained window and by what has been produced when the slice is extracted.
-next_context_batches = 1
-
-[memory.extraction]
-# Room for the model's reasoning as well as the answer: a slice of real chat can take several
-# thousand reasoning tokens, and an answer cut off at this limit is lost.
-max_output_tokens = 8192
-# Times a rejected answer is sent back for correction.
-max_attempts = 3
-
-[memory.recall]
-limit = 5
-# Cosine distance beyond which an episode is not relevant enough to be a candidate (below 1).
-max_distance = 0.45
-# Candidates are ranked by similarity times 0.5^(age / half-life), age counted from the
-# episode's end: an older memory weighs less, never nothing, so a strong old match still
-# surfaces. 0 ranks by similarity alone.
-half_life_days = 180
-
-[memory.knowledge]
-# Group terms shown in every reply's instructions at most; the most recently confirmed are kept.
-# The block is part of every prompt, and a long-lived group learns far more terms than that.
-max_terms = 40
-
-[memory.facts]
-# How quickly a fact nobody confirms again is forgotten, by its predicate's decay class: its
-# confidence halves every half-life since it was last confirmed.
-half_life_days = { stable = 90, default = 30, fast = 14 }
-# A fact whose confidence falls below this is expired by the nightly decay.
-forget_below = 0.05
-
-[identity]
-# A name resolves from this confidence up.
-confirm_at = 0.75
-invitation_ttl_secs = 600

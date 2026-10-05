@@ -19,6 +19,15 @@ pub struct DeliveryTimeouts {
     pub echo: Duration,
 }
 
+impl Default for DeliveryTimeouts {
+    fn default() -> Self {
+        Self {
+            action: Duration::from_secs(10),
+            echo: Duration::from_secs(15),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct OneBotDelivery {
     bridge: Arc<Bridge>,

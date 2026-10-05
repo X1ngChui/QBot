@@ -24,6 +24,10 @@ fn label(text: &str) -> String {
     }
 }
 
+/// Messages of a forwarded record shown in its line; the rest are counted. A record can hold
+/// hundreds of messages, and every prompt that shows the line would carry them all.
+pub const FORWARD_MAX_LINES: usize = 30;
+
 /// What rendering needs besides the segments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenderContext {

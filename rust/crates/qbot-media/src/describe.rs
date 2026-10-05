@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use qbot_llm::{
-    Content, ConvItem, Conversation, LlmError, LoadedMedia, MediaStore, Message, Params, Provider,
-    Request, Role, ToolChoice, collect,
+    Content, ConvItem, Conversation, LlmError, LoadedMedia, MediaStore, Message, Provider,
+    ReasoningEffort, Request, Role, ToolChoice, collect,
 };
 
 use crate::clean::clean_description;
@@ -32,7 +32,6 @@ impl MediaStore for OnePicture {
 pub struct LlmDescriber {
     provider: std::sync::Arc<dyn Provider>,
     instructions: String,
-    params: Params,
 }
 
 impl std::fmt::Debug for LlmDescriber {
@@ -42,15 +41,10 @@ impl std::fmt::Debug for LlmDescriber {
 }
 
 impl LlmDescriber {
-    pub fn new(
-        provider: std::sync::Arc<dyn Provider>,
-        instructions: String,
-        params: Params,
-    ) -> Self {
+    pub fn new(provider: std::sync::Arc<dyn Provider>, instructions: String) -> Self {
         Self {
             provider,
             instructions,
-            params,
         }
     }
 }
@@ -79,7 +73,8 @@ impl Describer for LlmDescriber {
             tools: &[],
             tool_choice: ToolChoice::None,
             parallel_tool_calls: false,
-            params: self.params,
+            // A description is a sentence or two; there is nothing to reason through.
+            reasoning: ReasoningEffort::Off,
             continuation: None,
             media: Some(&store),
         };

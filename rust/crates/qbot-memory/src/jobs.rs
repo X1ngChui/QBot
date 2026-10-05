@@ -69,9 +69,55 @@ impl EpisodeJobs {
         Ok(())
     }
 
-    /// Extract all complete slices of `group`; returns how many episodes were stored.
+    /// Embed the group's episodes that the current embedding index lacks: after the embedding
+    /// model or width changes, recall finds an episode again once this has run. Only the
+    /// embedding is redone; the episode itself (summary, evidence, findings) stays as it is.
+    async fn index_group(&self, group: GroupId) -> Result<usize, JobError> {
+        // Episodes embedded per round; the embedder splits them into requests it accepts.
+        const ROUND: usize = 64;
+        let (model, dims) = self.builder.index();
+        let (model, mut indexed) = (model.to_owned(), 0);
+        loop {
+            let missing = self
+                .store
+                .unembedded(group, &model, dims, ROUND)
+                .await
+                .map_err(failed)?;
+            if missing.is_empty() {
+                break;
+            }
+            let vectors = self.builder.embed(&missing).await.map_err(failed)?;
+            if vectors.len() != missing.len() {
+                return Err(JobError(format!(
+                    "{} episodes embedded as {} vectors",
+                    missing.len(),
+                    vectors.len()
+                )));
+            }
+            for (episode, vector) in missing.iter().zip(&vectors) {
+                self.store
+                    .set_embedding(episode.id, &model, vector)
+                    .await
+                    .map_err(failed)?;
+            }
+            indexed += missing.len();
+        }
+        if indexed > 0 {
+            tracing::info!(
+                group = group.get(),
+                indexed,
+                model,
+                "episodes embedded for recall"
+            );
+        }
+        Ok(indexed)
+    }
+
+    /// Extract all complete slices of `group`; returns how many episodes were stored. Episodes
+    /// the current embedding index lacks are embedded first.
     pub async fn extract_group(&self, group: GroupId) -> Result<usize, JobError> {
         let _one_at_a_time = self.running.lock().await;
+        self.index_group(group).await?;
         self.consolidate_pending(group).await?;
         let mut stored = 0;
         loop {

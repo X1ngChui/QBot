@@ -32,6 +32,19 @@ pub struct AsrConfig {
     pub workers: usize,
 }
 
+impl AsrConfig {
+    /// SenseVoice from `<models_dir>/asr/sense-voice` (where `deploy/fetch_asr_model.sh` puts
+    /// it), detecting the language, two threads, one recognition at a time.
+    pub fn new(models_dir: &std::path::Path) -> Self {
+        Self {
+            model_dir: models_dir.join("asr").join("sense-voice"),
+            language: "auto".into(),
+            threads: 2,
+            workers: 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AsrError {
     #[error(

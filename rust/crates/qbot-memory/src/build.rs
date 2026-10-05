@@ -5,7 +5,7 @@ use std::sync::Arc;
 use qbot_core::{AccountId, GroupId, SlicePlan};
 use qbot_llm::{Embedder, LlmError, Usage};
 
-use crate::episode::NewEpisode;
+use crate::episode::{Episode, NewEpisode};
 use crate::extract::{EpisodeExtractor, ExtractError, METHOD, SliceContext};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +42,11 @@ pub struct Built {
     pub attempts: u32,
 }
 
+/// What an episode is embedded as: its title and summary. Recall compares questions with this.
+pub fn embedding_text(title: &str, summary: &str) -> String {
+    format!("{title}\n{summary}")
+}
+
 pub struct EpisodeBuilder {
     extractor: EpisodeExtractor,
     embedder: Arc<dyn Embedder>,
@@ -65,6 +70,21 @@ impl EpisodeBuilder {
             embedder,
             cfg,
         }
+    }
+
+    /// The embedding index episodes are recalled through: the embedder's model and width.
+    pub fn index(&self) -> (&str, usize) {
+        let info = self.embedder.info();
+        (&info.model, info.dims)
+    }
+
+    /// Embed stored episodes again, from their own title and summary.
+    pub async fn embed(&self, episodes: &[Episode]) -> Result<Vec<Vec<f32>>, BuildError> {
+        let texts: Vec<String> = episodes
+            .iter()
+            .map(|e| embedding_text(&e.episode.title, &e.episode.summary))
+            .collect();
+        Ok(self.embedder.embed(&texts).await?.vectors)
     }
 
     /// Summarize the slice in `ctx.target`, which must be exactly the lines of `plan.target`.
@@ -109,7 +129,7 @@ impl EpisodeBuilder {
         };
         let embedded = self
             .embedder
-            .embed(&[format!("{}\n{}", episode.title, episode.summary)])
+            .embed(&[embedding_text(&episode.title, &episode.summary)])
             .await?;
         let vector = embedded.vectors.into_iter().next().unwrap_or_default();
         Ok(Built {

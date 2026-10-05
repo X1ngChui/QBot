@@ -7,8 +7,8 @@ use qbot_llm::fake::{FakeProvider, FakeReply, Step};
 use qbot_llm::responses::sim::{SimServer, SimStep};
 use qbot_llm::responses::{ResponsesConfig, ResponsesProvider, RetryPolicy, StateMode};
 use qbot_llm::{
-    Content, Continuation, ConvItem, Conversation, Message, Params, Provider, ReasoningEffort,
-    Request, Response, Role, ToolChoice, ToolOutput, ToolSpec, ToolStatus,
+    Content, Continuation, ConvItem, Conversation, Message, Provider, ReasoningEffort, Request,
+    Response, Role, ToolChoice, ToolOutput, ToolSpec, ToolStatus,
 };
 use serde_json::json;
 
@@ -23,14 +23,6 @@ pub fn tools() -> Vec<ToolSpec> {
             "additionalProperties": false
         }),
     }]
-}
-
-pub fn params() -> Params {
-    Params {
-        max_output_tokens: 1000,
-        reasoning: ReasoningEffort::Low,
-        temperature: None,
-    }
 }
 
 pub fn message(role: Role, text: &str) -> ConvItem {
@@ -58,7 +50,7 @@ pub fn request<'a>(
         tools,
         tool_choice: ToolChoice::Auto,
         parallel_tool_calls: true,
-        params: params(),
+        reasoning: ReasoningEffort::Low,
         continuation,
         media: None,
     }

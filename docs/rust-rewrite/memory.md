@@ -1,8 +1,8 @@
 # Memory: identity, episodes, recall
 
-Status: implemented in `qbot-memory` (domain, pipeline, ports), `qbot-store` (Postgres), and
-`qbot-tools` (`recall_episodes`, `read_episode`). Facts, group knowledge and decay are not built yet
-(see Follow-ups).
+How QBot remembers: `qbot-memory` (domain, pipeline, ports), `qbot-store` (Postgres) and the
+`recall_episodes`, `read_episode` and `lookup_member` tools. The archive of chat lines is the
+source of truth; everything here is derived from it.
 
 ## 1. Model
 
@@ -11,13 +11,13 @@ Status: implemented in `qbot-memory` (domain, pipeline, ports), `qbot-store` (Po
 - **Batch grid.** History is organized in fixed *batches* of `history.batch_lines` consecutive
   ordinals (30 by default), and the prompt's tiers move a whole batch at a time so the prompt
   prefix changes rarely: `history.raw_batches` newest batches verbatim, `history.summary_batches`
-  before them as episode summaries, older chat only through tools (design.md 4.19).
+  before them as episode summaries, older chat only through tools (design.md 7).
 - **Slice and episode.** A *slice* is `memory.slice_batches` whole batches. An *episode* is the
   summary of exactly one slice: it owns that exact ordinal range and nothing else. The ranges of
   one group tile the archive with no gap and no overlap; Postgres enforces non-overlap with a
   range-exclusion constraint, so two workers cannot both store the same slice.
-- **Context is not source.** When extracting slice N the model also sees the nearest
-  `previous_context_batches` before it and `next_context_batches` after it. They are labelled
+- **Context is not source.** When extracting a slice the model also sees the batch before it and
+  the batch after it. They are labelled
   "context only, do not summarize or quote", evidence quotes must come from the target, and
   they never extend the episode's range. The transcript stays authoritative.
 - **Following context is bounded.** It is capped by what the retained raw window leaves after the
@@ -30,29 +30,52 @@ Status: implemented in `qbot-memory` (domain, pipeline, ports), `qbot-store` (Po
 
 ## 2. Extraction
 
-`EpisodeJobs` (a `JobKind::Extract` runner) loops: find the next complete slice after the group's
-newest episode, read previous/target/next lines, call the model, validate, embed
-`title + summary`, store episode and vector in one transaction. It is idempotent, resumes at the
-failed slice after an error, and refuses an archive with a gap in a slice rather than guessing.
+Every filled batch queues its group's extraction job, and the nightly run extracts whatever was
+missed. `EpisodeJobs::extract_group` runs one group at a time: it first embeds any episode the
+current embedding index lacks, then loops: find the next complete slice after the group's newest
+episode, read the previous, target and next lines, call the model, validate, embed
+`title + summary`, store the episode and its vector in one transaction, and apply its findings. It
+is idempotent, resumes at a failed slice, and refuses an archive with a gap in a slice rather than
+guessing.
 
-The model call is one forced-shape tool call (`submit_episode`). Code validates the answer
-(non-empty title and summary, 1 to 3 evidence quotes copied exactly from target lines). A rejected
-answer goes back to the model with every reason, at most `memory.extraction.max_attempts` times.
+The model answers with one tool call, `submit_episode`: a title and summary in the bot's writing
+language (from the locale), one to three evidence quotes, and findings: names, facts about members
+(by the predicates in `prompts/predicates.toml`) and group knowledge (terms and the topic), each
+tied to a target line and a verbatim quote. Code validates everything:
+
+- The episode needs a title, a summary and one to three quotes copied exactly from target lines.
+  A rejected episode goes back to the model with every reason.
+- A finding needs a member's line (never the bot's, never a notice) whose text contains the quote,
+  a subject who wrote the line or is mentioned in the quote, a known predicate, and for a name or a
+  term, the name in the quote or the term written in the target. Rejected findings go back once;
+  if the correction is not valid, the episode is kept with the findings that held.
+- An answer cut off at the provider's output limit, or whose arguments are not JSON, is lost
+  rather than wrong: the same request is sent again. At most three model calls per slice.
+
 There is no staging state machine: a crash between the model response and the insert repeats one
-slice's model call, which is cheaper than the machinery to avoid it.
+slice's model call, which is cheaper than the machinery to avoid it. The episode records the
+extraction method and model; a later change of extraction model does not invalidate existing
+episodes or what was learned from them.
 
 ## 3. Retrieval
 
-`recall_episodes(question)` embeds the question and does an exact cosine scan over the group's
-episode vectors for the configured embedding model (no approximate index: retrieval filters by
-group first, so the scan is small and exact). Results are summaries; `read_episode(id)` returns
-the raw lines of that episode's range, bounded by the slice size. Vectors are keyed by model, so
-changing the embedding model hides old vectors until rebuilt.
+- `recall_episodes(question)` embeds the question and scans the group's episode vectors exactly
+  (retrieval filters by group first, so the scan is small; no approximate index). Candidates are
+  the episodes within `memory.recall.max_distance` (cosine, below 1). They are ranked by one score,
+  similarity times `0.5^(age / half_life)` with age counted from the episode's end
+  (`memory.recall.half_life_days`, 180 by default; 0 ranks by similarity alone), then the more
+  recent episode, then the higher id, and the best five are returned. There is no age cutoff: a
+  strong old match still surfaces over a weak recent one (0.98 similarity three months old beats
+  0.56 from today), while a somewhat less similar recent episode beats a very old one (0.7 from ten
+  days ago beats 0.8 from a year ago).
+- `read_episode(id)` returns the raw lines of that episode's range, bounded by the slice size.
+- **Embeddings are a derived index.** An episode has one vector, from the configured embedding
+  model and width. When either changes, recall finds an episode again once the nightly run has
+  embedded it anew from its stored title and summary; nothing is extracted again.
 
 ## 4. Identity
 
-Terms. A member's *group nickname* is the name they set for one group (OneBot `card`; QQ's
-"group nickname", formerly "group card"). Their *account nickname* is the account's global QQ
+Terms. A member's *group nickname* is the name they set for one group (OneBot `card`). Their *account nickname* is the account's global QQ
 name (OneBot `nickname`). Their *group display name* is what the group shows: the group nickname,
 else the account nickname. These docs say "group nickname" and "group display name" only.
 
@@ -72,9 +95,8 @@ else the account nickname. These docs say "group nickname" and "group display na
 - *Stored names* are the other names people use for someone: per group, pointing at an account or
   a holder. Evidence is fused in one Rust function: manual 1.0, extracted evidence 0.25 per
   distinct episode capped at 0.7, combined as independent evidence. A name resolves only when
-  confirmed (`identity.confirm_at`, default 0.75), so extraction alone never confirms: only a
-  person does. Two confirmed targets for a name is *ambiguous*, never a guess.
-- *Invitations* to link accounts: ten minutes (`identity.invitation_ttl_secs`), one pending per
+  confirmed (at 0.75), so extraction alone never confirms: only a person does. Two confirmed targets for a name is *ambiguous*, never a guess.
+- *Invitations* to link accounts: ten minutes, one pending per
   account per group, only the target confirms, the confirmation must come after the invitation, an
   expired or stale (a holder changed) invitation is closed, replaying the confirming message is a
   no-op.
@@ -89,12 +111,11 @@ immutable, the composed view is stable between requests and keeps the provider's
 This is how the summary tier is shown: episodes ending in it replace their lines from the start
 of every run (as `Summary` items over exactly those chat items), and episodes inside the verbatim
 tier are the fallback when a provider still reports the context too long. Each filled batch queues
-the extraction, so episodes normally exist before their lines leave the verbatim tier. See
-design.md 4.19.
+the extraction, so episodes normally exist before their lines leave the verbatim tier.
 
-## 6. What was investigated, and why slicing is fixed
+## 6. Why slicing is fixed
 
-Before settling on fixed slices I measured segmentation strategies on synthetic chats with known
+Before settling on fixed slices we measured segmentation strategies on synthetic chats with known
 conversation boundaries (silence, speaker changes, reply edges, embedding-similarity dips; ground
 truth by construction; the experiment code has since been removed). Findings, mean boundary F1
 over five scenarios:
@@ -120,17 +141,25 @@ needed for this use case, so episodes are fixed, batch-aligned slices; an LLM bo
 a segmentation state machine is only worth building if fixed slicing proves clearly insufficient.
 The design above would then still hold: the slicing function is the only part that changes.
 
-## 7. Configuration
+## 7. Facts and group knowledge
 
-Policy values live in configuration, not code (see `rust/deploy/README.md` for layering):
-`history.batch_lines`, `history.raw_batches`, `history.summary_batches`, `memory.slice_batches`, `memory.previous_context_batches`,
-`memory.next_context_batches`, `memory.language`, `memory.extraction.*`, `memory.recall.*`,
-`memory.facts.*`, `identity.confirm_at`, `identity.invitation_ttl_secs`. Fusion weights, the 64-character name
-bound and the evidence caps are internal tuning and stay constants.
+- **Consolidation** applies each episode's findings in order, right after it is stored and on
+  startup for any left over. Names become extracted identity evidence; facts and knowledge become
+  observations in `fact` / `fact_evidence`. A single-valued predicate supersedes its previous
+  value; a multi-valued one keys on the normalized object; an opposite predicate (likes /
+  dislikes) supersedes the other. An episode supports a fact at most once.
+- **Confidence** is the Wilson lower bound of the supporting episodes times `0.5^(age /
+  half-life)`, with the half-life chosen by the predicate's decay class
+  (`memory.facts.half_life_days`); a fact whose confidence falls below 0.05 is expired by the
+  nightly run. It is computed on read, so it is deterministic for a given time.
+- **Where facts reach the model.** Member facts only through `lookup_member`: by predicate, the
+  most recently confirmed first, with confidence and age, across the person's linked accounts.
+  Group knowledge as an instruction: the topic and the 40 most recently confirmed terms (design.md
+  7). Members see their own facts with `/who` and remove them with `/forget`.
 
 ## 8. Manual notes are not memory
 
-Two kinds of information about people and the group are kept apart (design.md decision 6):
+Two kinds of information about people and the group are kept apart (design.md 18):
 
 | | Manual notes | Extracted memory |
 | --- | --- | --- |
@@ -144,11 +173,7 @@ Neither path writes into the other: extraction reads chat lines, never notes, an
 never creates notes; `/forget` never touches notes and `/note` never touches facts. Help texts
 name the store each command acts on.
 
-## 9. Follow-ups
+## 9. Retention
 
-- Refresh of old episodes when the model or prompt version changes (`method` and `model` are
-  stored for this); not needed for migration, which rebuilds everything from imported chat
-  (design.md decision 10). Facts, group knowledge, display-name evidence and compaction are
-  built (design.md 4.19).
-- Evaluate on real chat if fixed slicing looks insufficient; then revisit section 6.
-- Episode retention is unbounded (text is small); revisit if storage or privacy requires.
+Episodes, facts and evidence are small text and are kept; expired and superseded facts stay as
+history. Revisit if storage or privacy requires.

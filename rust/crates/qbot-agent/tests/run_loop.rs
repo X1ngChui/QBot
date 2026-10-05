@@ -728,12 +728,7 @@ async fn a_provider_that_forces_tools_only_without_reasoning_keeps_reasoning_off
     h.world.say(1, 1, "hello");
     let report = run_once(&h, addressed(1, 101)).await;
     assert_eq!(report.end, RunEnd::Delivered);
-    let reasoning: Vec<_> = h
-        .fake
-        .recorded()
-        .iter()
-        .map(|r| r.params.reasoning)
-        .collect();
+    let reasoning: Vec<_> = h.fake.recorded().iter().map(|r| r.reasoning).collect();
     assert_eq!(
         reasoning,
         [

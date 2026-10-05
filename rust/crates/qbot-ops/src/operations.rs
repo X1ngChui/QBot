@@ -21,8 +21,7 @@ pub struct OpsConfig {
     /// A name nobody has vouched for and no evidence has supported for this long is dropped.
     pub alias_unused: Duration,
     /// Picture descriptions older than this are forgotten (and so redone when next needed).
-    /// `None` keeps them forever.
-    pub description_ttl: Option<Duration>,
+    pub description_ttl: Duration,
     pub timers_keep: Duration,
     /// Finished runs older than this are deleted. `None` keeps them forever.
     pub runs_keep: Option<Duration>,
@@ -30,6 +29,32 @@ pub struct OpsConfig {
     pub zone: TimeZone,
     /// How facts fade when nothing confirms them.
     pub fact_decay: DecayPolicy,
+}
+
+impl OpsConfig {
+    /// The nightly upkeep around the deployment's choices (backups, run retention, who gets the
+    /// report, the time zone, how facts fade). A name candidate nothing has supported for 30
+    /// days is dropped; picture descriptions are redone after 15 days, so a changed vision model
+    /// or prompt takes effect; finished timers are kept 30 days for /tasks history.
+    pub fn new(
+        backup: Option<BackupConfig>,
+        runs_keep: Option<Duration>,
+        owners: Vec<AccountId>,
+        zone: TimeZone,
+        fact_decay: DecayPolicy,
+    ) -> Self {
+        const DAY: Duration = Duration::from_secs(86_400);
+        Self {
+            backup,
+            alias_unused: DAY * 30,
+            description_ttl: DAY * 15,
+            timers_keep: DAY * 30,
+            runs_keep,
+            owners,
+            zone,
+            fact_decay,
+        }
+    }
 }
 
 pub struct Operations {
@@ -121,14 +146,11 @@ impl Operations {
             .expire_candidates(self.before(self.cfg.alias_unused))
             .await
             .map_err(failed)?;
-        let forgotten = match self.cfg.description_ttl {
-            Some(ttl) => self
-                .housekeeping
-                .expire_descriptions(self.before(ttl))
-                .await
-                .map_err(failed)?,
-            None => 0,
-        };
+        let forgotten = self
+            .housekeeping
+            .expire_descriptions(self.before(self.cfg.description_ttl))
+            .await
+            .map_err(failed)?;
         let faded = decay_facts(&*self.facts, &self.cfg.fact_decay, self.clock.now())
             .await
             .map_err(failed)?;

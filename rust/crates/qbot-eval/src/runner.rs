@@ -15,7 +15,7 @@ use qbot_context::{AssistantPart, ChatLine, Item, Outcome, Part, RunEnd, Speaker
 use qbot_core::{AccountId, ChainId, Clock, GroupId, MessageId, RunId, TimerId, UnixMillis};
 use qbot_llm::embedding::FakeEmbedder;
 use qbot_llm::search::{FakeSearch, PageRead, SearchHit, SearchResults};
-use qbot_llm::{Params, Provider, ReasoningEffort, Usage};
+use qbot_llm::{Provider, ReasoningEffort, Usage};
 use qbot_memory::facts::{
     DecayPolicy, FactStore, GROUP_TERM, GROUP_TOPIC, MemoryFactStore, Observation, normalize_key,
 };
@@ -153,19 +153,11 @@ fn render(segments: &[OutSegment], scenario: &Scenario, accounts: &[(u32, Accoun
 pub struct Runner {
     pub provider: Arc<dyn Provider>,
     pub personas: Personas,
-    pub params: Params,
+    /// The replies' reasoning effort (`providers.text.reasoning`).
+    pub reasoning: ReasoningEffort,
 }
 
 impl Runner {
-    pub fn default_params() -> Params {
-        // The production defaults (`[agent]`).
-        Params {
-            max_output_tokens: 4096,
-            reasoning: ReasoningEffort::Low,
-            temperature: None,
-        }
-    }
-
     pub async fn run(&self, scenario: &Scenario) -> Result<(RunResult, Vec<ChatLine>), String> {
         let group = GroupId::new(GROUP).map_err(|e| e.to_string())?;
         let world = SimWorld::new(group);
@@ -365,7 +357,7 @@ impl Runner {
         .map_err(|e| e.to_string())?
         .with_knowledge(Arc::new(FactKnowledge::new(
             facts.clone(),
-            FactKnowledge::DEFAULT_MAX_TERMS,
+            FactKnowledge::MAX_TERMS,
         )));
         let trigger = match (&scenario.trigger.line, &scenario.trigger.wake) {
             (Some(n), _) => {
@@ -401,7 +393,7 @@ impl Runner {
             renderer: Arc::new(PromptRenderer::new(prompt.zone().clone())),
             clock,
             limits: RunLimits::default(),
-            params: self.params,
+            reasoning: self.reasoning,
             media: None,
         };
         let input = RunInput {

@@ -22,6 +22,17 @@ pub struct SearchSettings {
     pub max_limit: u32,
 }
 
+impl Default for SearchSettings {
+    /// A screenful of matches by default; the model may ask for more, up to what one prompt can
+    /// reasonably carry.
+    fn default() -> Self {
+        Self {
+            default_limit: 8,
+            max_limit: 50,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct SearchHistory {
     archive: Arc<dyn Archive>,

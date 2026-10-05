@@ -21,20 +21,21 @@ use qbot_gateway::media::{FetchSettings, OneBotFetcher};
 use qbot_gateway::pipeline::{BatchFilled, Pipeline, PipelineConfig};
 use qbot_gateway::server::{GatewayServer, serve};
 use qbot_gateway::trigger::Nicknames;
-use qbot_i18n::{LocaleErrors, Locales};
+use qbot_i18n::{LocaleErrors, Locales, Msg};
 use qbot_llm::embedding::HttpEmbedder;
-use qbot_llm::responses::{KeySource, ReqwestTransport, ResponsesProvider};
+use qbot_llm::responses::{CONNECT_TIMEOUT, KeySource, ReqwestTransport, ResponsesProvider};
 use qbot_llm::search::TavilySearch;
 use qbot_llm::{Embedder, LlmError, Provider};
 use qbot_media::{
-    ArchivedMedia, Describer, LlmDescriber, MediaDeps, MediaService, OpenImages, PgLineEditor,
-    Transcriber,
+    ArchivedMedia, Describer, LlmDescriber, MediaConfig, MediaDeps, MediaService, OpenImages,
+    PgLineEditor, Transcriber,
 };
 use qbot_memory::consolidate::Consolidator;
 use qbot_memory::facts::FactStore;
 use qbot_memory::predicates::Predicates;
 use qbot_memory::{
-    EpisodeBuilder, EpisodeExtractor, EpisodeJobs, EpisodeStore, IdentityStore, Recall,
+    BuilderConfig, EpisodeBuilder, EpisodeExtractor, EpisodeJobs, EpisodeStore, IdentityStore,
+    Recall,
 };
 use qbot_ops::{BackupError, Operations, Parts, PgHousekeeping, PgReportSource, check_tools};
 use qbot_prompt::{
@@ -56,6 +57,10 @@ use tokio_util::sync::CancellationToken;
 /// How often the database lease is checked. Losing it ends the process: another instance may
 /// already be running.
 const LEASE_CHECK: Duration = Duration::from_secs(10);
+/// How long a reply waits for its triggering message's pictures and clips before it goes ahead
+/// without them: long enough for a description or a short transcript, short enough that the
+/// reply still feels prompt.
+const MEDIA_WAIT: Duration = Duration::from_secs(25);
 
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
@@ -179,12 +184,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
 
     // The database, and the single-instance lease before anything is recovered or started.
     let url = config.database_url(secrets.database_password.expose());
-    let store = Store::connect(
-        &url,
-        config.database.max_connections,
-        config.database_connect_timeout(),
-    )
-    .await?;
+    let store = Store::connect(&url).await?;
     store.migrate().await?;
     let lease = RuntimeLease::acquire(&url, DEFAULT_KEY).await?;
     let lease_lost = CancellationToken::new();
@@ -198,7 +198,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     let run_log = PgRunLog::new(pool.clone(), clock.clone());
     let timers = Arc::new(PgTimerStore::new(pool.clone(), clock.clone()));
     let identity: Arc<dyn IdentityStore> =
-        Arc::new(PgIdentityStore::new(pool.clone(), config.identity_policy()));
+        Arc::new(PgIdentityStore::new(pool.clone(), Default::default()));
     let episodes: Arc<dyn EpisodeStore> =
         Arc::new(PgEpisodeStore::new(pool.clone(), clock.clone()));
     let facts: Arc<dyn FactStore> = Arc::new(PgFactStore::new(pool.clone()));
@@ -220,7 +220,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     let text_transport = ReqwestTransport::new(
         config.providers.text.endpoint.clone(),
         http_key(&config.providers.text.api_key_secret, &resolver),
-        config.text_connect_timeout(),
+        CONNECT_TIMEOUT,
     )?;
     let provider: Arc<dyn Provider> = Arc::new(ResponsesProvider::new(
         config.text_provider(),
@@ -229,7 +229,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     let embed_transport = ReqwestTransport::new(
         config.providers.embedding.endpoint.clone(),
         http_key(&config.providers.embedding.api_key_secret, &resolver),
-        config.embedding_connect_timeout(),
+        CONNECT_TIMEOUT,
     )?;
     let embedder: Arc<dyn Embedder> = Arc::new(HttpEmbedder::new(
         config.embedding_provider(),
@@ -239,38 +239,26 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     // The platform side.
     let bridge = Arc::new(Bridge::new());
     let echoes = Arc::new(EchoBoard::new());
-    let timeouts = DeliveryTimeouts {
-        action: config.action_timeout(),
-        echo: config.echo_timeout(),
-    };
+    let timeouts = DeliveryTimeouts::default();
     let delivery = Arc::new(OneBotDelivery::new(
         bridge.clone(),
         echoes.clone(),
         timeouts,
     ));
-    let directory = Arc::new(OneBotDirectory::new(
-        bridge.clone(),
-        config.action_timeout(),
-    ));
+    let directory = Arc::new(OneBotDirectory::new(bridge.clone(), timeouts.action));
 
     // Tasks, tools, prompt, supervisor, scheduler.
     let wake = Arc::new(Notify::new());
     let tasks = TaskService::new(
         timers.clone(),
         clock.clone(),
-        config.task_limits(),
+        Default::default(),
         wake.clone(),
     );
     // Pictures and clips are fetched through the platform connection.
     let fetcher: Arc<OneBotFetcher> = Arc::new(
-        OneBotFetcher::new(
-            bridge.clone(),
-            FetchSettings {
-                http_timeout: config.media_http_timeout(),
-                protocol_timeout: config.media_protocol_timeout(),
-            },
-        )
-        .map_err(|e| RunError::Media(e.to_string()))?,
+        OneBotFetcher::new(bridge.clone(), FetchSettings::default())
+            .map_err(|e| RunError::Media(e.to_string()))?,
     );
     let archive_port: Arc<dyn Archive> = Arc::new(archive.clone());
     let tools = qbot_tools::standard_tools(
@@ -303,7 +291,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         let store = Arc::new(ArchivedMedia::new(
             Arc::new(archive.clone()),
             fetcher.clone(),
-            config.media_config().max_image_bytes,
+            MediaConfig::default().max_image_bytes,
         ));
         let tools = tools
             .with(OpenImages(store.clone()))
@@ -317,9 +305,9 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     // Web search and page reading are offered only when a search provider is configured.
     let tools = if config.providers.search.enabled {
         let transport = ReqwestTransport::with_proxy(
-            config.providers.search.endpoint.clone(),
+            qbot_llm::search::ENDPOINT,
             http_key(&config.providers.search.api_key_secret, &resolver),
-            config.search_connect_timeout(),
+            CONNECT_TIMEOUT,
             config.search_proxy(),
         )
         .map_err(|e| RunError::Tools(e.to_string()))?;
@@ -332,7 +320,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
             .and_then(|set| {
                 set.with(qbot_tools::ReadUrl::new(
                     search,
-                    config.read_url_max_chars(),
+                    qbot_tools::READ_URL_MAX_CHARS,
                 ))
             })
             .map_err(|e| RunError::Tools(e.to_string()))?
@@ -352,7 +340,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     )?
     .with_knowledge(Arc::new(qbot_prompt::FactKnowledge::new(
         facts.clone(),
-        config.memory.knowledge.max_terms,
+        qbot_prompt::FactKnowledge::MAX_TERMS,
     )))
     .with_episodes(episodes.clone());
     let renderer = Arc::new(PromptRenderer::new(prompt.zone().clone()));
@@ -364,8 +352,8 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         sink: recorder.sink(),
         renderer,
         clock: clock.clone(),
-        limits: config.run_limits(),
-        params: config.params(),
+        limits: Default::default(),
+        reasoning: config.reply_reasoning(),
         media: media_store,
     });
     let supervisor = Supervisor::new(
@@ -382,10 +370,14 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         // A missing client is an error now, not at two in the morning.
         check_tools(backup).await?;
     }
+    // The language the bot writes in comes with the locale.
+    let writing_language = locales.render(&Msg::WritingLanguage {});
     let builder = EpisodeBuilder::new(
-        EpisodeExtractor::new(provider.clone(), config.extractor_config()),
+        EpisodeExtractor::new(provider.clone()),
         embedder.clone(),
-        config.builder_config(),
+        BuilderConfig {
+            language: writing_language.clone(),
+        },
     );
     let operations = Arc::new(Operations::new(Parts {
         cfg: ops_config,
@@ -406,15 +398,12 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         identity: identity.clone(),
         facts: facts.clone(),
         report: Arc::new(PgReportSource(admin.clone())),
-        sink: Arc::new(OneBotReportSink::new(
-            bridge.clone(),
-            config.action_timeout(),
-        )),
+        sink: Arc::new(OneBotReportSink::new(bridge.clone(), timeouts.action)),
         locales: locales.clone(),
         platform_cache: config.maintenance.napcat_clean_cache.then(|| {
             Arc::new(crate::report_sink::NapCatCache::new(
                 bridge.clone(),
-                config.action_timeout(),
+                timeouts.action,
             )) as Arc<dyn qbot_ops::PlatformCache>
         }),
     }));
@@ -437,7 +426,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         supervisor.clone(),
         clock.clone(),
         operations,
-        config.scheduler_config(),
+        Default::default(),
         wake,
     ));
 
@@ -446,36 +435,27 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         let transport = ReqwestTransport::new(
             config.providers.vision.endpoint.clone(),
             http_key(&config.providers.vision.api_key_secret, &resolver),
-            config.vision_connect_timeout(),
+            CONNECT_TIMEOUT,
         )?;
         let vision = Arc::new(ResponsesProvider::new(
             config.vision_provider(),
             Arc::new(transport),
         )?);
-        let instructions = describe_image_instructions(&config.media.description_language)?;
-        Some(Arc::new(LlmDescriber::new(
-            vision,
-            instructions,
-            config.vision_params(),
-        )))
+        let instructions = describe_image_instructions(&writing_language)?;
+        Some(Arc::new(LlmDescriber::new(vision, instructions)))
     } else {
         tracing::info!("picture description is off (providers.vision.enabled = false)");
         None
     };
-    let transcriber: Option<Arc<dyn Transcriber>> = if config.asr.enabled {
-        let asr = AsrConfig {
-            model_dir: paths.models_dir.join(&config.asr.model_dir),
-            language: config.asr.language.clone(),
-            threads: config.asr.threads,
-            workers: config.asr.workers,
-        };
+    let transcriber: Option<Arc<dyn Transcriber>> = if config.media.transcribe_voice {
+        let asr = AsrConfig::new(&paths.models_dir);
         // Loading the model is slow and blocking; a missing or damaged one stops startup here.
         let loaded = tokio::task::spawn_blocking(move || SherpaTranscriber::load(&asr))
             .await
             .map_err(|e| RunError::Media(e.to_string()))??;
         Some(Arc::new(loaded))
     } else {
-        tracing::info!("voice transcription is off (asr.enabled = false)");
+        tracing::info!("voice transcription is off (media.transcribe_voice = false)");
         None
     };
     let media = Arc::new(MediaService::new(
@@ -502,33 +482,18 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         delivery: delivery.clone(),
         locales,
         clock: clock.clone(),
-        settings: CommandSettings {
-            bot,
-            owners: config.owners(),
-            zone,
-            max_message_chars: config.gateway.max_message_chars,
-            members_max_rows: config.commands.members_max_rows,
-            top_max_rows: config.commands.top_max_rows,
-            link_ttl: config.link_ttl(),
-            fact_decay: config.decay_policy(),
-            notes_per_account: config.commands.notes_per_account,
-            runs_max_rows: config.commands.runs_max_rows,
-        },
+        settings: CommandSettings::new(bot, config.owners(), zone, config.decay_policy()),
     }));
     let pipeline = Arc::new(
         Pipeline::new(
-            PipelineConfig {
-                bot,
-                echo_keep: config.echo_timeout(),
-                forward_max_lines: config.media.forward_max_lines,
-            },
+            PipelineConfig::new(bot),
             Arc::new(archive),
             commands,
             Arc::new(supervisor.clone()),
             Nicknames::new(&config.bot.nicknames),
             echoes,
         )
-        .with_media(media.clone(), config.media_wait())
+        .with_media(media.clone(), MEDIA_WAIT)
         .with_batches(batch_jobs, config.history.batch_lines),
     );
 
@@ -545,7 +510,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         bridge,
         bot,
         access_token,
-        path: config.gateway.path.as_str().into(),
+        path: qbot_gateway::server::PATH.into(),
         cancel: stop.clone(),
     };
     let listener = TcpListener::bind(listen)
@@ -558,7 +523,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         addr: config.gateway.listen.clone(),
         source,
     })?;
-    tracing::info!(listen = %bound, path = %config.gateway.path, bot = bot.get(), "listening for the platform");
+    tracing::info!(listen = %bound, path = qbot_gateway::server::PATH, bot = bot.get(), "listening for the platform");
     if let Some(ready) = ready {
         // The receiver may have gone away (a caller that stopped waiting); that is not an error.
         let _ = ready.send(bound);

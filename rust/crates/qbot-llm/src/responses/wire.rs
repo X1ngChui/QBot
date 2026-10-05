@@ -60,7 +60,7 @@ pub(crate) fn build_body(
         match caps.forced_tool_choice {
             ForcedToolChoice::Always => {}
             ForcedToolChoice::WithoutReasoning
-                if request.params.reasoning == crate::ReasoningEffort::Off => {}
+                if request.reasoning == crate::ReasoningEffort::Off => {}
             ForcedToolChoice::WithoutReasoning => {
                 return Err(LlmError::Unsupported(
                     "forced tool choice with reasoning on",
@@ -68,9 +68,6 @@ pub(crate) fn build_body(
             }
             ForcedToolChoice::Never => return Err(LlmError::Unsupported("forced tool choice")),
         }
-    }
-    if request.params.temperature.is_some() && !caps.temperature {
-        return Err(LlmError::Unsupported("temperature"));
     }
 
     let (from, previous) = match plan {
@@ -88,7 +85,6 @@ pub(crate) fn build_body(
         "stream": stream,
         "store": cfg.state == StateMode::ServerState,
         "parallel_tool_calls": request.parallel_tool_calls,
-        "max_output_tokens": request.params.max_output_tokens,
     });
     let map = body
         .as_object_mut()
@@ -123,15 +119,12 @@ pub(crate) fn build_body(
             ToolChoice::Auto | ToolChoice::None => {}
         }
     }
-    if let Some(temperature) = request.params.temperature {
-        map.insert("temperature".into(), json!(temperature));
-    }
     if let Some(id) = previous {
         map.insert("previous_response_id".into(), json!(id));
     }
     match cfg.flavor {
         Flavor::DeepSeek => {
-            let effort = match request.params.reasoning {
+            let effort = match request.reasoning {
                 ReasoningEffort::Off => "none",
                 ReasoningEffort::Low => "low",
                 ReasoningEffort::Medium => "high",
@@ -140,7 +133,7 @@ pub(crate) fn build_body(
             map.insert("reasoning".into(), json!({ "effort": effort }));
         }
         Flavor::Standard => {
-            let effort = match request.params.reasoning {
+            let effort = match request.reasoning {
                 ReasoningEffort::Off => None,
                 ReasoningEffort::Low => Some("low"),
                 ReasoningEffort::Medium => Some("medium"),

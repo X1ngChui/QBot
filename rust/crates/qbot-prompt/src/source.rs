@@ -41,8 +41,10 @@ pub struct FactKnowledge {
 }
 
 impl FactKnowledge {
-    /// The default for `memory.knowledge.max_terms`.
-    pub const DEFAULT_MAX_TERMS: usize = 40;
+    /// Terms a reply is shown. The block enters every reply's instructions, and a long-lived
+    /// group learns far more terms than a prompt should carry; 40 covers a group's working
+    /// vocabulary.
+    pub const MAX_TERMS: usize = 40;
 
     pub fn new(facts: Arc<dyn FactStore>, max_terms: usize) -> Self {
         Self { facts, max_terms }

@@ -38,6 +38,23 @@ pub struct TavilyConfig {
     pub extract: ExtractConfig,
 }
 
+impl TavilyConfig {
+    /// Five results a search and three passages a page: enough to answer from, little enough
+    /// to read. One search or page read is given 20 seconds, retries included.
+    pub fn new(depth: SearchDepth, extract_depth: SearchDepth) -> Self {
+        Self {
+            max_results: 5,
+            depth,
+            timeout: Duration::from_secs(20),
+            retry: RetryPolicy::default(),
+            extract: ExtractConfig {
+                depth: extract_depth,
+                chunks_per_source: 3,
+            },
+        }
+    }
+}
+
 /// Page reading (`POST /extract`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExtractConfig {
@@ -60,6 +77,9 @@ impl std::fmt::Debug for TavilySearch {
             .finish_non_exhaustive()
     }
 }
+
+/// Tavily's API.
+pub const ENDPOINT: &str = "https://api.tavily.com";
 
 impl TavilySearch {
     pub fn new(cfg: TavilyConfig, transport: Arc<dyn Transport>) -> Self {

@@ -58,8 +58,6 @@ pub struct Capabilities {
     /// When `ToolChoice::Required` and `ToolChoice::Named` are honored. `Auto` and `None` always
     /// are (`None` is emulated by declaring no tools).
     pub forced_tool_choice: ForcedToolChoice,
-    /// A sampling temperature may be set.
-    pub temperature: bool,
 }
 
 /// Whether a provider can be made to call a tool. A property of each adapter and dialect,

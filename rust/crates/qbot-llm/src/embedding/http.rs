@@ -24,16 +24,25 @@ pub struct EmbeddingConfig {
 }
 
 impl EmbeddingConfig {
+    /// An OpenAI-compatible embeddings endpoint. One request (a batch) is given 30 seconds,
+    /// retries included.
+    pub fn new(model: impl Into<String>, dims: usize, max_batch: usize) -> Self {
+        Self {
+            id: ProviderId::new("embedding"),
+            model: model.into(),
+            dims,
+            max_batch,
+            timeout: std::time::Duration::from_secs(30),
+            retry: RetryPolicy::default(),
+        }
+    }
+
     /// Alibaba DashScope `text-embedding-v4`: 10 inputs per request; 2048 dimensions measured
     /// to separate related from unrelated Chinese text better than 1024.
     pub fn dashscope_v4(dims: usize) -> Self {
         Self {
             id: ProviderId::new("dashscope"),
-            model: "text-embedding-v4".into(),
-            dims,
-            max_batch: 10,
-            timeout: std::time::Duration::from_secs(30),
-            retry: RetryPolicy::default(),
+            ..Self::new("text-embedding-v4", dims, 10)
         }
     }
 }

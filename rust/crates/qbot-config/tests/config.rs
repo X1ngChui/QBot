@@ -64,11 +64,11 @@ fn the_baked_in_defaults_are_a_complete_valid_configuration() {
     let c = &loaded.config;
     assert_eq!(
         (
-            c.runtime.reply_capacity,
-            c.runtime.reply_concurrency,
-            c.runtime.reply_deadline_secs
+            c.replies.concurrency,
+            c.replies.deadline_secs,
+            c.replies.max_messages
         ),
-        (32, 3, 180)
+        (3, 180, 4)
     );
     assert_eq!(
         (
@@ -99,43 +99,46 @@ fn layers_apply_in_a_fixed_order_and_override_key_by_key() {
     write(
         &root,
         "etc/config.toml",
-        "[runtime]\nreply_capacity = 10\nreply_concurrency = 2\n[memory]\nlanguage = \"French\"\n",
+        "[replies]\nconcurrency = 10\ndeadline_secs = 60\n[providers.text]\nmodel = \"m-one\"\n",
     );
     write(
         &root,
         "etc/conf.d/20-b.toml",
-        "[runtime]\nreply_capacity = 20\n",
+        "[replies]\nconcurrency = 20\n",
     );
     write(
         &root,
         "etc/conf.d/10-a.toml",
-        "[runtime]\nreply_capacity = 15\n[agent]\nmax_turns = 7\n",
+        "[replies]\nconcurrency = 15\nmax_messages = 7\n",
     );
     write(
         &root,
         "etc/conf.d/ignored.txt",
         "this is not toml and is not read",
     );
-    let env = MapEnv::new([("QBOT__AGENT__MAX_TURNS", "9")]);
+    let env = MapEnv::new([("QBOT__REPLIES__MAX_MESSAGES", "9")]);
     let loaded = load(&root, &env).unwrap();
     let c = &loaded.config;
 
     assert_eq!(
-        c.runtime.reply_capacity, 20,
+        c.replies.concurrency, 20,
         "drop-ins apply in file-name order, so 20-b wins over 10-a"
     );
     assert_eq!(
-        c.runtime.reply_concurrency, 2,
+        c.replies.deadline_secs, 60,
         "a key set in config.toml survives later layers that do not set it"
     );
-    assert_eq!(c.agent.max_turns, 9, "the environment beats every file");
-    assert_eq!(c.memory.language, "French");
     assert_eq!(
-        c.runtime.reply_deadline_secs, 180,
+        c.replies.max_messages, 9,
+        "the environment beats every file"
+    );
+    assert_eq!(c.providers.text.model, "m-one");
+    assert_eq!(
+        c.history.batch_lines, 30,
         "a key nobody sets keeps its default"
     );
     assert_eq!(
-        c.agent.max_sends_per_run, 4,
+        c.providers.text.endpoint, "https://api.deepseek.com",
         "siblings of an overridden key are untouched"
     );
 
@@ -146,7 +149,7 @@ fn layers_apply_in_a_fixed_order_and_override_key_by_key() {
     assert!(matches!(&loaded.sources[2], Source::DropIn(p) if p.ends_with("10-a.toml")));
     assert!(matches!(&loaded.sources[3], Source::DropIn(p) if p.ends_with("20-b.toml")));
     assert!(
-        matches!(&loaded.sources[4], Source::Env(n) if n == "QBOT__AGENT__MAX_TURNS"),
+        matches!(&loaded.sources[4], Source::Env(n) if n == "QBOT__REPLIES__MAX_MESSAGES"),
         "only the name is recorded, never the value"
     );
 }
@@ -154,24 +157,13 @@ fn layers_apply_in_a_fixed_order_and_override_key_by_key() {
 #[test]
 fn arrays_replace_rather_than_merge() {
     let root = scratch();
-    write(
-        &root,
-        "etc/config.toml",
-        "[scheduler]\njob_backoff_secs = [5, 10]\n",
-    );
+    write(&root, "etc/config.toml", "[bot]\nowners = [5, 10]\n");
     assert_eq!(
-        load(&root, &MapEnv::default())
-            .unwrap()
-            .config
-            .scheduler
-            .job_backoff_secs,
+        load(&root, &MapEnv::default()).unwrap().config.bot.owners,
         [5, 10]
     );
-    let env = MapEnv::new([("QBOT__SCHEDULER__JOB_BACKOFF_SECS", "[1, 2, 3]")]);
-    assert_eq!(
-        load(&root, &env).unwrap().config.scheduler.job_backoff_secs,
-        [1, 2, 3]
-    );
+    let env = MapEnv::new([("QBOT__BOT__OWNERS", "[1, 2, 3]")]);
+    assert_eq!(load(&root, &env).unwrap().config.bot.owners, [1, 2, 3]);
 }
 
 fn message(found: &[ConfigError]) -> String {
@@ -186,31 +178,34 @@ fn message(found: &[ConfigError]) -> String {
 fn environment_values_follow_figments_typing_rules() {
     let root = scratch();
     let ok = MapEnv::new([
-        ("QBOT__MEMORY__LANGUAGE", "French"),
-        ("QBOT__PROVIDERS__TEXT__RETRY_JITTER", "false"),
-        ("QBOT__IDENTITY__CONFIRM_AT", "0.9"),
-        ("QBOT__IDENTITY__INVITATION_TTL_SECS", "30"),
+        ("QBOT__PROVIDERS__TEXT__MODEL", "m-two"),
+        ("QBOT__MEDIA__TRANSCRIBE_VOICE", "false"),
+        ("QBOT__MEMORY__RECALL__MAX_DISTANCE", "0.3"),
+        ("QBOT__MAINTENANCE__RUNS_KEEP_DAYS", "30"),
         ("QBOT__DATABASE__SSL_MODE", "verify-full"),
     ]);
     let c = load(&root, &ok).unwrap().config;
-    assert_eq!(c.memory.language, "French");
-    assert!(!c.providers.text.retry_jitter);
-    assert!((c.identity.confirm_at - 0.9).abs() < 1e-6);
-    assert_eq!(c.identity.invitation_ttl_secs, 30);
+    assert_eq!(c.providers.text.model, "m-two");
+    assert!(!c.media.transcribe_voice);
+    assert!((c.memory.recall.max_distance - 0.3).abs() < 1e-6);
+    assert_eq!(c.maintenance.runs_keep_days, 30);
     assert_eq!(c.database.ssl_mode.as_str(), "verify-full");
 
     // A string that looks like a number must be quoted; unquoted it is a number, and a number is
     // not accepted where text belongs (no silent coercion either way).
-    let quoted = load(&root, &MapEnv::new([("QBOT__MEMORY__LANGUAGE", "\"123\"")]))
-        .unwrap()
-        .config;
-    assert_eq!(quoted.memory.language, "123");
+    let quoted = load(
+        &root,
+        &MapEnv::new([("QBOT__PROVIDERS__TEXT__MODEL", "\"123\"")]),
+    )
+    .unwrap()
+    .config;
+    assert_eq!(quoted.providers.text.model, "123");
     let text = message(&errors(load(
         &root,
-        &MapEnv::new([("QBOT__MEMORY__LANGUAGE", "123")]),
+        &MapEnv::new([("QBOT__PROVIDERS__TEXT__MODEL", "123")]),
     )));
     assert!(
-        text.to_lowercase().contains("language") && text.contains("expected a string"),
+        text.to_lowercase().contains("model") && text.contains("expected a string"),
         "{text}"
     );
 }
@@ -219,18 +214,10 @@ fn environment_values_follow_figments_typing_rules() {
 fn bad_environment_overrides_name_the_key_and_the_variable() {
     let root = scratch();
     for (name, value, key) in [
-        ("QBOT__RUNTIME__REPLY_CAPACITY", "many", "reply_capacity"),
-        (
-            "QBOT__PROVIDERS__TEXT__RETRY_JITTER",
-            "maybe",
-            "retry_jitter",
-        ),
-        (
-            "QBOT__SCHEDULER__JOB_BACKOFF_SECS",
-            "60",
-            "job_backoff_secs",
-        ),
-        ("QBOT__RUNTIME__NO_SUCH", "1", "no_such"),
+        ("QBOT__REPLIES__CONCURRENCY", "many", "concurrency"),
+        ("QBOT__MEDIA__TRANSCRIBE_VOICE", "maybe", "transcribe_voice"),
+        ("QBOT__BOT__OWNERS", "60", "owners"),
+        ("QBOT__REPLIES__NO_SUCH", "1", "no_such"),
         ("QBOT__NO_SUCH__KEY", "1", "no_such"),
     ] {
         let text = message(&errors(load(&root, &MapEnv::new([(name, value)]))));
@@ -245,21 +232,21 @@ fn bad_environment_overrides_name_the_key_and_the_variable() {
 #[test]
 fn unknown_keys_and_wrong_types_name_the_key_and_the_file_they_came_from() {
     let root = scratch();
-    write(&root, "etc/config.toml", "[runtime]\nreply_capacty = 4\n");
+    write(&root, "etc/config.toml", "[replies]\nconcurency = 4\n");
     let text = message(&errors(load(&root, &MapEnv::default())));
     assert!(
-        text.contains("reply_capacty") && text.contains("config.toml"),
+        text.contains("concurency") && text.contains("config.toml"),
         "{text}"
     );
 
     write(
         &root,
         "etc/config.toml",
-        "[runtime]\nreply_deadline_secs = \"soon\"\n",
+        "[replies]\ndeadline_secs = \"soon\"\n",
     );
     let text = message(&errors(load(&root, &MapEnv::default())));
     assert!(
-        text.contains("reply_deadline_secs") && text.contains("config.toml"),
+        text.contains("deadline_secs") && text.contains("config.toml"),
         "{text}"
     );
 
@@ -302,7 +289,7 @@ fn a_credential_pasted_into_a_config_file_is_rejected_without_echoing_it() {
 #[test]
 fn invalid_toml_is_reported_with_its_file() {
     let root = scratch();
-    write(&root, "etc/conf.d/broken.toml", "[runtime\nx = ");
+    write(&root, "etc/conf.d/broken.toml", "[replies\nx = ");
     let text = message(&errors(load(&root, &MapEnv::default())));
     assert!(text.contains("broken.toml"), "{text}");
 }
@@ -314,28 +301,23 @@ fn validation_reports_every_problem_together() {
         &root,
         "etc/config.toml",
         r#"
-[runtime]
-reply_capacity = 2
-reply_concurrency = 5
+[replies]
+concurrency = 0
+max_messages = 0
 [providers.text]
-kind = "deepseek"
-state = "server_state"
 endpoint = "https://user:pass@api.example.com"
 [providers.embedding]
 dims = 0
-[tasks]
-min_delay_secs = 0
-[scheduler]
-job_backoff_secs = []
-[tools.search_history]
-default_limit = 10
-max_limit = 5
+[media]
+images_per_minute = 0
 [memory]
 slice_batches = 0
 [memory.recall]
-max_distance = 3.0
-[identity]
-confirm_at = 1.5
+max_distance = 1.0
+[memory.facts]
+half_life_days = { stable = 0, default = 30, fast = 14 }
+[maintenance]
+nightly_cron = "every night"
 "#,
     );
     let found = errors(load(&root, &MapEnv::default()));
@@ -350,23 +332,22 @@ confirm_at = 1.5
         })
         .collect();
     for expected in [
-        "runtime.reply_concurrency",
-        "providers.text.state",
+        "replies.concurrency",
+        "replies.max_messages",
         "providers.text.endpoint",
         "providers.embedding.dims",
-        "tasks.min_delay_secs",
-        "scheduler.job_backoff_secs",
-        "tools.search_history.max_limit",
+        "media.images_per_minute",
         "memory.slice_batches",
         "memory.recall.max_distance",
-        "identity.confirm_at",
+        "memory.facts.half_life_days",
+        "maintenance.nightly_cron",
     ] {
         assert!(
             keys.contains(&expected.to_owned()),
             "{expected} missing from {keys:?}"
         );
     }
-    assert_eq!(keys.len(), 10);
+    assert_eq!(keys.len(), 9);
     assert!(
         !found.iter().any(|e| e.to_string().contains("pass@")),
         "an embedded credential is not echoed"
@@ -403,17 +384,12 @@ fn the_bootstrap_directories_come_from_the_environment_and_empty_means_unset() {
 }
 
 #[test]
-fn relative_paths_resolve_under_their_base_and_absolute_ones_are_kept() {
+fn state_and_configuration_files_have_fixed_places_under_their_directories() {
     let root = scratch();
-    write(
-        &root,
-        "etc/config.toml",
-        "[paths]\nbackups_dir = \"/mnt/backups\"\n",
-    );
     let loaded = load(&root, &MapEnv::default()).unwrap();
     let p = loaded.config.paths(&loaded.layout);
     assert_eq!(p.models_dir, root.join("data/models"));
-    assert_eq!(p.backups_dir, PathBuf::from("/mnt/backups"));
+    assert_eq!(p.backups_dir, root.join("data/backups"));
     assert_eq!(p.personas_dir, root.join("etc/personas"));
     assert_eq!(p.locales_dir, root.join("etc/locales"));
 }
@@ -591,32 +567,11 @@ fn a_rotated_key_is_picked_up_without_a_restart() {
 fn the_configuration_defaults_equal_the_defaults_of_the_crates_that_consume_them() {
     // One source of truth: if a crate's `Default` and `defaults.toml` ever drift, this fails.
     let c = load(&scratch(), &MapEnv::default()).unwrap().config;
-
-    assert_eq!(c.run_limits(), qbot_agent::RunLimits::default());
-    assert_eq!(c.task_limits(), qbot_sched::TaskLimits::default());
-    assert_eq!(c.scheduler_config(), qbot_sched::SchedulerConfig::default());
-    assert_eq!(
-        c.identity_policy(),
-        qbot_memory::identity::IdentityPolicy::default()
-    );
-    assert_eq!(
-        c.extractor_config(),
-        qbot_memory::ExtractorConfig::default()
-    );
-    assert_eq!(
-        c.builder_config().language,
-        qbot_memory::BuilderConfig::default().language
-    );
     assert_eq!(c.recall_params(), qbot_memory::RecallParams::default());
-    assert_eq!(
-        c.memory.knowledge.max_terms,
-        qbot_prompt::FactKnowledge::DEFAULT_MAX_TERMS
-    );
     assert_eq!(c.decay_policy(), qbot_memory::facts::DecayPolicy::default());
     assert_eq!(c.history_window(), qbot_core::HistoryWindow::default());
-    let retry = qbot_llm::responses::RetryPolicy::default();
-    assert_eq!(c.text_provider().retry, retry);
-    assert_eq!(c.embedding_provider().retry, retry);
+    assert_eq!(c.media_config(), qbot_media::MediaConfig::default());
+    assert_eq!(c.tool_settings().max_sends_per_run, 4);
 
     let embedding = c.embedding_provider();
     let reference = qbot_llm::embedding::EmbeddingConfig::dashscope_v4(2048);
@@ -632,16 +587,6 @@ fn the_configuration_defaults_equal_the_defaults_of_the_crates_that_consume_them
             reference.max_batch
         )
     );
-
-    let tools = c.tool_settings();
-    assert_eq!(
-        (
-            tools.max_sends_per_run,
-            tools.search.default_limit,
-            tools.search.max_limit
-        ),
-        (4, 8, 50)
-    );
 }
 
 #[test]
@@ -651,31 +596,31 @@ fn settings_flow_through_to_the_runtime_structs() {
         &root,
         "etc/config.toml",
         r#"
-[runtime]
-reply_capacity = 8
-reply_concurrency = 2
-reply_deadline_secs = 45
+[replies]
+concurrency = 2
+deadline_secs = 45
+max_messages = 2
 [history]
 batch_lines = 20
 raw_batches = 3
 summary_batches = 0
 [memory]
 slice_batches = 4
-previous_context_batches = 2
-next_context_batches = 3
+[memory.recall]
+half_life_days = 30
 [providers.text]
 kind = "openai_responses"
-state = "server_state"
-request_timeout_secs = 90
-retries = 5
+reasoning = "high"
 "#,
     );
     let c = load(&root, &MapEnv::default()).unwrap().config;
     let s = c.supervisor();
     assert_eq!(
         (s.capacity, s.concurrency, s.reply_deadline),
-        (8, 2, Duration::from_secs(45))
+        (20, 2, Duration::from_secs(45)),
+        "the queue is derived from the concurrency"
     );
+    assert_eq!(c.tool_settings().max_sends_per_run, 2);
     let grid = c.slice_grid();
     assert_eq!(grid.grid.lines_per_batch, 20);
     assert_eq!(
@@ -684,7 +629,7 @@ retries = 5
             grid.previous_context_batches,
             grid.next_context_batches
         ),
-        (4, 2, 3)
+        (4, 1, 1)
     );
     assert_eq!(grid.retained_raw_batches, 3, "the verbatim tier");
     assert_eq!(
@@ -695,12 +640,24 @@ retries = 5
             summary_batches: 0
         }
     );
+    assert_eq!(
+        c.recall_params().half_life,
+        Duration::from_secs(30 * 86_400)
+    );
     let t = c.text_provider();
     assert_eq!(t.flavor, qbot_llm::responses::Flavor::Standard);
-    assert_eq!(t.state, qbot_llm::responses::StateMode::ServerState);
     assert_eq!(
-        (t.timeout, t.retry.retries),
-        (Some(Duration::from_secs(90)), 5)
+        t.state,
+        qbot_llm::responses::StateMode::ServerState,
+        "an OpenAI-style provider continues from its stored response"
+    );
+    assert!(t.timeout.is_some(), "every text call has a deadline");
+    assert_eq!(c.reply_reasoning(), qbot_llm::ReasoningEffort::High);
+    let v = c.vision_provider();
+    assert_eq!(
+        v.state,
+        qbot_llm::responses::StateMode::Stateless,
+        "each picture is its own conversation"
     );
 }
 
@@ -752,10 +709,9 @@ fn gateway_and_bot_settings_are_validated_with_every_problem_reported() {
     let env = MapEnv::new([
         ("QBOT__BOT__TIMEZONE", "Mars/Olympus"),
         ("QBOT__BOT__OWNERS", "[0]"),
+        ("QBOT__BOT__NICKNAMES", "[\" \"]"),
         ("QBOT__GATEWAY__LISTEN", "not-an-address"),
-        ("QBOT__GATEWAY__PATH", "no-slash"),
-        ("QBOT__GATEWAY__MAX_MESSAGE_CHARS", "3"),
-        ("QBOT__COMMANDS__TOP_MAX_ROWS", "0"),
+        ("QBOT__GATEWAY__ACCESS_TOKEN_SECRET", "a-token-pasted-here"),
     ]);
     let keys: Vec<String> = errors(load(&root, &env))
         .into_iter()
@@ -767,10 +723,9 @@ fn gateway_and_bot_settings_are_validated_with_every_problem_reported() {
     for key in [
         "bot.timezone",
         "bot.owners",
+        "bot.nicknames",
         "gateway.listen",
-        "gateway.path",
-        "gateway.max_message_chars",
-        "commands.top_max_rows",
+        "gateway.access_token_secret",
     ] {
         assert!(keys.iter().any(|k| k == key), "{key} missing from {keys:?}");
     }
@@ -805,24 +760,21 @@ fn media_settings_convert_and_are_validated() {
     let root = scratch();
     let loaded = load(&root, &MapEnv::default()).unwrap();
     let media = loaded.config.media_config();
-    assert_eq!(
-        (
-            media.images_per_minute,
-            media.clips_per_minute,
-            media.max_image_bytes
-        ),
-        (6, 20, 8 * 1024 * 1024)
-    );
-    assert_eq!(loaded.config.media_wait(), Duration::from_secs(25));
+    assert_eq!((media.images_per_minute, media.clips_per_minute), (6, 20));
     assert!(
         !loaded.config.providers.vision.enabled,
         "pictures stay bare until a vision model is chosen"
     );
+    let busy = load(
+        &root,
+        &MapEnv::new([("QBOT__MEDIA__IMAGES_PER_MINUTE", "12")]),
+    )
+    .unwrap();
+    assert_eq!(busy.config.media_config().images_per_minute, 12);
 
     let env = MapEnv::new([
-        ("QBOT__MEDIA__CAPACITY", "0"),
-        ("QBOT__ASR__LANGUAGE", "klingon"),
-        ("QBOT__ASR__WORKERS", "0"),
+        ("QBOT__MEDIA__IMAGES_PER_MINUTE", "0"),
+        ("QBOT__MEDIA__CLIPS_PER_MINUTE", "0"),
     ]);
     let keys: Vec<String> = errors(load(&root, &env))
         .into_iter()
@@ -831,7 +783,7 @@ fn media_settings_convert_and_are_validated() {
             _ => None,
         })
         .collect();
-    for key in ["media.capacity", "asr.language", "asr.workers"] {
+    for key in ["media.images_per_minute", "media.clips_per_minute"] {
         assert!(keys.iter().any(|k| k == key), "{key} missing from {keys:?}");
     }
 }
@@ -902,7 +854,6 @@ fn web_search_needs_its_key_only_when_enabled_and_converts_every_setting() {
     let env = MapEnv::new([
         ("QBOT__PROVIDERS__SEARCH__ENABLED", "true"),
         ("QBOT__PROVIDERS__SEARCH__DEPTH", "advanced"),
-        ("QBOT__PROVIDERS__SEARCH__MAX_RESULTS", "8"),
         ("QBOT__PROVIDERS__SEARCH__PROXY", "http://172.17.0.1:7890"),
     ]);
     let on = load(&root, &env).unwrap();
@@ -927,20 +878,10 @@ fn web_search_needs_its_key_only_when_enabled_and_converts_every_setting() {
     let c = &on.config;
     assert_eq!(
         c.search_provider(),
-        qbot_llm::search::TavilyConfig {
-            max_results: 8,
-            depth: qbot_llm::search::SearchDepth::Advanced,
-            timeout: Duration::from_secs(20),
-            retry: qbot_llm::responses::RetryPolicy {
-                retries: 2,
-                base: Duration::from_millis(500),
-                jitter: true,
-            },
-            extract: qbot_llm::search::ExtractConfig {
-                depth: qbot_llm::search::SearchDepth::Basic,
-                chunks_per_source: 3,
-            },
-        }
+        qbot_llm::search::TavilyConfig::new(
+            qbot_llm::search::SearchDepth::Advanced,
+            qbot_llm::search::SearchDepth::Basic,
+        )
     );
     assert_eq!(c.search_proxy(), Some("http://172.17.0.1:7890"));
     assert_eq!(off.config.search_proxy(), None, "empty means direct");
@@ -949,16 +890,10 @@ fn web_search_needs_its_key_only_when_enabled_and_converts_every_setting() {
         &root,
         &MapEnv::new([
             ("QBOT__PROVIDERS__SEARCH__ENABLED", "true"),
-            ("QBOT__PROVIDERS__SEARCH__MAX_RESULTS", "50"),
             ("QBOT__PROVIDERS__SEARCH__PROXY", "not a url"),
         ]),
     ));
     let keys: Vec<_> = bad.iter().map(ToString::to_string).collect();
-    assert!(
-        keys.iter()
-            .any(|k| k.contains("providers.search.max_results")),
-        "{keys:?}"
-    );
     assert!(
         keys.iter().any(|k| k.contains("providers.search.proxy")),
         "{keys:?}"
@@ -995,24 +930,14 @@ fn maintenance_settings_convert_and_validate() {
         .config
         .ops_config(&paths, "pw", jiff::tz::TimeZone::UTC);
     let backup = ops.backup.unwrap();
-    assert_eq!(
-        (backup.keep, backup.timeout, backup.target.password.as_str()),
-        (14, Duration::from_secs(900), "pw")
-    );
+    assert_eq!((backup.keep, backup.target.password.as_str()), (14, "pw"));
     assert_eq!(backup.dir, paths.backups_dir);
-    assert!(backup.bin_dir.is_none(), "empty means PATH");
-    assert_eq!(
-        (ops.alias_unused, ops.runs_keep),
-        (
-            Duration::from_secs(30 * 86_400),
-            Some(Duration::from_secs(90 * 86_400))
-        )
-    );
+    assert_eq!(ops.runs_keep, Some(Duration::from_secs(90 * 86_400)));
 
     let off = load(
         &root,
         &MapEnv::new([
-            ("QBOT__MAINTENANCE__BACKUPS_ENABLED", "false"),
+            ("QBOT__MAINTENANCE__BACKUPS", "0"),
             ("QBOT__MAINTENANCE__RUNS_KEEP_DAYS", "0"),
         ]),
     )
@@ -1020,14 +945,14 @@ fn maintenance_settings_convert_and_validate() {
     let ops = off.config.ops_config(&paths, "pw", jiff::tz::TimeZone::UTC);
     assert!(
         ops.backup.is_none() && ops.runs_keep.is_none(),
-        "0 keeps runs forever; backups can be off"
+        "0 keeps runs forever; 0 backups makes none"
     );
 
     let keys: Vec<String> = errors(load(
         &root,
         &MapEnv::new([
             ("QBOT__MAINTENANCE__NIGHTLY_CRON", "every night"),
-            ("QBOT__MAINTENANCE__BACKUP_KEEP", "0"),
+            ("QBOT__MAINTENANCE__REPORT_CRON", "61 * * * *"),
         ]),
     ))
     .into_iter()
@@ -1038,7 +963,7 @@ fn maintenance_settings_convert_and_validate() {
     .collect();
     assert!(
         keys.contains(&"maintenance.nightly_cron".to_owned())
-            && keys.contains(&"maintenance.backup_keep".to_owned()),
+            && keys.contains(&"maintenance.report_cron".to_owned()),
         "{keys:?}"
     );
 }

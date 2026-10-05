@@ -6,7 +6,7 @@
 #   printf '%s' 'sk-...'            > secrets/embedding_api_key
 #   printf '%s' 'a-long-random-token' > secrets/onebot_access_token   # NapCat presents this
 #   cp config/personas/default.toml.example config/personas/default.toml
-#   deploy/fetch_asr_model.sh                              # voice model, once (or asr.enabled = false)
+#   deploy/fetch_asr_model.sh                              # voice model, once (or media.transcribe_voice = false)
 #   docker compose run --rm qbot check-config              # validate before starting
 #   docker compose up -d
 #

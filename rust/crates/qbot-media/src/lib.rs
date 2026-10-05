@@ -12,7 +12,6 @@ mod clean;
 mod describe;
 mod flight;
 mod item;
-mod limits;
 mod open;
 mod pg;
 mod ports;

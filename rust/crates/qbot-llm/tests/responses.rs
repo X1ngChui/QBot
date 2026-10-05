@@ -33,14 +33,16 @@ async fn deepseek_request_shape() {
     assert_eq!(body["stream"], false);
     assert_eq!(body["store"], false);
     assert_eq!(body["parallel_tool_calls"], true);
-    assert_eq!(body["max_output_tokens"], 1000);
+    assert!(
+        body.get("max_output_tokens").is_none(),
+        "the output length is left to the provider"
+    );
     assert_eq!(body["reasoning"], json!({ "effort": "low" }));
     assert!(
         body.get("include").is_none(),
         "no encrypted-content include on the DeepSeek dialect"
     );
     assert!(body.get("previous_response_id").is_none());
-    assert!(body.get("temperature").is_none());
     assert!(body.get("tool_choice").is_none());
     assert_eq!(
         body["tools"][0],
@@ -77,7 +79,7 @@ async fn reasoning_effort_maps_per_dialect() {
         );
         let (tools, conv) = (tools(), base_conversation());
         let mut req = request(&conv, &tools, None);
-        req.params.reasoning = effort;
+        req.reasoning = effort;
         provider.respond(req).await.unwrap();
         let sent = server.requests()[0]["reasoning"]["effort"]
             .as_str()
@@ -222,7 +224,7 @@ async fn a_forgotten_server_state_handle_is_absorbed_with_one_full_resend() {
 }
 
 #[tokio::test]
-async fn forced_tool_choice_and_temperature_follow_capabilities() {
+async fn forced_tool_choice_follows_capabilities() {
     let (tools, conv) = (tools(), base_conversation());
 
     let (_, deepseek) = sim_provider(true, StateMode::Stateless, sim_steps(&[second_reply()]), 64);
@@ -237,16 +239,9 @@ async fn forced_tool_choice_and_temperature_follow_capabilities() {
         sim_provider(true, StateMode::Stateless, sim_steps(&[second_reply()]), 64);
     let mut req = request(&conv, &tools, None);
     req.tool_choice = ToolChoice::Required;
-    req.params.reasoning = ReasoningEffort::Off;
+    req.reasoning = ReasoningEffort::Off;
     deepseek.respond(req).await.unwrap();
     assert_eq!(server.requests()[0]["tool_choice"], json!("required"));
-    let (_, deepseek) = sim_provider(true, StateMode::Stateless, sim_steps(&[second_reply()]), 64);
-    let mut req = request(&conv, &tools, None);
-    req.params.temperature = Some(0.5);
-    assert_eq!(
-        deepseek.respond(req).await.unwrap_err(),
-        LlmError::Unsupported("temperature")
-    );
 
     let (server, standard) = sim_provider(
         false,
@@ -256,14 +251,12 @@ async fn forced_tool_choice_and_temperature_follow_capabilities() {
     );
     let mut req = request(&conv, &tools, None);
     req.tool_choice = ToolChoice::Named("send_message".into());
-    req.params.temperature = Some(0.5);
     standard.respond(req).await.unwrap();
     let body = &server.requests()[0];
     assert_eq!(
         body["tool_choice"],
         json!({ "type": "function", "name": "send_message" })
     );
-    assert_eq!(body["temperature"], json!(0.5));
 
     // `None` is emulated by declaring no tools.
     let mut req = request(&conv, &tools, None);

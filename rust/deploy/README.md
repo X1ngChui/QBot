@@ -58,7 +58,9 @@ names, never values); `qbot print-defaults` shows the baked-in layer.
   `/run/secrets/<name>`. See `secrets/README.md`.
 - **Persistent state**: `/var/lib/qbot` (models, backups). The database has its own volume.
 
-Durations carry their unit in the key (`reply_deadline_secs`, `retry_base_ms`).
+Durations carry their unit in the key (`deadline_secs`, `half_life_days`). Internal tuning
+(timeouts, retries, bounds on untrusted input) is not configuration; docs/rust-rewrite/design.md
+(sections 13 and 14) lists what is configurable and every limit with its reason.
 
 ## Running the bot
 
@@ -76,8 +78,8 @@ an incomplete catalog is refused at startup, listing what is missing.
 
 - **Voice** is transcribed in the process (SenseVoice through sherpa-onnx, CPU). Run
   `deploy/fetch_asr_model.sh` once; the model lives in `data/qbot/models/asr/sense-voice`. A
-  missing model stops startup with a message naming the file; `asr.enabled = false` leaves clips
-  as bare `[voice]` markers instead.
+  missing model stops startup with a message naming the file; `media.transcribe_voice = false`
+  leaves clips as bare `[voice]` markers instead.
 - **Pictures** are described by a vision model when `providers.vision.enabled = true` (it needs
   `secrets/vision_api_key`, and a matching entry under `secrets:` in the compose file). Off by
   default: pictures stay bare `[image]` markers.
@@ -86,11 +88,11 @@ an incomplete catalog is refused at startup, listing what is missing.
   matching entry under `secrets:` in the compose file. `providers.search.proxy` routes only the
   search client through an HTTP proxy, for hosts that cannot reach the provider directly. Off by
   default: the tools are then not offered. A used-up plan allowance is reported to the model as
-  unavailable search; no local quota is kept on top of the provider's. `tools.read_url.max_chars`
-  bounds how much of a page the model is shown.
+  unavailable search; no local quota is kept on top of the provider's.
 - A message's media is worked on when it arrives. A reply triggered by such a message waits up to
-  `media.wait_secs` for the result, then goes ahead with whatever is ready. Descriptions are
-  cached by picture id and by content, so a picture is described once.
+  25 seconds for the result, then goes ahead with whatever is ready. Descriptions are cached by
+  picture id and by content, so a picture is described once. They are written in the language
+  the locale names, as is memory.
 - **NapCat setting required:** turn on `enableLocalFile2Url` in NapCat's OneBot configuration
   (`onebot11_<account>.json`, or the WebUI's OneBot settings). With it NapCat returns the bytes of
   pictures and voice clips inline in `get_image` / `get_record`. QBot never reads NapCat's files
@@ -110,29 +112,28 @@ The bot runs its own maintenance; nothing outside the container is needed.
   midnight) are cron expressions in `bot.timezone`. A run missed while the bot was down happens once
   when it comes back; each occurrence runs exactly once however often the bot restarts. A schedule
   that has never run starts from now.
-- **Nightly pipeline**, in order: memory extraction for every group, decay (stale name candidates
-  and old picture descriptions), a verified `pg_dump`, then cleanup of finished timers and old
-  runs. Every stage runs even if an earlier one failed; the job then fails and is retried with
-  backoff.
-- **Backups** go to `data/qbot/backups` (`paths.backups_dir`) as `qbot-YYYYMMDD-HHMMSS.dump`. A dump
-  is written under a temporary name, listed with `pg_restore` (it must parse and contain the chat
-  archive) and only then renamed into place; the newest `maintenance.backup_keep` are kept. The
-  image carries PostgreSQL 17 client tools; outside the image set `maintenance.postgres_bin_dir`.
+- **Nightly run**, in order: memory extraction for every group (after embedding any episode the
+  configured embedding model has no vector for, so a new embedding model needs no other step),
+  decay (stale name candidates, picture descriptions older than 15 days, faded facts), a verified
+  `pg_dump`, then cleanup (finished timers after 30 days, old runs, NapCat's file cache). Every
+  stage runs even if an earlier one failed; the job then fails and is retried with backoff.
+- **Backups** go to `data/qbot/backups` as `qbot-YYYYMMDD-HHMMSS.dump`. A dump is written under a
+  temporary name, listed with `pg_restore` (it must parse and contain the chat archive) and only
+  then renamed into place; the newest `maintenance.backups` are kept (0 makes none). The image
+  carries PostgreSQL 17 client tools; outside the image set `maintenance.postgres_bin_dir`.
   Missing tools stop startup. Restore with `pg_restore --clean --if-exists -d qbot FILE`.
-  `backups_enabled = false` switches them off.
 - **Daily report** to every account in `bot.owners`, as a private message: yesterday's replies, how
   they ended, model calls and tokens (with the cache share), tool failures, chat volume, groups,
   new episodes, job failures and the age of the last backup. It needs the platform connection; if
   it is down the job retries. With no owners there is no report.
-- **Retention.** `maintenance.timers_keep_days` and `runs_keep_days` (0 keeps runs forever) bound
-  the tables that otherwise grow for ever; `description_ttl_days` and `alias_unused_days` decay
-  derived data.
+- **Retention.** `maintenance.runs_keep_days` (0 keeps them) bounds the run transcripts, the one
+  table that grows with every reply; the rest of the upkeep above has fixed periods.
 
 ## Importing the Python bot's chat history
 
-Done once, at the cutover, after the Python bot is stopped and before the Rust bot starts. Only
-the chat history is imported (with the Python bot's picture descriptions); episodes, facts and
-group knowledge are rebuilt by the nightly extraction afterwards.
+Cutover tooling, deleted after the cutover (docs/rust-rewrite/cutover.md). Only the chat history
+is imported, with the Python bot's picture descriptions; episodes, facts and group knowledge are
+built from it by the nightly extraction.
 
 1. Export from the Python bot's database, read-only, to a private file:
 
@@ -142,7 +143,7 @@ group knowledge are rebuilt by the nightly extraction afterwards.
    chmod 600 history.jsonl
    ```
 
-2. Check it against the Rust deployment without writing (`qbot` must not be running; the import
+2. Check it against the Rust deployment without writing (the bot must not be running; the import
    takes the same database lease):
 
    ```bash
@@ -150,16 +151,6 @@ group knowledge are rebuilt by the nightly extraction afterwards.
      import-history /tmp/history.jsonl --dry-run
    ```
 
-3. Run the same command without `--dry-run`. A rerun skips what is already archived. A group
-   that already has lines the export does not contain is refused.
-4. Delete `history.jsonl`. Build memory from the imported history now rather than at the next
-   nightly run (episodes with their embeddings, then the names, facts and group knowledge
-   learned from them; about one model call per 90 lines, a few hours for the whole history):
-
-   ```bash
-   docker compose run -d --no-deps --name qbot-rust-rebuild qbot rebuild-memory
-   docker logs -f qbot-rust-rebuild      # "episode stored" per episode, "group done" per group
-   ```
-
-5. Start the bot.
-
+3. Run the same command without `--dry-run`. A rerun skips what is already archived; a group that
+   already has lines the export does not contain is refused.
+4. Delete `history.jsonl` and start the bot. The next nightly run extracts what was imported.

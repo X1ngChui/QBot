@@ -1,45 +1,82 @@
-//! From configuration to the plain settings structs each crate defines. Crates never read the
-//! configuration; the composition root builds their settings here, from one place.
+//! From configuration to the settings each crate defines. Crates never read the configuration;
+//! the composition root builds their settings here, from the operator's choices, and everything
+//! the configuration does not cover keeps the crate's own default.
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use qbot_agent::{RunLimits, SupervisorConfig};
+use qbot_agent::SupervisorConfig;
 use qbot_core::{AccountId, HistoryWindow, SliceGrid};
+use qbot_llm::ReasoningEffort;
 use qbot_llm::embedding::EmbeddingConfig;
-use qbot_llm::responses::{Flavor, ResponsesConfig, RetryPolicy, StateMode};
-use qbot_llm::{Params, ProviderId, ReasoningEffort};
+use qbot_llm::responses::{ResponsesConfig, StateMode};
+use qbot_llm::search::TavilyConfig;
 use qbot_media::MediaConfig;
-use qbot_memory::identity::IdentityPolicy;
-use qbot_memory::{BuilderConfig, ExtractorConfig, RecallParams};
+use qbot_memory::RecallParams;
+use qbot_memory::facts::DecayPolicy;
 use qbot_ops::{BackupConfig, OpsConfig, PgTarget};
-use qbot_sched::{SchedulerConfig, TaskLimits};
-use qbot_tools::{SearchSettings, ToolSettings};
+use qbot_tools::ToolSettings;
 
 use crate::error::{ConfigError, ConfigErrors};
-use crate::load::{Layout, resolve_dir};
-use crate::model::{Config, Reasoning, State, TextKind};
+use crate::load::Layout;
+use crate::model::{Config, ProviderKind, Reasoning, SearchDepth};
 
-/// Absolute locations, with relative configured paths resolved against their base.
+/// Replies that may wait for a model slot, per slot. Beyond that a trigger is dropped: a reply
+/// that waits longer than the queue drains would mostly miss its deadline anyway.
+const QUEUE_PER_SLOT: usize = 10;
+
+/// Deadline for one text-model call, retries included. Replies are bounded by their own deadline;
+/// this bounds the calls nothing else does (memory extraction), generously, because the output
+/// length is left to the provider and a long reasoning answer takes minutes.
+const TEXT_CALL_DEADLINE: Duration = Duration::from_secs(10 * 60);
+/// Deadline for describing one picture, retries included: a sentence or two.
+const VISION_CALL_DEADLINE: Duration = Duration::from_secs(2 * 60);
+
+/// The fixed layout under the configuration and data directories.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedPaths {
     pub config_dir: PathBuf,
     pub data_dir: PathBuf,
     pub secrets_dir: PathBuf,
+    /// `<data>/models`: the voice model.
     pub models_dir: PathBuf,
+    /// `<data>/backups`.
     pub backups_dir: PathBuf,
+    /// `<config>/personas`.
     pub personas_dir: PathBuf,
+    /// `<config>/locales`: catalogs that add to or replace the built-in ones.
     pub locales_dir: PathBuf,
 }
 
-fn secs(n: u64) -> Duration {
-    Duration::from_secs(n)
+fn days(n: u32) -> Duration {
+    Duration::from_secs(u64::from(n) * 86_400)
 }
 
-fn days(n: u64) -> Duration {
-    secs(n.saturating_mul(86_400))
+fn reasoning(r: Reasoning) -> ReasoningEffort {
+    match r {
+        Reasoning::Off => ReasoningEffort::Off,
+        Reasoning::Low => ReasoningEffort::Low,
+        Reasoning::Medium => ReasoningEffort::Medium,
+        Reasoning::High => ReasoningEffort::High,
+    }
+}
+
+fn depth(d: SearchDepth) -> qbot_llm::search::SearchDepth {
+    match d {
+        SearchDepth::Basic => qbot_llm::search::SearchDepth::Basic,
+        SearchDepth::Advanced => qbot_llm::search::SearchDepth::Advanced,
+    }
+}
+
+/// A Responses API model in the dialect of `kind`. DeepSeek keeps no server-side state; an
+/// OpenAI-style provider continues from its stored previous response.
+fn responses(kind: ProviderKind, model: &str) -> ResponsesConfig {
+    match kind {
+        ProviderKind::Deepseek => ResponsesConfig::deepseek(model),
+        ProviderKind::OpenaiResponses => ResponsesConfig::standard(model, StateMode::ServerState),
+    }
 }
 
 impl Config {
@@ -48,333 +85,11 @@ impl Config {
             config_dir: layout.config_dir.clone(),
             data_dir: layout.data_dir.clone(),
             secrets_dir: layout.secrets_dir.clone(),
-            models_dir: resolve_dir(&layout.data_dir, &self.paths.models_dir),
-            backups_dir: resolve_dir(&layout.data_dir, &self.paths.backups_dir),
-            personas_dir: resolve_dir(&layout.config_dir, &self.paths.personas_dir),
-            locales_dir: resolve_dir(&layout.config_dir, &self.paths.locales_dir),
+            models_dir: layout.data_dir.join("models"),
+            backups_dir: layout.data_dir.join("backups"),
+            personas_dir: layout.config_dir.join("personas"),
+            locales_dir: layout.config_dir.join("locales"),
         }
-    }
-
-    pub fn history_window(&self) -> HistoryWindow {
-        HistoryWindow {
-            batch_lines: self.history.batch_lines,
-            raw_batches: self.history.raw_batches,
-            summary_batches: self.history.summary_batches,
-        }
-    }
-
-    pub fn slice_grid(&self) -> SliceGrid {
-        SliceGrid::from_window(
-            self.history_window(),
-            self.memory.slice_batches,
-            self.memory.previous_context_batches,
-            self.memory.next_context_batches,
-        )
-    }
-
-    pub fn run_limits(&self) -> RunLimits {
-        RunLimits {
-            max_turns: self.agent.max_turns,
-        }
-    }
-
-    pub fn supervisor(&self) -> SupervisorConfig {
-        SupervisorConfig {
-            capacity: self.runtime.reply_capacity,
-            concurrency: self.runtime.reply_concurrency,
-            reply_deadline: secs(self.runtime.reply_deadline_secs),
-        }
-    }
-
-    /// Sampling parameters of a reply's model calls.
-    pub fn params(&self) -> Params {
-        Params {
-            max_output_tokens: self.agent.max_output_tokens,
-            reasoning: match self.agent.reasoning {
-                Reasoning::Off => ReasoningEffort::Off,
-                Reasoning::Low => ReasoningEffort::Low,
-                Reasoning::Medium => ReasoningEffort::Medium,
-                Reasoning::High => ReasoningEffort::High,
-            },
-            temperature: None,
-        }
-    }
-
-    pub fn tool_settings(&self) -> ToolSettings {
-        ToolSettings {
-            max_sends_per_run: self.agent.max_sends_per_run,
-            search: SearchSettings {
-                default_limit: self.tools.search_history.default_limit,
-                max_limit: self.tools.search_history.max_limit,
-            },
-        }
-    }
-
-    pub fn task_limits(&self) -> TaskLimits {
-        TaskLimits {
-            min_delay: secs(self.tasks.min_delay_secs),
-            max_pending_per_group: self.tasks.max_pending_per_group,
-            max_chain_depth: self.tasks.max_chain_depth,
-        }
-    }
-
-    pub fn scheduler_config(&self) -> SchedulerConfig {
-        SchedulerConfig {
-            job_lease: secs(self.scheduler.job_lease_secs),
-            max_job_attempts: self.scheduler.max_job_attempts,
-            job_backoff: self
-                .scheduler
-                .job_backoff_secs
-                .iter()
-                .copied()
-                .map(secs)
-                .collect(),
-            max_concurrent_jobs: self.scheduler.max_concurrent_jobs,
-        }
-    }
-
-    pub fn identity_policy(&self) -> IdentityPolicy {
-        IdentityPolicy {
-            confirm_at: self.identity.confirm_at,
-            invitation_ttl: secs(self.identity.invitation_ttl_secs),
-        }
-    }
-
-    pub fn extractor_config(&self) -> ExtractorConfig {
-        ExtractorConfig {
-            max_output_tokens: self.memory.extraction.max_output_tokens,
-            max_attempts: self.memory.extraction.max_attempts,
-        }
-    }
-
-    pub fn builder_config(&self) -> BuilderConfig {
-        BuilderConfig {
-            language: self.memory.language.clone(),
-        }
-    }
-
-    pub fn recall_params(&self) -> RecallParams {
-        RecallParams {
-            limit: self.memory.recall.limit,
-            max_distance: self.memory.recall.max_distance,
-            half_life: days(u64::from(self.memory.recall.half_life_days)),
-        }
-    }
-
-    pub fn decay_policy(&self) -> qbot_memory::facts::DecayPolicy {
-        let f = &self.memory.facts;
-        qbot_memory::facts::DecayPolicy {
-            stable: days(f.half_life_days.stable),
-            default: days(f.half_life_days.default),
-            fast: days(f.half_life_days.fast),
-            forget_below: f.forget_below,
-        }
-    }
-
-    pub fn text_provider(&self) -> ResponsesConfig {
-        let t = &self.providers.text;
-        ResponsesConfig {
-            model: t.model.clone(),
-            flavor: match t.kind {
-                TextKind::Deepseek => Flavor::DeepSeek,
-                TextKind::OpenaiResponses => Flavor::Standard,
-            },
-            state: match t.state {
-                State::Stateless => StateMode::Stateless,
-                State::ServerState => StateMode::ServerState,
-            },
-            timeout: Some(secs(t.request_timeout_secs)),
-            retry: RetryPolicy {
-                retries: t.retries,
-                base: Duration::from_millis(t.retry_base_ms),
-                jitter: t.retry_jitter,
-            },
-        }
-    }
-
-    pub fn text_connect_timeout(&self) -> Duration {
-        secs(self.providers.text.connect_timeout_secs)
-    }
-
-    pub fn embedding_provider(&self) -> EmbeddingConfig {
-        let e = &self.providers.embedding;
-        EmbeddingConfig {
-            id: ProviderId::new("embedding"),
-            model: e.model.clone(),
-            dims: e.dims,
-            max_batch: e.max_batch,
-            timeout: secs(e.request_timeout_secs),
-            retry: RetryPolicy {
-                retries: e.retries,
-                base: Duration::from_millis(e.retry_base_ms),
-                jitter: e.retry_jitter,
-            },
-        }
-    }
-
-    pub fn embedding_connect_timeout(&self) -> Duration {
-        secs(self.providers.embedding.connect_timeout_secs)
-    }
-
-    /// The connection URL, given the resolved password (percent-encoded).
-    pub fn database_url(&self, password: &str) -> String {
-        let d = &self.database;
-        format!(
-            "postgres://{}:{}@{}:{}/{}?sslmode={}",
-            encode(&d.user),
-            encode(password),
-            d.host,
-            d.port,
-            encode(&d.name),
-            d.ssl_mode.as_str()
-        )
-    }
-
-    /// The recurring schedules: the nightly pipeline always, the report when someone can receive it.
-    pub fn recurrences(&self) -> Vec<qbot_sched::Recurrence> {
-        let m = &self.maintenance;
-        let mut out = Vec::new();
-        if let Ok(nightly) =
-            qbot_sched::Recurrence::new("nightly", &m.nightly_cron, qbot_sched::JobKind::Nightly)
-        {
-            out.push(nightly);
-        }
-        if !self.bot.owners.is_empty()
-            && let Ok(report) =
-                qbot_sched::Recurrence::new("report", &m.report_cron, qbot_sched::JobKind::Report)
-        {
-            out.push(report);
-        }
-        out
-    }
-
-    /// Settings for backups, or `None` when they are switched off.
-    pub fn backup_config(&self, paths: &ResolvedPaths, password: &str) -> Option<BackupConfig> {
-        let m = &self.maintenance;
-        m.backups_enabled.then(|| BackupConfig {
-            dir: paths.backups_dir.clone(),
-            prefix: "qbot".to_owned(),
-            keep: m.backup_keep,
-            timeout: secs(m.backup_timeout_secs),
-            bin_dir: Some(m.postgres_bin_dir.as_str())
-                .filter(|d| !d.is_empty())
-                .map(PathBuf::from),
-            target: PgTarget {
-                host: self.database.host.clone(),
-                port: self.database.port,
-                user: self.database.user.clone(),
-                database: self.database.name.clone(),
-                password: password.to_owned(),
-            },
-        })
-    }
-
-    pub fn ops_config(
-        &self,
-        paths: &ResolvedPaths,
-        password: &str,
-        zone: jiff::tz::TimeZone,
-    ) -> OpsConfig {
-        let m = &self.maintenance;
-        OpsConfig {
-            backup: self.backup_config(paths, password),
-            alias_unused: days(m.alias_unused_days),
-            description_ttl: (m.description_ttl_days > 0).then(|| days(m.description_ttl_days)),
-            timers_keep: days(m.timers_keep_days),
-            runs_keep: (m.runs_keep_days > 0).then(|| days(m.runs_keep_days)),
-            owners: self.owners().into_iter().collect(),
-            zone,
-            fact_decay: self.decay_policy(),
-        }
-    }
-
-    pub fn media_config(&self) -> MediaConfig {
-        let m = &self.media;
-        MediaConfig {
-            images_per_minute: m.images_per_minute,
-            clips_per_minute: m.clips_per_minute,
-            max_image_bytes: m.max_image_mb.saturating_mul(1024 * 1024),
-            max_audio: secs(m.max_audio_secs),
-            concurrency: m.concurrency,
-            capacity: m.capacity,
-            unreadable_hold: secs(m.unreadable_hold_secs),
-        }
-    }
-
-    pub fn media_wait(&self) -> Duration {
-        secs(self.media.wait_secs)
-    }
-
-    pub fn media_http_timeout(&self) -> Duration {
-        secs(self.media.http_timeout_secs)
-    }
-
-    pub fn media_protocol_timeout(&self) -> Duration {
-        secs(self.media.protocol_timeout_secs)
-    }
-
-    /// The picture-describing model: stateless, in the configured dialect.
-    pub fn vision_provider(&self) -> ResponsesConfig {
-        let v = &self.providers.vision;
-        ResponsesConfig {
-            model: v.model.clone(),
-            flavor: match v.kind {
-                TextKind::Deepseek => Flavor::DeepSeek,
-                TextKind::OpenaiResponses => Flavor::Standard,
-            },
-            state: StateMode::Stateless,
-            timeout: Some(secs(v.request_timeout_secs)),
-            retry: RetryPolicy {
-                retries: v.retries,
-                base: Duration::from_millis(v.retry_base_ms),
-                jitter: v.retry_jitter,
-            },
-        }
-    }
-
-    /// The most characters of a page `read_url` shows.
-    pub fn read_url_max_chars(&self) -> usize {
-        self.tools.read_url.max_chars
-    }
-
-    /// The web search adapter's settings; meaningful when `providers.search.enabled`.
-    pub fn search_provider(&self) -> qbot_llm::search::TavilyConfig {
-        let s = &self.providers.search;
-        qbot_llm::search::TavilyConfig {
-            max_results: s.max_results,
-            depth: depth(s.depth),
-            timeout: secs(s.request_timeout_secs),
-            retry: RetryPolicy {
-                retries: s.retries,
-                base: Duration::from_millis(s.retry_base_ms),
-                jitter: s.retry_jitter,
-            },
-            extract: qbot_llm::search::ExtractConfig {
-                depth: depth(s.extract_depth),
-                chunks_per_source: s.chunks_per_source,
-            },
-        }
-    }
-
-    pub fn search_connect_timeout(&self) -> Duration {
-        secs(self.providers.search.connect_timeout_secs)
-    }
-
-    /// The search-only proxy, `None` for a direct connection.
-    pub fn search_proxy(&self) -> Option<&str> {
-        Some(self.providers.search.proxy.as_str()).filter(|p| !p.is_empty())
-    }
-
-    pub fn vision_params(&self) -> Params {
-        Params {
-            max_output_tokens: self.providers.vision.max_output_tokens,
-            reasoning: ReasoningEffort::Off,
-            temperature: None,
-        }
-    }
-
-    pub fn vision_connect_timeout(&self) -> Duration {
-        secs(self.providers.vision.connect_timeout_secs)
     }
 
     pub fn bot_account(&self) -> Option<AccountId> {
@@ -393,20 +108,164 @@ impl Config {
         self.gateway.listen.parse().ok()
     }
 
-    pub fn action_timeout(&self) -> Duration {
-        secs(self.gateway.action_timeout_secs)
+    /// The connection URL, given the resolved password (percent-encoded).
+    pub fn database_url(&self, password: &str) -> String {
+        let d = &self.database;
+        format!(
+            "postgres://{}:{}@{}:{}/{}?sslmode={}",
+            encode(&d.user),
+            encode(password),
+            d.host,
+            d.port,
+            encode(&d.name),
+            d.ssl_mode.as_str()
+        )
     }
 
-    pub fn echo_timeout(&self) -> Duration {
-        secs(self.gateway.echo_timeout_secs)
+    pub fn supervisor(&self) -> SupervisorConfig {
+        let r = &self.replies;
+        SupervisorConfig {
+            capacity: r.concurrency.saturating_mul(QUEUE_PER_SLOT),
+            concurrency: r.concurrency,
+            reply_deadline: Duration::from_secs(r.deadline_secs),
+        }
     }
 
-    pub fn link_ttl(&self) -> Duration {
-        secs(self.identity.invitation_ttl_secs)
+    pub fn reply_reasoning(&self) -> ReasoningEffort {
+        reasoning(self.providers.text.reasoning)
     }
 
-    pub fn database_connect_timeout(&self) -> Duration {
-        secs(self.database.connect_timeout_secs)
+    pub fn tool_settings(&self) -> ToolSettings {
+        ToolSettings {
+            max_sends_per_run: self.replies.max_messages,
+            search: Default::default(),
+        }
+    }
+
+    pub fn history_window(&self) -> HistoryWindow {
+        HistoryWindow {
+            batch_lines: self.history.batch_lines,
+            raw_batches: self.history.raw_batches,
+            summary_batches: self.history.summary_batches,
+        }
+    }
+
+    pub fn slice_grid(&self) -> SliceGrid {
+        SliceGrid::for_window(self.history_window(), self.memory.slice_batches)
+    }
+
+    pub fn recall_params(&self) -> RecallParams {
+        RecallParams {
+            max_distance: self.memory.recall.max_distance,
+            half_life: days(self.memory.recall.half_life_days),
+            ..RecallParams::default()
+        }
+    }
+
+    pub fn decay_policy(&self) -> DecayPolicy {
+        let h = &self.memory.facts.half_life_days;
+        DecayPolicy {
+            stable: days(h.stable),
+            default: days(h.default),
+            fast: days(h.fast),
+            ..DecayPolicy::default()
+        }
+    }
+
+    pub fn media_config(&self) -> MediaConfig {
+        MediaConfig {
+            images_per_minute: self.media.images_per_minute,
+            clips_per_minute: self.media.clips_per_minute,
+            ..MediaConfig::default()
+        }
+    }
+
+    pub fn text_provider(&self) -> ResponsesConfig {
+        let t = &self.providers.text;
+        ResponsesConfig {
+            timeout: Some(TEXT_CALL_DEADLINE),
+            ..responses(t.kind, &t.model)
+        }
+    }
+
+    pub fn vision_provider(&self) -> ResponsesConfig {
+        let v = &self.providers.vision;
+        ResponsesConfig {
+            state: StateMode::Stateless,
+            timeout: Some(VISION_CALL_DEADLINE),
+            ..responses(v.kind, &v.model)
+        }
+    }
+
+    pub fn embedding_provider(&self) -> EmbeddingConfig {
+        let e = &self.providers.embedding;
+        EmbeddingConfig::new(e.model.clone(), e.dims, e.max_batch)
+    }
+
+    pub fn search_provider(&self) -> TavilyConfig {
+        let s = &self.providers.search;
+        TavilyConfig::new(depth(s.depth), depth(s.extract_depth))
+    }
+
+    /// The search-only proxy, `None` for a direct connection.
+    pub fn search_proxy(&self) -> Option<&str> {
+        Some(self.providers.search.proxy.as_str()).filter(|p| !p.is_empty())
+    }
+
+    /// The recurring schedules: the nightly run always, the report when someone receives it.
+    pub fn recurrences(&self) -> Vec<qbot_sched::Recurrence> {
+        let m = &self.maintenance;
+        let mut out = Vec::new();
+        if let Ok(nightly) =
+            qbot_sched::Recurrence::new("nightly", &m.nightly_cron, qbot_sched::JobKind::Nightly)
+        {
+            out.push(nightly);
+        }
+        if !self.bot.owners.is_empty()
+            && let Ok(report) =
+                qbot_sched::Recurrence::new("report", &m.report_cron, qbot_sched::JobKind::Report)
+        {
+            out.push(report);
+        }
+        out
+    }
+
+    /// Backups, or `None` when none are kept.
+    pub fn backup_config(&self, paths: &ResolvedPaths, password: &str) -> Option<BackupConfig> {
+        let d = &self.database;
+        let m = &self.maintenance;
+        (m.backups > 0).then(|| BackupConfig {
+            bin_dir: Some(m.postgres_bin_dir.as_str())
+                .filter(|dir| !dir.is_empty())
+                .map(PathBuf::from),
+            ..BackupConfig::new(
+                paths.backups_dir.clone(),
+                m.backups,
+                PgTarget {
+                    host: d.host.clone(),
+                    port: d.port,
+                    user: d.user.clone(),
+                    database: d.name.clone(),
+                    password: password.to_owned(),
+                },
+            )
+        })
+    }
+
+    pub fn ops_config(
+        &self,
+        paths: &ResolvedPaths,
+        password: &str,
+        zone: jiff::tz::TimeZone,
+    ) -> OpsConfig {
+        let keep = self.maintenance.runs_keep_days;
+        OpsConfig::new(
+            self.backup_config(paths, password),
+            (keep > 0).then(|| days(keep)),
+            self.owners().into_iter().collect(),
+            zone,
+            self.decay_policy(),
+        )
     }
 }
 
@@ -436,24 +295,16 @@ pub fn prepare_directories(paths: &ResolvedPaths) -> Result<(), ConfigErrors> {
     }
     if errors.is_empty() {
         let probe = paths.data_dir.join(".qbot-write-check");
-        match std::fs::write(&probe, b"ok").and_then(|()| std::fs::remove_file(&probe)) {
-            Ok(()) => {}
-            Err(e) => errors.push(ConfigError::Directory {
+        if let Err(e) = std::fs::write(&probe, b"ok").and_then(|()| std::fs::remove_file(&probe)) {
+            errors.push(ConfigError::Directory {
                 path: paths.data_dir.clone(),
                 reason: format!("not writable: {e}"),
-            }),
+            });
         }
     }
     if errors.is_empty() {
         Ok(())
     } else {
         Err(ConfigErrors(errors))
-    }
-}
-
-fn depth(d: crate::model::SearchDepth) -> qbot_llm::search::SearchDepth {
-    match d {
-        crate::model::SearchDepth::Basic => qbot_llm::search::SearchDepth::Basic,
-        crate::model::SearchDepth::Advanced => qbot_llm::search::SearchDepth::Advanced,
     }
 }

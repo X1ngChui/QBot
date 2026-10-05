@@ -11,6 +11,10 @@ use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::layer::{Context, Layer};
 
+/// Recent warnings and errors `/logs` can show. They also go to the normal log output; this
+/// is only the tail an owner can read from the chat.
+pub const KEPT_LINES: usize = 200;
+
 /// The newest warnings and errors, at most `capacity` of them.
 #[derive(Debug)]
 pub struct LogBuffer {

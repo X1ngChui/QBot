@@ -10,6 +10,7 @@ qbot-wording.workspace = true
 qbot-agent.workspace = true
 qbot-context.workspace = true
 moka.workspace = true
+governor.workspace = true
 schemars.workspace = true
 serde.workspace = true
 qbot-core.workspace = true

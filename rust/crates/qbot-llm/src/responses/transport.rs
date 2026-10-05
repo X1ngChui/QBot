@@ -27,6 +27,10 @@ impl std::fmt::Debug for HttpBody {
     }
 }
 
+/// How long establishing a connection to a provider may take: an endpoint that does not answer
+/// within this is down, and the caller's retry policy or deadline takes over.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
 #[derive(Debug)]
 pub struct HttpResponse {
     pub status: u16,

@@ -15,8 +15,8 @@ use qbot_llm::FakeEmbedder;
 use qbot_llm::fake::{FakeProvider, FakeReply, Step};
 use qbot_memory::identity::IdentityPolicy;
 use qbot_memory::{
-    BuilderConfig, EpisodeBuilder, EpisodeExtractor, EpisodeJobs, EpisodeStore, ExtractorConfig,
-    Recall, RecallParams,
+    BuilderConfig, EpisodeBuilder, EpisodeExtractor, EpisodeJobs, EpisodeStore, Recall,
+    RecallParams,
 };
 use qbot_store::{Appended, NewLine, NewSpeaker, PgArchive, PgEpisodeStore, PgIdentityStore};
 use serde_json::json;
@@ -437,7 +437,7 @@ async fn lines_become_episodes_which_recall_finds_and_read_episode_opens() {
     let fake = Arc::new(FakeProvider::new((0..6).map(answer).collect::<Vec<_>>()));
     let embedder = Arc::new(FakeEmbedder::new(64));
     let builder = EpisodeBuilder::new(
-        EpisodeExtractor::new(fake.clone(), ExtractorConfig::default()),
+        EpisodeExtractor::new(fake.clone()),
         embedder.clone(),
         BuilderConfig::default(),
     );

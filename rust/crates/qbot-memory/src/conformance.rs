@@ -4,7 +4,7 @@
 
 use qbot_core::{AccountId, GroupId, MessageId, UnixMillis};
 
-use crate::episode::{EpisodeId, Evidence, NewEpisode};
+use crate::episode::{Episode, EpisodeId, Evidence, NewEpisode};
 use crate::store::{EpisodeStore, MemoryError};
 
 pub fn group(n: i64) -> GroupId {
@@ -176,4 +176,62 @@ pub async fn run(store: &dyn EpisodeStore) {
             .is_empty(),
         "a different width never matches"
     );
+
+    // The embedding index: what lacks a vector from a model at a width, and replacing one.
+    assert!(
+        store.unembedded(g, "m1", 2, 10).await.unwrap().is_empty(),
+        "everything is embedded with the model it was stored with"
+    );
+    let ids = |found: Vec<Episode>| found.into_iter().map(|e| e.id).collect::<Vec<_>>();
+    let mut every = ids(store.within(g, 0, i64::MAX as u64).await.unwrap());
+    every.sort();
+    assert_eq!(
+        ids(store.unembedded(g, "m2", 2, 100).await.unwrap()),
+        every,
+        "another model: every episode, oldest first"
+    );
+    assert_eq!(
+        ids(store.unembedded(g, "m1", 3, 100).await.unwrap()),
+        every,
+        "another width is another index"
+    );
+    assert_eq!(
+        ids(store.unembedded(g, "m2", 2, 2).await.unwrap()),
+        [first.id, second.id]
+    );
+    assert!(
+        store
+            .unembedded(h, "m2", 2, 100)
+            .await
+            .unwrap()
+            .iter()
+            .all(|e| e.episode.group == h),
+        "scoped by group"
+    );
+    store
+        .set_embedding(first.id, "m2", &[0.0, 1.0])
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(store.unembedded(g, "m2", 2, 100).await.unwrap()),
+        every[1..]
+    );
+    let m2 = store.search(g, "m2", &[0.0, 1.0], 2.0).await.unwrap();
+    assert_eq!(m2.len(), 1);
+    assert_eq!(m2[0].episode.id, first.id);
+    assert!(
+        store
+            .search(g, "m1", &[1.0, 0.0], 2.0)
+            .await
+            .unwrap()
+            .iter()
+            .all(|h| h.episode.id != first.id),
+        "an episode has one embedding: the old model's is gone"
+    );
+    assert!(matches!(
+        store
+            .set_embedding(EpisodeId::new(9_999_999), "m2", &[1.0, 0.0])
+            .await,
+        Err(MemoryError::NotFound)
+    ));
 }

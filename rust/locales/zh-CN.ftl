@@ -1,4 +1,5 @@
 # Simplified Chinese catalog (Fluent). Same message ids and variables as en.ftl.
+writing-language = Simplified Chinese
 command-owner_only = 该操作需要 bot owner 权限。
 command-outcome_unknown = 未能确认操作结果，可能已经生效，也可能没有，请先确认再重试。
 command-unknown_account = 目标账号暂无资料，无法执行此操作。

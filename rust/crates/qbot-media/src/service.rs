@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -7,13 +8,11 @@ use futures_util::future::join_all;
 use qbot_core::{GroupId, MessageId};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Semaphore, watch};
-use tokio::time::Instant;
 use tokio_util::task::TaskTracker;
 
 use crate::clean::{clean_description, sniff_mime};
 use crate::flight::Flights;
 use crate::item::{Kind, MediaItem, MediaJob, MediaRef};
-use crate::limits::SlidingWindow;
 use crate::ports::{
     DescribeError, Describer, DescriptionCache, FetchError, Fetcher, LineEditor, Transcriber,
 };
@@ -39,6 +38,24 @@ pub struct MediaConfig {
     pub capacity: usize,
     /// How long a picture that could not be read (or was declined) is not tried again.
     pub unreadable_hold: Duration,
+}
+
+impl Default for MediaConfig {
+    fn default() -> Self {
+        Self {
+            images_per_minute: 6,
+            clips_per_minute: 20,
+            // A picture is untrusted input of any size; this is above what the vision providers
+            // accept, so only absurd files are refused before fetching.
+            max_image_bytes: 8 * 1024 * 1024,
+            // Recognition runs on the CPU in the process; a longer clip would hold a worker for
+            // minutes.
+            max_audio: Duration::from_secs(300),
+            concurrency: 4,
+            capacity: 32,
+            unreadable_hold: Duration::from_secs(600),
+        }
+    }
 }
 
 pub struct MediaDeps {
@@ -75,10 +92,11 @@ struct Inner {
     deps: MediaDeps,
     permits: Semaphore,
     flights: Arc<Flights>,
-    image_windows: Mutex<HashMap<GroupId, SlidingWindow>>,
-    clip_windows: Mutex<HashMap<GroupId, SlidingWindow>>,
+    /// Per-group rates: one busy group cannot use up the capacity of all.
+    image_rate: GroupRate,
+    clip_rate: GroupRate,
     /// Pictures not worth another attempt for a while, by flight key.
-    unreadable: Mutex<HashMap<String, Instant>>,
+    unreadable: moka::sync::Cache<String, ()>,
     pending: Mutex<HashMap<(GroupId, MessageId), watch::Receiver<bool>>>,
     in_flight: AtomicUsize,
     closed: AtomicBool,
@@ -112,17 +130,21 @@ fn digest(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// A windows table that forgets idle groups when it grows, so a long-running process does not
-/// keep a window for every group it has ever seen. A window with events in it is never dropped.
-fn take(table: &Mutex<HashMap<GroupId, SlidingWindow>>, group: GroupId, limit: u32) -> bool {
-    let mut table = table.lock().unwrap_or_else(PoisonError::into_inner);
-    if table.len() >= 1024 {
-        table.retain(|_, window| !window.is_idle());
+type GroupRate = governor::DefaultKeyedRateLimiter<GroupId>;
+
+/// At most `per_minute` a minute for each group, as a burst that refills evenly.
+fn group_rate(per_minute: u32) -> GroupRate {
+    let per_minute = NonZeroU32::new(per_minute).unwrap_or(NonZeroU32::MIN);
+    governor::RateLimiter::keyed(governor::Quota::per_minute(per_minute))
+}
+
+/// Take one unit of `group`'s rate. The table forgets groups whose rate has refilled when it
+/// grows, so a long-running process does not keep an entry for every group it has seen.
+fn take(rate: &GroupRate, group: GroupId) -> bool {
+    if rate.len() >= 1024 {
+        rate.retain_recent();
     }
-    table
-        .entry(group)
-        .or_insert_with(|| SlidingWindow::new(Duration::from_secs(60)))
-        .take(limit)
+    rate.check_key(&group).is_ok()
 }
 
 impl Inner {
@@ -136,20 +158,11 @@ impl Inner {
     }
 
     fn held(&self, key: &str) -> bool {
-        let mut unreadable = self
-            .unreadable
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let hold = self.cfg.unreadable_hold;
-        unreadable.retain(|_, at| at.elapsed() < hold);
-        unreadable.contains_key(key)
+        self.unreadable.contains_key(key)
     }
 
     fn hold(&self, key: &str) {
-        self.unreadable
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(key.to_owned(), Instant::now());
+        self.unreadable.insert(key.to_owned(), ());
     }
 
     async fn cached(&self, key: &str) -> Option<String> {
@@ -193,7 +206,7 @@ impl Inner {
             tracing::debug!("picture recently unreadable or declined; not retried");
             return None;
         }
-        if !take(&self.image_windows, group, self.cfg.images_per_minute) {
+        if !take(&self.image_rate, group) {
             tracing::info!(
                 group = group.get(),
                 "picture description rate limited; left as it is"
@@ -275,7 +288,7 @@ impl Inner {
         if self.held(&flight_key) {
             return None;
         }
-        if !take(&self.clip_windows, group, self.cfg.clips_per_minute) {
+        if !take(&self.clip_rate, group) {
             tracing::info!(
                 group = group.get(),
                 "voice transcription rate limited; left as it is"
@@ -363,12 +376,14 @@ impl MediaService {
         Self {
             inner: Arc::new(Inner {
                 permits: Semaphore::new(cfg.concurrency.max(1)),
+                image_rate: group_rate(cfg.images_per_minute),
+                clip_rate: group_rate(cfg.clips_per_minute),
+                unreadable: moka::sync::Cache::builder()
+                    .time_to_live(cfg.unreadable_hold)
+                    .build(),
                 cfg,
                 deps,
                 flights: Arc::default(),
-                image_windows: Mutex::default(),
-                clip_windows: Mutex::default(),
-                unreadable: Mutex::default(),
                 pending: Mutex::default(),
                 in_flight: AtomicUsize::new(0),
                 closed: AtomicBool::new(false),

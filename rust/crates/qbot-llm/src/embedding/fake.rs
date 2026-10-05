@@ -83,6 +83,12 @@ impl FakeEmbedder {
         }
     }
 
+    /// The same embedder reporting another model name: vectors from it are a different index.
+    pub fn named(mut self, model: &str) -> Self {
+        self.info.model = model.into();
+        self
+    }
+
     /// Every `embed` call so far, with its texts.
     pub fn calls(&self) -> Vec<Vec<String>> {
         self.lock().calls.clone()

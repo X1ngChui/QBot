@@ -12,9 +12,7 @@ use qbot_agent::{
 };
 use qbot_core::{AccountId, GroupId, MessageId, SystemClock};
 use qbot_llm::fake::{FakeProvider, FakeReply, Step};
-use qbot_llm::{
-    EventStream, LlmError, Params, Provider, ProviderInfo, ReasoningEffort, Request, Response,
-};
+use qbot_llm::{EventStream, LlmError, Provider, ProviderInfo, ReasoningEffort, Request, Response};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
@@ -136,14 +134,6 @@ pub struct Harness {
     pub order: Order,
 }
 
-pub fn params() -> Params {
-    Params {
-        max_output_tokens: 1000,
-        reasoning: ReasoningEffort::Low,
-        temperature: None,
-    }
-}
-
 pub fn tool_set(world: &Arc<SimWorld>, order: &Order, max_sends: u32) -> ToolSet {
     ToolSet::new()
         .with(Echo(order.clone()))
@@ -191,7 +181,7 @@ pub fn harness_from(fake: FakeProvider, limits: RunLimits, max_sends: u32) -> Ha
         renderer: renderer(),
         clock: Arc::new(SystemClock),
         limits,
-        params: params(),
+        reasoning: ReasoningEffort::Low,
         media: None,
     });
     Harness {

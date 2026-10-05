@@ -49,6 +49,17 @@ pub struct PipelineConfig {
     pub forward_max_lines: usize,
 }
 
+impl PipelineConfig {
+    /// The settings for `bot`: an echo is kept as long as a delivery waits for one.
+    pub fn new(bot: AccountId) -> Self {
+        Self {
+            bot,
+            echo_keep: crate::delivery::DeliveryTimeouts::default().echo,
+            forward_max_lines: crate::render::FORWARD_MAX_LINES,
+        }
+    }
+}
+
 /// Told when a group's batch fills: older chat is about to leave the verbatim tier, so its
 /// episode should be written.
 #[async_trait]

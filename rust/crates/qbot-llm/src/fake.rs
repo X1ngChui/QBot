@@ -92,7 +92,7 @@ pub struct Recorded {
     pub plan: ReplayPlan,
     pub tool_names: Vec<String>,
     pub tool_choice: ToolChoice,
-    pub params: crate::Params,
+    pub reasoning: crate::ReasoningEffort,
     pub streamed: bool,
 }
 
@@ -143,7 +143,6 @@ impl FakeProvider {
                 image_input: None,
                 cache_metrics: true,
                 forced_tool_choice: ForcedToolChoice::Always,
-                temperature: true,
             },
         };
         Self {
@@ -208,7 +207,7 @@ impl FakeProvider {
             plan,
             tool_names: request.tools.iter().map(|t| t.name.clone()).collect(),
             tool_choice: request.tool_choice.clone(),
-            params: request.params,
+            reasoning: request.reasoning,
             streamed,
         });
         let step = inner
@@ -271,8 +270,7 @@ impl FakeProvider {
                 .sum(),
             None => 0,
         };
-        let output_tokens =
-            (tokens_of(&turn_json(&turn)) + 1).min(request.params.max_output_tokens);
+        let output_tokens = tokens_of(&turn_json(&turn)) + 1;
         inner.last_conversation = Some(conversation.clone());
 
         let handle = if self.info.capabilities.continuation == Realization::Native {

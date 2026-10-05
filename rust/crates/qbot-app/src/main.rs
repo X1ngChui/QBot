@@ -26,8 +26,6 @@ commands:
   import-history FILE [--dry-run]
                    import the Python bot's chat history from an export made with
                    deploy/export_python_history.sql; the bot must not be running
-  rebuild-memory   extract every group's memory from the archive now, as the nightly
-                   run would; the bot must not be running
 
 environment:
   QBOT_CONFIG_DIR   configuration directory   (default /etc/qbot)
@@ -64,7 +62,7 @@ fn main() -> ExitCode {
                 }
             };
             // Normal output, plus the recent warnings and errors /logs shows.
-            let logs = qbot_app::logs::LogBuffer::new(loaded.config.runtime.log_buffer_lines);
+            let logs = qbot_app::logs::LogBuffer::new(qbot_app::logs::KEPT_LINES);
             tracing_subscriber::registry()
                 .with(
                     tracing_subscriber::fmt::layer().with_filter(
@@ -146,41 +144,6 @@ fn main() -> ExitCode {
                         println!("dry run: nothing written");
                     }
                     println!("{stats}");
-                    ExitCode::SUCCESS
-                }
-                Err(error) => {
-                    eprintln!("{error}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
-        Some("rebuild-memory") => {
-            let loaded = match load() {
-                Ok(loaded) => loaded,
-                Err(errors) => {
-                    eprint!("{errors}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    tracing_subscriber::EnvFilter::try_from_default_env()
-                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-                )
-                .init();
-            let runtime = match tokio::runtime::Runtime::new() {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    eprintln!("cannot start the async runtime: {error}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            match runtime.block_on(qbot_app::rebuild::rebuild_memory(
-                loaded,
-                Arc::new(ProcessEnv),
-            )) {
-                Ok(episodes) => {
-                    println!("memory rebuilt: {episodes} episodes stored");
                     ExitCode::SUCCESS
                 }
                 Err(error) => {

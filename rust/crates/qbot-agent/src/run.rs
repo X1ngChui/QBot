@@ -12,8 +12,8 @@ use std::time::Duration;
 use qbot_context::{ChatBatch, Item, Meta, RunEnd, Summary, ToolCall, Transcript, project};
 use qbot_core::{Clock, GroupId, ItemSeq, RunId};
 use qbot_llm::{
-    Continuation, Conversation, ForcedToolChoice, LlmError, Params, Provider, ReasoningEffort,
-    Renderer, Request, ToolChoice, Usage,
+    Continuation, Conversation, ForcedToolChoice, LlmError, Provider, ReasoningEffort, Renderer,
+    Request, ToolChoice, Usage,
 };
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -35,7 +35,8 @@ pub struct RunDeps {
     pub renderer: Arc<dyn Renderer>,
     pub clock: Arc<dyn Clock>,
     pub limits: RunLimits,
-    pub params: Params,
+    /// The reasoning effort of a reply's model calls.
+    pub reasoning: ReasoningEffort,
     /// Where image bytes for `Part::Image` keys in the conversation come from (pictures a tool
     /// opened). `None` when nothing can produce images.
     pub media: Option<Arc<dyn qbot_llm::MediaStore>>,
@@ -264,14 +265,14 @@ impl Run<'_> {
     ) -> Result<Vec<ToolCall>, RunEnd> {
         let info = self.deps.provider.info().clone();
         // A provider that forces tools only without reasoning gets this one turn without it.
-        let mut params = self.deps.params;
+        let mut reasoning = self.deps.reasoning;
         if *choice != ToolChoice::Auto
             && info.capabilities.forced_tool_choice == ForcedToolChoice::WithoutReasoning
         {
             self.reasoning_off = true;
         }
         if self.reasoning_off {
-            params.reasoning = ReasoningEffort::Off;
+            reasoning = ReasoningEffort::Off;
         }
         let choice = if *choice != ToolChoice::Auto
             && info.capabilities.forced_tool_choice == ForcedToolChoice::Never
@@ -288,7 +289,7 @@ impl Run<'_> {
                 tools: specs,
                 tool_choice: choice.clone(),
                 parallel_tool_calls: true,
-                params,
+                reasoning,
                 continuation: self.continuation.as_ref(),
                 media: self.deps.media.as_deref(),
             };

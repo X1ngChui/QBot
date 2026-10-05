@@ -40,6 +40,21 @@ pub struct BackupConfig {
     pub target: PgTarget,
 }
 
+impl BackupConfig {
+    /// Dumps of `target` into `dir`, keeping `keep`, with the client tools on `PATH`. A dump or
+    /// verification of a group-chat database finishes in minutes; fifteen is a hung tool.
+    pub fn new(dir: PathBuf, keep: usize, target: PgTarget) -> Self {
+        Self {
+            dir,
+            prefix: "qbot".into(),
+            keep,
+            timeout: Duration::from_secs(15 * 60),
+            bin_dir: None,
+            target,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BackupError {
     #[error("cannot prepare the backup directory {path}: {reason}")]

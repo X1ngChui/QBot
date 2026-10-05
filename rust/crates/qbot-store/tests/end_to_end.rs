@@ -22,7 +22,7 @@ use qbot_context::{
 };
 use qbot_core::{AccountId, CallId, Clock, GroupId, MessageId, SystemClock, TimerId, UnixMillis};
 use qbot_llm::fake::{FakeProvider, FakeReply, Step};
-use qbot_llm::{Params, PlainRenderer, ReasoningEffort};
+use qbot_llm::{PlainRenderer, ReasoningEffort};
 use qbot_sched::{
     JobError, JobKind, JobRunner, NewWake, Origin, Scheduler, SchedulerConfig, TaskLimits,
     TaskService, TimerOutcome, TimerState, TimerStore,
@@ -183,11 +183,7 @@ fn stack_on(db: TestDb, script: Vec<Step>) -> Stack {
         renderer: Arc::new(PlainRenderer),
         clock: clock.clone(),
         limits: RunLimits::default(),
-        params: Params {
-            max_output_tokens: 1000,
-            reasoning: ReasoningEffort::Low,
-            temperature: None,
-        },
+        reasoning: ReasoningEffort::Low,
         media: None,
     });
     let supervisor = Supervisor::new(

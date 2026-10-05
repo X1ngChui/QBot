@@ -40,6 +40,31 @@ pub struct CommandSettings {
     pub runs_max_rows: usize,
 }
 
+impl CommandSettings {
+    /// The settings for `bot`. QQ shows at most 2000 characters in one message; the list sizes
+    /// keep a reply to one or two screens; 20 notes per account bound what one member's notes add
+    /// to a reply's context through member lookups.
+    pub fn new(
+        bot: AccountId,
+        owners: BTreeSet<AccountId>,
+        zone: TimeZone,
+        fact_decay: DecayPolicy,
+    ) -> Self {
+        Self {
+            bot,
+            owners,
+            zone,
+            max_message_chars: 2000,
+            members_max_rows: 60,
+            top_max_rows: 20,
+            link_ttl: qbot_memory::identity::IdentityPolicy::default().invitation_ttl,
+            fact_decay,
+            notes_per_account: 20,
+            runs_max_rows: 10,
+        }
+    }
+}
+
 pub struct Deps {
     pub identity: Arc<dyn IdentityStore>,
     pub facts: Arc<dyn FactStore>,

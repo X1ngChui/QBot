@@ -176,13 +176,7 @@ struct Bot {
 }
 
 fn deployment(db: &Database, llm: SocketAddr, root: &Path, asr_dir: Option<&Path>) {
-    deployment_with(
-        db,
-        llm,
-        root,
-        asr_dir,
-        "[maintenance]\nbackups_enabled = false\n",
-    );
+    deployment_with(db, llm, root, asr_dir, "[maintenance]\nbackups = 0\n");
 }
 
 /// `extra` is more TOML appended to the configuration (for example a `[maintenance]` section).
@@ -205,7 +199,6 @@ timezone = "Asia/Shanghai"
 
 [gateway]
 listen = "127.0.0.1:0"
-echo_timeout_secs = 5
 
 [database]
 host = "{}"
@@ -216,35 +209,33 @@ ssl_mode = "disable"
 
 [providers.text]
 endpoint = "http://{llm}"
-retries = 0
 
 [providers.vision]
 enabled = true
 # The mock serves the standard Responses dialect (pictures sent inline), not DeepSeek's uploads.
 kind = "openai_responses"
 endpoint = "http://{llm}"
-retries = 0
 
-[asr]
-enabled = {asr_enabled}
-model_dir = "{asr_dir}"
+[media]
+transcribe_voice = {asr_enabled}
 
 [providers.embedding]
 endpoint = "http://{llm}"
 dims = 4
-retries = 0
 "#,
             db.host,
             db.port,
             db.name,
             db.user,
             asr_enabled = asr_dir.is_some(),
-            asr_dir = asr_dir
-                .map_or("asr/sense-voice".to_owned(), |d| d.display().to_string())
-                .as_str()
-                .replace('\\', "/"),
         ) + extra),
     );
+    // The voice model has a fixed place under the data directory.
+    if let Some(model) = asr_dir {
+        let place = root.join("data/models/asr");
+        std::fs::create_dir_all(&place).unwrap();
+        std::os::unix::fs::symlink(model, place.join("sense-voice")).unwrap();
+    }
     write(
         &root.join("etc/personas/default.toml"),
         "name = \"Bobo\"\nsystem_prompt = \"You are Bobo, a cheerful member.\"\n",
@@ -737,9 +728,7 @@ async fn schedule_in(db: &Database, name: &str, seconds: i64) -> String {
     let at = jiff::Timestamp::from_second(now.as_second())
         .unwrap()
         .to_zoned(jiff::tz::TimeZone::get("Asia/Shanghai").unwrap());
-    let store = qbot_store::Store::connect(&db.url, 1, Duration::from_secs(10))
-        .await
-        .unwrap();
+    let store = qbot_store::Store::connect(&db.url).await.unwrap();
     store.migrate().await.unwrap();
     sqlx::query("INSERT INTO recurrence (name, last_fired_ms) VALUES ($1, $2)")
         .bind(name)
@@ -767,7 +756,7 @@ async fn the_nightly_pipeline_and_the_daily_report_run_on_schedule() {
         &root,
         None,
         &format!(
-            "[maintenance]\nnightly_cron = \"{nightly}\"\nreport_cron = \"{report}\"\nbackups_enabled = true\nbackup_keep = 2\npostgres_bin_dir = \"{}\"\n",
+            "[maintenance]\nnightly_cron = \"{nightly}\"\nreport_cron = \"{report}\"\nbackups = 2\npostgres_bin_dir = \"{}\"\n",
             tools.display()
         ),
     );
@@ -897,7 +886,7 @@ async fn a_missing_backup_tool_stops_startup_with_a_clear_error() {
         &root,
         None,
         &format!(
-            "[maintenance]\nbackups_enabled = true\npostgres_bin_dir = \"{}\"\n",
+            "[maintenance]\nbackups = 14\npostgres_bin_dir = \"{}\"\n",
             tools.display()
         ),
     );
@@ -948,7 +937,7 @@ async fn a_filled_batch_turns_archived_chat_into_a_stored_episode() {
         llm,
         &root,
         None,
-        "[history]\nbatch_lines = 1\n[maintenance]\nbackups_enabled = false\n",
+        "[history]\nbatch_lines = 1\n[maintenance]\nbackups = 0\n",
     );
     let bot = launch(&db, &root).await;
     let pool = db.pool().await;

@@ -28,9 +28,7 @@ pub mod store;
 
 pub use build::{BuildError, BuilderConfig, Built, EpisodeBuilder};
 pub use episode::{Episode, EpisodeId, Evidence, Hit, NewEpisode};
-pub use extract::{
-    EpisodeExtractor, ExtractError, Extracted, ExtractorConfig, METHOD, SliceContext,
-};
+pub use extract::{EpisodeExtractor, ExtractError, Extracted, MAX_ATTEMPTS, METHOD, SliceContext};
 pub use history::{HistoryPart, compose};
 pub use identity::{
     Alias, AliasId, AliasStatus, AliasTarget, AliasTextError, EvidenceKind, EvidenceRecord, Holder,
