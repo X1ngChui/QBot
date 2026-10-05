@@ -2,119 +2,92 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-QBot is an AI member for QQ group chats: a NoneBot2 app (`bot.py` → `qqbot/plugin.py`) that
-NapCat (OneBot v11) connects to over a reverse WebSocket, backed by PostgreSQL 17 + pgvector.
-Python 3.12. Read `docs/architecture.md` before larger changes; it is the authoritative design doc.
+QBot is an AI member for QQ group chats: a Rust service (`qbot run`) that NapCat (OneBot v11)
+connects to over a reverse WebSocket, backed by PostgreSQL 17 + pgvector. Read
+`docs/architecture.md` before larger changes; it is the authoritative design doc, with
+`docs/memory.md` for identity, episodes, extraction and recall. `docs/cutover.md` lists what is
+left of replacing the earlier Python bot in production (that implementation is on the `py` branch,
+for reference only). Develop on `dev`; `main` is the released line.
 
 ## Commands
 
 ```bash
-python -m venv .venv && .venv/bin/pip install -r requirements.txt -r requirements-dev.txt
-
-python -m pytest                              # the only supported test entry point
-python -m pytest tests/test_pipeline.py       # one suite
-python -m pytest tests/test_commands.py -k name   # one test
-python -m ruff check .                        # lint (import sorting deliberately off)
-python -m pyright                             # types: bot.py, qqbot/, scripts/ only (not tests); CI runs this
-
-python scripts/lint_prompts.py                # validate config/prompts/prompts.yaml offline
-python scripts/config_reference.py [--write]  # check / regenerate docs/configuration-reference.md and migration map
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace                       # the full suite needs the database below
+cargo test -p qbot-memory                    # one crate
+cargo test -p qbot-commands --test commands name   # one test
+cargo run -p qbot-eval -- --repeat 3         # reply-quality evaluation; calls the real model
 ```
 
-Run pytest, Ruff and Pyright as independent checks. Database tests (`tests/integration/`,
-`test_schema.py`, `test_scheduled.py`, …, marker `database`) **skip** unless
-`QBOT_TEST_DATABASE_URL` is set; a skipped DB case is not a pass. Start the disposable DB:
+Database tests (`qbot-store`, `qbot-app`'s end-to-end test and others) need a disposable pgvector
+Postgres; without `QBOT_TEST_DATABASE_URL` they fail on purpose (`QBOT_SKIP_DB_TESTS=1` skips
+them, which is not a full run). Each test creates and drops its own database, whose name must start
+with `qbot_test`:
 
 ```bash
 docker run -d --name qbot-pgtest \
-  -e POSTGRES_DB=qbot_test -e POSTGRES_USER=qbot_test -e POSTGRES_PASSWORD=testpw \
-  -p 127.0.0.1:15432:5432 \
-  -v "$PWD/sql/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro" \
-  -v "$PWD/tests/fixtures/test_db_marker.sql:/docker-entrypoint-initdb.d/02-test-marker.sql:ro" \
-  pgvector/pgvector:0.8.5-pg17
-export QBOT_TEST_DATABASE_URL=postgresql://qbot_test@127.0.0.1:15432/qbot_test
-export QBOT_TEST_DATABASE_PASSWORD=testpw
+  -e POSTGRES_USER=qbot_test -e POSTGRES_PASSWORD=testpw -e POSTGRES_DB=qbot_test_admin \
+  -p 127.0.0.1:15432:5432 --tmpfs /var/lib/postgresql/data \
+  pgvector/pgvector:0.8.5-pg17 -c fsync=off -c synchronous_commit=off -c max_connections=400
+export QBOT_TEST_DATABASE_URL=postgres://qbot_test:testpw@127.0.0.1:15432/qbot_test_admin
 ```
 
-The fixture verifies the test role/database/`qbot_test_guard` marker before mutating. Never
-point it at production, and don't run DB-mutating tests concurrently against one database.
-Nothing in the suite talks to QQ or a paid API. `scripts/eval_replies.py`, `eval_extract.py`,
-`eval_tasks.py`, `generate_prompts.py`, `review_prompts.py` and `preflight.py` call real models
-and are run by hand only.
-
-Deploy with `scripts/deploy.sh` (always rebuilds; `docker compose restart` does not pick up code).
+The recognizer tests run only when `QBOT_ASR_MODEL_DIR` points at the SenseVoice bundle
+(`deploy/fetch_asr_model.sh` fetches it); otherwise they say SKIPPED. Tests ignored with "calls
+paid provider APIs" are live tests run by hand with `-- --ignored`; nothing else talks to QQ or a
+paid API. Build the image with `docker build -f deploy/Dockerfile .`; deployment is described in
+`deploy/README.md`.
 
 ## Architecture
 
-- **Composition root:** `qqbot/runtime.py`. `plugin.py` loads one immutable `ConfigBundle` and
-  calls `Runtime.build()`; the Runtime owns clock, database, budget ledger, providers, caches,
-  `GroupDelivery`, command router, the shared `ReplyScheduler`, gateway and workers. There is no
-  `config()`/service-locator global — pass settings, prompt catalogs and predicates explicitly.
-  Startup takes an exclusive PostgreSQL session lease; losing it shuts the process down.
-- **Message path:** `gateway/` normalizes OneBot events to one `InboundEvent`, archives it
-  (`ON CONFLICT DO NOTHING` is the sole dedup gate), then routes commands (`commands/`) or, if
-  triggered (@, whole-word jieba nickname match, or quoting the bot — `gateway/trigger.py`),
-  submits a bounded reply request to the shared inbox.
-- **Reply engine:** `conversation/`. Each addressed message or due timer gets an independent
-  `ReplySession` (no merging) with its own deadline and fuel. Gates: mute → block → budget →
-  media wait. The model replies only via tools: `send_message` (one QQ message per call, waits
-  for its self-echo) and `finish_reply`; a tool-free turn ends silently. Every tool call executes
-  (no dedup). Tools live in `conversation/tools.py` / `tool_registry.py`.
-- **Providers:** `qqbot/providers/` is the only place vendors are named. Five capabilities (text,
-  vision, asr, embedding, search) behind contracts in `providers/base.py`; text/vision use the
-  Responses API with task-local replay (`TextSession`). No fallback between backends; unknown
-  models bill at the most expensive tier. Reasoning items never leave the provider adapter.
-- **Memory:** `domain/memory/`, `services/memory_extractor.py`, `workers/memory.py`. Facts are
-  extracted nightly by function call, validated against verbatim quotes, stored with evidence,
-  confidence and expiry. Identity (`domain/identity/`) separates accounts, display names and
-  people; prompts refer to members by member number. Episodes reach a reply only via the
-  `recall_events` tool.
-- **Durable work:** `memory_job` queue (`FOR UPDATE SKIP LOCKED` + leases) and a separate
-  `scheduled_task` table for group tasks (`services/scheduled_tasks.py`, `workers/scheduled.py`);
-  claims are single-attempt and are marked interrupted on restart, never replayed.
-- **Layering:** `domain/` (pure model) → `repositories/` (SQL, one per aggregate) →
-  `services/` → `conversation/`, `gateway/`, `commands/`, `operations/`.
+- **Composition root:** `crates/qbot-app/src/run.rs` builds every part from one loaded
+  configuration: database and the single-instance Postgres lease (losing it shuts the process
+  down), providers, tools, prompt context, supervisor, scheduler, media service, commands, the
+  gateway pipeline and server. No globals: settings and ports are passed explicitly.
+- **Message path:** `qbot-gateway` parses OneBot frames, renders a message to archive text with
+  ASCII markers, archives it (`UNIQUE (group_id, message_id)` is the only dedup gate), then routes
+  the bot's own line to the echo board, a command word to `qbot-commands`, or a trigger (@, a
+  nickname as a whole jieba token, a quote of a bot line) to the supervisor.
+- **Runs:** `qbot-agent`. Every trigger or due task is its own run with its own deadline over an
+  append-only transcript (`qbot-context`). The model speaks only through `send_message`
+  (`{text, end_turn?}` in the chat's marker syntax, waits for its echo) or ends with
+  `stay_silent`; text without a tool call gets one note and a forced tool turn. Every tool call
+  executes (no dedup). Tools live in `qbot-tools` (and `open_images` in `qbot-media`).
+- **Providers:** `qbot-llm` is the only place vendors are named: text and vision through the
+  Responses API (DeepSeek and OpenAI-style dialects, typed capabilities), embeddings, Tavily search.
+  No local output-token caps; reasoning items never leave the adapter.
+- **Memory:** `qbot-memory`. The archive is the source of truth. Episodes summarize fixed slices of
+  whole batches, extracted with validated findings (names, facts, group knowledge) that
+  consolidation applies; recall ranks by similarity decaying with age; embeddings are an index the
+  nightly run keeps complete for the configured model. Notes written by hand are a separate store.
+- **Durable work:** one `timer` table in `qbot-sched`: group tasks (at most once, interrupted on
+  restart, never replayed) and jobs (leased, retried), plus cron schedules fired exactly once per
+  occurrence. `qbot-ops` runs the nightly extraction, decay, backup and cleanup, and the report.
+- **Layering:** `qbot-core`/`qbot-context` are pure; a port is defined by the crate that needs it
+  and implemented by `qbot-store` (Postgres) or `qbot-gateway` (OneBot).
 
 ## Conventions that bite
 
-- **Nominal IDs:** `AccountId`, `GroupId`, `MessageId` (`qqbot/domain/ids.py`) must not be
-  interchanged with `str`; construct at ingress/SQL boundaries. Don't suppress Pyright wholesale.
-- **Language:** comments, docstrings, logs and SQL are English; Chinese only in model-facing
-  prompts/personas/predicates and member-facing command replies. `tests/test_logic.py` enforces this.
-- **Prompts are data:** all prompt wording lives in `config/prompts/prompts.yaml`; template keys,
-  roles and exact `{{slot}}` sets are a closed contract in `qqbot/prompting/templates.py`
-  (see `config/prompts/README.md`). Markers the code writes and parses stay in code. A changed
-  prompt should be run through the matching eval script.
-- **Schema:** `sql/init.sql` is the sole canonical schema; also update the structural contract in
-  `qqbot/db/repo.py`. No runtime fallback reads or migration chains.
-- **Config:** settings are pydantic-validated, unknown keys rejected. A new key goes in
-  `config/settings.yaml.example` and `docs/configuration.md` (then regenerate the reference).
-  Every setting needs a reader and must be a real choice. Real `settings.yaml`/personas are gitignored.
-- **New command:** add to `commands/catalog.py`, handle in `commands/router.py`, document in
-  `docs/commands.md`, test in `tests/test_commands.py`.
-- Comments describe the present, not history. Tests/docs/examples use invented names and group numbers.
-- Commit messages: one line saying what changed (and why if not obvious), naming the module/command/setting.
-
-## Rust rewrite (in progress)
-
-`rust/` holds the Rust implementation that replaces the Python bot at the cutover; the Python code
-stays until then. Start with `docs/rust-rewrite/design.md` (architecture, configuration, every limit
-and its reason), `docs/rust-rewrite/memory.md` (identity, episodes, extraction, recall),
-`docs/rust-rewrite/cutover.md` (the remaining steps and the transition tooling deleted afterwards),
-`rust/README.md` (commands; the database tests need a disposable pgvector Postgres) and
-`rust/deploy/README.md` (configuration layers, Docker layout, secrets).
-Workspace crates: `qbot-core` (ids, batch grid, markers), `qbot-context` (canonical transcript),
-`qbot-llm` (provider contract, Responses/DeepSeek adapter, embeddings, web search, fakes),
-`qbot-agent` (run loop, tools, supervisor), `qbot-sched` (timers, tasks, recurring schedules),
-`qbot-tools`, `qbot-memory` (identity, episodes, facts, recall, notes), `qbot-store` (Postgres),
-`qbot-config` (typed layered configuration), `qbot-i18n` (member-facing text), `qbot-wording`
-(model-facing short texts), `qbot-prompt` (instruction templates, personas, chat rendering),
-`qbot-gateway` (OneBot), `qbot-media` (pictures and voice), `qbot-asr` (speech recognition),
-`qbot-ops` (nightly run, backups, report), `qbot-commands` (chat commands), `qbot-app` (the `qbot`
-binary), `qbot-eval` (reply-quality evaluation against the real model; run by hand, see `rust/eval/`).
-Conventions: no CJK in Rust code or comments (it lives only in locale catalogs, prompts and
-fixtures); configuration holds only what a deployment may choose, and internal tuning is the
-`Default` of the owning crate's settings; every local limit needs a concrete reason (design.md 14)
-and must not duplicate a provider-side or already-implied bound (no local output-token caps);
-credentials are never config; the schema is one migration file until the Rust schema is in
-production; model-facing wording lives in `rust/prompts/`.
+- **Ids are newtypes** (`AccountId`, `GroupId`, `MessageId`, ...) parsed at the boundary; don't pass
+  raw integers around. Closed sets are enums, and the schema repeats them as CHECK constraints.
+- **No CJK in Rust code or comments.** It lives only in `locales/`, `prompts/`, persona files and
+  test fixtures; tests build CJK input from `\u` escapes.
+- **Wording is data.** Instruction templates are `prompts/*.md` (closed slot sets, tested); every
+  short model-facing text is in `prompts/wording.toml` behind `qbot-wording`'s `Text` enum;
+  member-facing text is a typed `Msg` in `qbot-i18n` with Fluent catalogs. Markers the code writes
+  and parses stay in code. Run a changed prompt through `qbot-eval`.
+- **Configuration holds only what a deployment may choose** (`crates/qbot-config/defaults.toml` is
+  the whole schema; unknown keys are rejected). Internal tuning is the `Default` of the owning
+  crate's settings. A new setting goes in `defaults.toml` with a comment, the example config if
+  operators need it, and the conversion in `qbot-config`; credentials are never configuration.
+- **Every local limit needs a concrete reason** and must not duplicate a provider-side or
+  already-implied bound; `docs/architecture.md` section 14 lists them.
+- **Schema:** `crates/qbot-store/migrations/` (one file today). The in-memory store implementations
+  define the semantics, and shared conformance suites run against both.
+- **New command:** catalog in `qbot-commands/src/catalog.rs`, handler, `Msg` texts in both catalogs,
+  a test in `crates/qbot-commands/tests/commands.rs`, and the table in `docs/architecture.md`.
+- Comments describe the present, not history. Tests, docs and examples use invented names and
+  group numbers.
+- Commit messages: one line saying what changed (and why if not obvious), naming the crate,
+  command or setting.

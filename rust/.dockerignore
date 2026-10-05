@@ -1,6 +1,0 @@
-target
-deploy/data
-deploy/secrets
-deploy/config/config.toml
-deploy/.env
-**/.git

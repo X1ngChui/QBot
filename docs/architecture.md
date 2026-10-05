@@ -1,683 +1,414 @@
-# Architecture
+# QBot architecture
 
-This document describes how QBot is built and why. It covers the runtime components,
-the path a message takes, the reply engine and its tools, how the prompt is assembled,
-how pictures and voice are handled, the memory model, the budget, and the scheduled
-jobs. Configuration keys are described in [configuration.md](configuration.md); the
-operator commands in [commands.md](commands.md).
+QBot is an AI member of QQ group chats. NapCat (OneBot v11) connects to it over a reverse
+WebSocket; it archives every group message, answers when it is addressed or when one of its own
+scheduled tasks comes due, remembers what the group talks about, and keeps out of the way
+otherwise. This document describes how it works and why. Memory (identity,
+episodes, recall) has its own document, [memory.md](memory.md). The remaining steps to replace
+the earlier Python bot in production are in [cutover.md](cutover.md).
 
-## Components
+## 1. What the product does
+
+R1. Join QQ groups through NapCat (OneBot v11, reverse WebSocket, the bot is the server).
+Receive group messages, the bot's own echoed messages and notices (recall, join, leave, mute,
+poke). Send group messages: text, mentions, a quote, QQ faces, dice, rock-paper-scissors, and a
+member's contact card. The bot knows only the group it is in and never sends or reveals another
+group's card.
+R2. Archive every event exactly once. A unique-key insert is the only dedup gate; a duplicate
+stops all further effects. The bot's own lines come only from the platform's echo.
+R3. Speak only when caused: an @ of the bot, a nickname as a whole word, a quote of one of the
+bot's lines, or a due group task. A muted group gets nothing; a blocked member cannot start a
+reply but stays in context.
+R4. Reply through tools: the model decides whether to speak, whom to mention and what to quote.
+R5. Tools: send, stay silent, archive search, episode recall and reading, member lookup, web
+search and page reading, opening pictures, and the group's scheduled tasks.
+R6. Group-scoped memory learned from chat: episodes with embeddings, names, facts about members
+and group knowledge, each grounded in verbatim quotes, with confidence that fades. Notes written
+by hand are a separate store with their own commands.
+R7. Identity: accounts belong to people; linking and splitting with revision-checked
+confirmation; stable member numbers per group.
+R8. Media: pictures described once and archived as text, originals opened on demand; voice
+transcribed on the CPU in the process.
+R9. Commands without model calls for members and owners (section 12).
+R10. Group tasks: durable one-shot timers owned by the group, bounded, never run twice, waking
+the agent with fresh context.
+R11. Operations: nightly extraction, embedding, fact decay, verified backups, cleanup, a daily
+report to the owners, and single-instance exclusivity.
+R12. Observability: calls, tokens, cache hits and latency are counted. Nothing refuses work on
+cost.
+R13. Localization: member-facing text comes from message catalogs.
+
+## 2. Principles
+
+- **One loop per run, one canonical log.** A run is "call the model; run the tools it asked for;
+  append everything; repeat". Everything the model saw is an append-only, typed transcript, from
+  which every request is derived and which is stored as it grows.
+- **Vendors at the edge.** Only `qbot-llm` names model providers, only `qbot-gateway` speaks
+  OneBot, only `qbot-store` speaks SQL. The runtime never branches on a vendor; differences are
+  typed capabilities.
+- **Invariants in types and in one mutation path.** Platform ids are newtypes parsed at the
+  boundary; closed sets are enums; the transcript has a single append function that enforces
+  call/result pairing; the schema repeats every closed set and cross-column rule as a CHECK.
+- **No silent fallback.** Errors are typed and end a run with a recorded reason. A retry happens
+  only where the failure is transient and the retry cannot duplicate an effect.
+- **Every limit has a reason** (section 14). Policy a deployment may choose is configuration;
+  everything else is a documented constant in the crate it governs (section 13).
+- **Model-facing wording is data.** Instructions are templates in `prompts/`; short texts are in
+  `prompts/wording.toml`; member-facing text is in `locales/`.
+- **No CJK in Rust code or comments.** It lives only in catalogs, prompts, personas and fixtures;
+  tests build CJK input from `\u` escapes.
+
+## 3. Workspace
+
+A Cargo workspace. Arrows point from dependent to dependency; there are no cycles.
 
 ```text
-QQ  <->  NapCat (OneBot v11)  <-- reverse WebSocket -->  bot  <-- asyncpg -->  PostgreSQL 17 + pgvector
+qbot-app       the `qbot` binary: configuration, wiring, signals, cutover import
+qbot-commands  chat commands
+qbot-gateway   OneBot server, rendering, the message pipeline, delivery and echoes
+qbot-ops       nightly run, backups, report, NapCat cache
+qbot-tools     the model's tools
+qbot-media     picture description and voice transcription service
+qbot-asr       in-process speech recognition (sherpa-onnx, SenseVoice)
+qbot-prompt    instructions, personas, history tiers, chat rendering
+qbot-sched     timers, group tasks, recurring schedules, the scheduler loop
+qbot-agent     supervisor, run loop, tool trait and executor, ports, a simulated group
+qbot-memory    identity, episodes, extraction, consolidation, facts, recall, notes
+qbot-store     Postgres adapters for every port, the schema, the lease
+qbot-llm       provider contract, Responses/DeepSeek adapter, embeddings, web search, fakes
+qbot-config    typed, layered configuration and secrets
+qbot-i18n      member-facing message catalogs (Fluent)
+qbot-wording   model-facing short texts (`prompts/wording.toml`)
+qbot-context   the canonical transcript and its projection (pure)
+qbot-core      ids, time, the batch grid, markers (pure)
+qbot-eval      reply-quality evaluation against the real model (run by hand)
 ```
 
-| Component | Role |
-| --- | --- |
-| NapCat | QQ protocol client. Speaks OneBot v11 and connects to the bot over a reverse WebSocket, so the bot is the server and NapCat reconnects on its own. |
-| bot | A NoneBot2 application (FastAPI driver). Everything in this document except storage. |
-| PostgreSQL | The archive, the memory model, the vector index, the job queue, the cost ledger and the per-group operational state. pgvector provides the vector type. |
+`qbot-core` and `qbot-context` do no IO. A port (a trait such as `Archive`, `Delivery`,
+`EpisodeStore`, `TimerStore`) is defined by the crate that needs it and implemented by
+`qbot-store` or `qbot-gateway`, so dependencies point at the domain, not at Postgres.
 
-All three run as Docker Compose services. Credentials are injected from `.env`; a
-missing one fails `docker compose up` rather than the first API call.
+## 4. The message path
 
-### Providers
+- **Parsing** (`qbot-gateway::wire`): frames become typed events (`GroupMessage`, `GroupNotice`,
+  `ActionResponse`); anything unusable is `Frame::Ignored` with a reason.
+- **Rendering** (`render`): a message becomes archive text with ASCII markers: `[at:N]`,
+  `[at:bot]`, `[reply:ID]`, `[image]`, `[sticker:..]`, `[voice]`, `[face:N]`, `[dice:N]`,
+  `[rps:N]`, `[forward:N]` with indented lines, `[file:NAME]`, `[card]`, `[notice:..]`.
+  Member-typed ASCII brackets become fullwidth brackets, so a marker cannot be forged. Forwarded
+  records show at most `FORWARD_MAX_LINES` (30) of their messages: a record can hold hundreds,
+  and every prompt showing the line would carry them all.
+- **Archiving** (`pipeline::archive_form`, `PgArchive::append_line`): one transaction per line
+  assigns the line its dense per-group ordinal, gives every mentioned account a stable member
+  number (rewriting `[at:ACCOUNT]` to `[at:N]`) and records each media item's platform
+  reference. `UNIQUE (group_id, message_id)` with `ON CONFLICT DO NOTHING` is the only dedup gate.
+  Notices are archived under a synthetic message id derived from their content (at and above
+  2^52), so redelivery deduplicates them too.
+- **Routing**: the bot's own line goes to the echo board; a recognised command word runs the
+  command on its own task; otherwise a trigger (an @ of the bot, a nickname as a whole jieba
+  token, or a quote of a bot line) submits a run. Mute and block are decided by the supervisor,
+  not here. A filled batch queues the group's extraction job.
+- **Delivery**: `send_group_msg`, correlated by `echo` token, then a wait for the platform's
+  report of the bot's own message (`message_sent`), which is how dice and rock-paper-scissors
+  results become known. A rejected send is returned to the model as an error.
 
-The code deals in five capabilities and never names a vendor outside the providers
-package:
+## 5. The conversation model (`qbot-context`)
 
-| Capability | Used for | Default provider |
+One append-only transcript per run:
+
+```rust
+enum Item { Chat(ChatBatch), Assistant(AssistantTurn), ToolResult(ToolResult),
+            Instruction(Instruction), Meta(Meta), Summary(Summary) }
+struct ToolResult { call_id: CallId, outcome: Outcome, content: Vec<Part> }
+enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
+```
+
+- A tool result appends only if its call is pending; each call gets exactly one result; while
+  calls are pending only their results may be appended. The invariants are checked in the single
+  append path, which loading a stored run replays too.
+- Chat arrives as `Chat` items between turns: the window at trigger time first, then lines that
+  arrived since, including echoes of the run's own sends. Lines carry stable message ids and
+  member numbers; nothing is positional.
+- Blocking never removes context: a blocked member's lines are shown, marked, and the block is
+  enforced at admission.
+- Projection is pure: the visible view of the transcript, lowered by the provider adapter. A
+  `Summary` stands in for a range of chat items (the summary history tier, and the
+  `ContextTooLong` fallback); the originals stay in the transcript. An earlier turn's view never
+  changes, so the provider's prefix cache keeps hitting.
+- Runs are stored as `run` and `run_item` rows as they grow. Startup closes runs left open by a
+  crashed process: pending calls get `Interrupted`, the run ends `interrupted`.
+
+## 6. The agent runtime (`qbot-agent`)
+
+- **Supervisor.** Every trigger (an addressed message or a due task) becomes its own run with its
+  own deadline; runs of one group may overlap. Admission gates, in order: muted group, then a
+  blocked initiator (addressed runs only), then capacity. One bounded queue serves addressed runs
+  and timers; `replies.concurrency` runs call the model at once; queue time counts against
+  `replies.deadline_secs`.
+- **Run loop.** Project, call the model, append, execute the calls, append the results, then the
+  chat that arrived. A turn with no tool call ends the run, except as below. The run also ends on
+  a tool that ends it (`send_message` by default, `stay_silent`), the deadline, `max_turns`, or a
+  model error.
+- **Speaking.** Only `send_message` reaches the group: `{text, end_turn?}` in the chat's own
+  marker syntax (`[reply:ID]` first, `[at:N]`, `[face:N]`; `[dice]`, `[rps]`, `[contact:N]`
+  alone), parsed strictly with an explanation for every mistake. It waits for the echo, so the
+  result shows the message as delivered. Sends per run are bounded by `replies.max_messages`.
+  `stay_silent` makes silence explicit.
+- **Undelivered text.** A turn that ends with text but no tool call wrote something nobody saw.
+  The run appends one note (`prompts/undelivered_note.md`) and asks for one more turn that must
+  call a tool, so a written reply is never lost and narration is never delivered.
+- **Forced tool choice is a provider capability** (`ForcedToolChoice`). DeepSeek's Responses API
+  refuses a forced choice with reasoning on, and refuses a reasoning turn after one without it
+  (measured on the live API, pinned by an ignored live test), so on DeepSeek the forced turn and
+  the rest of that run go without reasoning. OpenAI-style providers declare `Always`.
+- **Executor.** Reads run concurrently, then writes and sends in call order; a refused call gets
+  a typed refusal; every call executes (no deduplication), so the prompt teaches the model not to
+  repeat a write.
+- **Tools** (`Tool` trait): the argument schema is generated from the Rust type (schemars, nested
+  types inlined); descriptions of the tool and its parameters come from `wording.toml` by field
+  path. The tool set is fixed for the whole run, so the cached prefix does not change.
+
+## 7. The prompt (`qbot-prompt`, `qbot-wording`, `qbot-i18n`)
+
+- **Instructions** are minijinja templates in `prompts/*.md` with a closed set of slots per
+  template (a test holds them equal): the reply rules, the guide to reading chat markers, the
+  persona block, the learned group knowledge, the trigger note, picture description, extraction.
+  They are the same for every run of a group, which keeps the prefix cacheable; what varies (the
+  time, the trigger, a task's intent) is a separate trigger note.
+- **Personas** are TOML files: `default.toml`, or `group_<id>.toml` replacing it for one group.
+- **History tiers.** A run sees whole batches counted back from the batch being filled: the newest
+  `history.raw_batches` verbatim, the `history.summary_batches` before them as the summaries of
+  the episodes that cover them (a batch no episode covers yet stays verbatim), nothing older; that
+  is reached through `search_history` and `recall_episodes`. The tiers move a batch at a time.
+- **Group knowledge** enters as an instruction: the group's topic, and at most
+  `FactKnowledge::MAX_TERMS` (40) terms, the most recently confirmed, listed in key order so that
+  confirming a term again does not change the prompt.
+- **Wording** (`qbot-wording`): every short model-facing text (tool and parameter descriptions,
+  results, error explanations, outcome notes, extraction headers and corrections) is a `Text`
+  variant with fixed slots, rendered from `wording.toml`; tests keep the file and the enum in
+  step. Markers the code writes and parses stay in code.
+- **Member-facing text** (`qbot-i18n`) is a typed `Msg` rendered through Fluent catalogs
+  (`locales/en.ftl`, `zh-CN.ftl`, or `<config>/locales/<tag>.ftl`), checked against the schema at
+  startup. The catalog also names the language the bot writes its memory and picture
+  descriptions in (`writing-language`), so one setting, `bot.locale`, decides both.
+
+## 8. Memory
+
+Described in [memory.md](memory.md). In short: the archive is the source of truth; an episode
+summarizes one fixed slice of whole batches and is never rewritten; extraction returns the
+episode and its findings in one validated tool call; consolidation turns findings into names,
+facts and group knowledge; recall ranks episodes by similarity decaying with age; embeddings are
+a derived index the nightly run keeps complete for the configured embedding model.
+
+## 9. Media (`qbot-media`, `qbot-asr`)
+
+- A message with media is archived at once with bare markers; the media service then fills them
+  in place (`[image:a red bicycle]`, `[voice:see you at eight]`, `[voice:unclear]`) by rewriting
+  the stored line. The k-th marker of a kind is addressed by position, counting filled markers,
+  so slots survive out-of-order completion. Bytes exist only in memory.
+- **Pictures**: a description cache keyed by platform file id and by content hash; a size bound
+  (untrusted input); a per-group rate (`media.images_per_minute`, governor) so one busy group
+  cannot use up the capacity of all; single-flight fetching (the message's link, then a fresh link
+  from `get_image`); the vision model (`providers.vision`). A picture that could not be read or was
+  declined is held for ten minutes (a moka TTL cache) instead of being retried on every repost.
+  Descriptions expire after 15 days so a changed vision model takes effect.
+- **Voice**: always `get_record` with a WAV conversion (the stored file holds SILK audio a
+  recognizer answers with silence), transcribed by `qbot-asr` (SenseVoice through sherpa-onnx on
+  the CPU, model loaded and checked at startup); `media.clips_per_minute` per group.
+- **Stickers** (marketplace) are described like pictures and cached under the sticker id. Forwarded
+  pictures are filled only from the cache: no model call for content not posted in the group.
+- **`open_images`** lets the model look at an archived picture itself; the archive keeps each
+  item's platform reference, bytes are fetched again and kept in a 64 MiB in-memory cache. It is
+  offered only when the text model takes images. DeepSeek takes images through its Files API (one
+  upload per picture, reused for its 30-day lifetime); OpenAI-style providers take data URLs.
+- A reply to a message with media waits up to 25 seconds for it, then goes ahead with what there
+  is.
+
+## 10. Scheduling (`qbot-sched`)
+
+- One `timer` table. A `wake` is a group task: at most once, never replayed (a claim open at
+  startup is marked interrupted). A `job` (extract, nightly, decay, backup, cleanup, report) is
+  idempotent: claimed with a lease renewed while it runs, retried with backoff, failed for good
+  after five attempts, each failure logged.
+- **Group tasks** are created by the model or an owner, owned by the group, and bounded where a
+  model could otherwise loop: at least five minutes ahead, at most 50 pending per group, follow-up
+  chains at most 24 deep. Update and cancel apply to pending tasks only.
+- **Recurring schedules** (`maintenance.nightly_cron`, `report_cron`, croner with the bot's time
+  zone) turn each occurrence into a job through one atomic store step, so an occurrence fires once
+  however often the process restarts; one missed while down fires once on startup. The loop fires
+  the occurrence it slept toward even when the timer wakes a moment early.
+- **The scheduler loop** takes one clock reading per tick for claiming and for deciding what comes
+  due next, so a timer due between two readings is not mistaken for a blocked one. A store error
+  is logged and retried; scheduled work never stops silently.
+
+## 11. Providers (`qbot-llm`)
+
+- One `Provider` trait (`respond`, `stream`). A request carries the complete logical conversation
+  (lowered from the transcript view through a renderer), the tools, the tool choice, the
+  reasoning effort and an optional continuation.
+- **Continuation is opaque.** A stateful provider sends only the new tail after verifying the
+  covered prefix is unchanged; a stateless one replays everything. DeepSeek is stateless; an
+  OpenAI-style provider continues from its stored previous response.
+- **Capabilities are typed** (`Realization::{Native, Emulated}`, forced tool choice, image input,
+  cache metrics); an unsupported request fails with `LlmError::Unsupported`.
+- **Reasoning items never leave the adapter**; a turn keeps the provider's raw output to echo back
+  to the same provider.
+- **The output length is the provider's.** No request carries a local output cap: the provider
+  determines the usable range (DeepSeek returned a 44,000-token answer unprompted), and a local
+  cap only adds a way for a long but valid answer to be cut off. A reply is bounded by its
+  deadline; other calls by a per-call deadline (ten minutes for text, two for a picture).
+- **Errors** are one taxonomy (`Auth`, `RateLimited`, `Unavailable`, `Timeout`, `ContextTooLong`,
+  `QuotaExhausted`, `Protocol`, ...). Retries live in the adapter: bounded, transient failures
+  only, before any body arrives, honoring Retry-After. A used-up plan (HTTP 402, Tavily 432/433)
+  is `QuotaExhausted` and never retried.
+- **Embeddings**: an OpenAI-compatible endpoint, split into requests of `max_batch` inputs,
+  vectors normalized and checked for width.
+- **Web search and page reading** (Tavily, the only search vendor): five results a search; a page
+  read as Markdown, either the passages relevant to a question or the whole page cut at 8,000
+  characters, marked as outside text. An optional proxy serves the search client alone.
+- **Fakes**: `FakeProvider` implements the whole contract offline (validation, prefix-cache
+  simulation, recorded requests); `SimServer` is a Responses server for adapter tests.
+
+## 12. Commands (`qbot-commands`)
+
+Commands run without a model call. Each acts on one kind of information, so no command touches
+two stores.
+
+| Command | Who | Acts on |
 | --- | --- | --- |
-| text | Replies, memory extraction, attachment storage for pictures | DeepSeek |
-| vision | One-line picture descriptions for the archive | DeepSeek |
-| asr | Voice transcription | sherpa-onnx with SenseVoice, fixed in-process CPU service |
-| embedding | Vectors for episode recall | DashScope `text-embedding-v4` |
-| search | Web search | Tavily |
-| page reader | Optional readable-page extraction | Tavily, sharing the search runtime |
+| `/who [--linked] [@m]` | member | everything on record: names, notes written by people, facts learned from chat |
+| `/note` `add` `edit N` `remove N` `clear` | member | notes only |
+| `/name` `add` `remove` | member | names |
+| `/forget N`, `/forget group N` | member / owner | learned memory only: a member's fact, group knowledge |
+| `/group` | member | what the bot learned about the group |
+| `/link`, `/unlink`; `/link @a @b`, `/unlink @a` | member; owner | linking accounts |
+| `/stats`, `/top`, `/help` | member | runs, calls and tokens; replies started |
+| `/tasks`, `/members`, `/block [--linked]`, `/mute` | owner | the group's tasks, roster, blocks, mute |
+| `/runs [N]` | owner | the latest runs, or one run's steps |
+| `/logs [n]` | owner | recent warnings and errors (the last 200) |
 
-Lifecycle-bearing capabilities implement the abstract contracts in
-`qqbot/providers/base.py`; narrow collaborators such as attachment storage and page
-reading are protocols. Upper layers receive the `Providers` composition root and never
-see vendor wire objects, response ids or SDK exceptions.
+Replies quote the command, mention the sender, and are split at QQ's 2,000-character message
+limit. Members act on their own (linked) accounts, owners on anyone. A member's name in a reply is
+their current group display name, read live from the platform.
 
-Text and vision use Responses end to end. One task-local `TextSession` owns the ordered
-replay for one addressed message; function results carry exact `call_id` values, and the
-session cannot branch or continue after completion. DeepSeek is stateless, so its codec
-replays the complete sequence locally. Prompt chunks remain independently reconstructible:
-response lineage is never shared across messages, persisted, or attached to a group.
-Reasoning items needed for same-session replay remain inside the provider adapter and are
-excluded from debug files, archives, evidence and structured memory.
+## 13. Configuration
 
-Responses transport, provider codec, pricing and task-local session strategy are composed
-rather than inherited through a vendor class tree. Configuration chooses a closed
-`provider` value; adapters own role mapping, reasoning parameters, cache accounting and
-attachment representation. There is no Chat Completions fallback and no hosted ASR path.
+Typed serde structs with `deny_unknown_fields`, loaded in layers by Figment: the baked-in
+`defaults.toml`, `/etc/qbot/config.toml`, `conf.d/*.toml` in name order, then `QBOT__SECTION__KEY`
+environment variables. Every semantic problem is reported together at startup. Credentials are
+never configuration: a `*_secret` key names a secret read from `NAME_FILE`, `NAME` or
+`/run/secrets/<name>`. `deploy/README.md` documents the layers and the Docker layout.
 
-Each Responses call emits privacy-safe cache telemetry containing only a random run id,
-provider/model, initial-or-continuation phase, replay strategy, stable-prefix hash,
-history count, token counts, estimated flag, charge, latency and status. It never logs
-prompt text, query text, tool output, reasoning content, response id or credential.
+The schema holds only what a deployment may choose:
 
-Price tables live in the backend classes. An unknown model bills at the most expensive
-known tier and logs a warning, so a renamed model trips the budget early rather than
-under-billing.
-
-There is no automatic fallback between backends. A failed call is logged and the reply
-is dropped; being addressed and staying silent gets its own log line so it can be told
-apart from a message that was not addressed at all.
-
-### Platform identifiers
-
-`AccountId`, `GroupId` and `MessageId` are distinct nominal value types throughout
-core records, services, cache keys and repository read models. Ingress and SQL reads
-construct them at the boundary; only protocol and SQL encoding turn them into wire
-values. Identity-account keys and raw-event keys remain UUIDs, not platform identifiers.
-The NoneBot adapter supplies a small `OneBotClient` that wraps the framework bot account
-once and forwards protocol I/O; the core `BotApi` contract never exposes an untyped
-`self_id`. Pyright checks these contracts, with regressions rejecting erased or
-interchanged platform identifiers.
-
-### Runtime ownership
-
-`qqbot/runtime.py` is the process composition root. The plugin loads one immutable
-`ConfigBundle`, then passes it to `Runtime.build()`. The Runtime owns its `Clock`,
-`Database`, budget ledger, providers, member directory, roster cache, registry,
-`GroupDelivery`, media services, command router, one shared `ReplyScheduler`, gateway
-and workers. Settings, prompt catalogs and predicate tables are passed explicitly;
-production code has no `config()` or `prompt_catalog()` service locator. Group policy,
-media cache, reply evidence, archive and identity each have a dedicated repository.
-Repository operations use the owning database's pool getter, not a process-global pool.
-
-The Runtime-local clock controls display timestamps and accounting day boundaries.
-PostgreSQL remains authoritative for job leases, fencing and durable due times. A
-second constructed Runtime cannot change the first one's timezone or close its pool.
-The diagnostic error ring also belongs to the Runtime and uses its clock. It attaches
-to application loggers during startup and detaches after teardown, including partial
-startup failure. Closing an unstarted Runtime cannot detach another Runtime's handler.
-
-`Runtime.start()` acquires the exclusive PostgreSQL session lease before opening the
-pool, checking schema, starting ASR and launching memory work. Loss of the lease
-revokes new side effects and begins shutdown. `Runtime.aclose()` first quiesces
-admission, then cancels and joins owned work. Before closing the database it
-attempts to persist timer receipts; a failed flush is logged and does not prevent
-later resources from closing. Uncertain running tasks are marked interrupted at
-the next exclusive startup rather than replayed. Teardown also closes media,
-caches, providers, the lease and pool, including after partial startup or a
-cancelled startup/shutdown caller. A close failure does not skip later resources.
-
-`plugin.py` adapts NoneBot lifecycle/events to this Runtime. Framework-independent
-scheduled job bodies live in `qqbot/operations/scheduled.py`. CLI entry points load
-their own bundles and clocks, and own their database/provider lifetimes through exit
-stacks. Importing a CLI module does not read deployment configuration or credentials,
-start a database connection, or issue a model request.
-
-Reply roster reads use five bulk queries within one read-only repeatable-read
-transaction. Exact-account extraction identity reads use three such queries, rather
-than querying once for every speaker or mention. Extraction does not collapse linked
-accounts into a reply-holder code, and ambiguous or unconfirmed names do not become
-line-local identity targets. Runtime-owned roster caching is separately bounded by
-entry count, row count, text weight and TTL; a roster too large to cache is returned
-whole rather than silently truncated. The separate provider projection bound rejects
-the whole request if that roster makes the model payload too large.
-
-## Message pipeline
-
-```text
-message or supported notice arrives
- |- normalize to one InboundEvent
- |- parse and load the existing window
- |- append raw_event and required identity writes in one transaction
- |   `ON CONFLICT DO NOTHING RETURNING id` is the sole admission gate
- |- duplicate or archive failure -> stop with no window, media, command or reply effect
- |- admitted -> append to the live window; start picture and voice work
- |- self message or notice? -> done
- |- command?  -> exact first token of the original typed text routes through the
- |                importable command registry and GroupDelivery
- |- trigger?  -> no: done
- |             yes: cut the context slice now and submit one bounded reply request
- |                  to the shared inbox
- |
- |- in the session: mute -> block list -> budget -> bounded media wait
- |- retrieval: member roster (everyone who has appeared, with known facts), group knowledge
- |- prompt assembly
- |- tool loop: send_message sends one message and waits for its admitted self event
- |- model sees the observed result, may send again, then calls finish_reply
- |- self events are archived without dispatching another reply
-```
-
-Every addressed message creates an independent request with its arrival-time window
-and an absolute deadline. One `ReplyScheduler` bounds active plus pending addressed
-replies and due timers, including outstanding claim reservations, under the same
-capacity; waiting requests do not each own an asyncio task. Queueing counts against the same reply deadline. Full or expired requests
-end silently. The timer worker reserves a slot *before* claiming a due database row;
-without capacity it leaves that row pending. Both paths run the same `ReplySession`
-through `ReplyExecutor`, with separate initiator attribution and no message merging.
-
-Group notices (joins, leaves, kicks, recalls, bans, pokes) are transcribed as one marked
-line into the window and the archive. They never trigger a reply.
-
-### Trigger
-
-One rule, no tuning: the bot answers when a message @-mentions it, contains one of its
-nicknames as a whole word, or quotes one of the bot's own lines still in the window.
-Nicknames are matched as jieba tokens with an ASCII boundary check, so a Latin-lettered
-nickname cannot match inside a longer word. A muted group never answers an addressed message. One-shot task wakeups are a separate
-cause for a reply: they still obey the mute and budget gates, but do not invent an
-incoming QQ message or enter the archive.
-
-### Gates
-
-Before reply-model or tool spending, an addressed task checks the daily cap and its
-initiator's current group block status. A blocked account cannot independently trigger
-an ordinary reply, but its messages remain in context; another triggered session may
-refer or respond to them. There is no blocked-recipient send filter or guarantee of
-semantic silence. Group task wakeups have no member initiator or member block gate.
-The mute switch and budget still apply. Other members can use the bot immediately,
-without an acceptance step.
-
-## Reply engine
-
-Each addressed message or due timer owns an independent model session and stop-loss scope.
-Addressed work retains its causing AccountId; group timers have no single-account attribution. A session begins with the arrival-time window, then
-extends its own stable line, member and picture numbers only when it resumes after tools.
-New member messages still trigger their own concurrent tasks. They are additional
-observations in the existing task, not a replacement for its original request.
-
-Every admitted tool call executes, including repeated calls with identical arguments;
-there is no session-level tool deduplication. A repeat query can observe changed state,
-and a repeat mutation has its own effect. The model retains the original request and
-the complete ordered call/result replay so it can track its goal and completed steps.
-Parameter and permission validation, money gates, fuel, payload bounds and delivery
-uncertainty rules still apply; an oversized replay fails rather than silently dropping
-prior progress. Independent sessions can still interleave task mutations, so a final
-listing is a current observation rather than an atomic replacement guarantee.
-
-A model sends **one QQ message per `send_message(content=[...])` call**. The model must
-call `finish_reply({})` to end deliberately; a tool-free model turn ends silently.
-Outbound actions are exclusive in their tool round: if either is requested alongside
-retrieval, scheduling or another send, every call gets a refusal and no side effect.
-The send schema and runtime parser share the same strict Pydantic model. It accepts
-`text`, `at`, `reply`, `face`, `dice`, `rps`, `contact_member` and `contact_group`.
-Numbers resolve against this session's stable prompt-local member and line maps.
-`dice`, `rps` and either contact card must occupy the entire message alone. Historical
-rich cards are readable but not present in the current sending schema. Invalid
-arguments send nothing; bare model text is never sent to the group.
-
-The engine cleans and bounds the message before sending it. `GroupDelivery.deliver_one`
-locks only the OneBot API call within the group, including the specific reply-segment
-refusal fallback; it releases that lock before waiting. A confirmed `message_id` is
-matched against the bot's own `message_sent` event by bot account, group and message ID.
-The gateway first admits that event to PostgreSQL and projects it into the live group
-window; only then can the observer release the model session. The observer caches a
-bounded number of recent projections, so an event that arrives **before** the API ACK
-still matches. No fabricated echo or success is inserted by the send path. `get_msg`
-can supplement a missing random result only after that observation and only if it
-confirms the same sender, group and message ID. Its verified reading backfills the
-archive's derived text (not the original event payload). A missing ACK, uncertain transport
-failure or echo timeout stops the session without a blind resend; late events still
-archive normally. Once observed, the actual displayed text and any random result
-enter the tool result; newly arrived group messages are added after that result in a
-separate lower-trust observation. The bot's own send is numbered but not duplicated
-in that supplemental transcript.
-
-Reply preferences are `conversation.max_messages_per_reply` and
-`conversation.reply_deadline_sec`. Session fuel owns finite model/tool counts, retained
-tool results and attachments; delivery owns the bounded echo wait. The absolute reply
-deadline can end that wait sooner. If retrieval allowance is exhausted before sending,
-a final round can send or end without searching. After an already confirmed send,
-exhaustion ends immediately; it never retracts a visible message. Retrieval evidence
-is attached to the first platform-acknowledged message ID. Timers use the same send
-loop with group mute, budget, deadline and fuel checks. Member blocking gates addressed
-message causes, not group tasks; context remains available to every private session.
-
-### Model payload safety
-
-The provider-neutral projection bound covers a complete next request and its replay:
-up to 2 MiB of weighted text and structure, with 32 bytes charged per traversed node,
-and at most 40,000 nodes. It checks the entire input, tools and returned output as one
-projection, without truncating a roster that made the request too large. Inline image
-bytes are counted separately and remain under the existing media and image-count
-bounds, not the 2 MiB textual bound. These are local payload safety limits, not a
-model-token or context-window limit, nor a guarantee about heap use or SDK parsing.
-
-A request that exceeds the bound before dispatch is rejected without a provider call.
-If a provider has already produced an oversized result, the backend books its actual
-usage when available, otherwise one conservative estimate, before reporting a
-nonretryable overflow failure. It does not drop a potentially charged call from the
-ledger or retry it as if no charge occurred.
-
-### Tools
-
-All the query tools are free in themselves; what costs money is the model round that
-carries them.
-
-| Tool | What it does |
+| Section | Settings |
 | --- | --- |
-| `send_message`, `finish_reply` | Sends one QQ message with an observed result, or ends the session without another send. |
-| `schedule_task`, `list_scheduled_tasks`, `get_scheduled_task`, `update_scheduled_task`, `cancel_scheduled_task` | Group-scoped persistent work. The model autonomously creates, inspects, edits or cancels tasks; scope is supplied by the runtime, never by model arguments. Active lists include pending and running, with explicit paging. Editing and cancellation are pending-only conditional SQL mutations; edit preserves ID and chain. Task operations and sending occupy separate model rounds. |
-| `web_search` | Web search through the configured search backend. Debits the monthly allowance. |
-| `read_url` | The readable text of one page, bounded in characters. Debits the same allowance. |
-| `search_history` | Boolean search over this group's archive. Lucene syntax parsed by luqum: space means AND, `OR`, `-` exclusion, parentheses, quoted phrases. Only the boolean subset is accepted; fields and ranges are refused in words. The query compiles to one parameterised `ILIKE` expression. Narrowable by speaker (a member number, or a display name for someone the prompt shows no number for) and by days. Each hit is returned with surrounding lines, touching windows merged, and the whole answer is bounded in characters with a note when cut. |
-| `recall_events` | Vector search over this group's episodes. Each recalled episode is framed by its neighbours in group time. |
-| `open_images` | Fetches picture originals by their number in the transcript, several per call, and hands them to the model as file blocks. |
+| `bot` | account, owners, nicknames, timezone, locale (also the language the bot writes in) |
+| `gateway` | listen address, access token secret |
+| `database` | host, port, name, user, ssl mode, password secret |
+| `replies` | concurrency, deadline, messages per reply |
+| `history` | batch lines, raw and summary batches |
+| `memory` | slice batches; recall's max distance and half-life; fact half-lives per decay class |
+| `media` | voice transcription on or off; pictures and clips per minute per group |
+| `providers.*` | text (kind, endpoint, model, reasoning), vision, embedding (model, width, batch), search (depth, proxy) |
+| `maintenance` | nightly and report schedules, backups kept, client tools directory, run retention, NapCat cache cleanup |
 
-All model-facing wording lives in one `config/prompts/prompts.yaml` bundle. Tool
-descriptions remain separate logical templates because each maps one-to-one to a
-code-owned schema, and they are generated, validated, loaded and reviewed with the
-rest of the family as one atomic document.
+Derived rather than configured: the reply queue (ten waiting replies per model slot), the
+provider's state mode (from its kind), the writing language (from the locale), the extraction's
+context (one batch on either side of a slice), the directory layout (fixed under the
+configuration and data directories). Everything else is a constant in the crate it governs: the
+`Default` of that crate's settings struct, which tests use and the composition root fills in.
 
-### Output
+## 14. Limits
 
-The text of every send passes `clean_reply`. It strips Markdown that QQ cannot render (emphasis,
-headings, code fences, rules, link syntax) while keeping plain-text lists readable;
-removes every system marker (line numbers, timestamps, provenance, trace lines, quote
-pointers, owner and self tags, member numbers) and any text-form tool-call markup; and finally replaces any
-reserved bracket left over. An `@name` opening the text for an account the message
-already @-s is removed, so the address is not sent twice. The engine truncates to the configured message length
-before sending. The stripper counts what it removed, and the daily report shows the
-counters: every hit is a marker the model wrote and the stripper caught.
+A limit stays only for a concrete reason; anything a provider already rejects with a clear typed
+error is left to that error. The local limits and why they exist:
 
-## Prompt assembly
-
-Prompt wording is a single versioned YAML bundle with a closed code-owned template
-contract (`qqbot/prompting/templates.py`). The only syntax is a declared, one-pass
-`{{ascii_slot}}`; unknown, missing, duplicate and malformed slots fail the entire load.
-Inserted values are never evaluated as templates. Two explicit partials—the transcript
-legend and conversational pragmatics—are shared between reply and extraction. Their declared
-slot sources are injected by `PromptCatalog`; callers provide only dynamic values and cannot
-override a code-owned partial. Every other rule belongs to one complete role template.
-
-The prompt is ordered from most stable to least, so that a provider's prefix cache is
-hit as often as possible:
-
-```text
-constant rules (how to speak, transcript legend, identity, credibility and retrieval, privacy, tone)
--> persona
--> group knowledge
--> member roster: numbered identity and manual notes, then scored unconfirmed hints (stable order)
--> conversation history (append-only chunks)
--> [cache boundary]
--> current time
--> tool results
--> the message being answered
-```
-
-There is no prompt-token trimming budget. Each block renders whole; if the resulting
-request exceeds the local payload bound, the whole request is rejected instead of
-silently cutting the roster. The author of each block (the operator for persona and
-group knowledge, a prompt with its own length discipline for generated text) remains
-responsible for restraint. The history window is counted in messages and evicted a
-whole chunk at a time, so the prefix changes rarely.
-
-Every transcript line carries its send time in a fixed format. The stamp is written
-once at arrival and never rewritten, so it is cache-stable; the current time sits after
-the cache boundary and gives the model a clock to measure gaps against.
-
-### System markers
-
-Every marker the system writes uses one reserved bracket pair, `⟦ ⟧` (U+27E6 and
-U+27E7). Every untrusted string (member text, display names, picture and voice
-descriptions, forwarded and card contents, web and search digests) passes through a
-function that replaces that pair with ASCII square brackets before it can reach a
-rendered line. "Inside `⟦ ⟧` means the system wrote it" is therefore a rule the model
-can apply mechanically: a member whose card imitates the owner tag, or whose message
-types out a picture marker, produces plain text that collides with nothing.
-
-A transcript line opens with its line number and time; any other line is a continuation
-of the previous message, so a multi-line message cannot forge a line start. The same
-grammar is used in the reply history, the extraction transcript and search results.
-
-Markers in use:
-
-| Marker | Meaning |
-| --- | --- |
-| `#N ⟦MM-dd HH:mm⟧` | Line number and send time |
-| `⟦回复 #N⟧` | This message quotes line N |
-| `名字⟦0⟧` | The bot's reserved display identity; never a legal tool target |
-| `名字⟦N⟧`, N > 0 | Prompt-local member/account identity |
-| `⟦拥有者⟧` | The speaker is one of the bot's owners |
-| `⟦图片N:描述⟧`, `⟦语音:转写⟧` | Media, with the archived description or transcript |
-| `⟦转发的聊天记录 N条⟧` | A forwarded record, rendered as an indented block |
-| `⟦检索记录⟧` | Bounded, expiring retrieval context for the historical send immediately following it |
-
-### Member numbers
-
-Two members sharing a display name is ordinary, so every person a reply prompt shows wears
-a member number behind their name (`qqbot/conversation/member_numbers.py`). Zero is reserved for
-the bot's display identity; humans receive positive numbers, while `None` is the only
-absence/unknown sentinel. Zero never resolves through member-targeted tools. In reply
-prompts a positive number belongs to a current account holder, so linked accounts share
-it. Extraction uses a separate exact-account projection: each account receives its own
-batch-local code and every candidate is validated against that precise account. The reply
-roster lists everyone who has appeared in the group, whether or not anything is known
-about them, ordered by first appearance, and is numbered in that order, so a newcomer
-joins at the end and nobody else's number moves. The roster is therefore also where the
-model finds the number of someone who is not in the current conversation. Anybody a
-prompt shows who is not in the roster yet (a first message still being archived) is
-numbered after it. Because the numbers depend on the roster alone, the conversation
-moving never renumbers anything above the history. The same numbering runs through the
-roster, the window, `search_history` results and the tool arguments that name people,
-so the model @-s and filters by the number it read.
-
-Numbers are never stored. The archive and structured evidence hold stable account data or
-names only. A real platform mention of the bot renders as `@name⟦0⟧`; member-typed
-`@我` remains ordinary text. Members' other @-mentions keep their account identity and
-receive the target's prompt-local positive number during projection.
-
-The bot's own messages are rendered in the history as the `send_message` calls that
-requested them (ordered text and control segments). Each is followed by a tool result
-carrying the message's line number and send time; when QQ transformed the request, that
-result also states the platform-visible reading. Unexpired structured evidence, when
-present, is rendered as a separate assistant block immediately before that call. NapCat's
-reported self event is the only source for the live window and archive, so random dice and
-RPS results and other platform transformations are preserved without send-side lookups.
-In the archive, the bot's line reads exactly as the group saw it, `@name` openings
-included, with the @-ed accounts kept as `at` segments so a restart rebuilds the same
-window. Permanent-looking evidence tails are not an archive feature and carry no
-special authority if untrusted text imitates one.
-
-## Pictures and voice
-
-**Pictures are understood on arrival**, when the download link is freshest. Each picture
-is downloaded, uploaded to the text backend's file store, and described in one line by
-the vision backend; the description is written into the archived line. Descriptions
-are the archival form: search, extraction and window rebuild after a restart all read
-text. The description is cached by image content, so a repost costs nothing, and it
-expires by age so that a better model gets to look again; refreshing is lazy, because
-only a picture posted again is ever looked up. A picture the backend's content filter
-declined is cached as a marked placeholder on the same clock.
-
-`MediaCoordinator` owns asynchronous work by admitted raw-event ID. A `MediaTicket`
-tracks `pending`, `retryable` or `final`, the shared task, parsed references, bounded
-reply waits, live-window patching and archive backfill. `ChatMsg` contains only stable
-raw-event identity and typed image references; it owns no tasks. Multiple waiters share
-one task, waiter cancellation does not cancel that task, a timeout leaves it running to
-patch later, and a transient verdict can retry on a later reply. Restart restores image
-references from canonical archive segments but does not create a durable media queue.
-
-No picture is pushed into the prompt. Every picture appears as a numbered description
-line, and the reply model fetches the originals it wants with `open_images`. The
-history therefore stays byte-identical between turns. Uploaded file ids are stamped and
-re-uploaded when older than the configured age.
-
-Forwarded chat records, nested ones included, render as an indented block under the
-message that carries them, bounded in lines, depth and characters. Their pictures are
-numbered with the rest and can be opened, but are not described on their own account.
-
-**Voice is transcribed on arrival** by the in-process backend (sherpa-onnx with
-SenseVoice, two CPU threads, sub-second for a ten-second clip). It costs nothing, so it
-runs even on a day whose budget is exhausted; a per-minute gate stands in as a CPU
-guard. The transcript lands in the archived line like a picture description. There is no
-hosted or API ASR path in the provider registry.
-
-## Memory
-
-### Storage
-
-Twenty-one application tables form the canonical schema:
-
-| Layer | Tables | Holds |
+| Limit | Value | Reason |
 | --- | --- | --- |
-| Archive | `raw_event` | Every event, append-once. Versioned `payload` is the canonical code-owned envelope; its segments preserve the detached platform data. `plain_text` is the derived reading, updated with descriptions and transcripts. |
-| Identity | `entity`, `identity_account`, `alias`, `alias_evidence`, `account_link_challenge` | Account equivalence classes, exact accounts, scoped names with evidence, and durable two-account confirmation. |
-| Facts | `memory_fact`, `memory_fact_evidence`, `memory_candidate` | Temporal exact-account, holder and group facts; evidence; and audited model proposals. |
-| Extraction | `memory_extraction`, `memory_extraction_event` | Durable extraction state, exact ordered event membership, and the immutable staged validation snapshot. |
-| Episodes | `episode`, `episode_event` | Group-scoped summaries backed by every source event and their extraction batch. |
-| Index and queue | `embedding_index`, `memory_job` | Derived vectors and the background job queue. |
-| Operations | `reply_trace`, `cost_ledger`, `group_state`, `group_blocklist`, `image_cache` | Expiring reply evidence, spending, group switches, dynamic block rules, descriptions and file IDs. |
+| Reply deadline, queue, concurrency | configured; 10 per slot | a late reply is worthless; a flood must not fan out into unbounded model calls |
+| `max_turns` | 20 | a model looping on fast tool calls would spend dozens of growing-context calls within the deadline |
+| Messages per reply | configured | a product rule against flooding the group |
+| Task minimum delay, pending, chain depth | 5 min, 50, 24 | stop the model scheduling itself in a loop or filling the table |
+| Extraction attempts | 3 | one bad slice cannot stall a group's extraction |
+| Media per minute per group | configured | resource isolation between groups |
+| Media workers, queue, picture size, clip length | 4, 32, 8 MiB, 300 s | CPU and memory isolation; pictures and clips are untrusted input of any size |
+| Opened-picture cache | 64 MiB | memory bound for bytes fetched on demand |
+| Forwarded lines shown | 30 | an unbounded external input enters every later prompt |
+| `read_url` page | 8,000 characters | a web page is the one tool input with no size of its own |
+| Search results, passages | 5, 3 | enough to answer from, little enough to read |
+| Group terms in the prompt | 40 | the block enters every reply's instructions |
+| Notes per account | 20 | bounds what one member's notes add to a lookup |
+| Name length | 64 characters | a name is a name, not a paragraph |
+| Per-call deadlines | 10 min text, 2 min picture, 30 s embedding, 20 s search | a hung connection must not stall the nightly run |
+| Connect timeout | 10 s | a hung connect is invisible to the provider |
 
-`sql/init.sql` is the sole schema definition and describes a fresh database at the current
-code contract. Existing installations are updated manually under a verified backup.
-Startup and deployment perform a read-only structural check over required tables, columns,
-constraints, retired-table absence and vector width; they never execute DDL.
+Not limited, deliberately: model output length, context size (history is a batch-count policy;
+`ContextTooLong` is the fallback that summarizes the verbatim tier once), tool calls per turn,
+tool result size beyond the inputs above, chat folded into a run between turns, task horizon, and
+spend.
 
-Every table that carries a `group_id` indexes it first, and no retrieval path crosses
-groups. The identity graph (which accounts form one person) is the one deliberately
-global structure.
+## 15. Persistence (`qbot-store`)
 
-### Identity
+- Postgres 17 with pgvector, through sqlx; one schema file (`migrations/0001_schema.sql`), with
+  CHECK constraints for every closed set and cross-column rule. Instants are bigint milliseconds;
+  every group table carries `group_id` and every query filters by it.
+- One adapter per port. The in-memory implementations in the domain crates define the semantics;
+  shared conformance suites (`qbot_memory::conformance`, `qbot_sched::conformance`, ...) run
+  against both.
+- Member numbers are assigned densely under a per-group advisory lock. Episodes cannot overlap
+  (a range exclusion constraint). One active fact per subject, predicate and key (a partial
+  unique index).
+- **Single instance**: the process holds a Postgres advisory-lock session lease and shuts down if
+  it loses it. Commands that write the archive (the cutover import) take the same lease.
+- Database tests need a disposable server in `QBOT_TEST_DATABASE_URL`; each test creates and
+  drops its own database.
 
-An account is the strong identity. `entity` supplies the small account-equivalence class;
-`identity_account.entity_id` is its current membership and `merged_into` preserves root
-history. Automatic person aliases and facts are written against exact account foreign
-keys. Explicit `--all` edits write holder-scoped rows, and aggregate views combine those
-rows with the exact-account rows of the holder's current set.
+## 16. Operations (`qbot-ops`)
 
-`/merge` and confirmed `/link` use one deterministic union primitive. One transaction-level
-advisory lock serializes this deliberately tiny identity topology; each operation then locks
-its exact accounts and current roots before changing membership. Link challenges snapshot
-both root IDs and entity revisions;
-union and detach increment the affected live root revision, so any intervening membership
-change invalidates every stale confirmation even when the same root survives.
-`/split @account` and `/unlink` use one detach primitive that
-moves only that exact account to a fresh holder; every other account stays linked.
-Account-scoped rows therefore follow their account without rewrites, while holder-scoped
-rows remain with their holder. Exact-account and holder block rules are also evaluated
-dynamically, so a later link or split cannot leave expanded block copies behind.
+- **Nightly**: extraction (each group's episodes, after embedding any the current index lacks),
+  decay (name candidates nothing supported for 30 days, picture descriptions older than 15 days,
+  faded facts), a verified backup, cleanup (finished timers after 30 days, finished runs after
+  `maintenance.runs_keep_days`, NapCat's file cache through its `clean_cache` action). Every stage
+  runs; the job fails if any failed.
+- **Backups** shell out to `pg_dump`/`pg_restore`: password through the environment, a partial file
+  verified by listing before an atomic rename, rotation after success, the tools checked at
+  startup.
+- **The daily report** to the owners is a set of typed messages, so it follows the locale.
+- **Usage**: `usage_event` rows per model and tool call of a reply run, with daily views; `/stats`,
+  `/top` and the report read them. Nothing reads them to refuse work.
 
-Aliases retain group/global scope, evidence and status. Confidence is the maximum within
-one evidence channel and a noisy-OR across channels. A platform display name begins as a
-candidate, manual `/alias` evidence is authoritative, and a retired name stays retired
-against automatic evidence.
+## 17. Evaluation (`qbot-eval`)
 
-### Memory visibility and identity authority
+Scenarios in `eval/scenarios/*.toml` (an English description and rubric, chat in any
+language, a trigger, optional notes, facts, group knowledge and canned web results) run through
+the production prompt layer, tools and run loop against the real text model over a simulated
+group. Deterministic checks (sent or silent, tools required or forbidden, members not to mention,
+a normal ending) are followed by an English LLM judge per rubric item; `--repeat N` because model
+output varies. It is run by hand and spends the text model's account. A changed prompt is run
+through it.
 
-Current learned facts and candidate names share one visibility rule: both appear as
-individually typed, scored hints, without a minimum-confidence display gate. Retired,
-closed, retracted, superseded and expired records are excluded. Current platform display
-names, confirmed names and manual notes remain separate reliable context; the current
-live platform display name is not repeated as a candidate hint in the reply roster.
-When the live name cannot be read, a stored candidate display name remains a scored hint;
-only a confirmed platform name may label the roster as a fallback.
+## 18. Decisions that shape the design
 
-A score measures evidence strength within its own type, not calibrated probability.
-Fact scores and alias scores use different formulas; they are not compared against one
-universal cutoff. Even a high-scoring learned fact is still an automatic observation,
-not a manually confirmed statement. Group facts use the same scored hint renderer.
+1. Every trigger starts its own run; runs of one group may overlap. A blocked member's message is
+   archived and shown as marked context but never starts a run.
+2. Manual notes and learned memory stay separate in storage, commands, help and what the model is
+   told: `/note` acts on notes, `/forget` on learned memory, and neither path writes the other.
+3. No contact card for a group; a member's card only for members seen in this group.
+4. No cap on chat folded into a run between turns until real use shows a problem.
+5. Evaluation is written in English; test conversations may be in Chinese.
+6. Speech recognition runs in the process.
+7. The archive is the source of truth. Derived memory survives a change of extraction model; only
+   an incompatible embedding model or width calls for re-embedding, which the nightly run does.
 
-Candidate names are visible for understanding and text search, not for resolving identity
-or addressing a member. Only confirmed live aliases enter lookup and the extraction
-snapshot's name-based account targets. In extraction, candidate names appear in known
-context rather than the account roster; holder hints are labelled as shared, and another
-linked account's exact aliases are not copied onto the current account. Neither reading
-a hint nor repeating it as the bot creates evidence. A fresh member-authored reuse of
-an exact-account candidate can add evidence across batches only when that same line
-independently identifies the exact account; stored candidate context is not evidence.
-Tool argument validation checks the
-selected numeric target, not the model's reason for selecting it; reply prompts enforce
-the distinction, while extraction also enforces line-local source/target validation.
+## 19. Known gaps
 
-### Facts
-
-A fact has exactly one subject: an exact account or an entity (a holder or the group).
-It also has a predicate from a closed set, object, validity window, confidence and exact
-evidence events. Predicates are defined in `config/predicates.yaml` with their Chinese
-rendering, cardinality, decay class and the rule shown to the extraction model. A
-single-valued predicate closes the previous value within the same subject scope when a
-new one arrives; multi-valued values stand side by side. Partial unique indexes enforce
-one current row per subject, predicate and object key.
-
-Confidence is a Wilson lower bound over distinct source events, so one mention earns
-about 0.27, three about 0.53 and eight about 0.75. Re-confirmation accumulates evidence
-in place. Facts decay by predicate class with half-lives of 90, 30 or 14 days, one
-half-life per supporting event, so what a group repeats stays and a passing remark
-fades. A decayed fact is expired, never physically deleted; the archive is never
-deleted at all.
-
-Episodes remain available to `recall_events` for `memory.episode_ttl_days` from the
-conversation time. Nightly decay marks them expired while retaining extraction and exact
-source-event provenance. Their embedding rows are derived projections rather than
-evidence, so decay deletes them across model versions; an expired episode cannot be
-returned or re-embedded.
-
-### Extraction
-
-Nightly maintenance queues extraction. Each claimed job processes one exact batch,
-oldest first, with a code-owned limit of 120 events and a 30-minute gap policy.
-Successful work queues a continuation when unconsumed events remain; small final
-batches are not held behind a configurable drain floor. Failed and budget-deferred
-work retains durable state, so there is no promise that all memory is at most a day old.
-Each exact batch has six durable model-attempt reservations across replacement jobs.
-Cancelled or crashed attempts are not refunded. Exhausted batches retain their event
-links and become terminal rather than repackaging the same events into a fresh budget.
-
-Before any provider call, a short transaction reserves the exact ordered raw-event IDs
-in `memory_extraction_event`. A per-group session advisory lock allows only one worker to
-pay for an extracting batch at a time without keeping a transaction open across the
-provider call. Events that arrive after reservation belong to a later batch, even when
-the timestamps tie. If a worker fails, the next worker opens the same durable event set.
-
-One model call reads one chunk, known structured memory for deduplication, standing group
-knowledge, and the bot's names. Every rendered line receives a batch-local source ordinal.
-The immutable version-2 snapshot binds that ordinal to the raw event, timestamp, exact
-author account, eligible member-authored span and line-local account resolutions.
-
-Only top-level member text, structured mentions and top-level voice transcripts are
-eligible evidence. Bot output, notices, forwarded text, cards and generated media
-descriptions remain visible as context but cannot validate a quote. A person target must
-be the source author, a structured mention, or an account uniquely resolved by a
-confirmed name or alias literally present on that line. This permits facts about a
-clearly named non-speaker without exposing the complete group directory to the model.
-
-The model may only propose through structured calls. Every candidate supplies an explicit
-source ordinal and verbatim quote; an episode supplies one or more independent
-`source + quote` pairs and no model-generated identity list. The pure validator binds each
-quote to the eligible span of its exact source event and binds each person candidate to
-an allowed exact account before any projection begins. Known memory, notes and standing
-knowledge aid interpretation and deduplication but can never become fresh evidence. The
-worker checkpoints the snapshot and every candidate, including an empty set, before
-projection begins.
-
-An extraction moves through `extracting`, `staged`, and `applied`. Applying a staged
-checkpoint locks it and commits candidate audit, aliases, facts and evidence, group
-facts, episodes and provenance, required EMBED jobs, and the final `applied` state in one
-transaction. A database failure rolls the entire projection back; restart retries the
-staged checkpoint without another extraction call. The only unavoidable duplicate-call
-window is a process failure after the provider returns but before the staged checkpoint
-commits, because the provider offers no idempotency key.
-
-### Reply evidence
-
-Each reply's retrieval work becomes a versioned `EvidenceMemo`: a closed source kind,
-a bounded sanitized request summary, verified/unconfirmed outcome, bounded defanged
-digest, and explicit creation/expiry times. It contains no provider response, reasoning,
-response id, prompt-local member number or full page. `reply_trace` stores only the
-structured memo and mandatory expiry; there is no prose or compatibility payload.
-
-Prompt assembly renders unexpired evidence immediately before the send call it supported.
-The memo is working context for nearby follow-ups, not group memory: it is absent from
-`raw_event`, search and extraction, and the nightly pipeline deletes expired rows.
-
-## Budget
-
-Two monetary levels, both in `qqbot/services/budget.py`:
-
-- **The day.** `budget.daily_cny_cap` is a total over every group against one shared
-  ledger. Paid admission checks already-accounted spend before each provider attempt;
-  at the cap replies end and workers defer paid work until the
-  date rolls over in the configured timezone. The running total is restored from
-  `cost_ledger` on restart.
-- **The reply.** `budget.per_reply_cny` covers work started by the reply, including
-  media understanding and the tool loop; each backend books its priced spend into
-  that scope. The check reads money already spent rather than demanding
-  strict prepayment for a predicted call. A completed call can therefore cross a cap;
-  reaching it prevents another paid request, not an extra paid closing round.
-
-The monthly search allowance (`backends.search.monthly_quota`) is metered from the ledger's
-calendar-month call count in the vendor's own unit; an advanced-depth search books two,
-and page reads debit the same pool. Both caps are global settings.
-
-Attribution is task-local and feeds `/top` only. A reply's entire spend, including the
-transcriptions, picture looks and searches it forces, is booked to the member who
-addressed the bot. A picture's archival description is booked to whoever posted it.
-Extraction and other communal spend stays unattributed.
-
-In-process speech transcription bypasses the paid-spend gate: it can run on an
-exhausted day and is booked to the ledger at zero. It is not unbounded: CPU and media
-admission limits still apply. Reply sessions also have finite fuel, deadlines and
-payload bounds, including when their model backend is free.
-
-## Concurrency
-
-Every addressed message owns an independent work item. One finite inbox bounds
-active plus waiting addressed replies *and* due timers using
-`runtime.reply_capacity`; queued work does not create a task per waiter, and timers
-reserve capacity before claiming a row. Full or expired requests end silently. A
-provider semaphore (`backends.text.max_concurrency`) bounds concurrent model calls.
-A per-group delivery lock covers each protocol send but never the wait for its self
-echo, so other replies can proceed while one observes its own result.
-Self-observation archives messages independently when NapCat reports them. Background
-work rides the database job queue (`FOR UPDATE SKIP LOCKED`, leases, and a partial
-unique index that keeps one pending job per type and group). Exact extraction
-membership and the per-group provider slot prevent twin workers from paying for one
-batch together.
-
-## Scheduled jobs
-
-| Schedule | Job |
-| --- | --- |
-| `maintenance.nightly_cron` (02:30) | One pipeline in dependency order: memory extraction, memory decay, `pg_dump`, NapCat media cache cleanup. Each wait tracks only that stage's jobs; independent embedding backlog does not delay decay or backup. |
-| `maintenance.report_cron` (00:00) | The daily report to the owners: spend by kind and model, cache hit rates, picture cache, search allowance, job backlog, new and muted groups, backup age, error digest, output-stripper counters. |
-| resident | The job-queue worker, including lease reclaim. |
-| resident | The model-created timer worker polls due PostgreSQL rows only while OneBot is connected. It reserves the shared reply inbox first, then atomically claims a due task once and runs the common `ReplySession` against a fresh group window. |
-
-A restart in the middle of the nightly pipeline skips that night's remaining stages;
-decay catches up the next night, and a missed dump shows up in the report's backup-age
-line.
-
-Model-created timers persist across restarts in a separate `scheduled_task` table;
-`memory_job` cannot hold them because it deduplicates pending work by type and group.
-A due timer loads the latest archived messages even after a restart and rechecks the
-current group mute and shared daily budget before generation. Its original short intent
-is lower-trust historical input, not a new group message; the model decides anew whether
-to speak, retrieve facts, or create a bounded follow-up. Pending tasks wait for the
-OneBot connection. The worker must reserve inbox capacity before claiming a task;
-without that reservation the task stays pending. Claims are single-attempt: if a process dies after
-claiming a task, it is marked interrupted on restart rather than risking a duplicate
-unsolicited QQ send. Group/day execution counts and chain depth bound automatic
-rechecks. Ordinary replies retain their frozen arrival-time context and the same
-observable single-send contract.
-
-## Configuration model
-
-`config/settings.yaml` is global. `config/personas/default.yaml` is the default persona;
-`config/personas/group_<id>.yaml` may vary only the bot's name, persona prompt and standing
-group context. Persona fields are inherited from the default, settings are not. Both schemas
-are validated with pydantic and unknown keys are rejected. New groups need no configuration.
-
-Prompts are data: every runtime prompt template lives in one versioned
-`config/prompts/prompts.yaml` bundle. A closed contract in
-`qqbot/prompting/templates.py` owns the template keys, roles and exact `{{slot}}` sets.
-The whole catalog is validated as one immutable startup snapshot and rejects missing,
-extra, duplicate or malformed slots before any template becomes active. Marker formats
-that application code produces remain code-owned; their shared explanation has one
-source in the bundle.
-
-## Validation
-
-`python -m pytest` is the supported test entry point; `python -m ruff check .`
-runs separately. Unit tests need no database. DB-backed tests require an explicit
-`QBOT_TEST_DATABASE_URL` and skip when it is absent. Before any mutation, their
-fixture checks the distinct disposable test role, test database and guard marker,
-then owns the pool for that test. Do not run DB-mutating cases concurrently against
-the same database. Neither tests nor imports read private deployment configuration
-or call a paid API; manual evaluation scripts are separate.
-
-## Design decisions
-
-| Decision | Rationale |
-| --- | --- |
-| Speak only when addressed or an explicit timer fires | Incoming chatter alone never causes an unsolicited reply; a previously requested wakeup is a separate, bounded cause. |
-| Structured memory with evidence, no prose profiles | Prose cannot be corrected line by line, cannot carry confidence, and tends to invent. Evidence-based confidence and per-class decay can. |
-| Accounted spend plus finite safety bounds | Monetary caps govern paid admission using spend already booked; session fuel, deadlines, media limits and the model projection bound separately constrain work and payload size. Free work is not unlimited. |
-| A reached cap stops another paid attempt | A completed call may cross the cap because there is no strict price prepayment. The gate checks the ledger before the next provider attempt rather than purchasing a closing round. |
-| Reject an oversized projection whole | A large roster is not silently trimmed. Text and structure have a local safety ceiling distinct from model tokens, with inline image bytes governed by media admission. |
-| Function calls for every structured write | Free-text JSON needs parsing and invites drift; a schema is checked by the platform. |
-| Text as the archival form | Search, extraction and restart rebuild read text; the model fetches pixels only when it wants them. |
-| Media understood on arrival | The link is freshest then, each unique picture is paid for once, and groups the bot never answers in still get a readable archive. |
-| Episodes are pulled, never pushed | A block of related past events pushed next to the incoming message misled reference resolution. The past reaches a reply only through `recall_events`. |
-| Prefix-cache-friendly prompt order | A cache hit costs a small fraction of a miss; ordering, chunked eviction and batched extraction all serve the hit rate. |
-| No fallback, no automatic downgrade | Failover is the least-tested path. A failure stops and is logged. |
-| Search called directly, not the model's built-in search | Built-in search bills twice and inserts content where it breaks the prefix cache. |
-| Exact vector scan, no HNSW index | The embedding dimension exceeds pgvector's HNSW limit; retrieval filters by group first, so an exact scan over a few hundred rows is both accurate and fast. |
-| Reserved bracket grammar for markers | Makes system markers unforgeable by construction instead of asking the model in prose not to be fooled. |
+- NapCat delivers marketplace stickers as `image` segments carrying an `emoji_id`; they are
+  rendered and described as pictures rather than stickers.
+- A contact card the bot sends echoes back as `[unsupported:contact]`.
+- Extraction and picture-description calls are not recorded in `usage_event`.
+- Why an extraction answer needs a second attempt (about three in ten on real chat, mostly
+  findings sent back for correction) is not logged per attempt.
+- `open_images` cannot open pictures inside forwarded records whose content was not delivered.
+- History search scans the group's lines; a `pg_trgm` index is the step if archives grow large.
+- OpenAI-style providers are covered by the simulated server, not by a live test.

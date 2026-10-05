@@ -1,42 +1,20 @@
-# Runtime data (Postgres / NapCat / model weights)
-data/
-logs/
-backups/
-# Local inference weights (scripts/fetch_asr_model.sh); mounted, never shipped
-models/
+# Build output.
+/target
 
-# Secrets: only commit .example files
+# Deployment: real configuration, secrets and runtime data stay out of Git; only the examples
+# and the secrets README are committed.
+deploy/config/config.toml
+deploy/config/conf.d/*.toml
+deploy/config/personas/*.toml
+deploy/config/locales/*.ftl
+deploy/secrets/*
+!deploy/secrets/README.md
+deploy/data/*
+!deploy/data/.gitkeep
+deploy/.env
 
-# Local configuration: real owners and real group personas are not committed;
-# only .example files are committed.
-# (deploy.sh packages workspace files, so untracked local configuration will
-# still be included in deployments as usual)
-config/settings.yaml
-config/*.migrating-*
-config/personas/*.yaml
+# Reply-quality evaluation reports.
+eval/results/
 
-# Python
-__pycache__/
-*.py[cod]
-.venv/
-venv/
-*.egg-info/
-.pytest_cache/
-.hypothesis/
-.mypy_cache/
-
-# Local environment overrides
-.env
-
-# Rust deployment: real configuration, secrets and runtime data stay out of Git.
-rust/deploy/config/config.toml
-rust/deploy/config/conf.d/*.toml
-rust/deploy/config/personas/*.toml
-rust/deploy/config/locales/*.ftl
-rust/deploy/secrets/*
-!rust/deploy/secrets/README.md
-rust/deploy/data/*
-!rust/deploy/data/.gitkeep
-rust/deploy/.env
-# Reply-quality evaluation reports (generated).
-rust/eval/results/
+# Local tool state.
+.claude/

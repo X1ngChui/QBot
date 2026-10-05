@@ -1,20 +1,6 @@
-# The server-side build context is the whole deploy directory, which also holds the
-# database files, the napcat media cache, logs and backups. BuildKit only transfers
-# COPYd paths, but that is builder behaviour, not a guarantee: under the classic
-# builder the context is tarred whole - gigabytes per deploy, and root-owned data/pg
-# fails the build outright on permissions.
-data/
-logs/
-backups/
-models/
-.git/
-.env
-secrets/
-__pycache__/
-*.pyc
-# Not image content either: config/ is bind-mounted, the rest is workstation-only.
-config/
-tests/
-docs/
-.venv/
-requirements-dev.txt
+target
+deploy/data
+deploy/secrets
+deploy/config/config.toml
+deploy/.env
+**/.git
