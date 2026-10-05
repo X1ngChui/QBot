@@ -268,7 +268,14 @@ pub struct Memory {
     pub next_context_batches: u32,
     pub extraction: Extraction,
     pub recall: Recall,
+    pub knowledge: KnowledgeSettings,
     pub facts: Facts,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KnowledgeSettings {
+    pub max_terms: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -283,6 +290,7 @@ pub struct Extraction {
 pub struct Recall {
     pub limit: usize,
     pub max_distance: f32,
+    pub half_life_days: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

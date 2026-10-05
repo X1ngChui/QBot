@@ -2213,6 +2213,7 @@ dependencies = [
  "qbot-media",
  "qbot-memory",
  "qbot-ops",
+ "qbot-prompt",
  "qbot-sched",
  "qbot-tools",
  "serde",

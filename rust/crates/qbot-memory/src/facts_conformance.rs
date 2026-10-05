@@ -98,12 +98,26 @@ pub async fn run(store: &dyn FactStore, accounts: &[i64]) {
     assert_eq!(
         shown,
         [
-            ("likes", "Cats"),
             ("likes", "dogs"),
+            ("likes", "Cats"),
             ("lives_in", "Shanghai")
         ],
-        "ordered by predicate, then key"
+        "by predicate; within one, the most recently confirmed first"
     );
+    // Confirming an older value again brings it to the front.
+    store
+        .observe(&obs(g, Some(a), "likes", "cats", "cats", 20, 65))
+        .await
+        .unwrap();
+    let likes: Vec<String> = store
+        .current(g, subject(a))
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|f| f.predicate == "likes")
+        .map(|f| f.object)
+        .collect();
+    assert_eq!(likes, ["Cats", "dogs"]);
 
     // An opposite predicate retires its counterpart for the same key, and only that one.
     let mut dislike = obs(g, Some(a), "dislikes", "dogs", "dogs", 6, 90);

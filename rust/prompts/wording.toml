@@ -47,7 +47,7 @@ expect_closing_paren = "a closing )"
 expect_end = "the end of the query (is there a ')' without its '('?)"
 
 [tools.recall_episodes]
-description = "Recall past episodes of this group by meaning, closest first. Each result is a summary; use read_episode with its number to see the actual messages."
+description = "Recall past episodes of this group by meaning, best first: how closely each matches counts most, and older episodes count for less. Each result is a summary; use read_episode with its number to see the actual messages."
 param_question = "What to remember: a question or a description of the event."
 empty_question = "question must not be empty"
 no_matches = "no matching episodes"

@@ -125,6 +125,14 @@ impl EpisodeJobs {
                 .insert(&built.episode, &built.vector, &built.embed_model)
                 .await
                 .map_err(failed)?;
+            tracing::info!(
+                group = group.get(),
+                lines = ?plan.target,
+                attempts = built.attempts,
+                input_tokens = built.usage.input_tokens,
+                output_tokens = built.usage.output_tokens,
+                "episode stored"
+            );
             self.consolidate_pending(group).await?;
             stored += 1;
         }

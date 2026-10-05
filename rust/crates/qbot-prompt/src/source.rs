@@ -33,40 +33,61 @@ pub trait KnowledgeSource: Send + Sync {
 }
 
 /// Group knowledge held as group facts.
-pub struct FactKnowledge(pub Arc<dyn FactStore>);
+pub struct FactKnowledge {
+    facts: Arc<dyn FactStore>,
+    /// Terms shown at most: the block enters every reply's instructions, and a long-lived group
+    /// accumulates far more terms than a prompt should carry.
+    max_terms: usize,
+}
+
+impl FactKnowledge {
+    /// The default for `memory.knowledge.max_terms`.
+    pub const DEFAULT_MAX_TERMS: usize = 40;
+
+    pub fn new(facts: Arc<dyn FactStore>, max_terms: usize) -> Self {
+        Self { facts, max_terms }
+    }
+}
 
 impl std::fmt::Debug for FactKnowledge {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FactKnowledge").finish_non_exhaustive()
+        f.debug_struct("FactKnowledge")
+            .field("max_terms", &self.max_terms)
+            .finish_non_exhaustive()
     }
 }
 
 #[async_trait]
 impl KnowledgeSource for FactKnowledge {
+    /// The topic, then the most recently confirmed terms (up to `max_terms`), listed in key
+    /// order: which terms are shown follows recency, but confirming a shown term again does not
+    /// reorder the block, so the cached prompt prefix survives it.
     async fn knowledge(&self, group: GroupId) -> Result<Vec<Knowledge>, EnvError> {
         let facts = self
-            .0
+            .facts
             .current(group, None)
             .await
             .map_err(|e| EnvError(e.to_string()))?;
-        // The topic first, then terms in key order: the same knowledge always reads the same.
+        // Within a predicate the store lists the most recently confirmed first.
         let mut out: Vec<Knowledge> = facts
             .iter()
-            .filter(|f| f.predicate == GROUP_TOPIC)
+            .find(|f| f.predicate == GROUP_TOPIC)
             .map(|f| Knowledge {
                 term: None,
                 text: f.object.clone(),
             })
+            .into_iter()
             .collect();
-        out.extend(
-            facts
-                .iter()
-                .filter(|f| f.predicate == GROUP_TERM)
-                .map(|f| Knowledge {
-                    term: Some(f.label.clone().unwrap_or_else(|| f.key.clone())),
-                    text: f.object.clone(),
-                }),
-        );
+        let mut terms: Vec<_> = facts
+            .iter()
+            .filter(|f| f.predicate == GROUP_TERM)
+            .take(self.max_terms)
+            .collect();
+        terms.sort_by(|a, b| a.key.cmp(&b.key).then(a.id.cmp(&b.id)));
+        out.extend(terms.into_iter().map(|f| Knowledge {
+            term: Some(f.label.clone().unwrap_or_else(|| f.key.clone())),
+            text: f.object.clone(),
+        }));
         Ok(out)
     }
 }

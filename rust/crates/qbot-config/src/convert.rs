@@ -38,6 +38,10 @@ fn secs(n: u64) -> Duration {
     Duration::from_secs(n)
 }
 
+fn days(n: u64) -> Duration {
+    secs(n.saturating_mul(86_400))
+}
+
 impl Config {
     pub fn paths(&self, layout: &Layout) -> ResolvedPaths {
         ResolvedPaths {
@@ -153,12 +157,12 @@ impl Config {
         RecallParams {
             limit: self.memory.recall.limit,
             max_distance: self.memory.recall.max_distance,
+            half_life: days(u64::from(self.memory.recall.half_life_days)),
         }
     }
 
     pub fn decay_policy(&self) -> qbot_memory::facts::DecayPolicy {
         let f = &self.memory.facts;
-        let days = |n: u64| secs(n.saturating_mul(86_400));
         qbot_memory::facts::DecayPolicy {
             stable: days(f.half_life_days.stable),
             default: days(f.half_life_days.default),
@@ -272,7 +276,6 @@ impl Config {
         zone: jiff::tz::TimeZone,
     ) -> OpsConfig {
         let m = &self.maintenance;
-        let days = |n: u64| secs(n.saturating_mul(86_400));
         OpsConfig {
             backup: self.backup_config(paths, password),
             alias_unused: days(m.alias_unused_days),

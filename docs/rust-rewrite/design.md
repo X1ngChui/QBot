@@ -807,8 +807,10 @@ scan in `qbot-core::marker` (domain syntax no library knows).
 - **Defects the rehearsal found and fixed:**
   - Extraction on real chat failed every slice: the model's reasoning used the whole 2048-token
     output limit, the call was cut off, and the model was told it "did not call" the tool.
-    `memory.extraction.max_output_tokens` is now 8192, and a cut-off answer is its own error
-    naming the setting, not a correction round.
+    `memory.extraction.max_output_tokens` is now 8192. A cut-off answer, or one whose
+    arguments are not JSON, is lost rather than wrong, so the same request is sent again within
+    `max_attempts`. The full rebuild showed that both happen now and then. When every attempt
+    is cut off, the error names the setting.
   - The recurring loop could skip a nightly run: a sleep that ended milliseconds before the
     occurrence fired nothing, and the next reading, just past it, waited for the next day. The
     occurrence slept toward is now fired regardless.
@@ -826,6 +828,31 @@ scan in `qbot-core::marker` (domain syntax no library knows).
     cutover. No group was muted.
   - The full rebuild after the cutover is about 390 extraction calls (one per 90-line slice) on
     the shared DeepSeek account, a few hours of nightly work.
+
+### 4.25 Recency in long-term memory retrieval
+
+When more memory matches than can be offered, newer matches come first, because among similarly
+relevant memories the newer one more likely reflects how things are now. Relevance still decides
+what is a candidate. Every order is total, so it never depends on insertion or scan order.
+
+- `recall_episodes`: the store returns every episode within `memory.recall.max_distance` (below
+  1, so every candidate is similar). `qbot_memory::rank` orders them by one score,
+  `similarity * 0.5^(age / half_life)`, which is `(1 - cosine distance) * exp(-ln 2 / half_life *
+  age)`. Age is counted from the episode's last line, and `memory.recall.half_life_days`
+  defaults to 180; 0 means similarity alone. Then the list is cut to `limit`. There is no age
+  cutoff: an old episode weighs less, never nothing. With the default, 0.7 similarity from ten
+  days ago beats 0.8 from a year ago, but 0.98 from three months ago beats 0.56 from today.
+  Equal scores go to the more recent episode, then the higher id.
+- Group knowledge in the instructions: the topic, plus at most `memory.knowledge.max_terms`
+  terms (default 40). The terms kept are the most recently confirmed. They are listed in key
+  order, so confirming a term that is already shown does not change the cached prompt prefix.
+  Before this, every active term entered every prompt, which a long-lived group outgrows.
+- Member facts (`lookup_member`) are not cut. Within a predicate they are listed most recently
+  confirmed first, then the newest fact (the stores and the tool's merge across linked accounts
+  agree).
+- Unchanged: `search_history` already returns the newest matches first. Names are ordered by
+  confidence. Notes, at most `notes_per_account` of them, are all shown in the order they were
+  written, which the note commands' numbering follows.
 
 ### 4.12 Follow-up work (recorded, not blocking)
 
@@ -981,6 +1008,13 @@ complete; the importer and its rehearsal on a production copy are in place.
    explicitly and record it here.
 
 ### 3. Prepare the production deployment beside the current one
+
+In progress (2026-10-05): `/opt/docker/qbot-rust` on the production host is the compose project
+`qbot-rust` (renamed from `qbot`, which is the Python bot's project on the same host), with its
+own Postgres and the image loaded from a local build (`qbot-rust:latest`). The production
+history is imported and `qbot rebuild-memory` built memory from it ahead of the cutover; the
+cutover import adds only what arrived since. Not connected to NapCat. Still to do: persona,
+voice model, vision and search settings, backups, and NapCat's network path to the Rust bot.
 
 Without connecting it to the live NapCat account:
 

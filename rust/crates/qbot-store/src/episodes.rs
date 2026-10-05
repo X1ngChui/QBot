@@ -288,21 +288,19 @@ impl EpisodeStore for PgEpisodeStore {
         group: GroupId,
         embed_model: &str,
         query: &[f32],
-        limit: usize,
         max_distance: f32,
     ) -> Result<Vec<Hit>, MemoryError> {
         let rows = sqlx::query(&format!(
             "SELECT {EPISODE_COLS}, (m.embedding <=> $3::vector)::real AS distance \
              FROM episode_embedding m JOIN episode e ON e.episode_id = m.episode_id \
              WHERE e.group_id = $1 AND m.model = $2 AND m.dims = $4 AND (m.embedding <=> $3::vector) <= $5 \
-             ORDER BY distance, e.episode_id LIMIT $6"
+             ORDER BY distance, e.episode_id"
         ))
         .bind(group.get())
         .bind(embed_model)
         .bind(vector_text(query))
         .bind(i32::try_from(query.len()).map_err(backend)?)
         .bind(f64::from(max_distance))
-        .bind(i64::try_from(limit).map_err(backend)?)
         .fetch_all(&self.pool)
         .await
         .map_err(backend)?;

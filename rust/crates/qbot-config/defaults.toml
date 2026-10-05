@@ -266,8 +266,17 @@ max_attempts = 3
 
 [memory.recall]
 limit = 5
-# Cosine distance beyond which an episode is not relevant enough to return.
+# Cosine distance beyond which an episode is not relevant enough to be a candidate (below 1).
 max_distance = 0.45
+# Candidates are ranked by similarity times 0.5^(age / half-life), age counted from the
+# episode's end: an older memory weighs less, never nothing, so a strong old match still
+# surfaces. 0 ranks by similarity alone.
+half_life_days = 180
+
+[memory.knowledge]
+# Group terms shown in every reply's instructions at most; the most recently confirmed are kept.
+# The block is part of every prompt, and a long-lived group learns far more terms than that.
+max_terms = 40
 
 [memory.facts]
 # How quickly a fact nobody confirms again is forgotten, by its predicate's decay class: its

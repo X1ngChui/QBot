@@ -433,9 +433,9 @@ impl Config {
             "must be at least 1",
         );
         c.that(
-            m.recall.max_distance > 0.0 && m.recall.max_distance <= 2.0,
+            m.recall.max_distance > 0.0 && m.recall.max_distance < 1.0,
             "memory.recall.max_distance",
-            "must be in (0, 2]",
+            "must be in (0, 1): a candidate must be similar, not unrelated or opposite",
         );
         let half = &m.facts.half_life_days;
         c.that(

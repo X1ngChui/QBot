@@ -319,9 +319,11 @@ impl Runner {
         let recall = Arc::new(Recall::new(
             episodes.clone(),
             Arc::new(FakeEmbedder::new(64)),
+            clock.clone(),
             RecallParams {
                 limit: 5,
                 max_distance: 0.8,
+                ..RecallParams::default()
             },
         ));
         let tools = standard_tools(
@@ -361,7 +363,10 @@ impl Runner {
             },
         )
         .map_err(|e| e.to_string())?
-        .with_knowledge(Arc::new(FactKnowledge(facts.clone())));
+        .with_knowledge(Arc::new(FactKnowledge::new(
+            facts.clone(),
+            FactKnowledge::DEFAULT_MAX_TERMS,
+        )));
         let trigger = match (&scenario.trigger.line, &scenario.trigger.wake) {
             (Some(n), _) => {
                 let line = &lines[n - 1];

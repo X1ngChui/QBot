@@ -40,6 +40,6 @@ pub use identity::{
 pub use identity_store::{IdentityStore, MemoryIdentityStore};
 pub use jobs::EpisodeJobs;
 pub use notes::{MemoryNoteStore, Note, NoteId, NoteStore};
-pub use recall::{Recall, RecallError, RecallParams};
+pub use recall::{Recall, RecallError, RecallParams, rank};
 pub use slice::SliceLine;
 pub use store::{EpisodeStore, MemoryEpisodeStore, MemoryError};

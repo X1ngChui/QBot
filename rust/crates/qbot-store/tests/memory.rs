@@ -321,17 +321,14 @@ async fn pgvector_ranks_by_cosine_distance_in_a_real_exact_scan() {
             .await
             .unwrap();
     }
-    let hits = store
-        .search(g, "m", &[1.0, 0.0, 0.0], 10, 2.0)
-        .await
-        .unwrap();
+    let hits = store.search(g, "m", &[1.0, 0.0, 0.0], 2.0).await.unwrap();
     let distances: Vec<f32> = hits.iter().map(|h| h.distance).collect();
     let expected = [0.0, 1.0 - std::f32::consts::FRAC_1_SQRT_2, 1.0, 2.0];
     for (got, want) in distances.iter().zip(expected) {
         assert!((got - want).abs() < 1e-3, "{distances:?}");
     }
     let near: Vec<_> = store
-        .search(g, "m", &[1.0, 0.0, 0.0], 10, 0.5)
+        .search(g, "m", &[1.0, 0.0, 0.0], 0.5)
         .await
         .unwrap()
         .iter()
@@ -477,9 +474,12 @@ async fn lines_become_episodes_which_recall_finds_and_read_episode_opens() {
     let recall = Arc::new(Recall::new(
         store.clone(),
         embedder.clone(),
+        Arc::new(qbot_core::SystemClock),
         RecallParams {
             limit: 3,
             max_distance: 0.9,
+            // Similarity alone: this checks relevance.
+            half_life: std::time::Duration::ZERO,
         },
     ));
     let hits = recall

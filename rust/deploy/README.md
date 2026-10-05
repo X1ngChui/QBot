@@ -152,5 +152,14 @@ group knowledge are rebuilt by the nightly extraction afterwards.
 
 3. Run the same command without `--dry-run`. A rerun skips what is already archived. A group
    that already has lines the export does not contain is refused.
-4. Start the bot. The next nightly run extracts the imported history; delete `history.jsonl`.
+4. Delete `history.jsonl`. Build memory from the imported history now rather than at the next
+   nightly run (episodes with their embeddings, then the names, facts and group knowledge
+   learned from them; about one model call per 90 lines, a few hours for the whole history):
+
+   ```bash
+   docker compose run -d --no-deps --name qbot-rust-rebuild qbot rebuild-memory
+   docker logs -f qbot-rust-rebuild      # "episode stored" per episode, "group done" per group
+   ```
+
+5. Start the bot.
 

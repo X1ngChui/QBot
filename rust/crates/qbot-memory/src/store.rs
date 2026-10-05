@@ -69,14 +69,14 @@ pub trait EpisodeStore: Send + Sync {
         last_ordinal: u64,
     ) -> Result<Vec<Episode>, MemoryError>;
 
-    /// Nearest episodes of the group by cosine distance, closest first, no farther than
-    /// `max_distance`.
+    /// Every episode of the group no farther than `max_distance` (cosine) from `query`, closest
+    /// first. Which of them are returned to the model, and in what order, is decided by
+    /// [`Recall`](crate::Recall).
     async fn search(
         &self,
         group: GroupId,
         embed_model: &str,
         query: &[f32],
-        limit: usize,
         max_distance: f32,
     ) -> Result<Vec<Hit>, MemoryError>;
 }
@@ -274,7 +274,6 @@ impl EpisodeStore for MemoryEpisodeStore {
         group: GroupId,
         embed_model: &str,
         query: &[f32],
-        limit: usize,
         max_distance: f32,
     ) -> Result<Vec<Hit>, MemoryError> {
         let mut hits: Vec<Hit> = self
@@ -295,7 +294,6 @@ impl EpisodeStore for MemoryEpisodeStore {
                 .total_cmp(&b.distance)
                 .then(a.episode.id.cmp(&b.episode.id))
         });
-        hits.truncate(limit);
         Ok(hits)
     }
 }

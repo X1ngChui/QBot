@@ -135,8 +135,8 @@ pub async fn run(store: &dyn EpisodeStore) {
             .is_empty()
     );
 
-    // Search: closest first, scoped by group and embedding model, bounded by distance and limit.
-    let hits = store.search(g, "m1", &[1.0, 0.0], 10, 2.0).await.unwrap();
+    // Search: every candidate within the distance, closest first, scoped by group and model.
+    let hits = store.search(g, "m1", &[1.0, 0.0], 2.0).await.unwrap();
     let order: Vec<_> = hits
         .iter()
         .map(|h| h.episode.episode.title.as_str())
@@ -144,7 +144,7 @@ pub async fn run(store: &dyn EpisodeStore) {
     assert_eq!(order[0], "deploy");
     assert!(hits[0].distance < 1e-5 && hits.windows(2).all(|w| w[0].distance <= w[1].distance));
     assert_eq!(hits.len(), 4);
-    let near = store.search(g, "m1", &[1.0, 0.0], 10, 0.5).await.unwrap();
+    let near = store.search(g, "m1", &[1.0, 0.0], 0.5).await.unwrap();
     assert_eq!(
         near.iter()
             .map(|h| h.episode.episode.title.as_str())
@@ -152,18 +152,9 @@ pub async fn run(store: &dyn EpisodeStore) {
         ["deploy", "holiday"],
         "0.6*1 -> distance 0.4"
     );
-    assert_eq!(
-        store
-            .search(g, "m1", &[1.0, 0.0], 1, 2.0)
-            .await
-            .unwrap()
-            .len(),
-        1,
-        "limit applies"
-    );
     assert!(
         store
-            .search(g, "other-model", &[1.0, 0.0], 10, 2.0)
+            .search(g, "other-model", &[1.0, 0.0], 2.0)
             .await
             .unwrap()
             .is_empty(),
@@ -171,7 +162,7 @@ pub async fn run(store: &dyn EpisodeStore) {
     );
     assert!(
         store
-            .search(h, "m1", &[0.0, 1.0], 10, 0.1)
+            .search(h, "m1", &[0.0, 1.0], 0.1)
             .await
             .unwrap()
             .is_empty(),
@@ -179,7 +170,7 @@ pub async fn run(store: &dyn EpisodeStore) {
     );
     assert!(
         store
-            .search(g, "m1", &[1.0, 0.0, 0.0], 10, 2.0)
+            .search(g, "m1", &[1.0, 0.0, 0.0], 2.0)
             .await
             .unwrap()
             .is_empty(),

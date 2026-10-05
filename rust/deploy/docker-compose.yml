@@ -19,11 +19,12 @@
 #   ./secrets -> /run/secrets    read-only   one file per secret, named in lower case
 #   ./data/postgres              the database's own volume
 
-name: qbot
+# Distinct from the Python bot's project (`qbot`), so both can live on one host.
+name: qbot-rust
 
 services:
   postgres:
-    image: ${REGISTRY:-docker.io}/pgvector/pgvector:pg17
+    image: ${REGISTRY:-docker.io}/pgvector/pgvector:0.8.5-pg17
     restart: unless-stopped
     environment:
       POSTGRES_DB: qbot

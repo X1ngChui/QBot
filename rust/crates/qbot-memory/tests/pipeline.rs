@@ -8,7 +8,7 @@ use qbot_llm::{ConvItem, Embedder, FakeEmbedder, LlmError, Provider};
 use qbot_memory::extract::{SubmitArgs, validate};
 use qbot_memory::{
     BuildError, BuilderConfig, EpisodeBuilder, EpisodeExtractor, EpisodeJobs, EpisodeStore,
-    ExtractError, ExtractorConfig, METHOD, MemoryEpisodeStore, SliceContext, SliceLine,
+    ExtractError, Extracted, ExtractorConfig, METHOD, MemoryEpisodeStore, SliceContext, SliceLine,
 };
 use serde_json::json;
 
@@ -547,6 +547,60 @@ async fn the_in_memory_store_satisfies_the_episode_store_contract() {
 
 // ----- recall and history composition -----
 
+#[derive(Debug)]
+struct FixedClock(UnixMillis);
+impl qbot_core::Clock for FixedClock {
+    fn now(&self) -> UnixMillis {
+        self.0
+    }
+}
+
+#[tokio::test]
+async fn recall_weighs_the_same_memory_by_its_age_using_the_clock() {
+    use qbot_memory::conformance::{episode, group as g};
+    use qbot_memory::{Recall, RecallParams};
+    const DAY: i64 = 86_400_000;
+    let now = 1_900_000_000_000_i64;
+    let store = Arc::new(MemoryEpisodeStore::new());
+    let embedder = Arc::new(FakeEmbedder::new(256));
+    let model = embedder.info().model.clone();
+    // The same discussion three times: a year ago, last month and last week.
+    for (n, (title, days)) in [("a year ago", 365), ("last week", 7), ("last month", 30)]
+        .into_iter()
+        .enumerate()
+    {
+        let first = n as u64 * 10 + 1;
+        let mut e = episode(g(1), first, first + 9, title);
+        e.summary = "the deploy pipeline failed and was rolled back".into();
+        e.ended = UnixMillis::new(now - days * DAY);
+        let v = embedder
+            .embed(&["deploy\nthe deploy pipeline failed and was rolled back".to_owned()])
+            .await
+            .unwrap()
+            .vectors
+            .remove(0);
+        store.insert(&e, &v, &model).await.unwrap();
+    }
+    let recall = Recall::new(
+        store,
+        embedder,
+        Arc::new(FixedClock(UnixMillis::new(now))),
+        RecallParams {
+            limit: 2,
+            max_distance: 0.9,
+            half_life: std::time::Duration::from_secs(180 * 86_400),
+        },
+    );
+    let titles: Vec<String> = recall
+        .recall(g(1), "why did the deploy pipeline fail")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|h| h.episode.episode.title)
+        .collect();
+    assert_eq!(titles, ["last week", "last month"]);
+}
+
 #[tokio::test]
 async fn recall_finds_the_episode_about_the_question_and_respects_scope_and_distance() {
     use qbot_memory::conformance::{episode, group as g};
@@ -573,9 +627,12 @@ async fn recall_finds_the_episode_about_the_question_and_respects_scope_and_dist
     let recall = Recall::new(
         store.clone(),
         embedder.clone(),
+        Arc::new(qbot_core::SystemClock),
         RecallParams {
             limit: 2,
             max_distance: 0.9,
+            // Similarity alone: this test is about relevance.
+            half_life: std::time::Duration::ZERO,
         },
     );
     let hits = recall
@@ -595,9 +652,11 @@ async fn recall_finds_the_episode_about_the_question_and_respects_scope_and_dist
     let strict = Recall::new(
         store,
         embedder,
+        Arc::new(qbot_core::SystemClock),
         RecallParams {
             limit: 5,
             max_distance: 0.05,
+            half_life: std::time::Duration::ZERO,
         },
     );
     assert!(
@@ -1050,31 +1109,53 @@ async fn a_term_may_be_explained_by_a_line_that_does_not_repeat_it() {
     );
 }
 
-#[tokio::test]
-async fn an_answer_cut_off_at_the_output_limit_is_reported_not_retried() {
-    let cut = Step::Reply(
+fn cut_off() -> Step {
+    Step::Reply(
         FakeReply::new()
             .reasoning("thinking at length")
             .finish(qbot_llm::FinishReason::Length),
-    );
-    let (fake, ex) = extractor(vec![cut]);
+    )
+}
+
+async fn extract_lines(ex: &EpisodeExtractor) -> Result<Extracted, ExtractError> {
     let target = lines(1..=4);
-    let error = ex
-        .extract(
-            &SliceContext {
-                previous: &[],
-                target: &target,
-                next: &[],
-            },
-            "English",
-        )
-        .await
-        .unwrap_err();
+    ex.extract(
+        &SliceContext {
+            previous: &[],
+            target: &target,
+            next: &[],
+        },
+        "English",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_lost_answer_is_asked_for_again_and_a_later_good_one_is_kept() {
+    // Cut off at the output limit, then arguments that are not JSON, then a good answer.
+    let (fake, ex) = extractor(vec![
+        cut_off(),
+        Step::Fail(LlmError::Protocol("arguments are not JSON".into())),
+        answer(good_answer()),
+    ]);
+    let out = extract_lines(&ex).await.unwrap();
+    assert_eq!(out.attempts, 3);
+    assert_eq!(out.title, "Deploy pipeline");
+    let requests = fake.recorded();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[2].conversation.items().len(),
+        requests[0].conversation.items().len(),
+        "a lost answer adds nothing to the exchange: the same request again"
+    );
+}
+
+#[tokio::test]
+async fn an_answer_cut_off_on_every_attempt_names_the_limit() {
+    let (fake, ex) = extractor(vec![cut_off(), cut_off(), cut_off()]);
+    let error = extract_lines(&ex).await.unwrap_err();
     assert!(
-        matches!(
-            error,
-            qbot_memory::extract::ExtractError::CutOff { limit: 8192 }
-        ),
+        matches!(error, ExtractError::CutOff { limit: 8192 }),
         "{error}"
     );
     assert!(
@@ -1083,9 +1164,5 @@ async fn an_answer_cut_off_at_the_output_limit_is_reported_not_retried() {
             .contains("memory.extraction.max_output_tokens"),
         "names the setting"
     );
-    assert_eq!(
-        fake.recorded().len(),
-        1,
-        "asking again would hit the same limit"
-    );
+    assert_eq!(fake.recorded().len(), 3, "every attempt was used");
 }

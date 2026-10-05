@@ -133,7 +133,7 @@ impl BatchFilled for ExtractOnBatch {
     }
 }
 
-fn http_key(name: &str, resolver: &SecretResolver) -> KeySource {
+pub(crate) fn http_key(name: &str, resolver: &SecretResolver) -> KeySource {
     KeySource::Resolver(Arc::new(SecretKey {
         name: name.to_owned(),
         resolver: resolver.clone(),
@@ -283,6 +283,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         let recall = Arc::new(Recall::new(
             episodes.clone(),
             embedder.clone(),
+            clock.clone(),
             config.recall_params(),
         ));
         qbot_tools::add_memory_tools(set, recall, episodes.clone())
@@ -349,7 +350,10 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
             timezone: config.bot.timezone.clone(),
         },
     )?
-    .with_knowledge(Arc::new(qbot_prompt::FactKnowledge(facts.clone())))
+    .with_knowledge(Arc::new(qbot_prompt::FactKnowledge::new(
+        facts.clone(),
+        config.memory.knowledge.max_terms,
+    )))
     .with_episodes(episodes.clone());
     let renderer = Arc::new(PromptRenderer::new(prompt.zone().clone()));
     let deps = Arc::new(RunDeps {

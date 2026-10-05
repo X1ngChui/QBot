@@ -197,6 +197,13 @@ impl EpisodeExtractor {
                     accepted = kept;
                     response
                 }
+                // An answer that came back unreadable (arguments that are not JSON) is lost,
+                // not wrong: the model can do it right on another try.
+                (Err(LlmError::Protocol(detail)), kept) if attempt < self.cfg.max_attempts => {
+                    accepted = kept;
+                    tracing::warn!(attempt, %detail, "extraction answer unreadable; asking again");
+                    continue;
+                }
                 (Err(error), None) => return Err(error.into()),
                 (Err(error), Some(kept)) => {
                     tracing::warn!(%error, "the findings correction failed; keeping the episode");
@@ -209,9 +216,18 @@ impl EpisodeExtractor {
             let response_finish = response.finish.clone();
             let turn = response.turn;
 
-            // An answer cut off at the output limit is lost, and asking again hits the same
-            // limit: that is a setting to raise, not something the model can correct.
+            // An answer cut off at the output limit is lost. How much the model reasons varies
+            // from try to try, so it is asked again; only when every attempt is cut off is the
+            // limit itself the problem, a setting to raise rather than something to correct.
             if calls.is_empty() && response_finish == FinishReason::Length {
+                if attempt < self.cfg.max_attempts {
+                    tracing::warn!(
+                        attempt,
+                        limit = self.cfg.max_output_tokens,
+                        "extraction answer cut off at the output limit; asking again"
+                    );
+                    continue;
+                }
                 return match accepted {
                     Some(kept) => Ok(Extracted { usage, ..kept }),
                     None => Err(ExtractError::CutOff {

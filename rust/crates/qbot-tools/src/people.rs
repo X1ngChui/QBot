@@ -141,7 +141,13 @@ impl Tool for LookupMember {
                     .map_err(unavailable)?,
             );
         }
-        facts.sort_by(|a, b| (&a.predicate, &a.key).cmp(&(&b.predicate, &b.key)));
+        // By predicate; within one, the most recently confirmed first.
+        facts.sort_by(|a, b| {
+            a.predicate
+                .cmp(&b.predicate)
+                .then(b.last_confirmed.cmp(&a.last_confirmed))
+                .then(b.id.cmp(&a.id))
+        });
 
         let mut out = vec![format!("member:{}", args.member)];
         // The platform's current answer comes first and outranks every stored name.

@@ -170,7 +170,7 @@ impl FactStore for PgFactStore {
     ) -> Result<Vec<Fact>, MemoryError> {
         let rows = sqlx::query(&format!(
             "SELECT {COLS} FROM fact WHERE group_id = $1 AND subject_account IS NOT DISTINCT FROM $2 \
-             AND status = 'active' ORDER BY predicate COLLATE \"C\", key COLLATE \"C\""
+             AND status = 'active' ORDER BY predicate COLLATE \"C\", last_confirmed_ms DESC, fact_id DESC"
         ))
         .bind(group.get())
         .bind(subject.map(AccountId::get))

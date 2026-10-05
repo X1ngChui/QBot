@@ -608,6 +608,10 @@ fn the_configuration_defaults_equal_the_defaults_of_the_crates_that_consume_them
         qbot_memory::BuilderConfig::default().language
     );
     assert_eq!(c.recall_params(), qbot_memory::RecallParams::default());
+    assert_eq!(
+        c.memory.knowledge.max_terms,
+        qbot_prompt::FactKnowledge::DEFAULT_MAX_TERMS
+    );
     assert_eq!(c.decay_policy(), qbot_memory::facts::DecayPolicy::default());
     assert_eq!(c.history_window(), qbot_core::HistoryWindow::default());
     let retry = qbot_llm::responses::RetryPolicy::default();

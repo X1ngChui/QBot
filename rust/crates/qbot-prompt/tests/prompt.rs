@@ -327,7 +327,7 @@ async fn learned_group_knowledge_joins_the_stable_instructions() {
             at: UnixMillis::new(0),
         };
     let ctx = context(Personas::single(persona("Bobo", "")))
-        .with_knowledge(Arc::new(qbot_prompt::FactKnowledge(facts.clone())));
+        .with_knowledge(Arc::new(qbot_prompt::FactKnowledge::new(facts.clone(), 40)));
     let trigger = Trigger::Addressed {
         message: MessageId::new(5).unwrap(),
         sender: AccountId::new(1).unwrap(),
@@ -365,6 +365,65 @@ async fn learned_group_knowledge_joins_the_stable_instructions() {
         ctx.open(g, &trigger).await.unwrap().instructions,
         opened.instructions,
         "unchanged knowledge, unchanged prefix"
+    );
+}
+
+#[tokio::test]
+async fn only_the_most_recently_confirmed_terms_are_shown_in_a_stable_order() {
+    use qbot_memory::episode::EpisodeId;
+    use qbot_memory::facts::{FactStore, GROUP_TERM, GROUP_TOPIC, MemoryFactStore, Observation};
+    use qbot_memory::predicates::DecayClass;
+    use qbot_prompt::KnowledgeSource;
+    let g = GroupId::new(901).unwrap();
+    let facts = Arc::new(MemoryFactStore::new());
+    let observe = |predicate: &str, key: &str, text: &str, episode: i64, at: i64| Observation {
+        group: g,
+        subject: None,
+        predicate: predicate.into(),
+        key: key.into(),
+        object: text.into(),
+        label: None,
+        opposite: None,
+        decay: DecayClass::Default,
+        episode: EpisodeId::new(episode),
+        message: MessageId::new(episode).unwrap(),
+        quote: "q".into(),
+        at: UnixMillis::new(at),
+    };
+    // Learned in this order: old "aa", then "zz", then "mm".
+    for (n, (key, at)) in [("aa", 100), ("zz", 200), ("mm", 300)]
+        .into_iter()
+        .enumerate()
+    {
+        facts
+            .observe(&observe(GROUP_TERM, key, key, n as i64 + 1, at))
+            .await
+            .unwrap();
+    }
+    facts
+        .observe(&observe(GROUP_TOPIC, "", "a chess club", 9, 50))
+        .await
+        .unwrap();
+    let source = qbot_prompt::FactKnowledge::new(facts.clone(), 2);
+    let shown = |items: Vec<qbot_prompt::Knowledge>| -> Vec<String> {
+        items
+            .into_iter()
+            .map(|k| k.term.unwrap_or_else(|| "(topic)".into()))
+            .collect()
+    };
+    assert_eq!(
+        shown(source.knowledge(g).await.unwrap()),
+        ["(topic)", "mm", "zz"],
+        "the two most recently confirmed terms, in key order; the old one is left out"
+    );
+    // Confirming the old term again makes it recent: it is shown, the least recent goes.
+    facts
+        .observe(&observe(GROUP_TERM, "aa", "aa", 4, 400))
+        .await
+        .unwrap();
+    assert_eq!(
+        shown(source.knowledge(g).await.unwrap()),
+        ["(topic)", "aa", "mm"]
     );
 }
 

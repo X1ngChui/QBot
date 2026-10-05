@@ -168,7 +168,8 @@ pub trait FactStore: Send + Sync {
     /// for the same key). The same episode never supports a fact twice.
     async fn observe(&self, observation: &Observation) -> Result<FactId, MemoryError>;
 
-    /// Active facts about a subject (`None`: about the group), ordered by predicate then key.
+    /// Active facts about a subject (`None`: about the group), by predicate, and within a
+    /// predicate the most recently confirmed first (then the newest fact).
     async fn current(
         &self,
         group: GroupId,
@@ -313,7 +314,12 @@ impl FactStore for MemoryFactStore {
             .filter(|f| f.status == FactStatus::Active && f.group == group && f.subject == subject)
             .cloned()
             .collect();
-        found.sort_by(|a, b| (&a.predicate, &a.key).cmp(&(&b.predicate, &b.key)));
+        found.sort_by(|a, b| {
+            a.predicate
+                .cmp(&b.predicate)
+                .then(b.last_confirmed.cmp(&a.last_confirmed))
+                .then(b.id.cmp(&a.id))
+        });
         Ok(found)
     }
 
