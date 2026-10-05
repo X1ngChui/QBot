@@ -1,0 +1,21 @@
+[package]
+name = "qbot-asr"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+qbot-media.workspace = true
+async-trait.workspace = true
+hound.workspace = true
+sherpa-onnx.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[lints]
+workspace = true

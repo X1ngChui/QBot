@@ -1,0 +1,53 @@
+[package]
+name = "qbot-app"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "qbot_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "qbot"
+path = "src/main.rs"
+
+[dependencies]
+qbot-config.workspace = true
+qbot-core.workspace = true
+qbot-agent.workspace = true
+qbot-commands.workspace = true
+qbot-gateway.workspace = true
+qbot-i18n.workspace = true
+qbot-llm.workspace = true
+qbot-media.workspace = true
+qbot-asr.workspace = true
+qbot-ops.workspace = true
+serde_json.workspace = true
+qbot-memory.workspace = true
+qbot-prompt.workspace = true
+qbot-sched.workspace = true
+qbot-store.workspace = true
+qbot-tools.workspace = true
+async-trait.workspace = true
+jiff.workspace = true
+mimalloc.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "net", "macros", "time", "sync"] }
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+axum.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio-tungstenite.workspace = true
+
+[lints]
+workspace = true

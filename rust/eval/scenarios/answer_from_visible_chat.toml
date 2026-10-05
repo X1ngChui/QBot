@@ -1,0 +1,28 @@
+description = "A member asks about something said earlier in the visible chat. The answer is right there; the bot should read it from the conversation and attribute it correctly, without searching the web or inventing."
+
+members = [
+  { number = 1, account = 10001, name = "小林" },
+  { number = 2, account = 10002, name = "阿杰" },
+  { number = 3, account = 10003, name = "Mia" },
+]
+
+chat = [
+  { member = 2, text = "周六那家火锅绝了", minutes = 0 },
+  { member = 3, text = "哪家哪家" },
+  { member = 2, text = "春熙路那边的蜀大侠，排了快一个小时" },
+  { member = 3, text = "排这么久值吗" },
+  { member = 2, text = "值，毛肚很新鲜" },
+  { member = 1, text = "我在开会刚看到", minutes = 90 },
+  { member = 1, text = "[at:bot] 刚才阿杰说的那家火锅叫啥来着" },
+]
+
+trigger = { line = 7 }
+
+[expect]
+send = "required"
+tools_forbidden = ["web_search"]
+rubric = [
+  "The reply names the restaurant as 蜀大侠.",
+  "The reply attributes it to 阿杰 or otherwise matches what was said (on Chunxi Road, a long queue), without inventing details.",
+  "The reply is short and in Chinese.",
+]

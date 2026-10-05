@@ -1,0 +1,195 @@
+# What may be recorded about a person. This file is the whole definition of a predicate: the
+# extraction model is offered exactly these names with their rules, the validator accepts exactly
+# these names, and the reply model reads facts by these names.
+#
+#   kind         attribute (stable properties), preference (what they think of things),
+#                relation (who or what they belong to)
+#   cardinality  single: one value at a time; a new value replaces the old one ("moved to X").
+#                multi: values stand side by side, each confirmed or forgotten on its own.
+#   decay        stable | default | fast: how quickly it is forgotten when nothing confirms it
+#                again (the half-lives are configuration: memory.facts.half_life_days).
+#   opposite     recording this retires the named predicate for the same object, and back.
+#   rule         what the extraction model reads: the meaning, then the boundary against the
+#                predicate it would otherwise leak into.
+#
+# A predicate earns a place only if it is checkable (somebody said it, in a sentence that can be
+# quoted), still true next week, distinct from the others, and changes what a reply would say.
+# Deliberately absent: in-jokes and catchphrases; anything inferred rather than said (age,
+# occupation, identity); personality labels; political, religious, medical (other than allergies)
+# or financial facts; phone numbers, e-mail and home addresses.
+
+[lives_in]
+kind = "attribute"
+cardinality = "single"
+decay = "stable"
+rule = "The city or region where they live now, long-term. Short trips and business travel use visited; where they come from uses from_place."
+
+[lived_in]
+kind = "attribute"
+cardinality = "multi"
+decay = "stable"
+rule = "A city or region where they lived for a long time in the past. Their hometown uses from_place, where they live now uses lives_in, trips use visited."
+
+[from_place]
+kind = "attribute"
+cardinality = "single"
+decay = "stable"
+rule = "Where they come from or grew up, not where they live now."
+
+[works_as]
+kind = "attribute"
+cardinality = "single"
+decay = "stable"
+rule = "Their job or role itself (intern, programmer, student), without the employer."
+
+[works_at]
+kind = "attribute"
+cardinality = "single"
+decay = "stable"
+rule = "The name of their employer, without the role."
+
+[studies_at]
+kind = "attribute"
+cardinality = "single"
+decay = "stable"
+rule = "The name of the school they attend now. Schools they finished use graduated_from. Record only a real name, not a description such as 'a top-20 university'."
+
+[graduated_from]
+kind = "attribute"
+cardinality = "multi"
+decay = "stable"
+rule = "The name of a school they graduated from. Current schools use studies_at. A degree level or ranking without a school name is not recorded."
+
+[majors_in]
+kind = "attribute"
+cardinality = "single"
+decay = "stable"
+rule = "Their field of study, without the school."
+
+[birthday]
+kind = "attribute"
+cardinality = "single"
+decay = "stable"
+rule = "A birth date they state for themselves. Never an age, and never a date worked out from an age."
+
+[likes]
+kind = "preference"
+cardinality = "multi"
+decay = "default"
+opposite = "dislikes"
+rule = "Something they like. Something they are actually good at uses good_at."
+
+[dislikes]
+kind = "preference"
+cardinality = "multi"
+decay = "default"
+opposite = "likes"
+rule = "Something they dislike, as an opinion only. Something they refuse to touch or eat uses avoids."
+
+[avoids]
+kind = "preference"
+cardinality = "multi"
+decay = "default"
+rule = "Something they keep away from in practice (does not eat coriander). Mere dislike uses dislikes; fear uses fears; allergies use allergic_to."
+
+[wants]
+kind = "preference"
+cardinality = "multi"
+decay = "fast"
+rule = "Something they said they want to have or do. Something they already do does not count."
+
+[fears]
+kind = "preference"
+cardinality = "multi"
+decay = "stable"
+rule = "Something they are afraid of; the object is the thing itself ('spiders')."
+
+[plays]
+kind = "preference"
+cardinality = "multi"
+decay = "fast"
+rule = "A game they play."
+
+[watches]
+kind = "preference"
+cardinality = "multi"
+decay = "fast"
+rule = "A series or show they are following."
+
+[listens_to]
+kind = "preference"
+cardinality = "multi"
+decay = "default"
+rule = "Music, a band or a podcast they listen to."
+
+[reads]
+kind = "preference"
+cardinality = "multi"
+decay = "default"
+rule = "A book they are reading."
+
+[uses]
+kind = "preference"
+cardinality = "multi"
+decay = "fast"
+rule = "A tool, program or device model they use regularly. Something owned but not used uses owns."
+
+[owns]
+kind = "attribute"
+cardinality = "multi"
+decay = "stable"
+rule = "Something they own. Pets use has_pet, collections use collects, everyday tools and devices use uses."
+
+[collects]
+kind = "attribute"
+cardinality = "multi"
+decay = "default"
+rule = "Something they collect as a series, not a single purchase."
+
+[has_pet]
+kind = "attribute"
+cardinality = "multi"
+decay = "stable"
+rule = "A pet they keep: its kind or its name."
+
+[visited]
+kind = "attribute"
+cardinality = "multi"
+decay = "stable"
+rule = "A place they have been to, including trips and business travel. Where they live uses lives_in; where they used to live uses lived_in."
+
+[handle_on]
+kind = "attribute"
+cardinality = "multi"
+decay = "stable"
+rule = "A public social-media account they gave themselves, written 'Platform: ID'. One per account. Never phone numbers, e-mail or addresses."
+
+[preferred_name]
+kind = "attribute"
+cardinality = "single"
+decay = "stable"
+rule = "A name they explicitly asked to be called. Others using a name for them is a name finding, not this."
+
+[good_at]
+kind = "attribute"
+cardinality = "multi"
+decay = "default"
+rule = "Something they are actually good at. Something they merely like uses likes."
+
+[speaks]
+kind = "attribute"
+cardinality = "multi"
+decay = "stable"
+rule = "A language they speak."
+
+[member_of]
+kind = "relation"
+cardinality = "multi"
+decay = "stable"
+rule = "An organization, club or team they belong to. Employers use works_at, schools studies_at."
+
+[allergic_to]
+kind = "attribute"
+cardinality = "multi"
+decay = "stable"
+rule = "Something they are allergic to. Something they merely do not eat uses avoids."

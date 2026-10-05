@@ -1,0 +1,35 @@
+[package]
+name = "qbot-gateway"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+qbot-core.workspace = true
+qbot-context.workspace = true
+qbot-agent.workspace = true
+qbot-store.workspace = true
+qbot-media.workspace = true
+qbot-memory.workspace = true
+base64.workspace = true
+reqwest.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+futures-util.workspace = true
+jieba-rs.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "rt-multi-thread"] }
+tokio-util = { workspace = true, features = ["rt"] }
+tracing.workspace = true
+
+[dev-dependencies]
+qbot-tools.workspace = true
+qbot-llm.workspace = true
+tokio-tungstenite.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util", "net"] }
+
+[lints]
+workspace = true

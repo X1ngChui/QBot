@@ -1,0 +1,28 @@
+[package]
+name = "qbot-config"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+figment.workspace = true
+jiff.workspace = true
+qbot-core.workspace = true
+qbot-agent.workspace = true
+qbot-sched.workspace = true
+qbot-llm.workspace = true
+qbot-media.workspace = true
+qbot-memory.workspace = true
+qbot-ops.workspace = true
+qbot-tools.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+toml.workspace = true
+figment = { workspace = true, features = ["test"] }
+qbot-llm.workspace = true
+
+[lints]
+workspace = true

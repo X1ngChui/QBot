@@ -1,0 +1,28 @@
+description = "A member asks whether the bot remembers something about them. The bot has learned facts from earlier chat but they are not in the prompt; it should look the member up and answer from what it finds, honestly reflecting how sure it is."
+
+members = [
+  { number = 1, account = 10001, name = "小林" },
+  { number = 2, account = 10002, name = "阿杰" },
+]
+
+chat = [
+  { member = 2, text = "最近想养个宠物" },
+  { member = 1, text = "[at:bot] 你还记得我喜欢什么动物吗" },
+]
+
+trigger = { line = 2 }
+
+facts = [
+  { member = 1, predicate = "likes", object = "猫", episodes = 3 },
+  { member = 1, predicate = "dislikes", object = "蛇" },
+]
+
+[expect]
+send = "required"
+tools_required = ["lookup_member"]
+rubric = [
+  "The bot looked up member 1 (lookup_member) before answering.",
+  "The reply says that 小林 likes cats.",
+  "The reply does not present anything that the lookup did not return as remembered fact.",
+  "The reply is short and in Chinese.",
+]

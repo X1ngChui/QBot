@@ -1,0 +1,79 @@
+# The Rust QBot with its database. Run from this directory:
+#
+#   cp config/config.toml.example config/config.toml      # optional overrides
+#   printf '%s' 'a-strong-password' > secrets/database_password
+#   printf '%s' 'sk-...'            > secrets/text_api_key
+#   printf '%s' 'sk-...'            > secrets/embedding_api_key
+#   printf '%s' 'a-long-random-token' > secrets/onebot_access_token   # NapCat presents this
+#   cp config/personas/default.toml.example config/personas/default.toml
+#   deploy/fetch_asr_model.sh                              # voice model, once (or asr.enabled = false)
+#   docker compose run --rm qbot check-config              # validate before starting
+#   docker compose up -d
+#
+# NapCat connects to ws://qbot:6199/onebot/v11/ws (reverse WebSocket) with that token, so put it
+# on the same compose network or publish the port below.
+#
+# Layout (host -> container):
+#   ./config  -> /etc/qbot       read-only   non-secret settings (config.toml, conf.d/, personas, locales)
+#   ./data/qbot -> /var/lib/qbot read-write  persistent state (models, backups)
+#   ./secrets -> /run/secrets    read-only   one file per secret, named in lower case
+#   ./data/postgres              the database's own volume
+
+name: qbot
+
+services:
+  postgres:
+    image: ${REGISTRY:-docker.io}/pgvector/pgvector:pg17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: qbot
+      POSTGRES_USER: qbot
+      POSTGRES_PASSWORD_FILE: /run/secrets/database_password
+    secrets:
+      - database_password
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U qbot -d qbot"]
+      interval: 10s
+      retries: 5
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "3" }
+
+  qbot:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: ${QBOT_IMAGE:-qbot:local}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["run"]
+    # ports: ["127.0.0.1:6199:6199"]   # only if NapCat runs outside this compose project
+    environment:
+      # Non-secret, deployment-specific overrides use QBOT__SECTION__KEY. Anything that is the
+      # same everywhere belongs in ./config/config.toml instead. Credentials never go here.
+      QBOT__DATABASE__HOST: postgres
+    volumes:
+      - ./config:/etc/qbot:ro
+      - ./data/qbot:/var/lib/qbot
+    secrets:
+      - database_password
+      - text_api_key
+      - embedding_api_key
+      - onebot_access_token
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "3" }
+
+secrets:
+  database_password:
+    file: ./secrets/database_password
+  text_api_key:
+    file: ./secrets/text_api_key
+  embedding_api_key:
+    file: ./secrets/embedding_api_key
+  onebot_access_token:
+    file: ./secrets/onebot_access_token

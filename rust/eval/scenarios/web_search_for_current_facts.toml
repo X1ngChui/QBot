@@ -1,0 +1,25 @@
+description = "A member asks about current information the bot cannot know from memory. It should search the web and answer from the results, without inventing numbers the results do not contain."
+
+members = [
+  { number = 1, account = 10001, name = "小林" },
+]
+
+chat = [
+  { member = 1, text = "[at:bot] 明天杭州会下雨吗，我要不要带伞" },
+]
+
+trigger = { line = 1 }
+
+web = [
+  { title = "杭州天气预报 - 10月6日", url = "https://weather.example.cn/hangzhou", content = "10月6日 杭州 中雨转小雨 气温 16-21°C 东北风3级 降水概率 80%" },
+  { title = "浙江省气象台：今明两天浙北有明显降雨", url = "https://zj.example.cn/news/1", content = "受冷空气影响，6日浙北地区有中到大雨，杭州、湖州等地出行请注意携带雨具。" },
+]
+
+[expect]
+send = "required"
+tools_required = ["web_search"]
+rubric = [
+  "The reply says it will rain in Hangzhou tomorrow and suggests bringing an umbrella.",
+  "Any numbers in the reply (temperature, chance of rain) match the search results; nothing is invented.",
+  "The reply is short and in Chinese, with no links or Markdown unless needed.",
+]

@@ -1,0 +1,27 @@
+description = "A member asks the bot to remind them tomorrow morning. The bot should create one scheduled task at the right time, with an intent that will still make sense when it comes due, and confirm only after the task was actually created."
+
+start = "2026-10-05T21:30:00+08:00"
+
+members = [
+  { number = 1, account = 10001, name = "小林" },
+  { number = 2, account = 10002, name = "阿杰" },
+]
+
+chat = [
+  { member = 2, text = "明天周一了，又要开周会" },
+  { member = 1, text = "啊我周报还没写" },
+  { member = 1, text = "[at:bot] 明天早上九点提醒我交周报" },
+]
+
+trigger = { line = 3 }
+
+[expect]
+send = "required"
+tools_required = ["schedule_task"]
+rubric = [
+  "The bot created exactly one scheduled task (schedule_task succeeded once).",
+  "The task is due on 2026-10-06 at 09:00 in UTC+08:00 (an RFC 3339 run_at of 2026-10-06T09:00:00+08:00, or an equivalent delay).",
+  "The task's intent says what to remind about (the weekly report) and for whom (member:1 or 小林), in words that stay true later: no relative words like 'tomorrow' without a date, and no message ids.",
+  "The bot's confirmation message was sent after the schedule_task call succeeded, and does not claim anything the tool results do not show.",
+  "The confirmation is short and in Chinese.",
+]

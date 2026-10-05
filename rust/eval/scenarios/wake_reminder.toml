@@ -1,0 +1,25 @@
+description = "A scheduled task the bot created last night comes due. The bot wakes with fresh context and should deliver the reminder to the right person, addressing them, without pretending a member just asked."
+
+start = "2026-10-06T08:55:00+08:00"
+
+members = [
+  { number = 1, account = 10001, name = "小林" },
+  { number = 2, account = 10002, name = "阿杰" },
+]
+
+chat = [
+  { member = 2, text = "早" },
+  { member = 2, text = "今天好冷" },
+]
+
+trigger = { wake = "Remind 小林 to hand in the weekly report this morning; they asked for this reminder last night." }
+
+[expect]
+send = "required"
+mentions_forbidden = [2]
+rubric = [
+  "The bot sends a reminder about handing in the weekly report.",
+  "The reminder is addressed to 小林, preferably with an @-mention of member 1.",
+  "The bot does not act as if someone just asked it something, and does not invent details about the report.",
+  "The message is short and in Chinese.",
+]

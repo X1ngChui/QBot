@@ -1,0 +1,78 @@
+# Copy to config.toml (git-ignored). Everything here is optional: the image bakes in complete
+# defaults (see /usr/share/qbot/defaults.toml or `qbot print-defaults`), and any key set here
+# overrides only that key. Use conf.d/*.toml for per-environment drop-ins (applied in file-name
+# order, after this file). Environment variables QBOT__SECTION__KEY win over all files.
+#
+# Credentials do not belong here. A `*_secret` key names a secret; the value comes from the
+# environment or a file in /run/secrets.
+
+[bot]
+# Required: the bot's own QQ account. `check-config` and `run` refuse to start while it is 0.
+account = 10000
+# Owners may use owner-only commands (/tasks, /members, /block, /mute, /merge, /split) and cannot
+# be blocked.
+owners = [10001]
+# Names that address the bot as a whole word, besides an @ and quoting one of its messages.
+nicknames = ["Bobo"]
+timezone = "Asia/Shanghai"
+# en (built in), zh-CN (built in), or a file in the locales directory.
+locale = "en"
+
+[gateway]
+# NapCat's reverse WebSocket URL: ws://qbot:6199/onebot/v11/ws, with the access token below.
+listen = "0.0.0.0:6199"
+
+# Pictures: describe them with a vision model so the bot can read them. The default is DeepSeek
+# (pictures are uploaded through its Files API); for an OpenAI-style model set
+# kind = "openai_responses" with its endpoint and model.
+# Needs secrets/vision_api_key (and a `vision_api_key` entry under `secrets:` in the compose file).
+# [providers.vision]
+# enabled = true
+
+# Web search: the web_search tool, through Tavily. Needs secrets/search_api_key (and a
+# `search_api_key` entry under `secrets:` in the compose file). Set a proxy only if the provider
+# is not reachable directly; it is used by the search client alone.
+# [providers.search]
+# enabled = true
+# proxy = "http://172.17.0.1:7890"
+
+# Voice: transcribed in the process with SenseVoice. Run deploy/fetch_asr_model.sh once, or set
+# enabled = false to leave voice clips as bare markers.
+[asr]
+enabled = true
+
+[media]
+# The language picture descriptions are written in.
+description_language = "English"
+
+[maintenance]
+# Cron expressions (minute hour day month weekday), evaluated in bot.timezone. The nightly run is
+# memory extraction, decay, a verified backup, then cleanup. The report goes to bot.owners.
+nightly_cron = "30 2 * * *"
+report_cron = "0 0 * * *"
+backups_enabled = true
+backup_keep = 14
+
+[runtime]
+# Active plus waiting runs, and how many may call the model at once.
+reply_capacity = 32
+reply_concurrency = 3
+
+[history]
+# Lines per batch, then how many of the newest batches are shown verbatim and how many before
+# them as episode summaries. Older chat is reached only through tools.
+batch_lines = 30
+raw_batches = 4
+summary_batches = 9
+
+[memory]
+language = "English"
+slice_batches = 3
+
+# [providers.text]
+# endpoint = "https://api.deepseek.com"
+# model = "deepseek-flash"
+
+# [database]
+# host = "db.internal.example.com"   # an external server instead of the compose service
+# ssl_mode = "require"

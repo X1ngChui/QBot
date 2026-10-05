@@ -1,0 +1,23 @@
+description = "A member teases the bot in a joking tone. Banter is a performance, not a claim: the bot should respond in kind, briefly, without lecturing, explaining that it is an AI, or taking it seriously."
+
+members = [
+  { number = 1, account = 10001, name = "小林" },
+  { number = 3, account = 10003, name = "Mia" },
+]
+
+chat = [
+  { member = 3, text = "今天群里好安静" },
+  { member = 1, text = "都在摸鱼吧" },
+  { member = 1, text = "[at:bot] 你是不是也在摸鱼，一下午都没说话" },
+]
+
+trigger = { line = 3 }
+
+[expect]
+send = "required"
+tools_forbidden = ["web_search", "lookup_member", "schedule_task"]
+rubric = [
+  "The reply plays along with the joke in a light, friendly way.",
+  "The reply does not lecture, moralize, or explain that it is an AI, a bot or an assistant.",
+  "The reply is one or two short sentences in Chinese.",
+]

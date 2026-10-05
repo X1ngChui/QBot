@@ -1,0 +1,24 @@
+description = "A member @-mentions the bot with a simple practical question in the middle of ordinary chat. A good reply answers correctly, briefly and casually, like a group member typing on a phone."
+
+members = [
+  { number = 1, account = 10001, name = "小林" },
+  { number = 2, account = 10002, name = "阿杰" },
+]
+
+chat = [
+  { member = 2, text = "新冰箱到了，终于不用再塞得满满的了" },
+  { member = 1, text = "恭喜恭喜" },
+  { member = 2, text = "[at:bot] 冷藏室一般调到几度比较合适啊？" },
+]
+
+trigger = { line = 3 }
+
+[expect]
+send = "required"
+tools_forbidden = ["web_search", "schedule_task"]
+rubric = [
+  "The reply gives a correct refrigerator compartment temperature (roughly 2 to 5 degrees Celsius, or a nearby commonly recommended value).",
+  "The reply is written in Chinese.",
+  "The reply is short: at most three sentences, with no headings, bullet lists or Markdown formatting.",
+  "The reply sounds like a casual group member, not a customer-service or encyclopedia answer.",
+]

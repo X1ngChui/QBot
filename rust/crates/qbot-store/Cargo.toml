@@ -1,0 +1,28 @@
+[package]
+name = "qbot-store"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+qbot-core.workspace = true
+qbot-context.workspace = true
+qbot-agent.workspace = true
+qbot-sched.workspace = true
+qbot-llm.workspace = true
+qbot-memory.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+qbot-tools = { path = "../qbot-tools" }
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,26 @@
+[package]
+name = "qbot-ops"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+qbot-core.workspace = true
+qbot-i18n.workspace = true
+qbot-media.workspace = true
+qbot-memory.workspace = true
+qbot-sched.workspace = true
+qbot-store.workspace = true
+async-trait.workspace = true
+jiff.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["process", "fs", "time", "rt"] }
+tracing.workspace = true
+
+[dev-dependencies]
+jiff.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+
+[lints]
+workspace = true

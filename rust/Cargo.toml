@@ -1,0 +1,96 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/qbot-core",
+    "crates/qbot-eval",
+    "crates/qbot-wording",
+    "crates/qbot-context",
+    "crates/qbot-llm",
+    "crates/qbot-agent",
+    "crates/qbot-sched",
+    "crates/qbot-tools",
+    "crates/qbot-memory",
+    "crates/qbot-store",
+    "crates/qbot-config",
+    "crates/qbot-i18n",
+    "crates/qbot-gateway",
+    "crates/qbot-prompt",
+    "crates/qbot-commands",
+    "crates/qbot-media",
+    "crates/qbot-asr",
+    "crates/qbot-ops",
+    "crates/qbot-app",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+
+[workspace.dependencies]
+winnow = "1"
+url = "2"
+png = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+sha2 = "0.10"
+proptest = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "migrate", "macros", "json"] }
+tracing = "0.1"
+mimalloc = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
+time = { version = "0.3", features = ["formatting", "parsing"] }
+qbot-core = { path = "crates/qbot-core" }
+qbot-context = { path = "crates/qbot-context" }
+qbot-llm = { path = "crates/qbot-llm" }
+qbot-wording = { path = "crates/qbot-wording" }
+qbot-agent = { path = "crates/qbot-agent" }
+qbot-sched = { path = "crates/qbot-sched" }
+qbot-store = { path = "crates/qbot-store" }
+qbot-memory = { path = "crates/qbot-memory" }
+qbot-tools = { path = "crates/qbot-tools" }
+qbot-config = { path = "crates/qbot-config" }
+qbot-i18n = { path = "crates/qbot-i18n" }
+qbot-gateway = { path = "crates/qbot-gateway" }
+qbot-prompt = { path = "crates/qbot-prompt" }
+qbot-commands = { path = "crates/qbot-commands" }
+qbot-media = { path = "crates/qbot-media" }
+qbot-asr = { path = "crates/qbot-asr" }
+qbot-ops = { path = "crates/qbot-ops" }
+sherpa-onnx = "1.13"
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-bundle-always"] }
+axum = { version = "0.8", features = ["ws"] }
+jieba-rs = "0.11"
+tokio-tungstenite = "0.30"
+toml = "0.8"
+moka = { version = "0.12", features = ["future"] }
+figment = { version = "0.10", features = ["toml", "env"] }
+croner = "3"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+chrono-tz = "0.10"
+fluent-bundle = "0.16"
+fluent-syntax = "0.12"
+unic-langid = "0.9"
+minijinja = "2"
+humantime = "2"
+hound = "3"
+eventsource-stream = "0.2"
+unicode-normalization = "0.1"
+schemars = "1"
+tokio-util = "0.7"
+async-trait = "0.1"
+base64 = "0.22"
+bytes = "1"
+futures-util = "0.3"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "multipart"] }
+httpdate = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"

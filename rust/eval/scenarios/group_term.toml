@@ -1,0 +1,27 @@
+description = "The group has its own nickname for a place, which the bot has learned. A member uses the term; the bot should understand it from its group knowledge and reply naturally."
+
+members = [
+  { number = 1, account = 10001, name = "小林" },
+  { number = 3, account = 10003, name = "Mia" },
+]
+
+knowledge = [
+  { text = "Friends from the same university who chat about food, pets and weekend plans" },
+  { term = "喵站", text = "the cat cafe by the lake that the group often goes to" },
+]
+
+chat = [
+  { member = 3, text = "周末有人想出去玩吗" },
+  { member = 1, text = "[at:bot] 这周末去喵站你觉得怎么样" },
+]
+
+trigger = { line = 2 }
+
+[expect]
+send = "required"
+tools_forbidden = ["web_search"]
+rubric = [
+  "The reply treats 喵站 as a known place to go (it neither misreads it nor treats it as an unknown word).",
+  "The bot does not ask what 喵站 means.",
+  "The reply is short and in Chinese.",
+]

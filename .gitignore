@@ -27,3 +27,16 @@ venv/
 
 # Local environment overrides
 .env
+
+# Rust deployment: real configuration, secrets and runtime data stay out of Git.
+rust/deploy/config/config.toml
+rust/deploy/config/conf.d/*.toml
+rust/deploy/config/personas/*.toml
+rust/deploy/config/locales/*.ftl
+rust/deploy/secrets/*
+!rust/deploy/secrets/README.md
+rust/deploy/data/*
+!rust/deploy/data/.gitkeep
+rust/deploy/.env
+# Reply-quality evaluation reports (generated).
+rust/eval/results/
