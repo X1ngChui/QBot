@@ -58,6 +58,9 @@ struct Active {
     jobs: usize,
 }
 
+/// How long to wait before trying the timer store again after it failed.
+const STORE_RETRY: Duration = Duration::from_secs(30);
+
 pub struct Scheduler {
     store: Arc<dyn TimerStore>,
     supervisor: Supervisor,
@@ -106,17 +109,31 @@ impl Scheduler {
 
     /// Recover from a previous process, then tick until `shutdown`.
     pub async fn run(&self, shutdown: CancellationToken) {
-        if self.store.recover().await.is_err() {
-            return;
+        while let Err(error) = self.store.recover().await {
+            tracing::error!(%error, "scheduled work could not be recovered; retrying");
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                () = tokio::time::sleep(STORE_RETRY) => {}
+            }
         }
         loop {
             if shutdown.is_cancelled() {
                 break;
             }
-            if self.tick().await.is_err() {
-                break;
+            // One reading for the tick and for what comes due after it: a timer that comes due
+            // between two readings would otherwise look due-but-blocked and wait for a
+            // notification that never comes.
+            let now = self.clock.now();
+            if let Err(error) = self.tick_at(now).await {
+                // The store is unreachable for now: try again shortly rather than stop
+                // scheduled work until a restart.
+                tracing::error!(%error, "scheduled work could not be claimed; retrying");
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(STORE_RETRY) => continue,
+                }
             }
-            let next_due = self.next_future_due().await;
+            let next_due = self.next_future_due(now).await;
             tokio::select! {
                 () = shutdown.cancelled() => break,
                 () = async {
@@ -141,7 +158,10 @@ impl Scheduler {
 
     /// Fire everything that is due and can start now.
     pub async fn tick(&self) -> Result<Tick, crate::store::StoreError> {
-        let now = self.clock.now();
+        self.tick_at(self.clock.now()).await
+    }
+
+    async fn tick_at(&self, now: UnixMillis) -> Result<Tick, crate::store::StoreError> {
         let mut tick = Tick::default();
         loop {
             let Some(reservation) = self.supervisor.reserve() else {
@@ -175,14 +195,13 @@ impl Scheduler {
         Ok(tick)
     }
 
-    /// Time until the next timer that is due in the future. `None` means nothing is scheduled
-    /// ahead, or whatever is due is blocked (no capacity, group busy, job slots full); in both
-    /// cases the loop waits for a notification instead of polling, because every change that
-    /// can unblock work notifies it.
-    async fn next_future_due(&self) -> Option<Duration> {
-        let now = self.clock.now();
+    /// Time until the next timer that came due after the tick at `ticked`. `None` means
+    /// nothing is scheduled, or whatever is due was already due at the tick and is blocked (no
+    /// capacity, group busy, job slots full); the loop then waits for a notification instead of
+    /// polling, because every change that can unblock work notifies it.
+    async fn next_future_due(&self, ticked: UnixMillis) -> Option<Duration> {
         match self.store.next_due().await {
-            Ok(Some(due)) if due > now => Some(due.since(now)),
+            Ok(Some(due)) if due > ticked => Some(due.since(self.clock.now())),
             _ => None,
         }
     }
@@ -278,9 +297,11 @@ impl Scheduler {
                     let _ = store.finish(id, TimerOutcome::JobOk).await;
                 }
                 Err(error) if attempts >= cfg.max_job_attempts => {
+                    tracing::error!(?kind, attempts, error = %error.0, "job failed; giving up");
                     let _ = store.finish(id, TimerOutcome::JobFailed(error.0)).await;
                 }
-                Err(_) => {
+                Err(error) => {
+                    tracing::warn!(?kind, attempts, error = %error.0, "job failed; will retry");
                     let _ = store
                         .retry_job(id, clock.now().plus(backoff(&cfg, attempts)))
                         .await;

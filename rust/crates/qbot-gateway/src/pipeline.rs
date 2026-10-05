@@ -6,7 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use qbot_agent::{Rejected, Supervisor, Trigger, TriggerRequest};
 use qbot_core::{AccountId, GroupId, MessageId, UnixMillis};
-use qbot_media::{Admission, MediaService};
+use qbot_media::{Admission, MediaJob, MediaService};
 use tokio_util::task::TaskTracker;
 
 use qbot_store::MediaRefRow;
@@ -153,30 +153,8 @@ impl Pipeline {
             bot: self.cfg.bot,
             forward_max_lines: self.cfg.forward_max_lines,
         };
-        let text = render::render(&m.segments, &ctx);
-        let job = crate::media::job_for(&m, &ctx);
-        if text.is_empty() {
+        let Some((incoming, job)) = archive_form(&m, &ctx) else {
             return;
-        }
-        let incoming = Incoming {
-            group: m.group,
-            message: m.message,
-            author: (!m.from_bot).then_some(m.sender),
-            at: m.at,
-            text,
-            mentions: render::mentioned(&m.segments, self.cfg.bot),
-            media: job
-                .items
-                .iter()
-                .map(|item| MediaRefRow {
-                    kind: item.kind.marker().to_owned(),
-                    index: u32::try_from(item.index).unwrap_or(u32::MAX),
-                    key: item.reference.key.clone(),
-                    file: item.reference.file.clone(),
-                    url: item.reference.url.clone(),
-                    size: item.reference.size,
-                })
-                .collect(),
         };
         let line = match self.intake.append(incoming).await {
             Ok(Stored::New { line, ordinal }) => {
@@ -328,6 +306,38 @@ impl Pipeline {
             tracing::error!(%error, group = n.group.get(), "archiving a notice failed");
         }
     }
+}
+
+/// What a message is archived as: its line, and the media work it carries (each picture, sticker
+/// and clip with its reference and its position in the line). `None` when the message renders to
+/// nothing.
+pub fn archive_form(m: &GroupMessage, ctx: &RenderContext) -> Option<(Incoming, MediaJob)> {
+    let text = render::render(&m.segments, ctx);
+    if text.is_empty() {
+        return None;
+    }
+    let job = crate::media::job_for(m, ctx);
+    let incoming = Incoming {
+        group: m.group,
+        message: m.message,
+        author: (!m.from_bot).then_some(m.sender),
+        at: m.at,
+        text,
+        mentions: render::mentioned(&m.segments, ctx.bot),
+        media: job
+            .items
+            .iter()
+            .map(|item| MediaRefRow {
+                kind: item.kind.marker().to_owned(),
+                index: u32::try_from(item.index).unwrap_or(u32::MAX),
+                key: item.reference.key.clone(),
+                file: item.reference.file.clone(),
+                url: item.reference.url.clone(),
+                size: item.reference.size,
+            })
+            .collect(),
+    };
+    Some((incoming, job))
 }
 
 async fn submit(supervisor: &Supervisor, request: TriggerRequest) {

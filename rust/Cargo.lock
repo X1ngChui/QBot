@@ -2155,6 +2155,7 @@ dependencies = [
  "qbot-sched",
  "qbot-store",
  "qbot-tools",
+ "serde",
  "serde_json",
  "sqlx",
  "thiserror",
@@ -2421,6 +2422,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]

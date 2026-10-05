@@ -141,7 +141,11 @@ impl Recurring {
 
     /// Fire every occurrence that has come due. Returns how many jobs were created.
     pub async fn fire_due(&self) -> Result<usize, StoreError> {
-        let now = self.clock.now();
+        self.fire_through(self.clock.now()).await
+    }
+
+    /// Fire the latest occurrence at or before `now` of every schedule that has not fired it.
+    async fn fire_through(&self, now: UnixMillis) -> Result<usize, StoreError> {
         let mut created = 0;
         for schedule in &self.schedules {
             let Some(latest) = self.previous(schedule, now) else {
@@ -161,31 +165,54 @@ impl Recurring {
         Ok(created)
     }
 
-    /// The time until the next occurrence of any schedule.
-    pub fn until_next(&self) -> Option<Duration> {
-        let now = self.clock.now();
+    /// The next occurrence of any schedule after `now`.
+    fn next_occurrence(&self, now: UnixMillis) -> Option<UnixMillis> {
         self.schedules
             .iter()
             .filter_map(|s| self.next(s, now))
             .min()
-            .map(|at| at.since(now))
+    }
+
+    /// The time until the next occurrence of any schedule.
+    pub fn until_next(&self) -> Option<Duration> {
+        let now = self.clock.now();
+        self.next_occurrence(now).map(|at| at.since(now))
     }
 
     /// Catch up, then fire each occurrence as it arrives, until `shutdown`.
     pub async fn run(&self, shutdown: CancellationToken) -> Result<(), StoreError> {
-        self.catch_up().await?;
+        // A long sleep is re-evaluated at least hourly, which also absorbs clock changes.
+        const LONGEST: Duration = Duration::from_secs(3600);
+        while let Err(error) = self.catch_up().await {
+            tracing::error!(%error, "recurring schedules could not catch up; retrying");
+            tokio::select! {
+                () = shutdown.cancelled() => return Ok(()),
+                () = tokio::time::sleep(Duration::from_secs(30)) => {}
+            }
+        }
         loop {
-            // A long sleep is re-evaluated at least hourly, which also absorbs clock changes.
-            let wait = self
-                .until_next()
-                .unwrap_or(Duration::from_secs(3600))
-                .min(Duration::from_secs(3600));
+            let now = self.clock.now();
+            let target = self
+                .next_occurrence(now)
+                .filter(|at| at.since(now) <= LONGEST);
+            let wait = target.map_or(LONGEST, |at| at.since(now));
             tokio::select! {
                 () = shutdown.cancelled() => return Ok(()),
                 () = tokio::time::sleep(wait) => {}
             }
-            // The occurrence may be a moment away if the sleep woke early.
-            self.fire_due().await?;
+            // A sleep can end a moment before the occurrence it waited for. That occurrence is
+            // fired regardless: asking the clock again could find it just past and wait a day.
+            let now = self.clock.now();
+            let at = target.map_or(now, |at| now.max(at));
+            // A store that fails is tried again shortly, for the same occurrence: firing is
+            // idempotent, and a schedule must not stop until a restart.
+            while let Err(error) = self.fire_through(at).await {
+                tracing::error!(%error, "a recurring job could not be created; retrying");
+                tokio::select! {
+                    () = shutdown.cancelled() => return Ok(()),
+                    () = tokio::time::sleep(Duration::from_secs(30)) => {}
+                }
+            }
         }
     }
 }

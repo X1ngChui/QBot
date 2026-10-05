@@ -213,6 +213,22 @@ impl PgArchive {
         }))
     }
 
+    /// Every archived message id, by group.
+    pub async fn message_ids(&self) -> Result<Vec<(GroupId, MessageId)>, StoreError> {
+        let rows = sqlx::query("SELECT group_id, message_id FROM chat_line")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|r| {
+                let group = GroupId::new(r.get("group_id"))
+                    .map_err(|e| StoreError::corrupt(e.to_string()))?;
+                let message = MessageId::new(r.get("message_id"))
+                    .map_err(|e| StoreError::corrupt(e.to_string()))?;
+                Ok((group, message))
+            })
+            .collect()
+    }
+
     /// Whether `message` is a line the bot itself sent to `group`.
     pub async fn is_bot_message(
         &self,

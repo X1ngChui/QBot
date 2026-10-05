@@ -774,6 +774,59 @@ scan in `qbot-core::marker` (domain syntax no library knows).
   `providers.text.max_output_tokens`, `providers.search.kind`) and the informational `Limits`
   type; `providers.vision` defaults to DeepSeek. Every remaining setting has a reader.
 
+### 4.24 Chat-history import and the migration rehearsal (step 2)
+
+- **What production holds** (inspected read-only, 2026-10-05): `raw_event.payload` is not the
+  raw OneBot frame but the Python bot's normalized record of it. It keeps the platform's
+  `{type, data}` segments as received (only NUL removed), the sender, `message_id`, `reply_to`,
+  `to_me` and `self_id`; the time is the `occurred_at` column. About 35,000 messages in 11 groups
+  from 2026-08-10, no missing days, including the bot's own sent messages and inline forwarded
+  records (NapCat sends their content). That is enough to rebuild the frames.
+- **What the Python adapter took out** (NoneBot onebot adapter 2.4.6, read from its source): a
+  quote segment moves into `reply_to` (with an @ of the quoted author right after it); a leading
+  (up to two) or trailing @ of the bot is removed and sets `to_me`, as does quoting the bot. From
+  2026-09-18 the Python bot put the @ back before archiving; before that it is missing. Notices
+  were stored only as the Python bot's own text.
+- **The importer** (`qbot import-history FILE [--dry-run]`, `qbot-app/src/import.rs`) reads an
+  export made by `rust/deploy/export_python_history.sql` (read-only, one JSON object per line),
+  rebuilds each message's OneBot frame and runs it through the gateway's own parser and the same
+  `archive_form` the live pipeline uses, then the archive's normal append (whose message-id dedup
+  makes reruns no-ops). It restores the quote from `reply_to`; restores a leading `[at:bot]` only
+  where the export proves one was stripped (`to_me`, no @bot, and the quoted message, if any, is a
+  member's); leaves the 16 undecidable cases (quoting a message not in the export) as stored;
+  fills picture markers with the Python bot's descriptions by file hash (they cannot be rebuilt:
+  nothing is re-fetched); skips notices. The whole export is checked before anything is written;
+  a group that already has lines not in the export is refused (older history would land after
+  them); the bot's database lease is taken, so the import cannot run beside the bot. The quoted
+  author's @ is not restored: nothing records whether it was there.
+- **Rehearsal** against a full copy (2026-10-05): 34,883 messages (5,664 by the bot) in 11 groups,
+  148 notices skipped, 7,561 quotes and 2,552 bot mentions restored, 2,943 of 3,734 pictures
+  described, in about two minutes; a rerun writes nothing; ordinals are dense and in time order,
+  every mention resolved to a member number. The nightly extraction on one imported group (450
+  lines) produced its 5 episodes, facts and a name in Chinese on the first attempt each.
+- **Defects the rehearsal found and fixed:**
+  - Extraction on real chat failed every slice: the model's reasoning used the whole 2048-token
+    output limit, the call was cut off, and the model was told it "did not call" the tool.
+    `memory.extraction.max_output_tokens` is now 8192, and a cut-off answer is its own error
+    naming the setting, not a correction round.
+  - The recurring loop could skip a nightly run: a sleep that ended milliseconds before the
+    occurrence fired nothing, and the next reading, just past it, waited for the next day. The
+    occurrence slept toward is now fired regardless.
+  - The scheduler could strand a timer that came due between its two clock readings (it looked
+    due but blocked and waited for a notification). One reading now serves both.
+  - Scheduled work stopped silently on a store error until restart, and failed job attempts were
+    not logged. Both now log and retry.
+- **Findings not acted on** (none blocks the cutover):
+  - NapCat sends marketplace stickers as `image` segments with `emoji_id` (61 in production), not
+    `mface`; the live gateway renders and describes them as pictures, which works.
+  - A contact card the bot sent echoes back as `[unsupported:contact]` (5 in production).
+  - Extraction and description model calls are not recorded in `usage_event` (only reply runs
+    are).
+  - Python's one active per-account block is not imported; re-apply it with `/block` after the
+    cutover. No group was muted.
+  - The full rebuild after the cutover is about 390 extraction calls (one per 90-line slice) on
+    the shared DeepSeek account, a few hours of nightly work.
+
 ### 4.12 Follow-up work (recorded, not blocking)
 
 - Live verification against OpenAI-style endpoints (DeepSeek, DashScope and Tavily are verified
@@ -906,10 +959,14 @@ rollback if a critical path fails.
 - Configuration pass: done, see 4.23.
 - Prompt rewrite (decision 11): done, see 4.23 (reply prompts, wording out of code, extraction
   prompt), checked with the evaluation harness and the live extraction test.
-- The first CI run, once `rust/` is committed.
+- First CI run: done (2026-10-05, commit 9784e36: fmt, clippy and the full test suite with the
+  database tests).
 - Optional: WAV pad-byte handling for odd-sized chunks.
 
 ### 2. Investigate and prepare the migration (decision 10)
+
+Done (4.24): the history imports cleanly, so there is no fresh start. Items 1 to 3 below are
+complete; the importer and its rehearsal on a production copy are in place.
 
 1. Inspect the production database read-only: whether `raw_event.payload` holds the original
    OneBot event for every group message, including the bot's own sent messages, and how media,

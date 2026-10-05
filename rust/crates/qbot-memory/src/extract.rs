@@ -11,8 +11,8 @@ use std::sync::Arc;
 use qbot_context::{AssistantPart, AssistantTurn};
 use qbot_core::CallId;
 use qbot_llm::{
-    Content, ConvItem, Conversation, LlmError, Message, Params, Provider, ReasoningEffort, Request,
-    Role, ToolChoice, ToolOutput, ToolSpec, ToolStatus, Usage,
+    Content, ConvItem, Conversation, FinishReason, LlmError, Message, Params, Provider,
+    ReasoningEffort, Request, Role, ToolChoice, ToolOutput, ToolSpec, ToolStatus, Usage,
 };
 use qbot_wording::{Text, say};
 use schemars::JsonSchema;
@@ -41,7 +41,7 @@ pub struct ExtractorConfig {
 impl Default for ExtractorConfig {
     fn default() -> Self {
         Self {
-            max_output_tokens: 2048,
+            max_output_tokens: 8192,
             max_attempts: 3,
         }
     }
@@ -94,6 +94,10 @@ pub struct Extracted {
 pub enum ExtractError {
     #[error("model error: {0}")]
     Model(#[from] LlmError),
+    #[error(
+        "the answer was cut off at {limit} output tokens (memory.extraction.max_output_tokens)"
+    )]
+    CutOff { limit: u32 },
     #[error("the model gave no valid answer after {attempts} attempts: {problems:?}")]
     Invalid {
         attempts: u32,
@@ -202,8 +206,19 @@ impl EpisodeExtractor {
             usage += response.usage;
             let model = response.meta.model.clone();
             let calls: Vec<_> = response.calls().cloned().collect();
+            let response_finish = response.finish.clone();
             let turn = response.turn;
 
+            // An answer cut off at the output limit is lost, and asking again hits the same
+            // limit: that is a setting to raise, not something the model can correct.
+            if calls.is_empty() && response_finish == FinishReason::Length {
+                return match accepted {
+                    Some(kept) => Ok(Extracted { usage, ..kept }),
+                    None => Err(ExtractError::CutOff {
+                        limit: self.cfg.max_output_tokens,
+                    }),
+                };
+            }
             let mut feedback: Vec<(CallId, String)> = Vec::new();
             let mut only_findings = false;
             match calls.as_slice() {

@@ -193,3 +193,56 @@ async fn sub_second_clock_readings_name_the_same_occurrence() {
     let jobs = due_jobs(&store, midnight + 1000).await;
     assert_eq!(jobs, [(midnight, JobKind::Report)]);
 }
+
+/// A clock that returns scripted readings in order, then keeps returning the last one.
+#[derive(Debug)]
+struct Scripted(std::sync::Mutex<std::collections::VecDeque<i64>>);
+impl Clock for Scripted {
+    fn now(&self) -> UnixMillis {
+        let mut readings = self.0.lock().unwrap();
+        let reading = if readings.len() > 1 {
+            readings.pop_front().unwrap()
+        } else {
+            readings[0]
+        };
+        UnixMillis::new(reading)
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_sleep_that_ends_just_before_the_occurrence_still_fires_it() {
+    // The timer can end a few milliseconds early; by the next reading the occurrence is just
+    // past. Asking the clock again would then wait for tomorrow and skip tonight.
+    let midnight = chrono_tz::Asia::Shanghai
+        .with_ymd_and_hms(2026, 10, 5, 0, 0, 0)
+        .unwrap()
+        .timestamp_millis();
+    let start = midnight - 60_000;
+    let clock = Arc::new(Scripted(std::sync::Mutex::new(
+        [start, start, midnight - 5, midnight + 10].into(),
+    )));
+    let store = Arc::new(MemoryTimerStore::new());
+    let recurring = Arc::new(
+        Recurring::new(
+            store.clone(),
+            clock,
+            "Asia/Shanghai",
+            vec![Recurrence::new("report", "0 0 * * *", JobKind::Report).unwrap()],
+            Arc::new(Notify::new()),
+        )
+        .unwrap(),
+    );
+    let stop = tokio_util::sync::CancellationToken::new();
+    let task = tokio::spawn({
+        let (recurring, stop) = (recurring.clone(), stop.clone());
+        async move { recurring.run(stop).await }
+    });
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    assert_eq!(
+        due_jobs(&store, midnight + 1).await,
+        [(midnight, JobKind::Report)],
+        "tonight's occurrence fired"
+    );
+    stop.cancel();
+    task.await.unwrap().unwrap();
+}

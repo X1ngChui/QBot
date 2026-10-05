@@ -447,3 +447,45 @@ async fn a_job_longer_than_its_lease_is_not_taken_over_while_it_runs() {
     r.shutdown.cancel();
     handle.await.unwrap();
 }
+
+/// A clock that moves one millisecond forward with every reading.
+#[derive(Debug)]
+struct Stepping(std::sync::atomic::AtomicI64);
+impl qbot_core::Clock for Stepping {
+    fn now(&self) -> qbot_core::UnixMillis {
+        qbot_core::UnixMillis::new(self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_job_that_comes_due_between_two_clock_readings_is_not_stranded() {
+    // The tick reads START and finds nothing due; the job is due at START + 1, which the next
+    // reading already shows. It must count as coming due, not as due-but-blocked.
+    let r = rig(vec![], 4);
+    let id = r
+        .store
+        .insert_job(
+            qbot_core::UnixMillis::new(START + 1),
+            JobKind::Extract,
+            Some(group()),
+        )
+        .await
+        .unwrap()
+        .id;
+    let scheduler = std::sync::Arc::new(qbot_sched::Scheduler::new(
+        r.store.clone(),
+        r.supervisor.clone(),
+        std::sync::Arc::new(Stepping(std::sync::atomic::AtomicI64::new(START))),
+        r.jobs.clone(),
+        SchedulerConfig::default(),
+        std::sync::Arc::new(tokio::sync::Notify::new()),
+    ));
+    let handle = tokio::spawn({
+        let (scheduler, shutdown) = (scheduler.clone(), r.shutdown.clone());
+        async move { scheduler.run(shutdown).await }
+    });
+    sleep(mins(1)).await;
+    assert_eq!(r.state(id).await, TimerState::Done(TimerOutcome::JobOk));
+    r.shutdown.cancel();
+    handle.await.unwrap();
+}

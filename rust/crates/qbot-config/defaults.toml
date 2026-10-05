@@ -258,7 +258,9 @@ previous_context_batches = 1
 next_context_batches = 1
 
 [memory.extraction]
-max_output_tokens = 2048
+# Room for the model's reasoning as well as the answer: a slice of real chat can take several
+# thousand reasoning tokens, and an answer cut off at this limit is lost.
+max_output_tokens = 8192
 # Times a rejected answer is sent back for correction.
 max_attempts = 3
 

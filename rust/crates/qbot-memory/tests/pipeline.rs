@@ -1049,3 +1049,43 @@ async fn a_term_may_be_explained_by_a_line_that_does_not_repeat_it() {
         ["knowledge item 2: the term \"the Burrow\" is not written in the target part"]
     );
 }
+
+#[tokio::test]
+async fn an_answer_cut_off_at_the_output_limit_is_reported_not_retried() {
+    let cut = Step::Reply(
+        FakeReply::new()
+            .reasoning("thinking at length")
+            .finish(qbot_llm::FinishReason::Length),
+    );
+    let (fake, ex) = extractor(vec![cut]);
+    let target = lines(1..=4);
+    let error = ex
+        .extract(
+            &SliceContext {
+                previous: &[],
+                target: &target,
+                next: &[],
+            },
+            "English",
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            qbot_memory::extract::ExtractError::CutOff { limit: 8192 }
+        ),
+        "{error}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("memory.extraction.max_output_tokens"),
+        "names the setting"
+    );
+    assert_eq!(
+        fake.recorded().len(),
+        1,
+        "asking again would hit the same limit"
+    );
+}
