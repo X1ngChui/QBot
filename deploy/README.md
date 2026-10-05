@@ -66,8 +66,9 @@ Durations carry their unit in the key (`deadline_secs`, `half_life_days`). Inter
 
 Set `bot.account` (and `bot.owners`, `bot.nicknames`, `bot.timezone`) in `config/config.toml`,
 copy `config/personas/default.toml.example` to `config/personas/default.toml`, then
-`docker compose up -d`. Point NapCat's reverse WebSocket at `ws://qbot:6199/onebot/v11/ws` with
-the access token from `secrets/onebot_access_token`. A host-mounted `./data/qbot` must be writable
+`docker compose up -d`. NapCat runs in the same project: set `NAPCAT_ACCOUNT` in `.env`, log in
+once through its WebUI (`127.0.0.1:6099`, over an SSH tunnel), and point its reverse WebSocket at
+`ws://qbot:6199/onebot/v11/ws` with the access token from `secrets/onebot_access_token`. A host-mounted `./data/qbot` must be writable
 by uid 10001, the user the image runs as.
 
 Member-facing wording comes from a locale catalog: `bot.locale = "en"` or `"zh-CN"` (both built

@@ -1,4 +1,4 @@
-# The Rust QBot with its database. Run from this directory:
+# QBot with its database and NapCat. Run from this directory:
 #
 #   cp config/config.toml.example config/config.toml      # optional overrides
 #   printf '%s' 'a-strong-password' > secrets/database_password
@@ -10,14 +10,17 @@
 #   docker compose run --rm qbot check-config              # validate before starting
 #   docker compose up -d
 #
-# NapCat connects to ws://qbot:6199/onebot/v11/ws (reverse WebSocket) with that token, so put it
-# on the same compose network or publish the port below.
+# NapCat: set NAPCAT_ACCOUNT in .env, log in once by QR code in the WebUI (an SSH tunnel to
+# 127.0.0.1:6099), and in its OneBot settings add a reverse WebSocket to
+# ws://qbot:6199/onebot/v11/ws with the token above and turn on enableLocalFile2Url. The saved
+# session logs in by itself after that.
 #
 # Layout (host -> container):
 #   ./config  -> /etc/qbot       read-only   non-secret settings (config.toml, conf.d/, personas, locales)
 #   ./data/qbot -> /var/lib/qbot read-write  persistent state (models, backups)
 #   ./secrets -> /run/secrets    read-only   one file per secret, named in lower case
 #   ./data/postgres              the database's own volume
+#   ./data/napcat                NapCat's settings and QQ session (QBot never reads it)
 
 name: qbot
 
@@ -51,7 +54,6 @@ services:
       postgres:
         condition: service_healthy
     command: ["run"]
-    # ports: ["127.0.0.1:6199:6199"]   # only if NapCat runs outside this compose project
     environment:
       # Non-secret, deployment-specific overrides use QBOT__SECTION__KEY. Anything that is the
       # same everywhere belongs in ./config/config.toml instead. Credentials never go here.
@@ -64,6 +66,22 @@ services:
       - text_api_key
       - embedding_api_key
       - onebot_access_token
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "3" }
+
+  napcat:
+    image: ${REGISTRY:-docker.io}/mlikiowa/napcat-docker:v4.18.13
+    restart: unless-stopped
+    environment:
+      # Quick login with the saved session, so a restart needs no QR scan.
+      ACCOUNT: ${NAPCAT_ACCOUNT:-}
+    volumes:
+      - ./data/napcat/config:/app/napcat/config
+      - ./data/napcat/qq:/app/.config/QQ
+    ports:
+      - "127.0.0.1:6099:6099"   # WebUI, loopback only
+    mem_limit: 2g
     logging:
       driver: json-file
       options: { max-size: "20m", max-file: "3" }
