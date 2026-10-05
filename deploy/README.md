@@ -75,6 +75,40 @@ Member-facing wording comes from a locale catalog: `bot.locale = "en"` or `"zh-C
 in), or your own Fluent file `config/locales/<tag>.ftl` with every message the built-in English catalog has;
 an incomplete catalog is refused at startup, listing what is missing.
 
+## Upgrading and rolling back
+
+Migrations only go forward, and a binary refuses a database that has a migration it does not
+know. So once a release has migrated the schema, the previous image cannot simply be started
+again: rolling back means restoring the database as it was before the upgrade. Commands run in
+this directory.
+
+**Before an upgrade that adds a migration**, keep the running image's tag and take a verified dump:
+
+```bash
+f=data/qbot/backups/qbot-$(date +%Y%m%d-%H%M%S).dump
+docker compose exec -T postgres pg_dump -U qbot -d qbot -Fc > "$f"
+docker compose exec -T postgres pg_restore -l < "$f" | grep -c 'TABLE DATA'   # must be > 0
+```
+
+The name matches the nightly backups, so normal rotation retires it later.
+
+**To roll back**, recreate the database from that dump and start the previous image. Recreating
+(rather than `pg_restore --clean`) also removes anything the newer migrations created outside
+the tables, so the upgrade can be applied again later.
+
+```bash
+docker compose stop qbot                                   # releases the database lease
+docker compose exec -T postgres dropdb -U qbot --force qbot
+docker compose exec -T postgres createdb -U qbot qbot
+docker compose exec -T postgres pg_restore -U qbot -d qbot --exit-on-error < data/qbot/backups/qbot-<before-upgrade>.dump
+# set QBOT_IMAGE in .env to the previous tag, then
+docker compose up -d qbot
+docker compose logs -f qbot                               # expect "platform connected"
+```
+
+Everything archived after the dump (messages, runs, tasks, memory) is lost with the rollback.
+NapCat is untouched and reconnects by itself.
+
 ## Pictures and voice
 
 - **Voice** is transcribed in the process (SenseVoice through sherpa-onnx, CPU). Run
