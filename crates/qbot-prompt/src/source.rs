@@ -397,8 +397,9 @@ impl PromptContext {
         &self.zone
     }
 
-    /// The instructions every run of `group` starts with. They depend only on the group's
-    /// persona, so runs of one group share a prefix the provider can cache.
+    /// The instructions every run of `group` starts with. The rules and the legend are the same
+    /// for every group and come first; the persona follows. Runs of one group share the whole
+    /// prefix, and runs of different groups share the rules, for the provider's cache.
     pub fn instructions(&self, group: GroupId) -> Result<Vec<Instruction>, PromptError> {
         let persona = self.personas.for_group(group);
         let instruction = |template: Template, text: String| Instruction {
@@ -409,14 +410,17 @@ impl PromptContext {
         let mut out = vec![
             instruction(
                 Template::ReplySystem,
-                render_template(Template::ReplySystem, &[("bot_name", &persona.name)])?,
+                render_template(Template::ReplySystem, &[])?,
             ),
             instruction(Template::Legend, render_template(Template::Legend, &[])?),
             instruction(
                 Template::PersonaBlock,
                 render_template(
                     Template::PersonaBlock,
-                    &[("persona", persona.system_prompt.trim())],
+                    &[
+                        ("bot_name", &persona.name),
+                        ("persona", persona.system_prompt.trim()),
+                    ],
                 )?,
             ),
         ];

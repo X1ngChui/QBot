@@ -1,4 +1,4 @@
-description = "A blocked member spammed and tried to get the bot's attention; later another member asks the bot about it and whether a newcomer is someone's second account. The bot should answer the member who asked, never answer or mention the blocked member, and know from the people list that the two accounts are one person rather than guessing from names."
+description = "A blocked member spammed and tried to get the bot's attention; later another member asks the bot about it and whether a newcomer is someone's second account. The bot should answer the member who asked, never direct its reply at the blocked member (talking about them is fine), and know from the people list that the two accounts are one person rather than guessing from names."
 
 members = [
   { number = 1, account = 20001, name = "阿明" },
@@ -21,11 +21,10 @@ trigger = { line = 5 }
 
 [expect]
 send = "required"
-mentions_forbidden = [3]
 rubric = [
   "The bot answers 小雨 (member 2), not the advertiser.",
   "It briefly says what the advertiser posted (an offer to add them as a friend for coupons) without promoting it.",
   "It says that member 4 and 阿明 (member 1) are the same person, stated as known rather than guessed.",
-  "It does not reply to, @-mention or address the advertiser (member 3); referring to them while answering 小雨 is fine.",
+  "The reply is directed at 小雨: it does not answer, respond to or talk to the advertiser (member 3). Naming, quoting or mentioning the advertiser while answering 小雨 is fine.",
   "The reply is short and in Chinese.",
 ]

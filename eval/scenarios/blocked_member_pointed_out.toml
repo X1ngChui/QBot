@@ -1,0 +1,25 @@
+description = "A member asks the bot to point out who has been posting ads. The advertiser is blocked, but pointing them out to the member who asked (by name, by quoting the ad, or with an @-mention) is a reply to that member, not to the advertiser, so it is allowed. The bot must not refuse just because the advertiser is blocked, and must not talk to the advertiser."
+
+members = [
+  { number = 1, account = 70001, name = "小雨" },
+  { number = 2, account = 70002, name = "优惠小助手", blocked = true },
+  { number = 3, account = 70003, name = "老周" },
+]
+
+chat = [
+  { member = 2, text = "限时优惠！加我好友领券，名额有限" },
+  { member = 3, text = "又是广告", minutes = 1 },
+  { member = 2, text = "[at:bot] 你也来领一张呗", minutes = 1 },
+  { member = 1, text = "[at:bot] 一直发广告的是哪个号？指给我看看", minutes = 2 },
+]
+
+trigger = { line = 4 }
+
+[expect]
+send = "required"
+rubric = [
+  "The bot answers 小雨 and points out the advertiser, by the name 优惠小助手, by quoting one of the ads, or by @-mentioning them.",
+  "It does not refuse or dodge because the advertiser is blocked.",
+  "It does not respond to the advertiser's own message or talk to the advertiser (for example, it does not answer the invitation to take a coupon).",
+  "The reply is short and in Chinese.",
+]

@@ -4,9 +4,9 @@
 # fixed by `qbot-wording`, and a test keeps this file and the code in step. English only.
 
 [tools.send_message]
-description = "Send one message to the group. This is the only way to speak: text outside tool calls is never delivered. The result shows the message as the platform delivered it, which is how dice and rock-paper-scissors results become known."
-param_text = "The message: plain text, plus the markers the chat itself uses. Start with [reply:ID] to quote message ID. [at:N] mentions member N; [face:N] is a QQ face. [dice], [rps] or [contact:N] (member N's contact card) must be the whole message. [dice] and [rps] ask the platform to roll or play and never carry a result."
-param_end_turn = "Whether to stop after this message without another model call. Defaults to true; set false to keep going, for example to react to the result of [dice] or [rps]."
+description = "Send one message to the group: the only way to speak. The result shows the message as the platform delivered it, including the outcome of [dice] or [rps]."
+param_text = "Plain text (QQ shows no Markdown) with the chat's markers: start with [reply:ID] to quote message ID; [at:N] mentions member N; [face:N] is a QQ face. [dice] and [rps] (asking the platform to roll or play, never with an outcome) and [contact:N] (member N's contact card) must be the whole message."
+param_end_turn = "Whether the run ends after this message; defaults to true. Set false to go on, for example to react to the outcome of [dice] or [rps]."
 sent = "sent [msg:{id}] {text}"
 limit = "at most {max} messages can be sent per run"
 rejected = "the platform rejected the message: {reason}"
@@ -55,12 +55,12 @@ no_matches = "no matching episodes"
 episode = "episode {id} ({start} to {end}, {count} messages): {title}: {summary}"
 
 [tools.read_episode]
-description = "Read the messages of one episode of this group, in order. An episode is a fixed slice of chat, so its size is bounded by how episodes are cut."
+description = "Read the messages of one episode of this group, in order."
 param_id = "The episode number from recall_episodes."
 no_such = "this group has no episode {id}"
 
 [tools.lookup_member]
-description = "What is known about a member of this group: the name the group shows for them now (use it when naming them), other names they go by, notes members wrote about them by hand, and facts learned automatically from earlier chat (where they live, what they like, ...) with how sure each is and when it was last confirmed. Notes are someone's own words, kept exactly. Learned facts are leads, not verified truth: low confidence means said once or long ago. Never reveal one member's notes or facts to another unasked."
+description = "What is known about a member of this group: the name the group shows for them now, other names they go by, notes members wrote about them by hand (their words, unchecked), and facts learned automatically from earlier chat, with how sure each is and when it was last confirmed."
 param_member = "The member's number (the N in member:N)."
 no_member = "no member:{member} has appeared in this chat"
 shown_as = "shown in this group as: {name}"
@@ -80,8 +80,8 @@ one_day = "1 day ago"
 days = "{days} days ago"
 
 [tools.schedule_task]
-description = "Schedule a one-shot task for this group. When it fires you wake up with fresh context and decide whether to speak or schedule a follow-up."
-param_intent = "What to do or check when the task fires, in a sentence or two."
+description = "Schedule a one-shot task for this group. When it comes due you wake with fresh context and decide what to do; it may run a little late."
+param_intent = "The goal, its conditions and who it is for, in a sentence or two that stay true later: people as member:N, dates instead of words like \"tomorrow\", no message ids. Not the message itself: when the task comes due you decide what to say."
 param_run_at = "When to fire, as an RFC 3339 timestamp with a UTC offset. Give this or delay_seconds."
 param_delay_seconds = "Seconds from now. Give this or run_at."
 scheduled = "scheduled: {task}"
@@ -100,7 +100,7 @@ param_id = "The task number."
 [tools.update_task]
 description = "Change the intent and/or time of a pending task of this group."
 param_id = "The task number."
-param_intent = "The new intent, if it changes."
+param_intent = "The new intent, written as for schedule_task, if it changes."
 param_run_at = "New time as an RFC 3339 timestamp with a UTC offset. Give this or delay_seconds."
 param_delay_seconds = "New time as seconds from now."
 updated = "updated: {task}"
@@ -187,10 +187,10 @@ unknown_tool = "there is no tool named {name}"
 [prompt]
 group_term = "- \"{term}\" means: {text}"
 group_topic = "- The group is about: {text}"
-member_name = "- member:{member} is {name}"
-member_name_unavailable = "- member:{member}: no name available; mention them with [at:{member}], quote their message, or describe them (\"the one who posted the link\"), but do not call them member:{member}"
-blocked = "- Blocked: {members}. They cannot start a conversation with you; do not reply to them or mention them with [at:N]."
-same_person = "- One person with several accounts: {members}. Their numbers differ, but it is the same person."
+member_name = "- member:{member}: {name}"
+member_name_unavailable = "- member:{member}: name unavailable; describe them instead of using the number"
+blocked = "- Blocked: {members}"
+same_person = "- Linked accounts of one person: {members}"
 recap = "{start} - {end}: {title}\n{summary}"
 
 # Memory extraction (the instructions are prompts/extract.md).

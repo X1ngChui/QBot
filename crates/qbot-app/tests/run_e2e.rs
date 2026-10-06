@@ -383,9 +383,7 @@ async fn a_platform_message_becomes_a_stored_reply_and_commands_change_behaviour
     // The run asks the platform what the members in its chat are called, and tells the model.
     let action = serve_until_send(&mut napcat, None).await;
     assert!(
-        sim.requests()[0]
-            .to_string()
-            .contains("member:1 is Tester 2"),
+        sim.requests()[0].to_string().contains("member:1: Tester 2"),
         "the trigger note names the member"
     );
     assert_eq!(

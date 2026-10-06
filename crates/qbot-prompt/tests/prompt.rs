@@ -35,10 +35,10 @@ fn every_template_uses_exactly_its_declared_slots_and_no_cjk() {
 #[test]
 fn rendering_demands_the_exact_slot_set_and_never_rescans_values() {
     assert_eq!(
-        render_template(Template::PersonaBlock, &[]),
+        render_template(Template::KnowledgeBlock, &[]),
         Err(PromptError::MissingSlot {
-            template: Template::PersonaBlock,
-            slot: "persona"
+            template: Template::KnowledgeBlock,
+            slot: "knowledge"
         })
     );
     assert!(matches!(
@@ -46,11 +46,11 @@ fn rendering_demands_the_exact_slot_set_and_never_rescans_values() {
         Err(PromptError::UnknownSlot { .. })
     ));
     let text = render_template(
-        Template::PersonaBlock,
-        &[("persona", "call me {{persona}}")],
+        Template::KnowledgeBlock,
+        &[("knowledge", "call me {{knowledge}}")],
     )
     .unwrap();
-    assert!(text.ends_with("call me {{persona}}"), "{text}");
+    assert!(text.ends_with("call me {{knowledge}}"), "{text}");
 }
 
 fn line(message: i64, account: i64, number: u32, at: i64, text: &str) -> ChatLine {
@@ -183,7 +183,11 @@ async fn instructions_are_stable_per_group_and_the_trigger_note_carries_what_var
             .iter()
             .all(|i| i.role == InstructionRole::System)
     );
-    assert!(a.instructions[0].text.starts_with("You are Bobo,"));
+    assert!(
+        !a.instructions[0].text.contains("Bobo"),
+        "the rules are the same for every group; the name is the persona's"
+    );
+    assert!(a.instructions[2].text.starts_with("## Your persona: Bobo"));
     let note = a.trigger_note.unwrap();
     assert_eq!(note.role, InstructionRole::Trigger);
     assert!(
@@ -191,7 +195,11 @@ async fn instructions_are_stable_per_group_and_the_trigger_note_carries_what_var
         "{}",
         note.text
     );
-    assert!(note.text.contains("member:3 in [msg:5]"), "{}", note.text);
+    assert!(
+        note.text.contains("member:3 addressed you in [msg:5]"),
+        "{}",
+        note.text
+    );
     assert_eq!(a.window.len(), 1);
 
     // A per-group persona replaces the default for that group only, and adds its background.
@@ -213,12 +221,15 @@ async fn instructions_are_stable_per_group_and_the_trigger_note_carries_what_var
     let special = ctx.instructions(g).unwrap();
     assert_eq!(special.len(), 4);
     assert!(
-        special[0].text.starts_with("You are Cici,") && special[3].text.contains("A chess club.")
+        special[2].text.starts_with("## Your persona: Cici")
+            && special[3].text.contains("A chess club.")
     );
-    assert!(
-        ctx.instructions(other).unwrap()[0]
-            .text
-            .starts_with("You are Bobo,")
+    let default = ctx.instructions(other).unwrap();
+    assert!(default[2].text.starts_with("## Your persona: Bobo"));
+    assert_eq!(
+        special[..2],
+        default[..2],
+        "the rules and legend are shared by every group, so the provider can cache them"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -242,11 +253,11 @@ async fn a_wake_note_states_the_task_and_that_it_is_not_a_message() {
         .unwrap();
     let note = opened.trigger_note.unwrap().text;
     assert!(
-        note.contains("Task 12, chain depth 2")
+        note.contains("task 12 came due (depth 2")
             && note.contains("remind the group about the meeting"),
         "{note}"
     );
-    assert!(note.contains("not triggered by a new message"));
+    assert!(note.contains("No one has just asked for anything"));
 }
 
 #[test]
@@ -338,10 +349,7 @@ async fn learned_group_knowledge_joins_the_stable_instructions() {
     let opened = ctx.open(g, &trigger).await.unwrap();
     assert_eq!(opened.instructions.len(), 4);
     let block = &opened.instructions[3].text;
-    assert!(
-        block.starts_with("## What you have learned about this group"),
-        "{block}"
-    );
+    assert!(block.starts_with("## Learned about this group"), "{block}");
     assert!(
         block.ends_with("- The group is about: a chess club\n- \"GG\" means: good game\n- \"ZZ\" means: sleeping"),
         "the topic, then terms in a stable order: {block}"
@@ -396,9 +404,14 @@ async fn blocked_and_linked_members_are_listed_by_member_number() {
     assert!(block.starts_with("## People in this group"), "{block}");
     let entries: Vec<&str> = block.lines().filter(|l| l.starts_with("- ")).collect();
     assert_eq!(entries.len(), 3, "{block}");
-    assert!(entries[0].starts_with("- Blocked: member:4, member:17."));
-    assert!(entries[1].contains("member:2, member:9."));
-    assert!(entries[2].contains("member:3, member:5, member:8."));
+    assert_eq!(
+        entries,
+        [
+            "- Blocked: member:4, member:17",
+            "- Linked accounts of one person: member:2, member:9",
+            "- Linked accounts of one person: member:3, member:5, member:8"
+        ]
+    );
 }
 
 #[tokio::test]
@@ -650,8 +663,8 @@ async fn the_trigger_note_names_the_members_in_the_chat_so_numbers_stay_internal
     assert_eq!(
         listed,
         [
-            "- member:2 is Ali\u{ff3b}ce\u{ff3d}",
-            "- member:7: no name available; mention them with [at:7], quote their message, or describe them (\"the one who posted the link\"), but do not call them member:7"
+            "- member:2: Ali\u{ff3b}ce\u{ff3d}",
+            "- member:7: name unavailable; describe them instead of using the number"
         ],
         "each speaker once, in member order, brackets neutralized, the bot left out: {note}"
     );
@@ -661,5 +674,5 @@ async fn the_trigger_note_names_the_members_in_the_chat_so_numbers_stay_internal
     assert_eq!(named.instructions, plain.instructions);
     let plain_note = plain.trigger_note.unwrap().text;
     assert!(!plain_note.contains("- member:"), "{plain_note}");
-    assert!(!plain_note.contains("called in the group"), "{plain_note}");
+    assert!(!plain_note.contains("Names in this chat"), "{plain_note}");
 }

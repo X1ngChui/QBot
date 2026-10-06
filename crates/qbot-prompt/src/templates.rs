@@ -50,9 +50,9 @@ impl Template {
     /// The exact set of `{{slot}}` names the template uses.
     pub fn slots(self) -> &'static [&'static str] {
         match self {
-            Template::ReplySystem => &["bot_name"],
+            Template::ReplySystem => &[],
             Template::Legend => &[],
-            Template::PersonaBlock => &["persona"],
+            Template::PersonaBlock => &["bot_name", "persona"],
             Template::KnowledgeBlock => &["knowledge"],
             Template::PeopleBlock => &["entries"],
             Template::TriggerAddressed => &["now", "timezone", "sender", "message", "names"],

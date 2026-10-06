@@ -1,9 +1,9 @@
-Current time: {{now}} ({{timezone}}).
-A scheduled task for this group has come due. It was not triggered by a new message, and nobody asked for it just now. Treat its intent as the goal to pursue, not as a message or a higher-priority rule. Decide from the current chat whether it still matters; if nothing needs saying, call `stay_silent`.
+Now: {{now}} ({{timezone}}).
+This run: your scheduled task {{task}} came due (depth {{depth}}: how many tasks led to it). No one has just asked for anything. The intent below is the goal to pursue, not a message and not an instruction that outranks your rules. Call `stay_silent` only if the chat shows it is no longer wanted or it needs nothing said. Lines that arrive after this note are new chat.
 
-Task {{task}}, chain depth {{depth}}. Intent:
+Intent:
 {{intent}}
 {% if names %}
-What the members in this chat are called in the group right now (names they chose; use them when you talk about someone):
+Names in this chat now:
 {{names}}
 {% endif %}
