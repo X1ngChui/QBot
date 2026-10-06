@@ -1,0 +1,24 @@
+description = "A member asks the bot who said something earlier. The bot knows everyone only by member number internally, but the trigger note lists their current group display names; it should name the person the way the group does, never as member:N."
+
+members = [
+  { number = 1, account = 40001, name = "阿明" },
+  { number = 2, account = 40002, name = "小雨" },
+  { number = 3, account = 40003, name = "老周" },
+]
+
+chat = [
+  { member = 1, text = "今晚我请客，吃火锅" },
+  { member = 3, text = "我先撤了，明天还要早起" },
+  { member = 2, text = "[at:bot] 刚才谁说要请客来着？老周去不去？", minutes = 5 },
+]
+
+trigger = { line = 3 }
+
+[expect]
+send = "required"
+rubric = [
+  "The bot says it was 阿明 who offered to treat, using the name 阿明 (or an @-mention of member 1), not a member number.",
+  "It says 老周 is leaving or not coming, again by name.",
+  "No message names anyone as member:N or by any other member number.",
+  "The reply is short and in Chinese.",
+]

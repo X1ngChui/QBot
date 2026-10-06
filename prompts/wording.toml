@@ -187,6 +187,8 @@ unknown_tool = "there is no tool named {name}"
 [prompt]
 group_term = "- \"{term}\" means: {text}"
 group_topic = "- The group is about: {text}"
+member_name = "- member:{member} is {name}"
+member_name_unavailable = "- member:{member}: no name available; mention them with [at:{member}], quote their message, or describe them (\"the one who posted the link\"), but do not call them member:{member}"
 blocked = "- Blocked: {members}. They cannot start a conversation with you; do not reply to them or mention them with [at:N]."
 same_person = "- One person with several accounts: {members}. Their numbers differ, but it is the same person."
 recap = "{start} - {end}: {title}\n{summary}"

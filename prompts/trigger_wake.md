@@ -3,3 +3,7 @@ A scheduled task for this group has come due. It was not triggered by a new mess
 
 Task {{task}}, chain depth {{depth}}. Intent:
 {{intent}}
+{% if names %}
+What the members in this chat are called in the group right now (names they chose; use them when you talk about someone):
+{{names}}
+{% endif %}

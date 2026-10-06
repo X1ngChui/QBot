@@ -47,6 +47,9 @@ pub struct Member {
     pub name: String,
     #[serde(default)]
     pub blocked: bool,
+    /// The platform cannot say this member's name (the directory answers nothing).
+    #[serde(default)]
+    pub name_unavailable: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -133,6 +136,10 @@ pub struct Expect {
     /// Member numbers the bot must not @-mention or share a card of.
     #[serde(default)]
     pub mentions_forbidden: Vec<u32>,
+    /// The bot may write `member:N` in its messages (someone asked about the numbers). Off by
+    /// default: numbers are internal handles, not names.
+    #[serde(default)]
+    pub member_handles_allowed: bool,
     /// English criteria for the judge, each checkable from the transcript.
     #[serde(default)]
     pub rubric: Vec<String>,

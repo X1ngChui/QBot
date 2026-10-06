@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use qbot_agent::{
-    ArchiveCursor, ContextSource, EnvError, OpenedContext, Recap, RecapWhen, Trigger,
+    ArchiveCursor, ContextSource, Directory, EnvError, OpenedContext, Recap, RecapWhen, Trigger,
 };
 use qbot_context::{ChatLine, Instruction, InstructionRole, Speaker};
 use qbot_core::{Clock, GroupId, HistoryWindow, MemberNo, UnixMillis};
@@ -160,6 +160,7 @@ pub struct PromptSettings {
 pub struct PromptContext {
     knowledge: Option<Arc<dyn KnowledgeSource>>,
     people: Option<Arc<dyn PeopleSource>>,
+    directory: Option<Arc<dyn Directory>>,
     episodes: Option<Arc<dyn EpisodeStore>>,
     history: Arc<dyn HistorySource>,
     personas: Personas,
@@ -193,6 +194,7 @@ impl PromptContext {
         Ok(Self {
             knowledge: None,
             people: None,
+            directory: None,
             episodes: None,
             history,
             personas,
@@ -212,6 +214,13 @@ impl PromptContext {
     /// Tell every run who in the group is blocked and which members are one person.
     pub fn with_people(mut self, source: Arc<dyn PeopleSource>) -> Self {
         self.people = Some(source);
+        self
+    }
+
+    /// Tell every run what the members in its chat are called now, so it can name people
+    /// instead of writing their member numbers.
+    pub fn with_directory(mut self, directory: Arc<dyn Directory>) -> Self {
+        self.directory = Some(directory);
         self
     }
 
@@ -435,10 +444,49 @@ impl PromptContext {
             .unwrap_or_else(|_| clock_label(&self.zone, now))
     }
 
+    /// The current group display name of every member who speaks in `window`, one entry per
+    /// line in member order, asked of the platform now (in parallel) and kept nowhere. Empty
+    /// without a directory. A name is member-chosen text, so it is neutralized like chat text; a
+    /// member the platform cannot name is listed as unavailable.
+    async fn names(&self, group: GroupId, window: &[ChatLine]) -> String {
+        let Some(directory) = &self.directory else {
+            return String::new();
+        };
+        let members: std::collections::BTreeMap<MemberNo, qbot_core::AccountId> = window
+            .iter()
+            .filter_map(|line| match line.speaker {
+                Speaker::Member { account, number } => Some((number, account)),
+                Speaker::Bot => None,
+            })
+            .collect();
+        let names = futures_util::future::join_all(
+            members
+                .values()
+                .map(|account| directory.display_name(group, *account)),
+        )
+        .await;
+        members
+            .keys()
+            .zip(names)
+            .map(|(number, name)| {
+                let member = number.get().to_string();
+                match name {
+                    Some(name) => say(Text::PromptMemberName {
+                        member,
+                        name: qbot_core::marker::neutralize(&name),
+                    }),
+                    None => say(Text::PromptMemberNameUnavailable { member }),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn trigger_note(
         &self,
         trigger: &Trigger,
         window: &[ChatLine],
+        names: &str,
     ) -> Result<Option<Instruction>, PromptError> {
         let now = self.now_label();
         let (template, text) = match trigger {
@@ -464,6 +512,7 @@ impl PromptContext {
                             ("timezone", &self.timezone),
                             ("sender", &sender),
                             ("message", &message),
+                            ("names", names),
                         ],
                     )?,
                 )
@@ -484,6 +533,7 @@ impl PromptContext {
                             ("task", &task),
                             ("depth", &depth),
                             ("intent", intent),
+                            ("names", names),
                         ],
                     )?,
                 )
@@ -520,7 +570,9 @@ impl ContextSource for PromptContext {
         };
         Ok(OpenedContext {
             instructions,
-            trigger_note: self.trigger_note(trigger, &window).map_err(env)?,
+            trigger_note: self
+                .trigger_note(trigger, &window, &self.names(group, &window).await)
+                .map_err(env)?,
             window,
             cursor,
             recaps,

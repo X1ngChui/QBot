@@ -348,6 +348,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         qbot_prompt::FactKnowledge::MAX_TERMS,
     )))
     .with_people(Arc::new(archive.clone()))
+    .with_directory(directory.clone())
     .with_episodes(episodes.clone());
     let renderer = Arc::new(PromptRenderer::new(prompt.zone().clone()));
     let deps = Arc::new(RunDeps {

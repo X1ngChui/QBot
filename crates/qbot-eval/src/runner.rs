@@ -97,6 +97,41 @@ impl PeopleSource for ScenarioPeople {
     }
 }
 
+/// Whether `text` refers to someone by a member handle: `member:12`, `member 12`, `Member12`.
+fn has_member_handle(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.match_indices("member").any(|(at, word)| {
+        let starts_word = !lower[..at]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric);
+        starts_word
+            && lower[at + word.len()..]
+                .trim_start_matches([':', ' ', '#'])
+                .starts_with(|c: char| c.is_ascii_digit())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_member_handle;
+
+    #[test]
+    fn member_handles_are_found_in_prose_and_nothing_else_is() {
+        for text in ["ask member:5", "member 12 said", "Member#3", "MEMBER:7"] {
+            assert!(has_member_handle(text), "{text}");
+        }
+        for text in [
+            "members 5 of us",
+            "remember 2 things",
+            "a member said 3 things",
+            "member:",
+        ] {
+            assert!(!has_member_handle(text), "{text}");
+        }
+    }
+}
+
 /// One tool call as it happened.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CallRecord {
@@ -294,6 +329,7 @@ impl Runner {
             scenario
                 .members
                 .iter()
+                .filter(|m| !m.name_unavailable)
                 .map(|m| account(m.account).map(|a| (a, m.name.clone())))
                 .collect::<Result<_, _>>()?,
         ));
@@ -357,7 +393,7 @@ impl Runner {
         .and_then(|set| add_memory_tools(set, recall, episodes))
         .and_then(|set| {
             set.with(LookupMember {
-                directory: names,
+                directory: names.clone(),
                 identity: identity.clone(),
                 facts: facts.clone(),
                 notes: notes.clone(),
@@ -383,7 +419,8 @@ impl Runner {
             facts.clone(),
             FactKnowledge::MAX_TERMS,
         )))
-        .with_people(Arc::new(ScenarioPeople(people)));
+        .with_people(Arc::new(ScenarioPeople(people)))
+        .with_directory(names.clone());
         let trigger = match (&scenario.trigger.line, &scenario.trigger.wake) {
             (Some(n), _) => {
                 let line = &lines[n - 1];
@@ -552,6 +589,21 @@ fn checks(
             what: format!("does not call {tool}"),
             passed: !called(tool),
             detail: String::new(),
+        });
+    }
+    if !scenario.expect.member_handles_allowed {
+        let handles: Vec<&str> = sent
+            .iter()
+            .flatten()
+            .filter_map(|s| match s {
+                OutSegment::Text(text) if has_member_handle(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        out.push(Check {
+            what: "names people instead of writing member:N".into(),
+            passed: handles.is_empty(),
+            detail: handles.join(" | "),
         });
     }
     for n in &scenario.expect.mentions_forbidden {

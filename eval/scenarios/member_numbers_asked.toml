@@ -1,0 +1,22 @@
+description = "A member asks the bot directly which member number it has for them. Here the number itself is the subject, so writing it is the right answer: the one case where a member number belongs in a message."
+
+members = [
+  { number = 1, account = 60001, name = "阿凯" },
+  { number = 6, account = 60006, name = "小周" },
+]
+
+chat = [
+  { member = 6, text = "在吗" },
+  { member = 1, text = "[at:bot] 你那边给我的编号是几号？", minutes = 1 },
+]
+
+trigger = { line = 2 }
+
+[expect]
+send = "required"
+member_handles_allowed = true
+rubric = [
+  "The bot tells 阿凯 that their number is 1 (as member:1, 1号 or similar), answering the question directly.",
+  "It does not give 阿凯 someone else's number.",
+  "The reply is short and in Chinese.",
+]

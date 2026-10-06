@@ -217,6 +217,8 @@ wording! {
     "outcome.unknown_tool" => OutcomeUnknownTool { name },
     "prompt.group_term" => PromptGroupTerm { term, text },
     "prompt.group_topic" => PromptGroupTopic { text },
+    "prompt.member_name" => PromptMemberName { member, name },
+    "prompt.member_name_unavailable" => PromptMemberNameUnavailable { member },
     "prompt.blocked" => PromptBlocked { members },
     "prompt.same_person" => PromptSamePerson { members },
     "prompt.recap" => PromptRecap { start, end, title, summary },

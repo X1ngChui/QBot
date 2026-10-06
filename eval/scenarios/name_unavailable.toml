@@ -1,0 +1,22 @@
+description = "A member asks who posted a link earlier, but the platform cannot give that member's current name. The bot must still not fall back to writing member:N in conversation: it should refer to the person naturally (for example by quoting their message, or as the one who posted it)."
+
+members = [
+  { number = 1, account = 50001, name = "unknown", name_unavailable = true },
+  { number = 2, account = 50002, name = "小林" },
+]
+
+chat = [
+  { member = 1, text = "这个教程不错 https://example.com/rust-intro" },
+  { member = 2, text = "[at:bot] 刚才发教程的是谁啊？", minutes = 3 },
+]
+
+trigger = { line = 2 }
+
+[expect]
+send = "required"
+rubric = [
+  "The bot answers 小林 helpfully about who posted the tutorial, referring to that person naturally, for example by quoting the message with [reply:ID], with an @-mention, or as the one who posted it.",
+  "No message names anyone as member:N or by a bare member number.",
+  "It does not invent a name for the poster.",
+  "The reply is short and in Chinese.",
+]

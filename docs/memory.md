@@ -97,8 +97,13 @@ else the account nickname. These docs say "group nickname" and "group display na
   account nickname (OneBot `nickname`), exactly as QQ shows it in the group. It is the platform's own answer, not
   inferred and not added by anyone, so it is read live from NapCat when needed
   (`qbot_agent::Directory`, `get_group_member_info`) and never stored: no cache can go stale. It
-  takes precedence over stored names for display and addressing: command replies use it, and
-  `lookup_member` lists it first as the name to use.
+  takes precedence over stored names for display and addressing: command replies use it,
+  `lookup_member` lists it first as the name to use, and every run's trigger note lists it for
+  each member who speaks in the visible chat (asked of the platform when the run opens).
+- *Member number versus name*: `member:N` is the model's internal handle (tool arguments,
+  `[at:N]`, the people block, telling accounts apart); in what the bot writes, people are called
+  by their current group display name, addressed with `[at:N]`, or described naturally when no
+  name is available. A number appears in a message only when someone asks about the numbers.
 - *Stored names* are the other names people use for someone: per group, pointing at an account or
   a holder. Evidence is fused in one Rust function: manual 1.0, extracted evidence 0.25 per
   distinct episode capped at 0.7, combined as independent evidence. A name resolves only when

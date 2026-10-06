@@ -585,3 +585,81 @@ async fn summary_tier_lines_without_an_episode_yet_stay_verbatim() {
         Some("line 9")
     );
 }
+
+/// Display names as a platform would report them; accounts not listed have none.
+struct Shown(Vec<(i64, &'static str)>);
+
+#[async_trait]
+impl qbot_agent::Directory for Shown {
+    async fn display_name(&self, _: GroupId, account: AccountId) -> Option<String> {
+        self.0
+            .iter()
+            .find(|(a, _)| *a == account.get())
+            .map(|(_, n)| (*n).to_owned())
+    }
+}
+
+#[tokio::test]
+async fn the_trigger_note_names_the_members_in_the_chat_so_numbers_stay_internal() {
+    let g = GroupId::new(900).unwrap();
+    let at = 1_700_000_000_000;
+    let history = || {
+        Arc::new(FixedHistory(vec![
+            line(1, 22, 7, at, "hello"),
+            line(2, 11, 2, at, "[at:bot] who was that?"),
+            ChatLine {
+                message: MessageId::new(3).unwrap(),
+                speaker: Speaker::Bot,
+                at: UnixMillis::new(at),
+                text: "hi".into(),
+            },
+            line(4, 22, 7, at, "me again"),
+        ]))
+    };
+    let ctx = |directory: Option<Arc<dyn qbot_agent::Directory>>| {
+        let ctx = PromptContext::new(
+            history(),
+            Personas::single(persona("Bobo", "")),
+            Arc::new(Clock0),
+            PromptSettings {
+                window: HistoryWindow::default(),
+                timezone: "Asia/Shanghai".into(),
+            },
+        )
+        .unwrap();
+        match directory {
+            Some(d) => ctx.with_directory(d),
+            None => ctx,
+        }
+    };
+    let trigger = Trigger::Addressed {
+        message: MessageId::new(2).unwrap(),
+        sender: AccountId::new(11).unwrap(),
+    };
+
+    // Account 11 is shown as a name with brackets; account 22 has no name the platform can give.
+    let named = ctx(Some(Arc::new(Shown(vec![(11, "Ali[ce]")]))))
+        .open(g, &trigger)
+        .await
+        .unwrap();
+    let note = named.trigger_note.unwrap().text;
+    let listed: Vec<&str> = note
+        .lines()
+        .filter(|l| l.starts_with("- member:"))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            "- member:2 is Ali\u{ff3b}ce\u{ff3d}",
+            "- member:7: no name available; mention them with [at:7], quote their message, or describe them (\"the one who posted the link\"), but do not call them member:7"
+        ],
+        "each speaker once, in member order, brackets neutralized, the bot left out: {note}"
+    );
+
+    // Names vary from run to run, so they live in the trigger note, never in the cached prefix.
+    let plain = ctx(None).open(g, &trigger).await.unwrap();
+    assert_eq!(named.instructions, plain.instructions);
+    let plain_note = plain.trigger_note.unwrap().text;
+    assert!(!plain_note.contains("- member:"), "{plain_note}");
+    assert!(!plain_note.contains("called in the group"), "{plain_note}");
+}

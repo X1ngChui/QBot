@@ -183,7 +183,8 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
 - **Order is stable to volatile**, so runs of a group share the longest prefix the provider can
   cache: reply rules, legend, persona and its group background (fixed per deployment), then the
   people block (changes when a block or link does), then learned knowledge (changes nightly),
-  then the chat (grows by whole batches), and last the trigger note (the time, the trigger, a
+  then the chat (grows by whole batches), and last the trigger note (the time, the trigger, the
+  current group display names of the members in the chat (`with_directory`), a
   task's intent), which is different for every run.
 - **People block**: who is blocked (blocks in force now) and which member numbers are one person
   (holders with two or more numbered accounts in the group), from the store on every run, by

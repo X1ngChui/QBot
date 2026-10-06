@@ -380,8 +380,14 @@ async fn a_platform_message_becomes_a_stored_reply_and_commands_change_behaviour
         .send(group_message(1, 2, json!([{"type": "at", "data": {"qq": "100"}}, {"type": "text", "data": {"text": " are you there?"}}])))
         .await
         .unwrap();
-    let action = next_action(&mut napcat).await;
-    assert_eq!(action["action"], "send_group_msg");
+    // The run asks the platform what the members in its chat are called, and tells the model.
+    let action = serve_until_send(&mut napcat, None).await;
+    assert!(
+        sim.requests()[0]
+            .to_string()
+            .contains("member:1 is Tester 2"),
+        "the trigger note names the member"
+    );
     assert_eq!(
         action["params"]["message"][0],
         json!({"type": "text", "data": {"text": "hello from the model"}})
@@ -542,7 +548,8 @@ async fn a_second_instance_on_the_same_database_refuses_to_start() {
     std::fs::remove_dir_all(&second_root).ok();
 }
 
-/// Answers the actions the bot sends while handling media, until the reply it was waiting for.
+/// Answers the actions the bot sends before a reply (display names, media), until the reply. Every
+/// member is shown as "Tester <account>".
 async fn serve_until_send(napcat: &mut Client, wav: Option<&[u8]>) -> Value {
     use base64::Engine;
     loop {
@@ -566,9 +573,11 @@ async fn serve_until_send(napcat: &mut Client, wav: Option<&[u8]>) -> Value {
             }
             "get_group_member_info" => {
                 let echo = action["echo"].clone();
+                let card = format!("Tester {}", action["params"]["user_id"]);
                 napcat
                     .send(Message::text(
-                        json!({"status": "failed", "retcode": 1, "echo": echo}).to_string(),
+                        json!({"status": "ok", "retcode": 0, "data": {"card": card}, "echo": echo})
+                            .to_string(),
                     ))
                     .await
                     .unwrap();

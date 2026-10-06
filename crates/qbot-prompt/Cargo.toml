@@ -13,6 +13,7 @@ qbot-llm.workspace = true
 qbot-agent.workspace = true
 qbot-store.workspace = true
 qbot-memory.workspace = true
+futures-util.workspace = true
 async-trait.workspace = true
 jiff.workspace = true
 minijinja.workspace = true
