@@ -181,3 +181,50 @@ async fn constraints_reject_invalid_rows() {
     assert!(rejected(&db, "INSERT INTO link_invitation (group_id, initiator, target, created_by, created_ms, initiator_revision, target_revision, state, confirmed_by) VALUES (2, 7, 8, 1, 0, 0, 0, 'pending', 5)").await, "confirmed only when applied");
     db.drop_db().await;
 }
+
+#[tokio::test]
+async fn archived_game_results_are_rewritten_to_the_observed_form() {
+    let db = db!();
+    let lines = [
+        ("bot", "[dice:4]"),
+        ("bot", "[rps:1]"),
+        ("member", "[rps:2]"),
+        ("member", "[rps:3] and [dice:6]"),
+        ("bot", "[dice]"),
+        ("bot", "[dice:9]"),
+        ("bot", "\u{ff3b}dice:5\u{ff3d}"),
+    ];
+    for (i, (speaker, text)) in lines.iter().enumerate() {
+        let account = (*speaker == "member").then_some(7_i64);
+        sqlx::query("INSERT INTO chat_line (group_id, ordinal, message_id, speaker, account_id, at_ms, text) VALUES (1, $1, $1, $2, $3, 0, $4)")
+            .bind(i as i64 + 1)
+            .bind(speaker)
+            .bind(account)
+            .bind(text)
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+    sqlx::raw_sql(include_str!("../migrations/0003_game_result_markers.sql"))
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let texts: Vec<String> = sqlx::query_scalar("SELECT text FROM chat_line ORDER BY ordinal")
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        texts,
+        [
+            "[dice result:4]",
+            "[rps result:paper]",
+            "[rps result:scissors]",
+            "[rps result:rock] and [dice result:6]",
+            "[dice]",
+            "[dice:9]",
+            "\u{ff3b}dice:5\u{ff3d}",
+        ],
+        "only real result markers change; a fullwidth look-alike stays text"
+    );
+    db.drop_db().await;
+}

@@ -1,0 +1,20 @@
+description = "A member challenges the bot to a dice roll with stakes. The platform rolls the die; the bot must ask it to roll with a bare [dice], wait for the result, and then call the outcome from the number that actually came up, never one it picked."
+
+members = [
+  { number = 1, account = 30001, name = "阿凯" },
+]
+
+chat = [
+  { member = 1, text = "[at:bot] 掷个骰子，单数你赢，双数我赢" },
+]
+
+trigger = { line = 1 }
+
+[expect]
+send = "required"
+rubric = [
+  "The bot rolls with the platform's dice: one send_message whose text is exactly [dice], with no number in it.",
+  "After the roll, it states the outcome from the result in the send_message tool result ([dice result:N]): the number it names matches N, and the winner follows the stated rule (odd: the bot wins, even: 阿凯 wins).",
+  "Before the result came back, it did not announce any number or winner.",
+  "Its messages are short and in Chinese.",
+]

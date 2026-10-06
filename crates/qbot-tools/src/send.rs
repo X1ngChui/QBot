@@ -90,6 +90,14 @@ fn marker(inner: &str) -> Option<Result<Marker, String>> {
             .map(Marker::Reply),
         ("dice", None) => Ok(Marker::Dice),
         ("rps", None) => Ok(Marker::Rps),
+        // A game's result is the platform's to decide and only ever comes back in the echo; a
+        // marker carrying one would otherwise go out as text that looks like a real result.
+        ("dice" | "dice result", _) => Err(say(Text::SendMessageChosenResult {
+            name: "dice".to_owned(),
+        })),
+        ("rps" | "rps result", _) => Err(say(Text::SendMessageChosenResult {
+            name: "rps".to_owned(),
+        })),
         _ => return None,
     })
 }

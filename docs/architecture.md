@@ -92,8 +92,8 @@ qbot-eval      reply-quality evaluation against the real model (run by hand)
 - **Parsing** (`qbot-gateway::wire`): frames become typed events (`GroupMessage`, `GroupNotice`,
   `ActionResponse`); anything unusable is `Frame::Ignored` with a reason.
 - **Rendering** (`render`): a message becomes archive text with ASCII markers: `[at:N]`,
-  `[at:bot]`, `[reply:ID]`, `[image]`, `[sticker:..]`, `[voice]`, `[face:N]`, `[dice:N]`,
-  `[rps:N]`, `[forward:N]` with indented lines, `[file:NAME]`, `[card]`, `[notice:..]`.
+  `[at:bot]`, `[reply:ID]`, `[image]`, `[sticker:..]`, `[voice]`, `[face:N]`,
+  `[dice result:N]`, `[rps result:HAND]`, `[forward:N]` with indented lines, `[file:NAME]`, `[card]`, `[notice:..]`.
   Member-typed ASCII brackets become fullwidth brackets, so a marker cannot be forged. Forwarded
   records show at most `FORWARD_MAX_LINES` (30) of their messages: a record can hold hundreds,
   and every prompt showing the line would carry them all.
@@ -110,6 +110,13 @@ qbot-eval      reply-quality evaluation against the real model (run by hand)
 - **Delivery**: `send_group_msg`, correlated by `echo` token, then a wait for the platform's
   report of the bot's own message (`message_sent`), which is how dice and rock-paper-scissors
   results become known. A rejected send is returned to the model as an error.
+- **Platform games.** A dice or rock-paper-scissors send is a request with no result
+  (`{"type":"dice","data":{}}`); the platform decides the outcome and reports it in the echo.
+  Rendering normalizes it on the incoming side only (`qbot_core::GameResult`): a face 1 to 6 as
+  `[dice result:N]`, QQ's hand number (1 paper, 2 scissors, 3 rock) as `[rps result:HAND]`, and
+  an unreadable one as the bare `[dice]` / `[rps]`. The send tool refuses any dice or
+  rock-paper-scissors marker that carries a value, so the model can neither choose an outcome nor
+  post text that imitates one; it reacts to the result in the tool result, with `end_turn: false`.
 
 ## 5. The conversation model (`qbot-context`)
 
@@ -150,7 +157,7 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
   model error.
 - **Speaking.** Only `send_message` reaches the group: `{text, end_turn?}` in the chat's own
   marker syntax (`[reply:ID]` first, `[at:N]`, `[face:N]`; `[dice]`, `[rps]`, `[contact:N]`
-  alone), parsed strictly with an explanation for every mistake. It waits for the echo, so the
+  alone, never a game result), parsed strictly with an explanation for every mistake. It waits for the echo, so the
   result shows the message as delivered. Sends per run are bounded by `replies.max_messages`.
   `stay_silent` makes silence explicit.
 - **Undelivered text.** A turn that ends with text but no tool call wrote something nobody saw.

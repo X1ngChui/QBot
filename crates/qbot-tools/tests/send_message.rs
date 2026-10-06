@@ -128,23 +128,63 @@ async fn malformed_markers_and_shapes_are_explained_as_invalid_arguments() {
 }
 
 #[tokio::test]
+async fn a_model_cannot_choose_a_game_result() {
+    let r = rig(vec![]);
+    let cases = [
+        "[dice:6]",
+        "[rps:1]",
+        "[dice: 6 ]",
+        "[dice:]",
+        "[dice result:6]",
+        "[rps result:rock]",
+        "I rolled [dice:6]",
+    ];
+    let results = try_calls(&r, cases.iter().map(|t| send(t)).collect()).await;
+    for (result, text) in results.iter().zip(cases) {
+        assert_eq!(
+            result.outcome,
+            Outcome::Error(ErrorKind::InvalidArguments),
+            "{text}: {}",
+            text_of(result)
+        );
+        assert!(
+            text_of(result).contains("cannot choose the result"),
+            "{text}: {}",
+            text_of(result)
+        );
+    }
+    assert!(
+        r.world.sent().is_empty(),
+        "nothing that looks like a result reaches the group, not even as text"
+    );
+}
+
+#[tokio::test]
 async fn dice_results_come_back_through_the_echo_and_a_run_can_react() {
     let r = rig(vec![]);
-    r.fake.push(reply(call("send_message", send(" [dice] "))));
+    r.fake.push(reply(call(
+        "send_message",
+        json!({ "text": " [dice] ", "end_turn": false }),
+    )));
     r.fake
         .push(reply(call("send_message", json!({ "text": "nice roll" }))));
     let report = r.ask(1, 1, "roll a dice").await;
     let results = r.last_run_results();
-    assert!(
-        text_of(&results[0]).contains("[dice:"),
-        "{}",
-        text_of(&results[0])
-    );
+    // The request carries no result: the segment has nowhere to put one.
     assert_eq!(
         r.world.sent()[0],
         [OutSegment::Dice],
         "surrounding spaces are dropped"
     );
+    // What the model is told comes from the platform's echo, and the follow-up turn sees it.
+    let echoed = text_of(&results[0]);
+    assert!(echoed.contains("[dice result:"), "{echoed}");
+    let observed = echoed
+        .trim_start_matches(|c| c != ']')
+        .trim_start_matches(']')
+        .trim();
+    let followup = format!("{:?}", r.fake.recorded()[1].conversation);
+    assert!(followup.contains(observed), "{observed} in {followup}");
     assert_eq!(report.end, RunEnd::Delivered, "end_turn defaults to true");
     assert_eq!(report.turns, 2);
     assert_eq!(r.world.sent().len(), 2);

@@ -1,0 +1,20 @@
+description = "A member plays rock-paper-scissors with the bot and announces their own hand. The platform picks the bot's hand; the bot must ask it to play with a bare [rps], wait for the result, and then say who won from the hand that actually came up."
+
+members = [
+  { number = 1, account = 30002, name = "小周" },
+]
+
+chat = [
+  { member = 1, text = "[at:bot] 石头剪刀布，我出石头" },
+]
+
+trigger = { line = 1 }
+
+[expect]
+send = "required"
+rubric = [
+  "The bot plays with the platform's rock-paper-scissors: one send_message whose text is exactly [rps], with no hand or number in it.",
+  "After the move, it says who won from the hand in the send_message tool result ([rps result:HAND]) against 小周's rock, correctly (paper beats rock, rock beats scissors, the same hand is a draw), and names its own hand as that result.",
+  "Before the result came back, it did not announce a hand or a winner.",
+  "Its messages are short and in Chinese.",
+]

@@ -78,6 +78,7 @@ wording! {
     "tools.send_message.unconfirmed" => SendMessageUnconfirmed {},
     "tools.send_message.empty" => SendMessageEmpty {},
     "tools.send_message.alone" => SendMessageAlone {},
+    "tools.send_message.chosen_result" => SendMessageChosenResult { name },
     "tools.send_message.reply_first" => SendMessageReplyFirst {},
     "tools.send_message.no_member" => SendMessageNoMember { member },
     "tools.send_message.no_message" => SendMessageNoMessage { id },

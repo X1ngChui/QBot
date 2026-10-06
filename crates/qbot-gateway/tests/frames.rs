@@ -84,7 +84,20 @@ fn dice_results_and_unknown_segments_render_safely() {
     let Frame::Message(m) = frame else { panic!() };
     assert_eq!(
         render(&m.segments, &ctx()),
-        "[dice:4][rps][unsupported:weirdkind][file:ab..c.txt]"
+        "[dice result:4][rps][unsupported:weirdkind][file:ab..c.txt]"
+    );
+}
+
+#[test]
+fn platform_results_are_normalized_and_unreadable_ones_leave_only_the_action() {
+    let frame = parse_frame(&message(
+        "",
+        r#"[{"type":"rps","data":{"result":"3"}},{"type":"rps","data":{"result":1}},{"type":"dice","data":{"result":6}},{"type":"dice","data":{"result":"9"}},{"type":"rps","data":{"result":"x"}}]"#,
+    ));
+    let Frame::Message(m) = frame else { panic!() };
+    assert_eq!(
+        render(&m.segments, &ctx()),
+        "[rps result:rock][rps result:paper][dice result:6][dice][rps]"
     );
 }
 

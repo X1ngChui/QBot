@@ -4,7 +4,7 @@
 //! cannot forge one, because brackets typed by members are replaced with their fullwidth forms
 //! before they reach the archive. The prompt layer later maps `[at:ID]` to member numbers.
 
-use qbot_core::AccountId;
+use qbot_core::{AccountId, GameResult};
 
 use crate::wire::{Mention, Segment};
 
@@ -87,10 +87,19 @@ fn render_into(out: &mut String, segments: &[Segment], ctx: &RenderContext, nest
                     out.push_str(&format!("[sticker:{summary}]"));
                 }
             }
-            Segment::Dice(None) => out.push_str("[dice]"),
-            Segment::Dice(Some(result)) => out.push_str(&format!("[dice:{}]", label(result))),
-            Segment::Rps(None) => out.push_str("[rps]"),
-            Segment::Rps(Some(result)) => out.push_str(&format!("[rps:{}]", label(result))),
+            // The platform's result, normalized; without a readable one only the action is known.
+            Segment::Dice(result) => out.push_str(
+                &result
+                    .as_deref()
+                    .and_then(GameResult::dice)
+                    .map_or_else(|| "[dice]".to_owned(), GameResult::marker),
+            ),
+            Segment::Rps(result) => out.push_str(
+                &result
+                    .as_deref()
+                    .and_then(GameResult::rps)
+                    .map_or_else(|| "[rps]".to_owned(), GameResult::marker),
+            ),
             Segment::Forward { nodes: None } => out.push_str("[forward]"),
             Segment::Forward { nodes: Some(nodes) } if nested => {
                 out.push_str(&format!("[forward:{}]", nodes.len()))

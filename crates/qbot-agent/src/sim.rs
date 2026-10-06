@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use qbot_context::{ChatLine, Instruction, InstructionRole, Item, Speaker};
-use qbot_core::{AccountId, GroupId, ItemSeq, MemberNo, MessageId, RunId, UnixMillis};
+use qbot_core::{
+    AccountId, GameResult, GroupId, ItemSeq, MemberNo, MessageId, RpsHand, RunId, UnixMillis,
+};
 use qbot_llm::Renderer;
 
 use crate::env::{
@@ -206,14 +208,16 @@ fn render_segments(world: &mut World, segments: &[OutSegment]) -> String {
             OutSegment::Reply(message) => format!("[reply:{}]", message.get()),
             OutSegment::Face(id) => format!("[face:{id}]"),
             OutSegment::Contact(account) => format!("[contact:{}]", account.get()),
+            // The simulated platform decides, as the real one does; the request had no result.
             OutSegment::Dice => {
                 world.dice += 1;
-                format!("[dice:{}]", world.dice % 6 + 1)
+                GameResult::Dice((world.dice % 6 + 1) as u8).marker()
             }
             OutSegment::Rps => {
                 world.dice += 1;
-                let hand = ["rock", "paper", "scissors"][(world.dice % 3) as usize];
-                format!("[rps:{hand}]")
+                let hand =
+                    [RpsHand::Rock, RpsHand::Paper, RpsHand::Scissors][(world.dice % 3) as usize];
+                GameResult::Rps(hand).marker()
             }
         })
         .collect::<Vec<_>>()

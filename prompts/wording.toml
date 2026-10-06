@@ -5,14 +5,15 @@
 
 [tools.send_message]
 description = "Send one message to the group. This is the only way to speak: text outside tool calls is never delivered. The result shows the message as the platform delivered it, which is how dice and rock-paper-scissors results become known."
-param_text = "The message: plain text, plus the markers the chat itself uses. Start with [reply:ID] to quote message ID. [at:N] mentions member N; [face:N] is a QQ face. [dice], [rps] or [contact:N] (member N's contact card) must be the whole message."
-param_end_turn = "Whether to stop after this message without another model call. Defaults to true; set false to keep going, for example to react to a dice result."
+param_text = "The message: plain text, plus the markers the chat itself uses. Start with [reply:ID] to quote message ID. [at:N] mentions member N; [face:N] is a QQ face. [dice], [rps] or [contact:N] (member N's contact card) must be the whole message. [dice] and [rps] ask the platform to roll or play and never carry a result."
+param_end_turn = "Whether to stop after this message without another model call. Defaults to true; set false to keep going, for example to react to the result of [dice] or [rps]."
 sent = "sent [msg:{id}] {text}"
 limit = "at most {max} messages can be sent per run"
 rejected = "the platform rejected the message: {reason}"
 unconfirmed = "the message was sent but not confirmed; do not send it again"
 empty = "the message is empty"
 alone = "[dice], [rps] or [contact:N] must be the whole message, with nothing else in it"
+chosen_result = "you cannot choose the result: send [{name}] alone and the platform rolls or plays; what it came up with comes back in this tool's result as [{name} result:...]"
 reply_first = "a quote ([reply:ID]) must come first in the message"
 no_member = "no member {member} has appeared in this chat"
 no_message = "message {id} is not in this chat"

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
-use qbot_agent::{RunLimits, UsageDetail};
+use qbot_agent::{OutSegment, RunLimits, UsageDetail};
 use qbot_context::{ErrorKind, Item, Meta, Outcome, Part, RefusalReason, RunEnd};
 use qbot_llm::fake::{FakeReply, Step};
 use qbot_llm::{Content, ConvItem, FinishReason, LlmError, Provider, ReplayPlan};
@@ -277,8 +277,13 @@ async fn dice_results_are_observed_through_the_echo() {
     let results = tool_results(&report);
     let text = text_of(results[0].0);
     assert!(
-        text.contains("[dice:"),
+        text.contains("[dice result:"),
         "the model learns the real result: {text}"
+    );
+    assert_eq!(
+        h.world.sent()[0],
+        [OutSegment::Dice],
+        "the request has no result"
     );
     assert_eq!(report.end, RunEnd::Completed);
 }

@@ -36,6 +36,68 @@ impl MediaKind {
     }
 }
 
+/// A hand in the platform's rock-paper-scissors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpsHand {
+    Rock,
+    Paper,
+    Scissors,
+}
+
+impl RpsHand {
+    pub fn name(self) -> &'static str {
+        match self {
+            RpsHand::Rock => "rock",
+            RpsHand::Paper => "paper",
+            RpsHand::Scissors => "scissors",
+        }
+    }
+}
+
+/// What a platform game came up with: a dice roll or a rock-paper-scissors hand.
+///
+/// Only the incoming side carries one. The platform picks it when it performs the action, and
+/// the bot learns it from the echo of its own message; a request (`[dice]`, `[rps]`) never has a
+/// result. The archived form `[dice result:4]` / `[rps result:rock]` is deliberately different
+/// from the request markers, so a result reads as something observed, not something to send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GameResult {
+    /// The face rolled, 1 to 6.
+    Dice(u8),
+    Rps(RpsHand),
+}
+
+impl GameResult {
+    /// A dice result as the platform reports it (`"1"` to `"6"`).
+    pub fn dice(raw: &str) -> Option<Self> {
+        raw.trim()
+            .parse::<u8>()
+            .ok()
+            .filter(|face| (1..=6).contains(face))
+            .map(GameResult::Dice)
+    }
+
+    /// A rock-paper-scissors result as QQ reports it: 1 paper, 2 scissors, 3 rock (the order
+    /// of QQ's own label for the move, "cloth, shears, hammer").
+    pub fn rps(raw: &str) -> Option<Self> {
+        let hand = match raw.trim() {
+            "1" => RpsHand::Paper,
+            "2" => RpsHand::Scissors,
+            "3" => RpsHand::Rock,
+            _ => return None,
+        };
+        Some(GameResult::Rps(hand))
+    }
+
+    /// The archived marker: `[dice result:4]`, `[rps result:rock]`.
+    pub fn marker(self) -> String {
+        match self {
+            GameResult::Dice(face) => format!("[dice result:{face}]"),
+            GameResult::Rps(hand) => format!("[rps result:{}]", hand.name()),
+        }
+    }
+}
+
 const FULLWIDTH_OPEN: char = '\u{FF3B}';
 const FULLWIDTH_CLOSE: char = '\u{FF3D}';
 
@@ -91,6 +153,32 @@ pub fn fill(text: &str, name: &str, index: usize, replacement: &str) -> Option<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn platform_game_results_read_as_observed_results() {
+        assert_eq!(
+            GameResult::dice(" 4 ").map(GameResult::marker).as_deref(),
+            Some("[dice result:4]")
+        );
+        for out_of_range in ["0", "7", "-1", "six", ""] {
+            assert_eq!(GameResult::dice(out_of_range), None, "{out_of_range:?}");
+        }
+        // QQ's numbering: 1 paper, 2 scissors, 3 rock.
+        let hands: Vec<_> = ["1", "2", "3"]
+            .into_iter()
+            .map(|raw| GameResult::rps(raw).map(GameResult::marker))
+            .collect();
+        assert_eq!(
+            hands,
+            [
+                Some("[rps result:paper]".to_owned()),
+                Some("[rps result:scissors]".to_owned()),
+                Some("[rps result:rock]".to_owned())
+            ]
+        );
+        assert_eq!(GameResult::rps("0"), None);
+        assert_eq!(GameResult::rps("4"), None);
+    }
 
     #[test]
     fn neutralize_removes_nul_and_ascii_brackets() {
