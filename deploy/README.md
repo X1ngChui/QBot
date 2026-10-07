@@ -127,10 +127,12 @@ NapCat is untouched and reconnects by itself.
   vision, embedding, search, media), and the rest connect directly. Proxy variables in the
   environment are ignored, so the configuration alone decides the route. A used-up plan allowance is reported to the model as
   unavailable search; no local quota is kept on top of the provider's.
-- A message's media is worked on when it arrives. A reply triggered by such a message waits up to
-  25 seconds for the result, then goes ahead with whatever is ready. Descriptions are cached by
-  picture id and by content, so a picture is described once. They are written in the language
-  the locale names, as is memory.
+- A message's media is worked on when it arrives. A reply waits up to 25 seconds for the group's
+  pictures and clips still being worked on, then goes ahead with whatever is ready. Descriptions
+  are cached by the picture's content and by the vision model and instructions that wrote them,
+  so a repost is not described again, and a new vision model or locale describes new pictures
+  in its own way while what is already archived keeps its words. They are written in the
+  language the locale names, as is memory.
 - **NapCat setting required:** turn on `enableLocalFile2Url` in NapCat's OneBot configuration
   (`onebot11_<account>.json`, or the WebUI's OneBot settings). With it NapCat returns the bytes of
   pictures and voice clips inline in `get_image` / `get_record`. QBot never reads NapCat's files
@@ -152,7 +154,7 @@ The bot runs its own maintenance; nothing outside the container is needed.
   that has never run starts from now.
 - **Nightly run**, in order: memory extraction for every group (after embedding any episode the
   configured embedding model has no vector for, so a new embedding model needs no other step),
-  decay (stale name candidates, picture descriptions older than 15 days, faded facts), a verified
+  decay (stale name candidates, cached picture descriptions older than 15 days, faded facts), a verified
   `pg_dump`, then cleanup (finished timers after 30 days, old runs, NapCat's file cache). Every
   stage runs even if an earlier one failed; the job then fails and is retried with backoff.
 - **Backups** go to `data/qbot/backups` as `qbot-YYYYMMDD-HHMMSS.dump`. A dump is written under a

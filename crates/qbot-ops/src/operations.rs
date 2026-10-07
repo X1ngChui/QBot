@@ -34,8 +34,9 @@ pub struct OpsConfig {
 impl OpsConfig {
     /// The nightly upkeep around the deployment's choices (backups, run retention, who gets the
     /// report, the time zone, how facts fade). A name candidate nothing has supported for 30
-    /// days is dropped; picture descriptions are redone after 15 days, so a changed vision model
-    /// or prompt takes effect; finished timers are kept 30 days for /tasks history.
+    /// days is dropped; a cached picture description is dropped after 15 days (it serves reposts,
+    /// which come within days, and must not grow with the archive; what was archived keeps its
+    /// words); finished timers are kept 30 days for /tasks history.
     pub fn new(
         backup: Option<BackupConfig>,
         runs_keep: Option<Duration>,

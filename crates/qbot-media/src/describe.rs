@@ -4,6 +4,8 @@ use qbot_llm::{
     ReasoningEffort, Request, Role, ToolChoice, collect,
 };
 
+use sha2::{Digest, Sha256};
+
 use crate::clean::clean_description;
 use crate::ports::{DescribeError, Describer};
 
@@ -88,6 +90,19 @@ impl Describer for LlmDescriber {
         } else {
             Ok(text)
         }
+    }
+
+    fn fingerprint(&self) -> String {
+        let info = self.provider.info();
+        let mut hash = Sha256::new();
+        for part in [info.id.as_str(), &info.model, &self.instructions] {
+            hash.update(part.as_bytes());
+            hash.update([0]);
+        }
+        hash.finalize()[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
     }
 }
 

@@ -33,6 +33,10 @@ pub enum DescribeError {
 #[async_trait]
 pub trait Describer: Send + Sync {
     async fn describe(&self, bytes: &[u8], mime: &str) -> Result<String, DescribeError>;
+
+    /// What decides the wording of a description (the model and its instructions), as a short
+    /// token. Cached descriptions are keyed by it, so another model or language describes anew.
+    fn fingerprint(&self) -> String;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -49,7 +53,7 @@ pub trait Transcriber: Send + Sync {
 #[error("{0}")]
 pub struct CacheError(pub String);
 
-/// What pictures were described as. Keys are opaque to the caller.
+/// What pictures were described as, by content and describer. Keys are opaque to the store.
 #[async_trait]
 pub trait DescriptionCache: Send + Sync {
     async fn get(&self, key: &str) -> Result<Option<String>, CacheError>;

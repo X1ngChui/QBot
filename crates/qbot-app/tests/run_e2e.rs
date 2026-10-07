@@ -656,9 +656,9 @@ async fn pictures_and_voice_reach_the_model_as_words() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(cached, 2, "cached by platform id and by content");
+    assert_eq!(cached, 1, "cached by describer and content");
 
-    // The same picture again is free: no new vision call (the next model call is the reply).
+    // The same picture again costs no vision call (the next model call is the reply).
     napcat
         .send(group_message(
             2,

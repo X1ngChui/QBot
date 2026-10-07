@@ -26,8 +26,8 @@ and group knowledge, each grounded in verbatim quotes, with confidence that fade
 by hand are a separate store with their own commands.
 R7. Identity: accounts belong to people; linking and splitting with revision-checked
 confirmation; stable member numbers per group.
-R8. Media: pictures described once and archived as text, originals opened on demand; voice
-transcribed on the CPU in the process.
+R8. Media: pictures described once by content and archived as text, originals opened on demand;
+voice transcribed on the CPU in the process.
 R9. Commands without model calls for members and owners (section 12).
 R10. Group tasks: durable one-shot timers owned by the group, bounded, never run twice, waking
 the agent with fresh context.
@@ -216,27 +216,52 @@ a derived index the nightly run keeps complete for the configured embedding mode
 
 ## 9. Media (`qbot-media`, `qbot-asr`)
 
-- A message with media is archived at once with bare markers; the media service then fills them
-  in place (`[image:a red bicycle]`, `[voice:see you at eight]`, `[voice:unclear]`) by rewriting
-  the stored line. The k-th marker of a kind is addressed by position, counting filled markers,
-  so slots survive out-of-order completion. Bytes exist only in memory.
-- **Pictures**: a description cache keyed by platform file id and by content hash; a size bound
-  (untrusted input); a per-group rate (`media.images_per_minute`, governor) so one busy group
-  cannot use up the capacity of all; single-flight fetching (the message's link, then a fresh link
-  from `get_image`); the vision model (`providers.vision`). A picture that could not be read or was
-  declined is held for ten minutes (a moka TTL cache) instead of being retried on every repost.
-  Descriptions expire after 15 days so a changed vision model takes effect.
+Three kinds of state are kept apart. The **archived line** is durable conversational state: a
+picture's words are filled in once and are then part of the record, never revisited. The
+**description cache** is a derived lookup that only saves model calls. **Transport state** (a
+platform link, a provider's uploaded-file id, fetched bytes) is temporary and lives in memory or in
+the `media_ref` row the platform reference came in.
+
+- **Archiving.** A message with media is archived at once with bare markers, with each item's
+  platform reference (`media_ref`: kind, position, file id or sticker id, link, size). The media
+  service then fills the markers in place (`[image:a red bicycle]`, `[voice:see you at eight]`,
+  `[voice:unclear]`) by rewriting the stored line. The k-th marker of a kind is addressed by
+  position, counting filled markers, so slots survive out-of-order completion. Each message is
+  worked on once, when it is first archived: the archive's dedup gate admits no second pass.
+  Work is in memory only; media the service could not take (overload, the per-group rate, a
+  failed call, a restart) stays a bare marker, and `open_images` still reaches it.
+- **Pictures.** On arrival the bytes are always fetched (the message's link, then a fresh copy
+  from `get_image`), within a size bound (untrusted input). The description is looked up by
+  `fingerprint:sha256(bytes)`, where the fingerprint names the describer (provider, model and
+  instructions, which carry the writing language). A platform id says where a picture is, not
+  what it shows: the same picture under another id or in another group is recognised, a reused
+  id with other pixels is described anew, and a changed model or locale writes new descriptions
+  without touching the archived ones. Only a cache miss spends the group's rate
+  (`media.images_per_minute`, governor) and one call to the vision model (`providers.vision`),
+  single-flight per content key so concurrent reposts share the call. A source no route could
+  read is held for ten minutes by its platform reference, a picture the model declined by its
+  content key (a moka TTL cache); a failed call is not held. Cached descriptions are dropped after
+  15 days: they serve reposts, which come within days, and must not grow with the archive.
+- **Stickers** (marketplace) are fetched as their still PNG and described like pictures.
+- **Forwarded records.** Pictures inside one are fetched and filled only when their content was
+  described before: no model call for content not posted in the group. Clips inside one are not
+  transcribed.
 - **Voice**: always `get_record` with a WAV conversion (the stored file holds SILK audio a
   recognizer answers with silence), transcribed by `qbot-asr` (SenseVoice through sherpa-onnx on
-  the CPU, model loaded and checked at startup); `media.clips_per_minute` per group.
-- **Stickers** (marketplace) are described like pictures and cached under the sticker id. Forwarded
-  pictures are filled only from the cache: no model call for content not posted in the group.
-- **`open_images`** lets the model look at an archived picture itself; the archive keeps each
-  item's platform reference, bytes are fetched again and kept in a 64 MiB in-memory cache. It is
-  offered only when the text model takes images. DeepSeek takes images through its Files API (one
-  upload per picture, reused for its 30-day lifetime); OpenAI-style providers take data URLs.
-- A reply to a message with media waits up to 25 seconds for it, then goes ahead with what there
-  is.
+  the CPU, model loaded and checked at startup); `media.clips_per_minute` per group. Transcripts
+  are not cached: a clip cannot be reposted as such.
+- **`open_images`** lets the model look at an archived picture itself, addressed by message and
+  position as the chat shows it. The bytes are fetched again from the platform through the stored
+  reference and kept in a 64 MiB in-memory cache for the runs in flight; this works while QQ still
+  serves the picture (NapCat's own file cache is cleaned nightly). It is offered only when the
+  text model takes images. OpenAI-style providers take data URLs. DeepSeek takes images through
+  its Files API: the adapter keys uploads by `sha256(bytes)` (a request's image keys name pictures
+  only within its own media store), uploads each picture once per process for its 30-day lifetime,
+  and shares one upload between concurrent requests; the cache belongs to one provider instance,
+  so file ids never cross accounts or providers.
+- **Waiting.** A reply waits up to 25 seconds for every picture and clip of its group still being
+  worked on, not only its trigger's (the picture a question is about is often the message before
+  it, or the quoted one), then goes ahead with what there is.
 
 ## 10. Scheduling (`qbot-sched`)
 
@@ -387,7 +412,7 @@ spend.
 ## 16. Operations (`qbot-ops`)
 
 - **Nightly**: extraction (each group's episodes, after embedding any the current index lacks),
-  decay (name candidates nothing supported for 30 days, picture descriptions older than 15 days,
+  decay (name candidates nothing supported for 30 days, cached picture descriptions older than 15 days,
   faded facts), a verified backup, cleanup (finished timers after 30 days, finished runs after
   `maintenance.runs_keep_days`, NapCat's file cache through its `clean_cache` action). Every stage
   runs; the job fails if any failed.

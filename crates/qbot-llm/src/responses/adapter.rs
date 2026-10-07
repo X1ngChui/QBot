@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use futures_util::{StreamExt, stream};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::capability::{
     Capabilities, ForcedToolChoice, ProviderId, ProviderInfo, Realization, ReasoningInfo,
@@ -28,7 +29,9 @@ pub struct ResponsesProvider {
     info: ProviderInfo,
     cfg: ResponsesConfig,
     transport: Arc<dyn Transport>,
-    /// Image key to uploaded file id (DeepSeek), until shortly before the file expires.
+    /// SHA-256 of an image's bytes to its uploaded file id (DeepSeek), until shortly before the
+    /// file expires. Keyed by content: a request's image keys name pictures only within its own
+    /// media store, while this outlives every request.
     uploads: moka::future::Cache<String, String>,
 }
 
@@ -111,19 +114,18 @@ impl ResponsesProvider {
     ) -> Result<HashMap<String, ImageSource>, LlmError> {
         let mut out = HashMap::new();
         for key in image_keys(request, plan) {
-            if self.cfg.flavor == Flavor::DeepSeek
-                && let Some(id) = self.uploads.get(&key).await
-            {
-                out.insert(key, ImageSource::File(id));
-                continue;
-            }
             let media = request
                 .media
                 .ok_or_else(|| LlmError::InvalidRequest("images require a media store".into()))?;
             let loaded = media.load(&key).await?;
             let source = if self.cfg.flavor == Flavor::DeepSeek {
-                let id = self.upload(&loaded).await?;
-                self.uploads.insert(key.clone(), id.clone()).await;
+                let digest = format!("{:x}", Sha256::digest(&loaded.bytes));
+                // Concurrent requests with the same picture share one upload.
+                let id = self
+                    .uploads
+                    .try_get_with(digest, self.upload(&loaded))
+                    .await
+                    .map_err(|error| (*error).clone())?;
                 ImageSource::File(id)
             } else {
                 let encoded = base64::engine::general_purpose::STANDARD.encode(&loaded.bytes);

@@ -96,7 +96,8 @@ struct Inner {
     /// Per-group rates: one busy group cannot use up the capacity of all.
     image_rate: GroupRate,
     clip_rate: GroupRate,
-    /// Pictures not worth another attempt for a while, by flight key.
+    /// Pictures not worth another attempt for a while: an unreadable reference by its source
+    /// key, a declined picture by its content key.
     unreadable: moka::sync::Cache<String, ()>,
     pending: Mutex<HashMap<(GroupId, MessageId), watch::Receiver<bool>>>,
     in_flight: AtomicUsize,
@@ -113,14 +114,6 @@ impl std::fmt::Debug for MediaService {
         f.debug_struct("MediaService")
             .field("in_flight", &self.inner.in_flight.load(Ordering::SeqCst))
             .finish_non_exhaustive()
-    }
-}
-
-/// The cache key of a platform id. Sticker ids and picture file ids are different namespaces.
-fn platform_key(kind: MediaKind, key: &str) -> String {
-    match kind {
-        MediaKind::Sticker => format!("p:sticker:{key}"),
-        _ => format!("p:{key}"),
     }
 }
 
@@ -149,7 +142,9 @@ fn take(rate: &GroupRate, group: GroupId) -> bool {
 }
 
 impl Inner {
-    fn flight_key(kind: MediaKind, reference: &MediaRef) -> Option<String> {
+    /// Which platform reference this is, for single-flight and holds. It names where the bytes
+    /// come from, never what they show.
+    fn source_key(kind: MediaKind, reference: &MediaRef) -> Option<String> {
         let source = reference
             .key
             .as_deref()
@@ -183,28 +178,61 @@ impl Inner {
     }
 
     /// The description of a picture, or `None` to leave its marker bare.
+    ///
+    /// The bytes are always fetched (a download, no model call), and the description is found
+    /// by what they are: a platform id says where a picture is, not what it shows, so the same
+    /// picture under another id is recognised and two pictures can never share an answer. A
+    /// picture inside a forwarded record (`nested`) only reads the cache: one forwarded album
+    /// must not set off a burst of paid calls.
     async fn describe(
         self: &Arc<Self>,
         group: GroupId,
         kind: MediaKind,
         reference: &MediaRef,
+        nested: bool,
     ) -> Option<String> {
         let describer = self.deps.describer.clone()?;
-        let platform_key = reference.key.as_ref().map(|k| platform_key(kind, k));
-        if let Some(key) = &platform_key
-            && let Some(found) = self.cached(key).await
-        {
-            return Some(found);
-        }
         if reference
             .size
             .is_some_and(|size| size > self.cfg.max_image_bytes)
         {
             return None;
         }
-        let flight_key = Self::flight_key(kind, reference)?;
-        if self.held(&flight_key) {
-            tracing::debug!("picture recently unreadable or declined; not retried");
+        let source = Self::source_key(kind, reference)?;
+        if self.held(&source) {
+            tracing::debug!("picture recently unreadable; not fetched again");
+            return None;
+        }
+        let fetched = {
+            let _permit = self.permits.acquire().await.ok()?;
+            self.deps
+                .fetcher
+                .image(reference, self.cfg.max_image_bytes)
+                .await
+        };
+        let bytes = match fetched {
+            Ok(bytes) => bytes,
+            Err(FetchError::TooLarge) => return None,
+            Err(FetchError::Unreadable) => {
+                // Pictures of a forwarded record are often not served at all; that is no news.
+                if nested {
+                    tracing::debug!("forwarded picture unreadable; not retried for a while");
+                } else {
+                    tracing::warn!("picture unreadable by every route; not retried for a while");
+                }
+                self.hold(&source);
+                return None;
+            }
+        };
+        let key = format!("{}:{}", describer.fingerprint(), digest(&bytes));
+        if let Some(found) = self.cached(&key).await {
+            return Some(found);
+        }
+        if nested {
+            return None;
+        }
+        if self.held(&key) {
+            tracing::debug!("picture recently declined; not asked again");
             return None;
         }
         if !take(&self.image_rate, group) {
@@ -215,41 +243,19 @@ impl Inner {
             return None;
         }
         let this = Arc::clone(self);
-        let reference = reference.clone();
         let flights = Arc::clone(&self.flights);
         flights
-            .run(flight_key.clone(), async move {
-                let _permit = this.permits.acquire().await.ok()?;
-                let bytes = match this
-                    .deps
-                    .fetcher
-                    .image(&reference, this.cfg.max_image_bytes)
-                    .await
-                {
-                    Ok(bytes) => bytes,
-                    Err(FetchError::TooLarge) => return None,
-                    Err(FetchError::Unreadable) => {
-                        tracing::warn!(
-                            "picture unreadable by every route; not retried for a while"
-                        );
-                        this.hold(&flight_key);
-                        return None;
-                    }
-                };
-                // The same picture may arrive under another id.
-                let content_key = format!("h:{}", digest(&bytes));
-                if let Some(found) = this.cached(&content_key).await {
-                    if let Some(key) = &platform_key {
-                        this.remember(key, &found).await;
-                    }
+            .run(key.clone(), async move {
+                // A flight for these bytes may have finished since the lookup above.
+                if let Some(found) = this.cached(&key).await {
                     return Some(found);
                 }
-                let described = describer.describe(&bytes, sniff_mime(&bytes)).await;
-                let text = match described {
+                let _permit = this.permits.acquire().await.ok()?;
+                let text = match describer.describe(&bytes, sniff_mime(&bytes)).await {
                     Ok(text) => clean_description(&text),
                     Err(DescribeError::Declined) => {
                         tracing::info!("the vision model declined a picture; left unseen");
-                        this.hold(&flight_key);
+                        this.hold(&key);
                         return None;
                     }
                     Err(DescribeError::Failed(error)) => {
@@ -260,10 +266,7 @@ impl Inner {
                 if text.is_empty() {
                     return None;
                 }
-                this.remember(&content_key, &text).await;
-                if let Some(key) = &platform_key {
-                    this.remember(key, &text).await;
-                }
+                this.remember(&key, &text).await;
                 Some(text)
             })
             .await
@@ -285,7 +288,7 @@ impl Inner {
             // refused before fetching; the exact cap is enforced on the converted audio.
             return None;
         }
-        let flight_key = Self::flight_key(MediaKind::Voice, reference)?;
+        let flight_key = Self::source_key(MediaKind::Voice, reference)?;
         if self.held(&flight_key) {
             return None;
         }
@@ -331,21 +334,11 @@ impl Inner {
             .await
     }
 
-    /// A description already paid for, by platform id. Costs nothing.
-    async fn cached_description(&self, kind: MediaKind, reference: &MediaRef) -> Option<String> {
-        let key = reference.key.as_ref()?;
-        self.cached(&platform_key(kind, key)).await
-    }
-
     async fn process(self: &Arc<Self>, job: &MediaJob, item: &MediaItem) {
         let marker = item.kind.marker();
         let replacement = match item.kind {
-            MediaKind::Image | MediaKind::Sticker if item.nested => self
-                .cached_description(item.kind, &item.reference)
-                .await
-                .map(|text| format!("[{marker}:{text}]")),
             MediaKind::Image | MediaKind::Sticker => self
-                .describe(job.group, item.kind, &item.reference)
+                .describe(job.group, item.kind, &item.reference, item.nested)
                 .await
                 .map(|text| format!("[{marker}:{text}]")),
             MediaKind::Voice => self
@@ -403,10 +396,7 @@ impl MediaService {
             .items
             .iter()
             .filter(|item| match item.kind {
-                // A nested picture only reads the cache, which needs no describer.
-                MediaKind::Image | MediaKind::Sticker => {
-                    item.nested || inner.deps.describer.is_some()
-                }
+                MediaKind::Image | MediaKind::Sticker => inner.deps.describer.is_some(),
                 MediaKind::Voice => inner.deps.transcriber.is_some(),
             })
             .cloned()
@@ -448,22 +438,36 @@ impl MediaService {
         Admission::Started
     }
 
-    /// Wait until a message's media work has finished, up to `timeout`. True when there is
-    /// nothing (left) to wait for.
-    pub async fn wait(&self, group: GroupId, message: MessageId, timeout: Duration) -> bool {
-        let receiver = self
+    /// Whether any of `group`'s media is being worked on.
+    pub fn busy(&self, group: GroupId) -> bool {
+        self.inner
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .any(|(g, _)| *g == group)
+    }
+
+    /// Wait until the media work of `group` in flight now has finished, up to `timeout`. True
+    /// when there is nothing (left) to wait for.
+    ///
+    /// A reply waits for all of it, not only its trigger's: the picture a question is about is
+    /// often posted in the message before it, or is the quoted one.
+    pub async fn settle(&self, group: GroupId, timeout: Duration) -> bool {
+        let receivers: Vec<watch::Receiver<bool>> = self
             .inner
             .pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(&(group, message))
-            .cloned();
-        let Some(mut receiver) = receiver else {
-            return true;
-        };
-        tokio::time::timeout(timeout, receiver.wait_for(|done| *done))
-            .await
-            .is_ok()
+            .iter()
+            .filter(|((g, _), _)| *g == group)
+            .map(|(_, receiver)| receiver.clone())
+            .collect();
+        let all = join_all(receivers.into_iter().map(|mut receiver| async move {
+            // A dropped sender means the work is over as well.
+            let _ = receiver.wait_for(|done| *done).await;
+        }));
+        tokio::time::timeout(timeout, all).await.is_ok()
     }
 
     /// Stop accepting work and let what is in flight finish.

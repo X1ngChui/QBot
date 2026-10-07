@@ -10,7 +10,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MediaKind {
     Image,
-    /// A marketplace sticker: described like a picture, cached by its sticker id.
+    /// A marketplace sticker: described like a picture.
     Sticker,
     Voice,
 }

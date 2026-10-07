@@ -4,7 +4,8 @@ use qbot_core::{GroupId, MediaKind, MessageId};
 /// it has.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MediaRef {
-    /// A stable platform identifier (the file id), known before anything is downloaded.
+    /// A platform identifier (a file id, a sticker id). It names where the bytes come from, for
+    /// holding an unreadable source; it never stands for what they show.
     pub key: Option<String>,
     /// A link carried by the message. It may expire.
     pub url: Option<String>,
@@ -21,7 +22,8 @@ pub struct MediaItem {
     pub index: usize,
     pub reference: MediaRef,
     /// Inside a forwarded record rather than posted here. Such an item gets a description only
-    /// if one is already cached: one forwarded album must not set off a burst of paid calls.
+    /// if its picture was described before: one forwarded album must not set off a burst of
+    /// paid calls.
     pub nested: bool,
 }
 

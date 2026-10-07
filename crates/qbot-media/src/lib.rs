@@ -3,7 +3,9 @@
 //! A message with media is archived at once with bare markers (`[image]`, `[voice]`). This crate
 //! then fetches each item, describes the picture or transcribes the clip, and rewrites its
 //! marker (`[image:a cat on a keyboard]`, `[voice:see you at eight]`). Raw bytes live only in
-//! memory for the duration of the work; text and cache keys are all that is kept.
+//! memory for the duration of the work. A description is cached by the picture's content and the
+//! describer that wrote it, so a repost of the same picture under any id costs a download, not a
+//! model call; once filled into a line it is part of the archive and never revisited.
 //!
 //! Everything vendor- or platform-specific is behind a port ([`Fetcher`], [`Describer`],
 //! [`Transcriber`]), so the service is tested without a network or a model.

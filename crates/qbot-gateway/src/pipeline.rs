@@ -6,7 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use qbot_agent::{Rejected, Supervisor, Trigger, TriggerRequest};
 use qbot_core::{AccountId, GroupId, MessageId, UnixMillis};
-use qbot_media::{Admission, MediaJob, MediaService};
+use qbot_media::{MediaJob, MediaService};
 use tokio_util::task::TaskTracker;
 
 use qbot_store::MediaRefRow;
@@ -74,7 +74,7 @@ struct BatchHook {
 
 struct MediaHook {
     service: Arc<MediaService>,
-    /// How long a reply waits for the triggering message's pictures and clips to be described.
+    /// How long a reply waits for the group's pictures and clips in flight to be described.
     wait: Duration,
 }
 
@@ -129,8 +129,8 @@ impl Pipeline {
         self
     }
 
-    /// Describe pictures and transcribe clips as messages arrive. A reply triggered by such a
-    /// message waits up to `wait` for the result so the model sees words, not bare markers.
+    /// Describe pictures and transcribe clips as messages arrive. A reply waits up to `wait` for
+    /// the group's media in flight so the model sees words, not bare markers.
     pub fn with_media(mut self, service: Arc<MediaService>, wait: Duration) -> Self {
         self.media = Some(MediaHook { service, wait });
         self
@@ -194,13 +194,11 @@ impl Pipeline {
             return;
         }
 
-        let admission = self.media.as_ref().map(|hook| {
-            if job.items.is_empty() {
-                Admission::Nothing
-            } else {
-                hook.service.admit(job)
-            }
-        });
+        if let Some(hook) = &self.media
+            && !job.items.is_empty()
+        {
+            hook.service.admit(job);
+        }
 
         let typed = render::typed_text(&m.segments);
         if let Some(request) = self.command(&m, &typed) {
@@ -236,18 +234,19 @@ impl Pipeline {
                 sender: m.sender,
             },
         };
-        match (&self.media, admission) {
-            (Some(hook), Some(Admission::Started)) => {
-                // The message carries media still being worked on: let it finish (bounded)
-                // before the run's window is taken, off the reader so other frames keep flowing.
+        match &self.media {
+            Some(hook) if hook.service.busy(m.group) => {
+                // Pictures and clips of the group are still being worked on, perhaps the one
+                // this message asks about: let them finish (bounded) before the run's window is
+                // taken, off the reader so other frames keep flowing.
                 let (supervisor, service, wait) = (
                     Arc::clone(&self.supervisor),
                     Arc::clone(&hook.service),
                     hook.wait,
                 );
-                let (group, message) = (m.group, m.message);
+                let group = m.group;
                 self.tasks.spawn(async move {
-                    if !service.wait(group, message, wait).await {
+                    if !service.settle(group, wait).await {
                         tracing::info!(
                             group = group.get(),
                             "media still pending; replying with what is there"

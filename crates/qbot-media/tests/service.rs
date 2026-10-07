@@ -65,6 +65,7 @@ struct Describer0 {
     answer: Mutex<Result<String, DescribeError>>,
     delay: Duration,
     calls: AtomicUsize,
+    fingerprint: &'static str,
 }
 
 impl Describer0 {
@@ -73,6 +74,7 @@ impl Describer0 {
             answer: Mutex::new(Ok(answer.to_owned())),
             delay: Duration::ZERO,
             calls: AtomicUsize::new(0),
+            fingerprint: "v1",
         })
     }
     fn slow(answer: &str, delay: Duration) -> Arc<Self> {
@@ -80,6 +82,7 @@ impl Describer0 {
             answer: Mutex::new(Ok(answer.to_owned())),
             delay,
             calls: AtomicUsize::new(0),
+            fingerprint: "v1",
         })
     }
 }
@@ -90,6 +93,10 @@ impl Describer for Describer0 {
         self.calls.fetch_add(1, Ordering::SeqCst);
         tokio::time::sleep(self.delay).await;
         self.answer.lock().unwrap().clone()
+    }
+
+    fn fingerprint(&self) -> String {
+        self.fingerprint.to_owned()
     }
 }
 
@@ -241,12 +248,11 @@ fn rig(
     }
 }
 
+/// Wait for the group's media work; `id` names the message the test is waiting for.
 async fn finish(rig: &Rig, id: i64) {
     assert!(
-        rig.service
-            .wait(group(), message(id), Duration::from_secs(5))
-            .await,
-        "the media work should finish"
+        rig.service.settle(group(), Duration::from_secs(5)).await,
+        "the media work of message {id} should finish"
     );
 }
 
@@ -269,12 +275,12 @@ async fn a_picture_is_described_cached_and_filled_into_its_line() {
         "markdown stripped, one line, brackets neutralized"
     );
     assert_eq!(
-        r.cache.0.lock().unwrap().len(),
-        2,
-        "by platform key and by content"
+        r.cache.0.lock().unwrap().keys().collect::<Vec<_>>(),
+        [&format!("v1:{}", sha256_hex(b"\x89PNG-bytes"))],
+        "by describer and content"
     );
 
-    // The same picture again costs nothing: no download, no model call.
+    // The same picture again costs a download, no model call.
     let (calls_f, calls_d) = (
         r.fetcher.calls.load(Ordering::SeqCst),
         r.describer.calls.load(Ordering::SeqCst),
@@ -292,8 +298,68 @@ async fn a_picture_is_described_cached_and_filled_into_its_line() {
             r.fetcher.calls.load(Ordering::SeqCst),
             r.describer.calls.load(Ordering::SeqCst)
         ),
-        (calls_f, calls_d)
+        (calls_f + 1, calls_d)
     );
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
+#[tokio::test]
+async fn a_platform_id_reused_for_other_pixels_gets_its_own_description() {
+    let fetcher = Fetcher0::with(&[("same-name.jpg", Ok(b"first".to_vec()))]);
+    let r = rig(
+        config(),
+        fetcher.clone(),
+        Describer0::new("a cat"),
+        &[(1, "[image]"), (2, "[image]")],
+    );
+    r.service.admit(job(1, vec![image(0, "same-name.jpg")]));
+    finish(&r, 1).await;
+    fetcher
+        .files
+        .lock()
+        .unwrap()
+        .insert("same-name.jpg".into(), Ok(b"second".to_vec()));
+    *r.describer.answer.lock().unwrap() = Ok("a bus".into());
+    r.service.admit(job(2, vec![image(0, "same-name.jpg")]));
+    finish(&r, 2).await;
+    assert_eq!(
+        (r.lines.text(1), r.lines.text(2)),
+        ("[image:a cat]".into(), "[image:a bus]".into())
+    );
+}
+
+#[tokio::test]
+async fn another_describer_does_not_reuse_the_old_descriptions() {
+    let cache = Arc::new(Cache::default());
+    let lines = Lines::with(&[(1, "[image]"), (2, "[image]")]);
+    let service = |describer: Arc<Describer0>| {
+        MediaService::new(
+            config(),
+            MediaDeps {
+                fetcher: Fetcher0::with(&[("a", Ok(b"1".to_vec()))]),
+                describer: Some(describer),
+                transcriber: None,
+                cache: cache.clone(),
+                editor: lines.clone(),
+            },
+        )
+    };
+    let old = service(Describer0::new("a cat"));
+    old.admit(job(1, vec![image(0, "a")]));
+    assert!(old.settle(group(), Duration::from_secs(5)).await);
+    let other = Arc::new(Describer0 {
+        fingerprint: "v2",
+        ..Arc::into_inner(Describer0::new("eine Katze")).unwrap()
+    });
+    let new = service(other.clone());
+    new.admit(job(2, vec![image(0, "a")]));
+    assert!(new.settle(group(), Duration::from_secs(5)).await);
+    assert_eq!(lines.text(2), "[image:eine Katze]");
+    assert_eq!(other.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -476,19 +542,11 @@ async fn voice_is_transcribed_or_marked_unclear() {
         },
     );
     service.admit(job(1, vec![voice(0, "c1")]));
-    assert!(
-        service
-            .wait(group(), message(1), Duration::from_secs(5))
-            .await
-    );
+    assert!(service.settle(group(), Duration::from_secs(5)).await);
     assert_eq!(lines.text(1), "[voice:hello there]");
     *transcriber.0.lock().unwrap() = Ok("   ".into());
     service.admit(job(2, vec![voice(0, "c2")]));
-    assert!(
-        service
-            .wait(group(), message(2), Duration::from_secs(5))
-            .await
-    );
+    assert!(service.settle(group(), Duration::from_secs(5)).await);
     assert_eq!(lines.text(2), "[voice:unclear]");
 }
 
@@ -511,9 +569,7 @@ async fn disabled_backends_leave_their_media_alone() {
     );
     assert_eq!(lines.text(1), "[image]");
     assert!(
-        service
-            .wait(group(), message(1), Duration::from_millis(10))
-            .await,
+        service.settle(group(), Duration::from_millis(10)).await,
         "nothing to wait for"
     );
 }
@@ -537,9 +593,7 @@ async fn too_much_media_in_flight_is_declined_and_waiting_is_bounded() {
         Admission::Overloaded
     );
     assert!(
-        !r.service
-            .wait(group(), message(1), Duration::from_millis(20))
-            .await,
+        !r.service.settle(group(), Duration::from_millis(20)).await,
         "a short wait gives up"
     );
     finish(&r, 1).await;
@@ -574,37 +628,32 @@ async fn shutdown_lets_started_work_finish_and_refuses_new_work() {
 async fn a_picture_inside_a_forwarded_record_only_reads_the_cache() {
     let r = rig(
         config(),
-        Fetcher0::with(&[("known", Ok(b"1".to_vec())), ("new", Ok(b"2".to_vec()))]),
-        Describer0::new("pic"),
-        &[(1, "[image] [image]")],
+        Fetcher0::with(&[
+            ("posted", Ok(b"1".to_vec())),
+            ("same", Ok(b"1".to_vec())),
+            ("new", Ok(b"2".to_vec())),
+        ]),
+        Describer0::new("a red door"),
+        &[(1, "[image]"), (2, "[image] [image]")],
     );
-    r.cache
-        .0
-        .lock()
-        .unwrap()
-        .insert("p:known".into(), "a red door".into());
-    let mut known = image(0, "known");
-    known.nested = true;
+    r.service.admit(job(1, vec![image(0, "posted")]));
+    finish(&r, 1).await;
+    let mut same = image(0, "same");
+    same.nested = true;
     let mut new = image(1, "new");
     new.nested = true;
-    r.service.admit(job(1, vec![known, new]));
-    finish(&r, 1).await;
+    r.service.admit(job(2, vec![same, new]));
+    finish(&r, 2).await;
     assert_eq!(
-        r.lines.text(1),
+        r.lines.text(2),
         "[image:a red door] [image]",
-        "the uncached one is not paid for"
+        "the picture posted before is recognised by its content; the new one is not paid for"
     );
-    assert_eq!(
-        (
-            r.fetcher.calls.load(Ordering::SeqCst),
-            r.describer.calls.load(Ordering::SeqCst)
-        ),
-        (0, 0)
-    );
+    assert_eq!(r.describer.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
-async fn stickers_are_described_once_per_sticker_id_in_their_own_namespace() {
+async fn stickers_are_described_once_per_picture() {
     let r = rig(
         config(),
         Fetcher0::with(&[("e9", Ok(b"\x89PNG".to_vec()))]),
@@ -623,12 +672,28 @@ async fn stickers_are_described_once_per_sticker_id_in_their_own_namespace() {
     r.service.admit(job(1, vec![sticker(0)]));
     finish(&r, 1).await;
     assert_eq!(r.lines.text(1), "[sticker:a waving cat]");
-    assert!(
-        r.cache.0.lock().unwrap().contains_key("p:sticker:e9"),
-        "not confused with a picture file called e9"
-    );
     r.service.admit(job(2, vec![sticker(0)]));
     finish(&r, 2).await;
     assert_eq!(r.lines.text(2), "[sticker:a waving cat]");
     assert_eq!(r.describer.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn settling_waits_for_every_message_of_the_group_and_no_other_group() {
+    let r = rig(
+        config(),
+        Fetcher0::with(&[("a", Ok(b"1".to_vec())), ("b", Ok(b"2".to_vec()))]),
+        Describer0::slow("pic", Duration::from_millis(100)),
+        &[(1, "[image]"), (2, "[image]")],
+    );
+    r.service.admit(job(1, vec![image(0, "a")]));
+    let elsewhere = MediaJob {
+        group: GroupId::new(901).unwrap(),
+        ..job(2, vec![image(0, "b")])
+    };
+    r.service.admit(elsewhere);
+    assert!(r.service.busy(group()));
+    finish(&r, 1).await;
+    assert_eq!(r.lines.text(1), "[image:pic]");
+    assert!(!r.service.busy(group()));
 }

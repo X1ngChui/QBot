@@ -367,6 +367,65 @@ async fn deepseek_takes_images_as_uploaded_files_and_uploads_each_once() {
     }
 }
 
+/// Every key holds the same bytes.
+struct Pixels(Vec<u8>);
+
+#[async_trait]
+impl MediaStore for Pixels {
+    async fn load(&self, _: &str) -> Result<qbot_llm::request::LoadedMedia, LlmError> {
+        Ok(qbot_llm::request::LoadedMedia {
+            mime: "image/png".into(),
+            bytes: self.0.clone(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn deepseek_reuses_an_upload_by_content_never_by_the_callers_key() {
+    let (server, provider) = sim_provider(
+        true,
+        StateMode::Stateless,
+        sim_steps(&[second_reply(), second_reply(), second_reply()]),
+        64,
+    );
+    let tools = tools();
+    let with_image = |key: &str| {
+        let mut items = base_conversation().items().to_vec();
+        items.push(ConvItem::Message(qbot_llm::Message {
+            role: qbot_llm::Role::User,
+            content: vec![Content::Image { key: key.into() }],
+        }));
+        Conversation::new(items)
+    };
+    // Keys only mean something within one request's store: one key over two stores holding
+    // different pictures, then a different key over the first picture again.
+    let calls = [
+        (with_image("picture"), Pixels(vec![1, 1, 1])),
+        (with_image("picture"), Pixels(vec![2, 2, 2])),
+        (with_image("other"), Pixels(vec![1, 1, 1])),
+    ];
+    for (conv, media) in &calls {
+        let mut req = request(conv, &tools, None);
+        req.media = Some(media);
+        provider.respond(req).await.unwrap();
+    }
+    let uploads = server.uploads();
+    assert_eq!(uploads.len(), 2, "one upload per distinct picture");
+    let sent: Vec<_> = server
+        .requests()
+        .iter()
+        .map(|body| body["input"].as_array().unwrap().last().unwrap()["content"][0].clone())
+        .collect();
+    assert_eq!(
+        sent,
+        [
+            json!({ "type": "input_image", "file_id": uploads[0].0 }),
+            json!({ "type": "input_image", "file_id": uploads[1].0 }),
+            json!({ "type": "input_image", "file_id": uploads[0].0 }),
+        ]
+    );
+}
+
 // ----- errors, retries, malformed output -----
 
 fn http(status: u16, code: &'static str) -> SimStep {

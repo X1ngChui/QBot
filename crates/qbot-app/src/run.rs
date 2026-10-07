@@ -59,7 +59,7 @@ use tokio_util::sync::CancellationToken;
 /// How often the database lease is checked. Losing it ends the process: another instance may
 /// already be running.
 const LEASE_CHECK: Duration = Duration::from_secs(10);
-/// How long a reply waits for its triggering message's pictures and clips before it goes ahead
+/// How long a reply waits for the group's pictures and clips in flight before it goes ahead
 /// without them: long enough for a description or a short transcript, short enough that the
 /// reply still feels prompt.
 const MEDIA_WAIT: Duration = Duration::from_secs(25);
