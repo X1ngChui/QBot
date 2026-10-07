@@ -30,6 +30,10 @@ qbot-prompt.workspace = true
 qbot-sched.workspace = true
 qbot-store.workspace = true
 qbot-tools.workspace = true
+# Repair only (temporary).
+sqlx.workspace = true
+sha2.workspace = true
+futures-util.workspace = true
 async-trait.workspace = true
 jiff.workspace = true
 mimalloc.workspace = true

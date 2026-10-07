@@ -185,6 +185,84 @@ impl EpisodeJobs {
     }
 }
 
+impl EpisodeJobs {
+    /// One-off repair (temporary): under the extraction lock, run `undo` (which deletes the
+    /// episodes of `rebuild` and un-applies the findings of every episode from the first of them
+    /// on), extract each slice of `rebuild` again, then apply every unconsolidated episode of the
+    /// group in archive order. Returns how many episodes were stored.
+    pub async fn repair_group<F>(
+        &self,
+        group: GroupId,
+        rebuild: &[std::ops::RangeInclusive<u64>],
+        undo: F,
+    ) -> Result<usize, JobError>
+    where
+        F: std::future::Future<Output = Result<(), String>> + Send,
+    {
+        let _one_at_a_time = self.running.lock().await;
+        undo.await.map_err(JobError)?;
+        let last = self.store.last_ordinal(group).await.map_err(failed)?;
+        for range in rebuild {
+            let plan = self
+                .slices
+                .next(range.start() - 1, last)
+                .filter(|plan| plan.target == *range)
+                .ok_or_else(|| JobError(format!("slice {range:?} cannot be planned again")))?;
+            let target = self
+                .store
+                .lines(group, *plan.target.start(), *plan.target.end())
+                .await
+                .map_err(failed)?;
+            if target.len() != (plan.target.end() - plan.target.start() + 1) as usize {
+                return Err(JobError(format!("slice {range:?} is not complete")));
+            }
+            let previous = match &plan.previous {
+                Some(r) => self
+                    .store
+                    .lines(group, *r.start(), *r.end())
+                    .await
+                    .map_err(failed)?,
+                None => Vec::new(),
+            };
+            let next = match &plan.next {
+                Some(r) => self
+                    .store
+                    .lines(group, *r.start(), *r.end())
+                    .await
+                    .map_err(failed)?,
+                None => Vec::new(),
+            };
+            let ctx = SliceContext {
+                previous: &previous,
+                target: &target,
+                next: &next,
+            };
+            let built = self
+                .builder
+                .build(group, &plan, self.slices.grid.lines_per_batch, &ctx)
+                .await
+                .map_err(failed)?;
+            self.store
+                .insert(&built.episode, &built.vector, &built.embed_model)
+                .await
+                .map_err(failed)?;
+            tracing::info!(group = group.get(), lines = ?plan.target, "repair: episode rebuilt");
+        }
+        if let Some(consolidator) = &self.consolidator {
+            let mut pending = self.store.unconsolidated(group).await.map_err(failed)?;
+            pending.sort_by_key(|e| e.episode.first_ordinal);
+            for episode in pending {
+                consolidator.apply(&episode).await.map_err(failed)?;
+                self.store
+                    .mark_consolidated(episode.id)
+                    .await
+                    .map_err(failed)?;
+            }
+        }
+        Ok(rebuild.len())
+    }
+}
+
 #[async_trait]
 impl JobRunner for EpisodeJobs {
     async fn run(&self, kind: JobKind, group: Option<GroupId>) -> Result<(), JobError> {
