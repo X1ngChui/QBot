@@ -11,7 +11,7 @@ source of truth; everything here is derived from it.
 - **Batch grid.** History is organized in fixed *batches* of `history.batch_lines` consecutive
   ordinals (30 by default), and the prompt's tiers move a whole batch at a time so the prompt
   prefix changes rarely: `history.raw_batches` newest batches verbatim, `history.summary_batches`
-  before them as episode summaries, older chat only through tools (design.md 7).
+  before them as episode summaries, older chat only through tools (architecture.md section 7).
 - **Slice and episode.** A *slice* is `memory.slice_batches` whole batches. An *episode* is the
   summary of exactly one slice: it owns that exact ordinal range and nothing else. The ranges of
   one group tile the archive with no gap and no overlap; Postgres enforces non-overlap with a
@@ -36,7 +36,11 @@ current embedding index lacks, then loops: find the next complete slice after th
 episode, read the previous, target and next lines, call the model, validate, embed
 `title + summary`, store the episode and its vector in one transaction, and apply its findings. It
 is idempotent, resumes at a failed slice, and refuses an archive with a gap in a slice rather than
-guessing.
+guessing. A slice that can never be extracted (the provider refuses its content or finds it too
+long, or no valid answer came back in any of the three attempts) is recorded in `slice_skip` and
+counts as covered, so it does not hold back the group's later slices; its lines have no episode,
+so they stay verbatim wherever history shows them, and remain searchable. Network, account and
+provider-side failures are not permanent: the job fails and the slice is tried again.
 
 The model answers with one tool call, `submit_episode`: a title and summary in the bot's writing
 language (from the locale), one to three evidence quotes, and findings: names, facts about members
@@ -155,23 +159,26 @@ The design above would then still hold: the slicing function is the only part th
 
 ## 7. Facts and group knowledge
 
-- **Consolidation** applies each episode's findings in order, right after it is stored and on
-  startup for any left over. Names become extracted identity evidence; facts and knowledge become
-  observations in `fact` / `fact_evidence`. A single-valued predicate supersedes its previous
-  value; a multi-valued one keys on the normalized object; an opposite predicate (likes /
-  dislikes) supersedes the other. An episode supports a fact at most once.
+- **Consolidation** applies each episode's findings in chat order, right after it is stored and,
+  for any left over by a crash, at the start of the group's next extraction. Names become
+  extracted identity evidence; facts and knowledge become observations in `fact` /
+  `fact_evidence`. A single-valued predicate supersedes its previous value; a multi-valued one
+  keys on the normalized object; an opposite predicate (likes / dislikes) supersedes the other.
+  One episode says one thing per slot (a subject's predicate and key, an opposite pair counting
+  as one): its last statement. An episode supports a fact at most once, so applying it again
+  changes nothing.
 - **Confidence** is the Wilson lower bound of the supporting episodes times `0.5^(age /
   half-life)`, with the half-life chosen by the predicate's decay class
   (`memory.facts.half_life_days`); a fact whose confidence falls below 0.05 is expired by the
   nightly run. It is computed on read, so it is deterministic for a given time.
 - **Where facts reach the model.** Member facts only through `lookup_member`: by predicate, the
   most recently confirmed first, with confidence and age, across the person's linked accounts.
-  Group knowledge as an instruction: the topic and the 40 most recently confirmed terms (design.md
-  7). Members see their own facts with `/who` and remove them with `/forget`.
+  Group knowledge as an instruction: the topic and the 40 most recently confirmed terms
+  ([architecture.md](architecture.md) section 7). Members see their own facts with `/who` and remove them with `/forget`.
 
 ## 8. Manual notes are not memory
 
-Two kinds of information about people and the group are kept apart (design.md 18):
+Two kinds of information about people and the group are kept apart (architecture.md section 18):
 
 | | Manual notes | Extracted memory |
 | --- | --- | --- |

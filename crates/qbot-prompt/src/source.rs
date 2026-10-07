@@ -450,8 +450,7 @@ impl PromptContext {
 
     /// The current group display name of every member who speaks in `window`, one entry per
     /// line in member order, asked of the platform now (in parallel) and kept nowhere. Empty
-    /// without a directory. A name is member-chosen text, so it is neutralized like chat text; a
-    /// member the platform cannot name is listed as unavailable.
+    /// without a directory. A member the platform cannot name is listed as unavailable.
     async fn names(&self, group: GroupId, window: &[ChatLine]) -> String {
         let Some(directory) = &self.directory else {
             return String::new();
@@ -475,10 +474,7 @@ impl PromptContext {
             .map(|(number, name)| {
                 let member = number.get().to_string();
                 match name {
-                    Some(name) => say(Text::PromptMemberName {
-                        member,
-                        name: qbot_core::marker::neutralize(&name),
-                    }),
+                    Some(name) => say(Text::PromptMemberName { member, name }),
                     None => say(Text::PromptMemberNameUnavailable { member }),
                 }
             })
@@ -563,7 +559,7 @@ impl ContextSource for PromptContext {
         let env = |e: PromptError| EnvError(e.to_string());
         // Most stable first, so runs share the longest prefix the provider can cache: the
         // persona's fixed instructions, then who is blocked or linked (changes when a member
-        // command does), then learned knowledge (changes nightly).
+        // command does), then learned knowledge (changes when an episode is extracted).
         let mut instructions = self.instructions(group).map_err(env)?;
         instructions.extend(self.people_instruction(group).await?);
         instructions.extend(self.knowledge_instruction(group).await?);

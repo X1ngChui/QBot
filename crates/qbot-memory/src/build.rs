@@ -32,6 +32,23 @@ pub enum BuildError {
     Embed(#[from] LlmError),
 }
 
+impl BuildError {
+    /// Whether this slice can never be extracted, so asking again would only spend calls: the
+    /// provider refuses its content or finds it too long, or the model gave no valid answer in
+    /// any attempt. Account, network and provider-side failures pass with time and are not.
+    pub fn is_permanent(&self) -> bool {
+        matches!(
+            self,
+            BuildError::EmptyTarget
+                | BuildError::Extract(
+                    ExtractError::CutOff
+                        | ExtractError::Invalid { .. }
+                        | ExtractError::Model(LlmError::ContentFiltered | LlmError::ContextTooLong)
+                )
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Built {
     pub episode: NewEpisode,

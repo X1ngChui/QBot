@@ -29,8 +29,8 @@ use qbot_llm::responses::{KeySource, ReqwestTransport, ResponsesProvider};
 use qbot_llm::search::TavilySearch;
 use qbot_llm::{Embedder, LlmError, Provider};
 use qbot_media::{
-    ArchivedMedia, Describer, LlmDescriber, MediaConfig, MediaDeps, MediaService, OpenImages,
-    PgLineEditor, Transcriber,
+    ArchivedMedia, Describer, LlmDescriber, MediaDeps, MediaService, OpenImages, PgLineEditor,
+    Transcriber,
 };
 use qbot_memory::consolidate::Consolidator;
 use qbot_memory::facts::FactStore;
@@ -297,7 +297,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         let store = Arc::new(ArchivedMedia::new(
             Arc::new(archive.clone()),
             fetcher.clone(),
-            MediaConfig::default().max_image_bytes,
+            config.media_config().max_image_bytes,
         ));
         let tools = tools
             .with(OpenImages(store.clone()))

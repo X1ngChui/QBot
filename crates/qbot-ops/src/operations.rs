@@ -188,7 +188,7 @@ impl Operations {
     pub async fn backup(&self) -> Result<(), JobError> {
         let Some(cfg) = &self.cfg.backup else {
             return Err(JobError(
-                "backups are switched off (maintenance.backups_enabled = false)".into(),
+                "backups are switched off (maintenance.backups = 0)".into(),
             ));
         };
         let made = create_verified_backup(cfg).await.map_err(failed)?;
@@ -198,12 +198,17 @@ impl Operations {
     }
 
     /// The whole pipeline in order. Every stage runs even if an earlier one failed (a failed
-    /// extraction must not cost a night's backup); the job fails, and is retried, if any stage did.
+    /// extraction must not cost a night's backup). The job fails, and is retried, if decay, the
+    /// backup or cleanup did; a failed extraction is logged and left to the group's next filled
+    /// batch or the next night, because a retry of the pipeline would also take another backup
+    /// and rotate an older one out.
     pub async fn nightly(&self) -> Result<(), JobError> {
         let mut failures = Vec::new();
         match self.extract_all().await {
             Ok(episodes) => tracing::info!(episodes, "extraction finished"),
-            Err(error) => failures.push(format!("extraction: {error}")),
+            Err(error) => {
+                tracing::error!(error = %error.0, "extraction failed; retried with the next batch or night")
+            }
         }
         if let Err(error) = self.decay().await {
             failures.push(format!("decay: {error}"));

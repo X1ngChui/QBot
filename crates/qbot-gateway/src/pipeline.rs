@@ -169,10 +169,7 @@ impl Pipeline {
         };
         let line = match self.intake.append(incoming).await {
             Ok(Stored::New { line, ordinal }) => {
-                if let Some(hook) = self.batches.as_ref().filter(|h| ordinal % h.lines == 0) {
-                    let (sink, group) = (Arc::clone(&hook.sink), m.group);
-                    self.tasks.spawn(async move { sink.filled(group).await });
-                }
+                self.archived(m.group, ordinal);
                 line
             }
             Ok(Stored::Duplicate) => {
@@ -312,8 +309,25 @@ impl Pipeline {
             mentions: Vec::new(),
             media: Vec::new(),
         };
-        if let Err(error) = self.intake.append(incoming).await {
-            tracing::error!(%error, group = n.group.get(), "archiving a notice failed");
+        match self.intake.append(incoming).await {
+            Ok(Stored::New { ordinal, .. }) => self.archived(n.group, ordinal),
+            Ok(Stored::Duplicate) => {}
+            Err(error) => {
+                tracing::error!(%error, group = n.group.get(), "archiving a notice failed")
+            }
+        }
+    }
+
+    /// A line became the group's `ordinal`-th: report a batch it fills, whatever kind of line
+    /// it is.
+    fn archived(&self, group: GroupId, ordinal: u64) {
+        if let Some(hook) = self
+            .batches
+            .as_ref()
+            .filter(|h| ordinal.is_multiple_of(h.lines))
+        {
+            let sink = Arc::clone(&hook.sink);
+            self.tasks.spawn(async move { sink.filled(group).await });
         }
     }
 }

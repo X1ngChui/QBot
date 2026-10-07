@@ -5,17 +5,17 @@
 //! the number of active-plus-waiting runs, bounds how many call the model at once, and gives
 //! each run one end-to-end deadline that queue time counts against.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use qbot_context::{RunEnd, Transcript};
 use qbot_core::{GroupId, RunId};
 use qbot_llm::Usage;
 use tokio::sync::{Notify, Semaphore, oneshot};
-use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::env::{ContextSource, EnvError, GroupPolicy, RunSummary, Trigger};
 use crate::run::{RunDeps, RunInput, RunReport, execute};
@@ -67,7 +67,7 @@ struct Inner {
     slots: AtomicUsize,
     permits: Semaphore,
     cancel: CancellationToken,
-    tasks: Mutex<JoinSet<()>>,
+    tasks: TaskTracker,
     freed: Notify,
 }
 
@@ -118,7 +118,7 @@ impl Supervisor {
                 policy,
                 slots: AtomicUsize::new(0),
                 cancel: CancellationToken::new(),
-                tasks: Mutex::new(JoinSet::new()),
+                tasks: TaskTracker::new(),
                 freed: Notify::new(),
             }),
         }
@@ -169,14 +169,8 @@ impl Supervisor {
     /// interrupted.
     pub async fn shutdown(&self) {
         self.inner.cancel.cancel();
-        let mut tasks = std::mem::take(
-            &mut *self
-                .inner
-                .tasks
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner),
-        );
-        while tasks.join_next().await.is_some() {}
+        self.inner.tasks.close();
+        self.inner.tasks.wait().await;
     }
 
     async fn check_gates(&self, request: &TriggerRequest) -> Result<(), Rejected> {
@@ -225,11 +219,7 @@ impl Supervisor {
             finished.freed.notify_one();
             let _ = tx.send(report);
         };
-        self.inner
-            .tasks
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .spawn(task);
+        self.inner.tasks.spawn(task);
         Ok(RunHandle { run, done: rx })
     }
 }

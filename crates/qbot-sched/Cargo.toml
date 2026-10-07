@@ -15,7 +15,7 @@ qbot-agent.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 
 [dev-dependencies]

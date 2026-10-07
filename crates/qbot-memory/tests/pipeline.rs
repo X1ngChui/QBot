@@ -564,6 +564,44 @@ async fn a_failed_slice_leaves_no_episode_and_is_retried_from_the_same_point() {
 }
 
 #[tokio::test]
+async fn a_slice_that_can_never_be_extracted_is_skipped_and_the_later_ones_still_are() {
+    let (fake, store, job) = jobs(
+        vec![
+            answer(good_answer()),
+            Step::Fail(LlmError::ContentFiltered),
+            answer(good_answer()),
+        ],
+        10,
+        1,
+    );
+    store.add_lines(group(), lines(1..=30));
+    assert_eq!(
+        job.extract_group(group()).await.unwrap(),
+        2,
+        "the refused slice holds nothing back"
+    );
+    let ranges: Vec<_> = store
+        .within(group(), 1, 1000)
+        .await
+        .unwrap()
+        .iter()
+        .map(|e| (e.episode.first_ordinal, e.episode.last_ordinal))
+        .collect();
+    assert_eq!(
+        ranges,
+        [(1, 10), (21, 30)],
+        "the refused slice has no episode"
+    );
+    assert_eq!(store.covered_through(group()).await.unwrap(), 30);
+    assert_eq!(job.extract_group(group()).await.unwrap(), 0);
+    assert_eq!(
+        fake.recorded().len(),
+        3,
+        "the refused slice is not asked again"
+    );
+}
+
+#[tokio::test]
 async fn an_archive_with_a_gap_is_refused_not_papered_over() {
     let (_, store, job) = jobs(answers(1), 10, 1);
     let mut all = lines(1..=20);
@@ -1208,4 +1246,67 @@ async fn an_answer_cut_off_on_every_attempt_is_an_error() {
     let error = extract_lines(&ex).await.unwrap_err();
     assert!(matches!(error, ExtractError::CutOff), "{error}");
     assert_eq!(fake.recorded().len(), 3, "every attempt was used");
+}
+
+#[tokio::test]
+async fn one_episode_says_one_thing_per_slot_and_applying_it_again_changes_nothing() {
+    use qbot_memory::consolidate::Consolidator;
+    use qbot_memory::facts::{FactStore, MemoryFactStore};
+    use qbot_memory::findings::{FactFinding, Findings};
+    use qbot_memory::identity::IdentityPolicy;
+    use qbot_memory::predicates::Predicates;
+    use qbot_memory::{Episode, EpisodeId, MemoryIdentityStore};
+
+    let kit = AccountId::new(11).unwrap();
+    let fact = |predicate: &str, object: &str| FactFinding {
+        account: kit,
+        predicate: predicate.into(),
+        object: object.into(),
+        message: MessageId::new(1).unwrap(),
+        quote: "q".into(),
+    };
+    let mut new = qbot_memory::conformance::episode(group(), 1, 30, "moves");
+    new.findings = Findings {
+        facts: vec![
+            fact("lives_in", "Hangzhou"),
+            fact("likes", "tea"),
+            fact("lives_in", "Ningbo"),
+            fact("dislikes", "tea"),
+        ],
+        ..Findings::default()
+    };
+    let episode = Episode {
+        id: EpisodeId::new(7),
+        created: UnixMillis::new(0),
+        episode: new,
+    };
+    let facts = Arc::new(MemoryFactStore::new());
+    let consolidator = Consolidator::new(
+        facts.clone(),
+        Arc::new(MemoryIdentityStore::new(IdentityPolicy::default())),
+        Arc::new(Predicates::builtin()),
+    );
+    let current = || async {
+        facts
+            .current(group(), Some(kit))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| (f.id, f.predicate, f.object, f.supports))
+            .collect::<Vec<_>>()
+    };
+
+    consolidator.apply(&episode).await.unwrap();
+    let applied = current().await;
+    let held: Vec<_> = applied
+        .iter()
+        .map(|(_, p, o, s)| (p.as_str(), o.as_str(), *s))
+        .collect();
+    assert_eq!(
+        held,
+        [("dislikes", "tea", 1), ("lives_in", "Ningbo", 1)],
+        "the slice's last word on each slot, an opposite pair being one slot"
+    );
+    consolidator.apply(&episode).await.unwrap();
+    assert_eq!(current().await, applied, "the same rows, unchanged");
 }

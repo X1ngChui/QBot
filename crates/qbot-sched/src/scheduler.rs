@@ -15,8 +15,8 @@ use qbot_agent::{Rejected, Supervisor, Trigger, TriggerRequest};
 use qbot_context::RunEnd;
 use qbot_core::{Clock, GroupId, TimerId, UnixMillis};
 use tokio::sync::Notify;
-use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 
 use crate::store::TimerStore;
 use crate::timer::{JobKind, Timer, TimerKind, TimerOutcome};
@@ -69,7 +69,7 @@ pub struct Scheduler {
     cfg: SchedulerConfig,
     wake: Arc<Notify>,
     active: Arc<Mutex<Active>>,
-    tasks: Mutex<JoinSet<()>>,
+    tasks: TaskTracker,
 }
 
 impl std::fmt::Debug for Scheduler {
@@ -103,7 +103,7 @@ impl Scheduler {
             cfg,
             wake,
             active: Arc::default(),
-            tasks: Mutex::new(JoinSet::new()),
+            tasks: TaskTracker::new(),
         }
     }
 
@@ -151,9 +151,9 @@ impl Scheduler {
 
     /// Wait for the wake and job tasks this scheduler started.
     pub async fn join(&self) {
-        let mut tasks =
-            std::mem::take(&mut *self.tasks.lock().unwrap_or_else(PoisonError::into_inner));
-        while tasks.join_next().await.is_some() {}
+        self.tasks.close();
+        self.tasks.wait().await;
+        self.tasks.reopen();
     }
 
     /// Fire everything that is due and can start now.
@@ -272,11 +272,14 @@ impl Scheduler {
         );
         let (cfg, id, attempts) = (self.cfg.clone(), timer.id, timer.attempts);
         self.spawn(async move {
+            // The job's slot is given back however the task ends, a panicking job included.
+            let _slot = Slot { active, wake };
             // While the job runs its lease is kept fresh, so a long job is not mistaken for a
-            // dead one and taken over by a second run.
+            // dead one and taken over by a second run. The heartbeat ends with the job, also if
+            // the job panics.
             let heartbeat = {
                 let (store, clock, lease) = (store.clone(), clock.clone(), cfg.job_lease);
-                tokio::spawn(async move {
+                AbortOnDropHandle::new(tokio::spawn(async move {
                     let every = (lease / 3).max(Duration::from_millis(1));
                     loop {
                         tokio::time::sleep(every).await;
@@ -288,10 +291,10 @@ impl Scheduler {
                             break;
                         }
                     }
-                })
+                }))
             };
             let result = jobs.run(kind, group).await;
-            heartbeat.abort();
+            drop(heartbeat);
             match result {
                 Ok(()) => {
                     let _ = store.finish(id, TimerOutcome::JobOk).await;
@@ -307,16 +310,27 @@ impl Scheduler {
                         .await;
                 }
             }
-            active.lock().unwrap_or_else(PoisonError::into_inner).jobs -= 1;
-            wake.notify_one();
         });
     }
 
     fn spawn(&self, task: impl std::future::Future<Output = ()> + Send + 'static) {
-        self.tasks
+        self.tasks.spawn(task);
+    }
+}
+
+/// A running job's place among `max_concurrent_jobs`, released on drop.
+struct Slot {
+    active: Arc<Mutex<Active>>,
+    wake: Arc<Notify>,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.active
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .spawn(task);
+            .jobs -= 1;
+        self.wake.notify_one();
     }
 }
 

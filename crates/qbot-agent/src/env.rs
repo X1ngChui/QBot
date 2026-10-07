@@ -88,7 +88,8 @@ pub struct HistoryQuery {
 /// nickname they set for this group (OneBot `card`), or their account nickname (`nickname`) where
 /// they set none, as QQ shows it. It is read live, never stored,
 /// so it is never stale; stored names (`qbot_memory` aliases) are what people call someone
-/// besides it.
+/// besides it. A name comes marker-safe (`qbot_core::marker::neutralize`), so it can be shown
+/// wherever chat text is.
 #[async_trait]
 pub trait Directory: Send + Sync {
     /// `None` when the platform cannot say (no connection, not a member): a name is a courtesy,

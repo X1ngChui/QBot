@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use qbot_agent::Directory;
+use qbot_core::marker::neutralize;
 use qbot_core::{AccountId, GroupId};
 use serde_json::{Value, json};
 
@@ -22,14 +23,16 @@ impl OneBotDirectory {
     }
 }
 
+/// A name as the member chose it, fit to show wherever chat text is shown: no control
+/// characters, and no ASCII brackets that could pass for a marker.
 fn clean(value: Option<&Value>) -> Option<String> {
     let text: String = value?
         .as_str()?
         .chars()
         .filter(|c| !c.is_control())
         .collect();
-    let text = text.trim();
-    (!text.is_empty()).then(|| text.to_owned())
+    let text = neutralize(text.trim());
+    (!text.is_empty()).then_some(text)
 }
 
 #[async_trait]
@@ -51,5 +54,21 @@ impl Directory for OneBotDirectory {
             return None;
         }
         clean(response.data.get("card")).or_else(|| clean(response.data.get("nickname")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clean;
+    use serde_json::json;
+
+    #[test]
+    fn a_name_comes_marker_safe_and_on_one_line() {
+        assert_eq!(
+            clean(Some(&json!(" Ali[ce]\n "))).as_deref(),
+            Some("Ali\u{ff3b}ce\u{ff3d}")
+        );
+        assert_eq!(clean(Some(&json!("  "))), None);
+        assert_eq!(clean(None), None);
     }
 }

@@ -51,6 +51,8 @@ impl Extractor for Extract {
 #[derive(Default)]
 struct House {
     calls: Mutex<Vec<(String, i64)>>,
+    /// Deleting finished timers fails.
+    broken: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait]
@@ -66,6 +68,9 @@ impl Housekeeping for House {
         Ok(1)
     }
     async fn delete_finished_timers(&self, before: UnixMillis) -> Result<u64, OpsError> {
+        if self.broken.load(Ordering::SeqCst) {
+            return Err(OpsError("the database is gone".into()));
+        }
         self.calls
             .lock()
             .unwrap()
@@ -204,15 +209,10 @@ fn rig(owners: Vec<AccountId>) -> Rig {
 async fn the_nightly_pipeline_runs_every_stage_even_after_a_failure() {
     let r = rig(vec![owner(1)]);
     r.extract.failing.lock().unwrap().push(group(2));
-    let error = r.ops.run(JobKind::Nightly, None).await.unwrap_err();
-    assert!(
-        error.0.contains("extraction: group 2: the model is down"),
-        "{error}"
-    );
-    assert!(
-        !error.0.contains("group 1") && !error.0.contains("group 3"),
-        "only the failing group is named: {error}"
-    );
+    r.ops
+        .run(JobKind::Nightly, None)
+        .await
+        .expect("a failed extraction waits for the next batch or night, not a retry of the night");
     assert_eq!(
         *r.extract.done.lock().unwrap(),
         [group(1), group(3)],
@@ -228,6 +228,11 @@ async fn the_nightly_pipeline_runs_every_stage_even_after_a_failure() {
             ("runs".to_owned(), NOON - 90 * day)
         ]
     );
+
+    // A failed upkeep stage fails the night, so it is retried.
+    r.house.broken.store(true, Ordering::SeqCst);
+    let error = r.ops.run(JobKind::Nightly, None).await.unwrap_err();
+    assert!(error.0.contains("cleanup: "), "{error}");
 }
 
 #[tokio::test]

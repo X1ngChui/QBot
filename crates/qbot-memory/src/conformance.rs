@@ -100,6 +100,33 @@ pub async fn run(store: &dyn EpisodeStore) {
         .unwrap();
     assert_eq!(store.covered_through(g).await.unwrap(), 120);
 
+    // A skipped slice counts as covered, and shares the no-overlap rule with episodes.
+    store.skip_slice(g, 121, 150, "refused").await.unwrap();
+    assert_eq!(store.covered_through(g).await.unwrap(), 150);
+    for (a, b) in [(100, 130), (121, 150), (140, 160)] {
+        assert_eq!(
+            store.skip_slice(g, a, b, "again").await.unwrap_err(),
+            MemoryError::Overlap,
+            "skip {a}..={b}"
+        );
+    }
+    assert_eq!(
+        store
+            .insert(&episode(g, 141, 170, "over a skip"), &[1.0, 0.0], "m1")
+            .await
+            .unwrap_err(),
+        MemoryError::Overlap
+    );
+    assert_eq!(
+        store.skip_slice(g, 160, 151, "reversed").await.unwrap_err(),
+        MemoryError::InvalidRange
+    );
+    store.skip_slice(h, 121, 150, "other group").await.unwrap();
+    assert!(
+        store.within(g, 1, 1000).await.unwrap().len() == 4,
+        "a skipped slice is no episode"
+    );
+
     // `within` returns episodes wholly inside the range, in order.
     let within: Vec<_> = store
         .within(g, 20, 95)

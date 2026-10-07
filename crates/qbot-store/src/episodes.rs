@@ -14,7 +14,7 @@ fn backend(error: impl std::fmt::Display) -> MemoryError {
     MemoryError::Backend(error.to_string())
 }
 
-/// `23P01` is exclusion_violation: the range overlaps another episode of the group.
+/// `23P01` is exclusion_violation: the range overlaps another slice of the group.
 fn insert_error(error: sqlx::Error) -> MemoryError {
     if let sqlx::Error::Database(db) = &error
         && db.code().as_deref() == Some("23P01")
@@ -73,6 +73,40 @@ fn to_episode(row: &PgRow) -> Result<Episode, MemoryError> {
             findings: serde_json::from_value(row.get("findings")).map_err(backend)?,
         },
     })
+}
+
+/// One writer of a group's slices at a time. Each table's exclusion constraint decides overlap
+/// within it, but concurrent inserts checking it can deadlock on each other, and overlap between
+/// episodes and skipped slices is checked by query; under the lock both become `Overlap`.
+async fn lock_slices(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    group: GroupId,
+) -> Result<(), MemoryError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('episode:' || $1::text, 0))")
+        .bind(group.get())
+        .execute(&mut **tx)
+        .await
+        .map_err(backend)?;
+    Ok(())
+}
+
+async fn episode_overlaps(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    group: GroupId,
+    first: i64,
+    last: i64,
+) -> Result<bool, MemoryError> {
+    Ok(sqlx::query(
+        "SELECT EXISTS (SELECT 1 FROM episode WHERE group_id = $1 \
+            AND int8range(first_ordinal, last_ordinal, '[]') && int8range($2, $3, '[]')) AS taken",
+    )
+    .bind(group.get())
+    .bind(first)
+    .bind(last)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(backend)?
+    .get("taken"))
 }
 
 #[derive(Clone)]
@@ -143,14 +177,48 @@ impl EpisodeStore for PgEpisodeStore {
     }
 
     async fn covered_through(&self, group: GroupId) -> Result<u64, MemoryError> {
-        let last: Option<i64> =
-            sqlx::query("SELECT max(last_ordinal) AS last FROM episode WHERE group_id = $1")
-                .bind(group.get())
-                .fetch_one(&self.pool)
-                .await
-                .map_err(backend)?
-                .get("last");
+        let last: Option<i64> = sqlx::query(
+            "SELECT greatest((SELECT max(last_ordinal) FROM episode WHERE group_id = $1), \
+                             (SELECT max(last_ordinal) FROM slice_skip WHERE group_id = $1)) AS last",
+        )
+        .bind(group.get())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(backend)?
+        .get("last");
         u64_of(last.unwrap_or(0))
+    }
+
+    async fn skip_slice(
+        &self,
+        group: GroupId,
+        first_ordinal: u64,
+        last_ordinal: u64,
+        reason: &str,
+    ) -> Result<(), MemoryError> {
+        if first_ordinal > last_ordinal {
+            return Err(MemoryError::InvalidRange);
+        }
+        let (first, last) = (i64_of(first_ordinal)?, i64_of(last_ordinal)?);
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        lock_slices(&mut tx, group).await?;
+        if episode_overlaps(&mut tx, group, first, last).await? {
+            return Err(MemoryError::Overlap);
+        }
+        sqlx::query(
+            "INSERT INTO slice_skip (group_id, first_ordinal, last_ordinal, reason, created_ms) \
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(group.get())
+        .bind(first)
+        .bind(last)
+        .bind(reason)
+        .bind(self.clock.now().get())
+        .execute(&mut *tx)
+        .await
+        .map_err(insert_error)?;
+        tx.commit().await.map_err(backend)?;
+        Ok(())
     }
 
     async fn insert(
@@ -164,13 +232,21 @@ impl EpisodeStore for PgEpisodeStore {
             return Err(MemoryError::InvalidRange);
         }
         let mut tx = self.pool.begin().await.map_err(backend)?;
-        // The exclusion constraint alone decides overlap, but concurrent inserts checking it can
-        // deadlock on each other; one inserter per group at a time turns that into `Overlap`.
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('episode:' || $1::text, 0))")
-            .bind(episode.group.get())
-            .execute(&mut *tx)
-            .await
-            .map_err(backend)?;
+        lock_slices(&mut tx, episode.group).await?;
+        let skipped: bool = sqlx::query(
+            "SELECT EXISTS (SELECT 1 FROM slice_skip WHERE group_id = $1 \
+                AND int8range(first_ordinal, last_ordinal, '[]') && int8range($2, $3, '[]')) AS skipped",
+        )
+        .bind(episode.group.get())
+        .bind(i64_of(episode.first_ordinal)?)
+        .bind(i64_of(episode.last_ordinal)?)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(backend)?
+        .get("skipped");
+        if skipped {
+            return Err(MemoryError::Overlap);
+        }
         let evidence = serde_json::to_value(&episode.evidence).map_err(backend)?;
         let participants: Vec<i64> = episode.participants.iter().map(|a| a.get()).collect();
         let row = sqlx::query(&format!(
@@ -266,7 +342,7 @@ impl EpisodeStore for PgEpisodeStore {
 
     async fn unconsolidated(&self, group: GroupId) -> Result<Vec<Episode>, MemoryError> {
         let rows = sqlx::query(&format!(
-            "SELECT {EPISODE_COLS} FROM episode e WHERE e.group_id = $1 AND e.consolidated_ms IS NULL ORDER BY e.episode_id"
+            "SELECT {EPISODE_COLS} FROM episode e WHERE e.group_id = $1 AND e.consolidated_ms IS NULL ORDER BY e.first_ordinal"
         ))
         .bind(group.get())
         .fetch_all(&self.pool)

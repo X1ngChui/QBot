@@ -1,7 +1,8 @@
 //! Applying what an episode found: names become extracted identity evidence, facts and group
 //! knowledge become observations. Idempotent: an episode supports a name or a fact at most once,
-//! so applying the same episode again changes nothing, and a crash between storing an episode
-//! and applying it loses nothing (the episode stays unconsolidated until applied).
+//! and one episode says one thing per slot (its last statement), so applying the same episode
+//! again changes nothing, and a crash between storing an episode and applying it loses nothing
+//! (the episode stays unconsolidated until applied).
 
 use std::sync::Arc;
 
@@ -66,6 +67,7 @@ impl Consolidator {
                 Err(error) => return Err(MemoryError::Backend(error.to_string())),
             }
         }
+        let mut observations = Vec::new();
         for fact in &source.findings.facts {
             // The table may have changed since extraction; a predicate it no longer has is skipped.
             let Some(predicate) = self.predicates.get(&fact.predicate) else {
@@ -76,22 +78,20 @@ impl Consolidator {
                 Cardinality::Single => String::new(),
                 Cardinality::Multi => normalize_key(&fact.object),
             };
-            self.facts
-                .observe(&Observation {
-                    group,
-                    subject: Some(fact.account),
-                    predicate: fact.predicate.clone(),
-                    key,
-                    object: fact.object.clone(),
-                    label: None,
-                    opposite: predicate.opposite.clone(),
-                    decay: predicate.decay,
-                    episode: episode.id,
-                    message: fact.message,
-                    quote: fact.quote.clone(),
-                    at,
-                })
-                .await?;
+            observations.push(Observation {
+                group,
+                subject: Some(fact.account),
+                predicate: fact.predicate.clone(),
+                key,
+                object: fact.object.clone(),
+                label: None,
+                opposite: predicate.opposite.clone(),
+                decay: predicate.decay,
+                episode: episode.id,
+                message: fact.message,
+                quote: fact.quote.clone(),
+                at,
+            });
         }
         for item in &source.findings.knowledge {
             let observation = match item {
@@ -135,8 +135,31 @@ impl Consolidator {
                     at,
                 },
             };
+            observations.push(observation);
+        }
+        for observation in last_per_slot(observations) {
             self.facts.observe(&observation).await?;
         }
         Ok(())
     }
+}
+
+/// One observation per slot, the last one made, in the order they were made. A slot is a
+/// subject's predicate and key, with a predicate and its opposite sharing one: within one slice,
+/// a later statement replaces an earlier one about the same thing, and applying both would leave
+/// a superseded row that never held and make a second application differ from the first.
+fn last_per_slot(observations: Vec<Observation>) -> Vec<Observation> {
+    let slot = |o: &Observation| {
+        let pair = match &o.opposite {
+            Some(opposite) if *opposite < o.predicate => opposite.clone(),
+            _ => o.predicate.clone(),
+        };
+        (o.subject, pair, o.key.clone())
+    };
+    let mut kept: Vec<Observation> = Vec::new();
+    for observation in observations {
+        kept.retain(|earlier| slot(earlier) != slot(&observation));
+        kept.push(observation);
+    }
+    kept
 }

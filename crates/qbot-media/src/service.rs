@@ -416,29 +416,49 @@ impl MediaService {
             );
             return Admission::Overloaded;
         }
-        let (done_tx, done_rx) = watch::channel(false);
+        // What was posted here is what a reply waits for. Pictures inside a forwarded record
+        // only ever get a description that already exists, yet each must be downloaded to find
+        // out, so they come after and hold no reply up.
+        let (forwarded, posted): (Vec<MediaItem>, Vec<MediaItem>) =
+            items.into_iter().partition(|item| item.nested);
         let key = (job.group, job.message);
-        inner
-            .pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(key, done_rx);
-        let inner = Arc::clone(inner);
-        self.tasks.spawn(async move {
-            let job = MediaJob { items, ..job };
-            join_all(job.items.iter().map(|item| inner.process(&job, item))).await;
+        let done = (!posted.is_empty()).then(|| {
+            let (done_tx, done_rx) = watch::channel(false);
             inner
                 .pending
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .remove(&key);
+                .insert(key, done_rx);
+            done_tx
+        });
+        let inner = Arc::clone(inner);
+        self.tasks.spawn(async move {
+            let process = |items: Vec<MediaItem>| {
+                let job = MediaJob {
+                    group: job.group,
+                    message: job.message,
+                    items,
+                };
+                let inner = Arc::clone(&inner);
+                async move { join_all(job.items.iter().map(|item| inner.process(&job, item))).await }
+            };
+            process(posted).await;
+            if let Some(done) = done {
+                inner
+                    .pending
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&key);
+                let _ = done.send(true);
+            }
+            process(forwarded).await;
             inner.in_flight.fetch_sub(1, Ordering::SeqCst);
-            let _ = done_tx.send(true);
         });
         Admission::Started
     }
 
-    /// Whether any of `group`'s media is being worked on.
+    /// Whether any media posted in `group` is being worked on (pictures inside forwarded records
+    /// do not count: they never hold a reply up).
     pub fn busy(&self, group: GroupId) -> bool {
         self.inner
             .pending
@@ -448,8 +468,8 @@ impl MediaService {
             .any(|(g, _)| *g == group)
     }
 
-    /// Wait until the media work of `group` in flight now has finished, up to `timeout`. True
-    /// when there is nothing (left) to wait for.
+    /// Wait until the work on media posted in `group`, in flight now, has finished, up to
+    /// `timeout`. True when there is nothing (left) to wait for.
     ///
     /// A reply waits for all of it, not only its trigger's: the picture a question is about is
     /// often posted in the message before it, or is the quoted one.

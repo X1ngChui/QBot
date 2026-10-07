@@ -35,10 +35,23 @@ pub trait EpisodeStore: Send + Sync {
     /// The highest archived ordinal of the group, 0 when empty.
     async fn last_ordinal(&self, group: GroupId) -> Result<u64, MemoryError>;
 
-    /// The last ordinal owned by the group's newest episode, 0 when there is none.
+    /// The last ordinal of the group's newest slice, an episode or a skipped one; 0 when there
+    /// is none.
     async fn covered_through(&self, group: GroupId) -> Result<u64, MemoryError>;
 
-    /// Store one episode with the embedding of its summary. Ranges of one group never overlap.
+    /// Record that the slice `first_ordinal..=last_ordinal` will have no episode (extraction gave
+    /// up on it for good), so it counts as covered. Slices of a group never overlap, whether
+    /// episodes or skipped.
+    async fn skip_slice(
+        &self,
+        group: GroupId,
+        first_ordinal: u64,
+        last_ordinal: u64,
+        reason: &str,
+    ) -> Result<(), MemoryError>;
+
+    /// Store one episode with the embedding of its summary. Ranges of one group never overlap,
+    /// neither each other nor a skipped slice.
     async fn insert(
         &self,
         episode: &NewEpisode,
@@ -48,7 +61,7 @@ pub trait EpisodeStore: Send + Sync {
 
     async fn get(&self, group: GroupId, id: EpisodeId) -> Result<Option<Episode>, MemoryError>;
 
-    /// Episodes of the group whose findings have not been applied yet, oldest first.
+    /// Episodes of the group whose findings have not been applied yet, in chat order.
     async fn unconsolidated(&self, group: GroupId) -> Result<Vec<Episode>, MemoryError>;
 
     /// Record that an episode's findings have been applied.
@@ -108,6 +121,20 @@ struct Inner {
     episodes: Vec<(Episode, String, Vec<f32>)>,
     next_id: i64,
     consolidated: std::collections::HashSet<EpisodeId>,
+    skipped: Vec<(GroupId, u64, u64)>,
+}
+
+impl Inner {
+    /// Whether any line of `first..=last` belongs to a slice of the group already.
+    fn taken(&self, group: GroupId, first: u64, last: u64) -> bool {
+        let overlaps = |(a, b): (u64, u64)| a <= last && first <= b;
+        self.episodes.iter().any(|(e, _, _)| {
+            e.episode.group == group && overlaps((e.episode.first_ordinal, e.episode.last_ordinal))
+        }) || self
+            .skipped
+            .iter()
+            .any(|(g, a, b)| *g == group && overlaps((*a, *b)))
+    }
 }
 
 /// Reference implementation: defines the semantics durable stores must reproduce.
@@ -181,14 +208,36 @@ impl EpisodeStore for MemoryEpisodeStore {
     }
 
     async fn covered_through(&self, group: GroupId) -> Result<u64, MemoryError> {
-        Ok(self
-            .lock()
+        let inner = self.lock();
+        let episodes = inner
             .episodes
             .iter()
             .filter(|(e, _, _)| e.episode.group == group)
-            .map(|(e, _, _)| e.episode.last_ordinal)
-            .max()
-            .unwrap_or(0))
+            .map(|(e, _, _)| e.episode.last_ordinal);
+        let skipped = inner
+            .skipped
+            .iter()
+            .filter(|(g, _, _)| *g == group)
+            .map(|(_, _, last)| *last);
+        Ok(episodes.chain(skipped).max().unwrap_or(0))
+    }
+
+    async fn skip_slice(
+        &self,
+        group: GroupId,
+        first_ordinal: u64,
+        last_ordinal: u64,
+        _reason: &str,
+    ) -> Result<(), MemoryError> {
+        if first_ordinal > last_ordinal {
+            return Err(MemoryError::InvalidRange);
+        }
+        let mut inner = self.lock();
+        if inner.taken(group, first_ordinal, last_ordinal) {
+            return Err(MemoryError::Overlap);
+        }
+        inner.skipped.push((group, first_ordinal, last_ordinal));
+        Ok(())
     }
 
     async fn insert(
@@ -198,16 +247,11 @@ impl EpisodeStore for MemoryEpisodeStore {
         embed_model: &str,
     ) -> Result<Episode, MemoryError> {
         let mut inner = self.lock();
-        let overlaps = |e: &NewEpisode| {
-            e.group == episode.group
-                && e.first_ordinal <= episode.last_ordinal
-                && episode.first_ordinal <= e.last_ordinal
-        };
         if episode.first_ordinal > episode.last_ordinal || episode.first_batch > episode.last_batch
         {
             return Err(MemoryError::InvalidRange);
         }
-        if inner.episodes.iter().any(|(e, _, _)| overlaps(&e.episode)) {
+        if inner.taken(episode.group, episode.first_ordinal, episode.last_ordinal) {
             return Err(MemoryError::Overlap);
         }
         inner.next_id += 1;
@@ -269,7 +313,7 @@ impl EpisodeStore for MemoryEpisodeStore {
             .filter(|e| e.episode.group == group && !inner.consolidated.contains(&e.id))
             .cloned()
             .collect();
-        found.sort_by_key(|e| e.id);
+        found.sort_by_key(|e| e.episode.first_ordinal);
         Ok(found)
     }
 

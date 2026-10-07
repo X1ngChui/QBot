@@ -13,7 +13,8 @@ use crate::store::EpisodeStore;
 
 /// Runs `JobKind::Extract` for a group: extracts every complete slice that has no episode yet,
 /// oldest first. Idempotent: an extracted slice is covered and is never extracted again, and a
-/// crash between slices loses nothing.
+/// crash between slices loses nothing. A slice that can never be extracted is recorded as
+/// skipped, so it does not hold back the group's later slices.
 pub struct EpisodeJobs {
     store: Arc<dyn EpisodeStore>,
     builder: EpisodeBuilder,
@@ -162,11 +163,32 @@ impl EpisodeJobs {
                 target: &target,
                 next: &next,
             };
-            let built = self
+            let built = match self
                 .builder
                 .build(group, &plan, self.slices.grid.lines_per_batch, &ctx)
                 .await
-                .map_err(failed)?;
+            {
+                Ok(built) => built,
+                Err(error) if error.is_permanent() => {
+                    tracing::error!(
+                        group = group.get(),
+                        lines = ?plan.target,
+                        %error,
+                        "slice skipped: it can never be extracted; its lines stay verbatim"
+                    );
+                    self.store
+                        .skip_slice(
+                            group,
+                            *plan.target.start(),
+                            *plan.target.end(),
+                            &error.to_string(),
+                        )
+                        .await
+                        .map_err(failed)?;
+                    continue;
+                }
+                Err(error) => return Err(failed(error)),
+            };
             self.store
                 .insert(&built.episode, &built.vector, &built.embed_model)
                 .await

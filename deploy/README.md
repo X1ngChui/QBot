@@ -156,14 +156,17 @@ The bot runs its own maintenance; nothing outside the container is needed.
   configured embedding model has no vector for, so a new embedding model needs no other step),
   decay (stale name candidates, cached picture descriptions older than 15 days, faded facts), a verified
   `pg_dump`, then cleanup (finished timers after 30 days, old runs, NapCat's file cache). Every
-  stage runs even if an earlier one failed; the job then fails and is retried with backoff.
+  stage runs even if an earlier one failed. A failed decay, backup or cleanup fails the job, which
+  is retried with backoff; a failed extraction is logged (`extraction failed`) and tried again with
+  the group's next filled batch or the next night. A slice the provider refuses for good is
+  skipped (`slice skipped` in the log) and its lines simply have no episode.
 - **Backups** go to `data/qbot/backups` as `qbot-YYYYMMDD-HHMMSS.dump`. A dump is written under a
   temporary name, listed with `pg_restore` (it must parse and contain the chat archive) and only
   then renamed into place; the newest `maintenance.backups` are kept (0 makes none). The image
   carries PostgreSQL 17 client tools; outside the image set `maintenance.postgres_bin_dir`.
   Missing tools stop startup. Restore with `pg_restore --clean --if-exists -d qbot FILE`.
 - **Daily report** to every account in `bot.owners`, as a private message: yesterday's replies, how
-  they ended, model calls and tokens (with the cache share), tool failures, chat volume, groups,
+  they ended, model calls and tokens of replies (with the cache share), tool failures, chat volume, groups,
   new episodes, job failures and the age of the last backup. It needs the platform connection; if
   it is down the job retries. With no owners there is no report.
 - **Retention.** `maintenance.runs_keep_days` (0 keeps them) bounds the run transcripts, the one

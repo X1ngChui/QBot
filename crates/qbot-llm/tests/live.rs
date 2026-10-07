@@ -377,15 +377,16 @@ async fn a_repeated_long_prefix_is_served_from_the_provider_cache() {
 
 /// A 96x64 picture: left half red, right half blue.
 fn two_colour_png() -> Vec<u8> {
+    halves_png([220, 20, 20], [20, 40, 220])
+}
+
+/// A 96x64 picture whose left half is `left` and right half `right`.
+fn halves_png(left: [u8; 3], right: [u8; 3]) -> Vec<u8> {
     let (w, h) = (96u32, 64u32);
     let mut data = Vec::with_capacity((w * h * 3) as usize);
     for _ in 0..h {
         for x in 0..w {
-            data.extend_from_slice(if x < w / 2 {
-                &[220, 20, 20]
-            } else {
-                &[20, 40, 220]
-            });
+            data.extend_from_slice(if x < w / 2 { &left } else { &right });
         }
     }
     let mut out = Vec::new();
@@ -400,41 +401,85 @@ fn two_colour_png() -> Vec<u8> {
     out
 }
 
-struct OnePicture {
+/// Pictures by key: `picture-1` red and blue, `picture-2` green and yellow.
+struct Pictures {
     loads: AtomicUsize,
 }
 
 #[async_trait]
-impl MediaStore for OnePicture {
+impl MediaStore for Pictures {
     async fn load(&self, key: &str) -> Result<LoadedMedia, LlmError> {
-        assert_eq!(key, "picture-1");
         self.loads.fetch_add(1, Ordering::SeqCst);
+        let bytes = match key {
+            "picture-1" => two_colour_png(),
+            "picture-2" => halves_png([20, 170, 40], [240, 220, 20]),
+            other => panic!("unknown picture {other}"),
+        };
         Ok(LoadedMedia {
             mime: "image/png".into(),
-            bytes: two_colour_png(),
+            bytes,
         })
+    }
+}
+
+/// The real transport, counting file uploads.
+struct CountUploads {
+    inner: ReqwestTransport,
+    uploads: AtomicUsize,
+}
+
+#[async_trait]
+impl qbot_llm::responses::Transport for CountUploads {
+    async fn post(
+        &self,
+        path: &str,
+        body: &serde_json::Value,
+        want_stream: bool,
+    ) -> Result<qbot_llm::responses::HttpResponse, LlmError> {
+        self.inner.post(path, body, want_stream).await
+    }
+
+    async fn upload(
+        &self,
+        path: &str,
+        upload: &qbot_llm::responses::Upload,
+    ) -> Result<qbot_llm::responses::HttpResponse, LlmError> {
+        self.uploads.fetch_add(1, Ordering::SeqCst);
+        self.inner.upload(path, upload).await
     }
 }
 
 #[tokio::test]
 #[ignore = "calls paid provider APIs"]
-async fn deepseek_sees_an_uploaded_picture_and_reuses_the_upload() {
-    let provider = deepseek_with("vision_api_key", None);
-    let media = OnePicture {
+async fn deepseek_sees_each_uploaded_picture_and_reuses_an_upload_only_for_the_same_bytes() {
+    let endpoint = env_or("QBOT_LIVE_TEXT_ENDPOINT", "https://api.deepseek.com");
+    let transport = Arc::new(CountUploads {
+        inner: ReqwestTransport::new(
+            endpoint,
+            KeySource::Static(secret("vision_api_key")),
+            &qbot_llm::net::Route::Direct,
+        )
+        .unwrap(),
+        uploads: AtomicUsize::new(0),
+    });
+    let mut cfg = ResponsesConfig::deepseek(env_or("QBOT_LIVE_TEXT_MODEL", "deepseek-flash"));
+    cfg.timeout = Some(Duration::from_secs(120));
+    let provider = ResponsesProvider::new(cfg, transport.clone()).unwrap();
+    let media = Pictures {
         loads: AtomicUsize::new(0),
     };
-    let ask = |question: &str| {
+    let ask = |question: &str, key: &str| {
         Conversation::new(vec![ConvItem::Message(Message {
             role: Role::User,
             content: vec![
                 Content::Text(question.into()),
-                Content::Image {
-                    key: "picture-1".into(),
-                },
+                Content::Image { key: key.into() },
             ],
         })])
     };
-    let conv = ask("Which two colours does this picture show, and which is on the left? Be brief.");
+    let colours = "Which two colours does this picture show, and which is on the left? Be brief.";
+
+    let conv = ask(colours, "picture-1");
     let mut req = request(&conv, &[]);
     req.media = Some(&media);
     let first = provider.respond(req).await.unwrap();
@@ -442,14 +487,33 @@ async fn deepseek_sees_an_uploaded_picture_and_reuses_the_upload() {
     let text = first.turn.text().to_lowercase();
     assert!(text.contains("red") && text.contains("blue"), "{text}");
     assert_usage(&first);
+    assert_eq!(transport.uploads.load(Ordering::SeqCst), 1);
 
     // The same picture again: the uploaded file is referenced, not uploaded a second time.
-    let conv = ask("Is the right half of this picture blue? Answer yes or no.");
+    let conv = ask(
+        "Is the right half of this picture blue? Answer yes or no.",
+        "picture-1",
+    );
     let mut req = request(&conv, &[]);
     req.media = Some(&media);
     let second = provider.respond(req).await.unwrap();
     report("image again", &second);
     assert!(second.turn.text().to_lowercase().contains("yes"));
+    assert_eq!(transport.uploads.load(Ordering::SeqCst), 1, "reused");
+
+    // Another picture through the same provider is uploaded and seen as itself, never as the
+    // first one.
+    let conv = ask(colours, "picture-2");
+    let mut req = request(&conv, &[]);
+    req.media = Some(&media);
+    let third = provider.respond(req).await.unwrap();
+    report("other image", &third);
+    let text = third.turn.text().to_lowercase();
+    assert!(
+        text.contains("green") && text.contains("yellow") && !text.contains("red"),
+        "{text}"
+    );
+    assert_eq!(transport.uploads.load(Ordering::SeqCst), 2);
     eprintln!("[image] media loads={}", media.loads.load(Ordering::SeqCst));
 }
 

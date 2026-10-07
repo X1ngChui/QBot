@@ -142,15 +142,15 @@ impl PgArchive {
             .bind(new.group.get())
             .execute(&mut *tx)
             .await?;
-        let mut text = new.text.clone();
+        let mut numbers = Vec::with_capacity(mentions.len());
         for account in mentions {
             crate::identity::ensure_account(&mut tx, account.get(), new.at.get()).await?;
-            let number = ensure_number(&mut tx, new.group, *account).await?;
-            text = text.replace(
-                &format!("[at:{}]", account.get()),
-                &format!("[at:{number}]"),
-            );
+            numbers.push((
+                account.get(),
+                ensure_number(&mut tx, new.group, *account).await?,
+            ));
         }
+        let text = number_mentions(&new.text, &numbers);
         let (speaker, account) = match new.speaker {
             NewSpeaker::Bot => ("bot", None),
             NewSpeaker::Member(account) => ("member", Some(account.get())),
@@ -369,6 +369,34 @@ impl PgArchive {
     }
 }
 
+/// `text` with each `[at:ACCOUNT]` of `numbers` written `[at:NUMBER]`, in one pass: a number
+/// written for one account is never read again as another account.
+fn number_mentions(text: &str, numbers: &[(i64, i32)]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("[at:") {
+        out.push_str(&rest[..at]);
+        let marker = &rest[at..];
+        let replaced = marker.find(']').and_then(|close| {
+            let account: i64 = marker[4..close].parse().ok()?;
+            let (_, number) = numbers.iter().find(|(a, _)| *a == account)?;
+            Some((format!("[at:{number}]"), close + 1))
+        });
+        match replaced {
+            Some((marker, len)) => {
+                out.push_str(&marker);
+                rest = &rest[at + len..];
+            }
+            None => {
+                out.push_str("[at:");
+                rest = &rest[at + 4..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The member number of `account` in `group`, assigned densely on first use. The caller holds
 /// the group's archive lock.
 async fn ensure_number(
@@ -515,5 +543,27 @@ fn text_condition(query: &TextQuery, terms: &mut Vec<String>, first: usize) -> S
             .map(|q| format!("({})", text_condition(q, terms, first)))
             .collect::<Vec<_>>()
             .join(" OR "),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::number_mentions;
+
+    #[test]
+    fn mentions_are_numbered_in_one_pass() {
+        // Account 5 becomes member 1 and account 1 member 2: the 1 written for account 5 must
+        // not then be taken for account 1.
+        assert_eq!(
+            number_mentions(
+                "[at:5] and [at:1], [at:bot] [at:all] [at:77]",
+                &[(5, 1), (1, 2)]
+            ),
+            "[at:1] and [at:2], [at:bot] [at:all] [at:77]"
+        );
+        assert_eq!(
+            number_mentions("no marker [at:", &[(5, 1)]),
+            "no marker [at:"
+        );
     }
 }

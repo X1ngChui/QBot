@@ -650,8 +650,9 @@ async fn the_trigger_note_names_the_members_in_the_chat_so_numbers_stay_internal
         sender: AccountId::new(11).unwrap(),
     };
 
-    // Account 11 is shown as a name with brackets; account 22 has no name the platform can give.
-    let named = ctx(Some(Arc::new(Shown(vec![(11, "Ali[ce]")]))))
+    // Account 11 has a name (as the directory gives it: already marker-safe); account 22 has no
+    // name the platform can give.
+    let named = ctx(Some(Arc::new(Shown(vec![(11, "Ali\u{ff3b}ce\u{ff3d}")]))))
         .open(g, &trigger)
         .await
         .unwrap();
@@ -666,7 +667,7 @@ async fn the_trigger_note_names_the_members_in_the_chat_so_numbers_stay_internal
             "- member:2: Ali\u{ff3b}ce\u{ff3d}",
             "- member:7: name unavailable; describe them instead of using the number"
         ],
-        "each speaker once, in member order, brackets neutralized, the bot left out: {note}"
+        "each speaker once, in member order, the bot left out: {note}"
     );
 
     // Names vary from run to run, so they live in the trigger note, never in the cached prefix.

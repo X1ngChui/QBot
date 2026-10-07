@@ -28,6 +28,8 @@ struct Fetcher0 {
     /// key -> bytes or failure
     files: Mutex<HashMap<String, Result<Vec<u8>, FetchError>>>,
     calls: AtomicUsize,
+    /// Keys whose download takes this long.
+    slow: Mutex<HashMap<String, Duration>>,
 }
 
 impl Fetcher0 {
@@ -54,6 +56,13 @@ impl Fetcher0 {
 #[async_trait]
 impl Fetcher for Fetcher0 {
     async fn image(&self, reference: &MediaRef, _: u64) -> Result<Vec<u8>, FetchError> {
+        let delay = reference
+            .key
+            .as_ref()
+            .and_then(|key| self.slow.lock().unwrap().get(key).copied());
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         self.get(reference)
     }
     async fn voice(&self, reference: &MediaRef, _: u64) -> Result<Vec<u8>, FetchError> {
@@ -643,7 +652,7 @@ async fn a_picture_inside_a_forwarded_record_only_reads_the_cache() {
     let mut new = image(1, "new");
     new.nested = true;
     r.service.admit(job(2, vec![same, new]));
-    finish(&r, 2).await;
+    r.service.shutdown().await;
     assert_eq!(
         r.lines.text(2),
         "[image:a red door] [image]",
@@ -696,4 +705,35 @@ async fn settling_waits_for_every_message_of_the_group_and_no_other_group() {
     finish(&r, 1).await;
     assert_eq!(r.lines.text(1), "[image:pic]");
     assert!(!r.service.busy(group()));
+}
+
+#[tokio::test]
+async fn pictures_inside_a_forwarded_record_never_hold_a_reply_up() {
+    let fetcher = Fetcher0::with(&[("posted", Ok(b"1".to_vec())), ("album", Ok(b"2".to_vec()))]);
+    fetcher
+        .slow
+        .lock()
+        .unwrap()
+        .insert("album".into(), Duration::from_secs(2));
+    let r = rig(
+        config(),
+        fetcher,
+        Describer0::new("a red door"),
+        &[(1, "[image]"), (2, "[image] [image]")],
+    );
+    let mut album = image(1, "album");
+    album.nested = true;
+    r.service.admit(job(1, vec![album.clone()]));
+    assert!(
+        !r.service.busy(group()),
+        "a record of forwarded pictures alone is nothing to wait for"
+    );
+    album.index = 1;
+    r.service.admit(job(2, vec![image(0, "posted"), album]));
+    assert!(
+        r.service.settle(group(), Duration::from_millis(500)).await,
+        "the posted picture is waited for, the slow forwarded one is not"
+    );
+    assert_eq!(r.lines.text(2), "[image:a red door] [image]");
+    r.service.shutdown().await;
 }

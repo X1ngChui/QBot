@@ -182,7 +182,8 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
   description, extraction.
 - **Order is stable to volatile**, so runs of a group share the longest prefix the provider can
   cache: reply rules, legend, persona and its group background (fixed per deployment), then the
-  people block (changes when a block or link does), then learned knowledge (changes nightly),
+  people block (changes when a block or link does), then learned knowledge (changes when an
+  episode is extracted),
   then the chat (grows by whole batches), and last the trigger note (the time, the trigger, the
   current group display names of the members in the chat (`with_directory`), a
   task's intent), which is different for every run.
@@ -244,8 +245,9 @@ the `media_ref` row the platform reference came in.
   15 days: they serve reposts, which come within days, and must not grow with the archive.
 - **Stickers** (marketplace) are fetched as their still PNG and described like pictures.
 - **Forwarded records.** Pictures inside one are fetched and filled only when their content was
-  described before: no model call for content not posted in the group. Clips inside one are not
-  transcribed.
+  described before: no model call for content not posted in the group. They are worked on after
+  the message's own media and hold no reply up (each must be downloaded just to find out). Clips
+  inside one are not transcribed.
 - **Voice**: always `get_record` with a WAV conversion (the stored file holds SILK audio a
   recognizer answers with silence), transcribed by `qbot-asr` (SenseVoice through sherpa-onnx on
   the CPU, model loaded and checked at startup); `media.clips_per_minute` per group. Transcripts
@@ -258,9 +260,10 @@ the `media_ref` row the platform reference came in.
   its Files API: the adapter keys uploads by `sha256(bytes)` (a request's image keys name pictures
   only within its own media store), uploads each picture once per process for its 30-day lifetime,
   and shares one upload between concurrent requests; the cache belongs to one provider instance,
-  so file ids never cross accounts or providers.
-- **Waiting.** A reply waits up to 25 seconds for every picture and clip of its group still being
-  worked on, not only its trigger's (the picture a question is about is often the message before
+  so file ids never cross accounts or providers. The `media_cache` table holds only
+  `fingerprint:sha256` keys.
+- **Waiting.** A reply waits up to 25 seconds for every picture and clip posted in its group that is
+  still being worked on, not only its trigger's (the picture a question is about is often the message before
   it, or the quoted one), then goes ahead with what there is.
 
 ## 10. Scheduling (`qbot-sched`)
@@ -374,7 +377,7 @@ error is left to that error. The local limits and why they exist:
 | `max_turns` | 20 | a model looping on fast tool calls would spend dozens of growing-context calls within the deadline |
 | Messages per reply | configured | a product rule against flooding the group |
 | Task minimum delay, pending, chain depth | 5 min, 50, 24 | stop the model scheduling itself in a loop or filling the table |
-| Extraction attempts | 3 | one bad slice cannot stall a group's extraction |
+| Extraction attempts | 3 | bounds the calls on a slice the model cannot summarize; after them the slice is skipped, so it cannot stall the group |
 | Media per minute per group | configured | resource isolation between groups |
 | Media workers, queue, picture size, clip length | 4, 32, 8 MiB, 300 s | CPU and memory isolation; pictures and clips are untrusted input of any size |
 | Opened-picture cache | 64 MiB | memory bound for bytes fetched on demand |
@@ -401,8 +404,9 @@ spend.
   shared conformance suites (`qbot_memory::conformance`, `qbot_sched::conformance`, ...) run
   against both.
 - Member numbers are assigned densely under a per-group advisory lock and are immutable: a
-  trigger rejects any update, delete or truncate of `member_number`. Episodes cannot overlap
-  (a range exclusion constraint). One active fact per subject, predicate and key (a partial
+  trigger rejects any update, delete or truncate of `member_number`. A group's slices cannot
+  overlap, whether episodes or skipped (`slice_skip`): range exclusion constraints, and a check
+  across the two tables under the group's slice lock. One active fact per subject, predicate and key (a partial
   unique index).
 - **Single instance**: the process holds a Postgres advisory-lock session lease and shuts down if
   it loses it.
@@ -415,7 +419,9 @@ spend.
   decay (name candidates nothing supported for 30 days, cached picture descriptions older than 15 days,
   faded facts), a verified backup, cleanup (finished timers after 30 days, finished runs after
   `maintenance.runs_keep_days`, NapCat's file cache through its `clean_cache` action). Every stage
-  runs; the job fails if any failed.
+  runs. The job fails, and is retried, if decay, the backup or cleanup failed; a failed extraction
+  is logged and left to the group's next filled batch or the next night, since a retry of the
+  whole job would also take another backup and rotate an older one out.
 - **Backups** shell out to `pg_dump`/`pg_restore`: password through the environment, a partial file
   verified by listing before an atomic rename, rotation after success, the tools checked at
   startup.
@@ -451,7 +457,11 @@ through it.
 - NapCat delivers marketplace stickers as `image` segments carrying an `emoji_id`; they are
   rendered and described as pictures rather than stickers.
 - A contact card the bot sends echoes back as `[unsupported:contact]`.
-- Extraction and picture-description calls are not recorded in `usage_event`.
+- Extraction, picture-description and embedding calls are not recorded in `usage_event`, so
+  `/stats` and the report count reply runs only.
+- An uploaded picture stays at DeepSeek for the Files API's longest lifetime (30 days), though
+  each upload is used only for one description or one run's turns; the Files API's shortest
+  lifetime would do, once it is checked against the live API.
 - Why an extraction answer needs a second attempt (about three in ten on real chat, mostly
   findings sent back for correction) is not logged per attempt.
 - `open_images` cannot open pictures inside forwarded records whose content was not delivered.

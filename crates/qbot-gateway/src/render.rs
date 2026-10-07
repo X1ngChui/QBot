@@ -2,7 +2,8 @@
 //!
 //! Markers are ASCII and bracketed: `[at:123]`, `[reply:456]`, `[image]`, `[face:14]`. A member
 //! cannot forge one, because brackets typed by members are replaced with their fullwidth forms
-//! before they reach the archive. The prompt layer later maps `[at:ID]` to member numbers.
+//! before they reach the archive. The archive rewrites `[at:ACCOUNT]` to the member number as it
+//! stores the line.
 
 use qbot_core::{AccountId, GameResult};
 

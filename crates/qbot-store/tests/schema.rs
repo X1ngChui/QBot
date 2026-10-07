@@ -40,6 +40,7 @@ async fn migrations_are_idempotent_and_the_expected_tables_exist() {
             "recurrence",
             "run",
             "run_item",
+            "slice_skip",
             "timer",
             "usage_event"
         ]
@@ -225,6 +226,39 @@ async fn archived_game_results_are_rewritten_to_the_observed_form() {
             "\u{ff3b}dice:5\u{ff3d}",
         ],
         "only real result markers change; a fullwidth look-alike stays text"
+    );
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn only_content_keyed_picture_descriptions_are_kept() {
+    let db = db!();
+    let current = format!("0123456789abcdef:{}", "a".repeat(64));
+    for key in [
+        current.as_str(),
+        "p:ABCDEF.jpg",
+        &format!("h:{}", "b".repeat(64)),
+    ] {
+        sqlx::query("INSERT INTO media_cache (key, description, created_ms) VALUES ($1, 'x', 0)")
+            .bind(key)
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+    sqlx::raw_sql(include_str!(
+        "../migrations/0005_media_cache_by_content.sql"
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let keys: Vec<String> = sqlx::query_scalar("SELECT key FROM media_cache")
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        keys,
+        [current],
+        "platform-id and bare-hash keys can no longer be looked up"
     );
     db.drop_db().await;
 }
