@@ -17,7 +17,12 @@ cargo test --workspace                       # the full suite needs the database
 cargo test -p qbot-memory                    # one crate
 cargo test -p qbot-commands --test commands name   # one test
 cargo run -p qbot-eval -- --repeat 3         # reply-quality evaluation; calls the real model
+cargo run -p qbot-eval -- --only NAME        # one scenario from eval/scenarios/NAME.toml
 ```
+
+CI (`.github/workflows/ci.yml`) runs exactly the fmt, clippy and full test commands above against
+a pgvector service, plus the Docker image build. `qbot-eval` reads the text key from
+`deploy/secrets/text_api_key` (or `QBOT_EVAL_SECRETS_DIR`).
 
 Database tests (`qbot-store`, `qbot-app`'s end-to-end test and others) need a disposable pgvector
 Postgres; without `QBOT_TEST_DATABASE_URL` they fail on purpose (`QBOT_SKIP_DB_TESTS=1` skips
@@ -33,7 +38,9 @@ export QBOT_TEST_DATABASE_URL=postgres://qbot_test:testpw@127.0.0.1:15432/qbot_t
 ```
 
 The recognizer tests run only when `QBOT_ASR_MODEL_DIR` points at the SenseVoice bundle
-(`deploy/fetch_asr_model.sh` fetches it); otherwise they say SKIPPED. Tests ignored with "calls
+(`deploy/fetch_asr_model.sh` fetches it); otherwise they say SKIPPED. The first build downloads
+sherpa-onnx's native library, so it needs network access. `crates/qbot-app/tests/run_e2e.rs` runs
+the whole service against real Postgres, a mock Responses server and a simulated NapCat. Tests ignored with "calls
 paid provider APIs" are live tests run by hand with `-- --ignored`; nothing else talks to QQ or a
 paid API. Build the image with `docker build -f deploy/Dockerfile .`; deployment is described in
 `deploy/README.md`.
