@@ -2211,7 +2211,6 @@ dependencies = [
  "qbot-store",
  "qbot-tools",
  "serde_json",
- "sha2",
  "sqlx",
  "thiserror",
  "tokio",

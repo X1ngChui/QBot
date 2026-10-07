@@ -386,19 +386,18 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
             language: writing_language.clone(),
         },
     );
-    let episode_jobs = Arc::new(
-        EpisodeJobs::new(episodes.clone(), builder, config.slice_grid()).with_consolidator(
-            Arc::new(Consolidator::new(
-                facts.clone(),
-                identity.clone(),
-                predicates.clone(),
-            )),
-        ),
-    );
     let operations = Arc::new(Operations::new(Parts {
         cfg: ops_config,
         clock: clock.clone(),
-        extractor: episode_jobs.clone(),
+        extractor: Arc::new(
+            EpisodeJobs::new(episodes.clone(), builder, config.slice_grid()).with_consolidator(
+                Arc::new(Consolidator::new(
+                    facts.clone(),
+                    identity.clone(),
+                    predicates.clone(),
+                )),
+            ),
+        ),
         housekeeping: Arc::new(PgHousekeeping::new(
             admin.clone(),
             PgMediaCache::new(pool.clone(), clock.clone()),
@@ -439,7 +438,6 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     ));
 
     // Pictures and voice: described and transcribed as messages arrive.
-    let mut vision_provider: Option<Arc<dyn Provider>> = None;
     let describer: Option<Arc<dyn Describer>> = if config.providers.vision.enabled {
         let transport = ReqwestTransport::new(
             config.providers.vision.endpoint.clone(),
@@ -450,7 +448,6 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
             config.vision_provider(),
             Arc::new(transport),
         )?);
-        vision_provider = Some(vision.clone());
         let instructions = describe_image_instructions(&writing_language)?;
         Some(Arc::new(LlmDescriber::new(vision, instructions)))
     } else {
@@ -472,14 +469,13 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         config.media_config(),
         MediaDeps {
             fetcher: fetcher.clone(),
-            describer: describer.clone(),
+            describer,
             transcriber,
             cache: Arc::new(PgMediaCache::new(pool.clone(), clock.clone())),
             editor: Arc::new(PgLineEditor(archive.clone())),
         },
     ));
 
-    let (repair_archive, repair_bridge) = (archive.clone(), bridge.clone());
     // Commands and the pipeline.
     let commands = Arc::new(CommandRouter::new(Deps {
         identity: identity.clone(),
@@ -549,26 +545,6 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         tokio::spawn(async move { recurring.run(stop).await })
     };
     let server_task = tokio::spawn(serve(listener, server, stop.clone()));
-    // One-off repair (temporary), when requested by a file in the data directory.
-    if let (Some(describer), Some(vision)) = (describer, vision_provider) {
-        let repair = crate::repair::Repair {
-            pool: pool.clone(),
-            archive: repair_archive,
-            cache: PgMediaCache::new(pool.clone(), clock.clone()),
-            fetcher: fetcher.clone(),
-            describer,
-            vision,
-            jobs: episode_jobs,
-            slices: config.slice_grid(),
-            clock: clock.clone(),
-            bridge: repair_bridge,
-            data_dir: paths.data_dir.clone(),
-        };
-        if repair.requested() {
-            tracing::info!("repair of poisoned picture descriptions requested");
-            tokio::spawn(repair.run());
-        }
-    }
 
     let reason = tokio::select! {
         () = shutdown.cancelled() => "shutdown requested",

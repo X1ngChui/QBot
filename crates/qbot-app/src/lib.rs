@@ -1,7 +1,6 @@
 //! The composition root: configuration in, a running bot out.
 
 pub mod logs;
-mod repair;
 mod report_sink;
 mod run;
 
