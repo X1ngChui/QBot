@@ -44,7 +44,8 @@ pub trait Commands: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PipelineConfig {
     pub bot: AccountId,
-    /// Chance, from 0 to 1, that a member's line addressed to no one starts a spontaneous run.
+    /// Chance, from 0 to 1, that a member's message that did not trigger the bot starts a
+    /// spontaneous run.
     pub spontaneous_chance: f64,
     /// How long an unclaimed echo is kept; the delivery's echo timeout.
     pub echo_keep: Duration,
@@ -92,7 +93,8 @@ pub struct Pipeline {
     nicknames: Nicknames,
     echoes: Arc<EchoBoard>,
     tasks: TaskTracker,
-    /// Groups with a spontaneous run under way: one at a time, or a lively chat would start
+    /// Groups with a spontaneous run under way: at most one spontaneous run per group at a time
+    /// (other runs are not affected), or a lively chat would start
     /// several that talk over each other.
     spontaneous: Arc<Mutex<HashSet<GroupId>>>,
 }
@@ -267,8 +269,10 @@ impl Pipeline {
         }
     }
 
-    /// Roll `spontaneous_chance` for a member's line that addressed no one, and on a hit start a
-    /// spontaneous run once the group's media in flight is described, as a reply would.
+    /// Roll `spontaneous_chance` for a member's message that did not trigger the bot (no @ of the
+    /// bot, no nickname, no quote of a bot line, not a command; it may well address another
+    /// member), and on a hit start a spontaneous run once the group's media in flight is
+    /// described, as a reply would. Only another spontaneous run of the group holds it back.
     fn maybe_spontaneous(&self, group: GroupId, author: AccountId) {
         let chance = self.cfg.spontaneous_chance;
         if chance <= 0.0 || rand::random::<f64>() >= chance {

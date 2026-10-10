@@ -185,12 +185,15 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
   - `Addressed`: a member addressed the bot (an @, a nickname, a quote of a bot line). The
     member and their message are the run's initiator and focus.
   - `Wake`: a scheduled task came due, with its stored intent.
-  - `Spontaneous`: the bot looked at the conversation on its own. A member's line that
-    addresses no one rolls `replies.spontaneous_chance` (default 0, off). On a hit, a run starts
-    after the group's media in flight is described. It has no initiator and no triggering
-    message, and its note says so: nobody is waiting for an answer, and `stay_silent` is the
-    usual outcome. A group has at most one spontaneous run at a time, so a lively chat cannot
-    start several that talk over each other.
+  - `Spontaneous`: the bot looked at the conversation on its own. Every member message that did
+    not trigger the bot rolls `replies.spontaneous_chance` (default 0, off). "Did not trigger"
+    means no @ of the bot, no nickname, no quote of a bot line and not a command; a message to
+    another member (`@B ...`) counts. On a hit, a run starts after the group's media in flight
+    is described. It has no initiator and no triggering message, and its note says so: nobody
+    is waiting for an answer, and `stay_silent` is the usual outcome. At most one spontaneous
+    run per group at a time, so a lively chat cannot start several that talk over each other.
+    That rule is for spontaneous runs only: addressed and scheduled runs start and overlap as
+    always, also while a spontaneous run is under way.
 - **Supervisor.** Every trigger becomes its own run with its own deadline; runs of one group may
   overlap. Admission gates, in order: muted group, then a blocked member (the initiator of an
   addressed run; for a spontaneous run, the author of the line that rolled it, since a blocked

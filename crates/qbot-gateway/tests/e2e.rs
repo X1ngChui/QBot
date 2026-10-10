@@ -711,3 +711,104 @@ async fn with_no_chance_set_unaddressed_lines_start_nothing() {
     assert!(rig.world.logged_runs().is_empty());
     rig.cancel.cancel();
 }
+
+async fn runs_become(rig: &Rig, n: usize) {
+    for _ in 0..200 {
+        if rig.world.logged_runs().len() >= n {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("expected {n} runs, saw {}", rig.world.logged_runs().len());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_to_another_member_did_not_trigger_the_bot_so_it_can_roll() {
+    // "@B what's for dinner?": addressed to someone, but not to the bot.
+    let rig = rig_full(
+        vec![Step::Reply(FakeReply::new().text("nothing to add"))],
+        Duration::from_secs(5),
+        1.0,
+    )
+    .await;
+    let mut napcat = connect(&rig, Some("sesame")).await.unwrap();
+    napcat
+        .send(group_message(
+            1,
+            7,
+            json!([{"type": "at", "data": {"qq": "8"}}, {"type": "text", "data": {"text": " what's for dinner?"}}]),
+        ))
+        .await
+        .unwrap();
+    settle(&rig).await;
+    let runs = rig.world.logged_runs();
+    assert_eq!(runs.len(), 1);
+    assert!(spontaneous(&rig, runs[0]));
+    rig.cancel.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_spontaneous_runs_are_one_per_group_and_other_runs_still_overlap_them() {
+    let rig = rig_full(
+        vec![
+            // The spontaneous run speaks; its send is left unanswered, so it stays in flight.
+            Step::Reply(FakeReply::new().call("send_message", json!({ "text": "oh nice" }))),
+            // The addressed run that starts meanwhile.
+            Step::Reply(FakeReply::new().text("hello")),
+        ],
+        Duration::from_secs(5),
+        1.0,
+    )
+    .await;
+    let mut napcat = connect(&rig, Some("sesame")).await.unwrap();
+    napcat
+        .send(group_message(
+            1,
+            7,
+            json!([{"type": "text", "data": {"text": "nice weather"}}]),
+        ))
+        .await
+        .unwrap();
+    let action = next_action(&mut napcat).await;
+    assert_eq!(
+        action["action"], "send_group_msg",
+        "the spontaneous run is mid-send"
+    );
+
+    // Another line that did not trigger the bot: no second spontaneous run while one is under way.
+    napcat
+        .send(group_message(
+            2,
+            8,
+            json!([{"type": "text", "data": {"text": "very nice"}}]),
+        ))
+        .await
+        .unwrap();
+    // A message that does trigger the bot starts its own run alongside.
+    napcat
+        .send(group_message(
+            3,
+            8,
+            json!([{"type": "at", "data": {"qq": BOT.to_string()}}, {"type": "text", "data": {"text": " hi"}}]),
+        ))
+        .await
+        .unwrap();
+    runs_become(&rig, 2).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let runs = rig.world.logged_runs();
+    assert_eq!(
+        runs.len(),
+        2,
+        "one spontaneous run and the addressed run, overlapping"
+    );
+    assert!(spontaneous(&rig, runs[0]));
+    assert!(
+        !spontaneous(&rig, runs[1]),
+        "the second is the addressed run"
+    );
+    assert!(
+        rig.world.summary(runs[0]).is_none(),
+        "the spontaneous run is still in flight while the addressed one runs"
+    );
+    rig.cancel.cancel();
+}

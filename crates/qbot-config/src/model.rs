@@ -109,7 +109,8 @@ pub struct Replies {
     pub deadline_secs: u64,
     /// Messages one reply may send.
     pub max_messages: u32,
-    /// Chance, from 0 to 1, that a member's line addressed to no one starts a run on its own.
+    /// Chance, from 0 to 1, that a member's message that did not trigger the bot starts a
+    /// spontaneous run.
     pub spontaneous_chance: f64,
 }
 

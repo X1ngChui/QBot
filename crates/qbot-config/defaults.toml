@@ -54,9 +54,11 @@ concurrency = 3
 deadline_secs = 180
 # Messages one reply may send.
 max_messages = 4
-# Chance, from 0 to 1, that a member's line that addresses no one makes the bot look at the
-# conversation on its own and decide whether to join in (it usually stays silent). Rolled once
-# per such line, with one such run per group at a time. 0 never does.
+# Chance, from 0 to 1, that a member's message that did not trigger the bot (no @ of the bot, no
+# nickname, no quote of its lines, not a command; a message to another member counts) makes the
+# bot look at the conversation on its own and decide whether to join in (it usually stays
+# silent). Rolled once per such message; at most one spontaneous run per group at a time, while
+# other runs overlap as usual. 0 never does.
 spontaneous_chance = 0.0
 
 [history]
