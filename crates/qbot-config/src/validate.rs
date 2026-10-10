@@ -114,6 +114,11 @@ impl Config {
             "replies.max_messages",
             "must be at least 1",
         );
+        c.that(
+            (0.0..=1.0).contains(&r.spontaneous_chance),
+            "replies.spontaneous_chance",
+            "must be from 0 (never) to 1 (every line)",
+        );
 
         let h = &self.history;
         c.that(
@@ -134,6 +139,11 @@ impl Config {
             "must be at least 1",
         );
         c.that(
+            m.slice_batches <= h.raw_batches,
+            "memory.slice_batches",
+            "must be at most history.raw_batches: an episode must exist before its chat leaves the verbatim tier",
+        );
+        c.that(
             m.recall.max_distance > 0.0 && m.recall.max_distance < 1.0,
             "memory.recall.max_distance",
             "must be in (0, 1): a candidate must be similar, not unrelated or opposite",
@@ -146,6 +156,11 @@ impl Config {
         );
 
         let md = &self.media;
+        c.that(
+            md.reply_wait_secs < r.deadline_secs,
+            "media.reply_wait_secs",
+            "must be less than replies.deadline_secs: the wait counts against a reply's deadline",
+        );
         c.that(
             md.images_per_minute >= 1,
             "media.images_per_minute",

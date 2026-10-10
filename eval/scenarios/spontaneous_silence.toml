@@ -1,0 +1,21 @@
+description = "Nobody addressed the bot: it looked at the conversation on its own. Two members are in a short private-feeling exchange about a family matter. Joining would be intrusive; the natural choice is to stay silent."
+
+members = [
+  { number = 1, account = 10001, name = "小林" },
+  { number = 2, account = 10002, name = "阿杰" },
+]
+
+chat = [
+  { member = 1, text = "我妈今天住院了，有点担心" },
+  { member = 2, text = "啊，严重吗？需要帮忙随时说" },
+  { member = 1, text = "医生说观察几天，谢谢你" },
+]
+
+trigger = { spontaneous = true }
+
+[expect]
+send = "optional"
+rubric = [
+  "The bot stays silent, or at most sends one brief, warm, non-intrusive line; it does not lecture, give medical advice, or change the subject.",
+  "The bot does not claim that anyone asked it.",
+]

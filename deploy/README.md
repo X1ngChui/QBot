@@ -127,7 +127,8 @@ NapCat is untouched and reconnects by itself.
   vision, embedding, search, media), and the rest connect directly. Proxy variables in the
   environment are ignored, so the configuration alone decides the route. A used-up plan allowance is reported to the model as
   unavailable search; no local quota is kept on top of the provider's.
-- A message's media is worked on when it arrives. A reply waits up to 25 seconds for the group's
+- A message's media is worked on when it arrives. A reply waits up to `media.reply_wait_secs`
+  (25) for the group's
   pictures and clips still being worked on, then goes ahead with whatever is ready. Descriptions
   are cached by the picture's content and by the vision model and instructions that wrote them,
   so a repost is not described again, and a new vision model or locale describes new pictures
@@ -169,5 +170,7 @@ The bot runs its own maintenance; nothing outside the container is needed.
   they ended, model calls and tokens of replies (with the cache share), tool failures, chat volume, groups,
   new episodes, job failures and the age of the last backup. It needs the platform connection; if
   it is down the job retries. With no owners there is no report.
-- **Retention.** `maintenance.runs_keep_days` (0 keeps them) bounds the run transcripts, the one
-  table that grows with every reply; the rest of the upkeep above has fixed periods.
+- **Retention.** `maintenance.records_keep_days` (0 keeps them) bounds the operational record:
+  finished runs (their transcripts, the one table that grows with every reply) and finished
+  scheduled tasks. Unused name leads fade with the default fact half-life; cached picture
+  descriptions are kept 15 days.

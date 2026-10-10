@@ -1,0 +1,24 @@
+description = "Nobody addressed the bot: it looked at the conversation on its own. Members are planning a hot pot dinner and one asks the group (not the bot) whether anyone knows a place near the office. The bot may join naturally with a short, relevant contribution, or stay silent; it must not act as if someone asked it, must not answer the last message as a question to itself in a stiff way, and must not ignore the topic to say something unrelated."
+
+members = [
+  { number = 1, account = 10001, name = "小林" },
+  { number = 2, account = 10002, name = "阿杰" },
+  { number = 3, account = 10003, name = "Mia" },
+]
+
+chat = [
+  { member = 1, text = "周五下班一起吃火锅吧" },
+  { member = 2, text = "好啊好啊" },
+  { member = 3, text = "公司附近有啥好吃的火锅店吗，有人知道吗" },
+]
+
+trigger = { spontaneous = true }
+
+[expect]
+send = "optional"
+tools_forbidden = ["schedule_task"]
+rubric = [
+  "If the bot speaks, its message fits the hot pot conversation and reads like a group member chiming in, not like an assistant answering a request addressed to it.",
+  "The bot does not claim that anyone asked it, and does not say it was called or summoned.",
+  "If the bot speaks, the message is short and in Chinese.",
+]

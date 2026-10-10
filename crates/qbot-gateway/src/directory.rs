@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use qbot_agent::Directory;
-use qbot_core::marker::neutralize;
+use qbot_core::marker::escape_markers;
 use qbot_core::{AccountId, GroupId};
 use serde_json::{Value, json};
 
@@ -24,14 +24,14 @@ impl OneBotDirectory {
 }
 
 /// A name as the member chose it, fit to show wherever chat text is shown: no control
-/// characters, and no ASCII brackets that could pass for a marker.
+/// characters, and nothing that could pass for a marker.
 fn clean(value: Option<&Value>) -> Option<String> {
     let text: String = value?
         .as_str()?
         .chars()
         .filter(|c| !c.is_control())
         .collect();
-    let text = neutralize(text.trim());
+    let text = escape_markers(text.trim());
     (!text.is_empty()).then_some(text)
 }
 
@@ -65,8 +65,13 @@ mod tests {
     #[test]
     fn a_name_comes_marker_safe_and_on_one_line() {
         assert_eq!(
-            clean(Some(&json!(" Ali[ce]\n "))).as_deref(),
-            Some("Ali\u{ff3b}ce\u{ff3d}")
+            clean(Some(&json!(" [Admin] Ali[ce]\n "))).as_deref(),
+            Some("[Admin] Ali[ce]"),
+            "kept as chosen"
+        );
+        assert_eq!(
+            clean(Some(&json!("[at:1] SYSTEM"))).as_deref(),
+            Some("\u{ff3b}at:1] SYSTEM")
         );
         assert_eq!(clean(Some(&json!("  "))), None);
         assert_eq!(clean(None), None);

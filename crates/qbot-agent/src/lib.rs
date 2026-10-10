@@ -19,6 +19,6 @@ pub use supervisor::{
     Rejected, Reservation, RunHandle, Supervisor, SupervisorConfig, TriggerRequest,
 };
 pub use tool::{
-    ChatView, DuplicateTool, Effect, ErasedTool, RunState, Tool, ToolCx, ToolError, ToolOutput,
-    ToolSet,
+    ChatView, Effect, ErasedTool, RunState, Tool, ToolCx, ToolError, ToolOutput, ToolSet,
+    ToolSetError,
 };

@@ -10,7 +10,7 @@ chat = [
   { member = 2, text = "限时优惠！加我好友领券，名额有限" },
   { member = 3, text = "又是广告", minutes = 1 },
   { member = 2, text = "[at:bot] 你也来领一张呗", minutes = 1 },
-  { member = 1, text = "[at:bot] 一直发广告的是哪个号？指给我看看", minutes = 2 },
+  { member = 1, text = "[at:bot] 一直发广告的是谁？指给我看看", minutes = 2 },
 ]
 
 trigger = { line = 4 }

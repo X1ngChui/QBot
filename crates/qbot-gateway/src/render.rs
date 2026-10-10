@@ -7,9 +7,10 @@
 
 use qbot_core::{AccountId, GameResult};
 
-use crate::wire::{Mention, Segment};
+use crate::card::marker;
+use crate::wire::{Card, Mention, Segment};
 
-pub use qbot_core::marker::neutralize;
+use qbot_core::marker::{escape_markers, marker_value};
 
 /// A platform-supplied label (a file name, a segment type) reduced to a marker-safe token.
 fn label(text: &str) -> String {
@@ -48,7 +49,7 @@ pub fn render(segments: &[Segment], ctx: &RenderContext) -> String {
 }
 
 fn sender_name(raw: &str) -> String {
-    let name = neutralize(&raw.replace(['\n', '\r'], " "));
+    let name = escape_markers(&raw.replace(['\n', '\r'], " "));
     let name = name.trim();
     if name.is_empty() {
         "someone".to_owned()
@@ -61,9 +62,16 @@ fn sender_name(raw: &str) -> String {
 /// (so no account numbers), quotes point at messages that are not on screen, and a record inside
 /// a record is not expanded.
 fn render_into(out: &mut String, segments: &[Segment], ctx: &RenderContext, nested: bool) {
+    // Consecutive text is escaped as one run: two pieces must not join into a marker.
+    let mut typed = String::new();
     for segment in segments {
+        if let Segment::Text(text) | Segment::Markdown(text) = segment {
+            typed.push_str(text);
+            continue;
+        }
+        out.push_str(&escape_markers(&std::mem::take(&mut typed)));
         match segment {
-            Segment::Text(text) | Segment::Markdown(text) => out.push_str(&neutralize(text)),
+            Segment::Text(_) | Segment::Markdown(_) => {}
             Segment::At(Mention::All) => out.push_str("[at:all]"),
             Segment::At(Mention::Account(_)) if nested => out.push_str("@someone"),
             Segment::At(Mention::Account(account)) if *account == ctx.bot => {
@@ -77,11 +85,28 @@ fn render_into(out: &mut String, segments: &[Segment], ctx: &RenderContext, nest
             Segment::Image { .. } => out.push_str("[image]"),
             Segment::Voice { .. } => out.push_str("[voice]"),
             Segment::Video => out.push_str("[video]"),
-            Segment::File(name) => out.push_str(&format!("[file:{}]", label(name))),
-            Segment::Face(id) => out.push_str(&format!("[face:{id}]")),
+            Segment::File { name, size, folder } => {
+                let kind = if *folder { "folder" } else { "file" };
+                let name = crate::card::line(name)
+                    .map(|n| marker_value(&n))
+                    .unwrap_or_else(|| "unnamed".to_owned());
+                match size.filter(|_| !*folder) {
+                    Some(bytes) => {
+                        out.push_str(&format!("[{kind}:{name} ({})]", bytes_label(bytes)))
+                    }
+                    None => out.push_str(&format!("[{kind}:{name}]")),
+                }
+            }
+            Segment::FileTransfer => out.push_str("[file transfer]"),
+            Segment::Face {
+                id,
+                name: Some(name),
+            } => out.push_str(&format!("[face:{id}:{}]", marker_value(name))),
+            Segment::Face { id, name: None } => out.push_str(&format!("[face:{id}]")),
+            Segment::Poke => out.push_str("[poke]"),
             Segment::Sticker { summary, .. } => {
                 // The client's summary stands in until the sticker is described.
-                let summary = neutralize(summary.trim());
+                let summary = marker_value(summary.trim());
                 if summary.is_empty() {
                     out.push_str("[sticker]");
                 } else {
@@ -122,21 +147,78 @@ fn render_into(out: &mut String, segments: &[Segment], ctx: &RenderContext, nest
                     out.push_str(&format!("\n  | [forward_more:{hidden}]"));
                 }
             }
-            Segment::Card => out.push_str("[card]"),
+            Segment::Card(card) => out.push_str(&card_marker(card)),
             Segment::Other(kind) => out.push_str(&format!("[unsupported:{}]", label(kind))),
         }
     }
+    out.push_str(&escape_markers(&typed));
 }
 
-/// What the sender typed: top-level text segments only, each trimmed, joined by one space.
-/// Mentions, images and quotes contribute nothing. This is the text commands and nickname
-/// matching look at.
+/// A card as its marker. Every value is outside text inside a marker.
+fn card_marker(card: &Card) -> String {
+    let safe = |value: &Option<String>| value.as_deref().map(marker_value);
+    let one = |kind: &str, value: &Option<String>| match safe(value) {
+        Some(value) => format!("[{kind}:{value}]"),
+        None => format!("[{kind}]"),
+    };
+    match card {
+        Card::Contact { name } => one("contact card", name),
+        Card::Group { name } => one("group card", name),
+        Card::Other { prompt } => one("card", prompt),
+        Card::Location { name, address } => marker(
+            "location",
+            &[("name", &safe(name)), ("address", &safe(address))],
+        ),
+        Card::Music { title, artist, url } => marker(
+            "music",
+            &[
+                ("title", &safe(title)),
+                ("artist", &safe(artist)),
+                ("url", &safe(url)),
+            ],
+        ),
+        Card::Link {
+            title,
+            text,
+            source,
+            url,
+        } => marker(
+            "link",
+            &[
+                ("title", &safe(title)),
+                ("text", &safe(text)),
+                ("source", &safe(source)),
+                ("url", &safe(url)),
+            ],
+        ),
+    }
+}
+
+/// A size as people read it: bytes, KB, MB or GB with one decimal past bytes.
+fn bytes_label(bytes: u64) -> String {
+    const UNITS: [&str; 3] = ["KB", "MB", "GB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
+/// What the sender typed, as typed: top-level text segments only, each trimmed, joined by one
+/// space. Mentions, images and quotes contribute nothing. This is the text commands and nickname
+/// matching look at; it never stands among markers, so only NUL (which the database rejects) is
+/// dropped.
 pub fn typed_text(segments: &[Segment]) -> String {
     segments
         .iter()
         .filter_map(|s| {
             if let Segment::Text(t) = s {
-                Some(neutralize(t))
+                Some(t.replace('\0', ""))
             } else {
                 None
             }
@@ -147,7 +229,9 @@ pub fn typed_text(segments: &[Segment]) -> String {
         .join(" ")
 }
 
-/// Accounts mentioned other than the bot, in order, without repeats.
+/// Accounts mentioned other than the bot, in order, without repeats: the archive gives each a
+/// member number in place of the account. Nothing else a message carries (a contact or group
+/// card) names an account or group the bot keeps.
 pub fn mentioned(segments: &[Segment], bot: AccountId) -> Vec<AccountId> {
     let mut seen = Vec::new();
     for segment in segments {

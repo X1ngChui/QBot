@@ -44,3 +44,68 @@ fn describe_field(schema: &mut Value, path: &str, description: String) {
         object.insert("description".into(), Value::String(description));
     }
 }
+
+/// The fields of `schema` (paths as in [`tool_schema`]) that have no description: a model sees
+/// a field's name and type, and only the description says what it is for.
+pub fn undescribed(schema: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_undescribed(schema, "", &mut out);
+    out
+}
+
+fn collect_undescribed(node: &Value, prefix: &str, out: &mut Vec<String>) {
+    let mut node = node;
+    while let Some(items) = node.get("items") {
+        node = items;
+    }
+    let Some(properties) = node.get("properties").and_then(Value::as_object) else {
+        return;
+    };
+    for (name, field) in properties {
+        let path = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}.{name}")
+        };
+        if field.get("description").is_none() {
+            out.push(path.clone());
+        }
+        collect_undescribed(field, &path, out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{tool_schema, undescribed};
+    use schemars::JsonSchema;
+
+    #[derive(JsonSchema)]
+    #[allow(dead_code)]
+    struct Args {
+        query: String,
+        items: Vec<Item>,
+    }
+
+    #[derive(JsonSchema)]
+    #[allow(dead_code)]
+    struct Item {
+        id: u32,
+    }
+
+    #[test]
+    fn a_field_left_without_description_is_found_through_arrays() {
+        let full = tool_schema::<Args>([
+            ("query", "q".to_owned()),
+            ("items", "i".to_owned()),
+            ("items.id", "id".to_owned()),
+        ]);
+        assert!(undescribed(&full).is_empty(), "{full}");
+        // A mistyped path describes nothing, so its field shows up as undescribed.
+        let typo = tool_schema::<Args>([
+            ("query", "q".to_owned()),
+            ("items", "i".to_owned()),
+            ("item.id", "id".to_owned()),
+        ]);
+        assert_eq!(undescribed(&typo), ["items.id"]);
+    }
+}

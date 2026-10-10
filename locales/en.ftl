@@ -315,6 +315,7 @@ runs-step_call = call { $name }: { $args }
 runs-step_result = result ({ $outcome }): { $text }
 runs-trigger_addressed = addressed
 runs-trigger_wake = scheduled
+runs-trigger_spontaneous = on its own
 runs-open = still running
 logs-empty = No warnings or errors since the bot started.
 logs-header = Latest warnings and errors ({ $count }):

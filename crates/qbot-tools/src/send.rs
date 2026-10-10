@@ -82,9 +82,21 @@ fn marker(inner: &str) -> Option<Result<Marker, String>> {
         ("at", Some("all")) => Err(say(Text::SendMessageAtAll {})),
         ("at", _) => number(member).and_then(small).map(Marker::At),
         ("contact", _) => number(member).and_then(small).map(Marker::Contact),
-        ("face", _) => number(|name| Text::SendMessageNeedsFace { name })
+        // The chat shows a face with its name (`[face:14:smile]`); the name is only a label.
+        ("face", Some(value)) => value
+            .split(':')
+            .next()
+            .and_then(|id| id.trim().parse::<u64>().ok())
+            .ok_or_else(|| {
+                say(Text::SendMessageNeedsFace {
+                    name: name.to_owned(),
+                })
+            })
             .and_then(small)
             .map(Marker::Face),
+        ("face", None) => Err(say(Text::SendMessageNeedsFace {
+            name: name.to_owned(),
+        })),
         ("reply", _) => number(|name| Text::SendMessageNeedsMessage { name })
             .and_then(|n| i64::try_from(n).map_err(|_| too_large()))
             .map(Marker::Reply),
@@ -213,7 +225,7 @@ impl Tool for SendMessage {
     }
 
     fn effect(&self) -> Effect {
-        Effect::Send
+        Effect::Write
     }
 
     async fn call(&self, cx: &ToolCx<'_>, args: SendArgs) -> Result<ToolOutput, ToolError> {

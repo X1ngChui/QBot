@@ -11,7 +11,7 @@ mod source;
 mod templates;
 
 pub use persona::{Persona, PersonaError, Personas};
-pub use qbot_store::GroupPeople;
+pub use qbot_store::{GroupPeople, KnownFact, KnownName, KnownNote, Person};
 pub use render::PromptRenderer;
 pub use source::{
     FactKnowledge, HistorySource, Knowledge, KnowledgeSource, PeopleSource, PromptContext,

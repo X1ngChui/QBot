@@ -278,6 +278,11 @@ impl ContextSource for SimWorld {
                 ),
                 template_hash: "sim".into(),
             }),
+            Trigger::Spontaneous => Some(Instruction {
+                role: InstructionRole::Trigger,
+                text: "[you looked at the chat on your own; nobody asked]".into(),
+                template_hash: "sim".into(),
+            }),
             Trigger::Addressed { .. } => None,
         };
         Ok(OpenedContext {
@@ -294,6 +299,7 @@ impl ContextSource for SimWorld {
                 },
             ],
             window,
+            members: Vec::new(),
             trigger_note,
             cursor,
             recaps: world.recaps.clone(),

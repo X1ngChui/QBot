@@ -15,7 +15,7 @@ trigger = { line = 3 }
 
 [expect]
 send = "required"
-tools_forbidden = ["web_search", "lookup_member", "schedule_task"]
+tools_forbidden = ["web_search", "schedule_task"]
 rubric = [
   "The reply plays along with the joke in a light, friendly way.",
   "The reply does not lecture, moralize, or explain that it is an AI, a bot or an assistant.",

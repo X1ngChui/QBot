@@ -53,16 +53,6 @@ pub struct PgArchive {
     pool: PgPool,
 }
 
-/// Who in a group is blocked and whose accounts belong to one person, by member number.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct GroupPeople {
-    /// Numbered members whose block is in force, ascending.
-    pub blocked: Vec<MemberNo>,
-    /// Members whose accounts belong to one person: each set ascending and of at least two
-    /// numbered members of this group, the sets ordered by their lowest number.
-    pub same_person: Vec<Vec<MemberNo>>,
-}
-
 /// Lines with their author's member number.
 const SELECT_LINES: &str = "\
     SELECT l.seq, l.ordinal, l.message_id, l.speaker, l.account_id, l.at_ms, l.text, m.number \
@@ -74,41 +64,8 @@ impl PgArchive {
         Self { pool }
     }
 
-    /// The group's blocked members and same-person sets as of `now`, from the block list and
-    /// the identity store. Accounts that have no number in this group do not appear.
-    pub async fn people(&self, group: GroupId, now: UnixMillis) -> Result<GroupPeople, StoreError> {
-        let blocked: Vec<i32> = sqlx::query_scalar(
-            "SELECT m.number FROM group_block b \
-             JOIN member_number m ON m.group_id = b.group_id AND m.account_id = b.account_id \
-             WHERE b.group_id = $1 AND (b.until_ms IS NULL OR b.until_ms > $2) \
-             ORDER BY m.number",
-        )
-        .bind(group.get())
-        .bind(now.get())
-        .fetch_all(&self.pool)
-        .await?;
-        let same_person: Vec<Vec<i32>> = sqlx::query_scalar(
-            "SELECT array_agg(m.number ORDER BY m.number) FROM member_number m \
-             JOIN account a ON a.account_id = m.account_id \
-             WHERE m.group_id = $1 \
-             GROUP BY a.holder_id HAVING count(*) > 1 \
-             ORDER BY min(m.number)",
-        )
-        .bind(group.get())
-        .fetch_all(&self.pool)
-        .await?;
-        let number = |n: i32| {
-            u32::try_from(n)
-                .map(MemberNo::new)
-                .map_err(|e| StoreError::corrupt(e.to_string()))
-        };
-        Ok(GroupPeople {
-            blocked: blocked.into_iter().map(number).collect::<Result<_, _>>()?,
-            same_person: same_person
-                .into_iter()
-                .map(|set| set.into_iter().map(number).collect::<Result<_, _>>())
-                .collect::<Result<_, _>>()?,
-        })
+    pub(crate) fn pool(&self) -> &PgPool {
+        &self.pool
     }
 
     /// Archive one line. Members get a stable number on first appearance, assigned densely per
@@ -319,6 +276,36 @@ impl PgArchive {
         let lines = rows.iter().map(to_line).collect::<Result<Vec<_>, _>>()?;
         let cursor = lines.last().map_or(ArchiveCursor(0), |a| a.seq);
         Ok((lines.into_iter().map(|a| a.line).collect(), cursor))
+    }
+
+    /// The accounts behind those of `numbers` that are member numbers of `group`.
+    pub async fn members(
+        &self,
+        group: GroupId,
+        numbers: &[MemberNo],
+    ) -> Result<Vec<(MemberNo, AccountId)>, StoreError> {
+        let numbers: Vec<i32> = numbers
+            .iter()
+            .filter_map(|n| i32::try_from(n.get()).ok())
+            .collect();
+        let rows = sqlx::query(
+            "SELECT number, account_id FROM member_number WHERE group_id = $1 AND number = ANY($2) \
+             ORDER BY number",
+        )
+        .bind(group.get())
+        .bind(&numbers)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                let number = u32::try_from(r.get::<i32, _>("number"))
+                    .map(MemberNo::new)
+                    .map_err(|e| StoreError::corrupt(e.to_string()))?;
+                let account = AccountId::new(r.get("account_id"))
+                    .map_err(|e| StoreError::corrupt(e.to_string()))?;
+                Ok((number, account))
+            })
+            .collect()
     }
 
     /// The ordinal of the group's newest line, 0 when it has none.

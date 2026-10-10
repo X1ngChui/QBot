@@ -7,6 +7,9 @@
 use qbot_core::{AccountId, GroupId, MessageId, UnixMillis};
 use serde_json::Value;
 
+pub use crate::card::Card;
+use crate::card::{ark, field as card_field, xml_brief};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mention {
     All,
@@ -29,10 +32,23 @@ pub enum Segment {
         url: Option<String>,
     },
     Video,
-    File(String),
-    Face(u32),
-    /// A marketplace sticker: the client's summary (often a placeholder), its image link and
-    /// the stable sticker id.
+    /// A group file, or a file or folder sent online.
+    File {
+        name: String,
+        size: Option<u64>,
+        folder: bool,
+    },
+    /// QQ Flash Transfer: a set of files offered for download, nothing more is said.
+    FileTransfer,
+    /// A QQ face by its id, with the name QQ gives it when the platform passes that on.
+    Face {
+        id: u32,
+        name: Option<String>,
+    },
+    /// The poke shown as a message (a "poke" face), not the poke notice.
+    Poke,
+    /// A marketplace sticker: its name (often a placeholder), its image link and the stable
+    /// sticker id. The platform reports one as a picture carrying an `emoji_id`.
     Sticker {
         summary: String,
         url: Option<String>,
@@ -46,8 +62,11 @@ pub enum Segment {
     Forward {
         nodes: Option<Vec<ForwardNode>>,
     },
-    Card,
+    /// A rich card: a shared contact, group, location, song, link or mini-app. Context for the
+    /// message only: no account or group it names becomes anything the bot can act on.
+    Card(Card),
     Markdown(String),
+    /// A segment kind this parser does not know.
     Other(String),
 }
 
@@ -184,6 +203,21 @@ fn forward_node(raw: &Value) -> ForwardNode {
     }
 }
 
+/// A size in bytes, given as a number or a numeric string.
+fn size(value: Option<&Value>) -> Option<u64> {
+    value.and_then(int).and_then(|s| u64::try_from(s).ok())
+}
+
+/// A sticker's name without the brackets the client puts around it ("[name]").
+fn sticker_name(value: Option<&Value>) -> String {
+    text_of(value)
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim()
+        .to_owned()
+}
+
 fn segment(raw: &Value) -> Segment {
     let kind = raw.get("type").and_then(Value::as_str).unwrap_or("");
     let data = raw.get("data").unwrap_or(&Value::Null);
@@ -201,6 +235,12 @@ fn segment(raw: &Value) -> Segment {
             .and_then(int)
             .and_then(|id| MessageId::new(id).ok())
             .map_or_else(|| Segment::Other("reply".into()), Segment::Reply),
+        // A marketplace sticker arrives as a picture with the sticker's ids.
+        "image" if field("emoji_id").is_some() => Segment::Sticker {
+            summary: sticker_name(field("summary")),
+            url: nonempty(field("url")),
+            key: nonempty(field("emoji_id")),
+        },
         "image" => Segment::Image {
             file: nonempty(field("file")),
             url: nonempty(field("url")),
@@ -213,17 +253,35 @@ fn segment(raw: &Value) -> Segment {
             url: nonempty(field("url")),
         },
         "video" => Segment::Video,
-        "file" => Segment::File(
-            Some(text_of(field("name")))
-                .filter(|n| !n.is_empty())
-                .unwrap_or_else(|| text_of(field("file"))),
-        ),
+        "file" => Segment::File {
+            name: nonempty(field("name"))
+                .or_else(|| nonempty(field("file")))
+                .unwrap_or_default(),
+            size: size(field("file_size")),
+            folder: false,
+        },
+        "onlinefile" => Segment::File {
+            name: text_of(field("fileName")),
+            size: size(field("fileSize")),
+            folder: field("isDir").and_then(Value::as_bool) == Some(true),
+        },
+        "flashtransfer" => Segment::FileTransfer,
         "face" => field("id")
             .and_then(int)
             .and_then(|id| u32::try_from(id).ok())
-            .map_or_else(|| Segment::Other("face".into()), Segment::Face),
+            .map_or_else(
+                || Segment::Other("face".into()),
+                |id| Segment::Face {
+                    id,
+                    // QQ writes a face's name with a leading slash ("/smile").
+                    name: card_field(field("raw").and_then(|r| r.get("faceText")))
+                        .map(|n| n.trim_start_matches('/').trim().to_owned())
+                        .filter(|n| !n.is_empty()),
+                },
+            ),
+        "poke" => Segment::Poke,
         "mface" => Segment::Sticker {
-            summary: text_of(field("summary")),
+            summary: sticker_name(field("summary")),
             url: nonempty(field("url")),
             key: nonempty(field("emoji_id")).or_else(|| nonempty(field("key"))),
         },
@@ -242,7 +300,29 @@ fn segment(raw: &Value) -> Segment {
                 .and_then(Value::as_array)
                 .map(|nodes| nodes.iter().map(forward_node).collect()),
         },
-        "json" | "xml" => Segment::Card,
+        "json" | "miniapp" => Segment::Card(ark(field("data"))),
+        "xml" => Segment::Card(xml_brief(field("data"))),
+        // The OneBot form (as the bot's own card echoes): only an id, which is not shown.
+        "contact" => Segment::Card(if text_of(field("type")) == "group" {
+            Card::Group { name: None }
+        } else {
+            Card::Contact { name: None }
+        }),
+        "location" => Segment::Card(Card::Location {
+            name: card_field(field("title")),
+            address: card_field(field("content")),
+        }),
+        "music" => Segment::Card(Card::Music {
+            title: card_field(field("title")),
+            artist: card_field(field("content")),
+            url: None,
+        }),
+        "share" => Segment::Card(Card::Link {
+            title: card_field(field("title")),
+            text: card_field(field("content")),
+            source: None,
+            url: None,
+        }),
         "markdown" => Segment::Markdown(text_of(field("content").or_else(|| field("data")))),
         other => Segment::Other(other.to_owned()),
     }

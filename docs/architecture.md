@@ -91,12 +91,47 @@ qbot-eval      reply-quality evaluation against the real model (run by hand)
 
 - **Parsing** (`qbot-gateway::wire`): frames become typed events (`GroupMessage`, `GroupNotice`,
   `ActionResponse`); anything unusable is `Frame::Ignored` with a reason.
-- **Rendering** (`render`): a message becomes archive text with ASCII markers: `[at:N]`,
-  `[at:bot]`, `[reply:ID]`, `[image]`, `[sticker:..]`, `[voice]`, `[face:N]`,
-  `[dice result:N]`, `[rps result:HAND]`, `[forward:N]` with indented lines, `[file:NAME]`, `[card]`, `[notice:..]`.
-  Member-typed ASCII brackets become fullwidth brackets, so a marker cannot be forged. Forwarded
-  records show at most `FORWARD_MAX_LINES` (30) of their messages: a record can hold hundreds,
-  and every prompt showing the line would carry them all.
+- **Rendering** (`render`): a message becomes archive text with ASCII markers, one per segment
+  (the table below). What members typed is kept as typed; only a marker-shaped token in it is
+  escaped, so a marker cannot be forged (section 7, Trust). Forwarded records show at most `FORWARD_MAX_LINES` (30) of their messages: a
+  record can hold hundreds, and every prompt showing the line would carry them all.
+- **Segments, received and sent.** Receiving aims to understand everything NapCat (v4.18)
+  reports in a group message; sending is a separate, deliberately small set. A marker the model
+  can read is not therefore one it can write: a receive-only marker in `send_message` text is
+  sent as the literal text it is. Rich cards arrive as one `json` segment holding QQ's "ark"
+  document; `qbot-gateway::card` reads the few fields that say what the card is about.
+
+  | NapCat segment (received) | Archived as | Receive | Send |
+  | --- | --- | --- | --- |
+  | `text`, `markdown` | the text | understood | text: supported |
+  | `at` | `[at:N]`, `[at:bot]`, `[at:all]` | understood | `[at:N]`; `@all` refused |
+  | `reply` (NapCat drops one it cannot resolve) | `[reply:ID]` | understood | `[reply:ID]`, first |
+  | `face` | `[face:N]`, `[face:N:NAME]` (QQ's `faceText`) | understood | `[face:N]` |
+  | `image` | `[image]`, then `[image:DESCRIPTION]` | understood (described; `open_images`) | unsupported |
+  | `image` with `emoji_id`, `mface` (marketplace sticker) | `[sticker:NAME]`, then described | understood | unsupported |
+  | `record` | `[voice]`, then `[voice:TRANSCRIPT]` | understood (transcribed) | unsupported |
+  | `video` | `[video]` | marker only | unsupported |
+  | `file`, `onlinefile` | `[file:NAME (SIZE)]`, `[folder:NAME]` | marker and metadata | unsupported |
+  | `flashtransfer` | `[file transfer]` | marker only | unsupported |
+  | `forward` (inline content) | `[forward:N]` and indented lines | understood (30 lines) | unsupported |
+  | `dice`, `rps` | `[dice result:N]`, `[rps result:HAND]` | understood | `[dice]`, `[rps]`, no value |
+  | `poke` (the poke face) | `[poke]` | marker only | unsupported |
+  | `contact` (as the bot's own card echoes) | `[contact card]`, `[group card]` | marker only | `[contact:N]`, members seen speaking here |
+  | `json` ark: contact, group | `[contact card:NAME]`, `[group card:NAME]` | marker and metadata | unsupported |
+  | `json` ark: location | `[location:name=..; address=..]` | marker and metadata | unsupported |
+  | `json` ark: music | `[music:title=..; artist=..; url=..]` | marker and metadata | unsupported |
+  | `json` ark: news, link, mini-app; `share`, `miniapp` | `[link:title=..; text=..; source=..; url=..]` | marker and metadata | unsupported |
+  | `json` ark, other; `xml` | `[card:SUMMARY]` (`prompt`, `brief`), else `[card]` | marker only | unsupported |
+  | `location`, `music` (OneBot form) | as the ark cards | marker and metadata | unsupported |
+  | anything else | `[unsupported:KIND]` | marker only | unsupported |
+
+  NapCat reports group events (recalls, joins, leaves, mutes, pokes) as notices, never as
+  segments; they are archived as `[notice:..]` lines. A card's fields are cut at 120 characters,
+  and only an http(s) link of at most 400 characters is kept.
+- **A received card is context, never a capability.** No account or group id a card carries is
+  shown, numbered or stored: only mentions get member numbers, and `send_message` addresses only
+  members the run's context names (below). A card for another
+  group gives the bot no handle on that group.
 - **Archiving** (`pipeline::archive_form`, `PgArchive::append_line`): one transaction per line
   assigns the line its dense per-group ordinal, gives every mentioned account a stable member
   number (rewriting `[at:ACCOUNT]` to `[at:N]`) and records each media item's platform
@@ -146,10 +181,21 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
 
 ## 6. The agent runtime (`qbot-agent`)
 
-- **Supervisor.** Every trigger (an addressed message or a due task) becomes its own run with its
-  own deadline; runs of one group may overlap. Admission gates, in order: muted group, then a
-  blocked initiator (addressed runs only), then capacity. One bounded queue serves addressed runs
-  and timers; `replies.concurrency` runs call the model at once; queue time counts against
+- **Triggers.** Three kinds, each its own `Trigger` variant and trigger note:
+  - `Addressed`: a member addressed the bot (an @, a nickname, a quote of a bot line). The
+    member and their message are the run's initiator and focus.
+  - `Wake`: a scheduled task came due, with its stored intent.
+  - `Spontaneous`: the bot looked at the conversation on its own. A member's line that
+    addresses no one rolls `replies.spontaneous_chance` (default 0, off). On a hit, a run starts
+    after the group's media in flight is described. It has no initiator and no triggering
+    message, and its note says so: nobody is waiting for an answer, and `stay_silent` is the
+    usual outcome. A group has at most one spontaneous run at a time, so a lively chat cannot
+    start several that talk over each other.
+- **Supervisor.** Every trigger becomes its own run with its own deadline; runs of one group may
+  overlap. Admission gates, in order: muted group, then a blocked member (the initiator of an
+  addressed run; for a spontaneous run, the author of the line that rolled it, since a blocked
+  member's message never starts a run of any kind), then capacity. One bounded queue serves all
+  runs; `replies.concurrency` runs call the model at once; queue time counts against
   `replies.deadline_secs`.
 - **Run loop.** Project, call the model, append, execute the calls, append the results, then the
   chat that arrived. A turn with no tool call ends the run, except as below. The run also ends on
@@ -159,7 +205,11 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
   marker syntax (`[reply:ID]` first, `[at:N]`, `[face:N]`; `[dice]`, `[rps]`, `[contact:N]`
   alone, never a game result), parsed strictly with an explanation for every mistake. It waits for the echo, so the
   result shows the message as delivered. Sends per run are bounded by `replies.max_messages`.
-  `stay_silent` makes silence explicit.
+  `stay_silent` makes silence explicit. `[at:N]` and `[contact:N]` may name only a member the
+  run's context names (`OpenedContext::members`): someone who speaks in the visible chat, is
+  mentioned in it, is named in a task's intent as `member:N`, or has an entry in the people
+  block. So a reminder reaches someone who has been quiet, while the model cannot address a
+  number nothing showed it.
 - **Undelivered text.** A turn that ends with text but no tool call wrote something nobody saw.
   The run appends one note (`prompts/undelivered_note.md`) and asks for one more turn that must
   call a tool, so a written reply is never lost and narration is never delivered.
@@ -167,7 +217,7 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
   refuses a forced choice with reasoning on, and refuses a reasoning turn after one without it
   (measured on the live API, pinned by an ignored live test), so on DeepSeek the forced turn and
   the rest of that run go without reasoning. OpenAI-style providers declare `Always`.
-- **Executor.** Reads run concurrently, then writes and sends in call order; a refused call gets
+- **Executor.** Reads run concurrently, then writes (sends included) one at a time in call order; a refused call gets
   a typed refusal; every call executes (no deduplication), so the prompt teaches the model not to
   repeat a write.
 - **Tools** (`Tool` trait): the argument schema is generated from the Rust type (schemars, nested
@@ -178,25 +228,37 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
 
 - **Instructions** are minijinja templates in `prompts/*.md` with a closed set of slots per
   template (a test holds them equal): the reply rules, the guide to reading chat markers, the
-  persona block, the people block, the learned group knowledge, the trigger note, picture
+  persona block, the people block, the learned group knowledge, the three trigger notes, picture
   description, extraction.
 - **Order is stable to volatile**, so runs of a group share the longest prefix the provider can
-  cache: reply rules, legend, persona and its group background (fixed per deployment), then the
-  people block (changes when a block or link does), then learned knowledge (changes when an
-  episode is extracted),
-  then the chat (grows by whole batches), and last the trigger note (the time, the trigger, the
-  current group display names of the members in the chat (`with_directory`), a
-  task's intent), which is different for every run.
-- **People block**: who is blocked (blocks in force now) and which member numbers are one person
-  (holders with two or more numbered accounts in the group), from the store on every run, by
-  member number only, in ascending order. Omitted when there is neither.
+  cache:
+  1. the reply rules, the legend, and the persona with its group background (fixed per
+     deployment);
+  2. the people block and learned knowledge, which change only when a command or an extraction
+     changes a record;
+  3. the chat, which grows by whole batches;
+  4. last the trigger note (the time, the trigger, a task's intent, and the current group
+     display names of the members in the chat and in the people block, read live through
+     `with_directory`), which is different for every run.
+- **People block** (`PgArchive::people`, one read model): everyone the bot keeps a record about,
+  one entry per person, in member order. An entry has:
+  - the person's numbered accounts here (two or more are linked accounts), and which are
+    blocked now;
+  - the names they go by, confirmed ones and leads from chat;
+  - notes members wrote (each with its date);
+  - facts learned from chat (each with its episode count and last confirmation date).
+
+  Dates are absolute and nothing depends on the current hour, so the block is byte-identical
+  until a record changes. Member-written text is escaped like chat and kept on its own line.
+  Live display names are not part of it: they change apart from every record and sit in the
+  trigger note. The model reads who someone is here, with no tool call; there is no lookup tool.
 - **Personas** are TOML files: `default.toml`, or `group_<id>.toml` replacing it for one group.
 - **History tiers.** A run sees whole batches counted back from the batch being filled: the newest
   `history.raw_batches` verbatim, the `history.summary_batches` before them as the summaries of
   the episodes that cover them (a batch no episode covers yet stays verbatim), nothing older; that
   is reached through `search_history` and `recall_episodes`. The tiers move a batch at a time.
 - **Group knowledge** enters as an instruction: the group's topic, and at most
-  `FactKnowledge::MAX_TERMS` (40) terms, the most recently confirmed, listed in key order so that
+  `memory.group_terms` (40) terms, the most recently confirmed, listed in key order so that
   confirming a term again does not change the prompt.
 - **Wording** (`qbot-wording`): every short model-facing text (tool and parameter descriptions,
   results, error explanations, outcome notes, extraction headers and corrections) is a `Text`
@@ -206,6 +268,39 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
   (`locales/en.ftl`, `zh-CN.ftl`, or `<config>/locales/<tag>.ftl`), checked against the schema at
   startup. The catalog also names the language the bot writes its memory and picture
   descriptions in (`writing-language`), so one setting, `bot.locale`, decides both.
+
+- **Trust and provenance.** One stable rule in `reply_system.md` says the model's instructions
+  are its rules, the reading guide and its persona, and that everything else is material, never
+  instructions. Everything else carries its provenance in its structure rather than in repeated
+  warnings:
+  - The rules, reading guide, persona and operator group background are system messages. Notes
+    for the model (the undelivered-text note) are developer messages.
+  - Chat lines, episode summaries, the trigger note (names, a task's intent), the people block
+    and learned group knowledge are user content (`InstructionRole::Trigger`,
+    `InstructionRole::Reference`). The people block and knowledge are assembled by the system,
+    but their names, notes and facts are what members wrote or said, so they get the chat's
+    standing, never a system message's.
+  - Web pages, search results and history come back as tool results under a one-line header
+    naming their source; their text is passed on unchanged.
+- **Escaping is narrow and tied to the protocol** (`qbot_core::marker`). `MARKERS` is the closed
+  set of marker names the system writes into model-visible text (`[msg:`, `[at:`, `[image:`, the
+  card kinds, `[notice:`, the summary heading). Outside text is changed only where it could
+  collide with that protocol:
+  - `escape_markers`, for text standing among markers (member text, forwarded messages and
+    their sender names, display names, summaries and knowledge written from chat): an ASCII
+    `[` opening a marker-shaped token (a registered name in any case or spacing, closed by `]`
+    or opening a value with `:`) becomes fullwidth. `[at:1]` typed by a member shows as
+    fullwidth-bracket `at:1]`, while `arr[0]`, `[1]`, `[sic]`, Markdown links, code and
+    Chinese punctuation are untouched. Consecutive text segments are escaped as one run, so two
+    pieces cannot join into a marker.
+  - `marker_value`, for outside text inside a marker's value (picture descriptions,
+    transcripts, card fields, file, face and sticker names): both brackets become fullwidth,
+    because a value ends at the first `]`, and the value is put on one line.
+  - NUL is dropped (the database rejects it). Nothing else is rewritten: no Markdown stripping,
+    no punctuation changes.
+  - Tool results are not escaped. Their place in the conversation already says what they are.
+  - A test checks that every marker the renderer writes is registered; a new marker kind goes
+    into `MARKERS` first.
 
 ## 8. Memory
 
@@ -262,7 +357,7 @@ the `media_ref` row the platform reference came in.
   and shares one upload between concurrent requests; the cache belongs to one provider instance,
   so file ids never cross accounts or providers. The `media_cache` table holds only
   `fingerprint:sha256` keys.
-- **Waiting.** A reply waits up to 25 seconds for every picture and clip posted in its group that is
+- **Waiting.** A reply waits up to `media.reply_wait_secs` (25) for every picture and clip posted in its group that is
   still being worked on, not only its trigger's (the picture a question is about is often the message before
   it, or the quoted one), then goes ahead with what there is.
 
@@ -352,19 +447,36 @@ The schema holds only what a deployment may choose:
 | `bot` | account, owners, nicknames, timezone, locale (also the language the bot writes in) |
 | `gateway` | listen address, access token secret |
 | `database` | host, port, name, user, ssl mode, password secret |
-| `replies` | concurrency, deadline, messages per reply |
+| `replies` | concurrency, deadline, messages per reply, the chance of a spontaneous run |
 | `history` | batch lines, raw and summary batches |
-| `memory` | slice batches; recall's max distance and half-life; fact half-lives per decay class |
-| `media` | voice transcription on or off; pictures and clips per minute per group |
+| `memory` | slice batches, group terms shown; recall's max distance and half-life; fact half-lives per decay class |
+| `media` | voice transcription on or off; pictures and clips per minute per group; how long a reply waits for them |
 | `network` | an outbound proxy and the services that use it |
-| `providers.*` | text (kind, endpoint, model, reasoning), vision, embedding (model, width, batch), search (depths) |
-| `maintenance` | nightly and report schedules, backups kept, client tools directory, run retention, NapCat cache cleanup |
+| `providers.*` | text (kind, endpoint, model, reasoning of replies and of extraction), vision, embedding (model, width, batch), search (depths) |
+| `maintenance` | nightly and report schedules, backups kept, client tools directory, record retention, NapCat cache cleanup |
 
-Derived rather than configured: the reply queue (ten waiting replies per model slot), the
-provider's state mode (from its kind), the writing language (from the locale), the extraction's
-context (one batch on either side of a slice), the directory layout (fixed under the
-configuration and data directories). Everything else is a constant in the crate it governs: the
-`Default` of that crate's settings struct, which tests use and the composition root fills in.
+Settings that depend on each other are checked together at startup:
+- `memory.slice_batches` is at most `history.raw_batches`, so an episode exists before its chat
+  leaves the verbatim tier;
+- `media.reply_wait_secs` is less than `replies.deadline_secs`, since the wait counts against
+  the deadline;
+- `replies.spontaneous_chance` is from 0 to 1.
+
+Derived rather than configured:
+- the reply queue: ten waiting runs per model slot of `replies.concurrency`;
+- the extraction's context: one batch on either side of a slice, within the verbatim tier;
+- extraction cadence: every filled batch queues its group's extraction, which extracts each
+  completed slice, and the nightly run catches up;
+- how long an unused name lead lives: one default fact half-life
+  (`memory.facts.half_life_days.default`), since a lead from chat fades like a fact;
+- record retention: one `maintenance.records_keep_days` for finished runs and finished
+  scheduled tasks, the two operational records;
+- the provider's state mode (from its kind), the writing language (from the locale), and the
+  directory layout (fixed under the configuration and data directories).
+
+Everything else is a constant in the crate it governs, the `Default` of that crate's settings
+struct, because it is a safety bound, a resource bound on untrusted input, or algorithm tuning
+nobody should need. Section 14 lists the bounds and why each exists.
 
 ## 14. Limits
 
@@ -382,10 +494,11 @@ error is left to that error. The local limits and why they exist:
 | Media workers, queue, picture size, clip length | 4, 32, 8 MiB, 300 s | CPU and memory isolation; pictures and clips are untrusted input of any size |
 | Opened-picture cache | 64 MiB | memory bound for bytes fetched on demand |
 | Forwarded lines shown | 30 | an unbounded external input enters every later prompt |
+| Card field, file or face name; card link | 120 characters; 400 or left out | external text that enters every later prompt; a cut link leads nowhere |
 | `read_url` page | 8,000 characters | a web page is the one tool input with no size of its own |
 | Search results, passages | 5, 3 | enough to answer from, little enough to read |
-| Group terms in the prompt | 40 | the block enters every reply's instructions |
-| Notes per account | 20 | bounds what one member's notes add to a lookup |
+| Group terms in the prompt | configured (40) | the block enters every reply's instructions |
+| Notes per account | 20 | bounds what one member's notes add to every reply's people block |
 | Name length | 64 characters | a name is a name, not a paragraph |
 | Per-call deadlines | 10 min text, 2 min picture, 30 s embedding, 20 s search | a hung connection must not stall the nightly run |
 | Connect timeout | 10 s | a hung connect is invisible to the provider |
@@ -416,9 +529,9 @@ spend.
 ## 16. Operations (`qbot-ops`)
 
 - **Nightly**: extraction (each group's episodes, after embedding any the current index lacks),
-  decay (name candidates nothing supported for 30 days, cached picture descriptions older than 15 days,
-  faded facts), a verified backup, cleanup (finished timers after 30 days, finished runs after
-  `maintenance.runs_keep_days`, NapCat's file cache through its `clean_cache` action). Every stage
+  decay (name candidates nothing supported for one default fact half-life, cached picture descriptions older than 15 days,
+  faded facts), a verified backup, cleanup (finished tasks and finished runs after
+  `maintenance.records_keep_days`, NapCat's file cache through its `clean_cache` action). Every stage
   runs. The job fails, and is retried, if decay, the backup or cleanup failed; a failed extraction
   is logged and left to the group's next filled batch or the next night, since a retry of the
   whole job would also take another backup and rotate an older one out.
@@ -454,9 +567,9 @@ through it.
 
 ## 19. Known gaps
 
-- NapCat delivers marketplace stickers as `image` segments carrying an `emoji_id`; they are
-  rendered and described as pictures rather than stickers.
-- A contact card the bot sends echoes back as `[unsupported:contact]`.
+- Videos are only a `[video]` marker: nothing describes them.
+- A file's contents and a card's target page are never fetched by themselves; `read_url` reads a
+  card's link only if the model asks.
 - Extraction, picture-description and embedding calls are not recorded in `usage_event`, so
   `/stats` and the report count reply runs only.
 - An uploaded picture stays at DeepSeek for the Files API's longest lifetime (30 days), though

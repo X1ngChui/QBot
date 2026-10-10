@@ -727,14 +727,20 @@ async fn a_member_number_survives_everything_that_happens_to_its_account() {
 }
 
 #[tokio::test]
-async fn people_shows_current_blocks_and_linked_accounts_by_member_number() {
+async fn people_shows_each_person_with_blocks_links_names_notes_and_facts() {
     use qbot_core::MemberNo;
-    use qbot_memory::IdentityStore;
+    use qbot_memory::facts::{FactStore, Observation};
+    use qbot_memory::identity::AliasTarget;
+    use qbot_memory::predicates::DecayClass;
+    use qbot_memory::{IdentityStore, NoteStore};
+    use qbot_store::{KnownFact, KnownName, KnownNote, PgFactStore, PgNoteStore};
     let db = db!();
     let clock = ManualClock::new(T0);
     let archive = PgArchive::new(db.pool().clone());
     let identity = PgIdentityStore::new(db.pool().clone(), IdentityPolicy::default());
     let policy = qbot_store::PgGroupPolicy::new(db.pool().clone(), clock.clone());
+    let notes = PgNoteStore::new(db.pool().clone());
+    let facts = PgFactStore::new(db.pool().clone());
     let g = group(60);
     let account = |n: i64| AccountId::new(n).unwrap();
     let no = |n: u32| MemberNo::new(n);
@@ -749,9 +755,26 @@ async fn people_shows_current_blocks_and_linked_accounts_by_member_number() {
         .append(member(group(61), 1, 706, "hi"))
         .await
         .unwrap();
+    // Who each person is and who of them is blocked, by member number.
+    let shape = |people: &qbot_store::GroupPeople| {
+        people
+            .people
+            .iter()
+            .map(|p| {
+                (
+                    p.members.iter().map(|(n, _)| n.get()).collect::<Vec<_>>(),
+                    p.blocked.iter().map(|n| n.get()).collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
 
     let now = UnixMillis::new(T0);
-    assert_eq!(archive.people(g, now).await.unwrap(), Default::default());
+    assert_eq!(
+        archive.people(g, now).await.unwrap(),
+        Default::default(),
+        "no records, nobody listed"
+    );
 
     policy.block(g, account(704), None).await.unwrap();
     policy
@@ -762,26 +785,108 @@ async fn people_shows_current_blocks_and_linked_accounts_by_member_number() {
     policy.block(group(61), account(701), None).await.unwrap();
     identity.merge(account(705), account(703)).await.unwrap();
     identity.merge(account(701), account(706)).await.unwrap();
-
     let people = archive.people(g, now).await.unwrap();
-    assert_eq!(people.blocked, [no(2), no(4)], "ascending, this group only");
     assert_eq!(
-        people.same_person,
-        [vec![no(3), no(5)]],
-        "a linked account without a number here is not shown"
+        shape(&people),
+        [(vec![2], vec![2]), (vec![3, 5], vec![]), (vec![4], vec![4])],
+        "a linked account without a number here is not shown; blocks are this group's"
     );
+    assert_eq!(people.people[1].members[0], (no(3), account(703)));
 
     let later = UnixMillis::new(T0 + 60_001);
     identity.merge(account(701), account(702)).await.unwrap();
-    let people = archive.people(g, later).await.unwrap();
-    assert_eq!(people.blocked, [no(4)], "an expired block is gone");
-    assert_eq!(people.same_person, [vec![no(1), no(2)], vec![no(3), no(5)]]);
-
+    assert_eq!(
+        shape(&archive.people(g, later).await.unwrap()),
+        [
+            (vec![1, 2], vec![]),
+            (vec![3, 5], vec![]),
+            (vec![4], vec![4])
+        ],
+        "an expired block is gone; a new link joins two numbers into one person"
+    );
     identity.split(account(703), later).await.unwrap();
     assert_eq!(
-        archive.people(g, later).await.unwrap().same_person,
-        [vec![no(1), no(2)]],
+        shape(&archive.people(g, later).await.unwrap()),
+        [(vec![1, 2], vec![]), (vec![4], vec![4])],
         "unlinking ends the set"
+    );
+
+    // Names (of an account, and of a person whose holder was later merged away), notes and
+    // facts, all under the person they are about.
+    let person_of_705 = identity.holder_of(account(705)).await.unwrap().unwrap();
+    identity
+        .set_name(g, "Kit", AliasTarget::Account(account(705)), later)
+        .await
+        .unwrap();
+    identity
+        .set_name(g, "Kitty", AliasTarget::Holder(person_of_705.id), later)
+        .await
+        .unwrap();
+    identity.merge(account(704), account(705)).await.unwrap();
+    notes
+        .add(g, account(705), "allergic to peanuts", account(701), later)
+        .await
+        .unwrap();
+    facts
+        .observe(&Observation {
+            group: g,
+            subject: Some(account(704)),
+            predicate: "lives_in".into(),
+            key: String::new(),
+            object: "Hangzhou".into(),
+            label: None,
+            opposite: None,
+            decay: DecayClass::Stable,
+            episode: qbot_memory::EpisodeId::new(9),
+            message: qbot_core::MessageId::new(1).unwrap(),
+            quote: "q".into(),
+            at: later,
+        })
+        .await
+        .unwrap();
+    let people = archive.people(g, later).await.unwrap();
+    let merged = &people.people[1];
+    assert_eq!(
+        merged
+            .members
+            .iter()
+            .map(|(n, _)| n.get())
+            .collect::<Vec<_>>(),
+        [4, 5]
+    );
+    assert_eq!(
+        merged.names,
+        [
+            KnownName {
+                text: "kit".into(),
+                confirmed: true
+            },
+            KnownName {
+                text: "kitty".into(),
+                confirmed: true
+            }
+        ]
+    );
+    assert_eq!(
+        merged.notes,
+        [KnownNote {
+            text: "allergic to peanuts".into(),
+            updated: later
+        }]
+    );
+    assert_eq!(
+        merged.facts,
+        [KnownFact {
+            predicate: "lives_in".into(),
+            value: "Hangzhou".into(),
+            supports: 1,
+            last_confirmed: later
+        }]
+    );
+    assert_eq!(
+        archive.people(g, later).await.unwrap(),
+        people,
+        "the same records give the same block"
     );
     db.drop_db().await;
 }

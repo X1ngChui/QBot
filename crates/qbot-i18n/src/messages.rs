@@ -295,6 +295,7 @@ messages! {
     "runs-step_result" => RunsStepResult { outcome: String, text: String },
     "runs-trigger_addressed" => RunsTriggerAddressed {},
     "runs-trigger_wake" => RunsTriggerWake {},
+    "runs-trigger_spontaneous" => RunsTriggerSpontaneous {},
     "runs-open" => RunsOpen {},
     "logs-empty" => LogsEmpty {},
     "logs-header" => LogsHeader { count: u64 },

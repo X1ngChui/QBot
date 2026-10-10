@@ -17,22 +17,17 @@ use qbot_llm::embedding::FakeEmbedder;
 use qbot_llm::search::{FakeSearch, PageRead, SearchHit, SearchResults};
 use qbot_llm::{Provider, ReasoningEffort, Usage};
 use qbot_memory::facts::{
-    DecayPolicy, FactStore, GROUP_TERM, GROUP_TOPIC, MemoryFactStore, Observation, normalize_key,
+    FactStore, GROUP_TERM, GROUP_TOPIC, MemoryFactStore, Observation, normalize_key,
 };
-use qbot_memory::identity::IdentityPolicy;
 use qbot_memory::predicates::{Cardinality, DecayClass, Predicates};
-use qbot_memory::{
-    EpisodeId, IdentityStore, MemoryEpisodeStore, MemoryIdentityStore, MemoryNoteStore, NoteStore,
-    Recall, RecallParams,
-};
+use qbot_memory::{EpisodeId, MemoryEpisodeStore, Recall, RecallParams};
 use qbot_prompt::{
     FactKnowledge, GroupPeople, HistorySource, PeopleSource, Personas, PromptContext,
     PromptRenderer, PromptSettings,
 };
 use qbot_sched::{MemoryTimerStore, TaskLimits, TaskService};
 use qbot_tools::{
-    LookupMember, ReadUrl, SearchSettings, ToolSettings, WebSearchTool, add_memory_tools,
-    standard_tools,
+    ReadUrl, SearchSettings, ToolSettings, WebSearchTool, add_memory_tools, standard_tools,
 };
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -56,16 +51,18 @@ struct Names(Vec<(AccountId, String)>);
 
 #[async_trait]
 impl Directory for Names {
+    /// Marker-safe, as the platform directory gives a name.
     async fn display_name(&self, _: GroupId, account: AccountId) -> Option<String> {
         self.0
             .iter()
             .find(|(a, _)| *a == account)
-            .map(|(_, n)| n.clone())
+            .map(|(_, n)| qbot_core::marker::escape_markers(n))
     }
 }
 
-/// The simulated archive as the prompt layer reads it: every line, ordinals from 1.
-struct WorldHistory(Arc<SimWorld>);
+/// The simulated archive as the prompt layer reads it: every line, ordinals from 1, and the
+/// scenario's members by number.
+struct WorldHistory(Arc<SimWorld>, Vec<(u32, AccountId)>);
 
 #[async_trait]
 impl HistorySource for WorldHistory {
@@ -85,6 +82,19 @@ impl HistorySource for WorldHistory {
             cursor,
         ))
     }
+
+    async fn members(
+        &self,
+        _: GroupId,
+        numbers: &[qbot_core::MemberNo],
+    ) -> Result<Vec<(qbot_core::MemberNo, AccountId)>, EnvError> {
+        Ok(self
+            .1
+            .iter()
+            .map(|(n, a)| (qbot_core::MemberNo::new(*n), *a))
+            .filter(|(n, _)| numbers.contains(n))
+            .collect())
+    }
 }
 
 /// The scenario's blocked members, as the store would report them.
@@ -98,6 +108,20 @@ impl PeopleSource for ScenarioPeople {
 }
 
 /// Whether `text` refers to someone by a member handle: `member:12`, `member 12`, `Member12`.
+/// The markers the model can only read: every system marker except the ones `send_message`
+/// turns into message segments.
+const SENDABLE: [&str; 6] = ["at", "reply", "face", "dice", "rps", "contact"];
+
+/// Receive-only markers written into a message, as `[name:` or `[name]`.
+fn read_only_markers(text: &str) -> Vec<String> {
+    qbot_core::marker::MARKERS
+        .iter()
+        .filter(|name| !SENDABLE.contains(name))
+        .filter(|name| text.contains(&format!("[{name}:")) || text.contains(&format!("[{name}]")))
+        .map(|name| (*name).to_owned())
+        .collect()
+}
+
 fn has_member_handle(text: &str) -> bool {
     let lower = text.to_lowercase();
     lower.match_indices("member").any(|(at, word)| {
@@ -114,6 +138,15 @@ fn has_member_handle(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn receive_only_markers_are_found_and_send_markers_are_not() {
+        assert_eq!(
+            super::read_only_markers("see [link:title=x] and [image] and [at:3] [face:14]"),
+            ["image", "link"]
+        );
+        assert!(super::read_only_markers("arr[0] [sic] https://x.example/[1]").is_empty());
+    }
+
     use super::has_member_handle;
 
     #[test]
@@ -196,6 +229,72 @@ fn render(segments: &[OutSegment], scenario: &Scenario, accounts: &[(u32, Accoun
         .collect()
 }
 
+/// The people block as the store would give it: one entry per person (a same-person set or a
+/// single member) that has a block, a link, notes or learned facts.
+async fn scenario_people(
+    scenario: &Scenario,
+    accounts: &[(u32, AccountId)],
+    facts: &dyn FactStore,
+    group: GroupId,
+    now: UnixMillis,
+) -> Result<GroupPeople, String> {
+    use qbot_core::MemberNo;
+    use qbot_prompt::{KnownFact, KnownNote, Person};
+    let mut sets: Vec<Vec<u32>> = scenario.same_person.clone();
+    for (n, _) in accounts {
+        if !sets.iter().any(|set| set.contains(n)) {
+            sets.push(vec![*n]);
+        }
+    }
+    let mut people = Vec::new();
+    for mut set in sets {
+        set.sort();
+        let mut person = Person::default();
+        for n in &set {
+            let Some((_, account)) = accounts.iter().find(|(x, _)| x == n) else {
+                continue;
+            };
+            person.members.push((MemberNo::new(*n), *account));
+            if scenario.members.iter().any(|m| m.number == *n && m.blocked) {
+                person.blocked.push(MemberNo::new(*n));
+            }
+            person
+                .notes
+                .extend(
+                    scenario
+                        .notes
+                        .iter()
+                        .filter(|note| note.member == *n)
+                        .map(|note| KnownNote {
+                            text: note.text.clone(),
+                            updated: now,
+                        }),
+                );
+            for fact in facts
+                .current(group, Some(*account))
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                person.facts.push(KnownFact {
+                    predicate: fact.predicate,
+                    value: fact.label.unwrap_or(fact.object),
+                    supports: fact.supports,
+                    last_confirmed: fact.last_confirmed,
+                });
+            }
+        }
+        let has_records = person.members.len() > 1
+            || !person.blocked.is_empty()
+            || !person.notes.is_empty()
+            || !person.facts.is_empty();
+        if has_records {
+            people.push(person);
+        }
+    }
+    people.sort_by_key(|p| p.members.first().map(|(n, _)| *n));
+    Ok(GroupPeople { people })
+}
+
 pub struct Runner {
     pub provider: Arc<dyn Provider>,
     pub personas: Personas,
@@ -219,22 +318,9 @@ impl Runner {
                 .map(|(_, a)| *a)
                 .ok_or_else(|| format!("unknown member {n}"))
         };
-        let mut people = GroupPeople::default();
         for m in scenario.members.iter().filter(|m| m.blocked) {
             world.block(m.account);
-            people.blocked.push(qbot_core::MemberNo::new(m.number));
         }
-        people.blocked.sort();
-        people.same_person = scenario
-            .same_person
-            .iter()
-            .map(|set| {
-                let mut set: Vec<_> = set.iter().map(|n| qbot_core::MemberNo::new(*n)).collect();
-                set.sort();
-                set
-            })
-            .collect();
-        people.same_person.sort();
 
         // The chat, with times.
         let mut at = timestamp(&scenario.start)?;
@@ -254,14 +340,7 @@ impl Runner {
         let now = Arc::new(Fixed(at.plus(Duration::from_secs(30))));
         world.set_time(now.now());
 
-        // What the bot may look up.
-        let identity = Arc::new(MemoryIdentityStore::new(IdentityPolicy::default()));
-        for (_, a) in &accounts {
-            identity
-                .seen(*a, now.now())
-                .await
-                .map_err(|e| e.to_string())?;
-        }
+        // What the bot keeps about the group and its people.
         let facts = Arc::new(MemoryFactStore::new());
         let predicates = Predicates::builtin();
         let mut episode = 0;
@@ -317,14 +396,7 @@ impl Runner {
                 .await
                 .map_err(|e| e.to_string())?;
         }
-        let notes = Arc::new(MemoryNoteStore::default());
-        for n in &scenario.notes {
-            let who = account_of(n.member)?;
-            notes
-                .add(group, who, &n.text, who, now.now())
-                .await
-                .map_err(|e| e.to_string())?;
-        }
+        let people = scenario_people(scenario, &accounts, facts.as_ref(), group, now.now()).await?;
         let names = Arc::new(Names(
             scenario
                 .members
@@ -391,22 +463,13 @@ impl Runner {
             },
         )
         .and_then(|set| add_memory_tools(set, recall, episodes))
-        .and_then(|set| {
-            set.with(LookupMember {
-                directory: names.clone(),
-                identity: identity.clone(),
-                facts: facts.clone(),
-                notes: notes.clone(),
-                decay: DecayPolicy::default(),
-            })
-        })
         .and_then(|set| set.with(WebSearchTool::new(search.clone())))
         .and_then(|set| set.with(ReadUrl::new(search, 8000)))
         .map_err(|e| e.to_string())?;
 
         // The production prompt layer.
         let prompt = PromptContext::new(
-            Arc::new(WorldHistory(world.clone())),
+            Arc::new(WorldHistory(world.clone(), accounts.clone())),
             self.personas.clone(),
             clock.clone(),
             PromptSettings {
@@ -417,7 +480,8 @@ impl Runner {
         .map_err(|e| e.to_string())?
         .with_knowledge(Arc::new(FactKnowledge::new(
             facts.clone(),
-            FactKnowledge::MAX_TERMS,
+            // memory.group_terms by default
+            40,
         )))
         .with_people(Arc::new(ScenarioPeople(people)))
         .with_directory(names.clone());
@@ -440,6 +504,7 @@ impl Runner {
                     depth: 0,
                 },
             },
+            (None, None) if scenario.trigger.spontaneous => Trigger::Spontaneous,
             (None, None) => return Err("no trigger".into()),
         };
         let context = prompt
@@ -606,6 +671,19 @@ fn checks(
             detail: handles.join(" | "),
         });
     }
+    let copied: Vec<String> = sent
+        .iter()
+        .flatten()
+        .flat_map(|s| match s {
+            OutSegment::Text(text) => read_only_markers(text),
+            _ => Vec::new(),
+        })
+        .collect();
+    out.push(Check {
+        what: "writes no receive-only marker".into(),
+        passed: copied.is_empty(),
+        detail: copied.join(", "),
+    });
     for n in &scenario.expect.mentions_forbidden {
         let Some((_, who)) = accounts.iter().find(|(x, _)| x == n) else {
             continue;

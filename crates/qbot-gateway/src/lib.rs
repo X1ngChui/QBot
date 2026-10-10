@@ -2,6 +2,7 @@
 //! messages back out with their echoes.
 
 pub mod bridge;
+pub mod card;
 pub mod delivery;
 pub mod directory;
 pub mod echo;

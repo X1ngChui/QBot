@@ -270,7 +270,7 @@ async fn recovery_closes_open_runs_by_interrupting_unresolved_calls() {
     assert_eq!(results, [Outcome::Interrupted]);
     assert!(matches!(
         transcript.items()[transcript.len() - 2],
-        Item::Meta(Meta::Resumed {
+        Item::Meta(Meta::CallsInterrupted {
             interrupted_calls: 1
         })
     ));

@@ -83,6 +83,9 @@ pub fn evidence(scenario: &Scenario, run: &RunResult, lines: &[ChatLine]) -> Str
         (None, Some(intent)) => out.push_str(&format!(
             "a scheduled task came due. Its stored intent: {intent}\n"
         )),
+        (None, None) if scenario.trigger.spontaneous => out.push_str(
+            "nobody addressed the bot; it looked at the conversation on its own and may join in or stay silent.\n",
+        ),
         (None, None) => out.push('\n'),
     }
     out.push_str("\nWhat the bot did:\n");

@@ -40,6 +40,9 @@ impl Tool for Echo {
     fn description(&self) -> String {
         "Return the text".into()
     }
+    fn parameters(&self) -> Vec<(&'static str, String)> {
+        vec![("text", "The text to return.".into())]
+    }
     fn effect(&self) -> Effect {
         Effect::Read
     }
@@ -62,6 +65,9 @@ impl Tool for Slow {
     const NAME: &'static str = "slow";
     fn description(&self) -> String {
         "Sleep".into()
+    }
+    fn parameters(&self) -> Vec<(&'static str, String)> {
+        vec![("ms", "How long to sleep, in milliseconds.".into())]
     }
     fn effect(&self) -> Effect {
         Effect::Read
@@ -95,8 +101,15 @@ impl Tool for Say {
     fn description(&self) -> String {
         "Send a message".into()
     }
+    fn parameters(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("text", "The message.".into()),
+            ("dice", "Roll a dice instead.".into()),
+            ("end_turn", "Whether the run ends after it.".into()),
+        ]
+    }
     fn effect(&self) -> Effect {
-        Effect::Send
+        Effect::Write
     }
     async fn call(&self, cx: &ToolCx<'_>, args: SayArgs) -> Result<ToolOutput, ToolError> {
         self.order.lock().unwrap().push("say".into());

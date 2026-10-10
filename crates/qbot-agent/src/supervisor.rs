@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use qbot_context::{RunEnd, Transcript};
-use qbot_core::{GroupId, RunId};
+use qbot_core::{AccountId, GroupId, RunId};
 use qbot_llm::Usage;
 use tokio::sync::{Notify, Semaphore, oneshot};
 use tokio::time::Instant;
@@ -152,6 +152,30 @@ impl Supervisor {
         self.check_gates(&request).await?;
         let reservation = self.reserve().ok_or(Rejected::Overloaded)?;
         self.start(reservation, request).await
+    }
+
+    /// Start a spontaneous run, considered because `observed` wrote a line that addressed no
+    /// one. `observed` is not the run's initiator and the run is not about their line; it only
+    /// decides admission: a blocked member's message never starts a run, of any kind.
+    pub async fn submit_spontaneous(
+        &self,
+        group: GroupId,
+        observed: AccountId,
+    ) -> Result<RunHandle, Rejected> {
+        if self
+            .inner
+            .policy
+            .is_blocked(group, observed)
+            .await
+            .map_err(Rejected::Environment)?
+        {
+            return Err(Rejected::Blocked);
+        }
+        self.submit(TriggerRequest {
+            group,
+            trigger: Trigger::Spontaneous,
+        })
+        .await
     }
 
     /// Start a run on capacity reserved earlier (timers). Gates still apply; a rejection

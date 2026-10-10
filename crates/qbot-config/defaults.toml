@@ -54,6 +54,10 @@ concurrency = 3
 deadline_secs = 180
 # Messages one reply may send.
 max_messages = 4
+# Chance, from 0 to 1, that a member's line that addresses no one makes the bot look at the
+# conversation on its own and decide whether to join in (it usually stays silent). Rolled once
+# per such line, with one such run per group at a time. 0 never does.
+spontaneous_chance = 0.0
 
 [history]
 # What a reply is shown of the chat, in batches of lines. Batches are also the unit memory is
@@ -66,8 +70,12 @@ raw_batches = 4
 summary_batches = 9
 
 [memory]
-# Batches summarized into one episode.
+# Batches summarized into one episode, at most history.raw_batches (the episode must exist
+# before its chat leaves the verbatim tier).
 slice_batches = 3
+# Group terms every reply is shown (the most recently confirmed). The block is part of every
+# reply's cached prefix.
+group_terms = 40
 
 [memory.recall]
 # Cosine distance beyond which an episode is not a candidate at all (below 1). Tuned to the
@@ -89,6 +97,9 @@ transcribe_voice = true
 # Per group: one busy group cannot use up the describing and transcribing capacity of all.
 images_per_minute = 6
 clips_per_minute = 20
+# How long a reply waits for the group's pictures and clips still being described before it goes
+# ahead without them; less than replies.deadline_secs.
+reply_wait_secs = 25
 
 [providers.text]
 # deepseek | openai_responses
@@ -98,6 +109,8 @@ model = "deepseek-flash"
 api_key_secret = "TEXT_API_KEY"
 # The reasoning effort of replies: off | low | medium | high
 reasoning = "low"
+# The reasoning effort of memory extraction (one call per episode, in the background).
+extraction_reasoning = "low"
 
 [providers.vision]
 # Describes pictures. Off, pictures stay bare `[image]` markers.
@@ -140,8 +153,9 @@ backups = 14
 # The directory holding pg_dump and pg_restore (of the server's major version); empty finds them
 # on PATH, as in the image.
 postgres_bin_dir = ""
-# Finished runs (their full transcripts) older than this are deleted; 0 keeps them.
-runs_keep_days = 90
+# Days the operational record is kept: finished runs (their full transcripts, /runs) and finished
+# scheduled tasks (/tasks history). Older ones are deleted nightly; 0 keeps them.
+records_keep_days = 90
 # Ask NapCat to clear its own file cache in the nightly cleanup. NapCat keeps every downloaded
 # picture, clip and file otherwise.
 napcat_clean_cache = true

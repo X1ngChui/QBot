@@ -1,8 +1,8 @@
 # Memory: identity, episodes, recall
 
 How QBot remembers: `qbot-memory` (domain, pipeline, ports), `qbot-store` (Postgres) and the
-`recall_episodes`, `read_episode` and `lookup_member` tools. The archive of chat lines is the
-source of truth; everything here is derived from it.
+`recall_episodes` and `read_episode` tools, plus the people block every run starts with. The
+archive of chat lines is the source of truth; everything here is derived from it.
 
 ## 1. Model
 
@@ -41,6 +41,24 @@ long, or no valid answer came back in any of the three attempts) is recorded in 
 counts as covered, so it does not hold back the group's later slices; its lines have no episode,
 so they stay verbatim wherever history shows them, and remain searchable. Network, account and
 provider-side failures are not permanent: the job fails and the slice is tried again.
+
+**What the extractor reads.** No tools, only context, so the slice can be read the way the
+reply model reads chat:
+- Lines are `[msg:ID] MM-DD HH:MM member:N: text` in the bot's time zone: who said what,
+  when, and which line a `[reply:ID]` quotes.
+- The target lines are numbered; one batch on either side is unnumbered context.
+- Ahead of the lines, "Who is who" (`SliceBackground`, implemented by the prompt layer from the
+  same records replies use) lists every member the lines involve, whether as speaker or as
+  `[at:N]`. For each it gives the current group display name, other names, accounts linked as
+  one person, a block, and facts learned before. These resolve names and references to member
+  numbers.
+- "About the group" gives the operator's group background and the learned topic and terms.
+- Notes are left out: they are what members wrote about each other, not needed to read a
+  conversation.
+
+The prompt says that names and earlier facts help interpretation but are no evidence: a finding
+still needs a quote from the target. The model's reasoning effort is
+`providers.text.extraction_reasoning`.
 
 The model answers with one tool call, `submit_episode`: a title and summary in the bot's writing
 language (from the locale), one to three evidence quotes, and findings: names, facts about members
@@ -101,9 +119,9 @@ else the account nickname. These docs say "group nickname" and "group display na
   account nickname (OneBot `nickname`), exactly as QQ shows it in the group. It is the platform's own answer, not
   inferred and not added by anyone, so it is read live from NapCat when needed
   (`qbot_agent::Directory`, `get_group_member_info`) and never stored: no cache can go stale. It
-  takes precedence over stored names for display and addressing: command replies use it,
-  `lookup_member` lists it first as the name to use, and every run's trigger note lists it for
-  each member who speaks in the visible chat (asked of the platform when the run opens).
+  takes precedence over stored names for display and addressing: command replies use it, and
+  every run's trigger note lists it for each member who speaks in the visible chat or has an
+  entry in the people block (asked of the platform when the run opens).
 - *Member number versus name*: `member:N` is the model's internal handle (tool arguments,
   `[at:N]`, the people block, telling accounts apart); in what the bot writes, people are called
   by their current group display name, addressed with `[at:N]`, or described naturally when no
@@ -171,10 +189,12 @@ The design above would then still hold: the slicing function is the only part th
   half-life)`, with the half-life chosen by the predicate's decay class
   (`memory.facts.half_life_days`); a fact whose confidence falls below 0.05 is expired by the
   nightly run. It is computed on read, so it is deterministic for a given time.
-- **Where facts reach the model.** Member facts only through `lookup_member`: by predicate, the
-  most recently confirmed first, with confidence and age, across the person's linked accounts.
-  Group knowledge as an instruction: the topic and the 40 most recently confirmed terms
-  ([architecture.md](architecture.md) section 7). Members see their own facts with `/who` and remove them with `/forget`.
+- **Where facts reach the model.** Every run's people block lists each person's facts with
+  their other names, notes and linked accounts. Facts come by predicate, the most recently
+  confirmed first, each with its episode count and last confirmation date, across the person's
+  linked accounts. Dates are absolute, so the block stays in the cached prefix until a record
+  changes. Group knowledge is an instruction: the topic and the `memory.group_terms` (40) most
+  recently confirmed terms ([architecture.md](architecture.md) section 7). Members see their own facts with `/who` and remove them with `/forget`.
 
 ## 8. Manual notes are not memory
 

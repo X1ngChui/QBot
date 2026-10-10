@@ -546,6 +546,27 @@ async fn a_second_instance_on_the_same_database_refuses_to_start() {
     std::fs::remove_dir_all(&second_root).ok();
 }
 
+/// Await `until` while answering the display-name requests the bot makes meanwhile (extraction
+/// asks who the people in a slice are), as NapCat would.
+async fn answering_names<F: std::future::Future>(napcat: &mut Client, until: F) -> F::Output {
+    tokio::pin!(until);
+    loop {
+        tokio::select! {
+            out = &mut until => return out,
+            Some(Ok(frame)) = napcat.next() => {
+                let Ok(action) = serde_json::from_str::<Value>(frame.to_text().unwrap_or("")) else {
+                    continue;
+                };
+                if action["action"] == "get_group_member_info" {
+                    let card = format!("Tester {}", action["params"]["user_id"]);
+                    let answer = json!({"status": "ok", "retcode": 0, "data": {"card": card}, "echo": action["echo"]});
+                    napcat.send(Message::text(answer.to_string())).await.unwrap();
+                }
+            }
+        }
+    }
+}
+
 /// Answers the actions the bot sends before a reply (display names, media), until the reply. Every
 /// member is shown as "Tester <account>".
 async fn serve_until_send(napcat: &mut Client, wav: Option<&[u8]>) -> Value {
@@ -964,13 +985,16 @@ async fn a_filled_batch_turns_archived_chat_into_a_stored_episode() {
             .unwrap();
     }
 
-    eventually("the filled batch to store the episode", || async {
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM episode")
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            == 1
-    })
+    answering_names(
+        &mut napcat,
+        eventually("the filled batch to store the episode", || async {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM episode")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                == 1
+        }),
+    )
     .await;
     let (group, first, last, title, quote): (i64, i64, i64, String, String) = sqlx::query_as(
         "SELECT group_id, first_ordinal, last_ordinal, title, evidence->0->>'quote' FROM episode",
@@ -989,13 +1013,16 @@ async fn a_filled_batch_turns_archived_chat_into_a_stored_episode() {
     assert_eq!(vectors, 1, "the episode is searchable");
     // Every filled batch queued a job (three lines, three batches); the first two had no
     // complete slice yet and found nothing to do.
-    eventually("the extraction jobs to be done", || async {
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM timer WHERE job_kind = 'extract' AND state = 'done' AND outcome = 'job_ok'")
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            == 3
-    })
+    answering_names(
+        &mut napcat,
+        eventually("the extraction jobs to be done", || async {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM timer WHERE job_kind = 'extract' AND state = 'done' AND outcome = 'job_ok'")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                == 3
+        }),
+    )
     .await;
     assert_eq!(sim.requests().len(), 1, "the slice was extracted once");
 
@@ -1012,13 +1039,16 @@ async fn a_filled_batch_turns_archived_chat_into_a_stored_episode() {
             .await
             .unwrap();
     }
-    eventually("the second episode", || async {
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM episode")
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            == 2
-    })
+    answering_names(
+        &mut napcat,
+        eventually("the second episode", || async {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM episode")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                == 2
+        }),
+    )
     .await;
     napcat
         .send(group_message(7, 2, json!([{"type": "at", "data": {"qq": "100"}}, {"type": "text", "data": {"text": " any tips?"}}])))

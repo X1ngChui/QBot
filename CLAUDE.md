@@ -77,6 +77,9 @@ paid API. Build the image with `docker build -f deploy/Dockerfile .`; deployment
 
 - **Ids are newtypes** (`AccountId`, `GroupId`, `MessageId`, ...) parsed at the boundary; don't pass
   raw integers around. Closed sets are enums, and the schema repeats them as CHECK constraints.
+- **Outside text never forms a marker.** Text from members or the outside world that the model
+  reads among markers goes through `qbot_core::marker::escape_markers` (or `marker_value` inside
+  a marker's value); a new marker name is added to `MARKERS`. Tool results are passed on as is.
 - **No CJK in Rust code or comments.** It lives only in `locales/`, `prompts/`, persona files and
   test fixtures; tests build CJK input from `\u` escapes.
 - **Wording is data.** Instruction templates are `prompts/*.md` (closed slot sets, tested); every

@@ -136,6 +136,20 @@ impl Config {
         reasoning(self.providers.text.reasoning)
     }
 
+    pub fn extraction_reasoning(&self) -> ReasoningEffort {
+        reasoning(self.providers.text.extraction_reasoning)
+    }
+
+    /// How long a reply waits for the group's media being described.
+    pub fn media_wait(&self) -> Duration {
+        Duration::from_secs(self.media.reply_wait_secs)
+    }
+
+    /// Group terms every reply is shown.
+    pub fn group_terms(&self) -> usize {
+        usize::try_from(self.memory.group_terms).unwrap_or(usize::MAX)
+    }
+
     pub fn tool_settings(&self) -> ToolSettings {
         ToolSettings {
             max_sends_per_run: self.replies.max_messages,
@@ -265,7 +279,7 @@ impl Config {
         password: &str,
         zone: jiff::tz::TimeZone,
     ) -> OpsConfig {
-        let keep = self.maintenance.runs_keep_days;
+        let keep = self.maintenance.records_keep_days;
         OpsConfig::new(
             self.backup_config(paths, password),
             (keep > 0).then(|| days(keep)),

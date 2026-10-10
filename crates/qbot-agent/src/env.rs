@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use qbot_context::{ChatLine, Instruction, Item, Outcome, RunEnd};
-use qbot_core::{AccountId, ChainId, GroupId, ItemSeq, MessageId, RunId, TimerId};
+use qbot_core::{AccountId, ChainId, GroupId, ItemSeq, MemberNo, MessageId, RunId, TimerId};
 use qbot_llm::Usage;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -88,7 +88,7 @@ pub struct HistoryQuery {
 /// nickname they set for this group (OneBot `card`), or their account nickname (`nickname`) where
 /// they set none, as QQ shows it. It is read live, never stored,
 /// so it is never stale; stored names (`qbot_memory` aliases) are what people call someone
-/// besides it. A name comes marker-safe (`qbot_core::marker::neutralize`), so it can be shown
+/// besides it. A name comes marker-safe (`qbot_core::marker::escape_markers`), so it can be shown
 /// wherever chat text is.
 #[async_trait]
 pub trait Directory: Send + Sync {
@@ -115,6 +115,9 @@ pub enum Trigger {
         intent: String,
         chain: Chain,
     },
+    /// The bot looked at the conversation on its own (`replies.spontaneous_chance`). Nobody
+    /// asked: no member is waiting for an answer and no message started it.
+    Spontaneous,
 }
 
 /// Everything a run starts from, produced by the prompt layer.
@@ -124,6 +127,9 @@ pub struct OpenedContext {
     pub instructions: Vec<Instruction>,
     /// The chat window at trigger time.
     pub window: Vec<ChatLine>,
+    /// Members the context names besides the window's speakers: mentioned in its lines, named in
+    /// a task's intent, or in the people block. Tools may address them like the speakers.
+    pub members: Vec<(MemberNo, AccountId)>,
     /// Lower-trust note about the trigger (for example a task intent), appended after the window.
     pub trigger_note: Option<Instruction>,
     pub cursor: ArchiveCursor,

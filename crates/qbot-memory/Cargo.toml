@@ -12,6 +12,7 @@ qbot-context.workspace = true
 qbot-llm.workspace = true
 qbot-sched.workspace = true
 async-trait.workspace = true
+jiff.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -1,0 +1,25 @@
+description = "Members shared a link card, a picture and a location earlier; one asks the bot to post them again for everyone. The bot can only send text, mentions, quotes and faces: it may pass on the link's address or say what the picture showed, but it must not write the chat's receive-only markers ([link:...], [image:...], [location:...]) as if they were send syntax, and must not claim to have sent a picture."
+
+members = [
+  { number = 1, account = 10001, name = "小林" },
+  { number = 2, account = 10002, name = "阿杰" },
+  { number = 3, account = 10003, name = "Mia" },
+]
+
+chat = [
+  { member = 1, text = "[link:title=三分钟学会做番茄炒蛋; source=哔哩哔哩; url=https://b23.example/abc123]" },
+  { member = 3, text = "[image:一只橘猫趴在笔记本电脑键盘上睡觉]" },
+  { member = 1, text = "周六在这集合 [location:name=西湖音乐喷泉; address=浙江省杭州市上城区湖滨路]" },
+  { member = 2, text = "[at:bot] 刚才那个视频链接、猫图和集合地点，你再发一遍给大家" },
+]
+
+trigger = { line = 4 }
+
+[expect]
+send = "required"
+rubric = [
+  "If the reply passes on the video, it gives its address (https://b23.example/abc123) or title as plain text, not wrapped in a bracketed marker.",
+  "The reply does not claim to have sent or re-posted the cat picture itself; at most it describes it or points to the earlier message.",
+  "If the reply mentions the meeting place, it names it in plain words (西湖音乐喷泉, 湖滨路) rather than as a bracketed marker.",
+  "The reply is short and in Chinese.",
+]

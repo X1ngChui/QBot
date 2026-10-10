@@ -28,6 +28,7 @@ impl std::fmt::Debug for PgRunLog {
 pub enum TriggerKind {
     Addressed,
     Wake,
+    Spontaneous,
 }
 
 impl TriggerKind {
@@ -35,6 +36,7 @@ impl TriggerKind {
         match trigger {
             Trigger::Addressed { .. } => TriggerKind::Addressed,
             Trigger::Wake { .. } => TriggerKind::Wake,
+            Trigger::Spontaneous => TriggerKind::Spontaneous,
         }
     }
 
@@ -42,6 +44,7 @@ impl TriggerKind {
         match self {
             TriggerKind::Addressed => "addressed",
             TriggerKind::Wake => "wake",
+            TriggerKind::Spontaneous => "spontaneous",
         }
     }
 
@@ -49,6 +52,7 @@ impl TriggerKind {
         match text {
             "addressed" => Some(TriggerKind::Addressed),
             "wake" => Some(TriggerKind::Wake),
+            "spontaneous" => Some(TriggerKind::Spontaneous),
             _ => None,
         }
     }
@@ -84,6 +88,7 @@ fn trigger_json(trigger: &Trigger) -> Value {
         } => {
             json!({ "timer": timer.get(), "intent": intent, "chain": chain.id.get(), "depth": chain.depth })
         }
+        Trigger::Spontaneous => json!({}),
     }
 }
 

@@ -7,8 +7,8 @@ use qbot_llm::fake::{FakeProvider, FakeReply, Step};
 use qbot_llm::{ConvItem, Embedder, FakeEmbedder, LlmError, Provider};
 use qbot_memory::extract::{SubmitArgs, validate};
 use qbot_memory::{
-    BuildError, BuilderConfig, EpisodeBuilder, EpisodeExtractor, EpisodeJobs, EpisodeStore,
-    ExtractError, Extracted, METHOD, MemoryEpisodeStore, SliceContext, SliceLine,
+    Background, BuildError, BuilderConfig, EpisodeBuilder, EpisodeExtractor, EpisodeJobs,
+    EpisodeStore, ExtractError, Extracted, METHOD, MemoryEpisodeStore, SliceContext, SliceLine,
 };
 use serde_json::json;
 
@@ -65,6 +65,7 @@ async fn the_target_is_numbered_and_the_neighbors_are_marked_context_only() {
     let out = ex
         .extract(
             &SliceContext {
+                background: &Background::default(),
                 previous: &before,
                 target: &target,
                 next: &after,
@@ -82,19 +83,40 @@ async fn the_target_is_numbered_and_the_neighbors_are_marked_context_only() {
     assert!(p.contains("Target part (summarize this)"));
     assert!(p.contains("Context after (for understanding references only"));
     assert!(
-        p.contains("#1 [member:2] line 4 about"),
-        "target lines are numbered from 1: {p}"
+        p.contains("#1 [msg:1004] 01-15 08:00 member:2: line 4 about"),
+        "target lines are numbered from 1 and carry their id, time and speaker: {p}"
     );
     assert!(
-        p.contains("[member:1] line 3 about"),
-        "context lines appear"
-    );
-    assert!(
-        !p.contains("#1 [member:1] line 3"),
-        "but context lines are not numbered"
+        p.contains("[msg:1003] 01-15 08:00 member:1: line 3 about") && !p.contains("#3 [msg:1003]"),
+        "context lines appear, unnumbered, with ids a [reply:ID] can point at"
     );
     assert!(p.contains("Summarize and quote only the target part"));
     assert!(p.contains("language: English"));
+}
+
+#[tokio::test]
+async fn the_background_comes_before_the_lines_and_times_are_local() {
+    let (fake, ex) = extractor(vec![answer(good_answer())]);
+    let target = lines(4..=7);
+    let background = Background {
+        text: "## Who is who\n- member:2: shown as \"Kit\"".into(),
+        zone: jiff::tz::TimeZone::get("Asia/Shanghai").unwrap(),
+    };
+    ex.extract(
+        &SliceContext {
+            background: &background,
+            previous: &[],
+            target: &target,
+            next: &[],
+        },
+        "English",
+    )
+    .await
+    .unwrap();
+    let p = prompt(&fake, 0);
+    let who = p.find("## Who is who").expect("the background is shown");
+    assert!(who < p.find("Target part").unwrap(), "{p}");
+    assert!(p.contains("#1 [msg:1004] 01-15 16:00 member:2:"), "{p}");
 }
 
 #[tokio::test]
@@ -103,6 +125,7 @@ async fn context_sections_are_omitted_when_there_is_no_context() {
     let target = lines(1..=4);
     ex.extract(
         &SliceContext {
+            background: &Background::default(),
             previous: &[],
             target: &target,
             next: &[],
@@ -180,6 +203,7 @@ async fn a_rejected_answer_is_corrected_in_the_same_exchange_and_the_attempts_ar
     let out = ex
         .extract(
             &SliceContext {
+                background: &Background::default(),
                 previous: &[],
                 target: &target,
                 next: &[],
@@ -216,6 +240,7 @@ async fn a_rejected_answer_is_corrected_in_the_same_exchange_and_the_attempts_ar
     match ex
         .extract(
             &SliceContext {
+                background: &Background::default(),
                 previous: &[],
                 target: &target,
                 next: &[],
@@ -236,6 +261,7 @@ async fn a_rejected_answer_is_corrected_in_the_same_exchange_and_the_attempts_ar
 async fn missing_malformed_and_multiple_calls_are_corrected_too() {
     let target = lines(1..=4);
     let ctx = SliceContext {
+        background: &Background::default(),
         previous: &[],
         target: &target,
         next: &[],
@@ -286,6 +312,7 @@ async fn an_episode_owns_exactly_the_target_range_and_nothing_from_the_context()
             &plan,
             4,
             &SliceContext {
+                background: &Background::default(),
                 previous: &before,
                 target: &target,
                 next: &after,
@@ -334,6 +361,7 @@ async fn building_needs_lines_and_surfaces_extraction_failures() {
             &plan,
             4,
             &SliceContext {
+                background: &Background::default(),
                 previous: &[],
                 target: &[],
                 next: &[]
@@ -354,6 +382,7 @@ async fn building_needs_lines_and_surfaces_extraction_failures() {
             &plan,
             4,
             &SliceContext {
+                background: &Background::default(),
                 previous: &[],
                 target: &target,
                 next: &[]
@@ -478,7 +507,7 @@ async fn the_job_extracts_each_complete_slice_once_with_neighbors_as_context() {
 
     // The middle slice saw the batch before it and the batch after it, as context.
     let p = prompt(&fake, 1);
-    assert!(p.contains("[member:") && p.contains("line 30 about") && p.contains("line 61 about"));
+    assert!(p.contains(" member:") && p.contains("line 30 about") && p.contains("line 61 about"));
     assert!(p.contains("#1 ") && p.contains("line 31 about") && p.contains("line 60 about"));
     assert!(
         !p.contains("line 20 about") && !p.contains("line 71 about"),
@@ -1149,6 +1178,7 @@ async fn rejected_findings_go_back_once_and_the_corrected_answer_is_kept() {
     let out = ex
         .extract(
             &SliceContext {
+                background: &Background::default(),
                 previous: &[],
                 target: &target,
                 next: &[],
@@ -1187,6 +1217,7 @@ async fn a_term_may_be_explained_by_a_line_that_does_not_repeat_it() {
         ]
     }))]);
     let ctx = SliceContext {
+        background: &Background::default(),
         previous: &[],
         target: &target,
         next: &[],
@@ -1211,6 +1242,7 @@ async fn extract_lines(ex: &EpisodeExtractor) -> Result<Extracted, ExtractError>
     let target = lines(1..=4);
     ex.extract(
         &SliceContext {
+            background: &Background::default(),
             previous: &[],
             target: &target,
             next: &[],

@@ -104,12 +104,13 @@ impl ContextSource for PgContext {
                 "You are a group member.",
             )],
             window,
+            members: Vec::new(),
             trigger_note: match trigger {
                 Trigger::Wake { intent, .. } => Some(instruction(
                     InstructionRole::Trigger,
                     &format!("task intent: {intent}"),
                 )),
-                Trigger::Addressed { .. } => None,
+                Trigger::Addressed { .. } | Trigger::Spontaneous => None,
             },
             cursor,
             recaps: Vec::new(),

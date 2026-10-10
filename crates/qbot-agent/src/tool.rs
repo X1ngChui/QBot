@@ -20,10 +20,9 @@ use crate::env::Trigger;
 pub enum Effect {
     /// No side effects; runs concurrently with other reads.
     Read,
-    /// Mutates internal state; runs sequentially in call order, after reads.
+    /// Changes something (sends a message, schedules a task); runs one at a time in call order,
+    /// after the reads.
     Write,
-    /// Produces user-visible output; runs sequentially in call order, after reads.
-    Send,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -87,6 +86,12 @@ impl ChatView {
                 self.roster.insert(number, account);
             }
         }
+    }
+
+    /// Members the run's context names besides its speakers (mentioned in the chat, named in a
+    /// task's intent, in the people block): they can be addressed too.
+    pub fn know(&mut self, members: &[(MemberNo, AccountId)]) {
+        self.roster.extend(members.iter().copied());
     }
 
     /// The account behind a member number seen in this run.
@@ -207,9 +212,19 @@ impl<T: Tool> ErasedTool for Typed<T> {
     }
 }
 
+/// Why a tool cannot join a [`ToolSet`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("tool {0:?} is registered twice")]
-pub struct DuplicateTool(pub &'static str);
+pub enum ToolSetError {
+    #[error("tool {0:?} is registered twice")]
+    Duplicate(&'static str),
+    /// Every parameter needs a description; a missing one is usually a mistyped path in
+    /// [`Tool::parameters`].
+    #[error("tool {tool:?} has parameters without a description: {fields:?}")]
+    Undescribed {
+        tool: &'static str,
+        fields: Vec<String>,
+    },
+}
 
 /// The fixed tool set of a run. Its specs are identical for the whole run.
 #[derive(Clone, Default)]
@@ -230,11 +245,19 @@ impl ToolSet {
         Self::default()
     }
 
-    pub fn with<T: Tool>(mut self, tool: T) -> Result<Self, DuplicateTool> {
+    pub fn with<T: Tool>(mut self, tool: T) -> Result<Self, ToolSetError> {
         if self.get(T::NAME).is_some() {
-            return Err(DuplicateTool(T::NAME));
+            return Err(ToolSetError::Duplicate(T::NAME));
         }
-        self.tools.push(Arc::new(Typed(tool)));
+        let tool = Typed(tool);
+        let fields = qbot_llm::schema::undescribed(&tool.spec().schema);
+        if !fields.is_empty() {
+            return Err(ToolSetError::Undescribed {
+                tool: T::NAME,
+                fields,
+            });
+        }
+        self.tools.push(Arc::new(tool));
         Ok(self)
     }
 

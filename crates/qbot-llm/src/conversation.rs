@@ -234,7 +234,7 @@ fn instruction_message(instruction: &Instruction) -> Message {
         role: match instruction.role {
             InstructionRole::System => Role::System,
             InstructionRole::Developer => Role::Developer,
-            InstructionRole::Trigger => Role::User,
+            InstructionRole::Trigger | InstructionRole::Reference => Role::User,
         },
         content: vec![Content::Text(instruction.text.clone())],
     }

@@ -2,7 +2,6 @@
 //! task service in `qbot_sched`.
 
 mod memory;
-mod people;
 mod query;
 mod search;
 mod send;
@@ -11,11 +10,10 @@ mod web;
 
 use std::sync::Arc;
 
-use qbot_agent::{Archive, Delivery, DuplicateTool, ToolSet};
+use qbot_agent::{Archive, Delivery, ToolSet, ToolSetError};
 use qbot_sched::TaskService;
 
 pub use memory::{ReadEpisode, ReadEpisodeArgs, RecallArgs, RecallEpisodes, add_memory_tools};
-pub use people::{LookupArgs, LookupMember};
 pub use query::parse_query;
 pub use search::{SearchArgs, SearchHistory, SearchSettings};
 pub use send::{SendArgs, SendMessage, StaySilent, StaySilentArgs};
@@ -39,7 +37,7 @@ pub fn standard_tools(
     archive: Arc<dyn Archive>,
     tasks: TaskService,
     settings: ToolSettings,
-) -> Result<ToolSet, DuplicateTool> {
+) -> Result<ToolSet, ToolSetError> {
     ToolSet::new()
         .with(SendMessage::new(delivery, settings.max_sends_per_run))?
         .with(StaySilent)?

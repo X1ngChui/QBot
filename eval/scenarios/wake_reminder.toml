@@ -12,7 +12,7 @@ chat = [
   { member = 2, text = "今天好冷" },
 ]
 
-trigger = { wake = "Remind 小林 to hand in the weekly report this morning; they asked for this reminder last night." }
+trigger = { wake = "Remind member:1 (小林) to hand in the weekly report this morning (2026-10-06); they asked for this reminder last night." }
 
 [expect]
 send = "required"

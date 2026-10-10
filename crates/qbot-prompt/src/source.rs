@@ -7,9 +7,10 @@ use qbot_agent::{
     ArchiveCursor, ContextSource, Directory, EnvError, OpenedContext, Recap, RecapWhen, Trigger,
 };
 use qbot_context::{ChatLine, Instruction, InstructionRole, Speaker};
+use qbot_core::marker::escape_markers;
 use qbot_core::{Clock, GroupId, HistoryWindow, MemberNo, UnixMillis};
 use qbot_memory::facts::{FactStore, GROUP_TERM, GROUP_TOPIC};
-use qbot_memory::{EpisodeStore, HistoryPart, compose};
+use qbot_memory::{Background, EpisodeStore, HistoryPart, MemoryError, SliceBackground, compose};
 use qbot_store::{GroupPeople, PgArchive};
 use qbot_wording::{Text, say};
 
@@ -41,11 +42,6 @@ pub struct FactKnowledge {
 }
 
 impl FactKnowledge {
-    /// Terms a reply is shown. The block enters every reply's instructions, and a long-lived
-    /// group learns far more terms than a prompt should carry; 40 covers a group's working
-    /// vocabulary.
-    pub const MAX_TERMS: usize = 40;
-
     pub fn new(facts: Arc<dyn FactStore>, max_terms: usize) -> Self {
         Self { facts, max_terms }
     }
@@ -107,6 +103,13 @@ pub trait HistorySource: Send + Sync {
         group: GroupId,
         first: u64,
     ) -> Result<(Vec<(u64, ChatLine)>, ArchiveCursor), EnvError>;
+
+    /// The accounts behind those of `numbers` that are member numbers of the group.
+    async fn members(
+        &self,
+        group: GroupId,
+        numbers: &[MemberNo],
+    ) -> Result<Vec<(MemberNo, qbot_core::AccountId)>, EnvError>;
 }
 
 #[async_trait]
@@ -123,6 +126,16 @@ impl HistorySource for PgArchive {
         first: u64,
     ) -> Result<(Vec<(u64, ChatLine)>, ArchiveCursor), EnvError> {
         PgArchive::lines_from(self, group, first)
+            .await
+            .map_err(|e| EnvError(e.to_string()))
+    }
+
+    async fn members(
+        &self,
+        group: GroupId,
+        numbers: &[MemberNo],
+    ) -> Result<Vec<(MemberNo, qbot_core::AccountId)>, EnvError> {
+        PgArchive::members(self, group, numbers)
             .await
             .map_err(|e| EnvError(e.to_string()))
     }
@@ -211,7 +224,8 @@ impl PromptContext {
         self
     }
 
-    /// Tell every run who in the group is blocked and which members are one person.
+    /// Show every run what the bot keeps about the group's people: blocks, linked accounts,
+    /// names, notes and learned facts.
     pub fn with_people(mut self, source: Arc<dyn PeopleSource>) -> Self {
         self.people = Some(source);
         self
@@ -285,7 +299,8 @@ impl PromptContext {
                 .iter()
                 .position(|(_, l)| l.message == *message)
                 .map_or(0, |i| lines.len() - i),
-            Trigger::Wake { .. } => 0,
+            // Nothing to keep raw for: no message started the run.
+            Trigger::Wake { .. } | Trigger::Spontaneous => 0,
         };
         let mut recaps = Vec::new();
         let mut at = 0;
@@ -301,8 +316,9 @@ impl PromptContext {
                     let text = say(Text::PromptRecap {
                         start: clock_label(&self.zone, e.started),
                         end: clock_label(&self.zone, e.ended),
-                        title: e.title.trim().to_owned(),
-                        summary: e.summary.trim().to_owned(),
+                        // Written from chat, and shown among the chat lines.
+                        title: escape_markers(e.title.trim()),
+                        summary: escape_markers(e.summary.trim()),
                     });
                     recaps.push(Recap {
                         lines: at..at + count,
@@ -324,43 +340,102 @@ impl PromptContext {
         })
     }
 
-    /// The people instruction, if anyone in the group is blocked or has several accounts.
-    async fn people_instruction(&self, group: GroupId) -> Result<Option<Instruction>, EnvError> {
-        let Some(source) = &self.people else {
+    /// The people block: everyone the bot keeps a record about, one entry per person, in member
+    /// order. It changes only when a record does (a command, an extraction), so it sits in the
+    /// cached prefix. What members wrote or said is escaped like chat and kept on its line.
+    fn people_instruction(&self, people: &GroupPeople) -> Result<Option<Instruction>, EnvError> {
+        if people.people.is_empty() {
             return Ok(None);
-        };
-        let people = source.people(group, self.clock.now()).await?;
-        let members = |numbers: &[MemberNo]| {
+        }
+        let numbers = |numbers: &mut dyn Iterator<Item = MemberNo>| {
             numbers
-                .iter()
                 .map(|n| format!("member:{}", n.get()))
                 .collect::<Vec<_>>()
                 .join(", ")
         };
+        let line =
+            |text: &str| escape_markers(&text.split_whitespace().collect::<Vec<_>>().join(" "));
+        let date = |at: UnixMillis| {
+            Timestamp::from_millisecond(at.get())
+                .map(|t| {
+                    t.to_zoned(self.zone.clone())
+                        .strftime("%Y-%m-%d")
+                        .to_string()
+                })
+                .unwrap_or_default()
+        };
         let mut entries = Vec::new();
-        if !people.blocked.is_empty() {
-            entries.push(say(Text::PromptBlocked {
-                members: members(&people.blocked),
+        for person in &people.people {
+            let members = numbers(&mut person.members.iter().map(|(n, _)| *n));
+            entries.push(say(if person.members.len() > 1 {
+                Text::PromptPersonLinked { members }
+            } else {
+                Text::PromptPerson { members }
             }));
-        }
-        entries.extend(people.same_person.iter().map(|set| {
-            say(Text::PromptSamePerson {
-                members: members(set),
-            })
-        }));
-        if entries.is_empty() {
-            return Ok(None);
+            if !person.blocked.is_empty() {
+                entries.push(say(Text::PromptPersonBlocked {
+                    members: numbers(&mut person.blocked.iter().copied()),
+                }));
+            }
+            if !person.names.is_empty() {
+                let names = person
+                    .names
+                    .iter()
+                    .map(|n| {
+                        let name = line(&n.text);
+                        if n.confirmed {
+                            name
+                        } else {
+                            say(Text::PromptPersonNameLead { name })
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                entries.push(say(Text::PromptPersonNames { names }));
+            }
+            if !person.notes.is_empty() {
+                let notes = person
+                    .notes
+                    .iter()
+                    .map(|n| {
+                        say(Text::PromptPersonNote {
+                            text: line(&n.text),
+                            date: date(n.updated),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                entries.push(say(Text::PromptPersonNotes { notes }));
+            }
+            if !person.facts.is_empty() {
+                let facts = person
+                    .facts
+                    .iter()
+                    .map(|f| {
+                        say(Text::PromptPersonFact {
+                            predicate: f.predicate.clone(),
+                            value: line(&f.value),
+                            count: f.supports.to_string(),
+                            date: date(f.last_confirmed),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                entries.push(say(Text::PromptPersonFacts { facts }));
+            }
         }
         let text = render_template(Template::PeopleBlock, &[("entries", &entries.join("\n"))])
             .map_err(|e| EnvError(e.to_string()))?;
         Ok(Some(Instruction {
-            role: InstructionRole::System,
+            role: InstructionRole::Reference,
             text,
             template_hash: Template::PeopleBlock.hash(),
         }))
     }
 
-    /// The learned-knowledge instruction, if the group has any knowledge.
+    /// The learned-knowledge block, if the group has any knowledge. It is reference material
+    /// learned from what members said, so it reaches the model with the chat's standing, not as
+    /// a system instruction.
     async fn knowledge_instruction(&self, group: GroupId) -> Result<Option<Instruction>, EnvError> {
         let Some(source) = &self.knowledge else {
             return Ok(None);
@@ -373,11 +448,11 @@ impl PromptContext {
             .iter()
             .map(|k| match &k.term {
                 Some(term) => say(Text::PromptGroupTerm {
-                    term: term.clone(),
-                    text: k.text.clone(),
+                    term: escape_markers(term),
+                    text: escape_markers(&k.text),
                 }),
                 None => say(Text::PromptGroupTopic {
-                    text: k.text.clone(),
+                    text: escape_markers(&k.text),
                 }),
             })
             .collect();
@@ -387,7 +462,7 @@ impl PromptContext {
         )
         .map_err(|e| EnvError(e.to_string()))?;
         Ok(Some(Instruction {
-            role: InstructionRole::System,
+            role: InstructionRole::Reference,
             text,
             template_hash: Template::LearnedKnowledge.hash(),
         }))
@@ -448,20 +523,22 @@ impl PromptContext {
             .unwrap_or_else(|_| clock_label(&self.zone, now))
     }
 
-    /// The current group display name of every member who speaks in `window`, one entry per
-    /// line in member order, asked of the platform now (in parallel) and kept nowhere. Empty
-    /// without a directory. A member the platform cannot name is listed as unavailable.
-    async fn names(&self, group: GroupId, window: &[ChatLine]) -> String {
+    /// The current group display name of every member who speaks in `window` or has an entry
+    /// in the people block, one per line in member order, asked of the platform now (in
+    /// parallel) and kept nowhere: names change apart from every record. Empty without a
+    /// directory. A member the platform cannot name is listed as unavailable.
+    async fn names(&self, group: GroupId, window: &[ChatLine], people: &GroupPeople) -> String {
         let Some(directory) = &self.directory else {
             return String::new();
         };
-        let members: std::collections::BTreeMap<MemberNo, qbot_core::AccountId> = window
+        let mut members: std::collections::BTreeMap<MemberNo, qbot_core::AccountId> = window
             .iter()
             .filter_map(|line| match line.speaker {
                 Speaker::Member { account, number } => Some((number, account)),
                 Speaker::Bot => None,
             })
             .collect();
+        members.extend(people.people.iter().flat_map(|p| p.members.iter().copied()));
         let names = futures_util::future::join_all(
             members
                 .values()
@@ -480,6 +557,48 @@ impl PromptContext {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Members the run's context names besides its speakers, so tools can address them: those
+    /// mentioned (`[at:N]`) in the window, those a task's intent names (`member:N`), and
+    /// everyone in the people block.
+    async fn named_members(
+        &self,
+        group: GroupId,
+        window: &[ChatLine],
+        trigger: &Trigger,
+        people: &GroupPeople,
+    ) -> Result<Vec<(MemberNo, qbot_core::AccountId)>, EnvError> {
+        let mut known: std::collections::BTreeMap<MemberNo, qbot_core::AccountId> = people
+            .people
+            .iter()
+            .flat_map(|p| p.members.iter().copied())
+            .collect();
+        let mut wanted = std::collections::BTreeSet::new();
+        let mut scan = |text: &str, prefix: &str| {
+            for (at, _) in text.match_indices(prefix) {
+                let digits: String = text[at + prefix.len()..]
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                if let Ok(n) = digits.parse::<u32>() {
+                    wanted.insert(MemberNo::new(n));
+                }
+            }
+        };
+        for line in window {
+            scan(&line.text, "[at:");
+        }
+        if let Trigger::Wake { intent, .. } = trigger {
+            scan(intent, "member:");
+            scan(intent, "[at:");
+        }
+        wanted.retain(|n| !known.contains_key(n));
+        if !wanted.is_empty() {
+            let wanted: Vec<MemberNo> = wanted.into_iter().collect();
+            known.extend(self.history.members(group, &wanted).await?);
+        }
+        Ok(known.into_iter().collect())
     }
 
     fn trigger_note(
@@ -517,6 +636,17 @@ impl PromptContext {
                     )?,
                 )
             }
+            Trigger::Spontaneous => (
+                Template::TriggerSpontaneous,
+                render_template(
+                    Template::TriggerSpontaneous,
+                    &[
+                        ("now", &now),
+                        ("timezone", &self.timezone),
+                        ("names", names),
+                    ],
+                )?,
+            ),
             Trigger::Wake {
                 timer,
                 intent,
@@ -557,12 +687,17 @@ impl ContextSource for PromptContext {
         } = self.history(group, trigger).await?;
         let window: Vec<ChatLine> = lines.into_iter().map(|(_, line)| line).collect();
         let env = |e: PromptError| EnvError(e.to_string());
+        let people = match &self.people {
+            Some(source) => source.people(group, self.clock.now()).await?,
+            None => GroupPeople::default(),
+        };
         // Most stable first, so runs share the longest prefix the provider can cache: the
-        // persona's fixed instructions, then who is blocked or linked (changes when a member
-        // command does), then learned knowledge (changes when an episode is extracted).
+        // persona's fixed instructions, then the people block and learned knowledge (both change
+        // only when a command or an extraction changes a record), then the chat.
         let mut instructions = self.instructions(group).map_err(env)?;
-        instructions.extend(self.people_instruction(group).await?);
+        instructions.extend(self.people_instruction(&people)?);
         instructions.extend(self.knowledge_instruction(group).await?);
+        let members = self.named_members(group, &window, trigger, &people).await?;
         let undelivered_note = Instruction {
             role: InstructionRole::Developer,
             text: render_template(Template::UndeliveredNote, &[]).map_err(env)?,
@@ -571,12 +706,156 @@ impl ContextSource for PromptContext {
         Ok(OpenedContext {
             instructions,
             trigger_note: self
-                .trigger_note(trigger, &window, &self.names(group, &window).await)
+                .trigger_note(trigger, &window, &self.names(group, &window, &people).await)
                 .map_err(env)?,
             window,
+            members,
             cursor,
             recaps,
             undelivered_note: Some(undelivered_note),
+        })
+    }
+}
+
+/// What the extractor is told about a slice: the involved members as the group knows them now
+/// (their display name, other names, linked accounts, a block, facts learned before) and what
+/// the group is (the operator's background and learned knowledge). Notes are left out: they are
+/// what members wrote about each other, not something the conversation needs to be read.
+#[async_trait]
+impl SliceBackground for PromptContext {
+    async fn background(
+        &self,
+        group: GroupId,
+        members: &[(u32, Option<qbot_core::AccountId>)],
+    ) -> Result<Background, MemoryError> {
+        let backend = |e: EnvError| MemoryError::Backend(e.0);
+        let people = match &self.people {
+            Some(source) => source
+                .people(group, self.clock.now())
+                .await
+                .map_err(backend)?,
+            None => GroupPeople::default(),
+        };
+        let line =
+            |text: &str| escape_markers(&text.split_whitespace().collect::<Vec<_>>().join(" "));
+        // Display names, asked of the platform all at once.
+        let shown = futures_util::future::join_all(members.iter().map(|(number, account)| {
+            let account = account.or_else(|| {
+                people
+                    .people
+                    .iter()
+                    .flat_map(|p| p.members.iter())
+                    .find(|(n, _)| n.get() == *number)
+                    .map(|(_, a)| *a)
+            });
+            async move {
+                match (&self.directory, account) {
+                    (Some(directory), Some(account)) => {
+                        directory.display_name(group, account).await
+                    }
+                    _ => None,
+                }
+            }
+        }))
+        .await;
+        let mut entries = Vec::new();
+        for ((number, _), shown) in members.iter().zip(shown) {
+            let person = people
+                .people
+                .iter()
+                .find(|p| p.members.iter().any(|(n, _)| n.get() == *number));
+            let mut details = Vec::new();
+            if let Some(name) = shown {
+                details.push(say(Text::ExtractBackgroundShown { name }));
+            }
+            if let Some(person) = person {
+                if !person.names.is_empty() {
+                    details.push(say(Text::ExtractBackgroundNames {
+                        names: person
+                            .names
+                            .iter()
+                            .map(|n| line(&n.text))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    }));
+                }
+                let others: Vec<String> = person
+                    .members
+                    .iter()
+                    .filter(|(n, _)| n.get() != *number)
+                    .map(|(n, _)| format!("member:{}", n.get()))
+                    .collect();
+                if !others.is_empty() {
+                    details.push(say(Text::ExtractBackgroundLinked {
+                        members: others.join(", "),
+                    }));
+                }
+                if person.blocked.iter().any(|n| n.get() == *number) {
+                    details.push(say(Text::ExtractBackgroundBlocked {}));
+                }
+                if !person.facts.is_empty() {
+                    details.push(say(Text::ExtractBackgroundFacts {
+                        facts: person
+                            .facts
+                            .iter()
+                            .map(|f| format!("{}: {}", f.predicate, line(&f.value)))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    }));
+                }
+            }
+            let member = number.to_string();
+            entries.push(if details.is_empty() {
+                say(Text::ExtractBackgroundMemberPlain { member })
+            } else {
+                say(Text::ExtractBackgroundMember {
+                    member,
+                    details: details.join("; "),
+                })
+            });
+        }
+        let mut sections = Vec::new();
+        if !entries.is_empty() {
+            sections.push(say(Text::ExtractBackgroundPeople {
+                entries: entries.join("\n"),
+            }));
+        }
+        let mut about = Vec::new();
+        let operator = self
+            .personas
+            .for_group(group)
+            .group_knowledge
+            .trim()
+            .to_owned();
+        if !operator.is_empty() {
+            about.push(operator);
+        }
+        if let Some(source) = &self.knowledge {
+            about.extend(
+                source
+                    .knowledge(group)
+                    .await
+                    .map_err(backend)?
+                    .iter()
+                    .map(|k| match &k.term {
+                        Some(term) => say(Text::PromptGroupTerm {
+                            term: escape_markers(term),
+                            text: escape_markers(&k.text),
+                        }),
+                        None => say(Text::PromptGroupTopic {
+                            text: escape_markers(&k.text),
+                        }),
+                    }),
+            );
+        }
+        if !about.is_empty() {
+            sections.push(say(Text::ExtractBackgroundGroup {
+                text: about.join("\n"),
+            }));
+        }
+        Ok(Background {
+            text: sections.join("\n\n"),
+            zone: self.zone.clone(),
         })
     }
 }

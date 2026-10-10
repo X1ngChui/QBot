@@ -3,12 +3,13 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use qbot_core::{GroupId, SliceGrid};
+use qbot_core::{AccountId, GroupId, SliceGrid};
 use qbot_sched::{JobError, JobKind, JobRunner};
 
 use crate::build::EpisodeBuilder;
 use crate::consolidate::Consolidator;
 use crate::extract::SliceContext;
+use crate::slice::{Background, SliceBackground, SliceLine};
 use crate::store::EpisodeStore;
 
 /// Runs `JobKind::Extract` for a group: extracts every complete slice that has no episode yet,
@@ -20,6 +21,7 @@ pub struct EpisodeJobs {
     builder: EpisodeBuilder,
     slices: SliceGrid,
     consolidator: Option<Arc<Consolidator>>,
+    background: Option<Arc<dyn SliceBackground>>,
     /// One extraction at a time: a filled batch and the nightly run may both ask for a group,
     /// and the second must find the first's episodes rather than write them again.
     running: tokio::sync::Mutex<()>,
@@ -44,6 +46,7 @@ impl EpisodeJobs {
             builder,
             slices,
             consolidator: None,
+            background: None,
             running: tokio::sync::Mutex::new(()),
         }
     }
@@ -51,6 +54,12 @@ impl EpisodeJobs {
     /// Apply each new episode's findings to identity and facts as it is stored.
     pub fn with_consolidator(mut self, consolidator: Arc<Consolidator>) -> Self {
         self.consolidator = Some(consolidator);
+        self
+    }
+
+    /// Tell the extractor who the people in a slice are and what the group is.
+    pub fn with_background(mut self, background: Arc<dyn SliceBackground>) -> Self {
+        self.background = Some(background);
         self
     }
 
@@ -158,10 +167,18 @@ impl EpisodeJobs {
                 None => Vec::new(),
             };
 
+            let background = match &self.background {
+                Some(source) => source
+                    .background(group, &members(&[&previous, &target, &next]))
+                    .await
+                    .map_err(failed)?,
+                None => Background::default(),
+            };
             let ctx = SliceContext {
                 previous: &previous,
                 target: &target,
                 next: &next,
+                background: &background,
             };
             let built = match self
                 .builder
@@ -205,6 +222,27 @@ impl EpisodeJobs {
             stored += 1;
         }
     }
+}
+
+/// The members the lines involve, by number: who wrote them (with the account) and who they
+/// mention (`[at:N]`; the account is not in the line).
+fn members(parts: &[&[SliceLine]]) -> Vec<(u32, Option<AccountId>)> {
+    let mut found: std::collections::BTreeMap<u32, Option<AccountId>> = Default::default();
+    for line in parts.iter().flat_map(|part| part.iter()) {
+        if let (Some(account), Some(number)) = (line.speaker, line.member_no) {
+            found.insert(number, Some(account));
+        }
+        for (at, _) in line.text.match_indices("[at:") {
+            let digits: String = line.text[at + 4..]
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect();
+            if let Ok(number) = digits.parse() {
+                found.entry(number).or_insert(None);
+            }
+        }
+    }
+    found.into_iter().collect()
 }
 
 #[async_trait]

@@ -123,6 +123,10 @@ async fn rig(script: Vec<Step>) -> Rig {
 }
 
 async fn rig_with(script: Vec<Step>, echo: Duration) -> Rig {
+    rig_full(script, echo, 0.0).await
+}
+
+async fn rig_full(script: Vec<Step>, echo: Duration, spontaneous_chance: f64) -> Rig {
     let group = GroupId::new(GROUP).unwrap();
     let world = SimWorld::new(group);
     let bridge = Arc::new(Bridge::new());
@@ -168,6 +172,7 @@ async fn rig_with(script: Vec<Step>, echo: Duration) -> Rig {
         Pipeline::new(
             PipelineConfig {
                 bot: AccountId::new(BOT).unwrap(),
+                spontaneous_chance,
                 echo_keep: echo,
                 forward_max_lines: 30,
             },
@@ -592,5 +597,117 @@ async fn a_batch_filled_by_a_notice_is_reported_like_one_filled_by_a_message() {
         [GroupId::new(GROUP).unwrap()],
         "the notice was the batch's last line"
     );
+    rig.cancel.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_received_contact_or_group_card_is_archived_as_context_only() {
+    let rig = rig(vec![]).await;
+    let mut napcat = connect(&rig, Some("sesame")).await.unwrap();
+    let card = json!({"app": "com.tencent.troopsharecard",
+        "meta": {"contact": {"nickname": "Another Group", "contact": "group 7777"}}});
+    napcat
+        .send(group_message(
+            1,
+            7,
+            json!([
+                {"type": "contact", "data": {"type": "qq", "id": "4242"}},
+                {"type": "json", "data": {"data": card.to_string()}}
+            ]),
+        ))
+        .await
+        .unwrap();
+    for _ in 0..200 {
+        if !rig.intake.lines.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let lines = rig.intake.lines.lock().unwrap();
+    assert_eq!(lines[0].text, "[contact card][group card:Another Group]");
+    assert!(
+        lines[0].mentions.is_empty() && lines[0].media.is_empty(),
+        "no account gets a member number and nothing is kept to fetch or address"
+    );
+    drop(lines);
+    rig.cancel.cancel();
+}
+
+/// Whether `run`'s transcript holds the simulator's note for a spontaneous wake.
+fn spontaneous(rig: &Rig, run: qbot_core::RunId) -> bool {
+    rig.world.logged(run).iter().any(|(_, item)| {
+        matches!(item, qbot_context::Item::Instruction(i) if i.text.contains("on your own"))
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_line_addressed_to_no_one_can_wake_the_bot_on_its_own() {
+    let rig = rig_full(
+        vec![Step::Reply(FakeReply::new().text("nothing to add"))],
+        Duration::from_secs(5),
+        1.0,
+    )
+    .await;
+    let mut napcat = connect(&rig, Some("sesame")).await.unwrap();
+    napcat
+        .send(group_message(
+            1,
+            7,
+            json!([{"type": "text", "data": {"text": "nice weather today"}}]),
+        ))
+        .await
+        .unwrap();
+    settle(&rig).await;
+    let runs = rig.world.logged_runs();
+    assert_eq!(runs.len(), 1);
+    assert!(
+        spontaneous(&rig, runs[0]),
+        "a spontaneous run, not an addressed one"
+    );
+    assert!(
+        rig.world.sent().is_empty(),
+        "waking up does not force a reply"
+    );
+    rig.cancel.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_blocked_members_line_never_wakes_the_bot() {
+    let rig = rig_full(vec![], Duration::from_secs(5), 1.0).await;
+    rig.world.block(7);
+    let mut napcat = connect(&rig, Some("sesame")).await.unwrap();
+    napcat
+        .send(group_message(
+            1,
+            7,
+            json!([{"type": "text", "data": {"text": "buy now"}}]),
+        ))
+        .await
+        .unwrap();
+    for _ in 0..40 {
+        if !rig.intake.lines.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(rig.world.logged_runs().is_empty());
+    rig.cancel.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn with_no_chance_set_unaddressed_lines_start_nothing() {
+    let rig = rig(vec![]).await;
+    let mut napcat = connect(&rig, Some("sesame")).await.unwrap();
+    napcat
+        .send(group_message(
+            1,
+            7,
+            json!([{"type": "text", "data": {"text": "hello all"}}]),
+        ))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(rig.world.logged_runs().is_empty());
     rig.cancel.cancel();
 }

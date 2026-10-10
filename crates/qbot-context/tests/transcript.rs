@@ -252,7 +252,7 @@ fn resume_closes_pending_calls_as_interrupted() {
     ));
     assert!(matches!(
         t.items().last(),
-        Some(Item::Meta(Meta::Resumed {
+        Some(Item::Meta(Meta::CallsInterrupted {
             interrupted_calls: 1
         }))
     ));
@@ -286,4 +286,16 @@ fn digest_changes_when_the_view_changes() {
     t.append(turn(&["b"])).unwrap();
     t.append(result("b", "r")).unwrap();
     assert_ne!(before, project(&t).unwrap().digest());
+}
+
+#[test]
+fn an_interruption_stored_under_its_earlier_name_still_loads() {
+    let stored = serde_json::json!({"kind": "meta", "data": {"kind": "resumed", "data": {"interrupted_calls": 2}}});
+    let item: qbot_context::Item = serde_json::from_value(stored).unwrap();
+    assert_eq!(
+        item,
+        qbot_context::Item::Meta(qbot_context::Meta::CallsInterrupted {
+            interrupted_calls: 2
+        })
+    );
 }

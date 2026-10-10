@@ -21,7 +21,7 @@ use serde::Deserialize;
 use crate::episode::Evidence;
 use crate::findings::{FactArg, Findings, KnowledgeArg, NameArg, validate_findings};
 use crate::predicates::Predicates;
-use crate::slice::SliceLine;
+use crate::slice::{Background, SliceLine};
 
 pub const TOOL_NAME: &str = "submit_episode";
 /// Version of the prompt and validation rules, recorded on every episode.
@@ -62,6 +62,8 @@ pub struct SliceContext<'a> {
     pub target: &'a [SliceLine],
     /// The nearest batch after the slice. Context only.
     pub next: &'a [SliceLine],
+    /// Who the people in the lines are and what the group is.
+    pub background: &'a Background,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -93,6 +95,7 @@ pub enum ExtractError {
 pub struct EpisodeExtractor {
     provider: Arc<dyn Provider>,
     predicates: Arc<Predicates>,
+    reasoning: ReasoningEffort,
 }
 
 impl std::fmt::Debug for EpisodeExtractor {
@@ -106,7 +109,14 @@ impl EpisodeExtractor {
         Self {
             provider,
             predicates: Arc::new(Predicates::builtin()),
+            reasoning: ReasoningEffort::Low,
         }
+    }
+
+    /// How much the model reasons before answering (default low).
+    pub fn with_reasoning(mut self, reasoning: ReasoningEffort) -> Self {
+        self.reasoning = reasoning;
+        self
     }
 
     /// The instructions, with the predicate table spelled out.
@@ -166,7 +176,7 @@ impl EpisodeExtractor {
                     tools: &tools,
                     tool_choice: ToolChoice::Auto,
                     parallel_tool_calls: false,
-                    reasoning: ReasoningEffort::Low,
+                    reasoning: self.reasoning,
                     continuation: None,
                     media: None,
                 })
@@ -353,22 +363,26 @@ fn parameters() -> Vec<(&'static str, String)> {
 
 /// The target and its context, as the model sees them. Only target lines are numbered.
 pub fn render(ctx: &SliceContext<'_>) -> String {
+    let zone = &ctx.background.zone;
     let mut out = String::new();
+    if !ctx.background.text.is_empty() {
+        let _ = writeln!(out, "{}\n", ctx.background.text.trim_end());
+    }
     if !ctx.previous.is_empty() {
         let _ = writeln!(out, "{}", say(Text::ExtractContextBefore {}));
         for line in ctx.previous {
-            let _ = writeln!(out, "{}", line.render());
+            let _ = writeln!(out, "{}", line.render(zone));
         }
         out.push('\n');
     }
     let _ = writeln!(out, "{}", say(Text::ExtractTarget {}));
     for (i, line) in ctx.target.iter().enumerate() {
-        let _ = writeln!(out, "#{} {}", i + 1, line.render());
+        let _ = writeln!(out, "#{} {}", i + 1, line.render(zone));
     }
     if !ctx.next.is_empty() {
         let _ = writeln!(out, "\n{}", say(Text::ExtractContextAfter {}));
         for line in ctx.next {
-            let _ = writeln!(out, "{}", line.render());
+            let _ = writeln!(out, "{}", line.render(zone));
         }
     }
     out
@@ -437,5 +451,14 @@ mod tests {
         assert!(!text.contains('{'), "every slot is filled");
         assert!(text.contains("in this language: English."));
         assert!(text.contains("- lives_in (one value): "));
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    #[test]
+    fn every_field_of_the_episode_submission_is_described() {
+        let schema = qbot_llm::schema::tool_schema::<super::SubmitArgs>(super::parameters());
+        assert_eq!(qbot_llm::schema::undescribed(&schema), Vec::<String>::new());
     }
 }

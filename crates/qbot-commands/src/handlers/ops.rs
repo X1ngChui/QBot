@@ -13,6 +13,7 @@ fn trigger_label(cx: &Cx<'_>, record: &RunRecord) -> String {
     cx.t(&match record.trigger_kind {
         TriggerKind::Wake => Msg::RunsTriggerWake {},
         TriggerKind::Addressed => Msg::RunsTriggerAddressed {},
+        TriggerKind::Spontaneous => Msg::RunsTriggerSpontaneous {},
     })
 }
 

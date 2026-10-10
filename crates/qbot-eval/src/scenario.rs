@@ -73,6 +73,9 @@ pub struct TriggerSpec {
     /// A scheduled task coming due, with its stored intent.
     #[serde(default)]
     pub wake: Option<String>,
+    /// The bot looks at the chat on its own: nobody addressed it.
+    #[serde(default)]
+    pub spontaneous: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -170,13 +173,23 @@ impl Scenario {
                 return invalid(format!("chat line {} names unknown member {n}", i + 1));
             }
         }
-        match (&self.trigger.line, &self.trigger.wake) {
-            (Some(n), None) => match self.chat.get(n.wrapping_sub(1)).and_then(|l| l.member) {
-                Some(_) => {}
-                None => return invalid(format!("trigger line {n} is not a member's line")),
-            },
-            (None, Some(_)) => {}
-            _ => return invalid("trigger needs exactly one of `line` or `wake`".into()),
+        match (
+            &self.trigger.line,
+            &self.trigger.wake,
+            self.trigger.spontaneous,
+        ) {
+            (Some(n), None, false) => {
+                match self.chat.get(n.wrapping_sub(1)).and_then(|l| l.member) {
+                    Some(_) => {}
+                    None => return invalid(format!("trigger line {n} is not a member's line")),
+                }
+            }
+            (None, Some(_), false) | (None, None, true) => {}
+            _ => {
+                return invalid(
+                    "trigger needs exactly one of `line`, `wake` or `spontaneous = true`".into(),
+                );
+            }
         }
         for n in self
             .notes

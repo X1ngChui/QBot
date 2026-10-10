@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+rand.workspace = true
 qbot-core.workspace = true
 qbot-context.workspace = true
 qbot-agent.workspace = true

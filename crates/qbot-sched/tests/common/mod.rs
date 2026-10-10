@@ -48,6 +48,9 @@ impl Tool for Hold {
     fn description(&self) -> String {
         "Wait".into()
     }
+    fn parameters(&self) -> Vec<(&'static str, String)> {
+        vec![("ms", "How long to wait, in milliseconds.".into())]
+    }
     fn effect(&self) -> Effect {
         Effect::Read
     }

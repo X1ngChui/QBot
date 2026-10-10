@@ -115,8 +115,8 @@ impl Transcript {
         Ok(seq)
     }
 
-    /// Resolve every pending call as interrupted and record the resume. Deterministic, so a
-    /// resumed run never leaves a request without a result. Returns how many calls were closed.
+    /// Resolve every pending call as interrupted and record how many there were. Deterministic,
+    /// so an ended run never leaves a request without a result. Returns how many were closed.
     pub fn close_interrupted(&mut self) -> u32 {
         let pending = self.pending.clone();
         let count = u32::try_from(pending.len()).unwrap_or(u32::MAX);
@@ -130,7 +130,7 @@ impl Transcript {
             let _ = self.append(Item::ToolResult(result));
         }
         if count > 0 {
-            let _ = self.append(Item::Meta(Meta::Resumed {
+            let _ = self.append(Item::Meta(Meta::CallsInterrupted {
                 interrupted_calls: count,
             }));
         }

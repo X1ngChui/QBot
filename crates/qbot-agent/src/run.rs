@@ -86,7 +86,7 @@ struct Run<'a> {
     continuation: Option<Continuation>,
     usage: Usage,
     turns: u32,
-    tool_calls: usize,
+    tool_calls: u32,
     error: Option<LlmError>,
     /// Whether the model was already told that its text was not delivered.
     nudged: bool,
@@ -129,7 +129,7 @@ pub async fn execute(deps: &RunDeps, input: &RunInput, cancel: &CancellationToke
         error: run.error.as_ref().map(LlmError::class),
         usage: run.usage,
         turns: run.turns,
-        tool_calls: u32::try_from(run.tool_calls).unwrap_or(u32::MAX),
+        tool_calls: run.tool_calls,
         sends: run.state.sends(),
     };
     if deps
@@ -149,7 +149,7 @@ pub async fn execute(deps: &RunDeps, input: &RunInput, cancel: &CancellationToke
             end,
             usage: run.usage,
             turns: run.turns,
-            tool_calls: u32::try_from(run.tool_calls).unwrap_or(u32::MAX),
+            tool_calls: run.tool_calls,
         },
     });
     RunReport {
@@ -159,7 +159,7 @@ pub async fn execute(deps: &RunDeps, input: &RunInput, cancel: &CancellationToke
         error: run.error,
         usage: run.usage,
         turns: run.turns,
-        tool_calls: u32::try_from(run.tool_calls).unwrap_or(u32::MAX),
+        tool_calls: run.tool_calls,
         sends: run.state.sends(),
         transcript: run.transcript,
     }
@@ -213,6 +213,7 @@ impl Run<'_> {
             self.append(Item::Instruction(instruction.clone()))?;
         }
         self.view.absorb(&context.window);
+        self.view.know(&context.members);
         // Lines an episode may stand in for get their own chat item, so a summary can later
         // replace exactly them.
         let mut start = 0;
@@ -354,7 +355,9 @@ impl Run<'_> {
                 result = tokio::time::timeout_at(deadline, fut) => result.map_err(|_| RunEnd::Deadline)?,
             }
         };
-        self.tool_calls += calls.len();
+        self.tool_calls = self
+            .tool_calls
+            .saturating_add(u32::try_from(calls.len()).unwrap_or(u32::MAX));
         let mut ends_run = false;
         for item in executed {
             self.deps.sink.record(UsageEvent {

@@ -318,6 +318,7 @@ runs-step_call = 调用 { $name }：{ $args }
 runs-step_result = 结果（{ $outcome }）：{ $text }
 runs-trigger_addressed = 被叫
 runs-trigger_wake = 定时
+runs-trigger_spontaneous = 主动
 runs-open = 仍在运行
 logs-empty = 启动以来没有警告或错误。
 logs-header = 最近的警告和错误（{ $count } 条）：

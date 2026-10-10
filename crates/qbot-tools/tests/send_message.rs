@@ -44,6 +44,15 @@ async fn the_chat_markers_become_message_segments() {
 }
 
 #[tokio::test]
+async fn a_face_copied_from_the_chat_with_its_name_is_the_same_face() {
+    let r = rig(vec![]);
+    let results = try_calls(&r, vec![send("[face:14:smile]"), send("[face:]")]).await;
+    assert_eq!(results[0].outcome, Outcome::Ok, "{}", text_of(&results[0]));
+    assert_eq!(r.world.sent()[0], [OutSegment::Face(14)]);
+    assert_ne!(results[1].outcome, Outcome::Ok, "a face needs its number");
+}
+
+#[tokio::test]
 async fn ordinary_brackets_stay_text() {
     let r = rig(vec![]);
     let results = try_calls(&r, vec![send("[\u{7b11}] see [image] and [1] [at: x")]).await;

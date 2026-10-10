@@ -280,8 +280,8 @@ async fn a_picture_is_described_cached_and_filled_into_its_line() {
     finish(&r, 1).await;
     assert_eq!(
         r.lines.text(1),
-        "look [image:A cat on a keyboard \u{FF3B}sic\u{FF3D}]",
-        "markdown stripped, one line, brackets neutralized"
+        "look [image:**A cat** on a keyboard \u{FF3B}sic\u{FF3D}]",
+        "kept as written, on one line, its brackets unable to close the marker"
     );
     assert_eq!(
         r.cache.0.lock().unwrap().keys().collect::<Vec<_>>(),
@@ -300,7 +300,7 @@ async fn a_picture_is_described_cached_and_filled_into_its_line() {
     assert!(
         r.lines
             .text(2)
-            .starts_with("again [image:A cat on a keyboard")
+            .starts_with("again [image:**A cat** on a keyboard")
     );
     assert_eq!(
         (

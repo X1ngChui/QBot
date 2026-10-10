@@ -22,9 +22,9 @@ pub struct OpsConfig {
     pub alias_unused: Duration,
     /// Picture descriptions older than this are forgotten (and so redone when next needed).
     pub description_ttl: Duration,
-    pub timers_keep: Duration,
-    /// Finished runs older than this are deleted. `None` keeps them forever.
-    pub runs_keep: Option<Duration>,
+    /// Finished runs and finished scheduled tasks older than this are deleted. `None` keeps
+    /// them forever.
+    pub records_keep: Option<Duration>,
     pub owners: Vec<AccountId>,
     pub zone: TimeZone,
     /// How facts fade when nothing confirms them.
@@ -32,14 +32,14 @@ pub struct OpsConfig {
 }
 
 impl OpsConfig {
-    /// The nightly upkeep around the deployment's choices (backups, run retention, who gets the
-    /// report, the time zone, how facts fade). A name candidate nothing has supported for 30
-    /// days is dropped; a cached picture description is dropped after 15 days (it serves reposts,
-    /// which come within days, and must not grow with the archive; what was archived keeps its
-    /// words); finished timers are kept 30 days for /tasks history.
+    /// The nightly upkeep around the deployment's choices (backups, how long records are kept,
+    /// who gets the report, the time zone, how facts fade). A name candidate nothing has supported
+    /// for one default fact half-life is dropped: a lead from chat fades like a fact. A cached
+    /// picture description is dropped after 15 days (it serves reposts, which come within days,
+    /// and must not grow with the archive; what was archived keeps its words).
     pub fn new(
         backup: Option<BackupConfig>,
-        runs_keep: Option<Duration>,
+        records_keep: Option<Duration>,
         owners: Vec<AccountId>,
         zone: TimeZone,
         fact_decay: DecayPolicy,
@@ -47,10 +47,9 @@ impl OpsConfig {
         const DAY: Duration = Duration::from_secs(86_400);
         Self {
             backup,
-            alias_unused: DAY * 30,
+            alias_unused: fact_decay.default,
             description_ttl: DAY * 15,
-            timers_keep: DAY * 30,
-            runs_keep,
+            records_keep,
             owners,
             zone,
             fact_decay,
@@ -159,20 +158,20 @@ impl Operations {
         Ok(())
     }
 
-    /// Delete finished timers and old runs.
+    /// Delete finished runs and finished timers older than the record retention.
     pub async fn cleanup(&self) -> Result<(), JobError> {
-        let timers = self
-            .housekeeping
-            .delete_finished_timers(self.before(self.cfg.timers_keep))
-            .await
-            .map_err(failed)?;
-        let runs = match self.cfg.runs_keep {
-            Some(keep) => self
-                .housekeeping
-                .delete_runs(self.before(keep))
-                .await
-                .map_err(failed)?,
-            None => 0,
+        let (timers, runs) = match self.cfg.records_keep {
+            Some(keep) => (
+                self.housekeeping
+                    .delete_finished_timers(self.before(keep))
+                    .await
+                    .map_err(failed)?,
+                self.housekeeping
+                    .delete_runs(self.before(keep))
+                    .await
+                    .map_err(failed)?,
+            ),
+            None => (0, 0),
         };
         // Best effort: the platform may be disconnected at night. Failing would retry the whole
         // pipeline (another extraction pass, another backup) for a cache the next night cleans.

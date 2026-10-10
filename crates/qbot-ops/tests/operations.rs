@@ -179,8 +179,7 @@ fn rig(owners: Vec<AccountId>) -> Rig {
             backup: None,
             alias_unused: Duration::from_secs(30 * 86_400),
             description_ttl: Duration::from_secs(15 * 86_400),
-            timers_keep: Duration::from_secs(30 * 86_400),
-            runs_keep: Some(Duration::from_secs(90 * 86_400)),
+            records_keep: Some(Duration::from_secs(90 * 86_400)),
             owners,
             zone: jiff::tz::TimeZone::get("Asia/Shanghai").unwrap(),
             fact_decay: qbot_memory::facts::DecayPolicy::default(),
@@ -224,7 +223,7 @@ async fn the_nightly_pipeline_runs_every_stage_even_after_a_failure() {
         *r.house.calls.lock().unwrap(),
         [
             ("descriptions".to_owned(), NOON - 15 * day),
-            ("timers".to_owned(), NOON - 30 * day),
+            ("timers".to_owned(), NOON - 90 * day),
             ("runs".to_owned(), NOON - 90 * day)
         ]
     );

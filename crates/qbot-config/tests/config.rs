@@ -181,14 +181,14 @@ fn environment_values_follow_figments_typing_rules() {
         ("QBOT__PROVIDERS__TEXT__MODEL", "m-two"),
         ("QBOT__MEDIA__TRANSCRIBE_VOICE", "false"),
         ("QBOT__MEMORY__RECALL__MAX_DISTANCE", "0.3"),
-        ("QBOT__MAINTENANCE__RUNS_KEEP_DAYS", "30"),
+        ("QBOT__MAINTENANCE__RECORDS_KEEP_DAYS", "30"),
         ("QBOT__DATABASE__SSL_MODE", "verify-full"),
     ]);
     let c = load(&root, &ok).unwrap().config;
     assert_eq!(c.providers.text.model, "m-two");
     assert!(!c.media.transcribe_voice);
     assert!((c.memory.recall.max_distance - 0.3).abs() < 1e-6);
-    assert_eq!(c.maintenance.runs_keep_days, 30);
+    assert_eq!(c.maintenance.records_keep_days, 30);
     assert_eq!(c.database.ssl_mode.as_str(), "verify-full");
 
     // A string that looks like a number must be quoted; unquoted it is a number, and a number is
@@ -602,15 +602,19 @@ deadline_secs = 45
 max_messages = 2
 [history]
 batch_lines = 20
-raw_batches = 3
+raw_batches = 4
 summary_batches = 0
 [memory]
 slice_batches = 4
+group_terms = 12
 [memory.recall]
 half_life_days = 30
+[media]
+reply_wait_secs = 10
 [providers.text]
 kind = "openai_responses"
 reasoning = "high"
+extraction_reasoning = "medium"
 "#,
     );
     let c = load(&root, &MapEnv::default()).unwrap().config;
@@ -631,12 +635,15 @@ reasoning = "high"
         ),
         (4, 1, 1)
     );
-    assert_eq!(grid.retained_raw_batches, 3, "the verbatim tier");
+    assert_eq!(grid.retained_raw_batches, 4, "the verbatim tier");
+    assert_eq!(c.group_terms(), 12);
+    assert_eq!(c.media_wait(), Duration::from_secs(10));
+    assert_eq!(c.extraction_reasoning(), qbot_llm::ReasoningEffort::Medium);
     assert_eq!(
         c.history_window(),
         qbot_core::HistoryWindow {
             batch_lines: 20,
-            raw_batches: 3,
+            raw_batches: 4,
             summary_batches: 0
         }
     );
@@ -980,20 +987,20 @@ fn maintenance_settings_convert_and_validate() {
     let backup = ops.backup.unwrap();
     assert_eq!((backup.keep, backup.target.password.as_str()), (14, "pw"));
     assert_eq!(backup.dir, paths.backups_dir);
-    assert_eq!(ops.runs_keep, Some(Duration::from_secs(90 * 86_400)));
+    assert_eq!(ops.records_keep, Some(Duration::from_secs(90 * 86_400)));
 
     let off = load(
         &root,
         &MapEnv::new([
             ("QBOT__MAINTENANCE__BACKUPS", "0"),
-            ("QBOT__MAINTENANCE__RUNS_KEEP_DAYS", "0"),
+            ("QBOT__MAINTENANCE__RECORDS_KEEP_DAYS", "0"),
         ]),
     )
     .unwrap();
     let ops = off.config.ops_config(&paths, "pw", jiff::tz::TimeZone::UTC);
     assert!(
-        ops.backup.is_none() && ops.runs_keep.is_none(),
-        "0 keeps runs forever; 0 backups makes none"
+        ops.backup.is_none() && ops.records_keep.is_none(),
+        "0 keeps records forever; 0 backups makes none"
     );
 
     let keys: Vec<String> = errors(load(
@@ -1013,5 +1020,36 @@ fn maintenance_settings_convert_and_validate() {
         keys.contains(&"maintenance.nightly_cron".to_owned())
             && keys.contains(&"maintenance.report_cron".to_owned()),
         "{keys:?}"
+    );
+}
+
+#[test]
+fn settings_that_depend_on_each_other_are_checked_together() {
+    let root = scratch();
+    let keys: Vec<String> = errors(load(
+        &root,
+        &MapEnv::new([
+            ("QBOT__BOT__ACCOUNT", "10001"),
+            ("QBOT__HISTORY__RAW_BATCHES", "2"),
+            ("QBOT__MEMORY__SLICE_BATCHES", "3"),
+            ("QBOT__REPLIES__DEADLINE_SECS", "20"),
+            ("QBOT__MEDIA__REPLY_WAIT_SECS", "20"),
+            ("QBOT__REPLIES__SPONTANEOUS_CHANCE", "1.5"),
+        ]),
+    ))
+    .iter()
+    .map(|e| match e {
+        ConfigError::Invalid { key, .. } => key.clone(),
+        other => format!("{other:?}"),
+    })
+    .collect();
+    assert_eq!(
+        keys,
+        [
+            "replies.spontaneous_chance",
+            "memory.slice_batches",
+            "media.reply_wait_secs"
+        ],
+        "a slice wider than the verbatim tier, a media wait as long as the reply deadline, a chance above 1"
     );
 }

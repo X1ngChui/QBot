@@ -117,7 +117,7 @@ impl Tool for ScheduleTask {
         // A task created while handling a task continues that task's chain.
         let parent = match cx.trigger {
             Trigger::Wake { chain, .. } => Some(*chain),
-            Trigger::Addressed { .. } => None,
+            Trigger::Addressed { .. } | Trigger::Spontaneous => None,
         };
         let timer = self
             .0

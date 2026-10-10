@@ -69,9 +69,9 @@ fn markers_cannot_be_forged_by_members() {
     ));
     let Frame::Message(m) = frame else { panic!() };
     let text = render(&m.segments, &ctx());
-    assert!(
-        !text.contains('[') && !text.contains(']') && !text.contains('\0'),
-        "{text}"
+    assert_eq!(
+        text, "\u{FF3B}at:1] \u{FF3B}image]",
+        "kept as typed, but never a marker"
     );
 }
 
@@ -84,7 +84,7 @@ fn dice_results_and_unknown_segments_render_safely() {
     let Frame::Message(m) = frame else { panic!() };
     assert_eq!(
         render(&m.segments, &ctx()),
-        "[dice result:4][rps][unsupported:weirdkind][file:ab..c.txt]"
+        "[dice result:4][rps][unsupported:weirdkind][file:a b/../c.txt]"
     );
 }
 
@@ -208,7 +208,7 @@ fn stickers_show_their_label_until_described_and_carry_their_id() {
     let m = parsed(
         r#"[{"type":"mface","data":{"emoji_id":"e9","url":"https://gxh.vip.qq.com/club/item/parcel/item/ab/abcd/raw300.gif","summary":"[shy]"}}]"#,
     );
-    assert_eq!(render(&m.segments, &ctx()), "[sticker:\u{FF3B}shy\u{FF3D}]");
+    assert_eq!(render(&m.segments, &ctx()), "[sticker:shy]");
     let job = qbot_gateway::media::job_for(&m, &ctx());
     assert_eq!(job.items.len(), 1);
     assert_eq!(job.items[0].kind, qbot_core::MediaKind::Sticker);
@@ -269,7 +269,7 @@ fn inside_a_record_mentions_name_nobody_quotes_vanish_and_records_do_not_nest() 
     ));
     assert_eq!(
         render(&m.segments, &ctx()),
-        "[forward:1]\n  | Pal: @someone hi \u{FF3B}x\u{FF3D}[voice][forward:1][voice]"
+        "[forward:1]\n  | Pal: @someone hi [x][voice][forward:1][voice]"
     );
     // The clip inside the record is never transcribed, but it still takes a position.
     let job = qbot_gateway::media::job_for(&m, &ctx());

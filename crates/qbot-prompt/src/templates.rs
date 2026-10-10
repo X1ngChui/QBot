@@ -13,13 +13,14 @@ pub enum Template {
     PeopleBlock,
     TriggerAddressed,
     TriggerWake,
+    TriggerSpontaneous,
     DescribeImage,
     LearnedKnowledge,
     UndeliveredNote,
 }
 
 impl Template {
-    pub const ALL: [Template; 10] = [
+    pub const ALL: [Template; 11] = [
         Template::ReplySystem,
         Template::Legend,
         Template::PersonaBlock,
@@ -27,6 +28,7 @@ impl Template {
         Template::PeopleBlock,
         Template::TriggerAddressed,
         Template::TriggerWake,
+        Template::TriggerSpontaneous,
         Template::DescribeImage,
         Template::LearnedKnowledge,
         Template::UndeliveredNote,
@@ -41,6 +43,7 @@ impl Template {
             Template::PeopleBlock => include_str!("../../../prompts/people_block.md"),
             Template::TriggerAddressed => include_str!("../../../prompts/trigger_addressed.md"),
             Template::TriggerWake => include_str!("../../../prompts/trigger_wake.md"),
+            Template::TriggerSpontaneous => include_str!("../../../prompts/trigger_spontaneous.md"),
             Template::DescribeImage => include_str!("../../../prompts/describe_image.md"),
             Template::LearnedKnowledge => include_str!("../../../prompts/learned_knowledge.md"),
             Template::UndeliveredNote => include_str!("../../../prompts/undelivered_note.md"),
@@ -57,6 +60,7 @@ impl Template {
             Template::PeopleBlock => &["entries"],
             Template::TriggerAddressed => &["now", "timezone", "sender", "message", "names"],
             Template::TriggerWake => &["now", "timezone", "task", "depth", "intent", "names"],
+            Template::TriggerSpontaneous => &["now", "timezone", "names"],
             Template::DescribeImage => &["language"],
             Template::LearnedKnowledge => &["entries"],
             Template::UndeliveredNote => &[],
@@ -88,6 +92,7 @@ impl Template {
             Template::PeopleBlock => "people_block",
             Template::TriggerAddressed => "trigger_addressed",
             Template::TriggerWake => "trigger_wake",
+            Template::TriggerSpontaneous => "trigger_spontaneous",
             Template::DescribeImage => "describe_image",
             Template::LearnedKnowledge => "learned_knowledge",
             Template::UndeliveredNote => "undelivered_note",

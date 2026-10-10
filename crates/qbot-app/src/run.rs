@@ -59,10 +59,6 @@ use tokio_util::sync::CancellationToken;
 /// How often the database lease is checked. Losing it ends the process: another instance may
 /// already be running.
 const LEASE_CHECK: Duration = Duration::from_secs(10);
-/// How long a reply waits for the group's pictures and clips in flight before it goes ahead
-/// without them: long enough for a description or a short transcript, short enough that the
-/// reply still feels prompt.
-const MEDIA_WAIT: Duration = Duration::from_secs(25);
 
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
@@ -282,15 +278,6 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         ));
         qbot_tools::add_memory_tools(set, recall, episodes.clone())
     })
-    .and_then(|set| {
-        set.with(qbot_tools::LookupMember {
-            directory: directory.clone(),
-            identity: identity.clone(),
-            facts: facts.clone(),
-            notes: notes.clone(),
-            decay: config.decay_policy(),
-        })
-    })
     .map_err(|e| RunError::Tools(e.to_string()))?;
     // The model may look at pictures itself only if it accepts images at all.
     let (tools, media_store) = if provider.info().capabilities.image_input.is_some() {
@@ -345,11 +332,12 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     )?
     .with_knowledge(Arc::new(qbot_prompt::FactKnowledge::new(
         facts.clone(),
-        qbot_prompt::FactKnowledge::MAX_TERMS,
+        config.group_terms(),
     )))
     .with_people(Arc::new(archive.clone()))
     .with_directory(directory.clone())
     .with_episodes(episodes.clone());
+    let prompt = Arc::new(prompt);
     let renderer = Arc::new(PromptRenderer::new(prompt.zone().clone()));
     let deps = Arc::new(RunDeps {
         provider: provider.clone(),
@@ -366,7 +354,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     let supervisor = Supervisor::new(
         config.supervisor(),
         deps,
-        Arc::new(prompt) as Arc<dyn ContextSource>,
+        prompt.clone() as Arc<dyn ContextSource>,
         Arc::new(policy.clone()) as Arc<dyn GroupPolicy>,
     );
     // Background work: the nightly pipeline, backups and the daily report.
@@ -380,7 +368,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     // The language the bot writes in comes with the locale.
     let writing_language = locales.render(&Msg::WritingLanguage {});
     let builder = EpisodeBuilder::new(
-        EpisodeExtractor::new(provider.clone()),
+        EpisodeExtractor::new(provider.clone()).with_reasoning(config.extraction_reasoning()),
         embedder.clone(),
         BuilderConfig {
             language: writing_language.clone(),
@@ -390,13 +378,14 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         cfg: ops_config,
         clock: clock.clone(),
         extractor: Arc::new(
-            EpisodeJobs::new(episodes.clone(), builder, config.slice_grid()).with_consolidator(
-                Arc::new(Consolidator::new(
+            EpisodeJobs::new(episodes.clone(), builder, config.slice_grid())
+                .with_consolidator(Arc::new(Consolidator::new(
                     facts.clone(),
                     identity.clone(),
                     predicates.clone(),
-                )),
-            ),
+                )))
+                // Extraction reads the group as replies do: the same people and knowledge.
+                .with_background(prompt.clone()),
         ),
         housekeeping: Arc::new(PgHousekeeping::new(
             admin.clone(),
@@ -493,14 +482,17 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     }));
     let pipeline = Arc::new(
         Pipeline::new(
-            PipelineConfig::new(bot),
+            PipelineConfig {
+                spontaneous_chance: config.replies.spontaneous_chance,
+                ..PipelineConfig::new(bot)
+            },
             Arc::new(archive),
             commands,
             Arc::new(supervisor.clone()),
             Nicknames::new(&config.bot.nicknames),
             echoes,
         )
-        .with_media(media.clone(), MEDIA_WAIT)
+        .with_media(media.clone(), config.media_wait())
         .with_batches(batch_jobs, config.history.batch_lines),
     );
 

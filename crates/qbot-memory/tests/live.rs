@@ -89,10 +89,21 @@ async fn a_real_model_writes_a_valid_episode_with_findings() {
             "\u{5c31}\u{662f}\u{7fa4}\u{91cc}\u{5e38}\u{8bf4}\u{7684}\u{90a3}\u{5bb6}\u{732b}\u{5496}\u{ff0c}\u{5728}\u{6e56}\u{8fb9}",
         ),
     ];
+    // As the prompt layer writes it: the members as the group knows them, and the group.
+    let background = qbot_memory::Background {
+        text: "## Who is who\n\nThe members these lines involve, as the group knows them now.\n\n\
+               - member:1: shown as \"\u{5c0f}\u{6797}\"\n\
+               - member:2: shown as \"\u{963f}\u{6770}\"; known before: lives_in: \u{676d}\u{5dde}\n\
+               - member:3: shown as \"Mia\"\n\n\
+               ## About the group\n\nFriends from the same university who chat about food and trips."
+            .into(),
+        zone: jiff::tz::TimeZone::get("Asia/Shanghai").unwrap(),
+    };
     let ctx = SliceContext {
         previous: &[],
         target: &target,
         next: &[],
+        background: &background,
     };
     let out = extractor.extract(&ctx, "English").await.unwrap();
     eprintln!(

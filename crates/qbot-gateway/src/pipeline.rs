@@ -1,6 +1,7 @@
 //! From one platform frame to its consequences: archive first, then command or run.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -40,9 +41,11 @@ pub trait Commands: Send + Sync {
     async fn run(&self, request: CommandRequest);
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PipelineConfig {
     pub bot: AccountId,
+    /// Chance, from 0 to 1, that a member's line addressed to no one starts a spontaneous run.
+    pub spontaneous_chance: f64,
     /// How long an unclaimed echo is kept; the delivery's echo timeout.
     pub echo_keep: Duration,
     /// Messages of a forwarded record shown in its line.
@@ -54,6 +57,7 @@ impl PipelineConfig {
     pub fn new(bot: AccountId) -> Self {
         Self {
             bot,
+            spontaneous_chance: 0.0,
             echo_keep: crate::delivery::DeliveryTimeouts::default().echo,
             forward_max_lines: crate::render::FORWARD_MAX_LINES,
         }
@@ -88,6 +92,9 @@ pub struct Pipeline {
     nicknames: Nicknames,
     echoes: Arc<EchoBoard>,
     tasks: TaskTracker,
+    /// Groups with a spontaneous run under way: one at a time, or a lively chat would start
+    /// several that talk over each other.
+    spontaneous: Arc<Mutex<HashSet<GroupId>>>,
 }
 
 impl std::fmt::Debug for Pipeline {
@@ -117,6 +124,7 @@ impl Pipeline {
             nicknames,
             echoes,
             tasks: TaskTracker::new(),
+            spontaneous: Arc::default(),
         }
     }
 
@@ -222,7 +230,10 @@ impl Pipeline {
                 _ => None,
             },
         };
-        let Some(why) = why else { return };
+        let Some(why) = why else {
+            self.maybe_spontaneous(m.group, m.sender);
+            return;
+        };
         tracing::debug!(group = m.group.get(), ?why, "addressed");
         let request = TriggerRequest {
             group: m.group,
@@ -254,6 +265,53 @@ impl Pipeline {
             }
             _ => submit(&self.supervisor, request).await,
         }
+    }
+
+    /// Roll `spontaneous_chance` for a member's line that addressed no one, and on a hit start a
+    /// spontaneous run once the group's media in flight is described, as a reply would.
+    fn maybe_spontaneous(&self, group: GroupId, author: AccountId) {
+        let chance = self.cfg.spontaneous_chance;
+        if chance <= 0.0 || rand::random::<f64>() >= chance {
+            return;
+        }
+        if !self
+            .spontaneous
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(group)
+        {
+            return;
+        }
+        let (supervisor, spontaneous) =
+            (Arc::clone(&self.supervisor), Arc::clone(&self.spontaneous));
+        let media = self
+            .media
+            .as_ref()
+            .map(|hook| (Arc::clone(&hook.service), hook.wait));
+        self.tasks.spawn(async move {
+            if let Some((service, wait)) = media
+                && service.busy(group)
+            {
+                service.settle(group, wait).await;
+            }
+            match supervisor.submit_spontaneous(group, author).await {
+                Ok(handle) => {
+                    handle.finished().await;
+                }
+                Err(Rejected::Environment(error)) => tracing::error!(%error, "admission failed"),
+                Err(rejected) => {
+                    tracing::debug!(
+                        group = group.get(),
+                        ?rejected,
+                        "spontaneous run not admitted"
+                    )
+                }
+            }
+            spontaneous
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&group);
+        });
     }
 
     async fn quotes_bot(&self, group: GroupId, quoted: MessageId) -> bool {

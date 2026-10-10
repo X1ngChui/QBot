@@ -1,6 +1,6 @@
 //! Runs the tool calls of one model turn with deterministic ordering.
 //!
-//! Reads run concurrently; writes and sends then run one at a time in call order. A batch is
+//! Reads run concurrently; writes then run one at a time in call order. A batch is
 //! never rejected as a whole: each call gets its own result, so the model always sees what
 //! happened to everything it asked for.
 
@@ -11,7 +11,7 @@ use futures_util::future::join_all;
 use qbot_context::{ErrorKind, Outcome, Part, ToolCall, ToolResult};
 use tokio::time::Instant;
 
-use crate::tool::{Effect, ToolCx, ToolError, ToolOutput, ToolSet};
+use crate::tool::{Effect, ErasedTool, ToolCx, ToolError, ToolOutput, ToolSet};
 
 /// Bounds on one run. Only `max_turns` is local: it stops a model that never stops calling
 /// tools from looping for the whole deadline. Output size, call counts and context size are the
@@ -38,9 +38,9 @@ pub struct Executed {
 pub async fn execute_turn(tools: &ToolSet, calls: &[ToolCall], cx: &ToolCx<'_>) -> Vec<Executed> {
     let mut slots: Vec<Option<Executed>> = vec![None; calls.len()];
     let mut reads = Vec::new();
-    let mut ordered = Vec::new();
+    let mut writes = Vec::new();
     for (index, call) in calls.iter().enumerate() {
-        match tools.get(&call.name).map(|tool| tool.effect()) {
+        match tools.get(&call.name) {
             None => {
                 slots[index] = Some(failed(
                     call,
@@ -50,31 +50,27 @@ pub async fn execute_turn(tools: &ToolSet, calls: &[ToolCall], cx: &ToolCx<'_>) 
                     }),
                 ));
             }
-            Some(Effect::Read) => reads.push(index),
-            Some(Effect::Write | Effect::Send) => ordered.push(index),
+            Some(tool) if tool.effect() == Effect::Read => reads.push((index, tool)),
+            Some(tool) => writes.push((index, tool)),
         }
     }
 
-    let read_results = join_all(reads.iter().map(|&i| run_one(tools, &calls[i], cx))).await;
-    for (i, executed) in reads.into_iter().zip(read_results) {
+    let read_results = join_all(
+        reads
+            .iter()
+            .map(|(i, tool)| run_one(tool.as_ref(), &calls[*i], cx)),
+    )
+    .await;
+    for ((i, _), executed) in reads.into_iter().zip(read_results) {
         slots[i] = Some(executed);
     }
-    for i in ordered {
-        slots[i] = Some(run_one(tools, &calls[i], cx).await);
+    for (i, tool) in writes {
+        slots[i] = Some(run_one(tool.as_ref(), &calls[i], cx).await);
     }
     slots.into_iter().flatten().collect()
 }
 
-async fn run_one(tools: &ToolSet, call: &ToolCall, cx: &ToolCx<'_>) -> Executed {
-    let Some(tool) = tools.get(&call.name) else {
-        return failed(
-            call,
-            ErrorKind::InvalidArguments,
-            say(Text::OutcomeUnknownTool {
-                name: call.name.clone(),
-            }),
-        );
-    };
+async fn run_one(tool: &dyn ErasedTool, call: &ToolCall, cx: &ToolCx<'_>) -> Executed {
     let started = Instant::now();
     let outcome = tool.call(cx, call.arguments.clone()).await;
     let latency = started.elapsed();

@@ -100,7 +100,7 @@ pub struct Network {
     pub proxy_for: Vec<Service>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Replies {
     /// Replies calling the model at once.
@@ -109,6 +109,8 @@ pub struct Replies {
     pub deadline_secs: u64,
     /// Messages one reply may send.
     pub max_messages: u32,
+    /// Chance, from 0 to 1, that a member's line addressed to no one starts a run on its own.
+    pub spontaneous_chance: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +125,8 @@ pub struct History {
 #[serde(deny_unknown_fields)]
 pub struct Memory {
     pub slice_batches: u32,
+    /// Group terms every reply is shown, the most recently confirmed.
+    pub group_terms: u32,
     pub recall: Recall,
     pub facts: Facts,
 }
@@ -155,6 +159,8 @@ pub struct Media {
     pub transcribe_voice: bool,
     pub images_per_minute: u32,
     pub clips_per_minute: u32,
+    /// How long a reply waits for the group's pictures and clips being described.
+    pub reply_wait_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -191,6 +197,8 @@ pub struct TextProvider {
     pub api_key_secret: String,
     /// The reasoning effort of replies.
     pub reasoning: Reasoning,
+    /// The reasoning effort of memory extraction.
+    pub extraction_reasoning: Reasoning,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,6 +248,6 @@ pub struct Maintenance {
     /// Where `pg_dump` and `pg_restore` are; empty finds them on `PATH`.
     pub postgres_bin_dir: String,
     /// Finished runs older than this are deleted; 0 keeps them.
-    pub runs_keep_days: u32,
+    pub records_keep_days: u32,
     pub napcat_clean_cache: bool,
 }

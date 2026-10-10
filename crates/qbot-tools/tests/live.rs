@@ -141,7 +141,7 @@ async fn the_model_searches_the_web_and_answers_from_the_results() {
             result.len(),
             &result[..result.len().min(160)]
         );
-        assert!(result.contains("outside text"));
+        assert!(result.starts_with("Web results for"), "{result}");
         items.push(ConvItem::ToolResult(WireOutput {
             call_id: call.id.clone(),
             status: ToolStatus::Ok,
@@ -230,7 +230,10 @@ async fn read_live(url: &str, question: Option<&str>, max_chars: usize) -> Strin
 async fn a_long_article_is_read_whole_with_structure_or_by_question() {
     let url = "https://en.wikipedia.org/wiki/Rust_(programming_language)";
     let whole = read_live(url, None, 8000).await;
-    assert!(whole.contains("outside text"));
+    assert!(
+        whole.contains(", as Markdown:"),
+        "the page under its address"
+    );
     assert!(whole.contains("Rust"));
     assert!(
         whole.contains("\n#")

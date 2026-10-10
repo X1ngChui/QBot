@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use qbot_agent::{DuplicateTool, Effect, Tool, ToolCx, ToolError, ToolOutput, ToolSet};
+use qbot_agent::{Effect, Tool, ToolCx, ToolError, ToolOutput, ToolSet, ToolSetError};
 use qbot_context::RefusalReason;
 use qbot_memory::{Episode, EpisodeId, EpisodeStore, Recall, SliceLine};
 use qbot_wording::{Text, say};
@@ -154,6 +154,6 @@ pub fn add_memory_tools(
     set: ToolSet,
     recall: Arc<Recall>,
     store: Arc<dyn EpisodeStore>,
-) -> Result<ToolSet, DuplicateTool> {
+) -> Result<ToolSet, ToolSetError> {
     set.with(RecallEpisodes(recall))?.with(ReadEpisode(store))
 }

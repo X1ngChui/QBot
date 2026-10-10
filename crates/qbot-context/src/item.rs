@@ -136,6 +136,9 @@ pub enum InstructionRole {
     /// Lower-trust text describing why the run started (for example a task's stored intent).
     /// Delivered to the model as user-level content, never with developer authority.
     Trigger,
+    /// Reference material derived from chat (learned group knowledge). The system wrote it, but
+    /// from what members said, so it is delivered as user-level content like the chat itself.
+    Reference,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,7 +197,11 @@ impl RunEnd {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Meta {
-    Resumed { interrupted_calls: u32 },
+    /// Calls still unresolved when the run ended, closed as `Interrupted`.
+    #[serde(alias = "resumed")]
+    CallsInterrupted {
+        interrupted_calls: u32,
+    },
     RunEnded(RunEnd),
 }
 
