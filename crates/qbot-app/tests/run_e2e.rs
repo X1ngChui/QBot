@@ -1054,7 +1054,12 @@ async fn a_filled_batch_turns_archived_chat_into_a_stored_episode() {
         .send(group_message(7, 2, json!([{"type": "at", "data": {"qq": "100"}}, {"type": "text", "data": {"text": " any tips?"}}])))
         .await
         .unwrap();
-    eventually("the reply request", || async { sim.requests().len() == 3 }).await;
+    // The reply asks for the display names of the members it shows, as every run does.
+    answering_names(
+        &mut napcat,
+        eventually("the reply request", || async { sim.requests().len() == 3 }),
+    )
+    .await;
     let seen = sim.requests()[2]["input"].to_string();
     assert!(
         seen.contains("Members discussed planning a trip together."),
