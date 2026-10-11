@@ -150,6 +150,7 @@ pub async fn create_verified_backup(cfg: &BackupConfig) -> Result<VerifiedBackup
             path: cfg.dir.clone(),
             reason: e.to_string(),
         })?;
+    remove_partials(&cfg.dir, &cfg.prefix).await;
     let stamp = Timestamp::now().strftime("%Y%m%d-%H%M%S").to_string();
     let target = cfg.dir.join(format!("{}-{stamp}.dump", cfg.prefix));
     let partial = cfg.dir.join(format!("{}-{stamp}.partial", cfg.prefix));
@@ -173,6 +174,22 @@ pub async fn create_verified_backup(cfg: &BackupConfig) -> Result<VerifiedBackup
     // Whatever happened, no partial file is left behind.
     let _ = tokio::fs::remove_file(&partial).await;
     result
+}
+
+/// Remove partial files of backups that never finished: a backup stopped with the process (on
+/// shutdown, or a crash) gets no chance to clean up after itself. Only one instance runs (the
+/// database lease), so no other backup is writing one.
+async fn remove_partials(dir: &Path, prefix: &str) {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&format!("{prefix}-")) && name.ends_with(".partial") {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
+    }
 }
 
 async fn dump_and_verify(cfg: &BackupConfig, partial: &Path) -> Result<u64, BackupError> {

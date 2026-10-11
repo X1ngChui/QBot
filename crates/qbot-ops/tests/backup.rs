@@ -68,6 +68,9 @@ async fn a_verified_dump_is_published_and_the_password_stays_off_the_command_lin
     let (bin, out) = (scratch(), scratch());
     script(&bin, "pg_dump", GOOD_DUMP);
     script(&bin, "pg_restore", GOOD_RESTORE);
+    // Left by a backup that was stopped with the process; another tool's file is not ours.
+    std::fs::write(out.join("qbot-20260101-000000.partial"), "cut").unwrap();
+    std::fs::write(out.join("other-20260101-000000.partial"), "theirs").unwrap();
     let made = create_verified_backup(&config(&bin, &out)).await.unwrap();
     assert!(
         made.path.starts_with(&out) && made.path.extension().unwrap() == "dump",
@@ -78,8 +81,10 @@ async fn a_verified_dump_is_published_and_the_password_stays_off_the_command_lin
     let names: Vec<_> = std::fs::read_dir(&out)
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|name| !name.starts_with("other-"))
         .collect();
     assert_eq!(names.len(), 1, "no partial file left: {names:?}");
+    assert!(out.join("other-20260101-000000.partial").exists());
 
     let args = std::fs::read_to_string(bin.join("dump-args")).unwrap();
     assert!(

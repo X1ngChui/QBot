@@ -549,7 +549,7 @@ spend.
   whole job would also take another backup and rotate an older one out.
 - **Backups** shell out to `pg_dump`/`pg_restore`: password through the environment, a partial file
   verified by listing before an atomic rename, rotation after success, the tools checked at
-  startup.
+  startup. A partial file left by a backup stopped with the process is removed by the next one.
 - **The daily report** to the owners is a set of typed messages, so it follows the locale.
 - **Stopping** (SIGTERM, as `docker stop` sends) ends input first, then cancels the runs in
   flight (recorded as cancelled, open calls interrupted) before anything that might wait on one,
