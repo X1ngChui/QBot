@@ -4,7 +4,8 @@
 //! claimed task can always start; without capacity it simply stays pending. Group tasks are
 //! at-most-once (a claim is never replayed); background jobs are idempotent and retried with
 //! backoff. One loop sleeps until the next due instant and is woken early by task changes and
-//! by freed capacity.
+//! by freed capacity. On shutdown a running job is dropped where it is: its claim stays, and
+//! the next start puts it back in the queue.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -70,6 +71,8 @@ pub struct Scheduler {
     wake: Arc<Notify>,
     active: Arc<Mutex<Active>>,
     tasks: TaskTracker,
+    /// Drops running jobs when the loop stops.
+    stop: CancellationToken,
 }
 
 impl std::fmt::Debug for Scheduler {
@@ -104,6 +107,7 @@ impl Scheduler {
             wake,
             active: Arc::default(),
             tasks: TaskTracker::new(),
+            stop: CancellationToken::new(),
         }
     }
 
@@ -146,6 +150,10 @@ impl Scheduler {
                 () = self.supervisor.freed().notified() => {}
             }
         }
+        // A job can run for many minutes (an extraction pass, a backup). Its claim stays when it
+        // is dropped, and startup recovery queues it again; a group task's run ends with the
+        // supervisor's shutdown.
+        self.stop.cancel();
         self.join().await;
     }
 
@@ -271,6 +279,7 @@ impl Scheduler {
             self.clock.clone(),
         );
         let (cfg, id, attempts) = (self.cfg.clone(), timer.id, timer.attempts);
+        let stop = self.stop.clone();
         self.spawn(async move {
             // The job's slot is given back however the task ends, a panicking job included.
             let _slot = Slot { active, wake };
@@ -293,7 +302,10 @@ impl Scheduler {
                     }
                 }))
             };
-            let result = jobs.run(kind, group).await;
+            let result = tokio::select! {
+                () = stop.cancelled() => return,
+                result = jobs.run(kind, group) => result,
+            };
             drop(heartbeat);
             match result {
                 Ok(()) => {

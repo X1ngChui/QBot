@@ -43,7 +43,6 @@ pub struct ReasoningInfo {
 /// emulation cannot be used. Optional features are `Option`/`bool` and are typed as absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
-    pub streaming: Realization,
     pub tool_calls: Realization,
     pub parallel_tool_calls: Realization,
     /// `Native`: the provider keeps conversation state and accepts a handle.

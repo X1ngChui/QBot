@@ -7,20 +7,18 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use common::*;
-use futures_util::StreamExt;
 use qbot_llm::fake::FakeReply;
 use qbot_llm::responses::sim::SimStep;
 use qbot_llm::responses::{HttpResponse, ResponsesConfig, ResponsesProvider, StateMode, Transport};
 use qbot_llm::{
     Content, ConvItem, Conversation, FinishReason, LlmError, MediaStore, Provider, ReasoningEffort,
-    StreamEvent, ToolChoice,
+    ToolChoice,
 };
 use serde_json::{Value, json};
 
 #[tokio::test]
 async fn deepseek_request_shape() {
-    let (server, provider) =
-        sim_provider(true, StateMode::Stateless, sim_steps(&[second_reply()]), 64);
+    let (server, provider) = sim_provider(true, StateMode::Stateless, sim_steps(&[second_reply()]));
     let tools = tools();
     let conv = base_conversation();
     provider
@@ -71,12 +69,8 @@ async fn reasoning_effort_maps_per_dialect() {
         (false, ReasoningEffort::Off, None),
         (false, ReasoningEffort::Medium, Some("medium")),
     ] {
-        let (server, provider) = sim_provider(
-            deepseek,
-            StateMode::Stateless,
-            sim_steps(&[second_reply()]),
-            64,
-        );
+        let (server, provider) =
+            sim_provider(deepseek, StateMode::Stateless, sim_steps(&[second_reply()]));
         let (tools, conv) = (tools(), base_conversation());
         let mut req = request(&conv, &tools, None);
         req.reasoning = effort;
@@ -94,7 +88,6 @@ async fn own_output_items_are_echoed_back_verbatim() {
         true,
         StateMode::Stateless,
         sim_steps(&[first_reply(), second_reply()]),
-        64,
     );
     let (tools, conv0) = (tools(), base_conversation());
     let first = provider
@@ -130,12 +123,8 @@ async fn own_output_items_are_echoed_back_verbatim() {
 
 #[tokio::test]
 async fn standard_stateless_asks_for_encrypted_reasoning_and_keeps_the_developer_role() {
-    let (server, provider) = sim_provider(
-        false,
-        StateMode::Stateless,
-        sim_steps(&[second_reply()]),
-        64,
-    );
+    let (server, provider) =
+        sim_provider(false, StateMode::Stateless, sim_steps(&[second_reply()]));
     let (tools, conv) = (tools(), base_conversation());
     provider
         .respond(request(&conv, &tools, None))
@@ -149,7 +138,7 @@ async fn standard_stateless_asks_for_encrypted_reasoning_and_keeps_the_developer
 #[tokio::test]
 async fn server_state_sends_only_the_delta_and_falls_back_when_the_prefix_changes() {
     let replies = [first_reply(), second_reply(), second_reply()];
-    let (server, provider) = sim_provider(false, StateMode::ServerState, sim_steps(&replies), 64);
+    let (server, provider) = sim_provider(false, StateMode::ServerState, sim_steps(&replies));
     let (tools, conv0) = (tools(), base_conversation());
     let first = provider
         .respond(request(&conv0, &tools, None))
@@ -191,18 +180,10 @@ async fn server_state_sends_only_the_delta_and_falls_back_when_the_prefix_change
 
 #[tokio::test]
 async fn a_forgotten_server_state_handle_is_absorbed_with_one_full_resend() {
-    let (_, first_provider) = sim_provider(
-        false,
-        StateMode::ServerState,
-        sim_steps(&[first_reply()]),
-        64,
-    );
-    let (server, provider) = sim_provider(
-        false,
-        StateMode::ServerState,
-        sim_steps(&[second_reply()]),
-        64,
-    );
+    let (_, first_provider) =
+        sim_provider(false, StateMode::ServerState, sim_steps(&[first_reply()]));
+    let (server, provider) =
+        sim_provider(false, StateMode::ServerState, sim_steps(&[second_reply()]));
     let (tools, conv0) = (tools(), base_conversation());
     let first = first_provider
         .respond(request(&conv0, &tools, None))
@@ -227,7 +208,7 @@ async fn a_forgotten_server_state_handle_is_absorbed_with_one_full_resend() {
 async fn forced_tool_choice_follows_capabilities() {
     let (tools, conv) = (tools(), base_conversation());
 
-    let (_, deepseek) = sim_provider(true, StateMode::Stateless, sim_steps(&[second_reply()]), 64);
+    let (_, deepseek) = sim_provider(true, StateMode::Stateless, sim_steps(&[second_reply()]));
     let mut req = request(&conv, &tools, None);
     req.tool_choice = ToolChoice::Required;
     assert_eq!(
@@ -235,8 +216,7 @@ async fn forced_tool_choice_follows_capabilities() {
         LlmError::Unsupported("forced tool choice with reasoning on")
     );
     // With reasoning off DeepSeek takes it.
-    let (server, deepseek) =
-        sim_provider(true, StateMode::Stateless, sim_steps(&[second_reply()]), 64);
+    let (server, deepseek) = sim_provider(true, StateMode::Stateless, sim_steps(&[second_reply()]));
     let mut req = request(&conv, &tools, None);
     req.tool_choice = ToolChoice::Required;
     req.reasoning = ReasoningEffort::Off;
@@ -247,7 +227,6 @@ async fn forced_tool_choice_follows_capabilities() {
         false,
         StateMode::Stateless,
         sim_steps(&[first_reply(), second_reply()]),
-        64,
     );
     let mut req = request(&conv, &tools, None);
     req.tool_choice = ToolChoice::Named("send_message".into());
@@ -280,12 +259,8 @@ impl MediaStore for OneImage {
 
 #[tokio::test]
 async fn images_become_data_urls_on_providers_that_accept_them() {
-    let (server, provider) = sim_provider(
-        false,
-        StateMode::Stateless,
-        sim_steps(&[second_reply()]),
-        64,
-    );
+    let (server, provider) =
+        sim_provider(false, StateMode::Stateless, sim_steps(&[second_reply()]));
     let tools = tools();
     let mut items = base_conversation().items().to_vec();
     items.push(ConvItem::Message(qbot_llm::Message {
@@ -324,7 +299,6 @@ async fn deepseek_takes_images_as_uploaded_files_and_uploads_each_once() {
         true,
         StateMode::Stateless,
         sim_steps(&[second_reply(), second_reply()]),
-        64,
     );
     let tools = tools();
     let mut items = base_conversation().items().to_vec();
@@ -386,7 +360,6 @@ async fn deepseek_reuses_an_upload_by_content_never_by_the_callers_key() {
         true,
         StateMode::Stateless,
         sim_steps(&[second_reply(), second_reply(), second_reply()]),
-        64,
     );
     let tools = tools();
     let with_image = |key: &str| {
@@ -438,7 +411,7 @@ fn http(status: u16, code: &'static str) -> SimStep {
 }
 
 async fn respond_with(steps: Vec<SimStep>) -> Result<qbot_llm::Response, LlmError> {
-    let (_, provider) = sim_provider(true, StateMode::Stateless, steps, 64);
+    let (_, provider) = sim_provider(true, StateMode::Stateless, steps);
     let (tools, conv) = (tools(), base_conversation());
     provider.respond(request(&conv, &tools, None)).await
 }
@@ -518,7 +491,6 @@ async fn non_transient_errors_are_not_retried() {
         true,
         StateMode::Stateless,
         vec![http(401, "invalid_api_key"), second_reply().into()],
-        64,
     );
     let (tools, conv) = (tools(), base_conversation());
     assert_eq!(
@@ -616,48 +588,11 @@ async fn missing_usage_is_typed_not_zero_filled() {
     );
 }
 
-// ----- streaming failures -----
-
-async fn drain(steps: Vec<SimStep>) -> Vec<Result<StreamEvent, LlmError>> {
-    let (_, provider) = sim_provider(true, StateMode::Stateless, steps, 5);
-    let (tools, conv) = (tools(), base_conversation());
-    let stream = provider.stream(request(&conv, &tools, None)).await.unwrap();
-    stream.collect().await
-}
-
-#[tokio::test]
-async fn stream_errors_end_the_stream_without_retrying() {
-    let events = drain(vec![
-        SimStep::StreamError {
-            code: "rate_limit_exceeded",
-        },
-        second_reply().into(),
-    ])
-    .await;
-    assert_eq!(events.len(), 1);
-    assert_eq!(
-        events[0].as_ref().unwrap_err(),
-        &LlmError::RateLimited { retry_after: None }
-    );
-}
-
-#[tokio::test]
-async fn a_stream_cut_before_the_terminal_event_is_interrupted() {
-    let reply = FakeReply::new().text("partial text here");
-    let events = drain(vec![SimStep::CutStream { reply, events: 2 }]).await;
-    assert!(events.len() >= 2);
-    assert!(events[..events.len() - 1].iter().all(Result::is_ok));
-    assert_eq!(
-        events.last().unwrap().as_ref().unwrap_err(),
-        &LlmError::StreamInterrupted
-    );
-}
-
 struct Hang;
 
 #[async_trait]
 impl Transport for Hang {
-    async fn post(&self, _: &str, _: &Value, _: bool) -> Result<HttpResponse, LlmError> {
+    async fn post(&self, _: &str, _: &Value) -> Result<HttpResponse, LlmError> {
         std::future::pending().await
     }
 }
@@ -675,10 +610,6 @@ async fn a_hung_connection_times_out() {
             .unwrap_err(),
         LlmError::Timeout
     );
-    assert!(matches!(
-        provider.stream(request(&conv, &tools, None)).await,
-        Err(LlmError::Timeout)
-    ));
 }
 
 #[test]

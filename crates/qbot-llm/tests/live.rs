@@ -19,13 +19,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use qbot_llm::embedding::{EmbeddingConfig, HttpEmbedder};
 use qbot_llm::responses::{KeySource, ReqwestTransport, ResponsesConfig, ResponsesProvider};
 use qbot_llm::{
     CacheUsage, Content, ConvItem, Conversation, Embedder, FinishReason, LlmError, LoadedMedia,
-    MediaStore, Message, Provider, ReasoningEffort, Request, Response, Role, StreamEvent,
-    ToolChoice, ToolOutput, ToolSpec, ToolStatus, collect,
+    MediaStore, Message, Provider, ReasoningEffort, Request, Response, Role, ToolChoice,
+    ToolOutput, ToolSpec, ToolStatus,
 };
 use serde_json::json;
 
@@ -256,7 +255,7 @@ async fn a_failed_tool_result_is_understood() {
 
 #[tokio::test]
 #[ignore = "calls paid provider APIs"]
-async fn streaming_and_non_streaming_agree_in_shape() {
+async fn parallel_tool_calls_come_back_in_one_turn() {
     let provider = deepseek();
     let tools = weather_tool();
     let conv = Conversation::new(vec![
@@ -266,72 +265,19 @@ async fn streaming_and_non_streaming_agree_in_shape() {
         ),
         msg(Role::User, "Compare the weather in Rome and in Madrid."),
     ]);
-    let whole = provider.respond(request(&conv, &tools)).await.unwrap();
-    report("non-streaming", &whole);
-
-    let mut stream = provider.stream(request(&conv, &tools)).await.unwrap();
-    let (mut started, mut fragments, mut completed) = (Vec::new(), 0, None);
-    while let Some(event) = stream.next().await {
-        match event.unwrap() {
-            StreamEvent::CallStarted { name, .. } => started.push(name),
-            StreamEvent::CallArguments { .. } => fragments += 1,
-            StreamEvent::Completed(r) => completed = Some(*r),
-            StreamEvent::TextDelta(_) | StreamEvent::ReasoningDelta(_) => {}
-        }
-    }
-    let streamed = completed.expect("a completed event");
-    report("streaming", &streamed);
-    eprintln!("[streaming] calls started={started:?} argument fragments={fragments}");
-
-    for r in [&whole, &streamed] {
-        assert_eq!(r.finish, FinishReason::ToolCalls);
-        let mut cities: Vec<String> = r
-            .calls()
-            .map(|c| c.arguments["city"].as_str().unwrap_or("").to_lowercase())
-            .collect();
-        cities.sort();
-        assert!(
-            cities.iter().any(|c| c.contains("madrid"))
-                && cities.iter().any(|c| c.contains("rome")),
-            "{cities:?}"
-        );
-        assert_usage(r);
-    }
-    assert_eq!(
-        started.len(),
-        streamed.calls().count(),
-        "every call in the final response was announced while streaming"
+    let response = provider.respond(request(&conv, &tools)).await.unwrap();
+    report("parallel calls", &response);
+    assert_eq!(response.finish, FinishReason::ToolCalls);
+    let mut cities: Vec<String> = response
+        .calls()
+        .map(|c| c.arguments["city"].as_str().unwrap_or("").to_lowercase())
+        .collect();
+    cities.sort();
+    assert!(
+        cities.iter().any(|c| c.contains("madrid")) && cities.iter().any(|c| c.contains("rome")),
+        "{cities:?}"
     );
-
-    // A plain text answer streams as text deltas that add up to the final text.
-    let conv = Conversation::new(vec![msg(
-        Role::User,
-        "Count from one to ten in English words, separated by spaces.",
-    )]);
-    let mut stream = provider.stream(request(&conv, &[])).await.unwrap();
-    let (mut deltas, mut text, mut completed) = (0, String::new(), None);
-    while let Some(event) = stream.next().await {
-        match event.unwrap() {
-            StreamEvent::TextDelta(d) => {
-                deltas += 1;
-                text.push_str(&d);
-            }
-            StreamEvent::Completed(r) => completed = Some(*r),
-            _ => {}
-        }
-    }
-    let completed = completed.unwrap();
-    eprintln!("[streaming text] deltas={deltas}");
-    assert!(deltas > 1, "the answer arrived in pieces");
-    assert_eq!(text, completed.turn.text());
-    assert!(text.to_lowercase().contains("ten"));
-
-    // `collect` is what the agent uses; it gives the same response.
-    let collected = collect(provider.stream(request(&conv, &[])).await.unwrap())
-        .await
-        .unwrap();
-    assert_eq!(collected.finish, FinishReason::Stop);
-    assert_usage(&collected);
+    assert_usage(&response);
 }
 
 #[tokio::test]
@@ -434,9 +380,8 @@ impl qbot_llm::responses::Transport for CountUploads {
         &self,
         path: &str,
         body: &serde_json::Value,
-        want_stream: bool,
     ) -> Result<qbot_llm::responses::HttpResponse, LlmError> {
-        self.inner.post(path, body, want_stream).await
+        self.inner.post(path, body).await
     }
 
     async fn upload(
@@ -628,18 +573,15 @@ impl qbot_llm::responses::Transport for FailFirst {
         &self,
         path: &str,
         body: &serde_json::Value,
-        want_stream: bool,
     ) -> Result<qbot_llm::responses::HttpResponse, LlmError> {
         if !self.failed.swap(true, Ordering::SeqCst) {
             return Ok(qbot_llm::responses::HttpResponse {
                 status: 503,
                 retry_after: Some(Duration::from_millis(200)),
-                body: qbot_llm::responses::HttpBody::Full(
-                    br#"{"error":{"message":"overloaded"}}"#.to_vec().into(),
-                ),
+                body: br#"{"error":{"message":"overloaded"}}"#.to_vec().into(),
             });
         }
-        self.inner.post(path, body, want_stream).await
+        self.inner.post(path, body).await
     }
 }
 
@@ -647,32 +589,24 @@ impl qbot_llm::responses::Transport for FailFirst {
 #[ignore = "calls paid provider APIs"]
 async fn a_transient_failure_is_retried_and_the_retry_reaches_the_real_provider() {
     let conv = Conversation::new(vec![msg(Role::User, "Say ok.")]);
-    for stream in [false, true] {
-        let endpoint = env_or("QBOT_LIVE_TEXT_ENDPOINT", "https://api.deepseek.com");
-        let inner = ReqwestTransport::new(
-            endpoint,
-            KeySource::Static(secret("text_api_key")),
-            &qbot_llm::net::Route::Direct,
-        )
-        .unwrap();
-        let transport = FailFirst {
-            inner,
-            failed: std::sync::atomic::AtomicBool::new(false),
-        };
-        let mut cfg = ResponsesConfig::deepseek(env_or("QBOT_LIVE_TEXT_MODEL", "deepseek-flash"));
-        cfg.timeout = Some(Duration::from_secs(120));
-        let provider = ResponsesProvider::new(cfg, Arc::new(transport)).unwrap();
-        let response = if stream {
-            collect(provider.stream(request(&conv, &[])).await.unwrap())
-                .await
-                .unwrap()
-        } else {
-            provider.respond(request(&conv, &[])).await.unwrap()
-        };
-        report(if stream { "retry (stream)" } else { "retry" }, &response);
-        assert_eq!(response.finish, FinishReason::Stop);
-        assert_eq!(response.meta.attempts, 2, "one failure, one retry");
-    }
+    let endpoint = env_or("QBOT_LIVE_TEXT_ENDPOINT", "https://api.deepseek.com");
+    let inner = ReqwestTransport::new(
+        endpoint,
+        KeySource::Static(secret("text_api_key")),
+        &qbot_llm::net::Route::Direct,
+    )
+    .unwrap();
+    let transport = FailFirst {
+        inner,
+        failed: std::sync::atomic::AtomicBool::new(false),
+    };
+    let mut cfg = ResponsesConfig::deepseek(env_or("QBOT_LIVE_TEXT_MODEL", "deepseek-flash"));
+    cfg.timeout = Some(Duration::from_secs(120));
+    let provider = ResponsesProvider::new(cfg, Arc::new(transport)).unwrap();
+    let response = provider.respond(request(&conv, &[])).await.unwrap();
+    report("retry", &response);
+    assert_eq!(response.finish, FinishReason::Stop);
+    assert_eq!(response.meta.attempts, 2, "one failure, one retry");
 }
 
 fn tavily_with(key: String) -> qbot_llm::search::TavilySearch {

@@ -1,6 +1,5 @@
 use qbot_core::CallId;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use serde::Serialize;
 
 use crate::chat::ChatBatch;
 use crate::error::ProjectError;
@@ -17,34 +16,10 @@ pub enum ViewItem {
     ToolResult(ToolResult),
 }
 
-/// Stable identity of a view, recorded with each model request.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ViewDigest(String);
-
-impl ViewDigest {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 /// Exactly what the model is shown, before provider serialization.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct View {
     pub items: Vec<ViewItem>,
-}
-
-impl View {
-    pub fn digest(&self) -> ViewDigest {
-        // `serde_json` writes struct fields in declaration order and JSON object keys in sorted
-        // order (no `preserve_order` feature), so equal views give equal bytes.
-        let bytes = serde_json::to_vec(self).unwrap_or_default();
-        let hash = Sha256::digest(&bytes);
-        let mut hex = String::with_capacity(hash.len() * 2);
-        for byte in hash {
-            hex.push_str(&format!("{byte:02x}"));
-        }
-        ViewDigest(hex)
-    }
 }
 
 /// Derive the model's view. Calls are emitted with their results immediately after, in call

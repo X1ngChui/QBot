@@ -49,7 +49,6 @@ pub(crate) fn build_body(
     info: &ProviderInfo,
     request: &Request<'_>,
     plan: &ReplayPlan,
-    stream: bool,
     images: &HashMap<String, ImageSource>,
 ) -> Result<Value, LlmError> {
     let caps = &info.capabilities;
@@ -82,7 +81,7 @@ pub(crate) fn build_body(
     let mut body = json!({
         "model": cfg.model,
         "input": input,
-        "stream": stream,
+        "stream": false,
         "store": cfg.state == StateMode::ServerState,
         "parallel_tool_calls": request.parallel_tool_calls,
     });

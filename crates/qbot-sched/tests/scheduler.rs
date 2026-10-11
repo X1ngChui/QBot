@@ -372,6 +372,33 @@ async fn shutting_down_cancels_a_running_task_and_records_it() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn shutting_down_drops_a_running_job_which_the_next_start_queues_again() {
+    let r = rig(vec![], 4);
+    *r.jobs.hold.lock().unwrap() = Duration::from_secs(3600);
+    let id = r
+        .store
+        .insert_job(r.clock_now(), JobKind::Nightly, None)
+        .await
+        .unwrap()
+        .id;
+    let handle = r.start();
+    sleep(SETTLE).await;
+    assert!(matches!(r.state(id).await, TimerState::Claimed { .. }));
+
+    r.shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("the loop stops without waiting for the job")
+        .unwrap();
+    assert!(
+        matches!(r.state(id).await, TimerState::Claimed { .. }),
+        "the claim stays: neither done nor failed"
+    );
+    r.store.recover().await.unwrap();
+    assert_eq!(r.state(id).await, TimerState::Pending);
+}
+
+#[tokio::test(start_paused = true)]
 async fn addressed_runs_and_tasks_share_one_capacity() {
     let r = rig(vec![hold(100_000_000)], 1);
     r.world.say(1, 1, "hi");

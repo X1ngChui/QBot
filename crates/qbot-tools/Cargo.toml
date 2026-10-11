@@ -16,14 +16,12 @@ qbot-llm.workspace = true
 async-trait.workspace = true
 schemars.workspace = true
 serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
 jiff.workspace = true
-tokio.workspace = true
 url.workspace = true
 winnow.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
 tokio-util.workspace = true
 

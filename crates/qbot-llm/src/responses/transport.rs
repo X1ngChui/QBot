@@ -2,38 +2,19 @@
 //! tests use a simulator, so the adapter's wire handling runs without a network.
 
 use crate::net::{Route, client_builder};
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::{Stream, StreamExt};
 
 use crate::error::LlmError;
-
-pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, LlmError>> + Send>>;
-
-pub enum HttpBody {
-    Full(Bytes),
-    Stream(ByteStream),
-}
-
-impl std::fmt::Debug for HttpBody {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            HttpBody::Full(bytes) => write!(f, "Full({} bytes)", bytes.len()),
-            HttpBody::Stream(_) => write!(f, "Stream"),
-        }
-    }
-}
 
 #[derive(Debug)]
 pub struct HttpResponse {
     pub status: u16,
     pub retry_after: Option<Duration>,
-    /// Successful streaming requests yield `Stream`; everything else is `Full`.
-    pub body: HttpBody,
+    pub body: Bytes,
 }
 
 /// A file sent as `multipart/form-data`, with plain form fields beside it.
@@ -47,12 +28,7 @@ pub struct Upload {
 
 #[async_trait]
 pub trait Transport: Send + Sync {
-    async fn post(
-        &self,
-        path: &str,
-        body: &serde_json::Value,
-        want_stream: bool,
-    ) -> Result<HttpResponse, LlmError>;
+    async fn post(&self, path: &str, body: &serde_json::Value) -> Result<HttpResponse, LlmError>;
 
     /// POST a file. Only adapters whose vendor takes uploads call this.
     async fn upload(&self, path: &str, upload: &Upload) -> Result<HttpResponse, LlmError> {
@@ -149,23 +125,13 @@ pub(crate) fn parse_retry_after(value: &str) -> Option<Duration> {
 
 #[async_trait]
 impl Transport for ReqwestTransport {
-    async fn post(
-        &self,
-        path: &str,
-        body: &serde_json::Value,
-        want_stream: bool,
-    ) -> Result<HttpResponse, LlmError> {
+    async fn post(&self, path: &str, body: &serde_json::Value) -> Result<HttpResponse, LlmError> {
         let key = self.key.resolve()?;
-        let accept = if want_stream {
-            "text/event-stream"
-        } else {
-            "application/json"
-        };
         let response = self
             .client
             .post(format!("{}{path}", self.base_url))
             .bearer_auth(key)
-            .header("accept", accept)
+            .header("accept", "application/json")
             .json(body)
             .send()
             .await
@@ -176,21 +142,11 @@ impl Transport for ReqwestTransport {
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
             .and_then(parse_retry_after);
-        if want_stream && status.is_success() {
-            let stream = response
-                .bytes_stream()
-                .map(|chunk| chunk.map_err(|e| map_reqwest(&e)));
-            return Ok(HttpResponse {
-                status: status.as_u16(),
-                retry_after,
-                body: HttpBody::Stream(Box::pin(stream)),
-            });
-        }
         let bytes = response.bytes().await.map_err(|e| map_reqwest(&e))?;
         Ok(HttpResponse {
             status: status.as_u16(),
             retry_after,
-            body: HttpBody::Full(bytes),
+            body: bytes,
         })
     }
     async fn upload(&self, path: &str, upload: &Upload) -> Result<HttpResponse, LlmError> {
@@ -221,7 +177,7 @@ impl Transport for ReqwestTransport {
         Ok(HttpResponse {
             status: status.as_u16(),
             retry_after,
-            body: HttpBody::Full(bytes),
+            body: bytes,
         })
     }
 }

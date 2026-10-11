@@ -19,8 +19,8 @@ R3. Speak only when caused: an @ of the bot, a nickname as a whole word, a quote
 bot's lines, or a due group task. A muted group gets nothing; a blocked member cannot start a
 reply but stays in context.
 R4. Reply through tools: the model decides whether to speak, whom to mention and what to quote.
-R5. Tools: send, stay silent, archive search, episode recall and reading, member lookup, web
-search and page reading, opening pictures, and the group's scheduled tasks.
+R5. Tools: send, stay silent, archive search, episode recall and reading, web search and page
+reading, opening pictures, and the group's scheduled tasks.
 R6. Group-scoped memory learned from chat: episodes with embeddings, names, facts about members
 and group knowledge, each grounded in verbatim quotes, with confidence that fades. Notes written
 by hand are a separate store with their own commands.
@@ -33,8 +33,8 @@ R10. Group tasks: durable one-shot timers owned by the group, bounded, never run
 the agent with fresh context.
 R11. Operations: nightly extraction, embedding, fact decay, verified backups, cleanup, a daily
 report to the owners, and single-instance exclusivity.
-R12. Observability: calls, tokens, cache hits and latency are counted. Nothing refuses work on
-cost.
+R12. Observability: calls, tokens, cache hits and latency are counted; a run that fails logs
+why (`/logs`). Nothing refuses work on cost.
 R13. Localization: member-facing text comes from message catalogs.
 
 ## 2. Principles
@@ -84,8 +84,11 @@ qbot-eval      reply-quality evaluation against the real model (run by hand)
 ```
 
 `qbot-core` and `qbot-context` do no IO. A port (a trait such as `Archive`, `Delivery`,
-`EpisodeStore`, `TimerStore`) is defined by the crate that needs it and implemented by
-`qbot-store` or `qbot-gateway`, so dependencies point at the domain, not at Postgres.
+`EpisodeStore`, `TimerStore`) is defined by the crate that needs it, so the agent runtime, the
+scheduler and memory depend on no database or platform. Its Postgres adapter lives in
+`qbot-store` when the port belongs to one of those core crates; a port of an outer crate
+(`qbot-prompt`, `qbot-gateway`, `qbot-media`, `qbot-commands`, `qbot-ops`) is implemented over
+`qbot-store`'s types next to the port, in that crate. Platform adapters are in `qbot-gateway`.
 
 ## 4. The message path
 
@@ -190,20 +193,23 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
     means no @ of the bot, no nickname, no quote of a bot line and not a command; a message to
     another member (`@B ...`) counts. On a hit, a run starts after the group's media in flight
     is described. It has no initiator and no triggering message, and its note says so: nobody
-    is waiting for an answer, and `stay_silent` is the usual outcome. At most one spontaneous
-    run per group at a time, so a lively chat cannot start several that talk over each other.
-    That rule is for spontaneous runs only: addressed and scheduled runs start and overlap as
-    always, also while a spontaneous run is under way.
+    is waiting for an answer, and `stay_silent` is the usual outcome. The supervisor admits at
+    most one spontaneous run per group at a time, so a lively chat cannot start several that
+    talk over each other. That rule is for spontaneous runs only: addressed and scheduled runs
+    start and overlap as always, also while a spontaneous run is under way.
 - **Supervisor.** Every trigger becomes its own run with its own deadline; runs of one group may
   overlap. Admission gates, in order: muted group, then a blocked member (the initiator of an
   addressed run; for a spontaneous run, the author of the line that rolled it, since a blocked
-  member's message never starts a run of any kind), then capacity. One bounded queue serves all
+  member's message never starts a run of any kind), then for a spontaneous run another one of
+  the group still under way, then capacity. All admission policy is here; the gateway only
+  decides that a message triggers or rolls a run. One bounded queue serves all
   runs; `replies.concurrency` runs call the model at once; queue time counts against
   `replies.deadline_secs`.
 - **Run loop.** Project, call the model, append, execute the calls, append the results, then the
   chat that arrived. A turn with no tool call ends the run, except as below. The run also ends on
   a tool that ends it (`send_message` by default, `stay_silent`), the deadline, `max_turns`, or a
-  model error.
+  model error. A run that ends on a model or environment error (the archive, the run log, an
+  opened context) logs the cause as a warning; its record keeps the end and the error class.
 - **Speaking.** Only `send_message` reaches the group: `{text, end_turn?}` in the chat's own
   marker syntax (`[reply:ID]` first, `[at:N]`, `[face:N]`; `[dice]`, `[rps]`, `[contact:N]`
   alone, never a game result), parsed strictly with an explanation for every mistake. It waits for the echo, so the
@@ -328,7 +334,7 @@ the `media_ref` row the platform reference came in.
   position, counting filled markers, so slots survive out-of-order completion. Each message is
   worked on once, when it is first archived: the archive's dedup gate admits no second pass.
   Work is in memory only; media the service could not take (overload, the per-group rate, a
-  failed call, a restart) stays a bare marker, and `open_images` still reaches it.
+  failed call, a shutdown or restart) stays a bare marker, and `open_images` still reaches it.
 - **Pictures.** On arrival the bytes are always fetched (the message's link, then a fresh copy
   from `get_image`), within a size bound (untrusted input). The description is looked up by
   `fingerprint:sha256(bytes)`, where the fingerprint names the describer (provider, model and
@@ -369,7 +375,8 @@ the `media_ref` row the platform reference came in.
 - One `timer` table. A `wake` is a group task: at most once, never replayed (a claim open at
   startup is marked interrupted). A `job` (extract, nightly, decay, backup, cleanup, report) is
   idempotent: claimed with a lease renewed while it runs, retried with backoff, failed for good
-  after five attempts, each failure logged.
+  after five attempts, each failure logged. A job running at shutdown is dropped with its claim
+  in place, and startup queues it again.
 - **Group tasks** are created by the model or an owner, owned by the group, and bounded where a
   model could otherwise loop: at least five minutes ahead, at most 50 pending per group, follow-up
   chains at most 24 deep. Update and cancel apply to pending tasks only.
@@ -383,9 +390,11 @@ the `media_ref` row the platform reference came in.
 
 ## 11. Providers (`qbot-llm`)
 
-- One `Provider` trait (`respond`, `stream`). A request carries the complete logical conversation
-  (lowered from the transcript view through a renderer), the tools, the tool choice, the
-  reasoning effort and an optional continuation.
+- One `Provider` trait with one method, `respond`. A request carries the complete logical
+  conversation (lowered from the transcript view through a renderer), the tools, the tool choice,
+  the reasoning effort and an optional continuation; the answer is one whole turn. Nothing is
+  streamed: every consumer (sending a message, running tools, storing an episode, a picture's
+  description) needs the complete turn, and no person watches it being written.
 - **Continuation is opaque.** A stateful provider sends only the new tail after verifying the
   covered prefix is unchanged; a stateless one replays everything. DeepSeek is stateless; an
   OpenAI-style provider continues from its stored previous response.
@@ -399,7 +408,7 @@ the `media_ref` row the platform reference came in.
   deadline; other calls by a per-call deadline (ten minutes for text, two for a picture).
 - **Errors** are one taxonomy (`Auth`, `RateLimited`, `Unavailable`, `Timeout`, `ContextTooLong`,
   `QuotaExhausted`, `Protocol`, ...). Retries live in the adapter: bounded, transient failures
-  only, before any body arrives, honoring Retry-After. A used-up plan (HTTP 402, Tavily 432/433)
+  only (a connection error, a status that says to try again), honoring Retry-After. A used-up plan (HTTP 402, Tavily 432/433)
   is `QuotaExhausted` and never retried.
 - **Embeddings**: an OpenAI-compatible endpoint, split into requests of `max_batch` inputs,
   vectors normalized and checked for width.
@@ -542,6 +551,11 @@ spend.
   verified by listing before an atomic rename, rotation after success, the tools checked at
   startup.
 - **The daily report** to the owners is a set of typed messages, so it follows the locale.
+- **Stopping** (SIGTERM, as `docker stop` sends) ends input first, then cancels the runs in
+  flight (recorded as cancelled, open calls interrupted) before anything that might wait on one,
+  lets commands finish, drops media work (its markers stay bare) and running jobs (queued again
+  at the next start), writes the usage records, and releases the lease. Nothing waits out a
+  model call, so the container stops within its grace period.
 - **Usage**: `usage_event` rows per model and tool call of a reply run, with daily views; `/stats`,
   `/top` and the report read them. Nothing reads them to refuse work.
 

@@ -1,12 +1,14 @@
 //! Admission and lifetime of runs.
 //!
 //! Every eligible trigger becomes its own independent run; runs of one group may overlap. The
-//! supervisor decides *before a run exists* whether a trigger is allowed (mute, block), bounds
-//! the number of active-plus-waiting runs, bounds how many call the model at once, and gives
-//! each run one end-to-end deadline that queue time counts against.
+//! supervisor decides *before a run exists* whether a trigger is allowed (mute, block, one
+//! spontaneous run per group), bounds the number of active-plus-waiting runs, bounds how many
+//! call the model at once, and gives each run one end-to-end deadline that queue time counts
+//! against.
 
-use std::sync::Arc;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use qbot_context::{RunEnd, Transcript};
@@ -42,6 +44,8 @@ pub enum Rejected {
     /// The triggering member is blocked. No run, transcript or model call is created.
     Blocked,
     Overloaded,
+    /// A spontaneous run of the group is under way; it does not get a second one.
+    SpontaneousUnderWay,
     ShuttingDown,
     Environment(EnvError),
 }
@@ -69,6 +73,24 @@ struct Inner {
     cancel: CancellationToken,
     tasks: TaskTracker,
     freed: Notify,
+    /// Groups with a spontaneous run admitted and not finished.
+    spontaneous: Mutex<HashSet<GroupId>>,
+}
+
+/// A group's one spontaneous run, held from admission until the run ends.
+struct SpontaneousClaim {
+    inner: Arc<Inner>,
+    group: GroupId,
+}
+
+impl Drop for SpontaneousClaim {
+    fn drop(&mut self) {
+        self.inner
+            .spontaneous
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.group);
+    }
 }
 
 /// A claimed unit of capacity. Timers reserve one *before* claiming a due row, so a claimed
@@ -120,6 +142,7 @@ impl Supervisor {
                 cancel: CancellationToken::new(),
                 tasks: TaskTracker::new(),
                 freed: Notify::new(),
+                spontaneous: Mutex::default(),
             }),
         }
     }
@@ -151,17 +174,24 @@ impl Supervisor {
     pub async fn submit(&self, request: TriggerRequest) -> Result<RunHandle, Rejected> {
         self.check_gates(&request).await?;
         let reservation = self.reserve().ok_or(Rejected::Overloaded)?;
-        self.start(reservation, request).await
+        self.start(reservation, request, None).await
     }
 
-    /// Start a spontaneous run, considered because `observed` wrote a line that addressed no
-    /// one. `observed` is not the run's initiator and the run is not about their line; it only
-    /// decides admission: a blocked member's message never starts a run, of any kind.
+    /// Start a spontaneous run, considered because `observed` wrote a line that did not trigger
+    /// the bot. `observed` is not the run's initiator and the run is not about their line; it
+    /// only decides admission: a blocked member's message never starts a run, of any kind. A
+    /// group has at most one spontaneous run at a time, or a lively chat would start several
+    /// that talk over each other; other runs are not held back by it, nor it by them.
     pub async fn submit_spontaneous(
         &self,
         group: GroupId,
         observed: AccountId,
     ) -> Result<RunHandle, Rejected> {
+        let request = TriggerRequest {
+            group,
+            trigger: Trigger::Spontaneous,
+        };
+        self.check_gates(&request).await?;
         if self
             .inner
             .policy
@@ -171,11 +201,21 @@ impl Supervisor {
         {
             return Err(Rejected::Blocked);
         }
-        self.submit(TriggerRequest {
+        if !self
+            .inner
+            .spontaneous
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(group)
+        {
+            return Err(Rejected::SpontaneousUnderWay);
+        }
+        let claim = SpontaneousClaim {
+            inner: Arc::clone(&self.inner),
             group,
-            trigger: Trigger::Spontaneous,
-        })
-        .await
+        };
+        let reservation = self.reserve().ok_or(Rejected::Overloaded)?;
+        self.start(reservation, request, Some(claim)).await
     }
 
     /// Start a run on capacity reserved earlier (timers). Gates still apply; a rejection
@@ -186,7 +226,7 @@ impl Supervisor {
         request: TriggerRequest,
     ) -> Result<RunHandle, Rejected> {
         self.check_gates(&request).await?;
-        self.start(reservation, request).await
+        self.start(reservation, request, None).await
     }
 
     /// Cancel every run and wait for them to finish. Unfinished tool calls are recorded as
@@ -220,10 +260,12 @@ impl Supervisor {
         Ok(())
     }
 
+    /// Record the run and spawn it. `claim` is held until the run ends.
     async fn start(
         &self,
         reservation: Reservation,
         request: TriggerRequest,
+        claim: Option<SpontaneousClaim>,
     ) -> Result<RunHandle, Rejected> {
         let inner = Arc::clone(&self.inner);
         let finished = Arc::clone(&self.inner);
@@ -239,6 +281,7 @@ impl Supervisor {
         let (tx, rx) = oneshot::channel();
         let task = async move {
             let report = drive(&inner, run, request, deadline).await;
+            drop(claim);
             drop(reservation);
             finished.freed.notify_one();
             let _ = tx.send(report);
@@ -263,7 +306,15 @@ async fn drive(inner: &Inner, run: RunId, request: TriggerRequest, deadline: Ins
     }
     let context = match inner.source.open(request.group, &request.trigger).await {
         Ok(context) => context,
-        Err(_) => return finish_unstarted(inner, run, request.group, RunEnd::Environment).await,
+        Err(error) => {
+            tracing::warn!(
+                group = request.group.get(),
+                run = run.get(),
+                %error,
+                "run ended: its context could not be opened"
+            );
+            return finish_unstarted(inner, run, request.group, RunEnd::Environment).await;
+        }
     };
     let input = RunInput {
         run,
@@ -287,7 +338,10 @@ async fn finish_unstarted(inner: &Inner, run: RunId, group: GroupId, end: RunEnd
     };
     let end = match inner.deps.log.finish(group, run, &summary).await {
         Ok(()) => end,
-        Err(_) => RunEnd::Environment,
+        Err(error) => {
+            tracing::warn!(group = group.get(), run = run.get(), %error, "a run's end could not be recorded");
+            RunEnd::Environment
+        }
     };
     unstarted(run, group, end)
 }

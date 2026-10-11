@@ -8,6 +8,7 @@ use futures_util::future::join_all;
 use qbot_core::{GroupId, MessageId};
 use sha2::{Digest, Sha256};
 use tokio::sync::{Semaphore, watch};
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::clean::{clean_description, sniff_mime};
@@ -107,6 +108,8 @@ struct Inner {
 pub struct MediaService {
     inner: Arc<Inner>,
     tasks: TaskTracker,
+    /// Abandons the work in flight on shutdown.
+    stop: CancellationToken,
 }
 
 impl std::fmt::Debug for MediaService {
@@ -383,6 +386,7 @@ impl MediaService {
                 closed: AtomicBool::new(false),
             }),
             tasks: TaskTracker::new(),
+            stop: CancellationToken::new(),
         }
     }
 
@@ -431,7 +435,7 @@ impl MediaService {
                 .insert(key, done_rx);
             done_tx
         });
-        let inner = Arc::clone(inner);
+        let (inner, stop) = (Arc::clone(inner), self.stop.clone());
         self.tasks.spawn(async move {
             let process = |items: Vec<MediaItem>| {
                 let job = MediaJob {
@@ -442,16 +446,25 @@ impl MediaService {
                 let inner = Arc::clone(&inner);
                 async move { join_all(job.items.iter().map(|item| inner.process(&job, item))).await }
             };
-            process(posted).await;
-            if let Some(done) = done {
-                inner
-                    .pending
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .remove(&key);
-                let _ = done.send(true);
+            let work = async {
+                process(posted).await;
+                if let Some(done) = done {
+                    inner
+                        .pending
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .remove(&key);
+                    let _ = done.send(true);
+                }
+                process(forwarded).await;
+            };
+            // Abandoned work leaves its markers bare, as after a restart.
+            tokio::select! {
+                () = stop.cancelled() => {
+                    inner.pending.lock().unwrap_or_else(PoisonError::into_inner).remove(&key);
+                }
+                () = work => {}
             }
-            process(forwarded).await;
             inner.in_flight.fetch_sub(1, Ordering::SeqCst);
         });
         Admission::Started
@@ -490,9 +503,11 @@ impl MediaService {
         tokio::time::timeout(timeout, all).await.is_ok()
     }
 
-    /// Stop accepting work and let what is in flight finish.
+    /// Stop accepting work and abandon what is in flight: its markers stay bare, as media the
+    /// service could not take always does. Waiting could take a vision call's whole deadline.
     pub async fn shutdown(&self) {
         self.inner.closed.store(true, Ordering::SeqCst);
+        self.stop.cancel();
         self.tasks.close();
         self.tasks.wait().await;
     }

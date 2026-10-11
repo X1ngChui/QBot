@@ -8,18 +8,18 @@ use crate::error::LlmError;
 
 use super::RetryPolicy;
 use super::parse::http_error;
-use super::transport::{HttpBody, HttpResponse, Transport, Upload};
+use super::transport::{HttpResponse, Transport, Upload};
 
-/// POST with bounded retries for transient failures that happen before any body arrives.
+/// POST with bounded retries for transient failures: connection errors and the HTTP statuses
+/// that say to try again.
 /// Returns the successful response and the number of attempts it took.
 pub async fn post_with_retry(
     transport: &dyn Transport,
     policy: &RetryPolicy,
     path: &str,
     body: &Value,
-    want_stream: bool,
 ) -> Result<(HttpResponse, u32), LlmError> {
-    with_retry(policy, || transport.post(path, body, want_stream)).await
+    with_retry(policy, || transport.post(path, body)).await
 }
 
 /// Upload a file with the same retry rules as [`post_with_retry`].
@@ -48,13 +48,7 @@ where
             Ok(response) if (200..300).contains(&response.status) => {
                 return Ok((response, attempt));
             }
-            Ok(response) => {
-                let bytes = match response.body {
-                    HttpBody::Full(bytes) => bytes,
-                    HttpBody::Stream(_) => bytes::Bytes::new(),
-                };
-                http_error(response.status, &bytes, response.retry_after)
-            }
+            Ok(response) => http_error(response.status, &response.body, response.retry_after),
             Err(error) => error,
         };
         if error.is_transient() && attempt < max_attempts {

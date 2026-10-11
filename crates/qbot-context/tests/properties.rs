@@ -104,10 +104,7 @@ proptest! {
         let json = serde_json::to_string(&t).unwrap();
         let back: Transcript = serde_json::from_str(&json).unwrap();
         prop_assert_eq!(&back, &t);
-        prop_assert_eq!(
-            project(&back).unwrap().digest(),
-            project(&t).unwrap().digest()
-        );
+        prop_assert_eq!(project(&back).unwrap(), project(&t).unwrap());
     }
 
     #[test]

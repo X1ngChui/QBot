@@ -17,5 +17,5 @@ pub use item::{
     NativeReplay, OpaqueReasoning, Outcome, Part, RefusalReason, RunEnd, Summary, ToolCall,
     ToolResult,
 };
-pub use project::{View, ViewDigest, ViewItem, project};
+pub use project::{View, ViewItem, project};
 pub use transcript::Transcript;

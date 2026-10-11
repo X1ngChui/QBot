@@ -12,7 +12,7 @@ use qbot_agent::{
 };
 use qbot_core::{AccountId, GroupId, MessageId, SystemClock};
 use qbot_llm::fake::{FakeProvider, FakeReply, Step};
-use qbot_llm::{EventStream, LlmError, Provider, ProviderInfo, ReasoningEffort, Request, Response};
+use qbot_llm::{LlmError, Provider, ProviderInfo, ReasoningEffort, Request, Response};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
@@ -276,9 +276,6 @@ impl Provider for Hang {
         &self.0
     }
     async fn respond(&self, _: Request<'_>) -> Result<Response, LlmError> {
-        std::future::pending().await
-    }
-    async fn stream(&self, _: Request<'_>) -> Result<EventStream, LlmError> {
         std::future::pending().await
     }
 }

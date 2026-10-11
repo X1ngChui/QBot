@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 
 use super::hash_embed;
 use crate::error::LlmError;
-use crate::responses::{HttpBody, HttpResponse, Transport};
+use crate::responses::{HttpResponse, Transport};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Corruption {
@@ -81,20 +81,13 @@ fn error(status: u16, retry_after: Option<std::time::Duration>, message: &str) -
     HttpResponse {
         status,
         retry_after,
-        body: HttpBody::Full(Bytes::from(
-            json!({ "error": { "message": message } }).to_string(),
-        )),
+        body: Bytes::from(json!({ "error": { "message": message } }).to_string()),
     }
 }
 
 #[async_trait]
 impl Transport for SimEmbeddingServer {
-    async fn post(
-        &self,
-        path: &str,
-        body: &Value,
-        _want_stream: bool,
-    ) -> Result<HttpResponse, LlmError> {
+    async fn post(&self, path: &str, body: &Value) -> Result<HttpResponse, LlmError> {
         let mut inner = self.lock();
         inner.requests.push(body.clone());
         if path != "/embeddings" {
@@ -147,7 +140,7 @@ impl Transport for SimEmbeddingServer {
         Ok(HttpResponse {
             status: 200,
             retry_after: None,
-            body: HttpBody::Full(Bytes::from(answer.to_string())),
+            body: Bytes::from(answer.to_string()),
         })
     }
 }

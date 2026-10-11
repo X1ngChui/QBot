@@ -10,7 +10,6 @@ mod adapter;
 mod parse;
 mod retry;
 pub mod sim;
-mod stream;
 mod transport;
 mod wire;
 
@@ -18,9 +17,7 @@ use std::time::Duration;
 
 pub use adapter::ResponsesProvider;
 pub use retry::post_with_retry;
-pub use transport::{
-    ByteStream, HttpBody, HttpResponse, KeyResolver, KeySource, ReqwestTransport, Transport, Upload,
-};
+pub use transport::{HttpResponse, KeyResolver, KeySource, ReqwestTransport, Transport, Upload};
 
 /// Vendor dialect differences the wire layer handles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

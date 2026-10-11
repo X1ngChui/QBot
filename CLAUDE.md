@@ -70,8 +70,11 @@ paid API. Build the image with `docker build -f deploy/Dockerfile .`; deployment
 - **Durable work:** one `timer` table in `qbot-sched`: group tasks (at most once, interrupted on
   restart, never replayed) and jobs (leased, retried), plus cron schedules fired exactly once per
   occurrence. `qbot-ops` runs the nightly extraction, decay, backup and cleanup, and the report.
-- **Layering:** `qbot-core`/`qbot-context` are pure; a port is defined by the crate that needs it
-  and implemented by `qbot-store` (Postgres) or `qbot-gateway` (OneBot).
+- **Layering:** `qbot-core`/`qbot-context` are pure; a port is defined by the crate that needs it.
+  Ports of the core crates (agent, sched, memory, tools) are implemented by `qbot-store`
+  (Postgres) or `qbot-gateway` (OneBot); an outer crate implements its own port over
+  `qbot-store`'s types beside it. All admission policy (mute, block, capacity, one spontaneous
+  run per group) is in the supervisor.
 
 ## Conventions that bite
 

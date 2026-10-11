@@ -2,7 +2,6 @@ use std::ops::AddAssign;
 use std::time::Duration;
 
 use qbot_context::AssistantTurn;
-use qbot_core::CallId;
 use serde::{Deserialize, Serialize};
 
 use crate::capability::ProviderId;
@@ -143,23 +142,4 @@ impl Response {
     pub fn calls(&self) -> impl Iterator<Item = &qbot_context::ToolCall> {
         self.turn.calls()
     }
-}
-
-/// Incremental output. Deltas are previews for live display; [`StreamEvent::Completed`] is the
-/// authoritative result and is always last. A provider that cannot stream natively emits only
-/// `Completed`.
-#[derive(Debug, Clone, PartialEq)]
-pub enum StreamEvent {
-    TextDelta(String),
-    /// Visible reasoning summary text, where the provider exposes one.
-    ReasoningDelta(String),
-    CallStarted {
-        id: CallId,
-        name: String,
-    },
-    CallArguments {
-        id: CallId,
-        fragment: String,
-    },
-    Completed(Box<Response>),
 }

@@ -10,7 +10,6 @@ use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures_util::stream;
 use qbot_context::{AssistantPart, AssistantTurn, OpaqueReasoning, ToolCall};
 use qbot_core::CallId;
 use serde_json::Value;
@@ -20,11 +19,9 @@ use crate::capability::{
 };
 use crate::conversation::{ConvItem, Conversation};
 use crate::error::LlmError;
-use crate::provider::{EventStream, Provider, ReplayPlan, collect, plan_replay};
+use crate::provider::{Provider, ReplayPlan, plan_replay};
 use crate::request::{Request, ToolChoice, validate_request};
-use crate::response::{
-    CacheUsage, Continuation, FinishReason, Response, ResponseMeta, StreamEvent, Usage,
-};
+use crate::response::{CacheUsage, Continuation, FinishReason, Response, ResponseMeta, Usage};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FakePart {
@@ -93,7 +90,6 @@ pub struct Recorded {
     pub tool_names: Vec<String>,
     pub tool_choice: ToolChoice,
     pub reasoning: crate::ReasoningEffort,
-    pub streamed: bool,
 }
 
 #[derive(Default)]
@@ -129,7 +125,6 @@ impl FakeProvider {
             id: ProviderId::new("fake"),
             model: "fake-model".to_owned(),
             capabilities: Capabilities {
-                streaming: Realization::Native,
                 tool_calls: Realization::Native,
                 parallel_tool_calls: Realization::Native,
                 continuation: Realization::Emulated,
@@ -183,11 +178,7 @@ impl FakeProvider {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn run(
-        &self,
-        request: &Request<'_>,
-        streamed: bool,
-    ) -> Result<(Response, FakeReply), LlmError> {
+    fn run(&self, request: &Request<'_>) -> Result<Response, LlmError> {
         validate_request(&self.info, request)?;
         let conversation = request.conversation;
         let mut inner = self.lock();
@@ -208,7 +199,6 @@ impl FakeProvider {
             tool_names: request.tools.iter().map(|t| t.name.clone()).collect(),
             tool_choice: request.tool_choice.clone(),
             reasoning: request.reasoning,
-            streamed,
         });
         let step = inner
             .script
@@ -306,7 +296,7 @@ impl FakeProvider {
                 attempts: 1,
             },
         };
-        Ok((response, reply))
+        Ok(response)
     }
 }
 
@@ -317,57 +307,8 @@ impl Provider for FakeProvider {
     }
 
     async fn respond(&self, request: Request<'_>) -> Result<Response, LlmError> {
-        self.run(&request, false).map(|(response, _)| response)
+        self.run(&request)
     }
-
-    async fn stream(&self, request: Request<'_>) -> Result<EventStream, LlmError> {
-        let (response, _) = self.run(&request, true)?;
-        let mut events: Vec<Result<StreamEvent, LlmError>> = Vec::new();
-        for part in response.turn.parts() {
-            match part {
-                AssistantPart::Reasoning(r) => {
-                    if let Some(summary) = &r.summary {
-                        events.push(Ok(StreamEvent::ReasoningDelta(summary.clone())));
-                    }
-                }
-                AssistantPart::Text(text) => {
-                    for chunk in chunks(text, 8) {
-                        events.push(Ok(StreamEvent::TextDelta(chunk)));
-                    }
-                }
-                AssistantPart::Call(call) => {
-                    events.push(Ok(StreamEvent::CallStarted {
-                        id: call.id.clone(),
-                        name: call.name.clone(),
-                    }));
-                    for fragment in chunks(&call.arguments.to_string(), 6) {
-                        events.push(Ok(StreamEvent::CallArguments {
-                            id: call.id.clone(),
-                            fragment,
-                        }));
-                    }
-                }
-            }
-        }
-        events.push(Ok(StreamEvent::Completed(Box::new(response))));
-        Ok(Box::pin(stream::iter(events)))
-    }
-}
-
-/// Convenience for tests that do not care about streaming.
-pub async fn respond_streaming(
-    provider: &dyn Provider,
-    request: Request<'_>,
-) -> Result<Response, LlmError> {
-    collect(provider.stream(request).await?).await
-}
-
-fn chunks(text: &str, size: usize) -> Vec<String> {
-    let chars: Vec<char> = text.chars().collect();
-    chars
-        .chunks(size.max(1))
-        .map(|c| c.iter().collect())
-        .collect()
 }
 
 fn turn_json(turn: &AssistantTurn) -> String {

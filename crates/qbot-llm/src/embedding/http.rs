@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use super::{Embedder, EmbedderInfo, Embeddings, normalize};
 use crate::capability::ProviderId;
 use crate::error::LlmError;
-use crate::responses::{HttpBody, RetryPolicy, Transport, post_with_retry};
+use crate::responses::{RetryPolicy, Transport, post_with_retry};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingConfig {
@@ -77,18 +77,9 @@ impl HttpEmbedder {
 
     async fn batch(&self, chunk: &[String]) -> Result<(Vec<Vec<f32>>, Option<u64>, u32), LlmError> {
         let body = json!({ "model": self.cfg.model, "input": chunk, "dimensions": self.cfg.dims });
-        let (response, requests) = post_with_retry(
-            &*self.transport,
-            &self.cfg.retry,
-            "/embeddings",
-            &body,
-            false,
-        )
-        .await?;
-        let HttpBody::Full(bytes) = response.body else {
-            return Err(LlmError::Protocol("expected a full body".into()));
-        };
-        let value: Value = serde_json::from_slice(&bytes)
+        let (response, requests) =
+            post_with_retry(&*self.transport, &self.cfg.retry, "/embeddings", &body).await?;
+        let value: Value = serde_json::from_slice(&response.body)
             .map_err(|e| LlmError::Protocol(format!("response is not JSON: {e}")))?;
         let data = value
             .get("data")

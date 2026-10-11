@@ -22,8 +22,8 @@ use futures_util::{SinkExt, StreamExt};
 use qbot_app::{Options, run};
 use qbot_config::{Layout, MapEnv, load_in};
 use qbot_llm::fake::FakeReply;
+use qbot_llm::responses::Transport;
 use qbot_llm::responses::sim::{SimServer, SimStep};
-use qbot_llm::responses::{HttpBody, Transport};
 use serde_json::{Value, json};
 use sqlx::postgres::PgPoolOptions;
 use tokio::sync::oneshot;
@@ -122,23 +122,12 @@ async fn mock_llm(sim: Arc<SimServer>) -> SocketAddr {
         State(sim): State<Arc<SimServer>>,
         axum::Json(body): axum::Json<Value>,
     ) -> Response {
-        let stream = body.get("stream") == Some(&json!(true));
-        let answer = sim.post("/responses", &body, stream).await.unwrap();
-        let status = StatusCode::from_u16(answer.status).unwrap();
-        match answer.body {
-            HttpBody::Full(bytes) => Response::builder()
-                .status(status)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(bytes))
-                .unwrap(),
-            HttpBody::Stream(chunks) => Response::builder()
-                .status(status)
-                .header(header::CONTENT_TYPE, "text/event-stream")
-                .body(Body::from_stream(
-                    chunks.map(|c| c.map_err(|e| std::io::Error::other(e.to_string()))),
-                ))
-                .unwrap(),
-        }
+        let answer = sim.post("/responses", &body).await.unwrap();
+        Response::builder()
+            .status(StatusCode::from_u16(answer.status).unwrap())
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(answer.body))
+            .unwrap()
     }
     let app = Router::new()
         .route("/responses", post(handle))

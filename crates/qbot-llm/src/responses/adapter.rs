@@ -1,10 +1,9 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use base64::Engine;
-use futures_util::{StreamExt, stream};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -13,17 +12,15 @@ use crate::capability::{
 };
 use crate::conversation::Conversation;
 use crate::error::LlmError;
-use crate::provider::{EventStream, Provider, ReplayPlan, plan_replay};
+use crate::provider::{Provider, ReplayPlan, plan_replay};
 use crate::request::{Request, validate_request};
-use crate::response::{Continuation, Response, ResponseMeta, StreamEvent};
+use crate::response::{Continuation, Response, ResponseMeta};
 
 use super::parse::{Parsed, STATE_LOST, parse_response};
 use super::retry::{post_with_retry, upload_with_retry};
-use super::stream::{Folded, StreamFolder};
-use super::transport::{ByteStream, HttpBody, HttpResponse, Transport, Upload};
+use super::transport::{HttpResponse, Transport, Upload};
 use super::wire::{ImageSource, build_body, image_keys};
 use super::{Flavor, ResponsesConfig, StateMode};
-use eventsource_stream::{EventStream as SseStream, EventStreamError, Eventsource};
 
 pub struct ResponsesProvider {
     info: ProviderInfo,
@@ -58,7 +55,6 @@ impl ResponsesProvider {
         }
         let deepseek = cfg.flavor == Flavor::DeepSeek;
         let capabilities = Capabilities {
-            streaming: Realization::Native,
             tool_calls: Realization::Native,
             parallel_tool_calls: Realization::Native,
             continuation: if cfg.state == StateMode::ServerState {
@@ -154,10 +150,7 @@ impl ResponsesProvider {
         };
         let (response, _) =
             upload_with_retry(&*self.transport, &self.cfg.retry, "/files", &upload).await?;
-        let HttpBody::Full(bytes) = response.body else {
-            return Err(LlmError::Protocol("expected a full body".into()));
-        };
-        let value: serde_json::Value = serde_json::from_slice(&bytes)
+        let value: serde_json::Value = serde_json::from_slice(&response.body)
             .map_err(|e| LlmError::Protocol(format!("upload response is not JSON: {e}")))?;
         value
             .get("id")
@@ -168,26 +161,14 @@ impl ResponsesProvider {
     }
 
     /// Plan, build and send. If the server has forgotten our state handle, resend in full once.
-    async fn dispatch(
-        &self,
-        request: &Request<'_>,
-        stream: bool,
-    ) -> Result<(HttpResponse, u32), LlmError> {
+    async fn dispatch(&self, request: &Request<'_>) -> Result<(HttpResponse, u32), LlmError> {
         validate_request(&self.info, request)?;
         let mut plan = plan_replay(&self.info, request.conversation, request.continuation);
         let mut attempts_total = 0;
         loop {
             let images = self.load_images(request, &plan).await?;
-            let body = build_body(&self.cfg, &self.info, request, &plan, stream, &images)?;
-            match post_with_retry(
-                &*self.transport,
-                &self.cfg.retry,
-                "/responses",
-                &body,
-                stream,
-            )
-            .await
-            {
+            let body = build_body(&self.cfg, &self.info, request, &plan, &images)?;
+            match post_with_retry(&*self.transport, &self.cfg.retry, "/responses", &body).await {
                 Ok((response, attempts)) => return Ok((response, attempts_total + attempts)),
                 Err(LlmError::InvalidRequest(message))
                     if message == STATE_LOST && matches!(plan, ReplayPlan::Delta { .. }) =>
@@ -248,13 +229,10 @@ impl Provider for ResponsesProvider {
     async fn respond(&self, request: Request<'_>) -> Result<Response, LlmError> {
         let started = Instant::now();
         let call = async {
-            let (response, attempts) = self.dispatch(&request, false).await?;
-            let HttpBody::Full(bytes) = response.body else {
-                return Err(LlmError::Protocol("expected a full body".into()));
-            };
-            let value: Value = serde_json::from_slice(&bytes)
+            let (response, attempts) = self.dispatch(&request).await?;
+            let value: Value = serde_json::from_slice(&response.body)
                 .map_err(|e| LlmError::Protocol(format!("response is not JSON: {e}")))?;
-            let parsed = parse_response(self.info.id.as_str(), &value, None, &self.info.model)?;
+            let parsed = parse_response(self.info.id.as_str(), &value, &self.info.model)?;
             Self::assemble(
                 &self.info,
                 self.cfg.state,
@@ -269,122 +247,6 @@ impl Provider for ResponsesProvider {
                 .await
                 .map_err(|_| LlmError::Timeout)?,
             None => call.await,
-        }
-    }
-
-    async fn stream(&self, request: Request<'_>) -> Result<EventStream, LlmError> {
-        let started = Instant::now();
-        let deadline = self
-            .cfg
-            .timeout
-            .map(|limit| tokio::time::Instant::now() + limit);
-        let dispatch = self.dispatch(&request, true);
-        let (response, attempts) = match deadline {
-            Some(deadline) => tokio::time::timeout_at(deadline, dispatch)
-                .await
-                .map_err(|_| LlmError::Timeout)??,
-            None => dispatch.await?,
-        };
-        let HttpBody::Stream(bytes) = response.body else {
-            return Err(LlmError::Protocol("expected a streaming body".into()));
-        };
-        let state = Pump {
-            events: bytes.eventsource(),
-            folder: StreamFolder::default(),
-            queue: VecDeque::new(),
-            finished: false,
-            deadline,
-            info: self.info.clone(),
-            provider_state: self.cfg.state,
-            conversation: request.conversation.clone(),
-            started,
-            attempts,
-        };
-        Ok(Box::pin(stream::unfold(state, Pump::next)))
-    }
-}
-
-/// Drives one SSE response to its terminal event.
-struct Pump {
-    events: SseStream<ByteStream>,
-    folder: StreamFolder,
-    queue: VecDeque<Result<StreamEvent, LlmError>>,
-    finished: bool,
-    deadline: Option<tokio::time::Instant>,
-    info: ProviderInfo,
-    provider_state: StateMode,
-    conversation: Conversation,
-    started: Instant,
-    attempts: u32,
-}
-
-impl Pump {
-    async fn next(mut self) -> Option<(Result<StreamEvent, LlmError>, Self)> {
-        loop {
-            if let Some(item) = self.queue.pop_front() {
-                if item.is_err() {
-                    self.finished = true;
-                    self.queue.clear();
-                }
-                return Some((item, self));
-            }
-            if self.finished {
-                return None;
-            }
-            let next = match self.deadline {
-                Some(deadline) => tokio::time::timeout_at(deadline, self.events.next())
-                    .await
-                    .map_err(|_| LlmError::Timeout),
-                None => Ok(self.events.next().await),
-            };
-            let event = match next {
-                Err(error) => Err(error),
-                Ok(None) => Err(LlmError::StreamInterrupted),
-                Ok(Some(Err(EventStreamError::Transport(error)))) => Err(error),
-                Ok(Some(Err(other))) => Err(LlmError::Protocol(other.to_string())),
-                Ok(Some(Ok(event))) => Ok(event),
-            };
-            let events = match event {
-                Ok(event) => vec![event],
-                Err(error) => {
-                    self.queue.push_back(Err(error));
-                    continue;
-                }
-            };
-            for event in events {
-                match self.folder.feed(&event.data) {
-                    Ok(Folded::Events(items)) => self.queue.extend(items.into_iter().map(Ok)),
-                    Ok(Folded::Terminal {
-                        response,
-                        status_hint,
-                    }) => {
-                        let result = parse_response(
-                            self.info.id.as_str(),
-                            &response,
-                            Some(status_hint),
-                            &self.info.model,
-                        )
-                        .and_then(|parsed| {
-                            ResponsesProvider::assemble(
-                                &self.info,
-                                self.provider_state,
-                                &self.conversation,
-                                parsed,
-                                self.started,
-                                self.attempts,
-                            )
-                        })
-                        .map(|response| StreamEvent::Completed(Box::new(response)));
-                        self.queue.push_back(result);
-                        self.finished = true;
-                        break;
-                    }
-                    Err(error) => {
-                        self.queue.push_back(Err(error));
-                        break;
-                    }
-                }
-            }
         }
     }
 }

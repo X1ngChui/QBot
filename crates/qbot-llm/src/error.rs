@@ -21,8 +21,6 @@ pub enum LlmError {
     ContextTooLong,
     #[error("response blocked by a content filter")]
     ContentFiltered,
-    #[error("the stream ended before completion")]
-    StreamInterrupted,
     /// The provider answered, but not in a shape the contract allows.
     #[error("malformed provider output: {0}")]
     Protocol(String),
@@ -61,7 +59,6 @@ impl LlmError {
             LlmError::InvalidRequest(_) => "invalid_request",
             LlmError::ContextTooLong => "context_too_long",
             LlmError::ContentFiltered => "content_filtered",
-            LlmError::StreamInterrupted => "stream_interrupted",
             LlmError::Protocol(_) => "protocol",
             LlmError::Unsupported(_) => "unsupported",
             LlmError::InvalidConversation(_) => "invalid_conversation",

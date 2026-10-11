@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use qbot_llm::LlmError;
-use qbot_llm::responses::{HttpBody, HttpResponse, RetryPolicy, Transport};
+use qbot_llm::responses::{HttpResponse, RetryPolicy, Transport};
 use qbot_llm::search::{SearchDepth, TavilyConfig, TavilySearch, WebSearch};
 use serde_json::{Value, json};
 
@@ -27,7 +27,7 @@ impl Scripted {
 
 #[async_trait]
 impl Transport for Scripted {
-    async fn post(&self, path: &str, body: &Value, _: bool) -> Result<HttpResponse, LlmError> {
+    async fn post(&self, path: &str, body: &Value) -> Result<HttpResponse, LlmError> {
         self.sent
             .lock()
             .unwrap()
@@ -41,7 +41,7 @@ impl Transport for Scripted {
         Ok(HttpResponse {
             status,
             retry_after: None,
-            body: HttpBody::Full(serde_json::to_vec(&body).unwrap().into()),
+            body: serde_json::to_vec(&body).unwrap().into(),
         })
     }
 }

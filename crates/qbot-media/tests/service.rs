@@ -265,6 +265,18 @@ async fn finish(rig: &Rig, id: i64) {
     );
 }
 
+/// Wait until line `id` reads `expected`: work no reply waits for (a forwarded record's
+/// pictures) is not covered by `settle`.
+async fn until(rig: &Rig, id: i64, expected: &str) {
+    for _ in 0..500 {
+        if rig.lines.text(id) == expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(rig.lines.text(id), expected);
+}
+
 #[tokio::test]
 async fn a_picture_is_described_cached_and_filled_into_its_line() {
     let r = rig(
@@ -617,16 +629,19 @@ async fn too_much_media_in_flight_is_declined_and_waiting_is_bounded() {
 }
 
 #[tokio::test]
-async fn shutdown_lets_started_work_finish_and_refuses_new_work() {
+async fn shutdown_abandons_started_work_and_refuses_new_work() {
     let r = rig(
         config(),
         Fetcher0::with(&[("a", Ok(b"1".to_vec()))]),
-        Describer0::slow("pic", Duration::from_millis(100)),
+        Describer0::slow("pic", Duration::from_secs(60)),
         &[(1, "[image]"), (2, "[image]")],
     );
     r.service.admit(job(1, vec![image(0, "a")]));
-    r.service.shutdown().await;
-    assert_eq!(r.lines.text(1), "[image:pic]");
+    tokio::time::timeout(Duration::from_secs(5), r.service.shutdown())
+        .await
+        .expect("shutdown does not wait for a slow description");
+    assert_eq!(r.lines.text(1), "[image]", "left bare, as after a restart");
+    assert!(!r.service.busy(group()));
     assert_eq!(
         r.service.admit(job(2, vec![image(0, "a")])),
         Admission::ShuttingDown
@@ -652,12 +667,10 @@ async fn a_picture_inside_a_forwarded_record_only_reads_the_cache() {
     let mut new = image(1, "new");
     new.nested = true;
     r.service.admit(job(2, vec![same, new]));
-    r.service.shutdown().await;
-    assert_eq!(
-        r.lines.text(2),
-        "[image:a red door] [image]",
-        "the picture posted before is recognised by its content; the new one is not paid for"
-    );
+    // The picture posted before is recognised by its content; the new one is not paid for.
+    until(&r, 2, "[image:a red door] [image]").await;
+    // Both pictures are worked on together; give the second its moment to (wrongly) call.
+    tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(r.describer.calls.load(Ordering::SeqCst), 1);
 }
 

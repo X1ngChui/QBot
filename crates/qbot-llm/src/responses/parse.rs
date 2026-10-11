@@ -24,13 +24,11 @@ pub(crate) struct Parsed {
 pub(crate) fn parse_response(
     provider: &str,
     value: &Value,
-    status_hint: Option<&str>,
     fallback_model: &str,
 ) -> Result<Parsed, LlmError> {
     let status = value
         .get("status")
         .and_then(Value::as_str)
-        .or(status_hint)
         .unwrap_or("completed");
     if status == "failed" {
         return Err(error_from_object(value.get("error"), None, None));
@@ -308,10 +306,4 @@ pub(crate) fn http_error(status: u16, body: &[u8], retry_after: Option<Duration>
             retry_after,
         ),
     }
-}
-
-/// Error from an in-stream `error` event (top-level or nested under `error`).
-pub(crate) fn stream_error(event: &Value) -> LlmError {
-    let nested = event.get("error").filter(|e| e.is_object());
-    error_from_object(Some(nested.unwrap_or(event)), None, None)
 }

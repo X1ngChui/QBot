@@ -8,7 +8,7 @@
 //! Layout:
 //! - [`capability`]: what a provider offers, and whether natively or by emulation.
 //! - [`conversation`]: the provider-facing conversation, lowered from a `qbot_context::View`.
-//! - [`request`] and [`response`]: one call in, one normalized result out (or a stream).
+//! - [`request`] and [`response`]: one call in, one normalized result out.
 //! - [`error`]: the single error taxonomy.
 //! - [`provider`]: the trait and the continuation planner shared by all adapters.
 //! - [`fake`]: a scripted provider implementing the whole contract, for offline tests.
@@ -35,10 +35,8 @@ pub use conversation::{
 };
 pub use embedding::{Embedder, EmbedderInfo, Embeddings, FakeEmbedder, HttpEmbedder};
 pub use error::LlmError;
-pub use provider::{EventStream, Provider, ReplayPlan, collect, plan_replay};
+pub use provider::{Provider, ReplayPlan, plan_replay};
 pub use request::{
     LoadedMedia, MediaStore, ReasoningEffort, Request, ToolChoice, ToolSpec, validate_request,
 };
-pub use response::{
-    CacheUsage, Continuation, FinishReason, Response, ResponseMeta, StreamEvent, Usage,
-};
+pub use response::{CacheUsage, Continuation, FinishReason, Response, ResponseMeta, Usage};

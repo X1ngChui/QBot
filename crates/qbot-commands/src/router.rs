@@ -34,7 +34,7 @@ pub struct CommandSettings {
     pub link_ttl: Duration,
     /// How confident a learned fact still is, for /who.
     pub fact_decay: DecayPolicy,
-    /// Most notes one account may have in a group: notes reach the model through member lookups.
+    /// Most notes one account may have in a group: notes are in every run's people block.
     pub notes_per_account: usize,
     /// Rows `/runs` lists.
     pub runs_max_rows: usize,
@@ -43,7 +43,7 @@ pub struct CommandSettings {
 impl CommandSettings {
     /// The settings for `bot`. QQ shows at most 2000 characters in one message; the list sizes
     /// keep a reply to one or two screens; 20 notes per account bound what one member's notes add
-    /// to a reply's context through member lookups.
+    /// to every run's people block.
     pub fn new(
         bot: AccountId,
         owners: BTreeSet<AccountId>,

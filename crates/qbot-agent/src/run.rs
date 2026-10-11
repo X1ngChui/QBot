@@ -19,8 +19,8 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::env::{
-    Archive, ArchiveCursor, EnvError, OpenedContext, RecapWhen, RunLog, RunSummary, Trigger,
-    UsageDetail, UsageEvent, UsageSink,
+    Archive, ArchiveCursor, OpenedContext, RecapWhen, RunLog, RunSummary, Trigger, UsageDetail,
+    UsageEvent, UsageSink,
 };
 use crate::executor::{RunLimits, execute_turn};
 use crate::tool::{ChatView, RunState, ToolCx, ToolSet};
@@ -132,13 +132,8 @@ pub async fn execute(deps: &RunDeps, input: &RunInput, cancel: &CancellationToke
         tool_calls: run.tool_calls,
         sends: run.state.sends(),
     };
-    if deps
-        .log
-        .finish(input.group, input.run, &summary)
-        .await
-        .is_err()
-    {
-        end = RunEnd::Environment;
+    if let Err(error) = deps.log.finish(input.group, input.run, &summary).await {
+        end = run.environment("recording the run's end", &error);
     }
     deps.sink.record(UsageEvent {
         group: input.group,
@@ -283,7 +278,8 @@ impl Run<'_> {
             choice.clone()
         };
         let (answer, latency) = loop {
-            let view = project(&self.transcript).map_err(|_| RunEnd::Environment)?;
+            let view = project(&self.transcript)
+                .map_err(|e| self.environment("projecting the transcript", &e))?;
             let conversation = Conversation::lower(&view, &*self.deps.renderer);
             let request = Request {
                 conversation: &conversation,
@@ -309,6 +305,13 @@ impl Run<'_> {
             Ok(response) => response,
             Err(error) => {
                 self.record_model(&info, None, 0, Some(error.class()), latency);
+                tracing::warn!(
+                    group = self.input.group.get(),
+                    run = self.input.run.get(),
+                    turn = self.turns,
+                    %error,
+                    "run ended: the model call failed"
+                );
                 self.error = Some(error);
                 return Err(RunEnd::ModelError);
             }
@@ -327,6 +330,12 @@ impl Run<'_> {
         if let Err(error) = self.transcript.append(Item::Assistant(response.turn)) {
             // The provider produced a turn the transcript cannot hold (for example a duplicate
             // call id). That is a contract violation by the provider, not by us.
+            tracing::warn!(
+                group = self.input.group.get(),
+                run = self.input.run.get(),
+                %error,
+                "run ended: the model's turn breaks the transcript"
+            );
             self.error = Some(LlmError::Protocol(error.to_string()));
             return Err(RunEnd::ModelError);
         }
@@ -383,7 +392,7 @@ impl Run<'_> {
         let arrived = self
             .bounded(self.deps.archive.since(self.input.group, self.cursor))
             .await?
-            .map_err(|_| RunEnd::Environment)?;
+            .map_err(|e| self.environment("reading new chat", &e))?;
         let Some(last) = arrived.last() else {
             return Ok(());
         };
@@ -415,23 +424,43 @@ impl Run<'_> {
     }
 
     fn append(&mut self, item: Item) -> Result<ItemSeq, RunEnd> {
-        self.transcript
-            .append(item)
-            .map_err(|_| RunEnd::Environment)
+        match self.transcript.append(item) {
+            Ok(seq) => Ok(seq),
+            Err(error) => Err(self.environment("appending to the transcript", &error)),
+        }
     }
 
     async fn persist(&mut self) -> Result<(), RunEnd> {
         while self.logged < self.transcript.len() {
-            let seq = ItemSeq::new(u32::try_from(self.logged).map_err(|_| RunEnd::Environment)?);
+            let seq = ItemSeq::new(
+                u32::try_from(self.logged)
+                    .map_err(|e| self.environment("numbering the transcript", &e))?,
+            );
             let item = &self.transcript.items()[self.logged];
-            self.deps
+            if let Err(error) = self
+                .deps
                 .log
                 .append(self.input.group, self.input.run, seq, item)
                 .await
-                .map_err(|_: EnvError| RunEnd::Environment)?;
+            {
+                return Err(self.environment("recording the transcript", &error));
+            }
             self.logged += 1;
         }
         Ok(())
+    }
+
+    /// End the run for a failure of its environment (the archive, the run log, an invariant),
+    /// saying what failed: the run record keeps only that it was the environment.
+    fn environment(&self, doing: &str, error: &dyn std::fmt::Display) -> RunEnd {
+        tracing::warn!(
+            group = self.input.group.get(),
+            run = self.input.run.get(),
+            doing,
+            %error,
+            "run ended: its environment failed"
+        );
+        RunEnd::Environment
     }
 
     /// Await `future` unless the run is cancelled or past its deadline.

@@ -747,17 +747,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "eventsource-stream"
-version = "0.2.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74fef4569247a5f429d9156b9d0a2599914385dd189c539334c625d8099d90ab"
-dependencies = [
- "futures-core",
- "nom",
- "pin-project-lite",
-]
-
-[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1770,12 +1759,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "minimal-lexical"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
-
-[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1833,16 +1816,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "418abd1b6d34fbf6cae440dc874771b0525a604428704c76e48b29a5e67b8003"
 dependencies = [
  "memchr",
-]
-
-[[package]]
-name = "nom"
-version = "7.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
-dependencies = [
- "memchr",
- "minimal-lexical",
 ]
 
 [[package]]
@@ -2182,6 +2155,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -2231,7 +2205,6 @@ dependencies = [
  "sherpa-onnx",
  "thiserror",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -2283,7 +2256,6 @@ dependencies = [
  "qbot-core",
  "serde",
  "serde_json",
- "sha2",
  "thiserror",
 ]
 
@@ -2332,7 +2304,6 @@ dependencies = [
  "qbot-core",
  "qbot-llm",
  "qbot-media",
- "qbot-memory",
  "qbot-store",
  "qbot-tools",
  "rand 0.9.5",
@@ -2363,7 +2334,6 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bytes",
- "eventsource-stream",
  "futures-util",
  "httpdate",
  "moka",
@@ -2434,7 +2404,6 @@ dependencies = [
  "jiff",
  "qbot-core",
  "qbot-i18n",
- "qbot-media",
  "qbot-memory",
  "qbot-sched",
  "qbot-store",
@@ -2522,7 +2491,6 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "thiserror",
  "tokio",
  "tokio-util",
  "url",

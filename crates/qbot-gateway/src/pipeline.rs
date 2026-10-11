@@ -1,13 +1,13 @@
 //! From one platform frame to its consequences: archive first, then command or run.
 
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use qbot_agent::{Rejected, Supervisor, Trigger, TriggerRequest};
 use qbot_core::{AccountId, GroupId, MessageId, UnixMillis};
 use qbot_media::{MediaJob, MediaService};
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use qbot_store::MediaRefRow;
@@ -93,10 +93,8 @@ pub struct Pipeline {
     nicknames: Nicknames,
     echoes: Arc<EchoBoard>,
     tasks: TaskTracker,
-    /// Groups with a spontaneous run under way: at most one spontaneous run per group at a time
-    /// (other runs are not affected), or a lively chat would start
-    /// several that talk over each other.
-    spontaneous: Arc<Mutex<HashSet<GroupId>>>,
+    /// Ends waits for media on shutdown: a run they would start is refused then anyway.
+    stop: CancellationToken,
 }
 
 impl std::fmt::Debug for Pipeline {
@@ -126,7 +124,7 @@ impl Pipeline {
             nicknames,
             echoes,
             tasks: TaskTracker::new(),
-            spontaneous: Arc::default(),
+            stop: CancellationToken::new(),
         }
     }
 
@@ -156,10 +154,40 @@ impl Pipeline {
         }
     }
 
-    /// Stop accepting commands and wait for those in flight.
+    /// Stop accepting commands and wait for those in flight; a reply still waiting for media is
+    /// dropped.
     pub async fn finish(&self) {
+        self.stop.cancel();
         self.tasks.close();
         self.tasks.wait().await;
+    }
+
+    /// Wait (bounded) for the group's media in flight, unless the pipeline is finishing. True
+    /// when the run may go ahead.
+    fn settled(&self, group: GroupId) -> impl Future<Output = bool> + Send + 'static {
+        let media = self
+            .media
+            .as_ref()
+            .filter(|hook| hook.service.busy(group))
+            .map(|hook| (Arc::clone(&hook.service), hook.wait));
+        let stop = self.stop.clone();
+        async move {
+            let Some((service, wait)) = media else {
+                return true;
+            };
+            tokio::select! {
+                () = stop.cancelled() => false,
+                done = service.settle(group, wait) => {
+                    if !done {
+                        tracing::info!(
+                            group = group.get(),
+                            "media still pending; going ahead with what is there"
+                        );
+                    }
+                    true
+                }
+            }
+        }
     }
 
     async fn message(&self, m: GroupMessage) {
@@ -244,64 +272,37 @@ impl Pipeline {
                 sender: m.sender,
             },
         };
-        match &self.media {
-            Some(hook) if hook.service.busy(m.group) => {
-                // Pictures and clips of the group are still being worked on, perhaps the one
-                // this message asks about: let them finish (bounded) before the run's window is
-                // taken, off the reader so other frames keep flowing.
-                let (supervisor, service, wait) = (
-                    Arc::clone(&self.supervisor),
-                    Arc::clone(&hook.service),
-                    hook.wait,
-                );
-                let group = m.group;
-                self.tasks.spawn(async move {
-                    if !service.settle(group, wait).await {
-                        tracing::info!(
-                            group = group.get(),
-                            "media still pending; replying with what is there"
-                        );
-                    }
+        // Pictures and clips of the group may still be being worked on, perhaps the one this
+        // message asks about: let them finish (bounded) before the run's window is taken, off the
+        // reader so other frames keep flowing.
+        if self.media.as_ref().is_some_and(|h| h.service.busy(m.group)) {
+            let (supervisor, settled) = (Arc::clone(&self.supervisor), self.settled(m.group));
+            self.tasks.spawn(async move {
+                if settled.await {
                     submit(&supervisor, request).await;
-                });
-            }
-            _ => submit(&self.supervisor, request).await,
+                }
+            });
+        } else {
+            submit(&self.supervisor, request).await;
         }
     }
 
     /// Roll `spontaneous_chance` for a member's message that did not trigger the bot (no @ of the
     /// bot, no nickname, no quote of a bot line, not a command; it may well address another
     /// member), and on a hit start a spontaneous run once the group's media in flight is
-    /// described, as a reply would. Only another spontaneous run of the group holds it back.
+    /// described, as a reply would. The supervisor admits at most one per group at a time.
     fn maybe_spontaneous(&self, group: GroupId, author: AccountId) {
         let chance = self.cfg.spontaneous_chance;
         if chance <= 0.0 || rand::random::<f64>() >= chance {
             return;
         }
-        if !self
-            .spontaneous
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(group)
-        {
-            return;
-        }
-        let (supervisor, spontaneous) =
-            (Arc::clone(&self.supervisor), Arc::clone(&self.spontaneous));
-        let media = self
-            .media
-            .as_ref()
-            .map(|hook| (Arc::clone(&hook.service), hook.wait));
+        let (supervisor, settled) = (Arc::clone(&self.supervisor), self.settled(group));
         self.tasks.spawn(async move {
-            if let Some((service, wait)) = media
-                && service.busy(group)
-            {
-                service.settle(group, wait).await;
+            if !settled.await {
+                return;
             }
             match supervisor.submit_spontaneous(group, author).await {
-                Ok(handle) => {
-                    handle.finished().await;
-                }
+                Ok(_handle) => {}
                 Err(Rejected::Environment(error)) => tracing::error!(%error, "admission failed"),
                 Err(rejected) => {
                     tracing::debug!(
@@ -311,10 +312,6 @@ impl Pipeline {
                     )
                 }
             }
-            spontaneous
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&group);
         });
     }
 

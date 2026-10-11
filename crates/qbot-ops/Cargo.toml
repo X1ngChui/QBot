@@ -8,7 +8,6 @@ license.workspace = true
 [dependencies]
 qbot-core.workspace = true
 qbot-i18n.workspace = true
-qbot-media.workspace = true
 qbot-memory.workspace = true
 qbot-sched.workspace = true
 qbot-store.workspace = true

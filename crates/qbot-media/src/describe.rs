@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use qbot_llm::{
     Content, ConvItem, Conversation, LlmError, LoadedMedia, MediaStore, Message, Provider,
-    ReasoningEffort, Request, Role, ToolChoice, collect,
+    ReasoningEffort, Request, Role, ToolChoice,
 };
 
 use sha2::{Digest, Sha256};
@@ -80,8 +80,7 @@ impl Describer for LlmDescriber {
             continuation: None,
             media: Some(&store),
         };
-        let stream = self.provider.stream(request).await.map_err(classify)?;
-        let response = collect(stream).await.map_err(classify)?;
+        let response = self.provider.respond(request).await.map_err(classify)?;
         let text = clean_description(&response.turn.text());
         if text.is_empty() {
             Err(DescribeError::Failed(

@@ -92,9 +92,8 @@ pub fn sim_provider(
     deepseek: bool,
     state: StateMode,
     script: Vec<SimStep>,
-    chunk: usize,
 ) -> (Arc<SimServer>, Arc<ResponsesProvider>) {
-    let server = Arc::new(SimServer::new(script).with_chunk_size(chunk));
+    let server = Arc::new(SimServer::new(script));
     let mut cfg = if deepseek {
         ResponsesConfig::deepseek("deepseek-test")
     } else {
@@ -120,15 +119,15 @@ pub fn all_providers(replies: &[FakeReply]) -> Vec<(&'static str, Arc<dyn Provid
         ),
         (
             "deepseek",
-            sim_provider(true, StateMode::Stateless, sim_steps(replies), 7).1,
+            sim_provider(true, StateMode::Stateless, sim_steps(replies)).1,
         ),
         (
             "openai-stateless",
-            sim_provider(false, StateMode::Stateless, sim_steps(replies), 13).1,
+            sim_provider(false, StateMode::Stateless, sim_steps(replies)).1,
         ),
         (
             "openai-server-state",
-            sim_provider(false, StateMode::ServerState, sim_steps(replies), 64).1,
+            sim_provider(false, StateMode::ServerState, sim_steps(replies)).1,
         ),
     ]
 }

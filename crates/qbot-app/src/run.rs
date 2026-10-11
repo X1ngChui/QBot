@@ -544,12 +544,15 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     };
     tracing::info!(reason, "stopping");
 
-    // Stop taking input, then let what is in flight end: commands, runs, scheduled work, usage.
+    // Stop taking input, then end what is in flight without waiting out long work: runs are
+    // cancelled (recorded as such) before anything that could wait on one, commands finish,
+    // media work and running jobs are dropped (a job is queued again at the next start), and
+    // what was recorded is written.
     stop.cancel();
     let served = server_task.await;
+    supervisor.shutdown().await;
     pipeline.finish().await;
     media.shutdown().await;
-    supervisor.shutdown().await;
     let _ = scheduler_task.await;
     match recurring_task.await {
         Ok(Ok(())) => {}

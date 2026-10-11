@@ -1,8 +1,8 @@
 //! An in-process stand-in for a Responses server, used to test the adapter end to end.
 //!
 //! It enforces the request rules real servers enforce (call/output pairing, reasoning followed
-//! by its item, known `previous_response_id`), answers in JSON or SSE, simulates prompt-cache
-//! usage, and can inject HTTP errors, in-stream errors and cut-off streams.
+//! by its item, known `previous_response_id`), simulates prompt-cache usage, and can inject HTTP
+//! errors, failed and incomplete responses, and malformed output.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, PoisonError};
@@ -10,13 +10,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::stream;
 use serde_json::{Value, json};
 
 use crate::error::LlmError;
 use crate::fake::{FakePart, FakeReply};
 
-use super::transport::{HttpBody, HttpResponse, Transport, Upload};
+use super::transport::{HttpResponse, Transport, Upload};
 
 #[derive(Debug, Clone)]
 pub enum SimStep {
@@ -32,15 +31,6 @@ pub enum SimStep {
         retry_after: Option<Duration>,
         code: &'static str,
         message: &'static str,
-    },
-    /// A 200 stream that carries an `error` event and ends.
-    StreamError {
-        code: &'static str,
-    },
-    /// A 200 stream that ends after `events` events with no terminal event.
-    CutStream {
-        reply: FakeReply,
-        events: usize,
     },
     /// A `response.failed` terminal event.
     Failed {
@@ -71,7 +61,6 @@ pub type SimUpload = (String, Vec<(String, String)>, usize);
 
 pub struct SimServer {
     inner: Mutex<Inner>,
-    chunk_size: usize,
 }
 
 impl std::fmt::Debug for SimServer {
@@ -87,14 +76,7 @@ impl SimServer {
                 script: script.into_iter().collect(),
                 ..Inner::default()
             }),
-            chunk_size: 11,
         }
-    }
-
-    /// Bytes per network chunk in SSE answers; small values stress the decoder.
-    pub fn with_chunk_size(mut self, size: usize) -> Self {
-        self.chunk_size = size.max(1);
-        self
     }
 
     pub fn requests(&self) -> Vec<Value> {
@@ -121,7 +103,7 @@ fn error_response(
     HttpResponse {
         status,
         retry_after,
-        body: HttpBody::Full(Bytes::from(body.to_string())),
+        body: Bytes::from(body.to_string()),
     }
 }
 
@@ -209,62 +191,6 @@ fn output_items(inner: &mut Inner, reply: &FakeReply, incomplete: bool) -> Vec<V
     items
 }
 
-fn sse(events: &[Value]) -> Vec<u8> {
-    let mut out = String::new();
-    for event in events {
-        let kind = event
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        out.push_str(&format!("event: {kind}\ndata: {event}\n\n"));
-    }
-    out.into_bytes()
-}
-
-fn chunked(bytes: Vec<u8>, size: usize) -> HttpBody {
-    let chunks: Vec<Result<Bytes, LlmError>> = bytes
-        .chunks(size)
-        .map(|c| Ok(Bytes::copy_from_slice(c)))
-        .collect();
-    HttpBody::Stream(Box::pin(stream::iter(chunks)))
-}
-
-fn deltas(items: &[Value]) -> Vec<Value> {
-    let mut events = Vec::new();
-    for item in items {
-        match item.get("type").and_then(Value::as_str) {
-            Some("reasoning") => {
-                let text = item["summary"][0]["text"].as_str().unwrap_or_default();
-                events.push(
-                    json!({ "type": "response.reasoning_summary_text.delta", "delta": text }),
-                );
-            }
-            Some("message") => {
-                let text = item["content"][0]["text"].as_str().unwrap_or_default();
-                let chars: Vec<char> = text.chars().collect();
-                for chunk in chars.chunks(5) {
-                    let delta: String = chunk.iter().collect();
-                    events.push(json!({ "type": "response.output_text.delta", "delta": delta }));
-                }
-            }
-            Some("function_call") => {
-                events.push(json!({ "type": "response.output_item.added", "item": item }));
-                let args = item["arguments"].as_str().unwrap_or_default();
-                let chars: Vec<char> = args.chars().collect();
-                for chunk in chars.chunks(4) {
-                    let delta: String = chunk.iter().collect();
-                    events.push(json!({
-                        "type": "response.function_call_arguments.delta",
-                        "item_id": item["id"], "delta": delta,
-                    }));
-                }
-            }
-            _ => {}
-        }
-    }
-    events
-}
-
 #[async_trait]
 impl Transport for SimServer {
     async fn upload(&self, path: &str, upload: &Upload) -> Result<HttpResponse, LlmError> {
@@ -279,18 +205,11 @@ impl Transport for SimServer {
         Ok(HttpResponse {
             status: 200,
             retry_after: None,
-            body: HttpBody::Full(Bytes::from(
-                json!({ "id": id, "object": "file" }).to_string(),
-            )),
+            body: Bytes::from(json!({ "id": id, "object": "file" }).to_string()),
         })
     }
 
-    async fn post(
-        &self,
-        path: &str,
-        body: &Value,
-        want_stream: bool,
-    ) -> Result<HttpResponse, LlmError> {
+    async fn post(&self, path: &str, body: &Value) -> Result<HttpResponse, LlmError> {
         let mut inner = self.lock();
         inner.requests.push(body.clone());
         if path != "/responses" {
@@ -348,7 +267,12 @@ impl Transport for SimServer {
             ));
         };
 
-        let (reply, status, reason, mode) = match step {
+        let ok = |value: &Value| HttpResponse {
+            status: 200,
+            retry_after: None,
+            body: Bytes::from(value.to_string()),
+        };
+        let (reply, status, reason) = match step {
             SimStep::Http {
                 status,
                 retry_after,
@@ -357,50 +281,16 @@ impl Transport for SimServer {
             } => {
                 return Ok(error_response(status, retry_after, code, message));
             }
-            SimStep::StreamError { code } => {
-                let events = [json!({ "type": "error", "code": code, "message": "boom" })];
-                return Ok(HttpResponse {
-                    status: 200,
-                    retry_after: None,
-                    body: chunked(sse(&events), self.chunk_size),
-                });
-            }
-            SimStep::Raw(value) => {
-                let terminal = json!({ "type": "response.completed", "response": value });
-                return Ok(if want_stream {
-                    HttpResponse {
-                        status: 200,
-                        retry_after: None,
-                        body: chunked(sse(&[terminal]), self.chunk_size),
-                    }
-                } else {
-                    HttpResponse {
-                        status: 200,
-                        retry_after: None,
-                        body: HttpBody::Full(Bytes::from(value.to_string())),
-                    }
-                });
-            }
+            SimStep::Raw(value) => return Ok(ok(&value)),
             SimStep::Failed { code } => {
-                let response = json!({ "status": "failed", "error": { "code": code, "message": "failed" }, "output": [] });
-                let terminal = json!({ "type": "response.failed", "response": response });
-                return Ok(if want_stream {
-                    HttpResponse {
-                        status: 200,
-                        retry_after: None,
-                        body: chunked(sse(&[terminal]), self.chunk_size),
-                    }
-                } else {
-                    HttpResponse {
-                        status: 200,
-                        retry_after: None,
-                        body: HttpBody::Full(Bytes::from(response.to_string())),
-                    }
-                });
+                return Ok(ok(&json!({
+                    "status": "failed",
+                    "error": { "code": code, "message": "failed" },
+                    "output": [],
+                })));
             }
-            SimStep::Reply(reply) => (reply, "completed", None, None),
-            SimStep::Incomplete { reply, reason } => (reply, "incomplete", Some(reason), None),
-            SimStep::CutStream { reply, events } => (reply, "completed", None, Some(events)),
+            SimStep::Reply(reply) => (reply, "completed", None),
+            SimStep::Incomplete { reply, reason } => (reply, "incomplete", Some(reason)),
         };
 
         let input: Vec<Value> = body["input"].as_array().cloned().unwrap_or_default();
@@ -439,32 +329,6 @@ impl Transport for SimServer {
         if let Some(reason) = reason {
             response["incomplete_details"] = json!({ "reason": reason });
         }
-        if !want_stream {
-            return Ok(HttpResponse {
-                status: 200,
-                retry_after: None,
-                body: HttpBody::Full(Bytes::from(response.to_string())),
-            });
-        }
-        let mut events = deltas(&output_items_view(&response));
-        if let Some(limit) = mode {
-            events.truncate(limit);
-        } else {
-            let kind = if status == "incomplete" {
-                "response.incomplete"
-            } else {
-                "response.completed"
-            };
-            events.push(json!({ "type": kind, "response": response }));
-        }
-        Ok(HttpResponse {
-            status: 200,
-            retry_after: None,
-            body: chunked(sse(&events), self.chunk_size),
-        })
+        Ok(ok(&response))
     }
-}
-
-fn output_items_view(response: &Value) -> Vec<Value> {
-    response["output"].as_array().cloned().unwrap_or_default()
 }

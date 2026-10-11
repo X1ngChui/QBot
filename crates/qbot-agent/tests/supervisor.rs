@@ -12,6 +12,10 @@ use qbot_llm::ConvItem;
 use qbot_llm::fake::FakeReply;
 use serde_json::json;
 
+fn account(id: i64) -> qbot_core::AccountId {
+    qbot_core::AccountId::new(id).unwrap()
+}
+
 fn request(sender: i64, message: i64) -> TriggerRequest {
     TriggerRequest {
         group: group(),
@@ -152,6 +156,48 @@ async fn overlapping_runs_in_one_group_are_independent() {
             .count()
     };
     assert_eq!((results(&a), results(&b)), (1, 1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_group_has_one_spontaneous_run_at_a_time_and_other_runs_still_start() {
+    let h = harness(vec![
+        reply_ok(FakeReply::new().call("slow", json!({ "ms": 4000 }))),
+        reply_ok(say("an answer")),
+        reply_ok(FakeReply::new().text("quiet")),
+        reply_ok(FakeReply::new().text("quiet again")),
+    ]);
+    let sup = supervisor(&h, cfg(8, 4, 60));
+    h.world.say(1, 1, "chatting");
+    h.world.say(2, 2, "a question");
+    let first = sup.submit_spontaneous(group(), account(1)).await.unwrap();
+    assert_eq!(
+        sup.submit_spontaneous(group(), account(1))
+            .await
+            .unwrap_err(),
+        Rejected::SpontaneousUnderWay
+    );
+    let addressed = sup.submit(request(2, 102)).await.unwrap();
+    assert_eq!(
+        addressed.finished().await.unwrap().end,
+        RunEnd::Delivered,
+        "an addressed run is not held back by the spontaneous one"
+    );
+    first.finished().await.unwrap();
+    let next = sup.submit_spontaneous(group(), account(1)).await.unwrap();
+    next.finished().await.unwrap();
+
+    h.world.block(3);
+    assert_eq!(
+        sup.submit_spontaneous(group(), account(3))
+            .await
+            .unwrap_err(),
+        Rejected::Blocked,
+        "a blocked member's line starts no run"
+    );
+    assert!(
+        sup.submit_spontaneous(group(), account(1)).await.is_ok(),
+        "a refusal holds no claim"
+    );
 }
 
 #[tokio::test(start_paused = true)]

@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use super::{PageRead, PageReader, SearchHit, SearchResults, WebSearch};
 use crate::capability::ProviderId;
 use crate::error::LlmError;
-use crate::responses::{HttpBody, RetryPolicy, Transport, post_with_retry};
+use crate::responses::{RetryPolicy, Transport, post_with_retry};
 
 /// Tavily's search depth: `advanced` costs two credits and returns better excerpts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,13 +100,10 @@ impl TavilySearch {
             "include_usage": true,
         });
         let (response, requests) =
-            post_with_retry(&*self.transport, &self.cfg.retry, "/search", &body, false)
+            post_with_retry(&*self.transport, &self.cfg.retry, "/search", &body)
                 .await
                 .map_err(plan_limit)?;
-        let HttpBody::Full(bytes) = response.body else {
-            return Err(LlmError::Protocol("expected a full body".into()));
-        };
-        let value: Value = serde_json::from_slice(&bytes)
+        let value: Value = serde_json::from_slice(&response.body)
             .map_err(|e| LlmError::Protocol(format!("search response is not JSON: {e}")))?;
         let results = value
             .get("results")
@@ -155,14 +152,10 @@ impl TavilySearch {
             body["query"] = json!(question);
             body["chunks_per_source"] = json!(self.cfg.extract.chunks_per_source);
         }
-        let (response, _) =
-            post_with_retry(&*self.transport, &self.cfg.retry, "/extract", &body, false)
-                .await
-                .map_err(plan_limit)?;
-        let HttpBody::Full(bytes) = response.body else {
-            return Err(LlmError::Protocol("expected a full body".into()));
-        };
-        let value: Value = serde_json::from_slice(&bytes)
+        let (response, _) = post_with_retry(&*self.transport, &self.cfg.retry, "/extract", &body)
+            .await
+            .map_err(plan_limit)?;
+        let value: Value = serde_json::from_slice(&response.body)
             .map_err(|e| LlmError::Protocol(format!("extract response is not JSON: {e}")))?;
         let credits = value
             .get("usage")

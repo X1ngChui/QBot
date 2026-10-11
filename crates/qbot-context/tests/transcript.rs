@@ -267,25 +267,11 @@ fn storage_round_trip_is_lossless_and_revalidated() {
     let json = serde_json::to_string(&t).unwrap();
     let back: Transcript = serde_json::from_str(&json).unwrap();
     assert_eq!(back, t);
-    assert_eq!(
-        project(&back).unwrap().digest(),
-        project(&t).unwrap().digest()
-    );
+    assert_eq!(project(&back).unwrap(), project(&t).unwrap());
 
     // A stored log with an orphan result must be rejected on load.
     let orphan = serde_json::to_string(&vec![result("zzz", "")]).unwrap();
     assert!(serde_json::from_str::<Transcript>(&orphan).is_err());
-}
-
-#[test]
-fn digest_changes_when_the_view_changes() {
-    let mut t = Transcript::new();
-    t.append(turn(&["a"])).unwrap();
-    t.append(result("a", "r")).unwrap();
-    let before = project(&t).unwrap().digest();
-    t.append(turn(&["b"])).unwrap();
-    t.append(result("b", "r")).unwrap();
-    assert_ne!(before, project(&t).unwrap().digest());
 }
 
 #[test]

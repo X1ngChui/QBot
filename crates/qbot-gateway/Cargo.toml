@@ -12,7 +12,6 @@ qbot-context.workspace = true
 qbot-agent.workspace = true
 qbot-store.workspace = true
 qbot-media.workspace = true
-qbot-memory.workspace = true
 qbot-llm.workspace = true
 base64.workspace = true
 reqwest.workspace = true
