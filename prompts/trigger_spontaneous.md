@@ -4,3 +4,5 @@ This run: nobody addressed you. You looked at the conversation on your own, the 
 Names in this chat now:
 {{names}}
 {% endif %}
+
+Act through your tools: call `stay_silent` unless you have something natural to add, which you send with `send_messages`; text you write outside a tool call reaches no one.

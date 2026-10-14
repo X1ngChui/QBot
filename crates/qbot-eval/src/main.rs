@@ -239,6 +239,7 @@ async fn real_main() -> Result<bool, String> {
 
     let mut reports = Vec::new();
     let mut all_passed = true;
+    let (mut runs, mut reminded) = (0, 0);
     for (name, scenario) in &scenarios {
         let mut attempts = Vec::new();
         for n in 1..=args.repeat.max(1) {
@@ -268,7 +269,17 @@ async fn real_main() -> Result<bool, String> {
             let (cp, ct) = attempt.checks_passed();
             let (rp, rt) = attempt.rubric_passed(scenario.expect.rubric.len());
             all_passed &= attempt.failure.is_none() && cp == ct && rp == rt;
-            println!("  checks {cp}/{ct}, rubric {rp}/{rt}");
+            let fallback = attempt.run.as_ref().is_some_and(|r| r.reminded);
+            runs += 1;
+            reminded += usize::from(fallback);
+            println!(
+                "  checks {cp}/{ct}, rubric {rp}/{rt}{}",
+                if fallback {
+                    ", reminded to call a tool"
+                } else {
+                    ""
+                }
+            );
             attempts.push(attempt);
         }
         reports.push(ScenarioReport {
@@ -292,6 +303,7 @@ async fn real_main() -> Result<bool, String> {
         serde_json::to_string_pretty(&reports).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
+    println!("runs that needed the reminder to call a tool: {reminded} of {runs}");
     println!("report: {}", dir.join("report.md").display());
     Ok(all_passed)
 }

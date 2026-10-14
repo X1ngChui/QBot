@@ -4,3 +4,5 @@ This run: member:{{sender}} addressed you in [msg:{{message}}]. Lines that arriv
 Names in this chat now:
 {{names}}
 {% endif %}
+
+Reply through your tools: send what you have to say with `send_messages`, or call `stay_silent`; text you write outside a tool call reaches no one.

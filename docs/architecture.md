@@ -233,13 +233,24 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
   mentioned in it, is named in a task's intent as `member:N`, or has an entry in the people
   block. So a reminder reaches someone who has been quiet, while the model cannot address a
   number nothing showed it.
-- **Undelivered text.** A turn that ends with text but no tool call wrote something nobody saw.
-  The run appends one note (`prompts/undelivered_note.md`) and asks for one more turn that must
-  call a tool, so a written reply is never lost and narration is never delivered.
-- **Forced tool choice is a provider capability** (`ForcedToolChoice`). DeepSeek's Responses API
-  refuses a forced choice with reasoning on, and refuses a reasoning turn after one without it
-  (measured on the live API, pinned by an ignored live test), so on DeepSeek the forced turn and
-  the rest of that run go without reasoning. OpenAI-style providers declare `Always`.
+- **Tool choice per turn.** Every turn of a run must call a tool (a turn without one ends the
+  run), but a turn asks for `ToolChoice::Auto`, not a forced choice: the reply keeps its
+  reasoning, and DeepSeek's Responses API refuses any forced `tool_choice` (`required` or a
+  named function) whenever thinking is on, which it is by default (re-measured 2026-10-14:
+  "Thinking mode does not support this tool_choice"; with `reasoning.effort = none` a forced
+  choice is accepted). In thinking mode the model tends to answer in plain text when the
+  request ends on chat rather than on an instruction (6 of 6 replays of a real reply request,
+  against 0 of 6 without thinking), so every trigger note ends by saying to reply through
+  `send_messages` or `stay_silent`; with that line, 11 of 12 replays called a tool directly.
+- **Undelivered text, the fallback.** A turn that still ends with text but no tool call wrote
+  something nobody saw. The run logs it, appends one note (`prompts/undelivered_note.md`) and
+  asks for one more turn with a forced tool choice, so a written reply is never lost and
+  narration is never delivered. `qbot-eval` reports how many runs needed it.
+- **Forced tool choice is a provider capability** (`ForcedToolChoice`). DeepSeek refuses a
+  forced choice with reasoning on, and refuses a reasoning turn after one without it (both
+  measured on the live API, pinned by an ignored live test), so on DeepSeek the forced turn and
+  the rest of that run go without reasoning. OpenAI-style providers declare `Always`; a
+  provider that declares `Never` gets `Auto` and the note alone.
 - **Executor.** Reads run concurrently, then writes (sends included) one at a time in call order; a refused call gets
   a typed refusal; every call executes (no deduplication), so the prompt teaches the model not to
   repeat a write.

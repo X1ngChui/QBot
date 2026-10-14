@@ -11,7 +11,9 @@ use qbot_agent::{
     Archive, ArchiveCursor, Chain, ContextSource, Delivery, Directory, EnvError, OutSegment,
     RunDeps, RunInput, RunLimits, RunLog, Trigger, execute,
 };
-use qbot_context::{AssistantPart, ChatLine, Item, Outcome, Part, RunEnd, Speaker};
+use qbot_context::{
+    AssistantPart, ChatLine, InstructionRole, Item, Outcome, Part, RunEnd, Speaker,
+};
 use qbot_core::{AccountId, ChainId, Clock, GroupId, MessageId, RunId, TimerId, UnixMillis};
 use qbot_llm::embedding::FakeEmbedder;
 use qbot_llm::search::{FakeSearch, PageRead, SearchHit, SearchResults};
@@ -192,6 +194,9 @@ pub struct RunResult {
     pub calls: Vec<CallRecord>,
     /// Text the model wrote outside tool calls. Never delivered; kept to show what it meant.
     pub undelivered: Vec<String>,
+    /// A turn ended in text alone, so the run reminded the model and forced a tool call: the
+    /// fallback, not the normal path.
+    pub reminded: bool,
     pub checks: Vec<Check>,
     pub input_tokens: u32,
     pub output_tokens: u32,
@@ -536,6 +541,9 @@ impl Runner {
             })
             .filter(|t| !t.trim().is_empty())
             .collect();
+        let reminded = report.transcript.items().iter().any(
+            |item| matches!(item, Item::Instruction(i) if i.role == InstructionRole::Developer),
+        );
         let sent: Vec<String> = world
             .sent()
             .iter()
@@ -554,6 +562,7 @@ impl Runner {
                 sent,
                 calls,
                 undelivered,
+                reminded,
                 checks,
                 input_tokens,
                 output_tokens,

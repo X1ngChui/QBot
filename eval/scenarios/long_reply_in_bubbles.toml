@@ -19,8 +19,9 @@ messages = [2, 4]
 send_calls_at_most = 1
 tools_forbidden = ["schedule_task"]
 rubric = [
+  "If the reply is several messages, each reads as a natural chat bubble: no message is a lone clause or fragment, the quote is not repeated on every message, and no message is filler added just to keep talking.",
   "The advice is sensible for a beginner (for example starting slowly, walk-run intervals, rest days, warming up, not overdoing it).",
   "The reply is written in Chinese, casually, as a group member would.",
-  "The reply is split into a few messages at natural breaks: each message is a complete thought of one or more sentences, not a single short clause or fragment.",
+  "The reply is split into a few messages at natural breaks, each a complete thought.",
   "No message is a long block that packs the whole answer together, and none uses headings or Markdown formatting.",
 ]

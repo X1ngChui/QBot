@@ -1,4 +1,4 @@
-description = "A member asks the bot two small things at once. Both fit in one short reply; a person would answer them together in a single message or at most two, not one message per clause."
+description = "A member asks the bot two small things at once. Both fit in a short reply; a person would answer them in one message or a couple of short ones, not one message per clause."
 
 members = [
   { number = 1, account = 10001, name = "小林" },
@@ -14,11 +14,11 @@ trigger = { line = 2 }
 
 [expect]
 send = "required"
-messages = [1, 2]
+messages = [1, 3]
 send_calls_at_most = 1
 tools_forbidden = ["web_search", "schedule_task"]
 rubric = [
+  "If the reply is several messages, each reads as a natural chat bubble: no message is a lone clause or fragment, the quote is not repeated on every message, and no message is filler added just to keep talking.",
   "The reply recommends pork belly (五花肉) and gives a plausible braising time (roughly 40 minutes to an hour and a half).",
   "The reply is written in Chinese and is brief and casual.",
-  "Each message holds a complete thought; the reply is not broken into fragments.",
 ]

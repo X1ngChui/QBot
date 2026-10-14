@@ -7,3 +7,5 @@ Intent:
 Names in this chat now:
 {{names}}
 {% endif %}
+
+Act through your tools: do what the task needs with `send_messages`, or call `stay_silent`; text you write outside a tool call reaches no one.

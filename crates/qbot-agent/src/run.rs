@@ -175,6 +175,14 @@ impl Run<'_> {
                 // once and require a tool on the next turn: send it, or stay silent explicitly.
                 match &self.input.context.undelivered_note {
                     Some(note) if !self.nudged && self.wrote_text() => {
+                        // The fallback, not the normal path: on a provider that cannot force a
+                        // tool call while reasoning, a reasoning turn may end in text alone.
+                        tracing::info!(
+                            group = self.input.group.get(),
+                            run = self.input.run.get(),
+                            turn = self.turns,
+                            "a turn ended in text alone; asking once for a tool call"
+                        );
                         self.nudged = true;
                         self.append(Item::Instruction(note.clone()))?;
                         self.persist().await?;

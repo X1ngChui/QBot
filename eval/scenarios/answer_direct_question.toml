@@ -15,10 +15,11 @@ trigger = { line = 3 }
 
 [expect]
 send = "required"
-messages = [1, 1]
+messages = [1, 3]
 send_calls_at_most = 1
 tools_forbidden = ["web_search", "schedule_task"]
 rubric = [
+  "If the reply is several messages, each reads as a natural chat bubble: no message is a lone clause or fragment, the quote is not repeated on every message, and no message is filler added just to keep talking.",
   "The reply gives a correct refrigerator compartment temperature (roughly 2 to 5 degrees Celsius, or a nearby commonly recommended value).",
   "The reply is written in Chinese.",
   "The reply is short: at most three sentences, with no headings, bullet lists or Markdown formatting.",
