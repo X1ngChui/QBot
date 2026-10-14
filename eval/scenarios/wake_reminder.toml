@@ -16,6 +16,7 @@ trigger = { wake = "Remind member:1 (小林) to hand in the weekly report this m
 
 [expect]
 send = "required"
+send_calls_at_most = 1
 mentions_forbidden = [2]
 rubric = [
   "The bot sends a reminder about handing in the weekly report.",

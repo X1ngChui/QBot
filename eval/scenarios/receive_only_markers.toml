@@ -17,6 +17,7 @@ trigger = { line = 4 }
 
 [expect]
 send = "required"
+send_calls_at_most = 1
 rubric = [
   "If the reply passes on the video, it gives its address (https://b23.example/abc123) or title as plain text, not wrapped in a bracketed marker.",
   "The reply does not claim to have sent or re-posted the cat picture itself; at most it describes it or points to the earlier message.",

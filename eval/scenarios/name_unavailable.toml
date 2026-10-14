@@ -14,6 +14,7 @@ trigger = { line = 2 }
 
 [expect]
 send = "required"
+send_calls_at_most = 1
 rubric = [
   "The bot answers 小林 helpfully about who posted the tutorial, referring to that person naturally, for example by quoting the message with [reply:ID], with an @-mention, or as the one who posted it.",
   "No message names anyone as member:N or by a bare member number.",

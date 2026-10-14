@@ -16,6 +16,7 @@ trigger = { spontaneous = true }
 
 [expect]
 send = "optional"
+send_calls_at_most = 1
 tools_forbidden = ["schedule_task"]
 rubric = [
   "If the bot speaks, its message fits the hot pot conversation and reads like a group member chiming in, not like an assistant answering a request addressed to it.",

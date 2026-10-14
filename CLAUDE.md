@@ -56,9 +56,9 @@ paid API. Build the image with `docker build -f deploy/Dockerfile .`; deployment
   the bot's own line to the echo board, a command word to `qbot-commands`, or a trigger (@, a
   nickname as a whole jieba token, a quote of a bot line) to the supervisor.
 - **Runs:** `qbot-agent`. Every trigger or due task is its own run with its own deadline over an
-  append-only transcript (`qbot-context`). The model speaks only through `send_message`
-  (`{text, end_turn?}` in the chat's marker syntax, waits for its echo) or ends with
-  `stay_silent`; text without a tool call gets one note and a forced tool turn. Every tool call
+  append-only transcript (`qbot-context`). The model speaks only through `send_messages`
+  (`{messages, end_turn?}`: QQ messages sent in order in the chat's marker syntax, each
+  waiting for its echo) or ends with `stay_silent`; text without a tool call gets one note and a forced tool turn. Every tool call
   executes (no dedup). Tools live in `qbot-tools` (and `open_images` in `qbot-media`).
 - **Providers:** `qbot-llm` is the only place vendors are named: text and vision through the
   Responses API (DeepSeek and OpenAI-style dialects, typed capabilities), embeddings, Tavily search.

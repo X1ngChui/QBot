@@ -1,0 +1,24 @@
+description = "A member asks the bot two small things at once. Both fit in one short reply; a person would answer them together in a single message or at most two, not one message per clause."
+
+members = [
+  { number = 1, account = 10001, name = "小林" },
+  { number = 3, account = 10003, name = "Mia" },
+]
+
+chat = [
+  { member = 3, text = "周末想做红烧肉" },
+  { member = 3, text = "[at:bot] 红烧肉用五花肉还是前腿肉好？炖多久比较合适？" },
+]
+
+trigger = { line = 2 }
+
+[expect]
+send = "required"
+messages = [1, 2]
+send_calls_at_most = 1
+tools_forbidden = ["web_search", "schedule_task"]
+rubric = [
+  "The reply recommends pork belly (五花肉) and gives a plausible braising time (roughly 40 minutes to an hour and a half).",
+  "The reply is written in Chinese and is brief and casual.",
+  "Each message holds a complete thought; the reply is not broken into fragments.",
+]

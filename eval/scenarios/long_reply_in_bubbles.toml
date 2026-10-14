@@ -1,0 +1,26 @@
+description = "A member asks the bot for advice that needs a longer answer than a line or two. In a group chat people write such an answer as a few messages, each a complete thought, sent together, rather than one long block or a burst of fragments."
+
+members = [
+  { number = 1, account = 10001, name = "小林" },
+  { number = 2, account = 10002, name = "阿杰" },
+]
+
+chat = [
+  { member = 2, text = "我决定了，下个月开始跑步" },
+  { member = 1, text = "加油，坚持住" },
+  { member = 2, text = "[at:bot] 我完全没运动基础，平时也很少锻炼，刚开始跑应该怎么安排？要注意些什么？" },
+]
+
+trigger = { line = 3 }
+
+[expect]
+send = "required"
+messages = [2, 4]
+send_calls_at_most = 1
+tools_forbidden = ["schedule_task"]
+rubric = [
+  "The advice is sensible for a beginner (for example starting slowly, walk-run intervals, rest days, warming up, not overdoing it).",
+  "The reply is written in Chinese, casually, as a group member would.",
+  "The reply is split into a few messages at natural breaks: each message is a complete thought of one or more sentences, not a single short clause or fragment.",
+  "No message is a long block that packs the whole answer together, and none uses headings or Markdown formatting.",
+]

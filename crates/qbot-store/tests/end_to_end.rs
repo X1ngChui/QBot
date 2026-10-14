@@ -296,7 +296,7 @@ where
 }
 
 fn send(text: &str) -> Step {
-    Step::Reply(FakeReply::new().call("send_message", json!({ "text": text })))
+    Step::Reply(FakeReply::new().call("send_messages", json!({ "messages": [text] })))
 }
 
 #[tokio::test]
@@ -494,7 +494,7 @@ async fn after_a_crash_claimed_tasks_are_interrupted_and_open_runs_are_closed_ne
         .unwrap();
     let call = Item::Assistant(AssistantTurn::new(vec![AssistantPart::Call(ToolCall {
         id: CallId::new("c1").unwrap(),
-        name: "send_message".into(),
+        name: "send_messages".into(),
         arguments: json!({}),
     })]));
     before

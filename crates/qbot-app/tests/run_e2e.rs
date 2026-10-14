@@ -416,9 +416,10 @@ where
 async fn a_platform_message_becomes_a_stored_reply_and_commands_change_behaviour() {
     let Some(db) = database().await else { return };
     let root = scratch();
-    let sim = Arc::new(SimServer::new([SimStep::Reply(
-        FakeReply::new().call("send_message", json!({ "text": "hello from the model" })),
-    )]));
+    let sim = Arc::new(SimServer::new([SimStep::Reply(FakeReply::new().call(
+        "send_messages",
+        json!({ "messages": ["hello from the model"] }),
+    ))]));
     let llm = mock_llm(sim.clone()).await;
     let bot = start(&db, llm, &root, None).await;
     let pool = db.pool().await;
@@ -427,7 +428,7 @@ async fn a_platform_message_becomes_a_stored_reply_and_commands_change_behaviour
     assert!(connect(bot.addr, "wrong").await.is_err());
     let mut napcat = connect(bot.addr, "sesame").await.unwrap();
 
-    // 1. A member @s the bot: the run starts, the model answers through send_message, the
+    // 1. A member @s the bot: the run starts, the model answers through send_messages, the
     //    platform echoes it, and the run ends delivered.
     napcat
         .send(group_message(1, 2, json!([{"type": "at", "data": {"qq": "100"}}, {"type": "text", "data": {"text": " are you there?"}}])))
@@ -670,14 +671,14 @@ async fn pictures_and_voice_reach_the_model_as_words() {
         FakeReply::new().text("A red bicycle leaning against a brick wall"),
     )];
     script.push(SimStep::Reply(
-        FakeReply::new().call("send_message", json!({ "text": "nice bike" })),
+        FakeReply::new().call("send_messages", json!({ "messages": ["nice bike"] })),
     ));
     script.push(SimStep::Reply(
-        FakeReply::new().call("send_message", json!({ "text": "got it" })),
+        FakeReply::new().call("send_messages", json!({ "messages": ["got it"] })),
     ));
     // Used only when the voice part runs.
     script.push(SimStep::Reply(
-        FakeReply::new().call("send_message", json!({ "text": "heard you" })),
+        FakeReply::new().call("send_messages", json!({ "messages": ["heard you"] })),
     ));
     let sim = Arc::new(SimServer::new(script));
     let llm = mock_llm(sim.clone()).await;
@@ -1187,7 +1188,9 @@ async fn the_model_can_open_a_picture_and_mentions_become_member_numbers() {
             "open_images",
             json!({"pictures": [{"message": 1, "position": 1}]}),
         )),
-        SimStep::Reply(FakeReply::new().call("send_message", json!({ "text": "it says Elm St" }))),
+        SimStep::Reply(
+            FakeReply::new().call("send_messages", json!({ "messages": ["it says Elm St"] })),
+        ),
     ]));
     let llm = mock_llm(sim.clone()).await;
     deployment(&db, llm, &root, None);

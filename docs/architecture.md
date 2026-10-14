@@ -102,7 +102,7 @@ scheduler and memory depend on no database or platform. Its Postgres adapter liv
   record can hold hundreds, and every prompt showing the line would carry them all.
 - **Segments, received and sent.** Receiving aims to understand everything NapCat (v4.18)
   reports in a group message; sending is a separate, deliberately small set. A marker the model
-  can read is not therefore one it can write: a receive-only marker in `send_message` text is
+  can read is not therefore one it can write: a receive-only marker in `send_messages` text is
   sent as the literal text it is. Rich cards arrive as one `json` segment holding QQ's "ark"
   document; `qbot-gateway::card` reads the few fields that say what the card is about.
 
@@ -134,7 +134,7 @@ scheduler and memory depend on no database or platform. Its Postgres adapter liv
   segments; they are archived as `[notice:..]` lines. A card's fields are cut at 120 characters,
   and only an http(s) link of at most 400 characters is kept.
 - **A received card is context, never a capability.** No account or group id a card carries is
-  shown, numbered or stored: only mentions get member numbers, and `send_message` addresses only
+  shown, numbered or stored: only mentions get member numbers, and `send_messages` addresses only
   members the run's context names (below). A card for another
   group gives the bot no handle on that group.
 - **Archiving** (`pipeline::archive_form`, `PgArchive::append_line`): one transaction per line
@@ -214,13 +214,20 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
   `replies.deadline_secs`.
 - **Run loop.** Project, call the model, append, execute the calls, append the results, then the
   chat that arrived. A turn with no tool call ends the run, except as below. The run also ends on
-  a tool that ends it (`send_message` by default, `stay_silent`), the deadline, `max_turns`, or a
+  a tool that ends it (`send_messages` by default, `stay_silent`), the deadline, `max_turns`, or a
   model error. A run that ends on a model or environment error (the archive, the run log, an
   opened context) logs the cause as a warning; its record keeps the end and the error class.
-- **Speaking.** Only `send_message` reaches the group: `{text, end_turn?}` in the chat's own
-  marker syntax (`[reply:ID]` first, `[at:N]`, `[face:N]`; `[dice]`, `[rps]`, `[contact:N]`
-  alone, never a game result), parsed strictly with an explanation for every mistake. It waits for the echo, so the
-  result shows the message as delivered. Sends per run are bounded by `replies.max_messages`.
+- **Speaking.** Only `send_messages` reaches the group: `{messages: [text, ..], end_turn?}`, each
+  item one QQ message in the chat's own marker syntax (`[reply:ID]` first, `[at:N]`,
+  `[face:N]`; `[dice]`, `[rps]`, `[contact:N]` alone, never a game result), parsed strictly with
+  an explanation for every mistake. The model decides how many messages a reply is and where it
+  splits; nothing is split by length. Every item is checked before any is sent, and a batch
+  that does not fit what is left of `replies.max_messages` is refused whole, so a mistake never
+  leaves half a reply in the group. The messages then go out in order, each waiting for its
+  echo, and the call returns only when all have their outcome; its result shows each message as
+  delivered. The first failure stops the batch: what was sent is listed, the failing message is
+  reported as not sent or unconfirmed, the rest as not sent, and nothing is retried. The limit
+  counts messages, not calls, and a successful call ends the run unless `end_turn` is false.
   `stay_silent` makes silence explicit. `[at:N]` and `[contact:N]` may name only a member the
   run's context names (`OpenedContext::members`): someone who speaks in the visible chat, is
   mentioned in it, is named in a task's intent as `member:N`, or has an entry in the people
@@ -592,8 +599,8 @@ spend.
 Scenarios in `eval/scenarios/*.toml` (an English description and rubric, chat in any
 language, a trigger, optional notes, facts, group knowledge and canned web results) run through
 the production prompt layer, tools and run loop against the real text model over a simulated
-group. Deterministic checks (sent or silent, tools required or forbidden, members not to mention,
-a normal ending) are followed by an English LLM judge per rubric item; `--repeat N` because model
+group. Deterministic checks (sent or silent, how many messages and send calls, tools required or
+forbidden, members not to mention, a normal ending) are followed by an English LLM judge per rubric item; `--repeat N` because model
 output varies. It is run by hand and spends the text model's account. A changed prompt is run
 through it.
 

@@ -29,7 +29,8 @@ struct World {
     next_run: u64,
     summaries: HashMap<RunId, RunSummary>,
     sent: Vec<Vec<OutSegment>>,
-    fail_next_send: std::collections::VecDeque<DeliveryError>,
+    /// Outcomes of the next sends, in order: `None` delivers, `Some` fails.
+    fail_next_send: std::collections::VecDeque<Option<DeliveryError>>,
     /// How long opening a run's context takes, as a slow platform would make it.
     open_delay: Duration,
     fail_log: bool,
@@ -151,7 +152,16 @@ impl SimWorld {
 
     /// Make the next send fail with `error`; called again, the send after it too, in order.
     pub fn fail_next_send(&self, error: DeliveryError) {
-        self.lock().fail_next_send.push_back(error);
+        self.lock().fail_next_send.push_back(Some(error));
+    }
+
+    /// Deliver the next `delivered` sends, then fail the one after with `error`.
+    pub fn fail_send_after(&self, delivered: usize, error: DeliveryError) {
+        let mut world = self.lock();
+        world
+            .fail_next_send
+            .extend(std::iter::repeat_n(None, delivered));
+        world.fail_next_send.push_back(Some(error));
     }
 
     /// Make opening a run's context take `delay`.
@@ -328,7 +338,7 @@ impl Delivery for SimWorld {
     ) -> Result<Delivered, DeliveryError> {
         let delay = {
             let mut world = self.lock();
-            if let Some(error) = world.fail_next_send.pop_front() {
+            if let Some(Some(error)) = world.fail_next_send.pop_front() {
                 return Err(error);
             }
             world.echo_delay

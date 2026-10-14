@@ -13,8 +13,8 @@ trigger = { line = 1 }
 [expect]
 send = "required"
 rubric = [
-  "The bot rolls with the platform's dice: one send_message whose text is exactly [dice], with no number in it.",
-  "After the roll, it states the outcome from the result in the send_message tool result ([dice result:N]): the number it names matches N, and the winner follows the stated rule (odd: the bot wins, even: 阿凯 wins).",
+  "The bot rolls with the platform's dice: a sent message whose text is exactly [dice], with no number in it.",
+  "After the roll, it states the outcome from the result in the send_messages tool result ([dice result:N]): the number it names matches N, and the winner follows the stated rule (odd: the bot wins, even: 阿凯 wins).",
   "Before the result came back, it did not announce any number or winner.",
   "Its messages are short and in Chinese.",
 ]

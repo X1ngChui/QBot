@@ -17,6 +17,7 @@ trigger = { line = 3 }
 
 [expect]
 send = "required"
+send_calls_at_most = 1
 tools_required = ["schedule_task"]
 rubric = [
   "The bot created exactly one scheduled task (schedule_task succeeded once).",

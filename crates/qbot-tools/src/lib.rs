@@ -16,7 +16,7 @@ use qbot_sched::TaskService;
 pub use memory::{ReadEpisode, ReadEpisodeArgs, RecallArgs, RecallEpisodes, add_memory_tools};
 pub use query::parse_query;
 pub use search::{SearchArgs, SearchHistory, SearchSettings};
-pub use send::{SendArgs, SendMessage, StaySilent, StaySilentArgs};
+pub use send::{SendArgs, SendMessages, StaySilent, StaySilentArgs};
 pub use tasks::{
     CancelScheduledTask, GetScheduledTask, ListArgs, ListScheduledTasks, ScheduleArgs,
     ScheduleTask, TaskRef, UpdateArgs, UpdateScheduledTask,
@@ -39,7 +39,7 @@ pub fn standard_tools(
     settings: ToolSettings,
 ) -> Result<ToolSet, ToolSetError> {
     ToolSet::new()
-        .with(SendMessage::new(delivery, settings.max_sends_per_run))?
+        .with(SendMessages::new(delivery, settings.max_sends_per_run))?
         .with(StaySilent)?
         .with(SearchHistory::new(archive, settings.search))?
         .with(ScheduleTask(tasks.clone()))?

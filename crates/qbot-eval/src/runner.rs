@@ -108,7 +108,7 @@ impl PeopleSource for ScenarioPeople {
 }
 
 /// Whether `text` refers to someone by a member handle: `member:12`, `member 12`, `Member12`.
-/// The markers the model can only read: every system marker except the ones `send_message`
+/// The markers the model can only read: every system marker except the ones `send_messages`
 /// turns into message segments.
 const SENDABLE: [&str; 6] = ["at", "reply", "face", "dice", "rps", "contact"];
 
@@ -632,6 +632,26 @@ fn checks(
             },
             passed: sent_any == (rule == SendRule::Required),
             detail: format!("{} message(s) sent", sent.len()),
+        });
+    }
+    if let Some((from, to)) = scenario.expect.messages {
+        let n = u32::try_from(sent.len()).unwrap_or(u32::MAX);
+        out.push(Check {
+            what: if from == to {
+                format!("sends {from} message(s)")
+            } else {
+                format!("sends {from} to {to} messages")
+            },
+            passed: (from..=to).contains(&n),
+            detail: format!("{n} sent"),
+        });
+    }
+    if let Some(max) = scenario.expect.send_calls_at_most {
+        let n = calls.iter().filter(|c| c.name == "send_messages").count();
+        out.push(Check {
+            what: format!("sends in at most {max} send_messages call(s)"),
+            passed: u32::try_from(n).is_ok_and(|n| n <= max),
+            detail: format!("{n} call(s)"),
         });
     }
     let called = |name: &str| calls.iter().any(|c| c.name == name);

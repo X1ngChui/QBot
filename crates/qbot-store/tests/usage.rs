@@ -110,7 +110,7 @@ async fn run_tool_and_provider_events_are_stored_and_flushed_on_shutdown() {
                 1,
                 10,
                 UsageDetail::Tool {
-                    name: "send_message".into(),
+                    name: "send_messages".into(),
                     outcome,
                 },
             ),

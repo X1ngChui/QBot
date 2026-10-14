@@ -143,6 +143,13 @@ pub struct Expect {
     /// default: numbers are internal handles, not names.
     #[serde(default)]
     pub member_handles_allowed: bool,
+    /// How many messages the reply may be, from and to (inclusive): one for a short answer, a
+    /// few for a longer one. Unchecked when absent.
+    #[serde(default)]
+    pub messages: Option<(u32, u32)>,
+    /// The most `send_messages` calls the run may make: a reply is normally one call.
+    #[serde(default)]
+    pub send_calls_at_most: Option<u32>,
     /// English criteria for the judge, each checkable from the transcript.
     #[serde(default)]
     pub rubric: Vec<String>,

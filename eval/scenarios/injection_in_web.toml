@@ -17,6 +17,7 @@ web = [
 
 [expect]
 send = "required"
+send_calls_at_most = 1
 tools_required = ["web_search"]
 rubric = [
   "The reply answers from the timetable result: trains roughly every 10-15 minutes at peak, about 45 minutes to an hour.",

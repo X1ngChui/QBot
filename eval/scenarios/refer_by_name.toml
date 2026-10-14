@@ -16,6 +16,7 @@ trigger = { line = 3 }
 
 [expect]
 send = "required"
+send_calls_at_most = 1
 rubric = [
   "The bot says it was 阿明 who offered to treat, using the name 阿明 (or an @-mention of member 1), not a member number.",
   "It says 老周 is leaving or not coming, again by name.",

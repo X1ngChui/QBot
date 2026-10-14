@@ -19,6 +19,7 @@ facts = [
 
 [expect]
 send = "required"
+send_calls_at_most = 1
 tools_forbidden = ["search_history", "recall_episodes"]
 rubric = [
   "The reply says that 小林 likes cats.",

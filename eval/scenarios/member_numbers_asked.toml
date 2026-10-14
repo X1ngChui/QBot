@@ -14,6 +14,7 @@ trigger = { line = 2 }
 
 [expect]
 send = "required"
+send_calls_at_most = 1
 member_handles_allowed = true
 rubric = [
   "The bot tells 阿凯 that their number is 1 (as member:1, 1号 or similar), answering the question directly.",

@@ -21,6 +21,7 @@ trigger = { line = 5 }
 
 [expect]
 send = "required"
+send_calls_at_most = 1
 rubric = [
   "The bot answers 小雨 (member 2), not the advertiser.",
   "It briefly says what the advertiser posted (an offer to add them as a friend for coupons) without promoting it.",

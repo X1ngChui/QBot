@@ -179,7 +179,7 @@ async fn the_daily_report_and_housekeeping_read_what_happened() {
         .execute(db.pool())
         .await
         .unwrap();
-    sqlx::query("INSERT INTO usage_event (at_ms, group_id, run_id, turn, kind, tool, status, latency_ms) VALUES ($1, 21, 1, 0, 'tool', 'send_message', 'ok', 1), ($1, 21, 1, 0, 'tool', 'search_history', 'error', 1)")
+    sqlx::query("INSERT INTO usage_event (at_ms, group_id, run_id, turn, kind, tool, status, latency_ms) VALUES ($1, 21, 1, 0, 'tool', 'send_messages', 'ok', 1), ($1, 21, 1, 0, 'tool', 'search_history', 'error', 1)")
         .bind(T0)
         .execute(db.pool())
         .await

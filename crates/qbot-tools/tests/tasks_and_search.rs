@@ -175,8 +175,8 @@ async fn a_task_the_model_schedules_wakes_it_later_and_it_can_speak_then() {
 
     // The woken run speaks.
     r.fake.push(reply(call(
-        "send_message",
-        json!({ "text": "Meeting time!" }),
+        "send_messages",
+        json!({ "messages": ["Meeting time!"] }),
     )));
     sleep(Duration::from_secs(601)).await;
     sleep(Duration::from_secs(1)).await;
@@ -343,7 +343,7 @@ async fn tool_specs_come_from_the_argument_types() {
     assert_eq!(
         names,
         &[
-            "send_message",
+            "send_messages",
             "stay_silent",
             "search_history",
             "schedule_task",

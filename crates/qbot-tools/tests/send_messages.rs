@@ -12,7 +12,7 @@ use serde_json::json;
 async fn try_calls(r: &Rig, calls: Vec<serde_json::Value>) -> Vec<qbot_context::ToolResult> {
     let mut turn = qbot_llm::fake::FakeReply::new();
     for args in calls {
-        turn = turn.call("send_message", args);
+        turn = turn.call("send_messages", args);
     }
     r.fake.push(reply(turn));
     r.fake.push(done());
@@ -172,11 +172,13 @@ async fn a_model_cannot_choose_a_game_result() {
 async fn dice_results_come_back_through_the_echo_and_a_run_can_react() {
     let r = rig(vec![]);
     r.fake.push(reply(call(
-        "send_message",
-        json!({ "text": " [dice] ", "end_turn": false }),
+        "send_messages",
+        json!({ "messages": [" [dice] "], "end_turn": false }),
     )));
-    r.fake
-        .push(reply(call("send_message", json!({ "text": "nice roll" }))));
+    r.fake.push(reply(call(
+        "send_messages",
+        json!({ "messages": ["nice roll"] }),
+    )));
     let report = r.ask(1, 1, "roll a dice").await;
     let results = r.last_run_results();
     // The request carries no result: the segment has nowhere to put one.
@@ -245,7 +247,7 @@ async fn only_a_message_that_may_be_in_the_group_counts_as_sent() {
     r.world
         .fail_next_send(DeliveryError::Rejected("muted by the platform".into()));
     r.fake.push(reply(
-        qbot_llm::fake::FakeReply::new().call("send_message", send("x")),
+        qbot_llm::fake::FakeReply::new().call("send_messages", send("x")),
     ));
     r.fake.push(done());
     let report = r.ask(1, 1, "hello bot").await;
@@ -256,7 +258,7 @@ async fn only_a_message_that_may_be_in_the_group_counts_as_sent() {
     r.world
         .fail_next_send(DeliveryError::Unconfirmed("no echo".into()));
     r.fake.push(reply(
-        qbot_llm::fake::FakeReply::new().call("send_message", send("x")),
+        qbot_llm::fake::FakeReply::new().call("send_messages", send("x")),
     ));
     r.fake.push(done());
     assert_eq!(r.ask(1, 1, "hello bot").await.sends, 1);
@@ -272,7 +274,7 @@ async fn only_a_message_that_may_be_in_the_group_counts_as_sent() {
     }
     let mut turn = qbot_llm::fake::FakeReply::new();
     for args in calls {
-        turn = turn.call("send_message", args);
+        turn = turn.call("send_messages", args);
     }
     r.fake.push(reply(turn));
     r.fake.push(done());
@@ -319,4 +321,216 @@ async fn a_members_contact_card_is_sent_alone_and_only_for_members_of_this_chat(
         "no card for anyone outside this chat"
     );
     assert_eq!(r.world.sent(), [vec![OutSegment::Contact(account(2))]]);
+}
+
+/// One `send_messages` call with these messages, then done if it did not end the run.
+async fn batch(r: &Rig, messages: &[&str], end_turn: Option<bool>) -> qbot_agent::RunReport {
+    let mut args = json!({ "messages": messages });
+    if let Some(end) = end_turn {
+        args["end_turn"] = json!(end);
+    }
+    r.fake.push(reply(call("send_messages", args)));
+    r.fake.push(done());
+    r.ask(1, 1, "tell me about it").await
+}
+
+fn texts(r: &Rig) -> Vec<String> {
+    r.world
+        .sent()
+        .iter()
+        .map(|segments| match segments.as_slice() {
+            [OutSegment::Text(text)] => text.clone(),
+            other => format!("{other:?}"),
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn one_call_sends_several_messages_in_order_and_reports_each() {
+    let r = rig(vec![]);
+    let report = batch(&r, &["first part", "second part", "and the last"], None).await;
+    assert_eq!(texts(&r), ["first part", "second part", "and the last"]);
+    let results = r.last_run_results();
+    assert_eq!(results.len(), 1, "one tool call, one result");
+    assert_eq!(results[0].outcome, Outcome::Ok);
+    let lines: Vec<String> = text_of(&results[0]).lines().map(str::to_owned).collect();
+    assert_eq!(lines.len(), 3);
+    for (line, text) in lines
+        .iter()
+        .zip(["first part", "second part", "and the last"])
+    {
+        assert!(
+            line.starts_with("sent [msg:") && line.ends_with(text),
+            "{line}"
+        );
+    }
+    // Every message counts, the call ends the run, and the model was asked once.
+    assert_eq!(
+        (report.sends, report.end, report.turns),
+        (3, RunEnd::Delivered, 1)
+    );
+    assert_eq!(report.tool_calls, 1);
+}
+
+#[tokio::test]
+async fn the_model_continues_only_after_every_message_is_echoed() {
+    let r = rig(vec![]);
+    r.world.set_echo_delay(std::time::Duration::from_millis(50));
+    r.fake.push(reply(call(
+        "send_messages",
+        json!({ "messages": ["one", "two"], "end_turn": false }),
+    )));
+    r.fake.push(reply(call("stay_silent", json!({}))));
+    let report = r.ask(1, 1, "go on").await;
+    assert_eq!(report.sends, 2);
+    // The next turn sees both delivered messages in the tool result, and no echo of them again
+    // as new chat.
+    let followup = format!("{:?}", r.fake.recorded()[1].conversation);
+    assert!(
+        followup.contains("one") && followup.contains("two"),
+        "{followup}"
+    );
+    let echoes_as_chat = r.fake.recorded()[1]
+        .conversation
+        .items()
+        .iter()
+        .filter(|i| matches!(i, qbot_llm::ConvItem::Message(m) if format!("{m:?}").contains("bot: one")))
+        .count();
+    assert_eq!(
+        echoes_as_chat, 0,
+        "the run's own messages are not shown again"
+    );
+}
+
+#[tokio::test]
+async fn a_mistake_in_any_message_sends_none_of_them() {
+    let r = rig(vec![]);
+    r.world.say(2, 2, "hi");
+    batch(&r, &["fine", "[at:77] who?", "also fine"], None).await;
+    assert!(r.world.sent().is_empty(), "nothing went out");
+    let result = &r.last_run_results()[0];
+    assert_eq!(result.outcome, Outcome::Refused(RefusalReason::NotAllowed));
+    let text = text_of(result);
+    assert!(
+        text.starts_with("message 2:") && text.contains("nothing was sent"),
+        "{text}"
+    );
+
+    let r = rig(vec![]);
+    batch(&r, &["ok", "[dice] and words"], None).await;
+    assert!(r.world.sent().is_empty());
+    assert_eq!(
+        r.last_run_results()[0].outcome,
+        Outcome::Error(ErrorKind::InvalidArguments)
+    );
+
+    let r = rig(vec![]);
+    batch(&r, &[], None).await;
+    assert!(r.world.sent().is_empty());
+    assert!(text_of(&r.last_run_results()[0]).contains("at least one message"));
+}
+
+#[tokio::test]
+async fn a_batch_larger_than_what_is_left_of_the_limit_is_refused_whole() {
+    // The rig allows four messages a run: two now leave two.
+    let r = rig(vec![]);
+    let two = call(
+        "send_messages",
+        json!({ "messages": ["a", "b"], "end_turn": false }),
+    );
+    let three = call(
+        "send_messages",
+        json!({ "messages": ["c", "d", "e"], "end_turn": false }),
+    );
+    r.fake.push(reply(two.clone()));
+    r.fake.push(reply(three));
+    r.fake.push(reply(two));
+    r.fake.push(done());
+    let report = r.ask(1, 1, "talk").await;
+    assert_eq!(texts(&r), ["a", "b", "a", "b"], "the three never went out");
+    let results = r.last_run_results();
+    assert_eq!(
+        results[1].outcome,
+        Outcome::Refused(RefusalReason::LimitReached)
+    );
+    assert!(
+        text_of(&results[1]).contains("only 2 more"),
+        "{}",
+        text_of(&results[1])
+    );
+    assert_eq!(report.sends, 4);
+}
+
+#[tokio::test]
+async fn a_failure_stops_the_batch_and_nothing_is_sent_twice() {
+    // Refused by the platform: the first went out, the second did not, the third was not tried.
+    let r = rig(vec![]);
+    r.world
+        .fail_send_after(1, DeliveryError::Rejected("muted".into()));
+    let report = batch(&r, &["one", "two", "three"], None).await;
+    assert_eq!(texts(&r), ["one"]);
+    let result = &r.last_run_results()[0];
+    assert_eq!(result.outcome, Outcome::Error(ErrorKind::Execution));
+    let text = text_of(result);
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(
+        lines[0].starts_with("sent [msg:") && lines[0].ends_with("one"),
+        "{text}"
+    );
+    assert!(
+        lines[1].starts_with("message 2 failed:") && lines[1].contains("muted"),
+        "{text}"
+    );
+    assert!(
+        lines[2].starts_with("messages 3 to 3 were not sent"),
+        "{text}"
+    );
+    assert_eq!(report.sends, 1, "only what reached the group counts");
+    assert_eq!(report.turns, 2, "the failed call did not end the run");
+
+    // Unconfirmed: it may be in the group, so it counts, is not retried, and the rest wait.
+    let r = rig(vec![]);
+    r.world
+        .fail_send_after(0, DeliveryError::Unconfirmed("no echo".into()));
+    let report = batch(&r, &["one", "two"], None).await;
+    assert!(r.world.sent().is_empty(), "the sim never delivered it");
+    let text = text_of(&r.last_run_results()[0]);
+    assert!(
+        text.contains("message 1 failed:") && text.contains("do not send it again"),
+        "{text}"
+    );
+    assert!(text.contains("messages 2 to 2 were not sent"), "{text}");
+    assert_eq!(report.sends, 1);
+
+    // No connection at all: unavailable, nothing counts.
+    let r = rig(vec![]);
+    r.world
+        .fail_send_after(0, DeliveryError::Unavailable("gateway down".into()));
+    let report = batch(&r, &["one", "two"], None).await;
+    assert_eq!(
+        r.last_run_results()[0].outcome,
+        Outcome::Error(ErrorKind::Unavailable)
+    );
+    assert_eq!((report.sends, report.end), (0, RunEnd::Completed));
+}
+
+#[tokio::test]
+async fn end_turn_false_lets_the_run_go_on_after_a_batch_with_a_dice_roll() {
+    let r = rig(vec![]);
+    r.fake.push(reply(call(
+        "send_messages",
+        json!({ "messages": ["let's see", "[dice]"], "end_turn": false }),
+    )));
+    r.fake.push(reply(call(
+        "send_messages",
+        json!({ "messages": ["there it is"] }),
+    )));
+    let report = r.ask(1, 1, "roll for me").await;
+    assert_eq!(r.world.sent()[1], [OutSegment::Dice]);
+    let first = text_of(&r.last_run_results()[0]);
+    assert!(first.contains("[dice result:"), "{first}");
+    assert_eq!(
+        (report.turns, report.sends, report.end),
+        (2, 3, RunEnd::Delivered)
+    );
 }

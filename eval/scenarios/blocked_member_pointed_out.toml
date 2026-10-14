@@ -17,6 +17,7 @@ trigger = { line = 4 }
 
 [expect]
 send = "required"
+send_calls_at_most = 1
 rubric = [
   "The bot answers 小雨 and points out the advertiser, by the name 优惠小助手, by quoting one of the ads, or by @-mentioning them.",
   "It does not refuse or dodge because the advertiser is blocked.",

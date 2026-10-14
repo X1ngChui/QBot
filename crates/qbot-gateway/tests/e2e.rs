@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 //! A simulated NapCat talking to the real gateway, pipeline, supervisor, run loop and
-//! `send_message` tool. Only the database (archive, run log) and the model are stand-ins.
+//! `send_messages` tool. Only the database (archive, run log) and the model are stand-ins.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -24,7 +24,7 @@ use qbot_gateway::server::{GatewayServer, serve};
 use qbot_gateway::trigger::Nicknames;
 use qbot_llm::ReasoningEffort;
 use qbot_llm::fake::{FakeProvider, FakeReply, Step};
-use qbot_tools::SendMessage;
+use qbot_tools::SendMessages;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
@@ -144,7 +144,7 @@ async fn rig_full(script: Vec<Step>, echo: Duration, spontaneous_chance: f64) ->
     let deps = Arc::new(RunDeps {
         provider: fake.clone(),
         tools: ToolSet::new()
-            .with(SendMessage::new(delivery.clone(), 4))
+            .with(SendMessages::new(delivery.clone(), 4))
             .unwrap(),
         archive: world.clone() as Arc<dyn Archive>,
         log: world.clone() as Arc<dyn RunLog>,
@@ -257,7 +257,7 @@ async fn settle(rig: &Rig) {
 
 fn send_script(text: &str) -> Vec<Step> {
     vec![Step::Reply(
-        FakeReply::new().call("send_message", json!({ "text": text })),
+        FakeReply::new().call("send_messages", json!({ "messages": [text] })),
     )]
 }
 
@@ -343,16 +343,18 @@ async fn a_dice_roll_is_requested_without_a_result_and_the_run_continues_from_th
     let rig = rig(vec![
         // A numbered marker is refused before anything reaches the platform...
         Step::Reply(FakeReply::new().call(
-            "send_message",
-            json!({ "text": "[dice:6]", "end_turn": false }),
+            "send_messages",
+            json!({ "messages": ["[dice:6]"], "end_turn": false }),
         )),
         // ...so the model asks the platform to roll and waits for what it came up with...
         Step::Reply(FakeReply::new().call(
-            "send_message",
-            json!({ "text": "[dice]", "end_turn": false }),
+            "send_messages",
+            json!({ "messages": ["[dice]"], "end_turn": false }),
         )),
         // ...and reacts to it.
-        Step::Reply(FakeReply::new().call("send_message", json!({ "text": "two, you win" }))),
+        Step::Reply(
+            FakeReply::new().call("send_messages", json!({ "messages": ["two, you win"] })),
+        ),
     ])
     .await;
     let mut napcat = connect(&rig, Some("sesame")).await.unwrap();
@@ -771,7 +773,7 @@ async fn only_spontaneous_runs_are_one_per_group_and_other_runs_still_overlap_th
     let rig = rig_full(
         vec![
             // The spontaneous run speaks; its send is left unanswered, so it stays in flight.
-            Step::Reply(FakeReply::new().call("send_message", json!({ "text": "oh nice" }))),
+            Step::Reply(FakeReply::new().call("send_messages", json!({ "messages": ["oh nice"] }))),
             // The addressed run that starts meanwhile.
             Step::Reply(FakeReply::new().text("hello")),
         ],

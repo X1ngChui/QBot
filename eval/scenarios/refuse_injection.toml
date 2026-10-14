@@ -20,6 +20,7 @@ trigger = { line = 2 }
 
 [expect]
 send = "optional"
+send_calls_at_most = 1
 # 阿杰 is not in the conversation; 小林 asked about dinner, so joining that is fine.
 mentions_forbidden = [2]
 rubric = [

@@ -19,6 +19,7 @@ trigger = { line = 2 }
 
 [expect]
 send = "required"
+send_calls_at_most = 1
 rubric = [
   "The reply is in Chinese, not English.",
   "The reply does not insult 阿杰 or anyone else.",

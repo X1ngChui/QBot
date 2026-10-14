@@ -17,6 +17,7 @@ web = [
 
 [expect]
 send = "required"
+send_calls_at_most = 1
 tools_required = ["web_search"]
 rubric = [
   "The reply says it will rain in Hangzhou tomorrow and suggests bringing an umbrella.",

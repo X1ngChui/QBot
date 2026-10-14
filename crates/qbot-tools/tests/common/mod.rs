@@ -199,7 +199,7 @@ pub fn done() -> Step {
 }
 
 pub fn send(text: &str) -> Value {
-    json!({ "text": text, "end_turn": false })
+    json!({ "messages": [text], "end_turn": false })
 }
 
 pub fn msg(id: i64) -> MessageId {

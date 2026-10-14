@@ -3,15 +3,19 @@
 # are the templates next to this file. `{name}` is a slot the code fills; each text's slots are
 # fixed by `qbot-wording`, and a test keeps this file and the code in step. English only.
 
-[tools.send_message]
-description = "Send one message to the group: the only way to speak. The result shows the message as the platform delivered it, including the outcome of [dice] or [rps]."
-param_text = "Plain text (QQ shows no Markdown). These markers, and only these, become part of the message: start with [reply:ID] to quote message ID; [at:N] mentions member N; [face:N] is a QQ face. [dice] and [rps] (asking the platform to roll or play, never with an outcome) and [contact:N] (member N's contact card) must be the whole message. Every other marker you read in the chat ([image:...], [link:...], [file:...] and the rest) describes what others sent and cannot be sent: written here it would reach the group as literal text."
-param_end_turn = "Whether the run ends after this message; defaults to true. Set false to go on, for example to react to the outcome of [dice] or [rps]."
+[tools.send_messages]
+description = "Send your reply to the group: the only way to speak. Each item of messages is one QQ message, sent in order. Most replies are a single message; a sentence or two always is. Only a reply long enough to be a wall of text in one message goes out as a few messages, split where a person would naturally pause, each a complete thought; a run sends at most {max} messages in all. Never add a message just to say more than the reply needs. The result comes once every message has been sent and shows each as the platform delivered it, including the outcome of [dice] or [rps]."
+param_messages = "The reply's messages in order, usually just one; each is its own QQ message in plain text (QQ shows no Markdown). Quote ([reply:ID]) once, on the first message, unless a later one answers a different message. These markers, and only these, become part of a message: start it with [reply:ID] to quote message ID; [at:N] mentions member N; [face:N] is a QQ face. [dice] and [rps] (asking the platform to roll or play, never with an outcome) and [contact:N] (member N's contact card) must be a whole message by themselves. Every other marker you read in the chat ([image:...], [link:...], [file:...] and the rest) describes what others sent and cannot be sent: written here it would reach the group as literal text."
+param_end_turn = "Whether the run ends after these messages; defaults to true. Set false to go on, for example to react to the outcome of [dice] or [rps]."
 sent = "sent [msg:{id}] {text}"
-limit = "at most {max} messages can be sent per run"
+limit = "at most {max} messages can be sent per run, so only {left} more now; nothing was sent"
 rejected = "the platform rejected the message: {reason}"
 unconfirmed = "the message was not confirmed and may already be in the group; do not send it again"
 empty = "the message is empty"
+none = "give at least one message"
+item = "message {n}: {problem}; nothing was sent"
+failed = "message {n} failed: {problem}"
+stopped = "messages {from} to {to} were not sent: sending stops at the first message that fails"
 alone = "[dice], [rps] or [contact:N] must be the whole message, with nothing else in it"
 chosen_result = "you cannot choose the result: send [{name}] alone and the platform rolls or plays; what it came up with comes back in this tool's result as [{name} result:...]"
 reply_first = "a quote ([reply:ID]) must come first in the message"

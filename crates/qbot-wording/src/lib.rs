@@ -69,25 +69,29 @@ macro_rules! wording {
 }
 
 wording! {
-    "tools.send_message.description" => SendMessageDescription {},
-    "tools.send_message.param_text" => SendMessageParamText {},
-    "tools.send_message.param_end_turn" => SendMessageParamEndTurn {},
-    "tools.send_message.sent" => SendMessageSent { id, text },
-    "tools.send_message.limit" => SendMessageLimit { max },
-    "tools.send_message.rejected" => SendMessageRejected { reason },
-    "tools.send_message.unconfirmed" => SendMessageUnconfirmed {},
-    "tools.send_message.empty" => SendMessageEmpty {},
-    "tools.send_message.alone" => SendMessageAlone {},
-    "tools.send_message.chosen_result" => SendMessageChosenResult { name },
-    "tools.send_message.reply_first" => SendMessageReplyFirst {},
-    "tools.send_message.no_member" => SendMessageNoMember { member },
-    "tools.send_message.no_message" => SendMessageNoMessage { id },
-    "tools.send_message.not_message_id" => SendMessageNotMessageId { id },
-    "tools.send_message.needs_member" => SendMessageNeedsMember { name },
-    "tools.send_message.needs_face" => SendMessageNeedsFace { name },
-    "tools.send_message.needs_message" => SendMessageNeedsMessage { name },
-    "tools.send_message.too_large" => SendMessageTooLarge { name },
-    "tools.send_message.at_all" => SendMessageAtAll {},
+    "tools.send_messages.description" => SendMessagesDescription { max },
+    "tools.send_messages.param_messages" => SendMessagesParamMessages {},
+    "tools.send_messages.param_end_turn" => SendMessagesParamEndTurn {},
+    "tools.send_messages.sent" => SendMessagesSent { id, text },
+    "tools.send_messages.limit" => SendMessagesLimit { max, left },
+    "tools.send_messages.rejected" => SendMessagesRejected { reason },
+    "tools.send_messages.unconfirmed" => SendMessagesUnconfirmed {},
+    "tools.send_messages.empty" => SendMessagesEmpty {},
+    "tools.send_messages.none" => SendMessagesNone {},
+    "tools.send_messages.item" => SendMessagesItem { n, problem },
+    "tools.send_messages.failed" => SendMessagesFailed { n, problem },
+    "tools.send_messages.stopped" => SendMessagesStopped { from, to },
+    "tools.send_messages.alone" => SendMessagesAlone {},
+    "tools.send_messages.chosen_result" => SendMessagesChosenResult { name },
+    "tools.send_messages.reply_first" => SendMessagesReplyFirst {},
+    "tools.send_messages.no_member" => SendMessagesNoMember { member },
+    "tools.send_messages.no_message" => SendMessagesNoMessage { id },
+    "tools.send_messages.not_message_id" => SendMessagesNotMessageId { id },
+    "tools.send_messages.needs_member" => SendMessagesNeedsMember { name },
+    "tools.send_messages.needs_face" => SendMessagesNeedsFace { name },
+    "tools.send_messages.needs_message" => SendMessagesNeedsMessage { name },
+    "tools.send_messages.too_large" => SendMessagesTooLarge { name },
+    "tools.send_messages.at_all" => SendMessagesAtAll {},
     "tools.stay_silent.description" => StaySilentDescription {},
     "tools.stay_silent.result" => StaySilentResult {},
     "tools.search_history.description" => SearchHistoryDescription {},
@@ -349,8 +353,12 @@ mod tests {
             );
         }
         assert_eq!(
-            Text::SendMessageLimit { max: "4".into() }.render(),
-            "at most 4 messages can be sent per run"
+            Text::SendMessagesLimit {
+                max: "4".into(),
+                left: "1".into()
+            }
+            .render(),
+            "at most 4 messages can be sent per run, so only 1 more now; nothing was sent"
         );
         assert_eq!(say(Text::StaySilentResult {}), "staying silent");
     }

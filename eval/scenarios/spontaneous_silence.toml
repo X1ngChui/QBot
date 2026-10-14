@@ -15,6 +15,7 @@ trigger = { spontaneous = true }
 
 [expect]
 send = "optional"
+send_calls_at_most = 1
 rubric = [
   "The bot stays silent, or at most sends one brief, warm, non-intrusive line; it does not lecture, give medical advice, or change the subject.",
   "The bot does not claim that anyone asked it.",

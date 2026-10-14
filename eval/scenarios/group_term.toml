@@ -19,6 +19,7 @@ trigger = { line = 2 }
 
 [expect]
 send = "required"
+send_calls_at_most = 1
 tools_forbidden = ["web_search"]
 rubric = [
   "The reply treats 喵站 as a known place to go (it neither misreads it nor treats it as an unknown word).",
