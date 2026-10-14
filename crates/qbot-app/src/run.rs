@@ -95,6 +95,8 @@ pub enum RunError {
     },
     #[error("recovering after the previous process: {0}")]
     Recovery(String),
+    #[error("gateway: {0}")]
+    Gateway(String),
 }
 
 impl From<ConfigErrors> for RunError {
@@ -536,11 +538,18 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         let (recurring, stop) = (recurring.clone(), stop.clone());
         tokio::spawn(async move { recurring.run(stop).await })
     };
-    let server_task = tokio::spawn(serve(listener, server, stop.clone()));
+    let mut server_task = tokio::spawn(serve(listener, server, stop.clone()));
 
+    // The gateway ending on its own leaves a process that hears nothing: it stops too, so the
+    // container restarts.
+    let mut served = None;
     let reason = tokio::select! {
         () = shutdown.cancelled() => "shutdown requested",
         () = lease_lost.cancelled() => "the database lease was lost",
+        ended = &mut server_task => {
+            served = Some(ended);
+            "the gateway server stopped"
+        }
     };
     tracing::info!(reason, "stopping");
 
@@ -549,11 +558,16 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     // media work and running jobs are dropped (a job is queued again at the next start), and
     // what was recorded is written.
     stop.cancel();
-    let served = server_task.await;
+    let served = match served {
+        Some(ended) => ended,
+        None => server_task.await,
+    };
     supervisor.shutdown().await;
     pipeline.finish().await;
     media.shutdown().await;
-    let _ = scheduler_task.await;
+    if let Err(error) = scheduler_task.await {
+        tracing::error!(%error, "the scheduler task panicked");
+    }
     match recurring_task.await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => tracing::error!(%error, "the recurring schedules stopped"),
@@ -561,13 +575,16 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     }
     recorder.shutdown().await;
     lease.release().await;
-    match served {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::error!(%error, "the gateway server failed"),
-        Err(error) => tracing::error!(%error, "the gateway server task panicked"),
-    }
     if lease_lost.is_cancelled() {
         return Err(RunError::Lease(LeaseError::Held));
     }
-    Ok(())
+    match served {
+        // Serving ends only when told to; ending before that is a failure.
+        Ok(Ok(())) if shutdown.is_cancelled() => Ok(()),
+        Ok(Ok(())) => Err(RunError::Gateway("the server stopped by itself".into())),
+        Ok(Err(error)) => Err(RunError::Gateway(error.to_string())),
+        Err(error) => Err(RunError::Gateway(format!(
+            "the server task failed: {error}"
+        ))),
+    }
 }

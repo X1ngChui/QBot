@@ -75,7 +75,7 @@ impl Delivery for PgDelivery {
             .map_err(|e| DeliveryError::Unavailable(e.to_string()))?
         {
             Appended::Stored { line, .. } => Ok(Delivered { echo: line }),
-            Appended::Duplicate => Err(DeliveryError::EchoMissing),
+            Appended::Duplicate => Err(DeliveryError::Unconfirmed("already archived".into())),
         }
     }
 }

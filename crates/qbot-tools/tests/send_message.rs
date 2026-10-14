@@ -225,7 +225,8 @@ async fn delivery_failures_are_reported_distinctly() {
     assert!(text_of(&results[0]).contains("muted by the platform"));
 
     let r = rig(vec![]);
-    r.world.fail_next_send(DeliveryError::EchoMissing);
+    r.world
+        .fail_next_send(DeliveryError::Unconfirmed("no echo".into()));
     let results = try_calls(&r, vec![send("x")]).await;
     assert!(text_of(&results[0]).contains("do not send it again"));
 
@@ -234,6 +235,53 @@ async fn delivery_failures_are_reported_distinctly() {
         .fail_next_send(DeliveryError::Unavailable("gateway down".into()));
     let results = try_calls(&r, vec![send("x")]).await;
     assert_eq!(results[0].outcome, Outcome::Error(ErrorKind::Unavailable));
+}
+
+#[tokio::test]
+async fn only_a_message_that_may_be_in_the_group_counts_as_sent() {
+    // Refused by the platform: nothing reached the group, so the slot is given back and the
+    // run did not speak.
+    let r = rig(vec![]);
+    r.world
+        .fail_next_send(DeliveryError::Rejected("muted by the platform".into()));
+    r.fake.push(reply(
+        qbot_llm::fake::FakeReply::new().call("send_message", send("x")),
+    ));
+    r.fake.push(done());
+    let report = r.ask(1, 1, "hello bot").await;
+    assert_eq!((report.sends, report.end), (0, RunEnd::Completed));
+
+    // Unconfirmed: the message may be there, so it counts.
+    let r = rig(vec![]);
+    r.world
+        .fail_next_send(DeliveryError::Unconfirmed("no echo".into()));
+    r.fake.push(reply(
+        qbot_llm::fake::FakeReply::new().call("send_message", send("x")),
+    ));
+    r.fake.push(done());
+    assert_eq!(r.ask(1, 1, "hello bot").await.sends, 1);
+
+    // Four refused sends leave the whole budget of four.
+    let r = rig(vec![]);
+    let mut calls = Vec::new();
+    for _ in 0..4 {
+        calls.push(send("x"));
+    }
+    for i in 0..4 {
+        calls.push(send(&i.to_string()));
+    }
+    let mut turn = qbot_llm::fake::FakeReply::new();
+    for args in calls {
+        turn = turn.call("send_message", args);
+    }
+    r.fake.push(reply(turn));
+    r.fake.push(done());
+    for _ in 0..4 {
+        r.world
+            .fail_next_send(DeliveryError::Unavailable("gateway down".into()));
+    }
+    let report = r.ask(1, 1, "hello bot").await;
+    assert_eq!(report.sends, 4);
 }
 
 #[tokio::test]

@@ -104,6 +104,8 @@ struct Inner {
     timers: BTreeMap<TimerId, Timer>,
     next_id: u64,
     recurrences: BTreeMap<String, UnixMillis>,
+    /// Reads of the next due instant that fail, as an unreachable database would.
+    next_due_failures: usize,
 }
 
 #[derive(Default)]
@@ -124,6 +126,11 @@ impl MemoryTimerStore {
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Make the next `count` reads of the next due instant fail, for tests of a store outage.
+    pub fn fail_next_due(&self, count: usize) {
+        self.lock().next_due_failures = count;
     }
 
     /// Every timer, for assertions.
@@ -388,8 +395,12 @@ impl TimerStore for MemoryTimerStore {
     }
 
     async fn next_due(&self) -> Result<Option<UnixMillis>, StoreError> {
-        Ok(self
-            .lock()
+        let mut inner = self.lock();
+        if inner.next_due_failures > 0 {
+            inner.next_due_failures -= 1;
+            return Err(StoreError::Backend("unreachable".into()));
+        }
+        Ok(inner
             .timers
             .values()
             .filter_map(|t| match &t.state {

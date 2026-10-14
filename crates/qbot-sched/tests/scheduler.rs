@@ -516,3 +516,19 @@ async fn a_job_that_comes_due_between_two_clock_readings_is_not_stranded() {
     r.shutdown.cancel();
     handle.await.unwrap();
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_store_that_cannot_say_what_comes_due_next_is_asked_again() {
+    let r = rig(vec![], 4);
+    r.store
+        .insert_job(r.clock_now().plus(mins(10)), JobKind::Backup, None)
+        .await
+        .unwrap();
+    r.store.fail_next_due(1);
+    let handle = r.start();
+    // Nothing notifies the loop: only asking the store again finds the job.
+    sleep(mins(11)).await;
+    assert_eq!(r.jobs.runs.lock().unwrap().len(), 1, "the job ran when due");
+    r.shutdown.cancel();
+    handle.await.unwrap();
+}

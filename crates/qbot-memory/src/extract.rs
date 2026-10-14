@@ -276,6 +276,12 @@ impl EpisodeExtractor {
                         .collect();
                 }
             }
+            tracing::info!(
+                attempt,
+                findings_only = only_findings,
+                ?problems,
+                "extraction answer sent back for correction"
+            );
             // Send the answer back with the reasons, as the next turn of the same exchange.
             items.push(ConvItem::Assistant(AssistantTurn::new(
                 turn.parts()

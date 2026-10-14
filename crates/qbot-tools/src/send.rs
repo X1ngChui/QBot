@@ -238,19 +238,26 @@ impl Tool for SendMessage {
                 }),
             ));
         }
-        let delivered =
-            self.delivery
-                .send(cx.group, segments)
-                .await
-                .map_err(|error| match error {
+        let delivered = self
+            .delivery
+            .send(cx.group, segments)
+            .await
+            .map_err(|error| {
+                // A message that never reached the group neither counts against the limit nor
+                // makes the run one that spoke.
+                if error.not_sent() {
+                    cx.state.release_send();
+                }
+                match error {
                     DeliveryError::Rejected(reason) => {
                         ToolError::Failed(say(Text::SendMessageRejected { reason }))
                     }
-                    DeliveryError::EchoMissing => {
+                    DeliveryError::Unavailable(message) => ToolError::Unavailable(message),
+                    DeliveryError::Unconfirmed(_) => {
                         ToolError::Failed(say(Text::SendMessageUnconfirmed {}))
                     }
-                    DeliveryError::Unavailable(message) => ToolError::Unavailable(message),
-                })?;
+                }
+            })?;
         cx.state.note_observed(delivered.echo.message);
         Ok(ToolOutput::text(say(Text::SendMessageSent {
             id: delivered.echo.message.get().to_string(),

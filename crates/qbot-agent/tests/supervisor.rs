@@ -329,3 +329,29 @@ async fn every_run_gets_a_finished_record_even_one_that_never_started() {
     let queued = h.world.summary(b.run).unwrap();
     assert_eq!((queued.end, queued.turns), (RunEnd::Deadline, 0));
 }
+
+#[tokio::test]
+async fn opening_a_runs_context_is_bounded_by_the_deadline_and_by_shutdown() {
+    // The platform stalls while names are asked for: the run ends at its deadline.
+    let h = harness(vec![reply_ok(say("hi"))]);
+    h.world.delay_open(Duration::from_secs(3600));
+    let sup = supervisor(&h, cfg(8, 4, 1));
+    h.world.say(1, 1, "hey bot");
+    let report = tokio::time::timeout(
+        Duration::from_secs(10),
+        sup.submit(request(1, 101)).await.unwrap().finished(),
+    )
+    .await
+    .expect("the deadline ends the run")
+    .unwrap();
+    assert_eq!(report.end, RunEnd::Deadline);
+
+    // And a shutdown does not wait for it.
+    let sup = supervisor(&h, cfg(8, 4, 3600));
+    let handle = sup.submit(request(1, 101)).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), sup.shutdown())
+        .await
+        .expect("shutdown does not wait out the open");
+    assert_eq!(handle.finished().await.unwrap().end, RunEnd::Cancelled);
+    assert!(h.fake.recorded().is_empty(), "no model call");
+}

@@ -29,7 +29,9 @@ struct World {
     next_run: u64,
     summaries: HashMap<RunId, RunSummary>,
     sent: Vec<Vec<OutSegment>>,
-    fail_next_send: Option<DeliveryError>,
+    fail_next_send: std::collections::VecDeque<DeliveryError>,
+    /// How long opening a run's context takes, as a slow platform would make it.
+    open_delay: Duration,
     fail_log: bool,
     fail_begin: bool,
     echo_delay: Duration,
@@ -147,9 +149,14 @@ impl SimWorld {
         }
     }
 
-    /// Make the next send fail with `error`.
+    /// Make the next send fail with `error`; called again, the send after it too, in order.
     pub fn fail_next_send(&self, error: DeliveryError) {
-        self.lock().fail_next_send = Some(error);
+        self.lock().fail_next_send.push_back(error);
+    }
+
+    /// Make opening a run's context take `delay`.
+    pub fn delay_open(&self, delay: Duration) {
+        self.lock().open_delay = delay;
     }
 
     /// Make appending items and finishing runs fail (a run that already began).
@@ -266,6 +273,10 @@ impl Archive for SimWorld {
 #[async_trait]
 impl ContextSource for SimWorld {
     async fn open(&self, _group: GroupId, trigger: &Trigger) -> Result<OpenedContext, EnvError> {
+        let delay = self.lock().open_delay;
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
         let world = self.lock();
         let window: Vec<ChatLine> = world.lines.iter().map(|a| a.line.clone()).collect();
         let cursor = world.lines.last().map_or(ArchiveCursor(0), |a| a.seq);
@@ -317,7 +328,7 @@ impl Delivery for SimWorld {
     ) -> Result<Delivered, DeliveryError> {
         let delay = {
             let mut world = self.lock();
-            if let Some(error) = world.fail_next_send.take() {
+            if let Some(error) = world.fail_next_send.pop_front() {
                 return Err(error);
             }
             world.echo_delay

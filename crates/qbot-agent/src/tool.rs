@@ -107,6 +107,7 @@ impl ChatView {
 /// Counters and observations shared by the tools of one run.
 #[derive(Debug, Default)]
 pub struct RunState {
+    /// Messages sent, or perhaps sent: a send counts unless it certainly failed.
     sends: AtomicU32,
     observed: Mutex<HashSet<MessageId>>,
 }
@@ -119,6 +120,14 @@ impl RunState {
                 (n < max).then_some(n + 1)
             })
             .is_ok()
+    }
+
+    /// Give back a slot whose message certainly never reached the group, so the count stays the
+    /// number of messages that may be there.
+    pub fn release_send(&self) {
+        let _ = self
+            .sends
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
     }
 
     pub fn sends(&self) -> u32 {

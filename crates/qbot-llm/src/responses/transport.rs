@@ -110,6 +110,22 @@ fn map_reqwest(error: &reqwest::Error) -> LlmError {
     }
 }
 
+/// The status, Retry-After and whole body of a response.
+async fn read(response: reqwest::Response) -> Result<HttpResponse, LlmError> {
+    let status = response.status().as_u16();
+    let retry_after = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_retry_after);
+    let body = response.bytes().await.map_err(|e| map_reqwest(&e))?;
+    Ok(HttpResponse {
+        status,
+        retry_after,
+        body,
+    })
+}
+
 /// Retry-After, as whole seconds or as an HTTP-date (RFC 9110); a date in the past means now.
 pub(crate) fn parse_retry_after(value: &str) -> Option<Duration> {
     let value = value.trim();
@@ -136,18 +152,7 @@ impl Transport for ReqwestTransport {
             .send()
             .await
             .map_err(|e| map_reqwest(&e))?;
-        let status = response.status();
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(parse_retry_after);
-        let bytes = response.bytes().await.map_err(|e| map_reqwest(&e))?;
-        Ok(HttpResponse {
-            status: status.as_u16(),
-            retry_after,
-            body: bytes,
-        })
+        read(response).await
     }
     async fn upload(&self, path: &str, upload: &Upload) -> Result<HttpResponse, LlmError> {
         let key = self.key.resolve()?;
@@ -167,18 +172,7 @@ impl Transport for ReqwestTransport {
             .send()
             .await
             .map_err(|e| map_reqwest(&e))?;
-        let status = response.status();
-        let retry_after = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(parse_retry_after);
-        let bytes = response.bytes().await.map_err(|e| map_reqwest(&e))?;
-        Ok(HttpResponse {
-            status: status.as_u16(),
-            retry_after,
-            body: bytes,
-        })
+        read(response).await
     }
 }
 

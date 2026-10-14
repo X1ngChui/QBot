@@ -185,14 +185,29 @@ pub struct Delivered {
     pub echo: ChatLine,
 }
 
+/// Why a send did not complete. The variants differ in what is known about the group: after
+/// `Rejected` and `Unavailable` nothing reached it; after `Unconfirmed` the message may be there.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DeliveryError {
+    /// Not sent: the platform refused the message.
     #[error("the platform rejected the message: {0}")]
     Rejected(String),
-    #[error("the message was sent but its echo was not observed")]
-    EchoMissing,
+    /// Not sent: there is no platform connection to send it on.
     #[error("delivery is unavailable: {0}")]
     Unavailable(String),
+    /// Perhaps sent: the platform did not confirm the send, or its echo was not observed.
+    #[error("the message was not confirmed: {0}")]
+    Unconfirmed(String),
+}
+
+impl DeliveryError {
+    /// Whether the message certainly did not reach the group.
+    pub fn not_sent(&self) -> bool {
+        matches!(
+            self,
+            DeliveryError::Rejected(_) | DeliveryError::Unavailable(_)
+        )
+    }
 }
 
 #[async_trait]

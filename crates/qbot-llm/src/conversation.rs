@@ -223,10 +223,21 @@ impl Conversation {
     }
 }
 
-pub(crate) fn digest_items(items: &[ConvItem]) -> ConvDigest {
-    let bytes = serde_json::to_vec(items).unwrap_or_default();
-    let hash = Sha256::digest(&bytes);
-    ConvDigest(hash.iter().map(|b| format!("{b:02x}")).collect())
+/// Digest of `items` in order, each by its JSON form.
+pub(crate) fn digest_items<'a>(items: impl IntoIterator<Item = &'a ConvItem>) -> ConvDigest {
+    let mut hasher = Sha256::new();
+    for item in items {
+        // Serializing these types cannot fail: every map in them has string keys.
+        hasher.update(serde_json::to_vec(item).unwrap_or_default());
+        hasher.update(b"\n");
+    }
+    ConvDigest(
+        hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    )
 }
 
 fn instruction_message(instruction: &Instruction) -> Message {

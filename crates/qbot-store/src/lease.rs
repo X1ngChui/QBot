@@ -59,8 +59,10 @@ impl RuntimeLease {
         .is_ok_and(|row| row.get::<bool, _>("held"))
     }
 
-    /// Check the lease every `every`; cancel `lost` the moment it is gone. The lock is released
-    /// when the watch is stopped or dropped.
+    /// Check the lease every `every`; cancel `lost` the moment it is gone. A check that takes
+    /// longer than `every` counts as lost too: on a connection that hangs the lock may already
+    /// be gone, and only a check that answers proves it is held. The lock is released when the
+    /// watch is stopped or dropped.
     pub fn watch(mut self, every: Duration, lost: CancellationToken) -> LeaseWatch {
         let stop = CancellationToken::new();
         let stopped = stop.clone();
@@ -69,7 +71,8 @@ impl RuntimeLease {
                 tokio::select! {
                     () = stopped.cancelled() => break,
                     () = tokio::time::sleep(every) => {
-                        if !self.is_held().await {
+                        let held = tokio::time::timeout(every, self.is_held()).await;
+                        if !held.unwrap_or(false) {
                             lost.cancel();
                             break;
                         }

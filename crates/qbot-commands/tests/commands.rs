@@ -164,7 +164,7 @@ impl Delivery for Sent {
         segments: Vec<OutSegment>,
     ) -> Result<Delivered, DeliveryError> {
         self.0.lock().unwrap().push(segments);
-        Err(DeliveryError::EchoMissing)
+        Err(DeliveryError::Unconfirmed("no echo".into()))
     }
 }
 

@@ -101,8 +101,9 @@ pub struct Continuation {
     pub(crate) model: String,
     /// Number of conversation items the provider has already seen, including this response.
     pub(crate) covers: usize,
-    pub(crate) digest: ConvDigest,
-    pub(crate) handle: Option<String>,
+    /// The provider's state: its handle, and the digest of the prefix it covers. `None` for a
+    /// stateless provider, which replays everything and so needs neither.
+    pub(crate) state: Option<(String, ConvDigest)>,
 }
 
 impl Continuation {
@@ -113,19 +114,21 @@ impl Continuation {
         turn: &AssistantTurn,
         handle: Option<String>,
     ) -> Self {
-        let mut items: Vec<ConvItem> = conversation.items().to_vec();
-        items.push(ConvItem::Assistant(turn.clone()));
+        let state = handle.map(|handle| {
+            let turn = ConvItem::Assistant(turn.clone());
+            let digest = digest_items(conversation.items().iter().chain([&turn]));
+            (handle, digest)
+        });
         Self {
             provider,
             model,
-            covers: items.len(),
-            digest: digest_items(&items),
-            handle,
+            covers: conversation.len() + 1,
+            state,
         }
     }
 
     pub fn handle(&self) -> Option<&str> {
-        self.handle.as_deref()
+        self.state.as_ref().map(|(handle, _)| handle.as_str())
     }
 }
 

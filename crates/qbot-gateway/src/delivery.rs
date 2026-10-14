@@ -80,9 +80,10 @@ impl Delivery for OneBotDelivery {
                 CallError::Disconnected => {
                     DeliveryError::Unavailable("not connected to the platform".into())
                 }
-                CallError::TimedOut(after) => DeliveryError::Unavailable(format!(
-                    "no answer within {after:?}; the message may or may not have been sent"
-                )),
+                // The action went out; the platform may have sent the message.
+                CallError::Lost | CallError::TimedOut(_) => {
+                    DeliveryError::Unconfirmed(e.to_string())
+                }
             })?;
         if !response.ok {
             let detail = if response.detail.is_empty() {
@@ -93,13 +94,15 @@ impl Delivery for OneBotDelivery {
             return Err(DeliveryError::Rejected(detail));
         }
         let Some(message) = response.message_id else {
-            return Err(DeliveryError::Rejected(
+            return Err(DeliveryError::Unconfirmed(
                 "the platform accepted the send but returned no message id".into(),
             ));
         };
         match self.echoes.wait(group, message, self.timeouts.echo).await {
             Some(echo) => Ok(Delivered { echo }),
-            None => Err(DeliveryError::EchoMissing),
+            None => Err(DeliveryError::Unconfirmed(
+                "the platform did not report the sent message".into(),
+            )),
         }
     }
 }

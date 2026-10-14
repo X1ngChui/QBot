@@ -16,8 +16,12 @@ use crate::wire::ActionResponse;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CallError {
+    /// The action was never written: there is no platform connection.
     #[error("no platform connection")]
     Disconnected,
+    /// The action was written, but the connection ended before its answer came.
+    #[error("the platform connection ended before the answer came")]
+    Lost,
     #[error("the platform did not answer within {0:?}")]
     TimedOut(Duration),
 }
@@ -128,7 +132,7 @@ impl Bridge {
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(response)) => Ok(response),
             // The sender was dropped: the connection ended with this call pending.
-            Ok(Err(_)) => Err(CallError::Disconnected),
+            Ok(Err(_)) => Err(CallError::Lost),
             Err(_) => {
                 if let Some(live) = self
                     .live

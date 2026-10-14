@@ -147,7 +147,11 @@ scheduler and memory depend on no database or platform. Its Postgres adapter liv
   not here. A filled batch queues the group's extraction job.
 - **Delivery**: `send_group_msg`, correlated by `echo` token, then a wait for the platform's
   report of the bot's own message (`message_sent`), which is how dice and rock-paper-scissors
-  results become known. A rejected send is returned to the model as an error.
+  results become known. A failed send is returned to the model as an error of one of two kinds:
+  certainly not sent (the platform refused it, or there was no connection to send it on), or
+  unconfirmed (no answer in time, the connection ended while waiting, or no echo), when the
+  message may be in the group and the model is told not to send it again. Only a message that
+  may be in the group counts against `replies.max_messages` and makes the run one that spoke.
 - **Platform games.** A dice or rock-paper-scissors send is a request with no result
   (`{"type":"dice","data":{}}`); the platform decides the outcome and reports it in the echo.
   Rendering normalizes it on the incoming side only (`qbot_core::GameResult`): a face 1 to 6 as
@@ -198,7 +202,8 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
     talk over each other. That rule is for spontaneous runs only: addressed and scheduled runs
     start and overlap as always, also while a spontaneous run is under way.
 - **Supervisor.** Every trigger becomes its own run with its own deadline; runs of one group may
-  overlap. Admission gates, in order: muted group, then a blocked member (the initiator of an
+  overlap. The deadline and a shutdown bound every step, opening the context included (it asks
+  the platform for display names). Admission gates, in order: muted group, then a blocked member (the initiator of an
   addressed run; for a spontaneous run, the author of the line that rolled it, since a blocked
   member's message never starts a run of any kind), then for a spontaneous run another one of
   the group still under way, then capacity. All admission policy is here; the gateway only
@@ -386,7 +391,8 @@ the `media_ref` row the platform reference came in.
   the occurrence it slept toward even when the timer wakes a moment early.
 - **The scheduler loop** takes one clock reading per tick for claiming and for deciding what comes
   due next, so a timer due between two readings is not mistaken for a blocked one. A store error
-  is logged and retried; scheduled work never stops silently.
+  (claiming, reading when the next timer comes due, recording an outcome) is logged, and the
+  read is retried; scheduled work never stops silently.
 
 ## 11. Providers (`qbot-llm`)
 
@@ -533,8 +539,9 @@ spend.
   overlap, whether episodes or skipped (`slice_skip`): range exclusion constraints, and a check
   across the two tables under the group's slice lock. One active fact per subject, predicate and key (a partial
   unique index).
-- **Single instance**: the process holds a Postgres advisory-lock session lease and shuts down if
-  it loses it.
+- **Single instance**: the process holds a Postgres advisory-lock session lease, checked every ten
+  seconds, and shuts down if it loses it. A check that does not answer within the interval
+  counts as lost: on a hung connection only an answer proves the lock is still held.
 - Database tests need a disposable server in `QBOT_TEST_DATABASE_URL`; each test creates and
   drops its own database.
 
@@ -555,7 +562,9 @@ spend.
   flight (recorded as cancelled, open calls interrupted) before anything that might wait on one,
   lets commands finish, drops media work (its markers stay bare) and running jobs (queued again
   at the next start), writes the usage records, and releases the lease. Nothing waits out a
-  model call, so the container stops within its grace period.
+  model call, so the container stops within its grace period. The process also stops, with an
+  error, if the gateway server ends by itself or the lease is lost, so the container restarts
+  instead of running deaf.
 - **Usage**: `usage_event` rows per model and tool call of a reply run, with daily views; `/stats`,
   `/top` and the report read them. Nothing reads them to refuse work.
 
@@ -592,8 +601,6 @@ through it.
 - An uploaded picture stays at DeepSeek for the Files API's longest lifetime (30 days), though
   each upload is used only for one description or one run's turns; the Files API's shortest
   lifetime would do, once it is checked against the live API.
-- Why an extraction answer needs a second attempt (about three in ten on real chat, mostly
-  findings sent back for correction) is not logged per attempt.
 - `open_images` cannot open pictures inside forwarded records whose content was not delivered.
 - History search scans the group's lines; a `pg_trgm` index is the step if archives grow large.
 - OpenAI-style providers are covered by the simulated server, not by a live test.

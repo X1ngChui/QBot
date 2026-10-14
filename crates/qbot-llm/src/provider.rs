@@ -42,13 +42,13 @@ pub fn plan_replay(
     let Some(cont) = continuation else {
         return ReplayPlan::Full;
     };
-    let Some(handle) = cont.handle.as_ref() else {
+    let Some((handle, digest)) = cont.state.as_ref() else {
         return ReplayPlan::Full;
     };
     let applies = cont.provider == info.id
         && cont.model == info.model
         && conversation.len() > cont.covers
-        && conversation.digest_prefix(cont.covers) == cont.digest;
+        && conversation.digest_prefix(cont.covers) == *digest;
     if applies {
         ReplayPlan::Delta {
             from: cont.covers,

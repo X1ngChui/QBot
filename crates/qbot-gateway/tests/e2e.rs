@@ -563,7 +563,26 @@ async fn sending_without_a_connection_or_after_a_rejection_reports_why() {
     });
     let action = next_action(&mut napcat).await;
     napcat.send(Message::text(json!({"status": "ok", "retcode": 0, "data": {"message_id": 5}, "echo": action["echo"]}).to_string())).await.unwrap();
-    assert_eq!(send.await.unwrap(), Err(DeliveryError::EchoMissing));
+    assert!(
+        matches!(send.await.unwrap(), Err(DeliveryError::Unconfirmed(_))),
+        "accepted, so perhaps sent"
+    );
+
+    // The connection ends while the send waits for its answer: the action went out, so the
+    // message may have been sent.
+    let delivery = rig.delivery.clone();
+    let send = tokio::spawn(async move {
+        delivery
+            .send(group, vec![OutSegment::Text("z".into())])
+            .await
+    });
+    next_action(&mut napcat).await;
+    drop(napcat);
+    let lost = send.await.unwrap();
+    assert!(
+        matches!(lost, Err(DeliveryError::Unconfirmed(_))),
+        "{lost:?}"
+    );
     rig.cancel.cancel();
 }
 

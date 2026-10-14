@@ -206,11 +206,17 @@ impl Scheduler {
     /// Time until the next timer that came due after the tick at `ticked`. `None` means
     /// nothing is scheduled, or whatever is due was already due at the tick and is blocked (no
     /// capacity, group busy, job slots full); the loop then waits for a notification instead of
-    /// polling, because every change that can unblock work notifies it.
+    /// polling, because every change that can unblock work notifies it. A store that cannot say
+    /// is asked again shortly: waiting only for notifications would leave a later timer unfired
+    /// until something else happened.
     async fn next_future_due(&self, ticked: UnixMillis) -> Option<Duration> {
         match self.store.next_due().await {
             Ok(Some(due)) if due > ticked => Some(due.since(self.clock.now())),
-            _ => None,
+            Ok(_) => None,
+            Err(error) => {
+                tracing::error!(%error, "the next due timer could not be read; retrying");
+                Some(STORE_RETRY)
+            }
         }
     }
 
@@ -251,8 +257,11 @@ impl Scheduler {
                 Err(Rejected::ShuttingDown) => None,
                 Err(_) => Some(TimerOutcome::Ran(RunEnd::Environment)),
             };
-            if let Some(outcome) = outcome {
-                let _ = store.finish(id, outcome).await;
+            if let Some(outcome) = outcome
+                && let Err(error) = store.finish(id, outcome).await
+            {
+                // The claim stays; startup recovery marks the task interrupted.
+                tracing::error!(%error, task = id.get(), "a finished task could not be recorded");
             }
             active
                 .lock()
@@ -307,20 +316,23 @@ impl Scheduler {
                 result = jobs.run(kind, group) => result,
             };
             drop(heartbeat);
-            match result {
-                Ok(()) => {
-                    let _ = store.finish(id, TimerOutcome::JobOk).await;
-                }
+            let recorded = match result {
+                Ok(()) => store.finish(id, TimerOutcome::JobOk).await,
                 Err(error) if attempts >= cfg.max_job_attempts => {
                     tracing::error!(?kind, attempts, error = %error.0, "job failed; giving up");
-                    let _ = store.finish(id, TimerOutcome::JobFailed(error.0)).await;
+                    store.finish(id, TimerOutcome::JobFailed(error.0)).await
                 }
                 Err(error) => {
                     tracing::warn!(?kind, attempts, error = %error.0, "job failed; will retry");
-                    let _ = store
+                    store
                         .retry_job(id, clock.now().plus(backoff(&cfg, attempts)))
-                        .await;
+                        .await
                 }
+            };
+            if let Err(error) = recorded {
+                // The claim stays and its lease runs out, so the job is taken up again: it is
+                // idempotent.
+                tracing::error!(%error, ?kind, "a job's outcome could not be recorded");
             }
         });
     }

@@ -304,7 +304,14 @@ async fn drive(inner: &Inner, run: RunId, request: TriggerRequest, deadline: Ins
     if Instant::now() >= deadline {
         return finish_unstarted(inner, run, request.group, RunEnd::Deadline).await;
     }
-    let context = match inner.source.open(request.group, &request.trigger).await {
+    // Opening reads the store and asks the platform for names: bounded like the rest of the
+    // run, so a stalled platform neither outlives the deadline nor holds up a shutdown.
+    let opened = tokio::select! {
+        () = inner.cancel.cancelled() => return finish_unstarted(inner, run, request.group, RunEnd::Cancelled).await,
+        () = tokio::time::sleep_until(deadline) => return finish_unstarted(inner, run, request.group, RunEnd::Deadline).await,
+        opened = inner.source.open(request.group, &request.trigger) => opened,
+    };
+    let context = match opened {
         Ok(context) => context,
         Err(error) => {
             tracing::warn!(
