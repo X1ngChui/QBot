@@ -104,6 +104,24 @@ pub fn sim_provider(
     (server, Arc::new(provider))
 }
 
+/// [`sim_provider`] recording its calls on a meter.
+pub fn metered_provider(
+    deepseek: bool,
+    state: StateMode,
+    script: Vec<SimStep>,
+) -> (
+    Arc<SimServer>,
+    Arc<ResponsesProvider>,
+    Arc<qbot_llm::MemoryMeter>,
+) {
+    let (server, provider) = sim_provider(deepseek, state, script);
+    let meter = qbot_llm::MemoryMeter::new();
+    let provider = Arc::into_inner(provider)
+        .expect("only reference")
+        .with_meter(meter.clone());
+    (server, Arc::new(provider), meter)
+}
+
 pub fn sim_steps(replies: &[FakeReply]) -> Vec<SimStep> {
     replies.iter().cloned().map(SimStep::Reply).collect()
 }

@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use super::{PageRead, PageReader, SearchHit, SearchResults, WebSearch};
 use crate::capability::ProviderId;
 use crate::error::LlmError;
+use crate::meter::{self, CallKind, Meter};
 use crate::responses::{RetryPolicy, Transport, post_with_retry};
 
 /// Tavily's search depth: `advanced` costs two credits and returns better excerpts.
@@ -68,6 +69,7 @@ pub struct TavilySearch {
     id: ProviderId,
     cfg: TavilyConfig,
     transport: Arc<dyn Transport>,
+    meter: Option<Arc<dyn Meter>>,
 }
 
 impl std::fmt::Debug for TavilySearch {
@@ -87,7 +89,14 @@ impl TavilySearch {
             id: ProviderId::new("tavily"),
             cfg,
             transport,
+            meter: None,
         }
+    }
+
+    /// Record every search and page read on `meter`.
+    pub fn with_meter(mut self, meter: Arc<dyn Meter>) -> Self {
+        self.meter = Some(meter);
+        self
     }
 
     async fn post(&self, query: &str) -> Result<SearchResults, LlmError> {
@@ -99,10 +108,9 @@ impl TavilySearch {
             "include_raw_content": false,
             "include_usage": true,
         });
-        let (response, requests) =
-            post_with_retry(&*self.transport, &self.cfg.retry, "/search", &body)
-                .await
-                .map_err(plan_limit)?;
+        let response = post_with_retry(&*self.transport, &self.cfg.retry, "/search", &body)
+            .await
+            .map_err(plan_limit)?;
         let value: Value = serde_json::from_slice(&response.body)
             .map_err(|e| LlmError::Protocol(format!("search response is not JSON: {e}")))?;
         let results = value
@@ -126,16 +134,8 @@ impl TavilySearch {
             .filter(|hit| !hit.url.is_empty())
             .take(self.cfg.max_results as usize)
             .collect();
-        let credits = value
-            .get("usage")
-            .and_then(|u| u.get("credits"))
-            .and_then(Value::as_u64)
-            .and_then(|c| u32::try_from(c).ok());
-        Ok(SearchResults {
-            hits,
-            credits,
-            requests,
-        })
+        add_credits(&value);
+        Ok(SearchResults { hits })
     }
 }
 
@@ -152,16 +152,12 @@ impl TavilySearch {
             body["query"] = json!(question);
             body["chunks_per_source"] = json!(self.cfg.extract.chunks_per_source);
         }
-        let (response, _) = post_with_retry(&*self.transport, &self.cfg.retry, "/extract", &body)
+        let response = post_with_retry(&*self.transport, &self.cfg.retry, "/extract", &body)
             .await
             .map_err(plan_limit)?;
         let value: Value = serde_json::from_slice(&response.body)
             .map_err(|e| LlmError::Protocol(format!("extract response is not JSON: {e}")))?;
-        let credits = value
-            .get("usage")
-            .and_then(|u| u.get("credits"))
-            .and_then(Value::as_u64)
-            .and_then(|c| u32::try_from(c).ok());
+        add_credits(&value);
         // One URL was asked for, so at most one result; order is not guaranteed in general.
         if let Some(read) = value
             .get("results")
@@ -174,7 +170,7 @@ impl TavilySearch {
                 .unwrap_or_default()
                 .trim()
                 .to_owned();
-            return Ok(PageRead::Read { content, credits });
+            return Ok(PageRead::Read { content });
         }
         let reason = value
             .get("failed_results")
@@ -197,9 +193,31 @@ impl PageReader for TavilySearch {
     }
 
     async fn read(&self, url: &str, question: Option<&str>) -> Result<PageRead, LlmError> {
-        tokio::time::timeout(self.cfg.timeout, self.extract(url, question))
-            .await
-            .map_err(|_| LlmError::Timeout)?
+        let call = async {
+            tokio::time::timeout(self.cfg.timeout, self.extract(url, question))
+                .await
+                .map_err(|_| LlmError::Timeout)?
+        };
+        let depth = self.cfg.extract.depth.as_str();
+        meter::measured(
+            self.meter.as_ref(),
+            CallKind::Extract,
+            self.id.as_str(),
+            depth,
+            call,
+        )
+        .await
+    }
+}
+
+/// The plan credits a response reports (`include_usage`), added to the call in progress.
+fn add_credits(value: &Value) {
+    if let Some(credits) = value
+        .get("usage")
+        .and_then(|u| u.get("credits"))
+        .and_then(Value::as_u64)
+    {
+        meter::add_credits(u32::try_from(credits).unwrap_or(u32::MAX));
     }
 }
 
@@ -222,8 +240,19 @@ impl WebSearch for TavilySearch {
     }
 
     async fn search(&self, query: &str) -> Result<SearchResults, LlmError> {
-        tokio::time::timeout(self.cfg.timeout, self.post(query))
-            .await
-            .map_err(|_| LlmError::Timeout)?
+        let call = async {
+            tokio::time::timeout(self.cfg.timeout, self.post(query))
+                .await
+                .map_err(|_| LlmError::Timeout)?
+        };
+        let depth = self.cfg.depth.as_str();
+        meter::measured(
+            self.meter.as_ref(),
+            CallKind::Search,
+            self.id.as_str(),
+            depth,
+            call,
+        )
+        .await
     }
 }

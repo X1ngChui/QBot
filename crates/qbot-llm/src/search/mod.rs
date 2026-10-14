@@ -31,10 +31,6 @@ pub struct SearchHit {
 pub struct SearchResults {
     /// Most relevant first, at most the configured number.
     pub hits: Vec<SearchHit>,
-    /// Plan credits the provider charged, when it reports them.
-    pub credits: Option<u32>,
-    /// HTTP requests it took, retries included.
-    pub requests: u32,
 }
 
 #[async_trait]
@@ -49,11 +45,7 @@ pub trait WebSearch: Send + Sync {
 pub enum PageRead {
     /// The page's text as Markdown: the whole page, or with a question only the parts most
     /// relevant to it. May be empty when the page has no readable text.
-    Read {
-        content: String,
-        /// Plan credits the provider charged, when it reports them.
-        credits: Option<u32>,
-    },
+    Read { content: String },
     /// The provider answered but could not read this page (unreachable, blocked, not a
     /// document it understands). An ordinary outcome, not a provider failure.
     Failed { reason: String },

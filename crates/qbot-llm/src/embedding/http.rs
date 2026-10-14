@@ -8,6 +8,8 @@ use serde_json::{Value, json};
 use super::{Embedder, EmbedderInfo, Embeddings, normalize};
 use crate::capability::ProviderId;
 use crate::error::LlmError;
+use crate::meter::{self, CallKind, Meter};
+use crate::response::{CacheUsage, Usage};
 use crate::responses::{RetryPolicy, Transport, post_with_retry};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +53,7 @@ pub struct HttpEmbedder {
     info: EmbedderInfo,
     cfg: EmbeddingConfig,
     transport: Arc<dyn Transport>,
+    meter: Option<Arc<dyn Meter>>,
 }
 
 impl std::fmt::Debug for HttpEmbedder {
@@ -72,12 +75,19 @@ impl HttpEmbedder {
             info,
             cfg,
             transport,
+            meter: None,
         }
     }
 
-    async fn batch(&self, chunk: &[String]) -> Result<(Vec<Vec<f32>>, Option<u64>, u32), LlmError> {
+    /// Record every call on `meter`.
+    pub fn with_meter(mut self, meter: Arc<dyn Meter>) -> Self {
+        self.meter = Some(meter);
+        self
+    }
+
+    async fn batch(&self, chunk: &[String]) -> Result<Vec<Vec<f32>>, LlmError> {
         let body = json!({ "model": self.cfg.model, "input": chunk, "dimensions": self.cfg.dims });
-        let (response, requests) =
+        let response =
             post_with_retry(&*self.transport, &self.cfg.retry, "/embeddings", &body).await?;
         let value: Value = serde_json::from_slice(&response.body)
             .map_err(|e| LlmError::Protocol(format!("response is not JSON: {e}")))?;
@@ -123,11 +133,20 @@ impl HttpEmbedder {
             .ok_or_else(|| {
                 LlmError::Protocol("embedding response does not cover every input".into())
             })?;
-        let tokens = value
+        if let Some(tokens) = value
             .get("usage")
             .and_then(|u| u.get("total_tokens").or_else(|| u.get("prompt_tokens")))
-            .and_then(Value::as_u64);
-        Ok((vectors, tokens, requests))
+            .and_then(Value::as_u64)
+        {
+            meter::add_tokens(Usage {
+                input_tokens: u32::try_from(tokens).unwrap_or(u32::MAX),
+                output_tokens: 0,
+                cache: CacheUsage::NotReported,
+                reasoning_tokens: None,
+                reported: true,
+            });
+        }
+        Ok(vectors)
     }
 }
 
@@ -138,23 +157,20 @@ impl Embedder for HttpEmbedder {
     }
 
     async fn embed(&self, texts: &[String]) -> Result<Embeddings, LlmError> {
-        let mut vectors = Vec::with_capacity(texts.len());
-        let mut tokens: Option<u64> = None;
-        let mut requests = 0;
-        for chunk in texts.chunks(self.cfg.max_batch.max(1)) {
-            let (batch, used, sent) = self.batch(chunk).await?;
-            vectors.extend(batch);
-            tokens = match (tokens, used) {
-                (Some(a), Some(b)) => Some(a + b),
-                (None, Some(b)) if vectors.len() == chunk.len() => Some(b),
-                _ => None,
-            };
-            requests += sent;
-        }
-        Ok(Embeddings {
-            vectors,
-            input_tokens: tokens,
-            requests,
-        })
+        let call = async {
+            let mut vectors = Vec::with_capacity(texts.len());
+            for chunk in texts.chunks(self.cfg.max_batch.max(1)) {
+                vectors.extend(self.batch(chunk).await?);
+            }
+            Ok(Embeddings { vectors })
+        };
+        meter::measured(
+            self.meter.as_ref(),
+            CallKind::Embedding,
+            self.info.id.as_str(),
+            &self.info.model,
+            call,
+        )
+        .await
     }
 }

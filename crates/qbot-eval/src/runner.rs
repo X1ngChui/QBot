@@ -416,19 +416,12 @@ impl Runner {
             })
             .collect();
         let search = Arc::new(
-            FakeSearch::new((0..8).map(|_| {
-                Ok(SearchResults {
-                    hits: hits.clone(),
-                    credits: Some(1),
-                    requests: 1,
-                })
-            }))
-            .with_pages(scenario.pages.iter().map(|p| {
-                Ok(PageRead::Read {
-                    content: p.clone(),
-                    credits: Some(1),
-                })
-            })),
+            FakeSearch::new((0..8).map(|_| Ok(SearchResults { hits: hits.clone() }))).with_pages(
+                scenario
+                    .pages
+                    .iter()
+                    .map(|p| Ok(PageRead::Read { content: p.clone() })),
+            ),
         );
 
         // The production tool set over the simulated world.

@@ -18,6 +18,7 @@ use crate::ports::{
     DescribeError, Describer, DescriptionCache, FetchError, Fetcher, LineEditor, Transcriber,
 };
 use qbot_core::MediaKind;
+use qbot_llm::{Attribution, Purpose, attributed};
 
 /// Bytes per second of 16 kHz 16-bit mono WAV, the only audio the service handles. The clip
 /// length limit is stated in seconds and enforced as a byte cap through this.
@@ -254,7 +255,10 @@ impl Inner {
                     return Some(found);
                 }
                 let _permit = this.permits.acquire().await.ok()?;
-                let text = match describer.describe(&bytes, sniff_mime(&bytes)).await {
+                // Attributed here, inside the flight, whichever task happens to drive it.
+                let call = describer.describe(&bytes, sniff_mime(&bytes));
+                let text = match attributed(Attribution::group(Purpose::Picture, group), call).await
+                {
                     Ok(text) => clean_description(&text),
                     Err(DescribeError::Declined) => {
                         tracing::info!("the vision model declined a picture; left unseen");

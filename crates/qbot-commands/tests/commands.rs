@@ -14,9 +14,10 @@ use qbot_commands::{
 use qbot_core::{AccountId, Clock, GroupId, MessageId, UnixMillis};
 use qbot_gateway::pipeline::{CommandRequest, Commands};
 use qbot_i18n::Locales;
+use qbot_llm::{CallKind, Purpose};
 use qbot_memory::{IdentityPolicy, IdentityStore, MemoryIdentityStore};
 use qbot_sched::{MemoryTimerStore, TaskLimits, TaskService};
-use qbot_store::{BlockRule, RosterRow, TopRow, UsageTotals};
+use qbot_store::{BlockRule, RosterRow, TopRow, UsageLine, UsageSummary};
 use tokio::sync::Notify;
 
 const T0: i64 = 1_800_000_000_000;
@@ -110,15 +111,42 @@ impl GroupAdmin for FakeAdmin {
         &self,
         group: Option<GroupId>,
         _: UnixMillis,
-    ) -> Result<UsageTotals, AdminError> {
+        _: UnixMillis,
+    ) -> Result<UsageSummary, AdminError> {
         let scale = if group.is_some() { 1 } else { 10 };
-        Ok(UsageTotals {
+        let line = |purpose, kind, calls: u64, input: u64, cached, output: u64| UsageLine {
+            purpose: Some(purpose),
+            kind,
+            calls,
+            requests: calls,
+            failed: 0,
+            input_tokens: input,
+            cached_tokens: cached,
+            output_tokens: output,
+            credits: None,
+        };
+        Ok(UsageSummary {
             runs: 3 * scale,
-            model_calls: 5 * scale,
-            input_tokens: 1000 * scale,
-            cached_tokens: 400 * scale,
-            output_tokens: 50 * scale,
             tool_calls: 4 * scale,
+            tool_calls_not_ok: 0,
+            calls: vec![
+                line(
+                    Purpose::Reply,
+                    CallKind::Model,
+                    5 * scale,
+                    1000 * scale,
+                    Some(400 * scale),
+                    50 * scale,
+                ),
+                line(
+                    Purpose::Extraction,
+                    CallKind::Model,
+                    scale,
+                    3000 * scale,
+                    None,
+                    90 * scale,
+                ),
+            ],
         })
     }
     async fn top_requesters(
@@ -701,14 +729,19 @@ async fn members_stats_and_top_summarise_the_group() {
     let stats = rig.say(ALICE, "/stats", &[]).await;
     assert!(
         stats.starts_with("Usage today | group 900")
-            && stats.contains("Runs: 3 (5 model calls, 4 tool calls)")
+            && stats.contains("Replies: 3 (4 tool calls)")
+            && stats.contains(
+                "Replies, model: 5 calls (5 requests, 0 failed); 1000 tokens in (400 cached, 40%), 50 out"
+            )
+            && stats.contains("Memory, model: 1 call (1 request, 0 failed); 3000 tokens in (cache not reported), 90 out")
+            && stats.contains("All provider calls: 6 (6 requests, 0 failed); 4000 tokens in, 140 out")
             && stats.contains("Group replies: enabled"),
         "{stats}"
     );
     assert!(
         rig.say(OWNER, "/stats global", &[])
             .await
-            .contains("Runs: 30")
+            .contains("Replies: 30")
     );
     assert_eq!(
         rig.say(ALICE, "/stats nope", &[]).await,

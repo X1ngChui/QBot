@@ -11,6 +11,7 @@
 //! - [`request`] and [`response`]: one call in, one normalized result out.
 //! - [`error`]: the single error taxonomy.
 //! - [`provider`]: the trait and the continuation planner shared by all adapters.
+//! - [`meter`]: one record per provider call, whatever the work.
 //! - [`fake`]: a scripted provider implementing the whole contract, for offline tests.
 
 pub mod capability;
@@ -18,6 +19,7 @@ pub mod conversation;
 pub mod embedding;
 pub mod error;
 pub mod fake;
+pub mod meter;
 pub mod net;
 pub mod provider;
 pub mod request;
@@ -35,6 +37,7 @@ pub use conversation::{
 };
 pub use embedding::{Embedder, EmbedderInfo, Embeddings, FakeEmbedder, HttpEmbedder};
 pub use error::LlmError;
+pub use meter::{Attribution, CallKind, MemoryMeter, Meter, ProviderCall, Purpose, attributed};
 pub use provider::{Provider, ReplayPlan, plan_replay};
 pub use request::{
     LoadedMedia, MediaStore, ReasoningEffort, Request, ToolChoice, ToolSpec, validate_request,

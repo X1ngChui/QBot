@@ -212,8 +212,10 @@ members-row_names =
     }) | { $names }
 stats-group_title = Usage today | group { $group }
 stats-global_title = Usage today | all groups
-stats-runs = Runs: { $runs } ({ $model_calls } model calls, { $tool_calls } tool calls)
-stats-tokens = Tokens: { $input } in ({ $cached } cached), { $output } out
+stats-runs = Replies: { $runs } ({ $tool_calls } { $tool_calls ->
+        [one] tool call
+       *[other] tool calls
+    })
 stats-replies_muted = Group replies: muted
 stats-replies_enabled = Group replies: enabled
 stats-blocks = Block rules: { $count }
@@ -333,12 +335,70 @@ report-runs = Replies: { $runs } ({ $addressed } addressed, { $wake } scheduled)
 report-ends = How runs ended: { $ends }
 report-errors = Model errors: { $errors }
 report-count_entry = { $label } { $count }
-report-model = Model calls: { $calls } ({ $failed } failed)
-report-tokens = Tokens: { $input } in ({ $hit }% from cache, { $cached } tokens), { $output } out
+calls-none = Provider calls: none
+calls-line =
+    { $purpose }, { $kind }: { $calls } { $calls ->
+        [one] call
+       *[other] calls
+    } ({ $requests } { $requests ->
+        [one] request
+       *[other] requests
+    }, { $failed } failed); { $amounts }
+calls-total =
+    All provider calls: { $calls } ({ $requests } { $requests ->
+        [one] request
+       *[other] requests
+    }, { $failed } failed); { $input } { $input ->
+        [one] token
+       *[other] tokens
+    } in, { $output } out; { $credits } { $credits ->
+        [one] credit
+       *[other] credits
+    }
+calls-tokens = { $input } { $input ->
+        [one] token
+       *[other] tokens
+    } in ({ $cache }), { $output } out
+calls-cached = { $cached } cached, { $hit }%
+calls-cache_unreported = cache not reported
+calls-input_tokens = { $input } { $input ->
+        [one] token
+       *[other] tokens
+    }
+calls-credits = { $credits } { $credits ->
+        [one] credit
+       *[other] credits
+    }
+calls-credits_unreported = credits not reported
+purpose-reply = Replies
+purpose-extraction = Memory
+purpose-picture = Pictures
+purpose-unattributed = Unattributed
+call_kind-model = model
+call_kind-embedding = embeddings
+call_kind-search = web search
+call_kind-extract = page reading
 report-tools = Tool calls: { $calls } ({ $failed } not ok)
-report-chat = Chat: { $messages } messages archived; replied in { $groups } groups
+report-chat =
+    Chat: { $messages } { $messages ->
+        [one] message
+       *[other] messages
+    } archived; replied in { $groups } { $groups ->
+        [one] group
+       *[other] groups
+    }
 report-groups = Groups: { $new } new, { $muted } muted
-report-memory = Memory: { $episodes } new episodes
-report-jobs = Jobs: { $pending } pending, { $failed } failed; { $interrupted } scheduled tasks interrupted
-report-backup_age = Last backup: { $hours } hours ago
+report-memory = Memory: { $episodes } new { $episodes ->
+        [one] episode
+       *[other] episodes
+    }
+report-jobs =
+    Jobs: { $pending } pending, { $failed } failed; { $interrupted } scheduled { $interrupted ->
+        [one] task
+       *[other] tasks
+    } interrupted
+report-backup_age = Last backup: { $hours } { $hours ->
+        [one] hour
+       *[other] hours
+    } ago
 report-backup_none = Last backup: none found

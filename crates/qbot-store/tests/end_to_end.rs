@@ -174,7 +174,8 @@ fn stack_on(db: TestDb, script: Vec<Step>) -> Stack {
         },
     )
     .unwrap();
-    let fake = Arc::new(FakeProvider::new(script));
+    // Provider calls go to the same usage writer, as in production.
+    let fake = Arc::new(FakeProvider::new(script).with_meter(recorder.sink()));
     let deps = Arc::new(RunDeps {
         provider: fake.clone(),
         tools,
@@ -342,11 +343,25 @@ async fn a_run_is_recorded_completely_on_postgres() {
             ("tool".to_owned(), 1)
         ]
     );
-    let daily = sqlx::query("SELECT calls, input_tokens FROM usage_model_daily")
-        .fetch_one(s.db.pool())
-        .await
-        .unwrap();
-    assert_eq!(daily.get::<i64, _>("calls"), 1);
+    let daily = sqlx::query(
+        "SELECT purpose, calls, requests, input_tokens FROM usage_provider_daily WHERE kind = 'model'",
+    )
+    .fetch_one(s.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        (
+            daily.get::<Option<String>, _>("purpose"),
+            daily.get::<i64, _>("calls"),
+            daily.get::<i64, _>("requests")
+        ),
+        (Some("reply".into()), 1, 1)
+    );
+    assert_eq!(
+        daily.get::<i64, _>("input_tokens"),
+        record.input_tokens.unwrap(),
+        "the provider's record and the run's agree"
+    );
     s.finish().await;
 }
 

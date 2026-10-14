@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -19,6 +19,7 @@ use crate::capability::{
 };
 use crate::conversation::{ConvItem, Conversation};
 use crate::error::LlmError;
+use crate::meter::{self, CallKind, Meter};
 use crate::provider::{Provider, ReplayPlan, plan_replay};
 use crate::request::{Request, ToolChoice, validate_request};
 use crate::response::{CacheUsage, Continuation, FinishReason, Response, ResponseMeta, Usage};
@@ -108,6 +109,7 @@ pub struct FakeProvider {
     instance: u64,
     info: ProviderInfo,
     inner: Mutex<Inner>,
+    meter: Option<Arc<dyn Meter>>,
 }
 
 impl std::fmt::Debug for FakeProvider {
@@ -147,7 +149,15 @@ impl FakeProvider {
                 script: script.into_iter().collect(),
                 ..Inner::default()
             }),
+            meter: None,
         }
+    }
+
+    /// Record every call on `meter`, as a real adapter does: one request a call, and the
+    /// tokens of the answer.
+    pub fn with_meter(mut self, meter: Arc<dyn Meter>) -> Self {
+        self.meter = Some(meter);
+        self
     }
 
     /// Make the fake keep server-side state, so continuations produce delta plans.
@@ -293,7 +303,6 @@ impl FakeProvider {
                 model: self.info.model.clone(),
                 provider_response_id: handle,
                 latency: Duration::ZERO,
-                attempts: 1,
             },
         };
         Ok(response)
@@ -307,7 +316,20 @@ impl Provider for FakeProvider {
     }
 
     async fn respond(&self, request: Request<'_>) -> Result<Response, LlmError> {
-        self.run(&request)
+        let call = async {
+            meter::count_request();
+            let response = self.run(&request)?;
+            meter::add_tokens(response.usage);
+            Ok(response)
+        };
+        meter::measured(
+            self.meter.as_ref(),
+            CallKind::Model,
+            self.info.id.as_str(),
+            &self.info.model,
+            call,
+        )
+        .await
     }
 }
 

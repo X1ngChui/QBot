@@ -7,13 +7,14 @@ use std::time::Duration;
 use async_trait::async_trait;
 use qbot_core::{AccountId, Clock, GroupId, UnixMillis};
 use qbot_i18n::Locales;
+use qbot_llm::{CallKind, Purpose};
 use qbot_memory::{IdentityPolicy, MemoryIdentityStore};
 use qbot_ops::{
     Extractor, Housekeeping, Operations, OpsConfig, OpsError, Parts, ReportSink, ReportSource,
     render_report,
 };
 use qbot_sched::{JobError, JobKind, JobRunner};
-use qbot_store::ReportData;
+use qbot_store::{ReportData, UsageLine, UsageSummary};
 
 #[derive(Debug)]
 struct Fixed(AtomicI64);
@@ -113,6 +114,26 @@ impl ReportSink for Sink {
     }
 }
 
+fn line(
+    purpose: Option<Purpose>,
+    kind: CallKind,
+    (calls, requests, failed): (u64, u64, u64),
+    (input_tokens, cached_tokens, output_tokens): (u64, Option<u64>, u64),
+    credits: Option<u64>,
+) -> UsageLine {
+    UsageLine {
+        purpose,
+        kind,
+        calls,
+        requests,
+        failed,
+        input_tokens,
+        cached_tokens,
+        output_tokens,
+        credits,
+    }
+}
+
 fn data() -> ReportData {
     ReportData {
         runs: 12,
@@ -120,13 +141,55 @@ fn data() -> ReportData {
         runs_wake: 2,
         run_ends: vec![("delivered".into(), 9), ("deadline".into(), 3)],
         error_classes: vec![("timeout".into(), 3)],
-        model_calls: 30,
-        failed_model_calls: 3,
-        input_tokens: 2000,
-        cached_tokens: 1500,
-        output_tokens: 300,
-        tool_calls: 20,
-        tool_calls_not_ok: 1,
+        usage: UsageSummary {
+            runs: 12,
+            tool_calls: 20,
+            tool_calls_not_ok: 1,
+            calls: vec![
+                line(
+                    Some(Purpose::Reply),
+                    CallKind::Model,
+                    (30, 32, 3),
+                    (2000, Some(1500), 300),
+                    None,
+                ),
+                line(
+                    Some(Purpose::Reply),
+                    CallKind::Search,
+                    (2, 2, 0),
+                    (0, None, 0),
+                    Some(2),
+                ),
+                line(
+                    Some(Purpose::Extraction),
+                    CallKind::Model,
+                    (3, 4, 0),
+                    (9000, None, 800),
+                    None,
+                ),
+                line(
+                    Some(Purpose::Extraction),
+                    CallKind::Embedding,
+                    (3, 3, 0),
+                    (120, None, 0),
+                    None,
+                ),
+                line(
+                    Some(Purpose::Picture),
+                    CallKind::Model,
+                    (5, 5, 1),
+                    (4000, Some(0), 200),
+                    None,
+                ),
+                line(
+                    Some(Purpose::Reply),
+                    CallKind::Extract,
+                    (1, 1, 0),
+                    (0, None, 0),
+                    None,
+                ),
+            ],
+        },
         messages: 480,
         groups_active: 3,
         groups_new: 1,
@@ -309,9 +372,14 @@ fn the_report_reads_as_a_short_summary() {
          Replies: 12 (10 addressed, 2 scheduled)\n\
          How runs ended: delivered 9, deadline 3\n\
          Model errors: timeout 3\n\
-         Model calls: 30 (3 failed)\n\
-         Tokens: 2000 in (75% from cache, 1500 tokens), 300 out\n\
          Tool calls: 20 (1 not ok)\n\
+         Replies, model: 30 calls (32 requests, 3 failed); 2000 tokens in (1500 cached, 75%), 300 out\n\
+         Replies, web search: 2 calls (2 requests, 0 failed); 2 credits\n\
+         Memory, model: 3 calls (4 requests, 0 failed); 9000 tokens in (cache not reported), 800 out\n\
+         Memory, embeddings: 3 calls (3 requests, 0 failed); 120 tokens\n\
+         Pictures, model: 5 calls (5 requests, 1 failed); 4000 tokens in (0 cached, 0%), 200 out\n\
+         Replies, page reading: 1 call (1 request, 0 failed); credits not reported\n\
+         All provider calls: 44 (47 requests, 4 failed); 15120 tokens in, 1300 out; 2 credits\n\
          Chat: 480 messages archived; replied in 3 groups\n\
          Groups: 1 new, 1 muted\n\
          Memory: 4 new episodes\n\
@@ -328,7 +396,7 @@ fn the_report_reads_as_a_short_summary() {
     assert!(
         !quiet.contains("backup")
             && !quiet.contains("How runs ended")
-            && quiet.contains("Tokens: 0 in (0% from cache"),
+            && quiet.contains("Provider calls: none"),
         "{quiet}"
     );
     assert!(
@@ -346,4 +414,52 @@ async fn the_nightly_cleanup_asks_the_platform_to_clean_its_cache_best_effort() 
     *r.cache.down.lock().unwrap() = true;
     r.ops.run(JobKind::Cleanup, None).await.unwrap();
     assert_eq!(*r.cache.cleaned.lock().unwrap(), 1);
+}
+
+#[test]
+fn counts_of_one_read_in_the_singular() {
+    let one = ReportData {
+        messages: 1,
+        groups_active: 1,
+        episodes: 1,
+        tasks_interrupted: 1,
+        usage: UsageSummary {
+            calls: vec![
+                line(
+                    Some(Purpose::Reply),
+                    CallKind::Model,
+                    (1, 1, 0),
+                    (1, Some(1), 1),
+                    None,
+                ),
+                line(
+                    Some(Purpose::Reply),
+                    CallKind::Search,
+                    (1, 1, 0),
+                    (0, None, 0),
+                    Some(1),
+                ),
+            ],
+            ..UsageSummary::default()
+        },
+        ..ReportData::default()
+    };
+    let text = render_report(
+        &Locales::english(),
+        "d",
+        &one,
+        true,
+        Some(Duration::from_secs(3600)),
+    );
+    for expected in [
+        "Chat: 1 message archived; replied in 1 group",
+        "Memory: 1 new episode\n",
+        "0 failed; 1 scheduled task interrupted",
+        "Replies, model: 1 call (1 request, 0 failed); 1 token in (1 cached, 100%), 1 out",
+        "Replies, web search: 1 call (1 request, 0 failed); 1 credit",
+        "All provider calls: 2 (2 requests, 0 failed); 1 token in, 1 out; 1 credit",
+        "Last backup: 1 hour ago",
+    ] {
+        assert!(text.contains(expected), "{expected:?} in:\n{text}");
+    }
 }

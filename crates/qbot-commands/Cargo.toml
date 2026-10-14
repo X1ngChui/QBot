@@ -12,6 +12,7 @@ qbot-agent.workspace = true
 qbot-gateway.workspace = true
 qbot-i18n.workspace = true
 qbot-memory.workspace = true
+qbot-ops.workspace = true
 qbot-sched.workspace = true
 qbot-store.workspace = true
 async-trait.workspace = true
@@ -21,6 +22,7 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+qbot-llm.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 

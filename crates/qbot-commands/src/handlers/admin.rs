@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use qbot_core::AccountId;
 use qbot_i18n::Msg;
@@ -201,9 +202,14 @@ pub(crate) async fn stats(cx: &Cx<'_>) -> Reply {
     if global && !cx.owner {
         return Err(Msg::OwnerOnly {}.into());
     }
-    let since = period_start(&cx.deps.settings.zone, cx.deps.clock.now(), false)?;
+    let now = cx.deps.clock.now();
+    let since = period_start(&cx.deps.settings.zone, now, false)?;
     let group = (!global).then(|| cx.group());
-    let usage = cx.deps.admin.usage(group, since).await?;
+    let usage = cx
+        .deps
+        .admin
+        .usage(group, since, now.plus(Duration::from_millis(1)))
+        .await?;
     let mut lines = vec![cx.t(&if global {
         Msg::StatsGlobalTitle {}
     } else {
@@ -213,14 +219,9 @@ pub(crate) async fn stats(cx: &Cx<'_>) -> Reply {
     })];
     lines.push(cx.t(&Msg::StatsRuns {
         runs: usage.runs,
-        model_calls: usage.model_calls,
         tool_calls: usage.tool_calls,
     }));
-    lines.push(cx.t(&Msg::StatsTokens {
-        input: usage.input_tokens,
-        cached: usage.cached_tokens,
-        output: usage.output_tokens,
-    }));
+    lines.extend(qbot_ops::usage_lines(&cx.deps.locales, &usage));
     if !global {
         let muted = cx.deps.admin.is_muted(cx.group()).await?;
         lines.push(cx.t(&if muted {

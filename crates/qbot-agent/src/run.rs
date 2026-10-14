@@ -12,8 +12,8 @@ use std::time::Duration;
 use qbot_context::{ChatBatch, Item, Meta, RunEnd, Summary, ToolCall, Transcript, project};
 use qbot_core::{Clock, GroupId, ItemSeq, RunId};
 use qbot_llm::{
-    Continuation, Conversation, ForcedToolChoice, LlmError, Provider, ReasoningEffort, Renderer,
-    Request, ToolChoice, Usage,
+    Attribution, Continuation, Conversation, ForcedToolChoice, LlmError, Provider, Purpose,
+    ReasoningEffort, Renderer, Request, ToolChoice, Usage, attributed,
 };
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -259,7 +259,7 @@ impl Run<'_> {
         specs: &[qbot_llm::ToolSpec],
         choice: &ToolChoice,
     ) -> Result<Vec<ToolCall>, RunEnd> {
-        let info = self.deps.provider.info().clone();
+        let info = self.deps.provider.info();
         // A provider that forces tools only without reasoning gets this one turn without it.
         let mut reasoning = self.deps.reasoning;
         if *choice != ToolChoice::Auto
@@ -277,7 +277,7 @@ impl Run<'_> {
         } else {
             choice.clone()
         };
-        let (answer, latency) = loop {
+        let answer = loop {
             let view = project(&self.transcript)
                 .map_err(|e| self.environment("projecting the transcript", &e))?;
             let conversation = Conversation::lower(&view, &*self.deps.renderer);
@@ -290,21 +290,16 @@ impl Run<'_> {
                 continuation: self.continuation.as_ref(),
                 media: self.deps.media.as_deref(),
             };
-            let started = Instant::now();
-            let answer = self.bounded(self.deps.provider.respond(request)).await?;
-            let latency = started.elapsed();
-            match answer {
-                Err(error @ LlmError::ContextTooLong) if !self.recaps.is_empty() => {
-                    self.record_model(&info, None, 0, Some(error.class()), latency);
-                    self.compact().await?;
-                }
-                answer => break (answer, latency),
+            // The provider records the call itself (`qbot_llm::meter`), attributed to this turn.
+            let call = attributed(self.attribution(), self.deps.provider.respond(request));
+            match self.bounded(call).await? {
+                Err(LlmError::ContextTooLong) if !self.recaps.is_empty() => self.compact().await?,
+                answer => break answer,
             }
         };
         let response = match answer {
             Ok(response) => response,
             Err(error) => {
-                self.record_model(&info, None, 0, Some(error.class()), latency);
                 tracing::warn!(
                     group = self.input.group.get(),
                     run = self.input.run.get(),
@@ -316,13 +311,6 @@ impl Run<'_> {
                 return Err(RunEnd::ModelError);
             }
         };
-        self.record_model(
-            &info,
-            Some(response.usage),
-            response.meta.attempts,
-            None,
-            latency,
-        );
         self.usage += response.usage;
         self.continuation = Some(response.continuation);
 
@@ -354,7 +342,11 @@ impl Run<'_> {
             clock: &*self.deps.clock,
         };
         let executed = {
-            let fut = execute_turn(&self.deps.tools, calls, &cx);
+            // Tools that reach a provider (recall, web search) are this turn's calls too.
+            let fut = attributed(
+                self.attribution(),
+                execute_turn(&self.deps.tools, calls, &cx),
+            );
             // Cancellation or the deadline drops the futures; the calls stay pending and are
             // closed as interrupted when the run ends.
             let deadline = self.input.deadline;
@@ -463,34 +455,21 @@ impl Run<'_> {
         RunEnd::Environment
     }
 
+    /// The run's provider calls, attributed to it and its current turn.
+    fn attribution(&self) -> Attribution {
+        Attribution {
+            purpose: Purpose::Reply,
+            group: self.input.group,
+            run: Some(self.input.run),
+            turn: Some(self.turns),
+        }
+    }
+
     /// Await `future` unless the run is cancelled or past its deadline.
     async fn bounded<F: Future>(&self, future: F) -> Result<F::Output, RunEnd> {
         tokio::select! {
             () = self.cancel.cancelled() => Err(RunEnd::Cancelled),
             result = tokio::time::timeout_at(self.input.deadline, future) => result.map_err(|_| RunEnd::Deadline),
         }
-    }
-
-    fn record_model(
-        &self,
-        info: &qbot_llm::ProviderInfo,
-        usage: Option<Usage>,
-        attempts: u32,
-        error: Option<&'static str>,
-        latency: Duration,
-    ) {
-        self.deps.sink.record(UsageEvent {
-            group: self.input.group,
-            run: self.input.run,
-            turn: self.turns,
-            latency,
-            detail: UsageDetail::Model {
-                provider: info.id.as_str().to_owned(),
-                model: info.model.clone(),
-                usage,
-                attempts,
-                error,
-            },
-        });
     }
 }

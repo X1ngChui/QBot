@@ -22,4 +22,4 @@ pub use backup::{
 pub use operations::{Operations, OpsConfig, Parts};
 pub use pg::{PgHousekeeping, PgReportSource};
 pub use ports::{Extractor, Housekeeping, OpsError, PlatformCache, ReportSink, ReportSource};
-pub use report::render_report;
+pub use report::{render_report, usage_lines};

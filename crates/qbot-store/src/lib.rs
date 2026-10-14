@@ -22,7 +22,7 @@ mod usage;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 
-pub use admin::{BlockRule, PgAdmin, ReportData, RosterRow, TopRow, UsageTotals};
+pub use admin::{BlockRule, PgAdmin, ReportData, RosterRow, TopRow, UsageLine, UsageSummary};
 pub use archive::{Appended, MediaRefRow, NewLine, NewSpeaker, PgArchive};
 pub use episodes::PgEpisodeStore;
 pub use error::StoreError;

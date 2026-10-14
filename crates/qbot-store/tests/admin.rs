@@ -8,7 +8,7 @@ use common::*;
 use qbot_agent::{RunLog, RunSummary, Trigger};
 use qbot_context::RunEnd;
 use qbot_core::{AccountId, GroupId, MessageId, UnixMillis};
-use qbot_llm::Usage;
+use qbot_llm::{CallKind, Purpose, Usage};
 use qbot_store::{NewLine, NewSpeaker, PgAdmin, PgArchive, PgGroupPolicy, PgRunLog};
 
 fn group(n: i64) -> GroupId {
@@ -126,11 +126,10 @@ async fn usage_and_top_requesters_aggregate_runs() {
     // Usage events come from the usage sink; with none recorded the totals are zero, not an error.
     assert_eq!(
         admin
-            .usage(Some(g), UnixMillis::new(0))
+            .usage(Some(g), UnixMillis::new(0), UnixMillis::new(i64::MAX))
             .await
-            .unwrap()
-            .model_calls,
-        0
+            .unwrap(),
+        qbot_store::UsageSummary::default()
     );
     db.drop_db().await;
 }
@@ -175,7 +174,7 @@ async fn the_daily_report_and_housekeeping_read_what_happened() {
         let run = log.begin(g, &trigger).await.unwrap();
         log.finish(g, run, &finish(end, error)).await.unwrap();
     }
-    sqlx::query("INSERT INTO usage_event (at_ms, group_id, run_id, turn, kind, status, input_tokens, cached_tokens, output_tokens, latency_ms) VALUES ($1, 21, 1, 0, 'model', 'ok', 100, 60, 10, 5), ($1, 21, 1, 0, 'model', 'timeout', NULL, NULL, NULL, 5)")
+    sqlx::query("INSERT INTO usage_event (at_ms, group_id, run_id, turn, kind, purpose, status, input_tokens, cached_tokens, output_tokens, requests, latency_ms) VALUES ($1, 21, 1, 0, 'model', 'reply', 'ok', 100, 60, 10, 1, 5), ($1, 21, 1, 0, 'model', 'reply', 'timeout', NULL, NULL, NULL, 3, 5), ($1, 22, NULL, NULL, 'model', 'extraction', 'ok', 900, NULL, 90, 2, 5)")
         .bind(T0)
         .execute(db.pool())
         .await
@@ -208,17 +207,32 @@ async fn the_daily_report_and_housekeeping_read_what_happened() {
         report.run_ends,
         [("delivered".to_owned(), 2), ("model_error".to_owned(), 1)]
     );
+    let reply = report.usage.line(Purpose::Reply, CallKind::Model).unwrap();
     assert_eq!(
         (
-            report.model_calls,
-            report.failed_model_calls,
-            report.input_tokens,
-            report.cached_tokens
+            reply.calls,
+            reply.requests,
+            reply.failed,
+            reply.input_tokens,
+            reply.cached_tokens
         ),
-        (2, 1, 100, 60)
+        (2, 4, 1, 100, Some(60))
+    );
+    let memory = report
+        .usage
+        .line(Purpose::Extraction, CallKind::Model)
+        .unwrap();
+    assert_eq!(
+        (memory.calls, memory.input_tokens, memory.cached_tokens),
+        (1, 900, None),
+        "background work is counted beside replies; an unreported cache stays unreported"
     );
     assert_eq!(
-        (report.tool_calls, report.tool_calls_not_ok, report.messages),
+        (
+            report.usage.tool_calls,
+            report.usage.tool_calls_not_ok,
+            report.messages
+        ),
         (2, 1, 2)
     );
     assert_eq!(
@@ -236,7 +250,7 @@ async fn the_daily_report_and_housekeeping_read_what_happened() {
     assert_eq!(
         (
             empty.runs,
-            empty.model_calls,
+            empty.usage.calls.len() as u64,
             empty.messages,
             empty.groups_new
         ),

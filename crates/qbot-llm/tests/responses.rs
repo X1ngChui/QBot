@@ -182,8 +182,8 @@ async fn server_state_sends_only_the_delta_and_falls_back_when_the_prefix_change
 async fn a_forgotten_server_state_handle_is_absorbed_with_one_full_resend() {
     let (_, first_provider) =
         sim_provider(false, StateMode::ServerState, sim_steps(&[first_reply()]));
-    let (server, provider) =
-        sim_provider(false, StateMode::ServerState, sim_steps(&[second_reply()]));
+    let (server, provider, meter) =
+        metered_provider(false, StateMode::ServerState, sim_steps(&[second_reply()]));
     let (tools, conv0) = (tools(), base_conversation());
     let first = first_provider
         .respond(request(&conv0, &tools, None))
@@ -201,7 +201,12 @@ async fn a_forgotten_server_state_handle_is_absorbed_with_one_full_resend() {
     assert_eq!(requests.len(), 2);
     assert!(requests[0].get("previous_response_id").is_some());
     assert!(requests[1].get("previous_response_id").is_none());
-    assert_eq!(response.meta.attempts, 2);
+    let calls = meter.calls();
+    assert_eq!(calls.len(), 1, "one call, recorded once");
+    assert_eq!(
+        calls[0].requests, 2,
+        "the refused delta and the full resend"
+    );
 }
 
 #[tokio::test]
@@ -465,8 +470,18 @@ async fn transient_errors_retry_with_backoff_and_honor_retry_after() {
         second_reply().into(),
     ];
     let started = tokio::time::Instant::now();
-    let response = respond_with(steps).await.unwrap();
-    assert_eq!(response.meta.attempts, 3);
+    let (_, provider, meter) = metered_provider(true, StateMode::Stateless, steps);
+    let (tools, conv) = (tools(), base_conversation());
+    let response = provider.respond(request(&conv, &tools, None)).await;
+    assert!(response.is_ok());
+    let calls = meter.calls();
+    assert_eq!(calls.len(), 1, "one call, recorded once");
+    assert_eq!(calls[0].requests, 3, "both failed attempts count");
+    assert_eq!(calls[0].error, None);
+    assert!(
+        calls[0].tokens.is_some(),
+        "the one response read is counted"
+    );
     // 3 s (Retry-After beats 100 ms) + 200 ms exponential backoff.
     assert_eq!(started.elapsed(), Duration::from_millis(3200));
 }

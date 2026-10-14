@@ -142,6 +142,8 @@ impl Tool for Say {
 pub struct Harness {
     pub world: Arc<SimWorld>,
     pub sink: Arc<MemorySink>,
+    /// The provider calls the fake recorded.
+    pub meter: Arc<qbot_llm::MemoryMeter>,
     pub fake: Arc<FakeProvider>,
     pub deps: Arc<RunDeps>,
     pub order: Order,
@@ -183,7 +185,8 @@ pub fn harness_with(
 pub fn harness_from(fake: FakeProvider, limits: RunLimits, max_sends: u32) -> Harness {
     let world = SimWorld::new(group());
     let order: Order = Arc::default();
-    let fake = Arc::new(fake);
+    let meter = qbot_llm::MemoryMeter::new();
+    let fake = Arc::new(fake.with_meter(meter.clone()));
     let sink = MemorySink::new();
     let deps = Arc::new(RunDeps {
         provider: fake.clone(),
@@ -200,6 +203,7 @@ pub fn harness_from(fake: FakeProvider, limits: RunLimits, max_sends: u32) -> Ha
     Harness {
         world,
         sink,
+        meter,
         fake,
         deps,
         order,

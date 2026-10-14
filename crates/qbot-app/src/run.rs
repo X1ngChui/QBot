@@ -27,7 +27,7 @@ use qbot_i18n::{LocaleErrors, Locales, Msg};
 use qbot_llm::embedding::HttpEmbedder;
 use qbot_llm::responses::{KeySource, ReqwestTransport, ResponsesProvider};
 use qbot_llm::search::TavilySearch;
-use qbot_llm::{Embedder, LlmError, Provider};
+use qbot_llm::{Embedder, LlmError, Meter, Provider};
 use qbot_media::{
     ArchivedMedia, Describer, LlmDescriber, MediaDeps, MediaService, OpenImages, PgLineEditor,
     Transcriber,
@@ -222,19 +222,21 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         http_key(&config.providers.text.api_key_secret, &resolver),
         &config.route(Service::Text),
     )?;
-    let provider: Arc<dyn Provider> = Arc::new(ResponsesProvider::new(
-        config.text_provider(),
-        Arc::new(text_transport),
-    )?);
+    // Every provider records each call it makes in the usage records, whatever the work.
+    let meter: Arc<dyn Meter> = recorder.sink();
+    let provider: Arc<dyn Provider> = Arc::new(
+        ResponsesProvider::new(config.text_provider(), Arc::new(text_transport))?
+            .with_meter(meter.clone()),
+    );
     let embed_transport = ReqwestTransport::new(
         config.providers.embedding.endpoint.clone(),
         http_key(&config.providers.embedding.api_key_secret, &resolver),
         &config.route(Service::Embedding),
     )?;
-    let embedder: Arc<dyn Embedder> = Arc::new(HttpEmbedder::new(
-        config.embedding_provider(),
-        Arc::new(embed_transport),
-    ));
+    let embedder: Arc<dyn Embedder> = Arc::new(
+        HttpEmbedder::new(config.embedding_provider(), Arc::new(embed_transport))
+            .with_meter(meter.clone()),
+    );
 
     // The platform side.
     let bridge = Arc::new(Bridge::new());
@@ -305,10 +307,10 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
             &config.route(Service::Search),
         )
         .map_err(|e| RunError::Tools(e.to_string()))?;
-        let search = Arc::new(TavilySearch::new(
-            config.search_provider(),
-            Arc::new(transport),
-        ));
+        let search = Arc::new(
+            TavilySearch::new(config.search_provider(), Arc::new(transport))
+                .with_meter(meter.clone()),
+        );
         tools
             .with(qbot_tools::WebSearchTool::new(search.clone()))
             .and_then(|set| {
@@ -435,10 +437,10 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
             http_key(&config.providers.vision.api_key_secret, &resolver),
             &config.route(Service::Vision),
         )?;
-        let vision = Arc::new(ResponsesProvider::new(
-            config.vision_provider(),
-            Arc::new(transport),
-        )?);
+        let vision = Arc::new(
+            ResponsesProvider::new(config.vision_provider(), Arc::new(transport))?
+                .with_meter(meter.clone()),
+        );
         let instructions = describe_image_instructions(&writing_language)?;
         Some(Arc::new(LlmDescriber::new(vision, instructions)))
     } else {

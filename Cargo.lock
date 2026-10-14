@@ -2219,7 +2219,9 @@ dependencies = [
  "qbot-core",
  "qbot-gateway",
  "qbot-i18n",
+ "qbot-llm",
  "qbot-memory",
+ "qbot-ops",
  "qbot-sched",
  "qbot-store",
  "serde_json",
@@ -2348,6 +2350,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2404,6 +2407,7 @@ dependencies = [
  "jiff",
  "qbot-core",
  "qbot-i18n",
+ "qbot-llm",
  "qbot-memory",
  "qbot-sched",
  "qbot-store",

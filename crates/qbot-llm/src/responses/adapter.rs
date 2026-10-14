@@ -12,6 +12,7 @@ use crate::capability::{
 };
 use crate::conversation::Conversation;
 use crate::error::LlmError;
+use crate::meter::{self, CallKind, Meter};
 use crate::provider::{Provider, ReplayPlan, plan_replay};
 use crate::request::{Request, validate_request};
 use crate::response::{Continuation, Response, ResponseMeta};
@@ -30,6 +31,7 @@ pub struct ResponsesProvider {
     /// file expires. Keyed by content: a request's image keys name pictures only within its own
     /// media store, while this outlives every request.
     uploads: moka::future::Cache<String, String>,
+    meter: Option<Arc<dyn Meter>>,
 }
 
 /// How long an uploaded image lives at DeepSeek, and how long its id is reused: a little less,
@@ -100,7 +102,14 @@ impl ResponsesProvider {
             uploads: moka::future::Cache::builder()
                 .time_to_live(UPLOAD_REUSE)
                 .build(),
+            meter: None,
         })
+    }
+
+    /// Record every call on `meter`.
+    pub fn with_meter(mut self, meter: Arc<dyn Meter>) -> Self {
+        self.meter = Some(meter);
+        self
     }
 
     async fn load_images(
@@ -148,7 +157,7 @@ impl ResponsesProvider {
                 ),
             ],
         };
-        let (response, _) =
+        let response =
             upload_with_retry(&*self.transport, &self.cfg.retry, "/files", &upload).await?;
         let value: serde_json::Value = serde_json::from_slice(&response.body)
             .map_err(|e| LlmError::Protocol(format!("upload response is not JSON: {e}")))?;
@@ -161,19 +170,17 @@ impl ResponsesProvider {
     }
 
     /// Plan, build and send. If the server has forgotten our state handle, resend in full once.
-    async fn dispatch(&self, request: &Request<'_>) -> Result<(HttpResponse, u32), LlmError> {
+    async fn dispatch(&self, request: &Request<'_>) -> Result<HttpResponse, LlmError> {
         validate_request(&self.info, request)?;
         let mut plan = plan_replay(&self.info, request.conversation, request.continuation);
-        let mut attempts_total = 0;
         loop {
             let images = self.load_images(request, &plan).await?;
             let body = build_body(&self.cfg, &self.info, request, &plan, &images)?;
             match post_with_retry(&*self.transport, &self.cfg.retry, "/responses", &body).await {
-                Ok((response, attempts)) => return Ok((response, attempts_total + attempts)),
+                Ok(response) => return Ok(response),
                 Err(LlmError::InvalidRequest(message))
                     if message == STATE_LOST && matches!(plan, ReplayPlan::Delta { .. }) =>
                 {
-                    attempts_total += 1;
                     plan = ReplayPlan::Full;
                 }
                 Err(error) => return Err(error),
@@ -187,7 +194,6 @@ impl ResponsesProvider {
         conversation: &Conversation,
         parsed: Parsed,
         started: Instant,
-        attempts: u32,
     ) -> Result<Response, LlmError> {
         let handle = match state {
             StateMode::Stateless => None,
@@ -214,7 +220,6 @@ impl ResponsesProvider {
                 model: parsed.model,
                 provider_response_id: parsed.response_id,
                 latency: started.elapsed(),
-                attempts,
             },
         })
     }
@@ -229,24 +234,34 @@ impl Provider for ResponsesProvider {
     async fn respond(&self, request: Request<'_>) -> Result<Response, LlmError> {
         let started = Instant::now();
         let call = async {
-            let (response, attempts) = self.dispatch(&request).await?;
+            let response = self.dispatch(&request).await?;
             let value: Value = serde_json::from_slice(&response.body)
                 .map_err(|e| LlmError::Protocol(format!("response is not JSON: {e}")))?;
             let parsed = parse_response(self.info.id.as_str(), &value, &self.info.model)?;
+            meter::add_tokens(parsed.usage);
             Self::assemble(
                 &self.info,
                 self.cfg.state,
                 request.conversation,
                 parsed,
                 started,
-                attempts,
             )
         };
-        match self.cfg.timeout {
-            Some(limit) => tokio::time::timeout(limit, call)
-                .await
-                .map_err(|_| LlmError::Timeout)?,
-            None => call.await,
-        }
+        let bounded = async {
+            match self.cfg.timeout {
+                Some(limit) => tokio::time::timeout(limit, call)
+                    .await
+                    .map_err(|_| LlmError::Timeout)?,
+                None => call.await,
+            }
+        };
+        meter::measured(
+            self.meter.as_ref(),
+            CallKind::Model,
+            self.info.id.as_str(),
+            &self.info.model,
+            bounded,
+        )
+        .await
     }
 }

@@ -101,10 +101,9 @@ fn weather_tool() -> Vec<ToolSpec> {
 
 fn report(what: &str, response: &Response) {
     eprintln!(
-        "[{what}] model={} finish={:?} attempts={} latency={:?} input={} output={} reasoning={:?} cache={:?} reported={} text={:?}",
+        "[{what}] model={} finish={:?} latency={:?} input={} output={} reasoning={:?} cache={:?} reported={} text={:?}",
         response.meta.model,
         response.finish,
-        response.meta.attempts,
         response.meta.latency,
         response.usage.input_tokens,
         response.usage.output_tokens,
@@ -475,7 +474,9 @@ async fn dashscope_embeddings_have_the_configured_width_and_rank_by_meaning() {
         &qbot_llm::net::Route::Direct,
     )
     .unwrap();
-    let embedder = HttpEmbedder::new(EmbeddingConfig::dashscope_v4(2048), Arc::new(transport));
+    let meter = qbot_llm::MemoryMeter::new();
+    let embedder = HttpEmbedder::new(EmbeddingConfig::dashscope_v4(2048), Arc::new(transport))
+        .with_meter(meter.clone());
     // Twelve inputs: more than one batch of ten.
     let mut texts: Vec<String> = vec![
         "\u{6211}\u{4eec}\u{5468}\u{672b}\u{53bb}\u{722c}\u{5c71}\u{5427}".into(),
@@ -484,16 +485,21 @@ async fn dashscope_embeddings_have_the_configured_width_and_rank_by_meaning() {
     ];
     texts.extend((0..9).map(|n| format!("filler sentence number {n}")));
     let out = embedder.embed(&texts).await.unwrap();
+    let call = &meter.calls()[0];
     eprintln!(
-        "[embedding] vectors={} dims={} input_tokens={:?} requests={}",
+        "[embedding] vectors={} dims={} tokens={:?} requests={}",
         out.vectors.len(),
         out.vectors[0].len(),
-        out.input_tokens,
-        out.requests
+        call.tokens,
+        call.requests
     );
     assert_eq!(out.vectors.len(), texts.len());
     assert!(out.vectors.iter().all(|v| v.len() == 2048));
-    assert_eq!(out.requests, 2, "split into batches of ten");
+    assert_eq!(call.requests, 2, "split into batches of ten");
+    assert!(
+        call.tokens.is_some_and(|t| t.input_tokens > 0),
+        "tokens of both batches"
+    );
     let cos = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
     for v in &out.vectors {
         assert!((cos(v, v) - 1.0).abs() < 1e-3, "unit length");
@@ -602,11 +608,20 @@ async fn a_transient_failure_is_retried_and_the_retry_reaches_the_real_provider(
     };
     let mut cfg = ResponsesConfig::deepseek(env_or("QBOT_LIVE_TEXT_MODEL", "deepseek-flash"));
     cfg.timeout = Some(Duration::from_secs(120));
-    let provider = ResponsesProvider::new(cfg, Arc::new(transport)).unwrap();
+    let meter = qbot_llm::MemoryMeter::new();
+    let provider = ResponsesProvider::new(cfg, Arc::new(transport))
+        .unwrap()
+        .with_meter(meter.clone());
     let response = provider.respond(request(&conv, &[])).await.unwrap();
     report("retry", &response);
     assert_eq!(response.finish, FinishReason::Stop);
-    assert_eq!(response.meta.attempts, 2, "one failure, one retry");
+    let call = &meter.calls()[0];
+    assert_eq!(call.requests, 2, "one failure, one retry");
+    assert_eq!(
+        call.tokens,
+        Some(response.usage),
+        "only the answer is counted"
+    );
 }
 
 fn tavily_with(key: String) -> qbot_llm::search::TavilySearch {
@@ -637,16 +652,18 @@ fn tavily_with(key: String) -> qbot_llm::search::TavilySearch {
 #[ignore = "calls paid provider APIs"]
 async fn tavily_returns_normalized_results_and_reports_credits() {
     use qbot_llm::search::WebSearch;
-    let search = tavily_with(secret("search_api_key"));
+    let meter = qbot_llm::MemoryMeter::new();
+    let search = tavily_with(secret("search_api_key")).with_meter(meter.clone());
     let out = search
         .search("Rust programming language 2024 edition release")
         .await
         .unwrap();
+    let call = meter.calls()[0].clone();
     eprintln!(
         "[tavily] hits={} credits={:?} requests={}",
         out.hits.len(),
-        out.credits,
-        out.requests
+        call.credits,
+        call.requests
     );
     for hit in &out.hits {
         eprintln!(
@@ -675,7 +692,7 @@ async fn tavily_returns_normalized_results_and_reports_credits() {
             .any(|h| h.content.to_lowercase().contains("rust")),
         "results are about the query"
     );
-    assert_eq!(out.credits, Some(1), "a basic search costs one credit");
+    assert_eq!(call.credits, Some(1), "a basic search costs one credit");
 
     // A Chinese query works as well (the bot's groups mostly write Chinese).
     let zh = search

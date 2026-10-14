@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use qbot_context::Item;
 use qbot_core::{AccountId, GroupId, RunId, UnixMillis};
 use qbot_store::{
-    BlockRule, PgAdmin, PgGroupPolicy, PgRunLog, RosterRow, RunRecord, TopRow, UsageTotals,
+    BlockRule, PgAdmin, PgGroupPolicy, PgRunLog, RosterRow, RunRecord, TopRow, UsageSummary,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -42,11 +42,13 @@ pub trait GroupAdmin: Send + Sync {
     /// Total members on record, and the most active `limit`.
     async fn roster(&self, group: GroupId, limit: i64)
     -> Result<(u64, Vec<RosterRow>), AdminError>;
+    /// What was measured in `[from, to)`, for one group or (`None`) all of them.
     async fn usage(
         &self,
         group: Option<GroupId>,
-        since: UnixMillis,
-    ) -> Result<UsageTotals, AdminError>;
+        from: UnixMillis,
+        to: UnixMillis,
+    ) -> Result<UsageSummary, AdminError>;
     async fn top_requesters(
         &self,
         group: GroupId,
@@ -131,9 +133,10 @@ impl GroupAdmin for PgGroupAdmin {
     async fn usage(
         &self,
         group: Option<GroupId>,
-        since: UnixMillis,
-    ) -> Result<UsageTotals, AdminError> {
-        self.admin.usage(group, since).await.map_err(admin)
+        from: UnixMillis,
+        to: UnixMillis,
+    ) -> Result<UsageSummary, AdminError> {
+        self.admin.usage(group, from, to).await.map_err(admin)
     }
 
     async fn top_requesters(

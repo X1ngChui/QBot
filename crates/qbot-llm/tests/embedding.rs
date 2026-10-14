@@ -6,7 +6,7 @@ use std::time::Duration;
 use qbot_llm::embedding::sim::{Corruption, SimEmbeddingServer};
 use qbot_llm::embedding::{EmbeddingConfig, cosine_distance, hash_embed};
 use qbot_llm::responses::RetryPolicy;
-use qbot_llm::{Embedder, FakeEmbedder, HttpEmbedder, LlmError};
+use qbot_llm::{Embedder, FakeEmbedder, HttpEmbedder, LlmError, MemoryMeter};
 use serde_json::json;
 
 const DIMS: usize = 64;
@@ -27,15 +27,22 @@ fn embedder(server: Arc<SimEmbeddingServer>) -> HttpEmbedder {
     HttpEmbedder::new(cfg, server)
 }
 
+fn metered(server: Arc<SimEmbeddingServer>) -> (HttpEmbedder, Arc<MemoryMeter>) {
+    let meter = MemoryMeter::new();
+    (embedder(server).with_meter(meter.clone()), meter)
+}
+
 #[tokio::test]
 async fn any_number_of_texts_is_split_to_the_vendors_batch_size_and_kept_in_order() {
     let server = Arc::new(SimEmbeddingServer::new(10, DIMS));
-    let e = embedder(server.clone());
+    let (e, meter) = metered(server.clone());
     let input = texts(25);
     let out = e.embed(&input).await.unwrap();
 
     assert_eq!(out.vectors.len(), 25);
-    assert_eq!(out.requests, 3);
+    let calls = meter.calls();
+    assert_eq!(calls.len(), 1, "one call, however many batches");
+    assert_eq!(calls[0].requests, 3);
     let sizes: Vec<usize> = server
         .requests()
         .iter()
@@ -50,7 +57,9 @@ async fn any_number_of_texts_is_split_to_the_vendors_batch_size_and_kept_in_orde
             "vector i belongs to text i"
         );
     }
-    assert!(out.input_tokens.unwrap() > 0);
+    let tokens = calls[0].tokens.unwrap();
+    assert!(tokens.input_tokens > 0, "every batch's tokens");
+    assert_eq!(tokens.cache, qbot_llm::CacheUsage::NotReported);
     assert_eq!(
         e.embed(&[]).await.unwrap().vectors.len(),
         0,
@@ -104,8 +113,9 @@ async fn transient_failures_are_retried_per_request_and_errors_are_normalized() 
     let server = Arc::new(SimEmbeddingServer::new(10, DIMS));
     server.fail_first(vec![(429, Some(Duration::from_secs(2))), (503, None)]);
     let started = tokio::time::Instant::now();
-    let out = embedder(server.clone()).embed(&texts(3)).await.unwrap();
-    assert_eq!(out.requests, 3);
+    let (e, meter) = metered(server.clone());
+    e.embed(&texts(3)).await.unwrap();
+    assert_eq!(meter.calls()[0].requests, 3, "failed attempts count");
     assert_eq!(
         started.elapsed(),
         Duration::from_millis(2200),
@@ -114,10 +124,10 @@ async fn transient_failures_are_retried_per_request_and_errors_are_normalized() 
 
     let server = Arc::new(SimEmbeddingServer::new(10, DIMS));
     server.fail_first(vec![(401, None)]);
-    assert_eq!(
-        embedder(server.clone()).embed(&texts(1)).await.unwrap_err(),
-        LlmError::Auth
-    );
+    let (e, meter) = metered(server.clone());
+    assert_eq!(e.embed(&texts(1)).await.unwrap_err(), LlmError::Auth);
+    let failed = &meter.calls()[0];
+    assert_eq!((failed.requests, failed.error), (1, Some("auth")));
     assert_eq!(server.requests().len(), 1, "an auth error is not retried");
 }
 

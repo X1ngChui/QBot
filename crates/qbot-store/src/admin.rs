@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use qbot_core::{AccountId, Clock, GroupId, UnixMillis};
+use qbot_llm::{CallKind, Purpose};
 use sqlx::{PgPool, Row};
 
 use crate::error::StoreError;
@@ -32,14 +33,41 @@ pub struct RosterRow {
     pub messages: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct UsageTotals {
-    pub runs: u64,
-    pub model_calls: u64,
+/// Provider calls of one kind made for one kind of work, summed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsageLine {
+    /// `None` for calls made outside any attributed work (a wiring mistake, logged).
+    pub purpose: Option<Purpose>,
+    pub kind: CallKind,
+    pub calls: u64,
+    /// HTTP requests, retries included: more than `calls` when calls were retried.
+    pub requests: u64,
+    pub failed: u64,
     pub input_tokens: u64,
-    pub cached_tokens: u64,
+    /// `None` when no call reported its cache use.
+    pub cached_tokens: Option<u64>,
     pub output_tokens: u64,
+    /// `None` when no call reported plan credits.
+    pub credits: Option<u64>,
+}
+
+/// Everything measured in a period: reply runs and their tool calls, and every provider call
+/// by the work it served and its kind, in that order.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UsageSummary {
+    pub runs: u64,
     pub tool_calls: u64,
+    pub tool_calls_not_ok: u64,
+    pub calls: Vec<UsageLine>,
+}
+
+impl UsageSummary {
+    /// The line for `kind` calls made for `purpose`, if there were any.
+    pub fn line(&self, purpose: Purpose, kind: CallKind) -> Option<&UsageLine> {
+        self.calls
+            .iter()
+            .find(|l| l.purpose == Some(purpose) && l.kind == kind)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,13 +88,8 @@ pub struct ReportData {
     pub run_ends: Vec<(String, u64)>,
     /// Model error classes behind `model_error` runs, most common first.
     pub error_classes: Vec<(String, u64)>,
-    pub model_calls: u64,
-    pub failed_model_calls: u64,
-    pub input_tokens: u64,
-    pub cached_tokens: u64,
-    pub output_tokens: u64,
-    pub tool_calls: u64,
-    pub tool_calls_not_ok: u64,
+    /// Tool and provider calls of every group.
+    pub usage: UsageSummary,
     pub messages: u64,
     pub groups_active: u64,
     pub groups_new: u64,
@@ -185,33 +208,77 @@ impl PgAdmin {
         Ok((count(&total, "n"), rows))
     }
 
-    /// Usage since `since`, for one group or (`None`) all of them.
+    /// What was measured in `[from, to)`, for one group or (`None`) all of them.
     pub async fn usage(
         &self,
         group: Option<GroupId>,
-        since: UnixMillis,
-    ) -> Result<UsageTotals, StoreError> {
-        let row = sqlx::query(
-            "SELECT \
-               count(*) FILTER (WHERE kind = 'run')::bigint AS runs, \
-               count(*) FILTER (WHERE kind = 'model')::bigint AS model_calls, \
-               coalesce(sum(input_tokens) FILTER (WHERE kind = 'model'), 0)::bigint AS input_tokens, \
-               coalesce(sum(cached_tokens) FILTER (WHERE kind = 'model'), 0)::bigint AS cached_tokens, \
-               coalesce(sum(output_tokens) FILTER (WHERE kind = 'model'), 0)::bigint AS output_tokens, \
-               count(*) FILTER (WHERE kind = 'tool')::bigint AS tool_calls \
-             FROM usage_event WHERE at_ms >= $1 AND ($2::bigint IS NULL OR group_id = $2)",
+        from: UnixMillis,
+        to: UnixMillis,
+    ) -> Result<UsageSummary, StoreError> {
+        let runs = sqlx::query(
+            "SELECT count(*) FILTER (WHERE kind = 'run')::bigint AS runs, \
+                    count(*) FILTER (WHERE kind = 'tool')::bigint AS tools, \
+                    count(*) FILTER (WHERE kind = 'tool' AND status <> 'ok')::bigint AS tools_not_ok \
+             FROM usage_event WHERE at_ms >= $1 AND at_ms < $2 \
+               AND ($3::bigint IS NULL OR group_id = $3)",
         )
-        .bind(since.get())
+        .bind(from.get())
+        .bind(to.get())
         .bind(group.map(GroupId::get))
         .fetch_one(&self.pool)
         .await?;
-        Ok(UsageTotals {
-            runs: count(&row, "runs"),
-            model_calls: count(&row, "model_calls"),
-            input_tokens: count(&row, "input_tokens"),
-            cached_tokens: count(&row, "cached_tokens"),
-            output_tokens: count(&row, "output_tokens"),
-            tool_calls: count(&row, "tool_calls"),
+        let rows = sqlx::query(
+            "SELECT purpose, kind, count(*)::bigint AS calls, \
+                    coalesce(sum(requests), 0)::bigint AS requests, \
+                    count(*) FILTER (WHERE status <> 'ok')::bigint AS failed, \
+                    coalesce(sum(input_tokens), 0)::bigint AS input, \
+                    sum(cached_tokens)::bigint AS cached, \
+                    coalesce(sum(output_tokens), 0)::bigint AS output, \
+                    sum(credits)::bigint AS credits \
+             FROM usage_event WHERE kind IN ('model', 'embedding', 'search', 'extract') \
+               AND at_ms >= $1 AND at_ms < $2 AND ($3::bigint IS NULL OR group_id = $3) \
+             GROUP BY 1, 2",
+        )
+        .bind(from.get())
+        .bind(to.get())
+        .bind(group.map(GroupId::get))
+        .fetch_all(&self.pool)
+        .await?;
+        let optional = |row: &sqlx::postgres::PgRow, column: &str| {
+            row.get::<Option<i64>, _>(column)
+                .map(|n| u64::try_from(n).unwrap_or(0))
+        };
+        let mut calls = rows
+            .iter()
+            .map(|r| {
+                let kind: String = r.get("kind");
+                Ok(UsageLine {
+                    purpose: r
+                        .get::<Option<String>, _>("purpose")
+                        .map(|p| {
+                            Purpose::parse(&p)
+                                .ok_or_else(|| StoreError::corrupt(format!("purpose {p:?}")))
+                        })
+                        .transpose()?,
+                    kind: CallKind::parse(&kind)
+                        .ok_or_else(|| StoreError::corrupt(format!("usage kind {kind:?}")))?,
+                    calls: count(r, "calls"),
+                    requests: count(r, "requests"),
+                    failed: count(r, "failed"),
+                    input_tokens: count(r, "input"),
+                    cached_tokens: optional(r, "cached"),
+                    output_tokens: count(r, "output"),
+                    credits: optional(r, "credits"),
+                })
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        // Attributed work in its fixed order, then anything unattributed.
+        calls.sort_by_key(|l| (l.purpose.is_none(), l.purpose, l.kind));
+        Ok(UsageSummary {
+            runs: count(&runs, "runs"),
+            tool_calls: count(&runs, "tools"),
+            tool_calls_not_ok: count(&runs, "tools_not_ok"),
+            calls,
         })
     }
 
@@ -315,20 +382,9 @@ impl PgAdmin {
         .bind(to)
         .fetch_all(&self.pool)
         .await?;
-        let usage = sqlx::query(
-            "SELECT count(*) FILTER (WHERE kind = 'model')::bigint AS model_calls, \
-                    count(*) FILTER (WHERE kind = 'model' AND status <> 'ok')::bigint AS failed, \
-                    coalesce(sum(input_tokens) FILTER (WHERE kind = 'model'), 0)::bigint AS input, \
-                    coalesce(sum(cached_tokens) FILTER (WHERE kind = 'model'), 0)::bigint AS cached, \
-                    coalesce(sum(output_tokens) FILTER (WHERE kind = 'model'), 0)::bigint AS output, \
-                    count(*) FILTER (WHERE kind = 'tool')::bigint AS tools, \
-                    count(*) FILTER (WHERE kind = 'tool' AND status <> 'ok')::bigint AS tools_not_ok \
-             FROM usage_event WHERE at_ms >= $1 AND at_ms < $2",
-        )
-        .bind(from)
-        .bind(to)
-        .fetch_one(&self.pool)
-        .await?;
+        let usage = self
+            .usage(None, UnixMillis::new(from), UnixMillis::new(to))
+            .await?;
         let messages = sqlx::query(
             "SELECT count(*)::bigint AS n FROM chat_line WHERE at_ms >= $1 AND at_ms < $2",
         )
@@ -369,13 +425,7 @@ impl PgAdmin {
             runs_wake: count(&runs, "wake"),
             run_ends: pairs(run_ends),
             error_classes: pairs(error_classes),
-            model_calls: count(&usage, "model_calls"),
-            failed_model_calls: count(&usage, "failed"),
-            input_tokens: count(&usage, "input"),
-            cached_tokens: count(&usage, "cached"),
-            output_tokens: count(&usage, "output"),
-            tool_calls: count(&usage, "tools"),
-            tool_calls_not_ok: count(&usage, "tools_not_ok"),
+            usage,
             messages: count(&messages, "n"),
             groups_active: count(&runs, "groups"),
             groups_new: count(&groups, "fresh"),

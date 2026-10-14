@@ -120,8 +120,6 @@ impl Embedder for FakeEmbedder {
                 .iter()
                 .map(|t| hash_embed(t, self.info.dims))
                 .collect(),
-            input_tokens: Some(texts.iter().map(|t| t.len() as u64 / 4 + 1).sum()),
-            requests: 1,
         })
     }
 }

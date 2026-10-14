@@ -33,8 +33,10 @@ R10. Group tasks: durable one-shot timers owned by the group, bounded, never run
 the agent with fresh context.
 R11. Operations: nightly extraction, embedding, fact decay, verified backups, cleanup, a daily
 report to the owners, and single-instance exclusivity.
-R12. Observability: calls, tokens, cache hits and latency are counted; a run that fails logs
-why (`/logs`). Nothing refuses work on cost.
+R12. Observability: every provider call (model turns of replies, extraction and picture
+description, embeddings, web searches and page reads) is counted with its requests, tokens, cache
+hits, credits and latency, by the work it served; a run that fails logs why (`/logs`). Nothing
+refuses work on cost.
 R13. Localization: member-facing text comes from message catalogs.
 
 ## 2. Principles
@@ -425,6 +427,18 @@ the `media_ref` row the platform reference came in.
   `qbot_llm::net`, on a route the configuration decides: directly, or through the one proxy
   (`network.proxy`) for the services listed in `network.proxy_for`. Proxy variables in the
   environment are ignored, so nothing reroutes traffic behind the configuration's back.
+- **Accounting** (`qbot_llm::meter`): each adapter method that reaches a provider (`respond`,
+  `embed`, `search`, `read`) is one call, recorded once on the adapter's `Meter` when it ends,
+  failed or cut off by its caller included. What it consumed is gathered where each fact is
+  known: the shared retry helper counts every HTTP request (retries, embedding batches and image
+  uploads each count), and tokens or credits are added where a response body is parsed, once
+  per response. So a retried call is one record with all its requests, and no response is
+  counted twice. The work a call serves is declared around it, not passed to the adapter:
+  `attributed(Attribution, ..)` wraps a reply run's model turns and tool turns (purpose `reply`,
+  the run and the turn), a group's extraction job (`extraction`) and a picture description
+  (`picture`). A call made outside any such scope is still recorded, as unattributed, with a
+  warning. Search providers report plan credits, not tokens; a provider that does not report
+  its cache use is `CacheUsage::NotReported`, stored as NULL, never as zero.
 - **Fakes**: `FakeProvider` implements the whole contract offline (validation, prefix-cache
   simulation, recorded requests); `SimServer` is a Responses server for adapter tests.
 
@@ -441,7 +455,7 @@ two stores.
 | `/forget N`, `/forget group N` | member / owner | learned memory only: a member's fact, group knowledge |
 | `/group` | member | what the bot learned about the group |
 | `/link`, `/unlink`; `/link @a @b`, `/unlink @a` | member; owner | linking accounts |
-| `/stats`, `/top`, `/help` | member | runs, calls and tokens; replies started |
+| `/stats`, `/top`, `/help` | member | today's replies and provider calls by work and kind; replies started |
 | `/tasks`, `/members`, `/block [--linked]`, `/mute` | owner | the group's tasks, roster, blocks, mute |
 | `/runs [N]` | owner | the latest runs, or one run's steps |
 | `/logs [n]` | owner | recent warnings and errors (the last 200) |
@@ -565,8 +579,13 @@ spend.
   model call, so the container stops within its grace period. The process also stops, with an
   error, if the gateway server ends by itself or the lease is lost, so the container restarts
   instead of running deaf.
-- **Usage**: `usage_event` rows per model and tool call of a reply run, with daily views; `/stats`,
-  `/top` and the report read them. Nothing reads them to refuse work.
+- **Usage**: one `usage_event` table, written off the hot path by one writer: a reply run's end and
+  each of its tool calls (`UsageSink`), and every provider call of any work (`Meter`): its
+  purpose, kind (`model`, `embedding`, `search`, `extract`), provider and model, requests,
+  input, cached and output tokens, credits, status and latency. Daily views
+  (`usage_provider_daily`, `usage_tool_daily`) roll them up. `/stats` and the daily report show
+  the same lines from one aggregation: one per work and kind of call, then the total; `/top`
+  ranks who started reply runs. Nothing reads them to refuse work.
 
 ## 17. Evaluation (`qbot-eval`)
 
@@ -596,8 +615,6 @@ through it.
 - Videos are only a `[video]` marker: nothing describes them.
 - A file's contents and a card's target page are never fetched by themselves; `read_url` reads a
   card's link only if the model asks.
-- Extraction, picture-description and embedding calls are not recorded in `usage_event`, so
-  `/stats` and the report count reply runs only.
 - An uploaded picture stays at DeepSeek for the Files API's longest lifetime (30 days), though
   each upload is used only for one description or one run's turns; the Files API's shortest
   lifetime would do, once it is checked against the live API.

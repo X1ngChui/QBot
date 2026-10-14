@@ -11,14 +11,13 @@ use super::parse::http_error;
 use super::transport::{HttpResponse, Transport, Upload};
 
 /// POST with bounded retries for transient failures: connection errors and the HTTP statuses
-/// that say to try again.
-/// Returns the successful response and the number of attempts it took.
+/// that say to try again. Every request is counted for the call in progress ([`crate::meter`]).
 pub async fn post_with_retry(
     transport: &dyn Transport,
     policy: &RetryPolicy,
     path: &str,
     body: &Value,
-) -> Result<(HttpResponse, u32), LlmError> {
+) -> Result<HttpResponse, LlmError> {
     with_retry(policy, || transport.post(path, body)).await
 }
 
@@ -28,14 +27,11 @@ pub async fn upload_with_retry(
     policy: &RetryPolicy,
     path: &str,
     upload: &Upload,
-) -> Result<(HttpResponse, u32), LlmError> {
+) -> Result<HttpResponse, LlmError> {
     with_retry(policy, || transport.upload(path, upload)).await
 }
 
-async fn with_retry<F, Fut>(
-    policy: &RetryPolicy,
-    mut send: F,
-) -> Result<(HttpResponse, u32), LlmError>
+async fn with_retry<F, Fut>(policy: &RetryPolicy, mut send: F) -> Result<HttpResponse, LlmError>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<HttpResponse, LlmError>>,
@@ -44,9 +40,10 @@ where
     let mut attempt = 0;
     loop {
         attempt += 1;
+        crate::meter::count_request();
         let error = match send().await {
             Ok(response) if (200..300).contains(&response.status) => {
-                return Ok((response, attempt));
+                return Ok(response);
             }
             Ok(response) => http_error(response.status, &response.body, response.retry_after),
             Err(error) => error,

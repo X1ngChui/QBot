@@ -29,10 +29,6 @@ pub struct EmbedderInfo {
 pub struct Embeddings {
     /// One unit-length vector per input text, in input order.
     pub vectors: Vec<Vec<f32>>,
-    /// Input tokens the provider reported, when it reports them.
-    pub input_tokens: Option<u64>,
-    /// HTTP requests it took (batches, plus retries).
-    pub requests: u32,
 }
 
 #[async_trait]

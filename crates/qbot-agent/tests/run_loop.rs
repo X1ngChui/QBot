@@ -337,20 +337,9 @@ async fn a_provider_error_ends_the_run_and_is_reported() {
         report.error,
         Some(LlmError::RateLimited { retry_after: None })
     );
-    assert_eq!(
-        h.sink
-            .events()
-            .iter()
-            .filter(|e| matches!(
-                e.detail,
-                UsageDetail::Model {
-                    error: Some("rate_limited"),
-                    ..
-                }
-            ))
-            .count(),
-        1
-    );
+    let calls = h.meter.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].error, Some("rate_limited"));
 }
 
 #[tokio::test]
@@ -480,10 +469,21 @@ async fn usage_events_cover_models_tools_and_the_run() {
     h.world.say(1, 1, "hello");
     let report = run_once(&h, addressed(1, 101)).await;
     let events = h.sink.events();
-    let models = events
+    // Model calls are recorded by the provider, attributed to the run and the turn they were.
+    let calls = h.meter.calls();
+    let turns: Vec<_> = calls
         .iter()
-        .filter(|e| matches!(e.detail, UsageDetail::Model { .. }))
-        .count();
+        .map(|c| {
+            let by = c.attribution.unwrap();
+            assert_eq!(
+                (by.purpose, by.group, by.run),
+                (qbot_llm::Purpose::Reply, group(), Some(report.run))
+            );
+            by.turn
+        })
+        .collect();
+    assert_eq!(turns, [Some(1), Some(2)]);
+    let models = calls.len();
     let tools: Vec<_> = events
         .iter()
         .filter_map(|e| {
@@ -740,4 +740,88 @@ async fn a_provider_that_forces_tools_only_without_reasoning_keeps_reasoning_off
         ],
         "off for the forced turn and for the rest of the run"
     );
+}
+
+/// A tool that asks a model itself, as recall asks the embedder and web search the search
+/// provider.
+struct Ask(Arc<qbot_llm::fake::FakeProvider>);
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct AskArgs {}
+
+#[async_trait::async_trait]
+impl qbot_agent::Tool for Ask {
+    type Args = AskArgs;
+    const NAME: &'static str = "ask";
+    fn description(&self) -> String {
+        "Ask another model".into()
+    }
+    fn effect(&self) -> qbot_agent::Effect {
+        qbot_agent::Effect::Read
+    }
+    async fn call(
+        &self,
+        _cx: &qbot_agent::ToolCx<'_>,
+        _args: AskArgs,
+    ) -> Result<qbot_agent::ToolOutput, qbot_agent::ToolError> {
+        let conversation =
+            qbot_llm::Conversation::new(vec![ConvItem::Message(qbot_llm::Message {
+                role: qbot_llm::Role::User,
+                content: vec![Content::Text("q".into())],
+            })]);
+        let request = qbot_llm::Request {
+            conversation: &conversation,
+            tools: &[],
+            tool_choice: qbot_llm::ToolChoice::Auto,
+            parallel_tool_calls: false,
+            reasoning: qbot_llm::ReasoningEffort::Off,
+            continuation: None,
+            media: None,
+        };
+        self.0.respond(request).await.unwrap();
+        Ok(qbot_agent::ToolOutput::text("asked"))
+    }
+}
+
+#[tokio::test]
+async fn provider_calls_a_tool_makes_are_attributed_to_the_run_and_its_turn() {
+    let h = harness(vec![
+        reply_ok(FakeReply::new().call("echo", json!({"text": "a"}))),
+        reply_ok(FakeReply::new().call("ask", json!({}))),
+        reply_ok(say("done")),
+    ]);
+    let inner = Arc::new(
+        qbot_llm::fake::FakeProvider::new([Step::Reply(FakeReply::new().text("answer"))])
+            .with_meter(h.meter.clone()),
+    );
+    let tools = tool_set(&h.world, &h.order, 4).with(Ask(inner)).unwrap();
+    let h = Harness {
+        deps: Arc::new(qbot_agent::RunDeps {
+            provider: h.deps.provider.clone(),
+            tools,
+            archive: h.deps.archive.clone(),
+            log: h.deps.log.clone(),
+            sink: h.deps.sink.clone(),
+            renderer: h.deps.renderer.clone(),
+            clock: h.deps.clock.clone(),
+            limits: h.deps.limits,
+            reasoning: h.deps.reasoning,
+            media: None,
+        }),
+        ..h
+    };
+    h.world.say(1, 1, "hello");
+    let report = run_once(&h, addressed(1, 101)).await;
+    let turns: Vec<_> = h
+        .meter
+        .calls()
+        .iter()
+        .map(|c| {
+            let by = c.attribution.expect("attributed");
+            assert_eq!(by.run, Some(report.run));
+            by.turn
+        })
+        .collect();
+    // Three model turns, and the tool's own call during the second.
+    assert_eq!(turns, [Some(1), Some(2), Some(2), Some(3)]);
 }

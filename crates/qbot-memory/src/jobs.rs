@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use qbot_core::{AccountId, GroupId, SliceGrid};
+use qbot_llm::{Attribution, Purpose, attributed};
 use qbot_sched::{JobError, JobKind, JobRunner};
 
 use crate::build::EpisodeBuilder;
@@ -124,8 +125,17 @@ impl EpisodeJobs {
     }
 
     /// Extract all complete slices of `group`; returns how many episodes were stored. Episodes
-    /// the current embedding index lacks are embedded first.
+    /// the current embedding index lacks are embedded first. Every provider call is recorded as
+    /// the group's extraction.
     pub async fn extract_group(&self, group: GroupId) -> Result<usize, JobError> {
+        attributed(
+            Attribution::group(Purpose::Extraction, group),
+            self.extract(group),
+        )
+        .await
+    }
+
+    async fn extract(&self, group: GroupId) -> Result<usize, JobError> {
         let _one_at_a_time = self.running.lock().await;
         self.index_group(group).await?;
         self.consolidate_pending(group).await?;

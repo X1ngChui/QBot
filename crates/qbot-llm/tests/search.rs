@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use qbot_llm::LlmError;
 use qbot_llm::responses::{HttpResponse, RetryPolicy, Transport};
 use qbot_llm::search::{SearchDepth, TavilyConfig, TavilySearch, WebSearch};
+use qbot_llm::{LlmError, MemoryMeter};
 use serde_json::{Value, json};
 
 /// Answers each POST with the next scripted `(status, body)` and records what was sent.
@@ -91,8 +91,16 @@ async fn a_search_sends_the_configured_request_and_normalizes_results() {
             "response_time": 0.8
         }),
     )]);
-    let search = tavily(transport.clone(), 2);
+    let meter = MemoryMeter::new();
+    let search = tavily(transport.clone(), 2).with_meter(meter.clone());
     let out = search.search("rust async runtimes").await.unwrap();
+    let call = &meter.calls()[0];
+    assert_eq!(
+        (call.kind, call.model.as_str(), call.requests, call.credits),
+        (qbot_llm::CallKind::Search, "basic", 1, Some(1)),
+        "credits are provider usage, not tokens"
+    );
+    assert_eq!(call.tokens, None);
 
     let (path, body) = transport.sent.lock().unwrap()[0].clone();
     assert_eq!(path, "/search");
@@ -116,7 +124,6 @@ async fn a_search_sends_the_configured_request_and_normalizes_results() {
     assert_eq!(out.hits[0].content, "line one line two of 1");
     assert_eq!(out.hits[0].published, None);
     assert_eq!(out.hits[1].published.as_deref(), Some("2026-10-01"));
-    assert_eq!((out.credits, out.requests), (Some(1), 1));
 }
 
 #[tokio::test]
@@ -126,8 +133,18 @@ async fn provider_failures_are_typed_and_only_transient_ones_retried() {
         (503, json!({"detail": {"error": "busy"}})),
         (200, json!({"results": [result(1)]})),
     ]);
-    let out = tavily(transport, 5).search("q").await.unwrap();
-    assert_eq!((out.requests, out.credits), (2, None));
+    let meter = MemoryMeter::new();
+    tavily(transport, 5)
+        .with_meter(meter.clone())
+        .search("q")
+        .await
+        .unwrap();
+    let call = &meter.calls()[0];
+    assert_eq!(
+        (call.requests, call.credits),
+        (2, None),
+        "no usage reported"
+    );
 
     // A bad key, a used-up plan and a pay-as-you-go cap are the account's state: no retry.
     for (status, expected) in [
@@ -163,14 +180,14 @@ async fn reading_a_page_asks_for_markdown_and_passes_the_question_only_when_give
         "usage": {"credits": 1}
     });
     let transport = Scripted::new([(200, page.clone()), (200, page)]);
-    let reader = tavily(transport.clone(), 5);
+    let meter = MemoryMeter::new();
+    let reader = tavily(transport.clone(), 5).with_meter(meter.clone());
 
     let whole = reader.read("https://example.org/a", None).await.unwrap();
     assert_eq!(
         whole,
         PageRead::Read {
             content: "# Title\n\n- one\n- two".into(),
-            credits: Some(1)
         },
         "Markdown structure is kept, only the ends are trimmed"
     );
@@ -194,6 +211,13 @@ async fn reading_a_page_asks_for_markdown_and_passes_the_question_only_when_give
     );
     assert_eq!(sent[1].1["query"], "what is listed?");
     assert_eq!(sent[1].1["chunks_per_source"], 3);
+    let calls = meter.calls();
+    assert_eq!(calls.len(), 2);
+    assert!(
+        calls
+            .iter()
+            .all(|c| c.kind == qbot_llm::CallKind::Extract && c.credits == Some(1))
+    );
 }
 
 #[tokio::test]

@@ -49,8 +49,6 @@ async fn call(search: Arc<FakeSearch>, query: &str) -> Result<String, ToolError>
 async fn results_are_listed_under_where_they_came_from() {
     let search = Arc::new(FakeSearch::new([Ok(SearchResults {
         hits: vec![hit(1, Some("2026-10-01")), hit(2, None)],
-        credits: Some(1),
-        requests: 1,
     })]));
     let text = call(search.clone(), "  rust 2026 edition  ").await.unwrap();
     assert_eq!(search.queries(), ["rust 2026 edition"]);
@@ -69,11 +67,7 @@ async fn results_are_listed_under_where_they_came_from() {
 #[tokio::test]
 async fn empty_queries_empty_results_and_provider_failures_are_answers_to_the_model() {
     let search = Arc::new(FakeSearch::new([
-        Ok(SearchResults {
-            hits: vec![],
-            credits: None,
-            requests: 1,
-        }),
+        Ok(SearchResults { hits: vec![] }),
         Err(LlmError::QuotaExhausted("plan limit".into())),
         Err(LlmError::Timeout),
     ]));
@@ -135,7 +129,6 @@ async fn read(
 fn page(content: &str) -> Result<qbot_llm::search::PageRead, LlmError> {
     Ok(qbot_llm::search::PageRead::Read {
         content: content.into(),
-        credits: Some(1),
     })
 }
 

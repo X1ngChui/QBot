@@ -272,15 +272,10 @@ pub struct UsageEvent {
     pub detail: UsageDetail,
 }
 
+/// What a run did, for the usage records. Provider calls are recorded by the providers
+/// themselves (`qbot_llm::meter`), attributed to the run.
 #[derive(Debug, Clone, PartialEq)]
 pub enum UsageDetail {
-    Model {
-        provider: String,
-        model: String,
-        usage: Option<Usage>,
-        attempts: u32,
-        error: Option<&'static str>,
-    },
     Tool {
         name: String,
         outcome: Outcome,

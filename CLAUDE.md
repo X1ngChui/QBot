@@ -93,6 +93,11 @@ paid API. Build the image with `docker build -f deploy/Dockerfile .`; deployment
   the whole schema; unknown keys are rejected). Internal tuning is the `Default` of the owning
   crate's settings. A new setting goes in `defaults.toml` with a comment, the example config if
   operators need it, and the conversion in `qbot-config`; credentials are never configuration.
+- **Provider calls are accounted in `qbot_llm::meter`.** A new adapter method that reaches a
+  provider runs through `meter::measured`, sends HTTP through the shared retry helper (which
+  counts requests) and adds tokens or credits where it parses a response. New work that calls a
+  provider wraps the calls in `attributed(..)` with its purpose; the app end-to-end test checks
+  that the usage rows match the mock servers' requests and that none is unattributed.
 - **Every local limit needs a concrete reason** and must not duplicate a provider-side or
   already-implied bound; `docs/architecture.md` section 14 lists them.
 - **Schema:** `crates/qbot-store/migrations/`, forward-only: production runs it, so a change is a

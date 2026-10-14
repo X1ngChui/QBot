@@ -9,7 +9,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -118,29 +118,93 @@ async fn embeddings(axum::Json(body): axum::Json<Value>) -> axum::Json<Value> {
 
 /// A Responses endpoint over real HTTP, answering from the adapter test simulator.
 async fn mock_llm(sim: Arc<SimServer>) -> SocketAddr {
-    async fn handle(
-        State(sim): State<Arc<SimServer>>,
-        axum::Json(body): axum::Json<Value>,
-    ) -> Response {
-        let answer = sim.post("/responses", &body).await.unwrap();
+    mock_llm_counting(sim).await.0
+}
+
+/// [`mock_llm`], also counting the embedding requests it answers (the simulator records the
+/// Responses requests).
+async fn mock_llm_counting(sim: Arc<SimServer>) -> (SocketAddr, Arc<AtomicUsize>) {
+    #[derive(Clone)]
+    struct Mock {
+        sim: Arc<SimServer>,
+        embedded: Arc<AtomicUsize>,
+    }
+    async fn handle(State(mock): State<Mock>, axum::Json(body): axum::Json<Value>) -> Response {
+        let answer = mock.sim.post("/responses", &body).await.unwrap();
         Response::builder()
             .status(StatusCode::from_u16(answer.status).unwrap())
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(answer.body))
             .unwrap()
     }
+    async fn embed(State(mock): State<Mock>, body: axum::Json<Value>) -> axum::Json<Value> {
+        mock.embedded.fetch_add(1, Ordering::SeqCst);
+        embeddings(body).await
+    }
+    let embedded = Arc::new(AtomicUsize::new(0));
     let app = Router::new()
         .route("/responses", post(handle))
-        .route("/embeddings", post(embeddings))
+        .route("/embeddings", post(embed))
         .route(
             "/pic",
             axum::routing::get(|| async { b"\x89PNG\r\n\x1a\nfake-pixels".to_vec() }),
         )
-        .with_state(sim);
+        .with_state(Mock {
+            sim,
+            embedded: embedded.clone(),
+        });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    addr
+    (addr, embedded)
+}
+
+/// The usage records account for every request the mock providers answered, no more and no
+/// fewer, each attributed to its work: `expected` lists `(purpose, kind)` pairs with calls.
+async fn assert_usage_complete(
+    pool: &sqlx::PgPool,
+    responses: usize,
+    embedded: usize,
+    expected: &[(&str, &str)],
+) {
+    let recorded = |kind: &'static str| async move {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT coalesce(sum(requests), 0)::bigint FROM usage_event WHERE kind = $1",
+        )
+        .bind(kind)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    };
+    // The writer stores events a moment after they happen.
+    eventually("the usage records to catch up", || async {
+        recorded("model").await == i64::try_from(responses).unwrap()
+            && recorded("embedding").await == i64::try_from(embedded).unwrap()
+    })
+    .await;
+    let unattributed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM usage_event WHERE kind NOT IN ('tool', 'run') AND purpose IS NULL",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        unattributed, 0,
+        "every provider call says which work it served"
+    );
+    let mut seen: Vec<(String, String)> = sqlx::query_as(
+        "SELECT DISTINCT purpose, kind FROM usage_event WHERE purpose IS NOT NULL ORDER BY 1, 2",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let mut expected: Vec<(String, String)> = expected
+        .iter()
+        .map(|(p, k)| ((*p).to_owned(), (*k).to_owned()))
+        .collect();
+    seen.sort();
+    expected.sort();
+    assert_eq!(seen, expected);
 }
 
 fn scratch() -> PathBuf {
@@ -688,6 +752,13 @@ async fn pictures_and_voice_reach_the_model_as_words() {
             .contains("[image:A red bicycle leaning against a brick wall]")
     );
     assert_eq!(sim.requests().len(), 3, "one vision call, two replies");
+    assert_usage_complete(
+        &pool,
+        sim.requests().len(),
+        0,
+        &[("picture", "model"), ("reply", "model")],
+    )
+    .await;
 
     // Voice, through the real recogniser, when a model is available.
     if let Some(dir) = &asr_dir {
@@ -946,7 +1017,7 @@ async fn a_filled_batch_turns_archived_chat_into_a_stored_episode() {
         // The reply run looks and stays silent.
         SimStep::Reply(FakeReply::new().call("stay_silent", json!({}))),
     ]));
-    let llm = mock_llm(sim.clone()).await;
+    let (llm, embedded) = mock_llm_counting(sim.clone()).await;
     // One-line batches and three-batch slices: the third line completes a slice, and the batch
     // it fills queues the extraction at once, without waiting for the nightly run.
     deployment_with(
@@ -1070,6 +1141,27 @@ async fn a_filled_batch_turns_archived_chat_into_a_stored_episode() {
     assert!(
         asked.contains("we should plan the trip together") && asked.contains("submit_episode"),
         "{asked}"
+    );
+    // Extraction (its model calls and the episodes' embeddings) is accounted for beside the
+    // reply, request for request.
+    answering_names(
+        &mut napcat,
+        assert_usage_complete(
+            &pool,
+            sim.requests().len(),
+            embedded.load(Ordering::SeqCst),
+            &[
+                ("extraction", "embedding"),
+                ("extraction", "model"),
+                ("reply", "model"),
+            ],
+        ),
+    )
+    .await;
+    assert_eq!(
+        embedded.load(Ordering::SeqCst),
+        2,
+        "one embedding per episode"
     );
 
     bot.stop.cancel();

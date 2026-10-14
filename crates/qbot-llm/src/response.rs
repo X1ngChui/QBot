@@ -89,8 +89,6 @@ pub struct ResponseMeta {
     pub model: String,
     pub provider_response_id: Option<String>,
     pub latency: Duration,
-    /// HTTP-level attempts, counting the one that succeeded.
-    pub attempts: u32,
 }
 
 /// Opaque state a provider needs to continue a conversation. Callers store it and pass it back
