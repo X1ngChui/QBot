@@ -29,7 +29,11 @@ pub(crate) async fn help(cx: &Cx<'_>) -> Reply {
                 });
                 if command.owner_only() {
                     line.push(' ');
-                    line.push_str(&cx.t(&Msg::HelpOwnerTag {}));
+                    line.push_str(&cx.t(&if command.delegated() {
+                        Msg::HelpDelegatedTag {}
+                    } else {
+                        Msg::HelpOwnerTag {}
+                    }));
                 }
                 lines.push(line);
             }
@@ -40,7 +44,9 @@ pub(crate) async fn help(cx: &Cx<'_>) -> Reply {
             let command = Command::find(name).ok_or_else(|| Msg::HelpUnknown {
                 name: (*name).to_owned(),
             })?;
-            let access = cx.t(&if command.owner_only() {
+            let access = cx.t(&if command.delegated() {
+                Msg::HelpAccessDelegated {}
+            } else if command.owner_only() {
                 Msg::HelpAccessOwner {}
             } else {
                 Msg::HelpAccessMember {}

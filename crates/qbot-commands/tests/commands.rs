@@ -17,7 +17,7 @@ use qbot_i18n::Locales;
 use qbot_llm::{CallKind, Purpose};
 use qbot_memory::{IdentityPolicy, IdentityStore, MemoryIdentityStore};
 use qbot_sched::{MemoryTimerStore, TaskLimits, TaskService};
-use qbot_store::{BlockRule, RosterRow, TopRow, UsageLine, UsageSummary};
+use qbot_store::{BlockRule, BlockedBy, RosterRow, TopRow, UsageLine, UsageSummary};
 use tokio::sync::Notify;
 
 const T0: i64 = 1_800_000_000_000;
@@ -25,6 +25,9 @@ const OWNER: i64 = 1;
 const ALICE: i64 = 2;
 const BOB: i64 = 3;
 const CAROL: i64 = 4;
+/// Made a delegated admin of group 900 in the tests that need one, and a second one.
+const ADAM: i64 = 8;
+const AVA: i64 = 9;
 const BOT: i64 = 100;
 
 fn acct(n: i64) -> AccountId {
@@ -41,8 +44,9 @@ impl Clock for TestClock {
 
 #[derive(Default)]
 struct AdminState {
-    muted: bool,
+    muted: BTreeSet<GroupId>,
     blocks: Vec<BlockRule>,
+    admins: BTreeSet<(GroupId, AccountId)>,
 }
 
 #[derive(Default)]
@@ -50,12 +54,42 @@ struct FakeAdmin(Mutex<AdminState>);
 
 #[async_trait]
 impl GroupAdmin for FakeAdmin {
-    async fn is_muted(&self, _: GroupId) -> Result<bool, AdminError> {
-        Ok(self.0.lock().unwrap().muted)
+    async fn is_muted(&self, group: GroupId) -> Result<bool, AdminError> {
+        Ok(self.0.lock().unwrap().muted.contains(&group))
     }
-    async fn set_muted(&self, _: GroupId, muted: bool) -> Result<(), AdminError> {
-        self.0.lock().unwrap().muted = muted;
+    async fn set_muted(&self, group: GroupId, muted: bool) -> Result<(), AdminError> {
+        let mut state = self.0.lock().unwrap();
+        if muted {
+            state.muted.insert(group);
+        } else {
+            state.muted.remove(&group);
+        }
         Ok(())
+    }
+    async fn admins(&self, group: GroupId) -> Result<Vec<AccountId>, AdminError> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .admins
+            .iter()
+            .filter(|(g, _)| *g == group)
+            .map(|(_, a)| *a)
+            .collect())
+    }
+    async fn is_admin(&self, group: GroupId, account: AccountId) -> Result<bool, AdminError> {
+        Ok(self.0.lock().unwrap().admins.contains(&(group, account)))
+    }
+    async fn grant_admin(
+        &self,
+        group: GroupId,
+        account: AccountId,
+        _: AccountId,
+    ) -> Result<bool, AdminError> {
+        Ok(self.0.lock().unwrap().admins.insert((group, account)))
+    }
+    async fn revoke_admin(&self, group: GroupId, account: AccountId) -> Result<bool, AdminError> {
+        Ok(self.0.lock().unwrap().admins.remove(&(group, account)))
     }
     async fn blocks(&self, _: GroupId) -> Result<Vec<BlockRule>, AdminError> {
         Ok(self.0.lock().unwrap().blocks.clone())
@@ -65,16 +99,28 @@ impl GroupAdmin for FakeAdmin {
         _: GroupId,
         account: AccountId,
         until: Option<UnixMillis>,
-    ) -> Result<(), AdminError> {
+        by: BlockedBy,
+    ) -> Result<bool, AdminError> {
         let mut state = self.0.lock().unwrap();
+        let owners = |b: &BlockRule| b.account == account && b.by == BlockedBy::Owner;
+        if by == BlockedBy::DelegatedAdmin && state.blocks.iter().any(owners) {
+            return Ok(false);
+        }
         state.blocks.retain(|b| b.account != account);
-        state.blocks.push(BlockRule { account, until });
-        Ok(())
+        state.blocks.push(BlockRule { account, until, by });
+        Ok(true)
     }
-    async fn unblock(&self, _: GroupId, account: AccountId) -> Result<bool, AdminError> {
+    async fn unblock(
+        &self,
+        _: GroupId,
+        account: AccountId,
+        by: BlockedBy,
+    ) -> Result<bool, AdminError> {
         let mut state = self.0.lock().unwrap();
         let before = state.blocks.len();
-        state.blocks.retain(|b| b.account != account);
+        state.blocks.retain(|b| {
+            b.account != account || (by == BlockedBy::DelegatedAdmin && b.by == BlockedBy::Owner)
+        });
         Ok(state.blocks.len() != before)
     }
     async fn member_number(
@@ -82,7 +128,7 @@ impl GroupAdmin for FakeAdmin {
         _: GroupId,
         account: AccountId,
     ) -> Result<Option<u32>, AdminError> {
-        Ok([OWNER, ALICE, BOB, CAROL]
+        Ok([OWNER, ALICE, BOB, CAROL, ADAM, AVA]
             .iter()
             .position(|a| *a == account.get())
             .map(|i| i as u32 + 1))
@@ -177,6 +223,8 @@ impl Directory for Names {
             OWNER => Some("Olive".into()),
             ALICE => Some("Alice".into()),
             BOB => Some("Bob".into()),
+            ADAM => Some("Adam".into()),
+            AVA => Some("Ava".into()),
             _ => None,
         }
     }
@@ -295,7 +343,7 @@ struct Rig {
 async fn rig() -> Rig {
     let clock = Arc::new(TestClock(AtomicI64::new(T0)));
     let identity = Arc::new(MemoryIdentityStore::new(IdentityPolicy::default()));
-    for a in [OWNER, ALICE, BOB, CAROL] {
+    for a in [OWNER, ALICE, BOB, CAROL, ADAM, AVA] {
         identity.seen(acct(a), UnixMillis::new(T0)).await.unwrap();
     }
     let tasks = TaskService::new(
@@ -411,7 +459,7 @@ fn only_the_exact_lowercase_word_is_a_command() {
         Some(Command::Help),
         "help is lenient about slash and case"
     );
-    assert_eq!(Command::ALL.len(), 16);
+    assert_eq!(Command::ALL.len(), 17);
 }
 
 #[tokio::test]
@@ -424,8 +472,17 @@ async fn help_lists_commands_by_category_and_explains_one() {
         "{all}"
     );
     assert!(
-        all.contains("/mute  Mute or unmute the bot here (owner only)"),
+        all.contains("/mute  Mute or unmute the bot here (owner or delegated admin)"),
         "{all}"
+    );
+    assert!(
+        all.contains("/admin  Choose who may manage /mute and /block here (owner only)"),
+        "{all}"
+    );
+    assert!(
+        rig.say(ALICE, "/help block", &[])
+            .await
+            .contains("Bot owner, or an admin a bot owner delegated in this group")
     );
     assert!(all.contains("[Administration]"), "{all}");
     let one = rig.say(ALICE, "/help tasks", &[]).await;
@@ -446,12 +503,15 @@ async fn help_lists_commands_by_category_and_explains_one() {
 #[tokio::test]
 async fn owner_only_commands_are_refused_for_members() {
     let rig = rig().await;
-    for text in ["/mute on", "/members", "/block", "/tasks", "/runs", "/logs"] {
+    for text in ["/members", "/tasks", "/runs", "/logs", "/admin"] {
         assert_eq!(
             rig.say(ALICE, text, &[]).await,
             "This action needs bot-owner permission.",
             "{text}"
         );
+    }
+    for text in ["/mute on", "/block"] {
+        assert_eq!(rig.say(ALICE, text, &[]).await, DELEGATED_ONLY, "{text}");
     }
     assert_eq!(
         rig.say(ALICE, "/stats global", &[]).await,
@@ -1363,5 +1423,269 @@ async fn muted_groups_and_blocked_members_get_no_command_replies() {
             .await
             .contains("ignore your rules"),
         "and wrote no note"
+    );
+}
+
+const DELEGATED_ONLY: &str = "This action needs bot-owner permission, or to be an admin a bot owner delegated in this group.";
+
+#[tokio::test]
+async fn owners_grant_list_and_revoke_delegated_admins_per_group() {
+    let rig = rig().await;
+    assert_eq!(
+        rig.say(OWNER, "/admin", &[]).await,
+        "This group has no delegated admins."
+    );
+    assert_eq!(
+        rig.say(OWNER, "/admin add", &[ADAM]).await,
+        "Adam is now a delegated admin of this group and may use /mute and /block here."
+    );
+    assert_eq!(
+        rig.say(OWNER, "/admin add", &[ADAM]).await,
+        "Adam is already a delegated admin of this group."
+    );
+    assert_eq!(
+        rig.say(OWNER, "/admin", &[]).await,
+        "Delegated admins of this group (may use /mute and /block here):\n- Adam"
+    );
+    assert_eq!(
+        rig.say_in(901, OWNER, "/admin", &[]).await,
+        "This group has no delegated admins.",
+        "the grant is this group's"
+    );
+    assert_eq!(
+        rig.say(OWNER, "/admin add", &[OWNER]).await,
+        "Bot owners already have every permission."
+    );
+    assert_eq!(
+        rig.say(OWNER, "/admin add", &[BOT]).await,
+        "The bot cannot be an admin."
+    );
+    assert_eq!(
+        rig.say(OWNER, "/admin add", &[]).await,
+        "Usage: /admin, /admin add @account or /admin remove @account"
+    );
+    assert_eq!(
+        rig.say(OWNER, "/admin remove", &[ADAM]).await,
+        "Adam is no longer a delegated admin of this group."
+    );
+    assert_eq!(
+        rig.say(OWNER, "/admin remove", &[ADAM]).await,
+        "Adam is not a delegated admin of this group."
+    );
+    assert_eq!(
+        rig.say(ADAM, "/mute on", &[]).await,
+        DELEGATED_ONLY,
+        "revoked"
+    );
+}
+
+#[tokio::test]
+async fn a_delegated_admin_mutes_and_blocks_in_their_group_and_nothing_more() {
+    let rig = rig().await;
+    rig.say(OWNER, "/admin add", &[ADAM]).await;
+    assert_eq!(rig.say(ADAM, "/mute on", &[]).await, "Muted this group.");
+    assert_eq!(rig.say(ADAM, "/mute", &[]).await, "This group is muted.");
+    assert_eq!(
+        rig.say(ADAM, "/mute off", &[]).await,
+        "Replies are enabled again in this group."
+    );
+    assert!(
+        rig.say(ADAM, "/block add", &[BOB])
+            .await
+            .starts_with("Blocked replies to Bob")
+    );
+    assert!(rig.say(ADAM, "/block", &[]).await.contains("- Bob"));
+    assert!(
+        rig.say(ADAM, "/block remove", &[BOB])
+            .await
+            .starts_with("Removed the reply block: Bob")
+    );
+    assert_eq!(
+        rig.say(ADAM, "/block add", &[OWNER]).await,
+        "The bot and bot owners cannot be blocked."
+    );
+    // A bot owner's account linked here is protected too.
+    rig.say(OWNER, "/link", &[OWNER, CAROL]).await;
+    assert_eq!(
+        rig.say(ADAM, "/block add", &[CAROL]).await,
+        "The bot and bot owners cannot be blocked."
+    );
+    // The delegated set is the bot owners' alone to change.
+    for (text, target) in [
+        ("/admin add", ALICE),
+        ("/admin remove", ADAM),
+        ("/admin", ADAM),
+    ] {
+        assert_eq!(
+            rig.say(ADAM, text, &[target]).await,
+            "This action needs bot-owner permission.",
+            "{text}"
+        );
+    }
+    assert_eq!(
+        rig.say(ADAM, "/admin", &[]).await,
+        "This action needs bot-owner permission."
+    );
+    for text in ["/tasks", "/members", "/runs", "/logs", "/stats global"] {
+        assert_eq!(
+            rig.say(ADAM, text, &[]).await,
+            "This action needs bot-owner permission.",
+            "{text}"
+        );
+    }
+    // In another group they are an ordinary member.
+    assert_eq!(rig.say_in(901, ADAM, "/mute on", &[]).await, DELEGATED_ONLY);
+    assert_eq!(
+        rig.say_in(901, ADAM, "/block add", &[BOB]).await,
+        DELEGATED_ONLY
+    );
+    // Ordinary members are unchanged.
+    assert_eq!(rig.say(ALICE, "/mute on", &[]).await, DELEGATED_ONLY);
+}
+
+#[tokio::test]
+async fn a_delegation_is_one_accounts_and_no_link_carries_it() {
+    let rig = rig().await;
+    rig.say(OWNER, "/admin add", &[ADAM]).await;
+    // Linked to the admin in another group: nothing here.
+    rig.say_in(901, OWNER, "/link", &[ADAM, ALICE]).await;
+    assert_eq!(rig.say(ALICE, "/mute on", &[]).await, DELEGATED_ONLY);
+    // Linked to the admin in this group: still the admin's alone.
+    rig.say(OWNER, "/link", &[ADAM, BOB]).await;
+    assert_eq!(rig.say(BOB, "/mute on", &[]).await, DELEGATED_ONLY);
+    // And the admin's link elsewhere gives no authority in that group.
+    assert_eq!(rig.say_in(901, ADAM, "/mute on", &[]).await, DELEGATED_ONLY);
+    assert_eq!(
+        rig.say_in(901, ALICE, "/mute on", &[]).await,
+        DELEGATED_ONLY
+    );
+}
+
+/// In a muted group a delegated admin is answered for /mute and /block only, and a blocked
+/// admin not at all.
+#[tokio::test]
+async fn in_a_muted_group_a_delegated_admin_may_only_manage_mute_and_blocks() {
+    let rig = rig().await;
+    rig.say(OWNER, "/admin add", &[ADAM]).await;
+    rig.say(OWNER, "/mute on", &[]).await;
+    for text in ["/who", "/help", "/admin"] {
+        assert!(
+            rig.router
+                .respond(&rig.request(ADAM, text, &[]))
+                .await
+                .is_none(),
+            "{text}"
+        );
+    }
+    assert!(
+        rig.router
+            .respond(&rig.request(ALICE, "/mute off", &[]))
+            .await
+            .is_none()
+    );
+    assert!(
+        rig.say(ADAM, "/block add", &[BOB])
+            .await
+            .starts_with("Blocked replies to Bob")
+    );
+    assert_eq!(
+        rig.say(ADAM, "/mute off", &[]).await,
+        "Replies are enabled again in this group."
+    );
+    rig.say(OWNER, "/block add", &[ADAM]).await;
+    assert!(
+        rig.router
+            .respond(&rig.request(ADAM, "/mute on", &[]))
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_delegated_admin_blocks_only_ordinary_members() {
+    let rig = rig().await;
+    rig.say(OWNER, "/admin add", &[ADAM]).await;
+    rig.say(OWNER, "/admin add", &[AVA]).await;
+    assert_eq!(
+        rig.say(ADAM, "/block add", &[AVA]).await,
+        "A delegated admin can block only ordinary members, not another delegated admin."
+    );
+    assert_eq!(
+        rig.say(ADAM, "/block add 3d", &[AVA]).await,
+        "A delegated admin can block only ordinary members, not another delegated admin."
+    );
+    assert_eq!(
+        rig.say(OWNER, "/block", &[]).await,
+        "This group has no reply blocks.",
+        "nothing was blocked"
+    );
+    // --linked stops at the first account that is a delegated admin, before any is blocked.
+    rig.say(OWNER, "/link", &[BOB, AVA]).await;
+    assert_eq!(
+        rig.say(ADAM, "/block add --linked", &[BOB]).await,
+        "A delegated admin can block only ordinary members, not another delegated admin."
+    );
+    assert_eq!(
+        rig.say(OWNER, "/block", &[]).await,
+        "This group has no reply blocks."
+    );
+    assert!(
+        rig.say(ADAM, "/block add", &[ALICE])
+            .await
+            .starts_with("Blocked replies to Alice"),
+        "an ordinary member"
+    );
+    assert!(
+        rig.say(OWNER, "/block add", &[AVA])
+            .await
+            .starts_with("Blocked replies to Ava"),
+        "a bot owner may block anyone but the bot and bot owners"
+    );
+}
+
+#[tokio::test]
+async fn a_bot_owners_block_is_not_a_delegated_admins_to_change_or_lift() {
+    let rig = rig().await;
+    rig.say(OWNER, "/admin add", &[ADAM]).await;
+    rig.say(OWNER, "/block add", &[BOB]).await;
+    let refused = "A bot owner set the block on Bob; only a bot owner can change or lift it.";
+    assert_eq!(rig.say(ADAM, "/block remove", &[BOB]).await, refused);
+    assert_eq!(
+        rig.say(ADAM, "/block add 30m", &[BOB]).await,
+        refused,
+        "not shortened either"
+    );
+    let list = rig.say(ADAM, "/block", &[]).await;
+    assert!(
+        list.contains("- Bob") && !list.contains("until"),
+        "unchanged: {list}"
+    );
+    // A delegated admin's own block they may change and lift; a bot owner overrides either.
+    rig.say(ADAM, "/block add", &[ALICE]).await;
+    assert!(
+        rig.say(ADAM, "/block add 3d", &[ALICE])
+            .await
+            .starts_with("Blocked replies to Alice")
+    );
+    assert!(
+        rig.say(ADAM, "/block remove", &[ALICE])
+            .await
+            .starts_with("Removed the reply block: Alice")
+    );
+    rig.say(ADAM, "/block add", &[ALICE]).await;
+    assert!(
+        rig.say(OWNER, "/block add", &[ALICE])
+            .await
+            .starts_with("Blocked replies to Alice"),
+        "the bot owner takes the block over"
+    );
+    assert_eq!(
+        rig.say(ADAM, "/block remove", &[ALICE]).await,
+        "A bot owner set the block on Alice; only a bot owner can change or lift it."
+    );
+    assert!(
+        rig.say(OWNER, "/block remove", &[BOB])
+            .await
+            .starts_with("Removed the reply block: Bob")
     );
 }

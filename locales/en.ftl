@@ -3,6 +3,8 @@
 # The language the bot writes its memory and picture descriptions in, as a model reads it.
 writing-language = English
 command-owner_only = This action needs bot-owner permission.
+command-delegated_only = This action needs bot-owner permission, or to be an admin a bot owner delegated in this group.
+command-authority_unknown = Could not check your permissions just now, so nothing was done; try again.
 command-outcome_unknown = Could not confirm the result of that action. It may or may not have happened; check before repeating it.
 command-unknown_account = That account has no record yet, so this cannot be done.
 command-mentions_exact =
@@ -63,10 +65,12 @@ help-category_admin = Administration
 help-category_help = Help
 help-entry = { $command }  { $what }
 help-owner_tag = (owner only)
+help-delegated_tag = (owner or delegated admin)
 help-footer = Details: /help <command>
 help-unknown = There is no command called "{ $name }".
 help-access_member = Available to all members
 help-access_owner = Bot owner only
+help-access_delegated = Bot owner, or an admin a bot owner delegated in this group
 help-detail =
     { $command }  { $what }
     { $access }
@@ -90,6 +94,22 @@ detail-note =
     /note remove [--linked] [@account] N
     /note clear [--linked] [@account]
     Notes are written by hand and kept exactly as written; the bot can read them but never changes them, and they are separate from what it learns from chat (see /forget). Members manage notes about their own accounts; owners about anyone. Numbers come from /note or /who in the same scope.
+what-admin = Choose who may manage /mute and /block here
+detail-admin =
+    /admin
+    /admin add @account
+    /admin remove @account
+    Delegated admins may use /mute and /block in this group only. Only a bot owner adds or removes them; the permission belongs to that account alone, not to accounts linked to it.
+usage-admin = Usage: /admin, /admin add @account or /admin remove @account
+admin-list_empty = This group has no delegated admins.
+admin-list_header = Delegated admins of this group (may use /mute and /block here):
+admin-list_row = - { $label }
+admin-added = { $label } is now a delegated admin of this group and may use /mute and /block here.
+admin-already = { $label } is already a delegated admin of this group.
+admin-removed = { $label } is no longer a delegated admin of this group.
+admin-remove_none = { $label } is not a delegated admin of this group.
+admin-bot = The bot cannot be an admin.
+admin-bot_owner = Bot owners already have every permission.
 what-link = Confirm your linked accounts
 detail-link =
     /link @account
@@ -186,6 +206,8 @@ mute-set_off = Replies are enabled again in this group.
 mute-already_on = This group is already muted.
 mute-already_off = Replies are already enabled in this group.
 block-cannot_block = The bot and bot owners cannot be blocked.
+block-delegated_target = A delegated admin can block only ordinary members, not another delegated admin.
+block-owner_imposed = A bot owner set the block on { $label }; only a bot owner can change or lift it.
 block-list_empty = This group has no reply blocks.
 block-list_header = Reply blocks in this group:
 block-list_row = - { $label }{ $until }

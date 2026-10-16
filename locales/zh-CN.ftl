@@ -1,6 +1,8 @@
 # Simplified Chinese catalog (Fluent). Same message ids and variables as en.ftl.
 writing-language = Simplified Chinese
 command-owner_only = 该操作需要 bot owner 权限。
+command-delegated_only = 该操作需要 bot owner 权限，或由 bot owner 授权的本群管理员身份。
+command-authority_unknown = 暂时无法确认你的权限，未执行任何操作，请稍后再试。
 command-outcome_unknown = 未能确认操作结果，可能已经生效，也可能没有，请先确认再重试。
 command-unknown_account = 目标账号暂无资料，无法执行此操作。
 command-mentions_exact = 需要准确 @ { $count } 个账号。
@@ -53,10 +55,12 @@ help-category_admin = 管理
 help-category_help = 帮助
 help-entry = { $command }　{ $what }
 help-owner_tag = （仅 owner）
+help-delegated_tag = （owner 或授权管理员）
 help-footer = 详细用法：/help 指令名
 help-unknown = 没有「{ $name }」这条指令。
 help-access_member = 所有成员可用
 help-access_owner = 仅 bot owner
+help-access_delegated = bot owner，或 bot owner 在本群授权的管理员
 help-detail =
     { $command }　{ $what }
     { $access }
@@ -80,6 +84,22 @@ detail-note =
     /note remove [--linked] [@账号] 编号
     /note clear [--linked] [@账号]
     备注由人手写，按原文保存；bot 可以读到但不会修改，也与它从聊天中学到的内容分开（见 /forget）。成员管理自己账号的备注，owner 可管理任何人的。编号来自同一范围的 /note 或 /who。
+what-admin = 设置谁可以在本群管理 /mute 和 /block
+detail-admin =
+    /admin
+    /admin add @账号
+    /admin remove @账号
+    授权管理员只能在本群使用 /mute 和 /block。只有 bot owner 能添加或移除授权管理员；权限只属于该账号本身，不随关联账号转移。
+usage-admin = 用法：/admin、/admin add @账号 或 /admin remove @账号
+admin-list_empty = 本群没有授权管理员。
+admin-list_header = 本群的授权管理员（可在本群使用 /mute 和 /block）：
+admin-list_row = - { $label }
+admin-added = 已将 { $label } 设为本群授权管理员，可在本群使用 /mute 和 /block。
+admin-already = { $label } 已经是本群授权管理员。
+admin-removed = { $label } 不再是本群授权管理员。
+admin-remove_none = { $label } 不是本群授权管理员。
+admin-bot = 机器人不能成为管理员。
+admin-bot_owner = bot owner 已拥有全部权限。
 what-link = 确认自己的关联账号
 detail-link =
     /link @另一个账号
@@ -178,6 +198,8 @@ mute-set_off = 已恢复本群回复。
 mute-already_on = 本群已处于静音状态。
 mute-already_off = 本群已处于启用回复状态。
 block-cannot_block = 不能屏蔽机器人或 bot owner。
+block-delegated_target = 授权管理员只能屏蔽普通成员，不能屏蔽其他授权管理员。
+block-owner_imposed = { $label } 的屏蔽由 bot owner 设置，只有 bot owner 能修改或解除。
 block-list_empty = 本群暂无回复屏蔽规则。
 block-list_header = 本群回复屏蔽规则：
 block-list_row = · { $label }{ $until }

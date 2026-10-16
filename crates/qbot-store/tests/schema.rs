@@ -30,6 +30,7 @@ async fn migrations_are_idempotent_and_the_expected_tables_exist() {
             "episode_embedding",
             "fact",
             "fact_evidence",
+            "group_admin",
             "group_block",
             "group_state",
             "link_invitation",

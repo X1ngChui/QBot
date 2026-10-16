@@ -24,6 +24,15 @@ impl std::fmt::Debug for PgAdmin {
 pub struct BlockRule {
     pub account: AccountId,
     pub until: Option<UnixMillis>,
+    pub by: BlockedBy,
+}
+
+/// Who set a block, as far as authority goes: a delegated admin's block a bot owner may change,
+/// a bot owner's block only a bot owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockedBy {
+    Owner,
+    DelegatedAdmin,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,7 +134,7 @@ impl PgAdmin {
     /// Blocks in force now, oldest first.
     pub async fn blocks(&self, group: GroupId) -> Result<Vec<BlockRule>, StoreError> {
         let rows = sqlx::query(
-            "SELECT account_id, until_ms FROM group_block \
+            "SELECT account_id, until_ms, by_owner FROM group_block \
              WHERE group_id = $1 AND (until_ms IS NULL OR until_ms > $2) ORDER BY created_ms, account_id",
         )
         .bind(group.get())
@@ -137,9 +146,37 @@ impl PgAdmin {
                 Ok(BlockRule {
                     account: account(r.get("account_id"))?,
                     until: r.get::<Option<i64>, _>("until_ms").map(UnixMillis::new),
+                    by: if r.get::<bool, _>("by_owner") {
+                        BlockedBy::Owner
+                    } else {
+                        BlockedBy::DelegatedAdmin
+                    },
                 })
             })
             .collect()
+    }
+
+    /// The group's delegated admins, in the order they were made admins.
+    pub async fn admins(&self, group: GroupId) -> Result<Vec<AccountId>, StoreError> {
+        let ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT account_id FROM group_admin WHERE group_id = $1 ORDER BY granted_ms, account_id",
+        )
+        .bind(group.get())
+        .fetch_all(&self.pool)
+        .await?;
+        ids.into_iter().map(account).collect()
+    }
+
+    /// Whether this very account is a delegated admin of the group.
+    pub async fn is_admin(&self, group: GroupId, who: AccountId) -> Result<bool, StoreError> {
+        Ok(
+            sqlx::query("SELECT 1 FROM group_admin WHERE group_id = $1 AND account_id = $2")
+                .bind(group.get())
+                .bind(who.get())
+                .fetch_optional(&self.pool)
+                .await?
+                .is_some(),
+        )
     }
 
     /// The group's member number for an account, if it has one.

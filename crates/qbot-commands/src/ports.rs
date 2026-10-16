@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use qbot_context::Item;
 use qbot_core::{AccountId, GroupId, RunId, UnixMillis};
 use qbot_store::{
-    BlockRule, PgAdmin, PgGroupPolicy, PgRunLog, RosterRow, RunRecord, TopRow, UsageSummary,
+    BlockRule, BlockedBy, PgAdmin, PgGroupPolicy, PgRunLog, RosterRow, RunRecord, TopRow,
+    UsageSummary,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -21,14 +22,34 @@ pub trait GroupAdmin: Send + Sync {
     async fn set_muted(&self, group: GroupId, muted: bool) -> Result<(), AdminError>;
     /// Blocks in force now.
     async fn blocks(&self, group: GroupId) -> Result<Vec<BlockRule>, AdminError>;
+    /// Whether the block was set: a delegated admin never replaces a bot owner's block.
     async fn block(
         &self,
         group: GroupId,
         account: AccountId,
         until: Option<UnixMillis>,
-    ) -> Result<(), AdminError>;
-    /// Whether a block was removed.
-    async fn unblock(&self, group: GroupId, account: AccountId) -> Result<bool, AdminError>;
+        by: BlockedBy,
+    ) -> Result<bool, AdminError>;
+    /// Whether a block was removed: a delegated admin removes only a delegated admin's.
+    async fn unblock(
+        &self,
+        group: GroupId,
+        account: AccountId,
+        by: BlockedBy,
+    ) -> Result<bool, AdminError>;
+    /// The group's delegated admins, oldest grant first.
+    async fn admins(&self, group: GroupId) -> Result<Vec<AccountId>, AdminError>;
+    /// Whether this very account is a delegated admin of the group.
+    async fn is_admin(&self, group: GroupId, account: AccountId) -> Result<bool, AdminError>;
+    /// Whether the account was not an admin already.
+    async fn grant_admin(
+        &self,
+        group: GroupId,
+        account: AccountId,
+        by: AccountId,
+    ) -> Result<bool, AdminError>;
+    /// Whether the account was an admin.
+    async fn revoke_admin(&self, group: GroupId, account: AccountId) -> Result<bool, AdminError>;
     async fn member_number(
         &self,
         group: GroupId,
@@ -89,15 +110,51 @@ impl GroupAdmin for PgGroupAdmin {
         group: GroupId,
         account: AccountId,
         until: Option<UnixMillis>,
-    ) -> Result<(), AdminError> {
+        by: BlockedBy,
+    ) -> Result<bool, AdminError> {
         self.policy
-            .block(group, account, until)
+            .block_as(group, account, until, by)
             .await
             .map_err(admin)
     }
 
-    async fn unblock(&self, group: GroupId, account: AccountId) -> Result<bool, AdminError> {
-        self.policy.unblock(group, account).await.map_err(admin)
+    async fn unblock(
+        &self,
+        group: GroupId,
+        account: AccountId,
+        by: BlockedBy,
+    ) -> Result<bool, AdminError> {
+        self.policy
+            .unblock_as(group, account, by)
+            .await
+            .map_err(admin)
+    }
+
+    async fn admins(&self, group: GroupId) -> Result<Vec<AccountId>, AdminError> {
+        self.admin.admins(group).await.map_err(admin)
+    }
+
+    async fn is_admin(&self, group: GroupId, account: AccountId) -> Result<bool, AdminError> {
+        self.admin.is_admin(group, account).await.map_err(admin)
+    }
+
+    async fn grant_admin(
+        &self,
+        group: GroupId,
+        account: AccountId,
+        by: AccountId,
+    ) -> Result<bool, AdminError> {
+        self.policy
+            .grant_admin(group, account, by)
+            .await
+            .map_err(admin)
+    }
+
+    async fn revoke_admin(&self, group: GroupId, account: AccountId) -> Result<bool, AdminError> {
+        self.policy
+            .revoke_admin(group, account)
+            .await
+            .map_err(admin)
     }
 
     async fn member_number(

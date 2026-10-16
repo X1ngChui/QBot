@@ -22,6 +22,8 @@ pub enum Command {
     Members,
     Block,
     Mute,
+    /// The group's delegated admins.
+    Admin,
     /// Recent runs and their steps.
     Runs,
     /// Recent warnings and errors.
@@ -40,7 +42,7 @@ pub enum Category {
 
 impl Command {
     /// In the order `/help` lists them; commands of one category are adjacent.
-    pub const ALL: [Command; 16] = [
+    pub const ALL: [Command; 17] = [
         Command::Who,
         Command::Note,
         Command::Name,
@@ -54,6 +56,7 @@ impl Command {
         Command::Members,
         Command::Block,
         Command::Mute,
+        Command::Admin,
         Command::Runs,
         Command::Logs,
         Command::Help,
@@ -74,6 +77,7 @@ impl Command {
             Command::Members => "members",
             Command::Block => "block",
             Command::Mute => "mute",
+            Command::Admin => "admin",
             Command::Runs => "runs",
             Command::Logs => "logs",
             Command::Help => "help",
@@ -89,9 +93,15 @@ impl Command {
                 | Command::Members
                 | Command::Block
                 | Command::Mute
+                | Command::Admin
                 | Command::Runs
                 | Command::Logs
         )
+    }
+
+    /// Owner-only commands a bot owner's delegated admin of a group may also use there.
+    pub fn delegated(self) -> bool {
+        matches!(self, Command::Mute | Command::Block)
     }
 
     pub fn category(self) -> Category {
@@ -103,6 +113,7 @@ impl Command {
             | Command::Members
             | Command::Block
             | Command::Mute
+            | Command::Admin
             | Command::Runs
             | Command::Logs => Category::Admin,
             Command::Help => Category::Help,
@@ -137,6 +148,7 @@ impl Command {
             Command::Members => Msg::WhatMembers {},
             Command::Block => Msg::WhatBlock {},
             Command::Mute => Msg::WhatMute {},
+            Command::Admin => Msg::WhatAdmin {},
             Command::Runs => Msg::WhatRuns {},
             Command::Logs => Msg::WhatLogs {},
             Command::Help => Msg::WhatHelp {},
@@ -158,6 +170,7 @@ impl Command {
             Command::Members => Msg::DetailMembers {},
             Command::Block => Msg::DetailBlock {},
             Command::Mute => Msg::DetailMute {},
+            Command::Admin => Msg::DetailAdmin {},
             Command::Runs => Msg::DetailRuns {},
             Command::Logs => Msg::DetailLogs {},
             Command::Help => Msg::DetailHelp {},

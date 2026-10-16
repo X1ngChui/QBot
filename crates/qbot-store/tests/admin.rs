@@ -285,3 +285,126 @@ async fn the_daily_report_and_housekeeping_read_what_happened() {
     let _ = TimerId::new(1);
     db.drop_db().await;
 }
+
+#[tokio::test]
+async fn delegated_admins_are_granted_and_revoked_per_group_and_per_account() {
+    let db = db!();
+    let clock = ManualClock::new(T0);
+    let admin = PgAdmin::new(db.pool().clone(), clock.clone());
+    let policy = PgGroupPolicy::new(db.pool().clone(), clock.clone());
+    let archive = PgArchive::new(db.pool().clone());
+    let (g, h) = (group(70), group(71));
+    for (n, who) in [(1, 701), (2, 702), (3, 703)] {
+        say(&archive, g, n, who).await;
+    }
+    let owner = account(1);
+    assert!(admin.admins(g).await.unwrap().is_empty());
+    assert!(policy.grant_admin(g, account(702), owner).await.unwrap());
+    clock.advance(Duration::from_secs(1));
+    assert!(policy.grant_admin(g, account(701), owner).await.unwrap());
+    assert!(
+        !policy.grant_admin(g, account(702), owner).await.unwrap(),
+        "already one"
+    );
+    assert_eq!(
+        admin.admins(g).await.unwrap(),
+        [account(702), account(701)],
+        "oldest grant first"
+    );
+    assert!(admin.is_admin(g, account(702)).await.unwrap());
+    assert!(!admin.is_admin(g, account(703)).await.unwrap());
+    assert!(
+        !admin.is_admin(h, account(702)).await.unwrap(),
+        "a grant is one group's"
+    );
+    assert!(admin.admins(h).await.unwrap().is_empty());
+    assert!(
+        policy.grant_admin(g, account(99), owner).await.is_err(),
+        "only a known account"
+    );
+    assert!(policy.revoke_admin(g, account(702)).await.unwrap());
+    assert!(!policy.revoke_admin(g, account(702)).await.unwrap());
+    assert_eq!(admin.admins(g).await.unwrap(), [account(701)]);
+    db.drop_db().await;
+}
+
+/// Who set the account's block in force, and until when.
+async fn block_of(
+    admin: &PgAdmin,
+    g: GroupId,
+    who: i64,
+) -> Option<(qbot_store::BlockedBy, Option<UnixMillis>)> {
+    admin
+        .blocks(g)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.account.get() == who)
+        .map(|r| (r.by, r.until))
+}
+
+#[tokio::test]
+async fn a_delegated_admin_never_replaces_or_lifts_a_bot_owners_block() {
+    use qbot_store::BlockedBy::{DelegatedAdmin, Owner};
+    let db = db!();
+    let clock = ManualClock::new(T0);
+    let admin = PgAdmin::new(db.pool().clone(), clock.clone());
+    let policy = PgGroupPolicy::new(db.pool().clone(), clock.clone());
+    let g = group(80);
+    policy.block(g, account(801), None).await.unwrap();
+    assert!(
+        !policy
+            .block_as(
+                g,
+                account(801),
+                Some(UnixMillis::new(T0 + 1)),
+                DelegatedAdmin
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        !policy
+            .unblock_as(g, account(801), DelegatedAdmin)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        block_of(&admin, g, 801).await,
+        Some((Owner, None)),
+        "untouched"
+    );
+
+    // A delegated admin's block is theirs to change, and a bot owner takes it over.
+    assert!(
+        policy
+            .block_as(g, account(802), None, DelegatedAdmin)
+            .await
+            .unwrap()
+    );
+    assert_eq!(block_of(&admin, g, 802).await, Some((DelegatedAdmin, None)));
+    assert!(policy.block_as(g, account(802), None, Owner).await.unwrap());
+    assert_eq!(block_of(&admin, g, 802).await, Some((Owner, None)));
+    assert!(
+        !policy
+            .unblock_as(g, account(802), DelegatedAdmin)
+            .await
+            .unwrap()
+    );
+    assert!(policy.unblock(g, account(802)).await.unwrap());
+
+    // A bot owner's block that ran out no longer stands in the way.
+    policy
+        .block(g, account(803), Some(UnixMillis::new(T0 + 1_000)))
+        .await
+        .unwrap();
+    clock.advance(Duration::from_secs(2));
+    assert!(
+        policy
+            .block_as(g, account(803), None, DelegatedAdmin)
+            .await
+            .unwrap()
+    );
+    assert_eq!(block_of(&admin, g, 803).await, Some((DelegatedAdmin, None)));
+    db.drop_db().await;
+}

@@ -17,8 +17,9 @@ R2. Archive every event exactly once. A unique-key insert is the only dedup gate
 stops all further effects. The bot's own lines come only from the platform's echo.
 R3. Speak only when caused: an @ of the bot, one of its nicknames in a message, a quote of one of
 the bot's lines, a due group task, or (at `replies.spontaneous_chance`) a look at the chat on its
-own. A muted group gets nothing, commands included except an owner's; a blocked member cannot
-start a reply or get a command answered, but stays in context.
+own. A muted group gets nothing, commands included except a bot owner's and its delegated
+admins' `/mute` and `/block`; a blocked member cannot start a reply or get a command answered,
+but stays in context.
 R4. Reply through tools: the model decides whether to speak, whom to mention and what to quote.
 R5. Tools: send, stay silent, archive search, episode recall and reading, web search and page
 reading, opening pictures, and the group's scheduled tasks.
@@ -383,7 +384,7 @@ record is one of these:
 | Global, by content | picture descriptions and voice transcripts (`media_cache`) | keyed by a digest of the bytes and made from the bytes alone (the describer and recognizer see nothing else), so a hit gives a group only what it could get from the same picture or clip it received itself; nothing learned from any group's conversation enters them. A forwarded picture is described only on a hit, which says only that identical bytes were seen before |
 | Global, owners | `usage_event`, `run` totals for `/stats global` and the daily report | counts and tokens, no text; the report goes to the owners privately |
 | Process, owners | warnings and errors for `/logs` | a line about a group (its `group` field) is shown only in that group; a line about no group is shown everywhere, so it keeps only its fixed message and numeric fields, never free text such as an error or a model's answer (the full line stays in the process log) |
-| Group | archive and `media_ref`, member numbers, blocks, mute, links (`account_link`), names, notes, facts and group knowledge, episodes and their embeddings, tasks and recurring schedules, runs and their transcripts, invitations | read only with the group's id |
+| Group | archive and `media_ref`, member numbers, blocks, mute, delegated admins (`group_admin`), links (`account_link`), names, notes, facts and group knowledge, episodes and their embeddings, tasks and recurring schedules, runs and their transcripts, invitations | read only with the group's id |
 
 Nothing else crosses: no name, fact, note, relationship (link), chat text, memory, task context
 or anything else derived from a group's conversation is shown or used in another group.
@@ -526,13 +527,29 @@ two stores.
 | `/group` | member | what the bot learned about the group |
 | `/link`, `/unlink`; `/link @a @b`, `/unlink @a` | member; owner | linking accounts in this group |
 | `/stats`, `/top`, `/help` | member | today's replies and provider calls by work and kind; replies started |
-| `/tasks`, `/members`, `/block [--linked]`, `/mute` | owner | the group's tasks, roster, blocks, mute |
+| `/block [--linked]`, `/mute` | owner, delegated admin | the group's blocks, mute |
+| `/admin`, `/admin add @m`, `/admin remove @m` | owner | the group's delegated admins |
+| `/tasks`, `/members` | owner | the group's tasks, roster |
 | `/runs [N]` | owner | the latest runs, or one run's steps |
 | `/logs [n]` | owner | recent warnings and errors (the last 200) about this group or no group |
 
 Replies quote the command, mention the sender, and are split at QQ's 2,000-character message
-limit. Mute and block hold for commands as for runs: in a muted group only owners are answered
-(so `/mute off` works), and a blocked member gets no answer and so cannot write notes either. Members act on their own accounts and those linked to them in the group, owners on anyone. A member's name in a reply is
+limit. Mute and block hold for commands as for runs: in a muted group only bot owners are
+answered, and delegated admins for `/mute` and `/block` (so `/mute off` works), and a blocked
+member gets no answer and so cannot write notes either.
+
+**Authority** has three levels and is not taken from QQ's own group roles. *Bot owners*
+(`owners` in the configuration) may do everything everywhere. A *delegated admin* is an account
+a bot owner made one with `/admin add` in one group (`group_admin`); there, and only there, it may
+use `/mute` and `/block`, and nothing else owner-only: it cannot change the admin list, so
+delegated authority never passes itself on. It blocks only ordinary members: not the bot, a bot
+owner (nor a bot owner's account linked to them in the group) or another delegated admin. Lower
+authority never overrides higher: each block records whether a bot owner set it
+(`group_block.by_owner`), a delegated admin can neither change nor lift a bot owner's block in
+force, and a bot owner can change or lift any block (taking it over). The grant belongs to that account alone: a
+linked account, in the group or elsewhere, gets nothing from it. Everyone else is a *member*.
+Whether the sender is a delegated admin is read from the database, and only for the commands it
+can matter to; when it cannot be read, nothing is granted. Members act on their own accounts and those linked to them in the group, owners on anyone. A member's name in a reply is
 their current group display name, read live from the platform.
 
 ## 13. Configuration

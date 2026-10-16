@@ -14,7 +14,7 @@ use crate::args;
 use crate::fail::Fail;
 use crate::router::Cx;
 
-pub(crate) use admin::{block, members, mute, stats, top};
+pub(crate) use admin::{admin, block, members, mute, stats, top};
 pub(crate) use identity::{link, unlink};
 pub(crate) use notes::note;
 pub(crate) use ops::{logs, runs};

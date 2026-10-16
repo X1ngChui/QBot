@@ -91,6 +91,16 @@ pub struct CommandRouter {
     deps: Deps,
 }
 
+/// Who a command's sender is. A delegated admin is told apart only for the commands they may
+/// use; `Unknown` is a store that could not say, which grants nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Standing {
+    BotOwner,
+    DelegatedAdmin,
+    Member,
+    Unknown,
+}
+
 /// What a handler sees: the dependencies, the request and who is asking.
 pub(crate) struct Cx<'a> {
     pub deps: &'a Deps,
@@ -141,15 +151,51 @@ impl CommandRouter {
         Self { deps }
     }
 
-    async fn dispatch(&self, command: Command, req: &CommandRequest) -> Result<String, Fail> {
-        let owner = self.deps.settings.owners.contains(&req.sender);
-        if command.owner_only() && !owner {
-            return Err(Fail::Say(Msg::OwnerOnly {}));
+    /// Who the sender is for this command. Authority is the account's own: a bot owner by
+    /// configuration, a delegated admin by a bot owner's grant in this group; a linked account
+    /// shares neither.
+    async fn standing(&self, command: Command, req: &CommandRequest) -> Standing {
+        if self.deps.settings.owners.contains(&req.sender) {
+            return Standing::BotOwner;
+        }
+        if !command.delegated() {
+            return Standing::Member;
+        }
+        match self.deps.admin.is_admin(req.group, req.sender).await {
+            Ok(true) => Standing::DelegatedAdmin,
+            Ok(false) => Standing::Member,
+            Err(error) => {
+                tracing::warn!(
+                    group = req.group.get(),
+                    %error,
+                    "could not tell whether the sender is a delegated admin"
+                );
+                Standing::Unknown
+            }
+        }
+    }
+
+    async fn dispatch(
+        &self,
+        command: Command,
+        req: &CommandRequest,
+        standing: Standing,
+    ) -> Result<String, Fail> {
+        if command.owner_only() && standing != Standing::BotOwner {
+            let refusal = match standing {
+                Standing::DelegatedAdmin if command.delegated() => None,
+                Standing::Unknown => Some(Msg::AuthorityUnknown {}),
+                _ if command.delegated() => Some(Msg::DelegatedOnly {}),
+                _ => Some(Msg::OwnerOnly {}),
+            };
+            if let Some(msg) = refusal {
+                return Err(Fail::Say(msg));
+            }
         }
         let cx = Cx {
             deps: &self.deps,
             req,
-            owner,
+            owner: standing == Standing::BotOwner,
         };
         match command {
             Command::Help => handlers::help(&cx).await,
@@ -163,6 +209,7 @@ impl CommandRouter {
             Command::Runs => handlers::runs(&cx).await,
             Command::Logs => handlers::logs(&cx).await,
             Command::Mute => handlers::mute(&cx).await,
+            Command::Admin => handlers::admin(&cx).await,
             Command::Block => handlers::block(&cx).await,
             Command::Members => handlers::members(&cx).await,
             Command::Stats => handlers::stats(&cx).await,
@@ -171,11 +218,12 @@ impl CommandRouter {
         }
     }
 
-    /// Whether a command from this sender gets no answer at all: in a muted group only owners
-    /// are answered (so `/mute off` works), and a blocked member is not answered, as neither
-    /// gets a reply from a run. A store that cannot say does not silence anyone.
-    async fn ignored(&self, req: &CommandRequest) -> bool {
-        if self.deps.settings.owners.contains(&req.sender) {
+    /// Whether a command from this sender gets no answer at all: in a muted group only bot
+    /// owners are answered, and the group's delegated admins for `/mute` and `/block` (so they
+    /// can unmute it); a blocked member is not answered, as neither gets a reply from a run. A
+    /// store that cannot say whether the group is muted or the sender blocked silences no one.
+    async fn ignored(&self, req: &CommandRequest, standing: Standing) -> bool {
+        if standing == Standing::BotOwner {
             return false;
         }
         let admin = &self.deps.admin;
@@ -190,13 +238,14 @@ impl CommandRouter {
                 false
             }
         };
-        muted || blocked
+        blocked || (muted && standing != Standing::DelegatedAdmin)
     }
 
     /// The reply text for a request, or `None` when the command is not answered.
     pub async fn respond(&self, req: &CommandRequest) -> Option<String> {
         let command = Command::from_word(&req.word)?;
-        if self.ignored(req).await {
+        let standing = self.standing(command, req).await;
+        if self.ignored(req, standing).await {
             tracing::debug!(
                 group = req.group.get(),
                 command = command.name(),
@@ -204,7 +253,7 @@ impl CommandRouter {
             );
             return None;
         }
-        let text = match self.dispatch(command, req).await {
+        let text = match self.dispatch(command, req, standing).await {
             Ok(text) => text,
             Err(Fail::Say(msg)) => self.deps.locales.render(&msg),
             Err(Fail::Storage(error)) => {
