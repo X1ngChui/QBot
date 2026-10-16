@@ -135,7 +135,7 @@ impl DescriptionCache for Cache {
     }
 }
 
-/// Lines by message id, edited with the real marker logic.
+/// Lines by ordinal (each test job's ordinal is its message id), edited with the real marker logic.
 #[derive(Default)]
 struct Lines(Mutex<HashMap<i64, String>>);
 
@@ -157,13 +157,13 @@ impl LineEditor for Lines {
     async fn fill(
         &self,
         _: GroupId,
-        message: MessageId,
+        ordinal: u64,
         kind: MediaKind,
         index: usize,
         replacement: &str,
     ) -> Result<bool, EditError> {
         let mut lines = self.0.lock().unwrap();
-        let Some(line) = lines.get_mut(&message.get()) else {
+        let Some(line) = lines.get_mut(&i64::try_from(ordinal).unwrap()) else {
             return Ok(false);
         };
         match fill(line, kind.marker(), index, replacement) {
@@ -204,6 +204,7 @@ fn job(message_id: i64, items: Vec<MediaItem>) -> MediaJob {
     MediaJob {
         group: group(),
         message: message(message_id),
+        ordinal: u64::try_from(message_id).unwrap(),
         items,
     }
 }

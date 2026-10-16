@@ -20,6 +20,7 @@ fn member(group: GroupId, message: i64, account: i64, text: &str) -> NewLine {
     NewLine {
         group,
         message: MessageId::new(message).unwrap(),
+        platform_seq: None,
         speaker: NewSpeaker::Member(AccountId::new(account).unwrap()),
         at: UnixMillis::new(T0 + message),
         text: text.into(),
@@ -132,6 +133,124 @@ async fn a_duplicate_message_stores_nothing_and_consumes_no_number() {
     db.drop_db().await;
 }
 
+/// A member line with QQ's per-group sequence, as group message events carry it.
+fn sequenced(group: GroupId, message: i64, seq: u64, account: i64, text: &str) -> NewLine {
+    NewLine {
+        platform_seq: Some(seq),
+        ..member(group, message, account, text)
+    }
+}
+
+#[tokio::test]
+async fn messages_sharing_a_message_id_are_both_kept_and_a_replay_is_still_one_line() {
+    use qbot_store::MediaRefRow;
+    let db = db!();
+    let archive = PgArchive::new(db.pool().clone());
+    let g = group(410);
+    let image = |key: &str| MediaRefRow {
+        kind: MediaKind::Image,
+        index: 0,
+        key: Some(key.into()),
+        file: None,
+        url: None,
+        size: None,
+    };
+    // Two different messages whose hashed ids collide.
+    let first = archive
+        .append_line(
+            sequenced(g, 7, 1001, 501, "first [image]"),
+            &[],
+            &[image("a")],
+        )
+        .await
+        .unwrap();
+    let second = archive
+        .append_line(
+            sequenced(g, 7, 1002, 502, "second [image]"),
+            &[],
+            &[image("b")],
+        )
+        .await
+        .unwrap();
+    assert!(matches!(first, Appended::Stored { ordinal: 1, .. }));
+    assert!(matches!(second, Appended::Stored { ordinal: 2, .. }));
+    // A redelivery of either is the same platform event.
+    for replay in [
+        sequenced(g, 7, 1002, 502, "second [image]"),
+        sequenced(g, 99, 1001, 501, "first [image]"),
+    ] {
+        assert_eq!(
+            archive
+                .append_line(replay, &[], &[image("c")])
+                .await
+                .unwrap(),
+            Appended::Duplicate
+        );
+    }
+    // The same sequence in another group is another message.
+    assert!(matches!(
+        archive
+            .append(sequenced(group(411), 7, 1001, 501, "elsewhere"))
+            .await
+            .unwrap(),
+        Appended::Stored { .. }
+    ));
+    let (lines, _) = archive.recent(g, 10).await.unwrap();
+    let texts: Vec<_> = lines.iter().map(|l| l.text.as_str()).collect();
+    assert_eq!(texts, ["first [image]", "second [image]"]);
+
+    // Each line's media stays its own: a description fills the line it was found in.
+    assert!(
+        archive
+            .rewrite_text(g, 1, |t| Some(t.replace("[image]", "[image:a cat]")))
+            .await
+            .unwrap()
+    );
+    let (lines, _) = archive.recent(g, 10).await.unwrap();
+    let texts: Vec<_> = lines.iter().map(|l| l.text.as_str()).collect();
+    assert_eq!(texts, ["first [image:a cat]", "second [image]"]);
+    // A lookup by the shared id (a quote, a picture the model opens) takes the newest line.
+    let found = archive
+        .media_ref(g, MessageId::new(7).unwrap(), MediaKind::Image, 0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.key.as_deref(), Some("b"));
+    assert_eq!(
+        archive
+            .quoted_author(g, MessageId::new(7).unwrap())
+            .await
+            .unwrap(),
+        Some(Some(AccountId::new(502).unwrap()))
+    );
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn a_line_without_a_sequence_is_still_unique_by_its_message_id() {
+    let db = db!();
+    let archive = PgArchive::new(db.pool().clone());
+    let g = group(420);
+    // A notice (or a line archived before sequences were kept) has only its message id.
+    assert!(matches!(
+        archive.append(member(g, 5, 501, "notice")).await.unwrap(),
+        Appended::Stored { .. }
+    ));
+    assert_eq!(
+        archive.append(member(g, 5, 501, "notice")).await.unwrap(),
+        Appended::Duplicate
+    );
+    // A sequenced message may share that id: the two identities never collide.
+    assert!(matches!(
+        archive
+            .append(sequenced(g, 5, 2001, 502, "message"))
+            .await
+            .unwrap(),
+        Appended::Stored { ordinal: 2, .. }
+    ));
+    db.drop_db().await;
+}
+
 #[tokio::test]
 async fn since_and_recent_follow_the_cursor_and_isolate_groups() {
     let db = db!();
@@ -151,6 +270,7 @@ async fn since_and_recent_follow_the_cursor_and_isolate_groups() {
         .append(NewLine {
             group: g,
             message: MessageId::new(6).unwrap(),
+            platform_seq: None,
             speaker: NewSpeaker::Bot,
             at: UnixMillis::new(T0),
             text: "bot reply".into(),
@@ -420,33 +540,33 @@ async fn a_stored_line_can_be_rewritten_under_a_lock() {
         .append(member(g, 1, 501, "look [image] and [voice]"))
         .await
         .unwrap();
-    let message = MessageId::new(1).unwrap();
+    let line = 1;
     assert!(
         archive
-            .rewrite_text(g, message, |t| Some(t.replace("[image]", "[image:a cat]")))
+            .rewrite_text(g, line, |t| Some(t.replace("[image]", "[image:a cat]")))
             .await
             .unwrap()
     );
     assert!(
         archive
-            .rewrite_text(g, message, |t| Some(t.replace("[voice]", "[voice:hello]")))
+            .rewrite_text(g, line, |t| Some(t.replace("[voice]", "[voice:hello]")))
             .await
             .unwrap()
     );
     assert!(
-        !archive.rewrite_text(g, message, |_| None).await.unwrap(),
+        !archive.rewrite_text(g, line, |_| None).await.unwrap(),
         "no edit, no change"
     );
     assert!(
         !archive
-            .rewrite_text(g, message, |t| Some(t.to_owned()))
+            .rewrite_text(g, line, |t| Some(t.to_owned()))
             .await
             .unwrap(),
         "same text is not a change"
     );
     assert!(
         !archive
-            .rewrite_text(g, MessageId::new(99).unwrap(), |_| Some("x".into()))
+            .rewrite_text(g, 99, |_| Some("x".into()))
             .await
             .unwrap(),
         "unknown line"

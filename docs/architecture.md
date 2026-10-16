@@ -141,13 +141,21 @@ scheduler and memory depend on no database or platform. Its Postgres adapter liv
 - **Archiving** (`pipeline::archive_form`, `PgArchive::append_line`): one transaction per line
   assigns the line its dense per-group ordinal, gives every mentioned account a stable member
   number (rewriting `[at:ACCOUNT]` to `[at:N]`) and records each media item's platform
-  reference. `UNIQUE (group_id, message_id)` with `ON CONFLICT DO NOTHING` is the only dedup gate.
-  Notices are archived under a synthetic message id derived from their content (at and above
-  2^52), so redelivery deduplicates them too. NapCat's message ids are 31-bit hashes of QQ's
-  own ids (measured: about half of consecutive ids in a group decrease): unique in practice,
-  never ordered. Nothing compares them for order; order is the archive ordinal. In a group of
-  n lines the chance that two ids ever collide is about n²/2³² (about 17% at 28,000 lines);
-  a colliding message would be taken for a duplicate and dropped.
+  reference. An insert with `ON CONFLICT DO NOTHING` against the line's platform identity is
+  the only dedup gate. A group message's identity is `real_seq`, the sequence QQ's server gives
+  each message of a group (`UNIQUE (group_id, platform_seq)`): the same on every redelivery,
+  never shared by two messages of a group. NapCat's `message_id` is a 31-bit hash of QQ's own
+  id (measured: about half of consecutive ids in a group decrease): never ordered, and in a
+  group of n lines two collide with a chance of about n²/2³² (about 17% at 28,000 lines), so
+  two lines may share one. A line without a sequence is unique by its message id
+  (`UNIQUE (group_id, message_id) WHERE platform_seq IS NULL`): notices, archived under a
+  synthetic id derived from their content (at and above 2^52), and lines archived before
+  sequences were kept. Nothing compares ids for order; order is the archive ordinal. A lookup
+  by message id (a quote, a picture the model opens) takes the newest line with that id, and a
+  filled media description addresses its line by ordinal. At the boundary of the change
+  (migration 0008) a message archived just before it, without a sequence, and redelivered just
+  after, with one, would be stored twice; NapCat does not replay history on reconnect, so that
+  takes a redelivery within the seconds of the restart, and it is accepted.
 - **Routing**: the bot's own line goes to the echo board; a recognised command word runs the
   command on its own task; otherwise a trigger (an @ of the bot, a nickname, or a quote of a bot
   line) submits a run. A nickname counts in Chinese text wherever it appears (jieba always cuts

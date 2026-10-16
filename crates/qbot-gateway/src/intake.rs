@@ -10,6 +10,8 @@ use qbot_store::{Appended, MediaRefRow, NewLine, NewSpeaker, PgArchive};
 pub struct Incoming {
     pub group: GroupId,
     pub message: MessageId,
+    /// QQ's sequence number of the message in its group, the archive's identity of it when known.
+    pub platform_seq: Option<u64>,
     /// `None` for the bot itself.
     pub author: Option<AccountId>,
     pub at: UnixMillis,
@@ -30,9 +32,17 @@ pub enum Stored {
 
 #[async_trait]
 pub trait Intake: Send + Sync {
-    /// Archive one line. This is the only dedup gate: a redelivered event is `Duplicate`.
+    /// Archive one line. This is the only dedup gate: a redelivered event is `Duplicate`. A line is
+    /// the same event as one already archived when it has the same platform sequence, or, when it
+    /// has none (a notice), the same message id.
     async fn append(&self, line: Incoming) -> Result<Stored, EnvError>;
-    async fn is_bot_message(&self, group: GroupId, message: MessageId) -> Result<bool, EnvError>;
+    /// Who wrote the line a quote of `message` points at: `Some(None)` for the bot, `Some(account)`
+    /// for a member, `None` when there is no such line.
+    async fn quoted_author(
+        &self,
+        group: GroupId,
+        message: MessageId,
+    ) -> Result<Option<Option<AccountId>>, EnvError>;
 }
 
 #[async_trait]
@@ -44,6 +54,7 @@ impl Intake for PgArchive {
             NewLine {
                 group: line.group,
                 message: line.message,
+                platform_seq: line.platform_seq,
                 speaker,
                 at: line.at,
                 text: line.text,
@@ -59,8 +70,12 @@ impl Intake for PgArchive {
         })
     }
 
-    async fn is_bot_message(&self, group: GroupId, message: MessageId) -> Result<bool, EnvError> {
-        PgArchive::is_bot_message(self, group, message)
+    async fn quoted_author(
+        &self,
+        group: GroupId,
+        message: MessageId,
+    ) -> Result<Option<Option<AccountId>>, EnvError> {
+        PgArchive::quoted_author(self, group, message)
             .await
             .map_err(|e| EnvError(e.to_string()))
     }

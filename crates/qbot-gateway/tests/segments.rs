@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use qbot_core::{AccountId, MediaKind};
-use qbot_gateway::media::job_for;
+use qbot_gateway::media::items_for;
 use qbot_gateway::render::{RenderContext, mentioned, render};
 use qbot_gateway::wire::{Frame, GroupMessage, parse_frame};
 use serde_json::{Value, json};
@@ -41,9 +41,9 @@ fn a_marketplace_sticker_reported_as_a_picture_is_a_sticker() {
         "emoji_package_id": 7,
         "url": "https://gxh.vip.qq.com/club/item/parcel/item/ab/abcd/raw300.gif"}}]));
     assert_eq!(render(&m.segments, &ctx()), "[sticker:wave]");
-    let job = job_for(&m, &ctx());
-    assert_eq!(job.items[0].kind, MediaKind::Sticker);
-    assert_eq!(job.items[0].reference.key.as_deref(), Some("abcd"));
+    let items = items_for(&m, &ctx());
+    assert_eq!(items[0].kind, MediaKind::Sticker);
+    assert_eq!(items[0].reference.key.as_deref(), Some("abcd"));
     // An ordinary picture stays a picture.
     let photo =
         parsed(json!([{"type": "image", "data": {"file": "x.jpg", "summary": "", "sub_type": 0}}]));
@@ -141,7 +141,7 @@ fn a_received_card_is_context_only_and_names_no_account_or_group_the_bot_keeps()
         // No member number is assigned (the archive numbers only mentions), no media is fetched,
         // and no tool can address the card: a send target is a member seen speaking here.
         assert!(mentioned(&m.segments, ctx().bot).is_empty(), "{text}");
-        assert!(job_for(&m, &ctx()).items.is_empty(), "{text}");
+        assert!(items_for(&m, &ctx()).is_empty(), "{text}");
     }
 }
 
@@ -277,11 +277,8 @@ fn every_new_kind_leaves_media_positions_alone() {
         {"type": "json", "data": {"data": "{}"}},
         {"type": "image", "data": {"file": "b.jpg"}}
     ]));
-    let job = job_for(&m, &ctx());
-    assert_eq!(
-        job.items.iter().map(|i| i.index).collect::<Vec<_>>(),
-        [0, 1]
-    );
+    let items = items_for(&m, &ctx());
+    assert_eq!(items.iter().map(|i| i.index).collect::<Vec<_>>(), [0, 1]);
     assert_eq!(
         render(&m.segments, &ctx()),
         "[image][file:x.zip][card][image]"

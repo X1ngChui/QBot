@@ -10,7 +10,7 @@ use axum::routing::get;
 use base64::Engine;
 use qbot_core::MediaKind;
 use qbot_gateway::bridge::Bridge;
-use qbot_gateway::media::{FetchSettings, OneBotFetcher, job_for};
+use qbot_gateway::media::{FetchSettings, OneBotFetcher, items_for};
 use qbot_gateway::wire::{Frame, parse_frame};
 use qbot_media::{FetchError, Fetcher, MediaRef};
 use serde_json::{Value, json};
@@ -91,15 +91,14 @@ fn a_message_lists_its_pictures_and_clips_by_position() {
     let Frame::Message(m) = parse_frame(&raw.to_string()) else {
         panic!()
     };
-    let job = job_for(
+    let items = items_for(
         &m,
         &qbot_gateway::render::RenderContext {
             bot: qbot_core::AccountId::new(100).unwrap(),
             forward_max_lines: 30,
         },
     );
-    let summary: Vec<_> = job
-        .items
+    let summary: Vec<_> = items
         .iter()
         .map(|i| {
             (

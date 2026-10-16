@@ -32,13 +32,13 @@ impl LineEditor for PgLineEditor {
     async fn fill(
         &self,
         group: GroupId,
-        message: MessageId,
+        ordinal: u64,
         kind: MediaKind,
         index: usize,
         replacement: &str,
     ) -> Result<bool, EditError> {
         self.0
-            .rewrite_text(group, message, |text| {
+            .rewrite_text(group, ordinal, |text| {
                 fill(text, kind.marker(), index, replacement)
             })
             .await

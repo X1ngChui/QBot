@@ -82,7 +82,13 @@ pub struct ForwardNode {
 pub struct GroupMessage {
     pub self_id: AccountId,
     pub group: GroupId,
+    /// NapCat's id for the message: a 31-bit hash of QQ's own id, what a quote and the platform's
+    /// actions name. Unique in practice for a while, never ordered, and two messages can share it.
     pub message: MessageId,
+    /// QQ's sequence number of the message in its group (`real_seq`): unique within the group and
+    /// the same on every redelivery, so it is the archive's identity of the message. `None` when
+    /// the event does not carry it.
+    pub platform_seq: Option<u64>,
     pub sender: AccountId,
     pub at: UnixMillis,
     /// The bot's own message reported back (`message_sent`, or a sender equal to the bot).
@@ -389,6 +395,11 @@ pub fn parse_frame(raw: &str) -> Frame {
                 self_id,
                 group,
                 message,
+                platform_seq: frame
+                    .get("real_seq")
+                    .and_then(int)
+                    .and_then(|seq| u64::try_from(seq).ok())
+                    .filter(|seq| *seq > 0),
                 sender,
                 at: millis(&frame),
                 from_bot: post == "message_sent" || sender == self_id,

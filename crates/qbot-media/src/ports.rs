@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use qbot_core::{GroupId, MessageId};
+use qbot_core::GroupId;
 
 use crate::item::MediaRef;
 use qbot_core::MediaKind;
@@ -67,11 +67,11 @@ pub struct EditError(pub String);
 /// Fills in a marker of an archived line.
 #[async_trait]
 pub trait LineEditor: Send + Sync {
-    /// Replace the `index`-th marker of `kind` in the line. Returns whether a marker was found.
+    /// Replace the `index`-th marker of `kind` in the group's `ordinal`-th line. Returns whether a marker was found.
     async fn fill(
         &self,
         group: GroupId,
-        message: MessageId,
+        ordinal: u64,
         kind: MediaKind,
         index: usize,
         replacement: &str,

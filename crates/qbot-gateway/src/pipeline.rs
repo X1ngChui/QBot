@@ -6,7 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use qbot_agent::{Rejected, Supervisor, Trigger, TriggerRequest};
 use qbot_core::{AccountId, GroupId, MessageId, UnixMillis};
-use qbot_media::{MediaJob, MediaService};
+use qbot_media::{MediaItem, MediaJob, MediaService};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -202,13 +202,13 @@ impl Pipeline {
             bot: self.cfg.bot,
             forward_max_lines: self.cfg.forward_max_lines,
         };
-        let Some((incoming, job)) = archive_form(&m, &ctx) else {
+        let Some((incoming, items)) = archive_form(&m, &ctx) else {
             return;
         };
-        let line = match self.intake.append(incoming).await {
+        let (line, ordinal) = match self.intake.append(incoming).await {
             Ok(Stored::New { line, ordinal }) => {
                 self.archived(m.group, ordinal);
-                line
+                (line, ordinal)
             }
             Ok(Stored::Duplicate) => {
                 tracing::debug!(
@@ -230,13 +230,26 @@ impl Pipeline {
         }
 
         if let Some(hook) = &self.media
-            && !job.items.is_empty()
+            && !items.is_empty()
         {
-            hook.service.admit(job);
+            hook.service.admit(MediaJob {
+                group: m.group,
+                message: m.message,
+                ordinal,
+                items,
+            });
         }
 
         let typed = render::typed_text(&m.segments);
-        if let Some(request) = self.command(&m, &typed) {
+        if let Some(mut request) = self.command(&m, &typed) {
+            // A command sent as a reply carries the @ QQ inserts for the quoted author; it is
+            // metadata of the reply, not a target the sender chose.
+            if let Some((quoted, account)) = reply_mention(&m.segments)
+                && self.quoted_author(m.group, quoted).await == Some(Some(account))
+                && let Some(at) = request.mentions.iter().position(|a| *a == account)
+            {
+                request.mentions.remove(at);
+            }
             let commands = Arc::clone(&self.commands);
             self.tasks.spawn(async move { commands.run(request).await });
             return;
@@ -315,14 +328,19 @@ impl Pipeline {
         });
     }
 
-    async fn quotes_bot(&self, group: GroupId, quoted: MessageId) -> bool {
+    /// Who wrote the quoted line (`Some(None)` for the bot); `None` when unknown.
+    async fn quoted_author(&self, group: GroupId, quoted: MessageId) -> Option<Option<AccountId>> {
         self.intake
-            .is_bot_message(group, quoted)
+            .quoted_author(group, quoted)
             .await
             .unwrap_or_else(|error| {
-                tracing::warn!(%error, "could not tell whether the quoted message is the bot's");
-                false
+                tracing::warn!(%error, "could not tell who wrote the quoted message");
+                None
             })
+    }
+
+    async fn quotes_bot(&self, group: GroupId, quoted: MessageId) -> bool {
+        self.quoted_author(group, quoted).await == Some(None)
     }
 
     fn command(&self, m: &GroupMessage, typed: &str) -> Option<CommandRequest> {
@@ -362,6 +380,7 @@ impl Pipeline {
         let incoming = Incoming {
             group: n.group,
             message: notice::archive_id(&n),
+            platform_seq: None,
             author: Some(n.subject),
             at: n.at,
             text: notice::archive_text(&n),
@@ -391,24 +410,43 @@ impl Pipeline {
     }
 }
 
+/// The quote a message opens with and the account @-mentioned right after it (only whitespace
+/// between), if any. When someone replies, QQ inserts an @ of the quoted message's author in
+/// exactly that place; whether this one is that @ the caller decides by the quoted line's author.
+fn reply_mention(segments: &[Segment]) -> Option<(MessageId, AccountId)> {
+    let at = segments
+        .iter()
+        .position(|s| matches!(s, Segment::Reply(_)))?;
+    let Segment::Reply(quoted) = segments[at] else {
+        return None;
+    };
+    segments[at + 1..]
+        .iter()
+        .find(|s| !matches!(s, Segment::Text(t) if t.trim().is_empty()))
+        .and_then(|s| match s {
+            Segment::At(Mention::Account(account)) => Some((quoted, *account)),
+            _ => None,
+        })
+}
+
 /// What a message is archived as: its line, and the media work it carries (each picture, sticker
 /// and clip with its reference and its position in the line). `None` when the message renders to
 /// nothing.
-fn archive_form(m: &GroupMessage, ctx: &RenderContext) -> Option<(Incoming, MediaJob)> {
+fn archive_form(m: &GroupMessage, ctx: &RenderContext) -> Option<(Incoming, Vec<MediaItem>)> {
     let text = render::render(&m.segments, ctx);
     if text.is_empty() {
         return None;
     }
-    let job = crate::media::job_for(m, ctx);
+    let items = crate::media::items_for(m, ctx);
     let incoming = Incoming {
         group: m.group,
         message: m.message,
+        platform_seq: m.platform_seq,
         author: (!m.from_bot).then_some(m.sender),
         at: m.at,
         text,
         mentions: render::mentioned(&m.segments, ctx.bot),
-        media: job
-            .items
+        media: items
             .iter()
             .map(|item| MediaRefRow {
                 kind: item.kind,
@@ -420,7 +458,7 @@ fn archive_form(m: &GroupMessage, ctx: &RenderContext) -> Option<(Incoming, Medi
             })
             .collect(),
     };
-    Some((incoming, job))
+    Some((incoming, items))
 }
 
 async fn submit(supervisor: &Supervisor, request: TriggerRequest) {

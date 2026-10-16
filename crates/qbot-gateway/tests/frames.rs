@@ -51,6 +51,19 @@ fn group_messages_parse_with_ids_and_segments() {
 }
 
 #[test]
+fn the_group_sequence_is_the_messages_identity_when_present() {
+    let seq = |extra: &str| match parse_frame(&message(extra, "[]")) {
+        Frame::Message(m) => m.platform_seq,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(seq(r#","real_seq":"4821""#), Some(4821));
+    assert_eq!(seq(r#","real_seq":4821"#), Some(4821));
+    assert_eq!(seq(""), None);
+    assert_eq!(seq(r#","real_seq":"0""#), None, "zero is no sequence");
+    assert_eq!(seq(r#","real_seq":"x""#), None);
+}
+
+#[test]
 fn the_bots_own_messages_are_recognised_two_ways() {
     let sent = message("", "[]")
         .replace("\"message\"", "\"message_sent\"")
@@ -209,10 +222,10 @@ fn stickers_show_their_label_until_described_and_carry_their_id() {
         r#"[{"type":"mface","data":{"emoji_id":"e9","url":"https://gxh.vip.qq.com/club/item/parcel/item/ab/abcd/raw300.gif","summary":"[shy]"}}]"#,
     );
     assert_eq!(render(&m.segments, &ctx()), "[sticker:shy]");
-    let job = qbot_gateway::media::job_for(&m, &ctx());
-    assert_eq!(job.items.len(), 1);
-    assert_eq!(job.items[0].kind, qbot_core::MediaKind::Sticker);
-    assert_eq!(job.items[0].reference.key.as_deref(), Some("e9"));
+    let items = qbot_gateway::media::items_for(&m, &ctx());
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].kind, qbot_core::MediaKind::Sticker);
+    assert_eq!(items[0].reference.key.as_deref(), Some("e9"));
 }
 
 fn forward(nodes: usize) -> String {
@@ -245,9 +258,8 @@ fn a_forwarded_record_is_shown_under_its_marker_up_to_the_limit() {
     );
     // Positions follow the rendered markers: two shown pictures inside the record, then the
     // picture posted with it. The hidden third message contributes nothing.
-    let job = qbot_gateway::media::job_for(&m, &small);
-    let positions: Vec<_> = job
-        .items
+    let items = qbot_gateway::media::items_for(&m, &small);
+    let positions: Vec<_> = items
         .iter()
         .map(|i| (i.index, i.nested, i.reference.key.clone().unwrap()))
         .collect();
@@ -272,9 +284,9 @@ fn inside_a_record_mentions_name_nobody_quotes_vanish_and_records_do_not_nest() 
         "[forward:1]\n  | Pal: @someone hi [x][voice][forward:1][voice]"
     );
     // The clip inside the record is never transcribed, but it still takes a position.
-    let job = qbot_gateway::media::job_for(&m, &ctx());
+    let items = qbot_gateway::media::items_for(&m, &ctx());
     assert_eq!(
-        job.items
+        items
             .iter()
             .map(|i| (i.index, i.nested))
             .collect::<Vec<_>>(),

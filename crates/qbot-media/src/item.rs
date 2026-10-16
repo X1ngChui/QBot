@@ -31,5 +31,7 @@ pub struct MediaItem {
 pub struct MediaJob {
     pub group: GroupId,
     pub message: MessageId,
+    /// The archived line the markers are in: message ids may repeat within a group.
+    pub ordinal: u64,
     pub items: Vec<MediaItem>,
 }

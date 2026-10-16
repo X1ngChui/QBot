@@ -19,6 +19,9 @@ pub enum NewSpeaker {
 pub struct NewLine {
     pub group: GroupId,
     pub message: MessageId,
+    /// QQ's sequence number of the message in its group: the line's identity when known. A line
+    /// without one (a notice) is identified by its message id.
+    pub platform_seq: Option<u64>,
     pub speaker: NewSpeaker,
     pub at: UnixMillis,
     pub text: String,
@@ -113,9 +116,9 @@ impl PgArchive {
             NewSpeaker::Member(account) => ("member", Some(account.get())),
         };
         let inserted = sqlx::query(
-            "INSERT INTO chat_line (group_id, ordinal, message_id, speaker, account_id, at_ms, text) \
-             SELECT $1, coalesce(max(ordinal), 0) + 1, $2, $3, $4, $5, $6 FROM chat_line WHERE group_id = $1 \
-             ON CONFLICT (group_id, message_id) DO NOTHING RETURNING seq, ordinal",
+            "INSERT INTO chat_line (group_id, ordinal, message_id, platform_seq, speaker, account_id, at_ms, text) \
+             SELECT $1, coalesce(max(ordinal), 0) + 1, $2, $7, $3, $4, $5, $6 FROM chat_line WHERE group_id = $1 \
+             ON CONFLICT DO NOTHING RETURNING seq, ordinal",
         )
         .bind(new.group.get())
         .bind(new.message.get())
@@ -123,6 +126,11 @@ impl PgArchive {
         .bind(account)
         .bind(new.at.get())
         .bind(&text)
+        .bind(
+            new.platform_seq
+                .map(|seq| i64::try_from(seq).map_err(|e| StoreError::corrupt(e.to_string())))
+                .transpose()?,
+        )
         .fetch_optional(&mut *tx)
         .await?;
         let Some(row) = inserted else {
@@ -150,11 +158,11 @@ impl PgArchive {
         }
         for item in media {
             sqlx::query(
-                "INSERT INTO media_ref (group_id, message_id, kind, idx, key, file, url, size_bytes) \
+                "INSERT INTO media_ref (group_id, line_seq, kind, idx, key, file, url, size_bytes) \
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             )
             .bind(new.group.get())
-            .bind(new.message.get())
+            .bind(seq)
             .bind(item.kind.marker())
             .bind(i32::try_from(item.index).map_err(|e| StoreError::corrupt(e.to_string()))?)
             .bind(&item.key)
@@ -174,7 +182,8 @@ impl PgArchive {
         })
     }
 
-    /// The stored reference to one media item of a line.
+    /// The stored reference to one media item of the line with `message`, the newest such line if
+    /// two share the id.
     pub async fn media_ref(
         &self,
         group: GroupId,
@@ -183,8 +192,10 @@ impl PgArchive {
         index: u32,
     ) -> Result<Option<MediaRefRow>, StoreError> {
         let row = sqlx::query(
-            "SELECT idx, key, file, url, size_bytes FROM media_ref \
-             WHERE group_id = $1 AND message_id = $2 AND kind = $3 AND idx = $4",
+            "SELECT r.idx, r.key, r.file, r.url, r.size_bytes FROM media_ref r \
+             WHERE r.line_seq = (SELECT seq FROM chat_line WHERE group_id = $1 AND message_id = $2 \
+                                 ORDER BY seq DESC LIMIT 1) \
+               AND r.kind = $3 AND r.idx = $4",
         )
         .bind(group.get())
         .bind(message.get())
@@ -204,20 +215,28 @@ impl PgArchive {
         }))
     }
 
-    /// Whether `message` is a line the bot itself sent to `group`.
-    pub async fn is_bot_message(
+    /// Who wrote the line a quote of `message` points at: `Some(None)` for the bot, `Some(account)`
+    /// for a member, `None` when the archive has no such line. Message ids are hashes that two
+    /// lines can share; a quote points at a recent message, so the newest line with the id wins.
+    pub async fn quoted_author(
         &self,
         group: GroupId,
         message: MessageId,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<Option<Option<AccountId>>, StoreError> {
         let row = sqlx::query(
-            "SELECT speaker = 'bot' AS bot FROM chat_line WHERE group_id = $1 AND message_id = $2",
+            "SELECT account_id FROM chat_line WHERE group_id = $1 AND message_id = $2 \
+             ORDER BY seq DESC LIMIT 1",
         )
         .bind(group.get())
         .bind(message.get())
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.is_some_and(|r| r.get::<bool, _>("bot")))
+        row.map(|r| {
+            r.get::<Option<i64>, _>("account_id")
+                .map(|id| AccountId::new(id).map_err(|e| StoreError::corrupt(e.to_string())))
+                .transpose()
+        })
+        .transpose()
     }
 
     /// Replace a stored line's text with `edit(current)`, if `edit` returns one. Used to fill in
@@ -227,18 +246,19 @@ impl PgArchive {
     pub async fn rewrite_text<F>(
         &self,
         group: GroupId,
-        message: MessageId,
+        ordinal: u64,
         edit: F,
     ) -> Result<bool, StoreError>
     where
         F: FnOnce(&str) -> Option<String>,
     {
+        let ordinal = i64::try_from(ordinal).map_err(|e| StoreError::corrupt(e.to_string()))?;
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
-            "SELECT text FROM chat_line WHERE group_id = $1 AND message_id = $2 FOR UPDATE",
+            "SELECT text FROM chat_line WHERE group_id = $1 AND ordinal = $2 FOR UPDATE",
         )
         .bind(group.get())
-        .bind(message.get())
+        .bind(ordinal)
         .fetch_optional(&mut *tx)
         .await?;
         let Some(row) = row else {
@@ -248,9 +268,9 @@ impl PgArchive {
         let Some(next) = edit(&current).filter(|next| *next != current) else {
             return Ok(false);
         };
-        sqlx::query("UPDATE chat_line SET text = $3 WHERE group_id = $1 AND message_id = $2")
+        sqlx::query("UPDATE chat_line SET text = $3 WHERE group_id = $1 AND ordinal = $2")
             .bind(group.get())
-            .bind(message.get())
+            .bind(ordinal)
             .bind(&next)
             .execute(&mut *tx)
             .await?;

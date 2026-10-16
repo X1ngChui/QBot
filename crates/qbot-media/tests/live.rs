@@ -112,13 +112,13 @@ impl LineEditor for Lines {
     async fn fill(
         &self,
         _: GroupId,
-        message: MessageId,
+        ordinal: u64,
         kind: MediaKind,
         index: usize,
         replacement: &str,
     ) -> Result<bool, EditError> {
         let mut lines = self.0.lock().unwrap();
-        let Some(line) = lines.get_mut(&message.get()) else {
+        let Some(line) = lines.get_mut(&i64::try_from(ordinal).unwrap()) else {
             return Ok(false);
         };
         match fill(line, kind.marker(), index, replacement) {
@@ -135,6 +135,7 @@ fn job(message: i64, file: &str) -> MediaJob {
     MediaJob {
         group: GroupId::new(900).unwrap(),
         message: MessageId::new(message).unwrap(),
+        ordinal: u64::try_from(message).unwrap(),
         items: vec![MediaItem {
             kind: MediaKind::Image,
             index: 0,

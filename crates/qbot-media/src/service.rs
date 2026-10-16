@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use futures_util::future::join_all;
-use qbot_core::{GroupId, MessageId};
+use qbot_core::GroupId;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Semaphore, watch};
 use tokio_util::sync::CancellationToken;
@@ -101,7 +101,7 @@ struct Inner {
     /// Pictures not worth another attempt for a while: an unreadable reference by its source
     /// key, a declined picture by its content key.
     unreadable: moka::sync::Cache<String, ()>,
-    pending: Mutex<HashMap<(GroupId, MessageId), watch::Receiver<bool>>>,
+    pending: Mutex<HashMap<(GroupId, u64), watch::Receiver<bool>>>,
     in_flight: AtomicUsize,
     closed: AtomicBool,
 }
@@ -359,7 +359,7 @@ impl Inner {
         match self
             .deps
             .editor
-            .fill(job.group, job.message, item.kind, item.index, &replacement)
+            .fill(job.group, job.ordinal, item.kind, item.index, &replacement)
             .await
         {
             Ok(true) => {}
@@ -429,7 +429,7 @@ impl MediaService {
         // out, so they come after and hold no reply up.
         let (forwarded, posted): (Vec<MediaItem>, Vec<MediaItem>) =
             items.into_iter().partition(|item| item.nested);
-        let key = (job.group, job.message);
+        let key = (job.group, job.ordinal);
         let done = (!posted.is_empty()).then(|| {
             let (done_tx, done_rx) = watch::channel(false);
             inner
@@ -445,6 +445,7 @@ impl MediaService {
                 let job = MediaJob {
                     group: job.group,
                     message: job.message,
+                    ordinal: job.ordinal,
                     items,
                 };
                 let inner = Arc::clone(&inner);

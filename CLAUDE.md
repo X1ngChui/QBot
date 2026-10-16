@@ -52,9 +52,10 @@ paid API. Build the image with `docker build -f deploy/Dockerfile .`; deployment
   down), providers, tools, prompt context, supervisor, scheduler, media service, commands, the
   gateway pipeline and server. No globals: settings and ports are passed explicitly.
 - **Message path:** `qbot-gateway` parses OneBot frames, renders a message to archive text with
-  ASCII markers, archives it (`UNIQUE (group_id, message_id)` is the only dedup gate), then routes
-  the bot's own line to the echo board, a command word to `qbot-commands`, or a trigger (@, a
-  nickname (effectively anywhere in Chinese text, a whole word in Latin), a quote of a bot line) to the supervisor.
+  ASCII markers, archives it (QQ's per-group `real_seq`, else the message id, is the only dedup
+  gate; NapCat's message ids are hashes two messages can share), then routes the bot's own line
+  to the echo board, a command word to `qbot-commands`, or a trigger (@, a nickname (effectively
+  anywhere in Chinese text, a whole word in Latin), a quote of a bot line) to the supervisor.
 - **Runs:** `qbot-agent`. Every trigger or due task is its own run with its own deadline over an
   append-only transcript (`qbot-context`). The model speaks only through `send_messages`
   (`{messages, end_turn?}`: QQ messages sent in order in the chat's marker syntax, each

@@ -30,6 +30,7 @@ fn member(group: GroupId, message: i64, account: i64, text: &str) -> NewLine {
     NewLine {
         group,
         message: MessageId::new(message).unwrap(),
+        platform_seq: None,
         speaker: NewSpeaker::Member(AccountId::new(account).unwrap()),
         at: UnixMillis::new(T0 + message * 1000),
         text: text.into(),
@@ -354,6 +355,7 @@ async fn deleting_an_episode_removes_its_embedding_and_lines_carry_member_number
         .append(NewLine {
             group: g,
             message: MessageId::new(3).unwrap(),
+            platform_seq: None,
             speaker: NewSpeaker::Bot,
             at: UnixMillis::new(T0),
             text: "bot line".into(),

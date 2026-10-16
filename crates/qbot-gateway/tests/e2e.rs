@@ -43,10 +43,14 @@ struct MemoryIntake {
 impl Intake for MemoryIntake {
     async fn append(&self, line: Incoming) -> Result<Stored, EnvError> {
         let mut lines = self.lines.lock().unwrap();
-        if lines
-            .iter()
-            .any(|l| l.group == line.group && l.message == line.message)
-        {
+        if lines.iter().any(|l| {
+            l.group == line.group
+                && match (l.platform_seq, line.platform_seq) {
+                    (Some(a), Some(b)) => a == b,
+                    (None, None) => l.message == line.message,
+                    _ => false,
+                }
+        }) {
             return Ok(Stored::Duplicate);
         }
         let speaker = line.author.map_or(Speaker::Bot, |account| Speaker::Member {
@@ -67,13 +71,19 @@ impl Intake for MemoryIntake {
         })
     }
 
-    async fn is_bot_message(&self, group: GroupId, message: MessageId) -> Result<bool, EnvError> {
+    async fn quoted_author(
+        &self,
+        group: GroupId,
+        message: MessageId,
+    ) -> Result<Option<Option<AccountId>>, EnvError> {
         Ok(self
             .lines
             .lock()
             .unwrap()
             .iter()
-            .any(|l| l.group == group && l.message == message && l.author.is_none()))
+            .rev()
+            .find(|l| l.group == group && l.message == message)
+            .map(|l| l.author))
     }
 }
 
@@ -831,5 +841,105 @@ async fn only_spontaneous_runs_are_one_per_group_and_other_runs_still_overlap_th
         rig.world.summary(runs[0]).is_none(),
         "the spontaneous run is still in flight while the addressed one runs"
     );
+    rig.cancel.cancel();
+}
+
+/// A command sent as a reply: QQ puts the quote first and then an @ of the quoted message's
+/// author. That @ is metadata of the reply; only mentions the sender chose are targets.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_at_a_reply_inserts_is_not_a_command_target_but_chosen_mentions_are() {
+    let rig = rig(send_script("unused")).await;
+    let mut napcat = connect(&rig, Some("sesame")).await.unwrap();
+    // Alice (300) and Bob (400) each said something earlier.
+    for (id, who) in [(10, 300), (11, 400)] {
+        napcat
+            .send(group_message(
+                id,
+                who,
+                json!([{"type": "text", "data": {"text": "earlier"}}]),
+            ))
+            .await
+            .unwrap();
+    }
+    let at = |qq: i64| json!({"type": "at", "data": {"qq": qq.to_string()}});
+    let reply = json!({"type": "reply", "data": {"id": "10"}});
+    let text = |t: &str| json!({"type": "text", "data": {"text": t}});
+    let cases = [
+        // The owner replies to Alice's message with a command: only the inserted @ of Alice.
+        json!([reply, at(300), text(" /ping 2")]),
+        // ... and also names Bob: Bob is the target.
+        json!([reply, at(300), text(" /ping "), at(400)]),
+        // ... and names Alice again on purpose: Alice is the target.
+        json!([reply, at(300), text(" /ping "), at(300)]),
+        // The inserted @ was deleted and Bob named right after the quote: Bob is the target.
+        json!([reply, at(400), text(" /ping")]),
+    ];
+    for (n, segments) in cases.into_iter().enumerate() {
+        napcat
+            .send(group_message(20 + n as i64, 200, segments))
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Commands run concurrently: order what they saw by message.
+    let mut requests = rig.commands.0.lock().unwrap().clone();
+    requests.sort_by_key(|r| r.message.get());
+    let seen: Vec<Vec<i64>> = requests
+        .iter()
+        .map(|r| r.mentions.iter().map(|a| a.get()).collect())
+        .collect();
+    assert_eq!(seen, [vec![], vec![400], vec![300], vec![400]]);
+    rig.cancel.cancel();
+}
+
+#[tokio::test]
+async fn messages_are_archived_by_their_group_sequence_not_their_hashed_id() {
+    let rig = rig(vec![]).await;
+    let mut napcat = connect(&rig, Some("sesame")).await.unwrap();
+    let sequenced = |id: i64, seq: i64, text: &str| {
+        Message::text(
+            json!({"post_type": "message", "message_type": "group", "time": 1_700_000_000,
+                   "self_id": BOT, "user_id": 7, "group_id": GROUP, "message_id": id,
+                   "real_seq": seq.to_string(),
+                   "message": [{"type": "text", "data": {"text": text}}]})
+            .to_string(),
+        )
+    };
+    for frame in [
+        sequenced(9, 11, "one"),
+        sequenced(9, 12, "two"),
+        sequenced(9, 12, "two"),
+        sequenced(10, 13, "end"),
+    ] {
+        napcat.send(frame).await.unwrap();
+    }
+    for _ in 0..200 {
+        if rig
+            .intake
+            .lines
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.text == "end")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let lines = rig.intake.lines.lock().unwrap();
+    let archived: Vec<_> = lines
+        .iter()
+        .map(|l| (l.message.get(), l.platform_seq, l.text.as_str()))
+        .collect();
+    assert_eq!(
+        archived,
+        [
+            (9, Some(11), "one"),
+            (9, Some(12), "two"),
+            (10, Some(13), "end")
+        ],
+        "a colliding id is a new message; a replayed sequence is not"
+    );
+    drop(lines);
     rig.cancel.cancel();
 }

@@ -9,7 +9,7 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use futures_util::StreamExt;
 use qbot_core::MediaKind;
-use qbot_media::{FetchError, Fetcher, MediaItem, MediaJob, MediaRef};
+use qbot_media::{FetchError, Fetcher, MediaItem, MediaRef};
 use serde_json::{Value, json};
 
 use crate::bridge::Bridge;
@@ -19,14 +19,10 @@ use crate::wire::{GroupMessage, Segment};
 /// The pictures, stickers and clips of a message, each with its position among the markers of
 /// its kind in the rendered line. The walk mirrors [`render`](crate::render::render) exactly,
 /// including the messages of a forwarded record that are shown, so positions always match.
-pub fn job_for(message: &GroupMessage, ctx: &RenderContext) -> MediaJob {
+pub fn items_for(message: &GroupMessage, ctx: &RenderContext) -> Vec<MediaItem> {
     let mut walk = Walk::default();
     walk.collect(&message.segments, ctx, false);
-    MediaJob {
-        group: message.group,
-        message: message.message,
-        items: walk.items,
-    }
+    walk.items
 }
 
 #[derive(Default)]

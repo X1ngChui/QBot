@@ -64,6 +64,7 @@ impl Delivery for PgDelivery {
         let line = NewLine {
             group,
             message,
+            platform_seq: None,
             speaker: NewSpeaker::Bot,
             at: SystemClock.now(),
             text,
@@ -233,6 +234,7 @@ impl Stack {
         let line = NewLine {
             group: group(),
             message: id,
+            platform_seq: None,
             speaker: NewSpeaker::Member(AccountId::new(account).unwrap()),
             at: SystemClock.now(),
             text: text.into(),
