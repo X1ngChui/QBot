@@ -1,9 +1,10 @@
 //! Identity: who is who.
 //!
-//! An *account* is a platform login. A *holder* is the person behind one or more accounts.
-//! Linking accounts merges their holders; splitting moves one account to a fresh holder. Names
-//! (*aliases*) are scoped to a group and point at an account or at a holder, each backed by
-//! evidence whose strength is fused here, in one place, rather than in SQL.
+//! An *account* is a platform login. Accounts are *linked* in a group: a link is a record of that
+//! group, and a person in a group is the accounts linked to each other there, directly or through
+//! others. Nothing about a link reaches another group. Names (*aliases*) are scoped to a group and
+//! point at an account, each backed by evidence whose strength is fused here, in one place,
+//! rather than in SQL.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -14,19 +15,7 @@ use unicode_normalization::UnicodeNormalization;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct HolderId(pub i64);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
 pub struct AliasId(pub i64);
-
-/// What a name refers to. An account target follows that one login; a holder target follows the
-/// person across every account they have linked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum AliasTarget {
-    Account(AccountId),
-    Holder(HolderId),
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AliasStatus {
@@ -145,7 +134,7 @@ pub struct Alias {
     pub group: GroupId,
     /// Normalized text.
     pub text: String,
-    pub target: AliasTarget,
+    pub account: AccountId,
     pub status: AliasStatus,
     pub confidence: f32,
     pub last_evidence: UnixMillis,
@@ -155,13 +144,13 @@ pub struct Alias {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolution {
     Unknown,
-    One(AliasTarget),
-    /// More than one confirmed target; the caller must not guess.
-    Ambiguous(Vec<AliasTarget>),
+    One(AccountId),
+    /// More than one confirmed account; the caller must not guess.
+    Ambiguous(Vec<AccountId>),
 }
 
 impl Resolution {
-    pub fn from_targets(mut targets: Vec<AliasTarget>) -> Self {
+    pub fn from_targets(mut targets: Vec<AccountId>) -> Self {
         targets.sort();
         targets.dedup();
         match targets.len() {
@@ -172,23 +161,11 @@ impl Resolution {
     }
 }
 
-/// A person behind one or more accounts, with a revision that changes whenever the set of
-/// accounts does, so a confirmation made against an older state can be rejected.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Holder {
-    pub id: HolderId,
-    pub revision: u32,
-    pub accounts: Vec<AccountId>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MergeOutcome {
-    /// The two accounts were already one person.
-    AlreadyLinked(HolderId),
-    Merged {
-        winner: HolderId,
-        loser: HolderId,
-    },
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkOutcome {
+    /// The two accounts were already one person in the group.
+    AlreadyLinked,
+    Linked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,9 +185,9 @@ pub struct Invitation {
     /// The message that created it; a confirmation must come after it.
     pub created_by: MessageId,
     pub created_at: UnixMillis,
-    /// Each side's holder revision when it was created.
-    pub initiator_revision: u32,
-    pub target_revision: u32,
+    /// The accounts each side was linked to in the group when it was created, with itself.
+    pub initiator_linked: Vec<AccountId>,
+    pub target_linked: Vec<AccountId>,
     pub state: InvitationState,
 }
 
@@ -229,7 +206,7 @@ pub enum LinkError {
     #[error("only the invited account can confirm")]
     NotTheTarget,
     #[error(
-        "an account involved was linked or split since the invitation, so it no longer applies"
+        "an account involved was linked or unlinked since the invitation, so it no longer applies"
     )]
     Stale,
 }
@@ -247,8 +224,8 @@ impl Invitation {
         confirming: AccountId,
         now: UnixMillis,
         ttl: Duration,
-        initiator_revision: u32,
-        target_revision: u32,
+        initiator_linked: &[AccountId],
+        target_linked: &[AccountId],
     ) -> Result<(), LinkError> {
         if self.state != InvitationState::Pending {
             return Err(LinkError::NoInvitation);
@@ -259,8 +236,7 @@ impl Invitation {
         if self.is_expired(now, ttl) {
             return Err(LinkError::Expired);
         }
-        if initiator_revision != self.initiator_revision || target_revision != self.target_revision
-        {
+        if initiator_linked != self.initiator_linked || target_linked != self.target_linked {
             return Err(LinkError::Stale);
         }
         Ok(())
@@ -274,7 +250,7 @@ pub enum IdentityError {
     /// A person tried to give a name that already refers to someone else in the group.
     #[error("that name already refers to someone else in this group")]
     NameTaken,
-    #[error("the account is not linked to any other account")]
+    #[error("the account is not linked to another account in this group")]
     NotLinked,
     #[error("unknown account")]
     UnknownAccount,

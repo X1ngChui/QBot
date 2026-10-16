@@ -1,69 +1,84 @@
 //! The storage port for identity, plus a reference in-memory implementation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, PoisonError};
 
 use async_trait::async_trait;
 use qbot_core::{AccountId, GroupId, MessageId, UnixMillis};
 
 use crate::identity::{
-    Alias, AliasId, AliasStatus, AliasTarget, EvidenceKind, EvidenceRecord, Holder, HolderId,
-    IdentityError, IdentityPolicy, Invitation, InvitationState, LinkError, MergeOutcome,
-    Resolution, confidence, normalize_alias, status_for,
+    Alias, AliasId, AliasStatus, EvidenceKind, EvidenceRecord, IdentityError, IdentityPolicy,
+    Invitation, InvitationState, LinkError, LinkOutcome, Resolution, confidence, normalize_alias,
+    status_for,
 };
 
 #[async_trait]
 pub trait IdentityStore: Send + Sync {
-    /// Make sure the account exists, with a holder of its own if it is new. Idempotent.
-    async fn seen(&self, account: AccountId, at: UnixMillis) -> Result<Holder, IdentityError>;
+    /// Make sure the account exists. Idempotent.
+    async fn seen(&self, account: AccountId, at: UnixMillis) -> Result<(), IdentityError>;
 
-    async fn holder_of(&self, account: AccountId) -> Result<Option<Holder>, IdentityError>;
+    async fn is_known(&self, account: AccountId) -> Result<bool, IdentityError>;
 
-    /// Link two accounts into one holder. The older holder (then the lower id) wins; both
-    /// revisions change. Linking accounts already linked is not an error.
-    async fn merge(&self, a: AccountId, b: AccountId) -> Result<MergeOutcome, IdentityError>;
+    /// The accounts linked to `account` in `group`, directly or through others, with `account`
+    /// itself; ascending. Links made in other groups play no part.
+    async fn linked(
+        &self,
+        group: GroupId,
+        account: AccountId,
+    ) -> Result<Vec<AccountId>, IdentityError>;
 
-    /// Move one account to a fresh holder. Holder-scoped records stay with the original holder.
-    async fn split(&self, account: AccountId, at: UnixMillis) -> Result<Holder, IdentityError>;
+    /// Link two accounts in `group`. Linking accounts already linked there is not an error.
+    async fn link(
+        &self,
+        group: GroupId,
+        a: AccountId,
+        b: AccountId,
+        at: UnixMillis,
+    ) -> Result<LinkOutcome, IdentityError>;
 
-    /// Record evidence that `text` refers to `target` in `group`, creating the alias if needed
+    /// Remove every link of `account` in `group`. The accounts it connected stay linked only
+    /// where they have links of their own.
+    async fn unlink(&self, group: GroupId, account: AccountId) -> Result<(), IdentityError>;
+
+    /// Record evidence that `text` refers to `account` in `group`, creating the alias if needed
     /// and recomputing its confidence and status. The same evidence recorded twice counts once.
     async fn add_evidence(
         &self,
         group: GroupId,
         text: &str,
-        target: AliasTarget,
+        account: AccountId,
         evidence: EvidenceRecord,
         at: UnixMillis,
     ) -> Result<Alias, IdentityError>;
 
-    /// A person gives a name: manual evidence. Refused if the name is already confirmed for a
-    /// different target in the group.
+    /// A person gives a name to each of `accounts` (one account, or the accounts of one person
+    /// in the group): manual evidence. Refused if the name is already confirmed for an account
+    /// not among them.
     async fn set_name(
         &self,
         group: GroupId,
         text: &str,
-        target: AliasTarget,
+        accounts: &[AccountId],
         at: UnixMillis,
-    ) -> Result<Alias, IdentityError>;
+    ) -> Result<Vec<Alias>, IdentityError>;
 
-    /// A person removes a name from a target. Returns whether one was active.
+    /// A person removes a name from `accounts`. Returns whether one was active.
     async fn remove_name(
         &self,
         group: GroupId,
         text: &str,
-        target: AliasTarget,
+        accounts: &[AccountId],
     ) -> Result<bool, IdentityError>;
 
-    /// What the name refers to in the group, from confirmed aliases only. Holder targets are
-    /// reported as the current holder of the merge chain.
+    /// What the name refers to in the group, from confirmed aliases only.
     async fn resolve(&self, group: GroupId, text: &str) -> Result<Resolution, IdentityError>;
 
-    /// The group's aliases for a target, strongest first, inactive ones excluded.
+    /// The group's names for any of `accounts`, one per text (the strongest), strongest first,
+    /// inactive ones excluded.
     async fn names_of(
         &self,
         group: GroupId,
-        target: AliasTarget,
+        accounts: &[AccountId],
     ) -> Result<Vec<Alias>, IdentityError>;
 
     /// Mark candidate aliases with no evidence since `before` inactive, unless a person vouched
@@ -79,15 +94,15 @@ pub trait IdentityStore: Send + Sync {
         now: UnixMillis,
     ) -> Result<Invitation, IdentityError>;
 
-    /// The target confirms in `message`. Applying merges the two accounts. Confirming again in
-    /// the same message is a no-op that returns the same result.
+    /// The target confirms in `message`. Applying links the two accounts in the group.
+    /// Confirming again in the same message is a no-op that reports them already linked.
     async fn confirm(
         &self,
         group: GroupId,
         confirming: AccountId,
         message: MessageId,
         now: UnixMillis,
-    ) -> Result<MergeOutcome, IdentityError>;
+    ) -> Result<LinkOutcome, IdentityError>;
 
     /// Cancel the pending invitation the account is part of. Returns whether there was one.
     async fn cancel_invitation(
@@ -97,20 +112,36 @@ pub trait IdentityStore: Send + Sync {
     ) -> Result<bool, IdentityError>;
 }
 
-#[derive(Default)]
-struct Inner {
-    next_holder: i64,
-    next_alias: i64,
-    holders: BTreeMap<HolderId, HolderRow>,
-    accounts: BTreeMap<AccountId, HolderId>,
-    aliases: Vec<AliasRow>,
-    invitations: Vec<InvitationRow>,
+/// The strongest alias per text, strongest first, ties by text.
+fn strongest_per_text(aliases: Vec<Alias>) -> Vec<Alias> {
+    let mut best: BTreeMap<String, Alias> = BTreeMap::new();
+    for alias in aliases {
+        match best.get(&alias.text) {
+            Some(kept)
+                if (kept.confidence, std::cmp::Reverse(kept.id))
+                    >= (alias.confidence, std::cmp::Reverse(alias.id)) => {}
+            _ => {
+                best.insert(alias.text.clone(), alias);
+            }
+        }
+    }
+    let mut names: Vec<Alias> = best.into_values().collect();
+    names.sort_by(|a, b| {
+        b.confidence
+            .total_cmp(&a.confidence)
+            .then(a.text.cmp(&b.text))
+    });
+    names
 }
 
-struct HolderRow {
-    created: UnixMillis,
-    revision: u32,
-    merged_into: Option<HolderId>,
+#[derive(Default)]
+struct Inner {
+    next_alias: i64,
+    accounts: BTreeSet<AccountId>,
+    /// `(group, lower account, higher account)`.
+    links: BTreeSet<(GroupId, AccountId, AccountId)>,
+    aliases: Vec<AliasRow>,
+    invitations: Vec<InvitationRow>,
 }
 
 struct AliasRow {
@@ -150,57 +181,38 @@ impl MemoryIdentityStore {
 }
 
 impl Inner {
-    fn holder(&self, id: HolderId) -> Holder {
-        let accounts = self
-            .accounts
-            .iter()
-            .filter(|(_, h)| **h == id)
-            .map(|(a, _)| *a)
-            .collect();
-        Holder {
-            id,
-            revision: self.holders[&id].revision,
-            accounts,
-        }
-    }
-
-    fn root(&self, mut id: HolderId) -> HolderId {
-        while let Some(next) = self.holders[&id].merged_into {
-            id = next;
-        }
-        id
-    }
-
-    fn holder_of(&self, account: AccountId) -> Result<HolderId, IdentityError> {
-        self.accounts
-            .get(&account)
-            .copied()
-            .ok_or(IdentityError::UnknownAccount)
-    }
-
-    fn merge(&mut self, a: AccountId, b: AccountId) -> Result<MergeOutcome, IdentityError> {
-        let (ha, hb) = (self.holder_of(a)?, self.holder_of(b)?);
-        if ha == hb {
-            return Ok(MergeOutcome::AlreadyLinked(ha));
-        }
-        let key = |h: HolderId| (self.holders[&h].created, h);
-        let (winner, loser) = if key(ha) <= key(hb) {
-            (ha, hb)
+    fn known(&self, account: AccountId) -> Result<(), IdentityError> {
+        if self.accounts.contains(&account) {
+            Ok(())
         } else {
-            (hb, ha)
-        };
-        for holder in self.accounts.values_mut().filter(|h| **h == loser) {
-            *holder = winner;
+            Err(IdentityError::UnknownAccount)
         }
-        if let Some(h) = self.holders.get_mut(&loser) {
-            h.merged_into = Some(winner);
-        }
-        for id in [winner, loser] {
-            if let Some(h) = self.holders.get_mut(&id) {
-                h.revision += 1;
+    }
+
+    fn linked(&self, group: GroupId, account: AccountId) -> Vec<AccountId> {
+        let mut found = BTreeSet::from([account]);
+        let mut frontier = vec![account];
+        while let Some(next) = frontier.pop() {
+            for (g, low, high) in &self.links {
+                let other = match (*low == next, *high == next) {
+                    (true, _) => *high,
+                    (_, true) => *low,
+                    _ => continue,
+                };
+                if *g == group && found.insert(other) {
+                    frontier.push(other);
+                }
             }
         }
-        Ok(MergeOutcome::Merged { winner, loser })
+        found.into_iter().collect()
+    }
+
+    fn link(&mut self, group: GroupId, a: AccountId, b: AccountId) -> LinkOutcome {
+        if self.linked(group, a).contains(&b) {
+            return LinkOutcome::AlreadyLinked;
+        }
+        self.links.insert((group, a.min(b), a.max(b)));
+        LinkOutcome::Linked
     }
 
     fn recompute(row: &mut AliasRow, policy: &IdentityPolicy) {
@@ -218,166 +230,167 @@ impl Inner {
             status_for(row.alias.confidence, policy)
         };
     }
+
+    fn add_evidence(
+        &mut self,
+        policy: &IdentityPolicy,
+        group: GroupId,
+        text: &str,
+        account: AccountId,
+        evidence: EvidenceRecord,
+        at: UnixMillis,
+    ) -> Result<Alias, IdentityError> {
+        self.known(account)?;
+        let existing = self.aliases.iter().position(|r| {
+            r.alias.group == group && r.alias.text == text && r.alias.account == account
+        });
+        let index = match existing {
+            Some(i) => i,
+            None => {
+                self.next_alias += 1;
+                let alias = Alias {
+                    id: AliasId(self.next_alias),
+                    group,
+                    text: text.to_owned(),
+                    account,
+                    status: AliasStatus::Candidate,
+                    confidence: 0.0,
+                    last_evidence: at,
+                };
+                self.aliases.push(AliasRow {
+                    alias,
+                    evidence: Vec::new(),
+                    removed: false,
+                });
+                self.aliases.len() - 1
+            }
+        };
+        let row = &mut self.aliases[index];
+        match row.evidence.iter_mut().find(|(e, _)| *e == evidence) {
+            Some(slot) => slot.1 = at,
+            None => row.evidence.push((evidence, at)),
+        }
+        row.removed = false;
+        Inner::recompute(row, policy);
+        Ok(row.alias.clone())
+    }
 }
 
 #[async_trait]
 impl IdentityStore for MemoryIdentityStore {
-    async fn seen(&self, account: AccountId, at: UnixMillis) -> Result<Holder, IdentityError> {
-        let mut inner = self.lock();
-        if !inner.accounts.contains_key(&account) {
-            inner.next_holder += 1;
-            let id = HolderId(inner.next_holder);
-            inner.holders.insert(
-                id,
-                HolderRow {
-                    created: at,
-                    revision: 0,
-                    merged_into: None,
-                },
-            );
-            inner.accounts.insert(account, id);
+    async fn seen(&self, account: AccountId, _at: UnixMillis) -> Result<(), IdentityError> {
+        self.lock().accounts.insert(account);
+        Ok(())
+    }
+
+    async fn is_known(&self, account: AccountId) -> Result<bool, IdentityError> {
+        Ok(self.lock().accounts.contains(&account))
+    }
+
+    async fn linked(
+        &self,
+        group: GroupId,
+        account: AccountId,
+    ) -> Result<Vec<AccountId>, IdentityError> {
+        Ok(self.lock().linked(group, account))
+    }
+
+    async fn link(
+        &self,
+        group: GroupId,
+        a: AccountId,
+        b: AccountId,
+        _at: UnixMillis,
+    ) -> Result<LinkOutcome, IdentityError> {
+        if a == b {
+            return Err(LinkError::SelfLink.into());
         }
-        let id = inner.accounts[&account];
-        Ok(inner.holder(id))
-    }
-
-    async fn holder_of(&self, account: AccountId) -> Result<Option<Holder>, IdentityError> {
-        let inner = self.lock();
-        Ok(inner.accounts.get(&account).map(|id| inner.holder(*id)))
-    }
-
-    async fn merge(&self, a: AccountId, b: AccountId) -> Result<MergeOutcome, IdentityError> {
-        self.lock().merge(a, b)
-    }
-
-    async fn split(&self, account: AccountId, at: UnixMillis) -> Result<Holder, IdentityError> {
         let mut inner = self.lock();
-        let old = inner.holder_of(account)?;
-        if inner.accounts.values().filter(|h| **h == old).count() < 2 {
+        inner.known(a)?;
+        inner.known(b)?;
+        Ok(inner.link(group, a, b))
+    }
+
+    async fn unlink(&self, group: GroupId, account: AccountId) -> Result<(), IdentityError> {
+        let mut inner = self.lock();
+        inner.known(account)?;
+        let before = inner.links.len();
+        inner
+            .links
+            .retain(|(g, low, high)| !(*g == group && (*low == account || *high == account)));
+        if inner.links.len() == before {
             return Err(IdentityError::NotLinked);
         }
-        inner.next_holder += 1;
-        let fresh = HolderId(inner.next_holder);
-        inner.holders.insert(
-            fresh,
-            HolderRow {
-                created: at,
-                revision: 0,
-                merged_into: None,
-            },
-        );
-        inner.accounts.insert(account, fresh);
-        if let Some(h) = inner.holders.get_mut(&old) {
-            h.revision += 1;
-        }
-        if let Some(h) = inner.holders.get_mut(&fresh) {
-            h.revision += 1;
-        }
-        Ok(inner.holder(fresh))
+        Ok(())
     }
 
     async fn add_evidence(
         &self,
         group: GroupId,
         text: &str,
-        target: AliasTarget,
+        account: AccountId,
         evidence: EvidenceRecord,
         at: UnixMillis,
     ) -> Result<Alias, IdentityError> {
-        let policy = self.policy;
         let text = normalize_alias(text)?;
-        let mut inner = self.lock();
-        if let AliasTarget::Account(a) = target {
-            inner.holder_of(a)?;
-        }
-        let existing = inner.aliases.iter().position(|r| {
-            r.alias.group == group && r.alias.text == text && r.alias.target == target
-        });
-        let index = match existing {
-            Some(i) => i,
-            None => {
-                inner.next_alias += 1;
-                let alias = Alias {
-                    id: AliasId(inner.next_alias),
-                    group,
-                    text,
-                    target,
-                    status: AliasStatus::Candidate,
-                    confidence: 0.0,
-                    last_evidence: at,
-                };
-                inner.aliases.push(AliasRow {
-                    alias,
-                    evidence: Vec::new(),
-                    removed: false,
-                });
-                inner.aliases.len() - 1
-            }
-        };
-        let row = &mut inner.aliases[index];
-        if !row.evidence.iter().any(|(e, _)| *e == evidence) {
-            row.evidence.push((evidence, at));
-        } else if let Some(slot) = row.evidence.iter_mut().find(|(e, _)| *e == evidence) {
-            slot.1 = at;
-        }
-        row.removed = false;
-        Inner::recompute(row, &policy);
-        Ok(row.alias.clone())
+        let policy = self.policy;
+        self.lock()
+            .add_evidence(&policy, group, &text, account, evidence, at)
     }
 
     async fn set_name(
         &self,
         group: GroupId,
         text: &str,
-        target: AliasTarget,
+        accounts: &[AccountId],
         at: UnixMillis,
-    ) -> Result<Alias, IdentityError> {
+    ) -> Result<Vec<Alias>, IdentityError> {
         let normalized = normalize_alias(text)?;
-        {
-            let inner = self.lock();
-            let taken = inner.aliases.iter().any(|r| {
-                r.alias.group == group
-                    && r.alias.text == normalized
-                    && r.alias.target != target
-                    && r.alias.status == AliasStatus::Confirmed
-            });
-            if taken {
-                return Err(IdentityError::NameTaken);
-            }
+        let policy = self.policy;
+        let mut inner = self.lock();
+        for account in accounts {
+            inner.known(*account)?;
         }
-        self.add_evidence(
-            group,
-            text,
-            target,
-            EvidenceRecord {
-                kind: EvidenceKind::Manual,
-                support: None,
-            },
-            at,
-        )
-        .await
+        let taken = inner.aliases.iter().any(|r| {
+            r.alias.group == group
+                && r.alias.text == normalized
+                && !accounts.contains(&r.alias.account)
+                && r.alias.status == AliasStatus::Confirmed
+        });
+        if taken {
+            return Err(IdentityError::NameTaken);
+        }
+        let manual = EvidenceRecord {
+            kind: EvidenceKind::Manual,
+            support: None,
+        };
+        accounts
+            .iter()
+            .map(|account| inner.add_evidence(&policy, group, &normalized, *account, manual, at))
+            .collect()
     }
 
     async fn remove_name(
         &self,
         group: GroupId,
         text: &str,
-        target: AliasTarget,
+        accounts: &[AccountId],
     ) -> Result<bool, IdentityError> {
         let policy = self.policy;
         let normalized = normalize_alias(text)?;
         let mut inner = self.lock();
-        let Some(row) = inner.aliases.iter_mut().find(|r| {
+        let mut removed = false;
+        for row in inner.aliases.iter_mut().filter(|r| {
             r.alias.group == group
                 && r.alias.text == normalized
-                && r.alias.target == target
+                && accounts.contains(&r.alias.account)
                 && !r.removed
-        }) else {
-            return Ok(false);
-        };
-        row.removed = true;
-        Inner::recompute(row, &policy);
-        Ok(true)
+        }) {
+            row.removed = true;
+            Inner::recompute(row, &policy);
+            removed = true;
+        }
+        Ok(removed)
     }
 
     async fn resolve(&self, group: GroupId, text: &str) -> Result<Resolution, IdentityError> {
@@ -391,10 +404,7 @@ impl IdentityStore for MemoryIdentityStore {
                     && r.alias.text == normalized
                     && r.alias.status == AliasStatus::Confirmed
             })
-            .map(|r| match r.alias.target {
-                AliasTarget::Holder(h) => AliasTarget::Holder(inner.root(h)),
-                account => account,
-            })
+            .map(|r| r.alias.account)
             .collect();
         Ok(Resolution::from_targets(targets))
     }
@@ -402,27 +412,22 @@ impl IdentityStore for MemoryIdentityStore {
     async fn names_of(
         &self,
         group: GroupId,
-        target: AliasTarget,
+        accounts: &[AccountId],
     ) -> Result<Vec<Alias>, IdentityError> {
         let inner = self.lock();
-        let mut names: Vec<Alias> = inner
-            .aliases
-            .iter()
-            .filter(|r| {
-                r.alias.group == group && !r.removed && r.alias.status != AliasStatus::Inactive
-            })
-            .filter(|r| match (r.alias.target, target) {
-                (AliasTarget::Holder(a), AliasTarget::Holder(b)) => inner.root(a) == inner.root(b),
-                (a, b) => a == b,
-            })
-            .map(|r| r.alias.clone())
-            .collect();
-        names.sort_by(|a, b| {
-            b.confidence
-                .total_cmp(&a.confidence)
-                .then(a.text.cmp(&b.text))
-        });
-        Ok(names)
+        Ok(strongest_per_text(
+            inner
+                .aliases
+                .iter()
+                .filter(|r| {
+                    r.alias.group == group
+                        && accounts.contains(&r.alias.account)
+                        && !r.removed
+                        && r.alias.status != AliasStatus::Inactive
+                })
+                .map(|r| r.alias.clone())
+                .collect(),
+        ))
     }
 
     async fn expire_candidates(&self, before: UnixMillis) -> Result<usize, IdentityError> {
@@ -460,8 +465,10 @@ impl IdentityStore for MemoryIdentityStore {
             return Err(LinkError::SelfLink.into());
         }
         let mut inner = self.lock();
-        let (hi, ht) = (inner.holder_of(initiator)?, inner.holder_of(target)?);
-        if hi == ht {
+        inner.known(initiator)?;
+        inner.known(target)?;
+        let initiator_linked = inner.linked(group, initiator);
+        if initiator_linked.contains(&target) {
             return Err(LinkError::AlreadyLinked.into());
         }
         for row in &mut inner.invitations {
@@ -487,8 +494,8 @@ impl IdentityStore for MemoryIdentityStore {
             target,
             created_by: message,
             created_at: now,
-            initiator_revision: inner.holders[&hi].revision,
-            target_revision: inner.holders[&ht].revision,
+            initiator_linked,
+            target_linked: inner.linked(group, target),
             state: InvitationState::Pending,
         };
         inner.invitations.push(InvitationRow {
@@ -504,19 +511,17 @@ impl IdentityStore for MemoryIdentityStore {
         confirming: AccountId,
         message: MessageId,
         now: UnixMillis,
-    ) -> Result<MergeOutcome, IdentityError> {
+    ) -> Result<LinkOutcome, IdentityError> {
         let ttl = self.policy.invitation_ttl;
         let mut inner = self.lock();
         // Replaying the confirming message is a no-op.
-        if let Some(row) = inner.invitations.iter().find(|r| {
+        if inner.invitations.iter().any(|r| {
             r.invitation.group == group
                 && r.invitation.state == InvitationState::Applied
                 && r.confirmed_by == Some(message)
                 && r.invitation.target == confirming
         }) {
-            // After a merge both accounts share a holder.
-            let holder = inner.holder_of(row.invitation.initiator)?;
-            return Ok(MergeOutcome::AlreadyLinked(holder));
+            return Ok(LinkOutcome::AlreadyLinked);
         }
         let index = inner
             .invitations
@@ -528,12 +533,11 @@ impl IdentityStore for MemoryIdentityStore {
             })
             .ok_or(LinkError::NoInvitation)?;
         let invitation = inner.invitations[index].invitation.clone();
-        let (hi, ht) = (
-            inner.holder_of(invitation.initiator)?,
-            inner.holder_of(invitation.target)?,
+        let (now_initiator, now_target) = (
+            inner.linked(group, invitation.initiator),
+            inner.linked(group, invitation.target),
         );
-        let (ri, rt) = (inner.holders[&hi].revision, inner.holders[&ht].revision);
-        match invitation.check_confirm(confirming, now, ttl, ri, rt) {
+        match invitation.check_confirm(confirming, now, ttl, &now_initiator, &now_target) {
             Ok(()) => {}
             Err(error @ (LinkError::Expired | LinkError::Stale)) => {
                 inner.invitations[index].invitation.state = if error == LinkError::Expired {
@@ -545,7 +549,7 @@ impl IdentityStore for MemoryIdentityStore {
             }
             Err(error) => return Err(error.into()),
         }
-        let outcome = inner.merge(invitation.initiator, invitation.target)?;
+        let outcome = inner.link(group, invitation.initiator, invitation.target);
         let row = &mut inner.invitations[index];
         row.invitation.state = InvitationState::Applied;
         row.confirmed_by = Some(message);

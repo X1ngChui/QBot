@@ -180,13 +180,13 @@ impl CommandRouter {
         }
         let admin = &self.deps.admin;
         let muted = admin.is_muted(req.group).await.unwrap_or_else(|error| {
-            tracing::warn!(%error, "could not tell whether the group is muted");
+            tracing::warn!(group = req.group.get(), %error, "could not tell whether the group is muted");
             false
         });
         let blocked = match admin.blocks(req.group).await {
             Ok(rules) => rules.iter().any(|rule| rule.account == req.sender),
             Err(error) => {
-                tracing::warn!(%error, "could not tell whether the sender is blocked");
+                tracing::warn!(group = req.group.get(), %error, "could not tell whether the sender is blocked");
                 false
             }
         };
@@ -208,7 +208,12 @@ impl CommandRouter {
             Ok(text) => text,
             Err(Fail::Say(msg)) => self.deps.locales.render(&msg),
             Err(Fail::Storage(error)) => {
-                tracing::error!(%error, command = command.name(), "command failed in storage");
+                tracing::error!(
+                    group = req.group.get(),
+                    %error,
+                    command = command.name(),
+                    "command failed in storage"
+                );
                 self.deps.locales.render(&Msg::OutcomeUnknown {})
             }
         };
@@ -235,7 +240,12 @@ impl Commands for CommandRouter {
                 OutSegment::Text(format!(" {piece}")),
             ];
             if let Err(error) = self.deps.delivery.send(request.group, segments).await {
-                tracing::warn!(%error, command = %request.word, "could not deliver a command reply");
+                tracing::warn!(
+                    group = request.group.get(),
+                    %error,
+                    command = %request.word,
+                    "could not deliver a command reply"
+                );
                 return;
             }
         }

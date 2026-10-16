@@ -50,7 +50,7 @@ reply model reads chat:
 - Ahead of the lines, "Who is who" (`SliceBackground`, implemented by the prompt layer from the
   same records replies use) lists every member the lines involve, whether as speaker or as
   `[at:N]`. For each it gives the current group display name, other names, accounts linked as
-  one person, a block, and facts learned before. These resolve names and references to member
+  one person in the group, a block, and facts learned before, all from the group's own records. These resolve names and references to member
   numbers.
 - "About the group" gives the operator's group background and the learned topic and terms.
 - Notes are left out: they are what members wrote about each other, not needed to read a
@@ -101,19 +101,21 @@ Terms. A member's *group nickname* is the name they set for one group (OneBot `c
 name (OneBot `nickname`). Their *group display name* is what the group shows: the group nickname,
 else the account nickname. These docs say "group nickname" and "group display name" only.
 
-- *Account* (a platform login, the QQ number) belongs to a *holder* (a person). New accounts get
-  their own holder in the same transaction as their first line.
+- *Account* (a platform login, the QQ number) is recorded in the same transaction as its first
+  line. It is the one global identity record and is never shown; everything about an account
+  is kept per group ([architecture.md](architecture.md) section 8, "Groups are separate").
 - *Member number*: an account's number in one group (`member:N` to the model), assigned densely
   the first time the account appears there (speaks or is mentioned) and never changed, reused or
   removed: a trigger on `member_number` rejects every update, delete and truncate. Linking,
   splitting, blocks, names and other groups do not touch it. Account ids are global and never
   reach the model; member numbers are group-local, and two accounts of one person keep two
   numbers. The model learns which numbers are one person, and who is blocked, from the "People in
-  this group" instruction, read from the block list and the holders on every run.
-- *Linking* merges holders (older wins, then lower id; accounts re-point; the loser keeps a
-  `merged_into` pointer). *Splitting* moves one account to a fresh holder. Every change bumps the
-  holders' revisions; holder-scoped records stay with the original holder after a split and follow
-  the merge chain after a merge.
+  this group" instruction, read from the group's block list and links on every run.
+- *Linking* records a link between two accounts in the group where it was made
+  (`account_link`). A *person* in a group is the accounts linked to each other there, directly or
+  through others; a link made in another group plays no part, so it never joins numbers, names,
+  notes, facts, blocks or command authority here. *Unlinking* removes an account's links in the
+  group; the accounts it connected stay linked only where they have links of their own.
 - *The current group display name* is the authoritative name of a member in a group: their
   group nickname (OneBot `card`, the name they set for this group) or, where they set none, their
   account nickname (OneBot `nickname`), exactly as QQ shows it in the group. It is the platform's own answer, not
@@ -126,15 +128,16 @@ else the account nickname. These docs say "group nickname" and "group display na
   `[at:N]`, the people block, telling accounts apart); in what the bot writes, people are called
   by their current group display name, addressed with `[at:N]`, or described naturally when no
   name is available. A number appears in a message only when someone asks about the numbers.
-- *Stored names* are the other names people use for someone: per group, pointing at an account or
-  a holder. Evidence is fused in one Rust function: manual 1.0, extracted evidence 0.25 per
+- *Stored names* are the other names people use for someone: per group, pointing at an account.
+  A name given with `--linked` is given to each of the person's accounts in the group, and a name
+  confirmed for one of a person's accounts does not stop their other accounts from having it. Evidence is fused in one Rust function: manual 1.0, extracted evidence 0.25 per
   distinct episode capped at 0.7, combined as independent evidence. A name resolves only when
   confirmed (at 0.75), so extraction alone never confirms: only a person does. Two confirmed targets for a name is *ambiguous*, never a guess.
 - *Invitations* to link accounts: ten minutes, one pending per
   account per group, only the target confirms (once: the archive runs each message once, and a
   confirmed invitation is no longer pending; message ids are hashes and are never compared), an
-  expired or stale (a holder changed) invitation is closed, replaying the confirming message is a
-  no-op.
+  expired or stale (either side's links in the group changed) invitation is closed, replaying the
+  confirming message is a no-op.
 
 ## 5. Compaction alignment
 
@@ -193,7 +196,7 @@ The design above would then still hold: the slicing function is the only part th
 - **Where facts reach the model.** Every run's people block lists each person's facts with
   their other names, notes and linked accounts. Facts come by predicate, the most recently
   confirmed first, each with its episode count and last confirmation date, across the person's
-  linked accounts. Dates are absolute, so the block stays in the cached prefix until a record
+  accounts linked in the group. Dates are absolute, so the block stays in the cached prefix until a record
   changes. Group knowledge is an instruction: the topic and the `memory.group_terms` (40) most
   recently confirmed terms ([architecture.md](architecture.md) section 7). Members see their own facts with `/who` and remove them with `/forget`.
 

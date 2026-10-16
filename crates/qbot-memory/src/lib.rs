@@ -31,9 +31,9 @@ pub use episode::{Episode, EpisodeId, Evidence, Hit, NewEpisode};
 pub use extract::{EpisodeExtractor, ExtractError, Extracted, MAX_ATTEMPTS, METHOD, SliceContext};
 pub use history::{HistoryPart, compose};
 pub use identity::{
-    Alias, AliasId, AliasStatus, AliasTarget, AliasTextError, EvidenceKind, EvidenceRecord, Holder,
-    HolderId, IdentityError, IdentityPolicy, Invitation, InvitationState, LinkError,
-    MAX_ALIAS_CHARS, MergeOutcome, Resolution, confidence, normalize_alias,
+    Alias, AliasId, AliasStatus, AliasTextError, EvidenceKind, EvidenceRecord, IdentityError,
+    IdentityPolicy, Invitation, InvitationState, LinkError, LinkOutcome, MAX_ALIAS_CHARS,
+    Resolution, confidence, normalize_alias,
 };
 pub use identity_store::{IdentityStore, MemoryIdentityStore};
 pub use jobs::EpisodeJobs;

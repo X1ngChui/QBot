@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::episode::Episode;
 use crate::facts::{FactStore, GROUP_TERM, GROUP_TOPIC, Observation, normalize_key};
 use crate::findings::KnowledgeFinding;
-use crate::identity::{AliasTarget, EvidenceKind, EvidenceRecord, IdentityError};
+use crate::identity::{EvidenceKind, EvidenceRecord, IdentityError};
 use crate::identity_store::IdentityStore;
 use crate::predicates::{Cardinality, DecayClass, Predicates};
 use crate::store::MemoryError;
@@ -49,13 +49,7 @@ impl Consolidator {
             };
             match self
                 .identity
-                .add_evidence(
-                    group,
-                    &name.name,
-                    AliasTarget::Account(name.account),
-                    evidence,
-                    at,
-                )
+                .add_evidence(group, &name.name, name.account, evidence, at)
                 .await
             {
                 Ok(_) => {}

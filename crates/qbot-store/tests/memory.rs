@@ -104,7 +104,7 @@ async fn ordinals_are_dense_per_group_even_under_concurrency_and_duplicates_use_
 }
 
 #[tokio::test]
-async fn a_line_from_a_new_account_creates_its_account_and_holder_atomically() {
+async fn a_line_from_a_new_account_creates_its_account_atomically() {
     let db = db!();
     let archive = PgArchive::new(db.pool().clone());
     let identity = PgIdentityStore::new(db.pool().clone(), IdentityPolicy::default());
@@ -114,14 +114,11 @@ async fn a_line_from_a_new_account_creates_its_account_and_holder_atomically() {
         .await
         .unwrap();
     use qbot_memory::IdentityStore;
-    let holder = identity
-        .holder_of(AccountId::new(777).unwrap())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        (holder.revision, holder.accounts),
-        (0, vec![AccountId::new(777).unwrap()])
+    assert!(
+        identity
+            .is_known(AccountId::new(777).unwrap())
+            .await
+            .unwrap()
     );
     // A duplicate stores nothing, so it creates no account either.
     assert_eq!(
@@ -129,11 +126,10 @@ async fn a_line_from_a_new_account_creates_its_account_and_holder_atomically() {
         Appended::Duplicate
     );
     assert!(
-        identity
-            .holder_of(AccountId::new(888).unwrap())
+        !identity
+            .is_known(AccountId::new(888).unwrap())
             .await
             .unwrap()
-            .is_none()
     );
     db.drop_db().await;
 }
@@ -160,7 +156,7 @@ async fn identity_stays_consistent_under_concurrency() {
         IdentityPolicy::default(),
     ));
 
-    // The same account seen by many tasks at once is still one account with one holder.
+    // The same account seen by many tasks at once is still one account.
     let tasks: Vec<_> = (0..16)
         .map(|_| {
             let store = store.clone();
@@ -169,30 +165,17 @@ async fn identity_stays_consistent_under_concurrency() {
                     .seen(AccountId::new(1).unwrap(), UnixMillis::new(T0))
                     .await
                     .unwrap()
-                    .id
             })
         })
         .collect();
-    let mut holders = BTreeSet::new();
     for t in tasks {
-        holders.insert(t.await.unwrap().0);
+        t.await.unwrap();
     }
-    assert_eq!(holders.len(), 1);
-    let (holder_count, account_count): (i64, i64) = (
-        sqlx::query_scalar("SELECT count(*) FROM holder")
-            .fetch_one(db.pool())
-            .await
-            .unwrap(),
-        sqlx::query_scalar("SELECT count(*) FROM account")
-            .fetch_one(db.pool())
-            .await
-            .unwrap(),
-    );
-    assert_eq!(
-        (holder_count, account_count),
-        (1, 1),
-        "no orphan holders from the race"
-    );
+    let accounts: i64 = sqlx::query_scalar("SELECT count(*) FROM account")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(accounts, 1);
 
     // Of many concurrent invitations touching the same account, exactly one is accepted.
     for n in 2..=9 {
@@ -227,13 +210,19 @@ async fn identity_stays_consistent_under_concurrency() {
     }
     assert_eq!(accepted, 1);
 
-    // Concurrent merges into one person end with every account in the same holder.
+    // Concurrent links into one person end with every account linked once.
     let tasks: Vec<_> = (2..=9)
-        .map(|n| {
+        .flat_map(|n| [(1, n), (n, 1)])
+        .map(|(a, b)| {
             let store = store.clone();
             tokio::spawn(async move {
                 store
-                    .merge(AccountId::new(1).unwrap(), AccountId::new(n).unwrap())
+                    .link(
+                        g,
+                        AccountId::new(a).unwrap(),
+                        AccountId::new(b).unwrap(),
+                        UnixMillis::new(T0),
+                    )
                     .await
                     .unwrap()
             })
@@ -242,12 +231,19 @@ async fn identity_stays_consistent_under_concurrency() {
     for t in tasks {
         t.await.unwrap();
     }
-    let holder = store
-        .holder_of(AccountId::new(5).unwrap())
+    assert_eq!(
+        store
+            .linked(g, AccountId::new(5).unwrap())
+            .await
+            .unwrap()
+            .len(),
+        9
+    );
+    let links: i64 = sqlx::query_scalar("SELECT count(*) FROM account_link")
+        .fetch_one(db.pool())
         .await
-        .unwrap()
         .unwrap();
-    assert_eq!(holder.accounts.len(), 9);
+    assert_eq!(links, 8, "a link raced from both sides is stored once");
     db.drop_db().await;
 }
 
@@ -660,7 +656,7 @@ async fn numbers(db: &TestDb, g: GroupId) -> Vec<(i64, i32)> {
 
 #[tokio::test]
 async fn a_member_number_survives_everything_that_happens_to_its_account() {
-    use qbot_memory::{AliasTarget, IdentityStore};
+    use qbot_memory::IdentityStore;
     let db = db!();
     let clock = ManualClock::new(T0);
     let archive = PgArchive::new(db.pool().clone());
@@ -688,21 +684,20 @@ async fn a_member_number_survives_everything_that_happens_to_its_account() {
         .append(member(other, 1, 603, "elsewhere"))
         .await
         .unwrap();
-    identity.merge(account(601), account(602)).await.unwrap();
+    let now = UnixMillis::new(T0);
     identity
-        .split(account(602), UnixMillis::new(T0))
+        .link(g, account(601), account(602), now)
         .await
         .unwrap();
-    identity.merge(account(601), account(603)).await.unwrap();
+    identity.unlink(g, account(602)).await.unwrap();
+    identity
+        .link(g, account(601), account(603), now)
+        .await
+        .unwrap();
     policy.block(g, account(602), None).await.unwrap();
     policy.unblock(g, account(602)).await.unwrap();
     identity
-        .set_name(
-            g,
-            "Tester",
-            AliasTarget::Account(account(601)),
-            UnixMillis::new(T0),
-        )
+        .set_name(g, "Tester", &[account(601)], UnixMillis::new(T0))
         .await
         .unwrap();
     for i in 0..5 {
@@ -730,10 +725,9 @@ async fn a_member_number_survives_everything_that_happens_to_its_account() {
 }
 
 #[tokio::test]
-async fn people_shows_each_person_with_blocks_links_names_notes_and_facts() {
+async fn people_shows_each_person_with_blocks_links_names_notes_and_facts_of_its_group_only() {
     use qbot_core::MemberNo;
     use qbot_memory::facts::{FactStore, Observation};
-    use qbot_memory::identity::AliasTarget;
     use qbot_memory::predicates::DecayClass;
     use qbot_memory::{IdentityStore, NoteStore};
     use qbot_store::{KnownFact, KnownName, KnownNote, PgFactStore, PgNoteStore};
@@ -753,11 +747,13 @@ async fn people_shows_each_person_with_blocks_links_names_notes_and_facts() {
             .await
             .unwrap();
     }
-    // 706 speaks only in another group: no number here.
-    archive
-        .append(member(group(61), 1, 706, "hi"))
-        .await
-        .unwrap();
+    // 706 speaks only in another group: no number here. 701 and 702 are there too.
+    for (i, a) in [706, 701, 702].into_iter().enumerate() {
+        archive
+            .append(member(group(61), i as i64 + 1, a, "hi"))
+            .await
+            .unwrap();
+    }
     // Who each person is and who of them is blocked, by member number.
     let shape = |people: &qbot_store::GroupPeople| {
         people
@@ -786,18 +782,32 @@ async fn people_shows_each_person_with_blocks_links_names_notes_and_facts() {
         .unwrap();
     policy.block(g, account(706), None).await.unwrap();
     policy.block(group(61), account(701), None).await.unwrap();
-    identity.merge(account(705), account(703)).await.unwrap();
-    identity.merge(account(701), account(706)).await.unwrap();
+    identity
+        .link(g, account(705), account(703), now)
+        .await
+        .unwrap();
+    identity
+        .link(g, account(701), account(706), now)
+        .await
+        .unwrap();
+    // A link made in the other group is that group's record.
+    identity
+        .link(group(61), account(701), account(702), now)
+        .await
+        .unwrap();
     let people = archive.people(g, now).await.unwrap();
     assert_eq!(
         shape(&people),
         [(vec![2], vec![2]), (vec![3, 5], vec![]), (vec![4], vec![4])],
-        "a linked account without a number here is not shown; blocks are this group's"
+        "a linked account without a number here is not shown; blocks and links are this group's"
     );
     assert_eq!(people.people[1].members[0], (no(3), account(703)));
 
     let later = UnixMillis::new(T0 + 60_001);
-    identity.merge(account(701), account(702)).await.unwrap();
+    identity
+        .link(g, account(701), account(702), later)
+        .await
+        .unwrap();
     assert_eq!(
         shape(&archive.people(g, later).await.unwrap()),
         [
@@ -807,46 +817,60 @@ async fn people_shows_each_person_with_blocks_links_names_notes_and_facts() {
         ],
         "an expired block is gone; a new link joins two numbers into one person"
     );
-    identity.split(account(703), later).await.unwrap();
+    identity.unlink(g, account(703)).await.unwrap();
     assert_eq!(
         shape(&archive.people(g, later).await.unwrap()),
         [(vec![1, 2], vec![]), (vec![4], vec![4])],
         "unlinking ends the set"
     );
 
-    // Names (of an account, and of a person whose holder was later merged away), notes and
-    // facts, all under the person they are about.
-    let person_of_705 = identity.holder_of(account(705)).await.unwrap().unwrap();
+    // Names, notes and facts, all under the person they are about, and only this group's.
     identity
-        .set_name(g, "Kit", AliasTarget::Account(account(705)), later)
+        .set_name(g, "Kit", &[account(705)], later)
         .await
         .unwrap();
     identity
-        .set_name(g, "Kitty", AliasTarget::Holder(person_of_705.id), later)
+        .link(g, account(704), account(705), later)
         .await
         .unwrap();
-    identity.merge(account(704), account(705)).await.unwrap();
+    identity
+        .set_name(g, "Kitty", &[account(704), account(705)], later)
+        .await
+        .unwrap();
+    identity
+        .set_name(group(61), "Elsewhere", &[account(704)], later)
+        .await
+        .unwrap();
     notes
         .add(g, account(705), "allergic to peanuts", account(701), later)
         .await
         .unwrap();
-    facts
-        .observe(&Observation {
-            group: g,
-            subject: Some(account(704)),
-            predicate: "lives_in".into(),
-            key: String::new(),
-            object: "Hangzhou".into(),
-            label: None,
-            opposite: None,
-            decay: DecayClass::Stable,
-            episode: qbot_memory::EpisodeId::new(9),
-            message: qbot_core::MessageId::new(1).unwrap(),
-            quote: "q".into(),
-            at: later,
-        })
+    notes
+        .add(
+            group(61),
+            account(704),
+            "said elsewhere",
+            account(701),
+            later,
+        )
         .await
         .unwrap();
+    let fact = |group: GroupId, object: &str| Observation {
+        group,
+        subject: Some(account(704)),
+        predicate: "lives_in".into(),
+        key: String::new(),
+        object: object.into(),
+        label: None,
+        opposite: None,
+        decay: DecayClass::Stable,
+        episode: qbot_memory::EpisodeId::new(9),
+        message: qbot_core::MessageId::new(1).unwrap(),
+        quote: "q".into(),
+        at: later,
+    };
+    facts.observe(&fact(g, "Hangzhou")).await.unwrap();
+    facts.observe(&fact(group(61), "Suzhou")).await.unwrap();
     let people = archive.people(g, later).await.unwrap();
     let merged = &people.people[1];
     assert_eq!(

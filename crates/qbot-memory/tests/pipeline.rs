@@ -65,6 +65,7 @@ async fn the_target_is_numbered_and_the_neighbors_are_marked_context_only() {
     let out = ex
         .extract(
             &SliceContext {
+                group: group(),
                 background: &Background::default(),
                 previous: &before,
                 target: &target,
@@ -104,6 +105,7 @@ async fn the_background_comes_before_the_lines_and_times_are_local() {
     };
     ex.extract(
         &SliceContext {
+            group: group(),
             background: &background,
             previous: &[],
             target: &target,
@@ -125,6 +127,7 @@ async fn context_sections_are_omitted_when_there_is_no_context() {
     let target = lines(1..=4);
     ex.extract(
         &SliceContext {
+            group: group(),
             background: &Background::default(),
             previous: &[],
             target: &target,
@@ -203,6 +206,7 @@ async fn a_rejected_answer_is_corrected_in_the_same_exchange_and_the_attempts_ar
     let out = ex
         .extract(
             &SliceContext {
+                group: group(),
                 background: &Background::default(),
                 previous: &[],
                 target: &target,
@@ -240,6 +244,7 @@ async fn a_rejected_answer_is_corrected_in_the_same_exchange_and_the_attempts_ar
     match ex
         .extract(
             &SliceContext {
+                group: group(),
                 background: &Background::default(),
                 previous: &[],
                 target: &target,
@@ -261,6 +266,7 @@ async fn a_rejected_answer_is_corrected_in_the_same_exchange_and_the_attempts_ar
 async fn missing_malformed_and_multiple_calls_are_corrected_too() {
     let target = lines(1..=4);
     let ctx = SliceContext {
+        group: group(),
         background: &Background::default(),
         previous: &[],
         target: &target,
@@ -312,6 +318,7 @@ async fn an_episode_owns_exactly_the_target_range_and_nothing_from_the_context()
             &plan,
             4,
             &SliceContext {
+                group: group(),
                 background: &Background::default(),
                 previous: &before,
                 target: &target,
@@ -361,6 +368,7 @@ async fn building_needs_lines_and_surfaces_extraction_failures() {
             &plan,
             4,
             &SliceContext {
+                group: group(),
                 background: &Background::default(),
                 previous: &[],
                 target: &[],
@@ -382,6 +390,7 @@ async fn building_needs_lines_and_surfaces_extraction_failures() {
             &plan,
             4,
             &SliceContext {
+                group: group(),
                 background: &Background::default(),
                 previous: &[],
                 target: &target,
@@ -961,7 +970,7 @@ fn answer_with_findings() -> serde_json::Value {
 async fn an_episodes_findings_become_names_facts_and_group_knowledge_once() {
     use qbot_memory::consolidate::Consolidator;
     use qbot_memory::facts::{FactStore, MemoryFactStore};
-    use qbot_memory::identity::{AliasStatus, AliasTarget, IdentityPolicy};
+    use qbot_memory::identity::{AliasStatus, IdentityPolicy};
     use qbot_memory::predicates::Predicates;
     use qbot_memory::{IdentityStore, MemoryIdentityStore};
 
@@ -1047,10 +1056,7 @@ async fn an_episodes_findings_become_names_facts_and_group_knowledge_once() {
 
     // The name is extracted evidence: a lead, never confirmed by extraction alone, counted once
     // per episode however often it is cited.
-    let names = identity
-        .names_of(group(), AliasTarget::Account(kit))
-        .await
-        .unwrap();
+    let names = identity.names_of(group(), &[kit]).await.unwrap();
     assert_eq!(names.len(), 1);
     assert_eq!(
         (names[0].text.as_str(), names[0].status),
@@ -1063,7 +1069,7 @@ async fn an_episodes_findings_become_names_facts_and_group_knowledge_once() {
     );
     assert!(
         identity
-            .names_of(group(), AliasTarget::Account(AccountId::new(12).unwrap()))
+            .names_of(group(), &[AccountId::new(12).unwrap()])
             .await
             .unwrap()
             .is_empty()
@@ -1178,6 +1184,7 @@ async fn rejected_findings_go_back_once_and_the_corrected_answer_is_kept() {
     let out = ex
         .extract(
             &SliceContext {
+                group: group(),
                 background: &Background::default(),
                 previous: &[],
                 target: &target,
@@ -1217,6 +1224,7 @@ async fn a_term_may_be_explained_by_a_line_that_does_not_repeat_it() {
         ]
     }))]);
     let ctx = SliceContext {
+        group: group(),
         background: &Background::default(),
         previous: &[],
         target: &target,
@@ -1242,6 +1250,7 @@ async fn extract_lines(ex: &EpisodeExtractor) -> Result<Extracted, ExtractError>
     let target = lines(1..=4);
     ex.extract(
         &SliceContext {
+            group: group(),
             background: &Background::default(),
             previous: &[],
             target: &target,

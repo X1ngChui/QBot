@@ -100,6 +100,7 @@ async fn a_real_model_writes_a_valid_episode_with_findings() {
         zone: jiff::tz::TimeZone::get("Asia/Shanghai").unwrap(),
     };
     let ctx = SliceContext {
+        group: qbot_core::GroupId::new(900).unwrap(),
         previous: &[],
         target: &target,
         next: &[],

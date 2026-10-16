@@ -107,24 +107,29 @@ fn the_pure_confirmation_rules_do_not_need_a_store() {
         target: qbot_core::AccountId::new(2).unwrap(),
         created_by: qbot_core::MessageId::new(10).unwrap(),
         created_at: t,
-        initiator_revision: 0,
-        target_revision: 0,
+        initiator_linked: vec![qbot_core::AccountId::new(1).unwrap()],
+        target_linked: vec![qbot_core::AccountId::new(2).unwrap()],
         state: InvitationState::Pending,
     };
-    let confirm = |who: i64, after: u64, ri: u32, rt: u32| {
+    let accounts = |ids: &[i64]| -> Vec<qbot_core::AccountId> {
+        ids.iter()
+            .map(|id| qbot_core::AccountId::new(*id).unwrap())
+            .collect()
+    };
+    let confirm = |who: i64, after: u64, initiator: &[i64], target: &[i64]| {
         inv.check_confirm(
             qbot_core::AccountId::new(who).unwrap(),
             t.plus(Duration::from_secs(after)),
             ttl,
-            ri,
-            rt,
+            &accounts(initiator),
+            &accounts(target),
         )
     };
-    assert_eq!(confirm(2, 5, 0, 0), Ok(()));
-    assert_eq!(confirm(1, 5, 0, 0), Err(LinkError::NotTheTarget));
-    assert_eq!(confirm(2, 600, 0, 0), Err(LinkError::Expired));
-    assert_eq!(confirm(2, 5, 1, 0), Err(LinkError::Stale));
-    assert_eq!(confirm(2, 5, 0, 3), Err(LinkError::Stale));
+    assert_eq!(confirm(2, 5, &[1], &[2]), Ok(()));
+    assert_eq!(confirm(1, 5, &[1], &[2]), Err(LinkError::NotTheTarget));
+    assert_eq!(confirm(2, 600, &[1], &[2]), Err(LinkError::Expired));
+    assert_eq!(confirm(2, 5, &[1, 3], &[2]), Err(LinkError::Stale));
+    assert_eq!(confirm(2, 5, &[1], &[2, 3]), Err(LinkError::Stale));
 }
 
 #[test]

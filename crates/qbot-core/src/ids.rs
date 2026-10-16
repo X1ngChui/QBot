@@ -46,7 +46,7 @@ positive_id!(
     GroupId, "group id"
 );
 positive_id!(
-    /// A QQ account number (a person's login, not the holder entity behind it).
+    /// A QQ account number: one login of a person.
     AccountId, "account id"
 );
 positive_id!(

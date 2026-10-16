@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use qbot_commands::{LogLine, RecentLogs};
-use qbot_core::UnixMillis;
+use qbot_core::{GroupId, UnixMillis};
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::layer::{Context, Layer};
@@ -48,30 +48,79 @@ impl LogBuffer {
 }
 
 impl RecentLogs for LogBuffer {
-    fn recent(&self, limit: usize) -> Vec<LogLine> {
+    fn recent(&self, group: GroupId, limit: usize) -> Vec<LogLine> {
         let lines = self.lines.lock().unwrap_or_else(PoisonError::into_inner);
-        let skip = lines.len().saturating_sub(limit);
-        lines.iter().skip(skip).cloned().collect()
+        let mut shown: Vec<LogLine> = lines
+            .iter()
+            .rev()
+            .filter(|line| line.group.is_none_or(|g| g == group))
+            .take(limit)
+            .cloned()
+            .collect();
+        shown.reverse();
+        shown
     }
 }
 
-/// Collects an event's message and fields into one line.
-struct OneLine(String);
+/// Collects an event's message and fields, and the group it names.
+///
+/// Messages are fixed text and numbers are ids and counts. Text fields (an error, a detail) can
+/// quote a group's chat, so they are kept only on a line about a group, which `/logs` shows in
+/// that group alone; a line about no group keeps its message and numbers, and its full text is
+/// in the process log.
+#[derive(Default)]
+struct OneLine {
+    message: String,
+    numbers: String,
+    texts: String,
+    group: Option<GroupId>,
+}
+
+impl OneLine {
+    fn number(&mut self, field: &Field, value: impl std::fmt::Display) {
+        let _ = write!(self.numbers, " {}={value}", field.name());
+    }
+
+    fn text(&self) -> String {
+        match self.group {
+            Some(_) => format!("{}{}{}", self.message, self.numbers, self.texts),
+            None => format!("{}{}", self.message, self.numbers),
+        }
+    }
+}
 
 impl Visit for OneLine {
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        if field.name() == "group" {
+            self.group = GroupId::new(value).ok();
+        }
+        self.number(field, value);
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        if field.name() == "group" {
+            self.group = i64::try_from(value).ok().and_then(|v| GroupId::new(v).ok());
+        }
+        self.number(field, value);
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.number(field, value);
+    }
+
     fn record_str(&mut self, field: &Field, value: &str) {
         if field.name() == "message" {
-            self.0.insert_str(0, value);
+            self.message = value.to_owned();
         } else {
-            let _ = write!(self.0, " {}={value}", field.name());
+            let _ = write!(self.texts, " {}={value}", field.name());
         }
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
-            self.0.insert_str(0, &format!("{value:?}"));
+            self.message = format!("{value:?}");
         } else {
-            let _ = write!(self.0, " {}={value:?}", field.name());
+            let _ = write!(self.texts, " {}={value:?}", field.name());
         }
     }
 }
@@ -86,15 +135,16 @@ impl<S: Subscriber> Layer<S> for CaptureLayer {
         if level > Level::WARN {
             return;
         }
-        let mut text = OneLine(String::new());
-        event.record(&mut text);
+        let mut line = OneLine::default();
+        event.record(&mut line);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
         self.0.push(LogLine {
             at: UnixMillis::new(now),
+            group: line.group,
             level: level.as_str().to_owned(),
-            text: text.0,
+            text: line.text(),
         });
     }
 }
@@ -116,15 +166,44 @@ mod tests {
             tracing::error!(error = "boom", "second");
             tracing::warn!("third");
         });
-        let lines = buffer.recent(10);
+        let g = GroupId::new(7).unwrap();
+        let lines = buffer.recent(g, 10);
         assert_eq!(
             lines
                 .iter()
                 .map(|l| (l.level.as_str(), l.text.as_str()))
                 .collect::<Vec<_>>(),
-            [("ERROR", "second error=boom"), ("WARN", "third")]
+            [("ERROR", "second"), ("WARN", "third")]
         );
-        assert_eq!(buffer.recent(1).len(), 1);
-        assert_eq!(buffer.recent(1)[0].text, "third");
+        assert_eq!(buffer.recent(g, 1).len(), 1);
+        assert_eq!(buffer.recent(g, 1)[0].text, "third");
+    }
+
+    #[test]
+    fn a_group_sees_its_own_lines_and_those_about_no_group_only() {
+        let buffer = LogBuffer::new(10);
+        let subscriber = tracing_subscriber::registry().with(buffer.layer());
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!(group = 7_i64, "here");
+            tracing::warn!(group = 8_u64, detail = "their chat", "there");
+            tracing::error!(attempts = 3, error = "a quote of some chat", "everywhere");
+        });
+        let texts = |g: i64| {
+            buffer
+                .recent(GroupId::new(g).unwrap(), 10)
+                .into_iter()
+                .map(|l| l.text)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(texts(7), ["here group=7", "everywhere attempts=3"]);
+        assert_eq!(
+            texts(8),
+            ["there group=8 detail=their chat", "everywhere attempts=3"]
+        );
+        assert_eq!(
+            texts(9),
+            ["everywhere attempts=3"],
+            "a line about no group carries no text that could quote a chat"
+        );
     }
 }

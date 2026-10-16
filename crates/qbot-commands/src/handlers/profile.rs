@@ -1,7 +1,7 @@
 use qbot_core::AccountId;
 use qbot_i18n::Msg;
 use qbot_memory::facts::{Fact, GROUP_TERM, GROUP_TOPIC};
-use qbot_memory::{Alias, AliasStatus, AliasTarget, IdentityError};
+use qbot_memory::{Alias, AliasStatus, IdentityError};
 
 use super::Reply;
 use crate::args;
@@ -56,14 +56,16 @@ pub(crate) async fn help(cx: &Cx<'_>) -> Reply {
     }
 }
 
-/// The alias target for an account: the account itself, or the person it belongs to.
-async fn alias_target(cx: &Cx<'_>, account: AccountId, all: bool) -> Result<AliasTarget, Fail> {
-    if !all {
-        return Ok(AliasTarget::Account(account));
-    }
-    match cx.deps.identity.holder_of(account).await? {
-        Some(holder) => Ok(AliasTarget::Holder(holder.id)),
-        None => Err(IdentityError::UnknownAccount.into()),
+/// The accounts a scoped command covers: the account, or the person's accounts in this group.
+async fn scope_accounts(
+    cx: &Cx<'_>,
+    account: AccountId,
+    all: bool,
+) -> Result<Vec<AccountId>, Fail> {
+    if all {
+        cx.linked_accounts(account).await
+    } else {
+        Ok(vec![account])
     }
 }
 
@@ -90,13 +92,9 @@ pub(crate) async fn who(cx: &Cx<'_>) -> Reply {
     {
         return Err(Msg::WhoNoRecord {}.into());
     }
-    let holder = cx.deps.identity.holder_of(account).await?;
-    let accounts = match (&holder, all) {
-        (Some(h), true) => h.accounts.clone(),
-        _ => vec![account],
-    };
-    let target = alias_target(cx, account, all).await?;
-    let names = cx.deps.identity.names_of(cx.group(), target).await?;
+    let linked = cx.linked_accounts(account).await?;
+    let accounts = if all { linked.clone() } else { vec![account] };
+    let names = cx.deps.identity.names_of(cx.group(), &accounts).await?;
     let confirmed: Vec<String> = names
         .iter()
         .filter(|a| a.status == AliasStatus::Confirmed)
@@ -122,9 +120,9 @@ pub(crate) async fn who(cx: &Cx<'_>) -> Reply {
                 .to_string(),
         }),
     ];
-    if let Some(holder) = holder.filter(|h| h.accounts.len() > 1) {
+    if linked.len() > 1 {
         lines.push(cx.t(&Msg::WhoLinked {
-            count: holder.accounts.len().to_string(),
+            count: linked.len().to_string(),
         }));
     }
     if !confirmed.is_empty() {
@@ -295,11 +293,7 @@ pub(crate) async fn forget(cx: &Cx<'_>) -> Reply {
     };
     let index = args::positive(number)?;
     let account = cx.target().await?;
-    let accounts = if all {
-        cx.linked_accounts(account).await?
-    } else {
-        vec![account]
-    };
+    let accounts = scope_accounts(cx, account, all).await?;
     let facts = learned(cx, &accounts).await?;
     let Some(fact) = facts.get(index as usize - 1) else {
         return Err(Msg::ForgetNoSuch {
@@ -344,13 +338,13 @@ pub(crate) async fn name(cx: &Cx<'_>) -> Reply {
         return Err(Msg::WhoNoRecord {}.into());
     }
     let display = cx.name_of(account).await;
-    let target = alias_target(cx, account, all).await?;
+    let accounts = scope_accounts(cx, account, all).await?;
 
     let Some(action) = action else {
         if !rest.is_empty() {
             return Err(Msg::UsageNameList {}.into());
         }
-        let names = cx.deps.identity.names_of(cx.group(), target).await?;
+        let names = cx.deps.identity.names_of(cx.group(), &accounts).await?;
         if names.is_empty() {
             return Ok(cx.t(&Msg::NameNone { display }));
         }
@@ -379,7 +373,7 @@ pub(crate) async fn name(cx: &Cx<'_>) -> Reply {
         let removed = cx
             .deps
             .identity
-            .remove_name(cx.group(), &name, target)
+            .remove_name(cx.group(), &name, &accounts)
             .await?;
         return Ok(cx.t(&if removed {
             Msg::NameRemoved { display, name }
@@ -390,7 +384,7 @@ pub(crate) async fn name(cx: &Cx<'_>) -> Reply {
     match cx
         .deps
         .identity
-        .set_name(cx.group(), &name, target, cx.deps.clock.now())
+        .set_name(cx.group(), &name, &accounts, cx.deps.clock.now())
         .await
     {
         Ok(_) => Ok(cx.t(&Msg::NameAdded { display, name })),

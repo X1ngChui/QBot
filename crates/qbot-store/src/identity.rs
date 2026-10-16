@@ -1,63 +1,67 @@
-//! Identity on Postgres. Topology changes (a new account, merge, split, applying an invitation)
-//! take one global advisory lock, always after any group lock, so they cannot interleave.
+//! Identity on Postgres. Links are rows of `account_link`, each with the group it was made in;
+//! changes to a group's links (linking, unlinking, invitations) take that group's link lock.
 
 use async_trait::async_trait;
 use qbot_core::{AccountId, GroupId, MessageId, UnixMillis};
 use qbot_memory::IdentityStore;
 use qbot_memory::identity::{
-    Alias, AliasId, AliasStatus, AliasTarget, EvidenceKind, EvidenceRecord, Holder, HolderId,
-    IdentityError, IdentityPolicy, Invitation, InvitationState, LinkError, MergeOutcome,
-    Resolution, confidence, normalize_alias, status_for,
+    Alias, AliasId, AliasStatus, EvidenceKind, EvidenceRecord, IdentityError, IdentityPolicy,
+    Invitation, InvitationState, LinkError, LinkOutcome, Resolution, confidence, normalize_alias,
+    status_for,
 };
 use sqlx::postgres::PgRow;
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx::{PgExecutor, PgPool, Postgres, Row, Transaction};
 
 use crate::error::StoreError;
 
 type Tx<'a> = Transaction<'a, Postgres>;
 
-const TOPOLOGY_LOCK: &str = "SELECT pg_advisory_xact_lock(hashtextextended('identity', 0))";
+const LINK_LOCK: &str = "SELECT pg_advisory_xact_lock(hashtextextended('link:' || $1::text, 0))";
 
 fn backend(error: impl std::fmt::Display) -> IdentityError {
     IdentityError::Backend(error.to_string())
 }
 
-/// Make sure the account and a holder of its own exist. Used by the archive in the same
-/// transaction that stores a line, so a line never refers to an unknown account.
+/// Make sure the account exists. Used by the archive in the same transaction that stores a line,
+/// so a line never refers to an unknown account.
 pub(crate) async fn ensure_account(
     tx: &mut Tx<'_>,
     account: i64,
     at_ms: i64,
 ) -> Result<(), StoreError> {
-    let known = sqlx::query("SELECT 1 FROM account WHERE account_id = $1")
-        .bind(account)
-        .fetch_optional(&mut **tx)
-        .await?;
-    if known.is_some() {
-        return Ok(());
-    }
-    sqlx::query(TOPOLOGY_LOCK).execute(&mut **tx).await?;
-    let known = sqlx::query("SELECT 1 FROM account WHERE account_id = $1")
-        .bind(account)
-        .fetch_optional(&mut **tx)
-        .await?;
-    if known.is_none() {
-        let holder: i64 =
-            sqlx::query("INSERT INTO holder (created_ms) VALUES ($1) RETURNING holder_id")
-                .bind(at_ms)
-                .fetch_one(&mut **tx)
-                .await?
-                .get("holder_id");
-        sqlx::query(
-            "INSERT INTO account (account_id, holder_id, first_seen_ms) VALUES ($1, $2, $3)",
-        )
-        .bind(account)
-        .bind(holder)
-        .bind(at_ms)
-        .execute(&mut **tx)
-        .await?;
-    }
+    sqlx::query(
+        "INSERT INTO account (account_id, first_seen_ms) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+    )
+    .bind(account)
+    .bind(at_ms)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
+}
+
+/// The accounts linked to `account` in `group` through that group's links, with `account`;
+/// ascending.
+pub(crate) async fn linked_in<'e>(
+    executor: impl PgExecutor<'e>,
+    group: GroupId,
+    account: AccountId,
+) -> Result<Vec<AccountId>, sqlx::Error> {
+    let ids: Vec<i64> = sqlx::query_scalar(
+        "WITH RECURSIVE c(a) AS ( \
+             SELECT $2::bigint \
+           UNION \
+             SELECT CASE WHEN l.low_account = c.a THEN l.high_account ELSE l.low_account END \
+             FROM account_link l JOIN c ON l.group_id = $1 \
+                                      AND (l.low_account = c.a OR l.high_account = c.a)) \
+         SELECT a FROM c ORDER BY a",
+    )
+    .bind(group.get())
+    .bind(account.get())
+    .fetch_all(executor)
+    .await?;
+    ids.into_iter()
+        .map(|id| AccountId::new(id).map_err(|e| sqlx::Error::Decode(e.to_string().into())))
+        .collect()
 }
 
 #[derive(Clone)]
@@ -74,142 +78,60 @@ impl std::fmt::Debug for PgIdentityStore {
     }
 }
 
-fn holder_of_tx_sql() -> &'static str {
-    "SELECT holder_id FROM account WHERE account_id = $1"
-}
-
-async fn holder_row(tx: &mut Tx<'_>, id: i64) -> Result<Holder, IdentityError> {
-    let revision: i32 = sqlx::query("SELECT revision FROM holder WHERE holder_id = $1")
-        .bind(id)
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(backend)?
-        .get("revision");
-    let accounts =
-        sqlx::query("SELECT account_id FROM account WHERE holder_id = $1 ORDER BY account_id")
-            .bind(id)
-            .fetch_all(&mut **tx)
-            .await
-            .map_err(backend)?
-            .iter()
-            .map(|r| AccountId::new(r.get("account_id")).map_err(backend))
-            .collect::<Result<Vec<_>, _>>()?;
-    Ok(Holder {
-        id: HolderId(id),
-        revision: u32::try_from(revision).map_err(backend)?,
-        accounts,
-    })
-}
-
-async fn holder_id_of(tx: &mut Tx<'_>, account: AccountId) -> Result<i64, IdentityError> {
-    sqlx::query(holder_of_tx_sql())
+async fn require_known(tx: &mut Tx<'_>, account: AccountId) -> Result<(), IdentityError> {
+    sqlx::query("SELECT 1 FROM account WHERE account_id = $1")
         .bind(account.get())
         .fetch_optional(&mut **tx)
         .await
         .map_err(backend)?
-        .map(|r| r.get("holder_id"))
+        .map(|_| ())
         .ok_or(IdentityError::UnknownAccount)
 }
 
-async fn root_of(tx: &mut Tx<'_>, mut id: i64) -> Result<i64, IdentityError> {
-    loop {
-        let next: Option<i64> = sqlx::query("SELECT merged_into FROM holder WHERE holder_id = $1")
-            .bind(id)
-            .fetch_one(&mut **tx)
-            .await
-            .map_err(backend)?
-            .get("merged_into");
-        match next {
-            Some(n) => id = n,
-            None => return Ok(id),
-        }
-    }
+async fn linked_tx(
+    tx: &mut Tx<'_>,
+    group: GroupId,
+    account: AccountId,
+) -> Result<Vec<AccountId>, IdentityError> {
+    linked_in(&mut **tx, group, account).await.map_err(backend)
 }
 
-async fn merge_tx(
+/// Link two known accounts in `group`, under the group's link lock.
+async fn link_tx(
     tx: &mut Tx<'_>,
+    group: GroupId,
     a: AccountId,
     b: AccountId,
-) -> Result<MergeOutcome, IdentityError> {
-    let (ha, hb) = (holder_id_of(tx, a).await?, holder_id_of(tx, b).await?);
-    if ha == hb {
-        return Ok(MergeOutcome::AlreadyLinked(HolderId(ha)));
+    at: UnixMillis,
+) -> Result<LinkOutcome, IdentityError> {
+    if linked_tx(tx, group, a).await?.contains(&b) {
+        return Ok(LinkOutcome::AlreadyLinked);
     }
-    let key = |row: PgRow| {
-        (
-            row.get::<i64, _>("created_ms"),
-            row.get::<i64, _>("holder_id"),
-        )
-    };
-    let ka = key(
-        sqlx::query("SELECT created_ms, holder_id FROM holder WHERE holder_id = $1")
-            .bind(ha)
-            .fetch_one(&mut **tx)
-            .await
-            .map_err(backend)?,
-    );
-    let kb = key(
-        sqlx::query("SELECT created_ms, holder_id FROM holder WHERE holder_id = $1")
-            .bind(hb)
-            .fetch_one(&mut **tx)
-            .await
-            .map_err(backend)?,
-    );
-    let (winner, loser) = if ka <= kb { (ha, hb) } else { (hb, ha) };
-    sqlx::query("UPDATE account SET holder_id = $1 WHERE holder_id = $2")
-        .bind(winner)
-        .bind(loser)
-        .execute(&mut **tx)
-        .await
-        .map_err(backend)?;
-    sqlx::query("UPDATE holder SET merged_into = $1, revision = revision + 1 WHERE holder_id = $2")
-        .bind(winner)
-        .bind(loser)
-        .execute(&mut **tx)
-        .await
-        .map_err(backend)?;
-    sqlx::query("UPDATE holder SET revision = revision + 1 WHERE holder_id = $1")
-        .bind(winner)
-        .execute(&mut **tx)
-        .await
-        .map_err(backend)?;
-    Ok(MergeOutcome::Merged {
-        winner: HolderId(winner),
-        loser: HolderId(loser),
-    })
+    sqlx::query(
+        "INSERT INTO account_link (group_id, low_account, high_account, created_ms) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(group.get())
+    .bind(a.get().min(b.get()))
+    .bind(a.get().max(b.get()))
+    .bind(at.get())
+    .execute(&mut **tx)
+    .await
+    .map_err(backend)?;
+    Ok(LinkOutcome::Linked)
 }
 
-struct TargetCols {
-    kind: &'static str,
-    account: Option<i64>,
-    holder: Option<i64>,
+fn ids(accounts: &[AccountId]) -> Vec<i64> {
+    accounts.iter().map(|a| a.get()).collect()
 }
 
-fn target_cols(target: AliasTarget) -> TargetCols {
-    match target {
-        AliasTarget::Account(a) => TargetCols {
-            kind: "account",
-            account: Some(a.get()),
-            holder: None,
-        },
-        AliasTarget::Holder(h) => TargetCols {
-            kind: "holder",
-            account: None,
-            holder: Some(h.0),
-        },
-    }
+fn accounts_of(ids: Vec<i64>) -> Result<Vec<AccountId>, IdentityError> {
+    ids.into_iter()
+        .map(|id| AccountId::new(id).map_err(backend))
+        .collect()
 }
 
 fn to_alias(row: &PgRow) -> Result<Alias, IdentityError> {
-    let target = match row.get::<String, _>("target_kind").as_str() {
-        "account" => AliasTarget::Account(
-            AccountId::new(row.get::<Option<i64>, _>("target_account").unwrap_or(0))
-                .map_err(backend)?,
-        ),
-        _ => AliasTarget::Holder(HolderId(
-            row.get::<Option<i64>, _>("target_holder").unwrap_or(0),
-        )),
-    };
     let status = match row.get::<String, _>("status").as_str() {
         "confirmed" => AliasStatus::Confirmed,
         "candidate" => AliasStatus::Candidate,
@@ -219,7 +141,7 @@ fn to_alias(row: &PgRow) -> Result<Alias, IdentityError> {
         id: AliasId(row.get("alias_id")),
         group: GroupId::new(row.get("group_id")).map_err(backend)?,
         text: row.get("text"),
-        target,
+        account: AccountId::new(row.get("account_id")).map_err(backend)?,
         status,
         confidence: row.get("confidence"),
         last_evidence: UnixMillis::new(row.get("last_evidence_ms")),
@@ -240,7 +162,8 @@ fn kind_parse(text: &str) -> EvidenceKind {
     }
 }
 
-const ALIAS_COLS: &str = "alias_id, group_id, text, target_kind, target_account, target_holder, status, confidence, last_evidence_ms";
+const ALIAS_COLS: &str =
+    "alias_id, group_id, text, account_id, status, confidence, last_evidence_ms";
 
 impl PgIdentityStore {
     pub fn new(pool: PgPool, policy: IdentityPolicy) -> Self {
@@ -252,43 +175,29 @@ impl PgIdentityStore {
         tx: &mut Tx<'_>,
         group: GroupId,
         text: &str,
-        target: AliasTarget,
+        account: AccountId,
         evidence: EvidenceRecord,
         at: UnixMillis,
     ) -> Result<Alias, IdentityError> {
-        let t = target_cols(target);
-        if let Some(account) = t.account {
-            let exists = sqlx::query("SELECT 1 FROM account WHERE account_id = $1")
-                .bind(account)
-                .fetch_optional(&mut **tx)
-                .await
-                .map_err(backend)?;
-            if exists.is_none() {
-                return Err(IdentityError::UnknownAccount);
-            }
-        }
+        require_known(tx, account).await?;
         sqlx::query(
-            "INSERT INTO alias (group_id, text, target_kind, target_account, target_holder, status, confidence, last_evidence_ms) \
-             VALUES ($1, $2, $3, $4, $5, 'candidate', 0, $6) ON CONFLICT DO NOTHING",
+            "INSERT INTO alias (group_id, text, account_id, status, confidence, last_evidence_ms) \
+             VALUES ($1, $2, $3, 'candidate', 0, $4) ON CONFLICT DO NOTHING",
         )
         .bind(group.get())
         .bind(text)
-        .bind(t.kind)
-        .bind(t.account)
-        .bind(t.holder)
+        .bind(account.get())
         .bind(at.get())
         .execute(&mut **tx)
         .await
         .map_err(backend)?;
         let alias_id: i64 = sqlx::query(
-            "SELECT alias_id FROM alias WHERE group_id = $1 AND text = $2 AND target_kind = $3 \
-             AND target_account IS NOT DISTINCT FROM $4 AND target_holder IS NOT DISTINCT FROM $5 FOR UPDATE",
+            "SELECT alias_id FROM alias WHERE group_id = $1 AND text = $2 AND account_id = $3 \
+             FOR UPDATE",
         )
         .bind(group.get())
         .bind(text)
-        .bind(t.kind)
-        .bind(t.account)
-        .bind(t.holder)
+        .bind(account.get())
         .fetch_one(&mut **tx)
         .await
         .map_err(backend)?
@@ -339,93 +248,93 @@ impl PgIdentityStore {
         .map_err(backend)?;
         to_alias(&row)
     }
+
+    async fn begin_linking(&self, group: GroupId) -> Result<Tx<'static>, IdentityError> {
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        sqlx::query(LINK_LOCK)
+            .bind(group.get())
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+        Ok(tx)
+    }
 }
 
 #[async_trait]
 impl IdentityStore for PgIdentityStore {
-    async fn seen(&self, account: AccountId, at: UnixMillis) -> Result<Holder, IdentityError> {
+    async fn seen(&self, account: AccountId, at: UnixMillis) -> Result<(), IdentityError> {
         let mut tx = self.pool.begin().await.map_err(backend)?;
         ensure_account(&mut tx, account.get(), at.get())
             .await
             .map_err(backend)?;
-        let id = holder_id_of(&mut tx, account).await?;
-        let holder = holder_row(&mut tx, id).await?;
-        tx.commit().await.map_err(backend)?;
-        Ok(holder)
+        tx.commit().await.map_err(backend)
     }
 
-    async fn holder_of(&self, account: AccountId) -> Result<Option<Holder>, IdentityError> {
-        let mut tx = self.pool.begin().await.map_err(backend)?;
-        match holder_id_of(&mut tx, account).await {
-            Ok(id) => Ok(Some(holder_row(&mut tx, id).await?)),
-            Err(IdentityError::UnknownAccount) => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-
-    async fn merge(&self, a: AccountId, b: AccountId) -> Result<MergeOutcome, IdentityError> {
-        let mut tx = self.pool.begin().await.map_err(backend)?;
-        sqlx::query(TOPOLOGY_LOCK)
-            .execute(&mut *tx)
+    async fn is_known(&self, account: AccountId) -> Result<bool, IdentityError> {
+        Ok(sqlx::query("SELECT 1 FROM account WHERE account_id = $1")
+            .bind(account.get())
+            .fetch_optional(&self.pool)
             .await
-            .map_err(backend)?;
-        let outcome = merge_tx(&mut tx, a, b).await?;
+            .map_err(backend)?
+            .is_some())
+    }
+
+    async fn linked(
+        &self,
+        group: GroupId,
+        account: AccountId,
+    ) -> Result<Vec<AccountId>, IdentityError> {
+        linked_in(&self.pool, group, account).await.map_err(backend)
+    }
+
+    async fn link(
+        &self,
+        group: GroupId,
+        a: AccountId,
+        b: AccountId,
+        at: UnixMillis,
+    ) -> Result<LinkOutcome, IdentityError> {
+        if a == b {
+            return Err(LinkError::SelfLink.into());
+        }
+        let mut tx = self.begin_linking(group).await?;
+        require_known(&mut tx, a).await?;
+        require_known(&mut tx, b).await?;
+        let outcome = link_tx(&mut tx, group, a, b, at).await?;
         tx.commit().await.map_err(backend)?;
         Ok(outcome)
     }
 
-    async fn split(&self, account: AccountId, at: UnixMillis) -> Result<Holder, IdentityError> {
-        let mut tx = self.pool.begin().await.map_err(backend)?;
-        sqlx::query(TOPOLOGY_LOCK)
-            .execute(&mut *tx)
-            .await
-            .map_err(backend)?;
-        let old = holder_id_of(&mut tx, account).await?;
-        let count: i64 = sqlx::query("SELECT count(*) AS n FROM account WHERE holder_id = $1")
-            .bind(old)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(backend)?
-            .get("n");
-        if count < 2 {
-            return Err(IdentityError::NotLinked);
-        }
-        let fresh: i64 = sqlx::query(
-            "INSERT INTO holder (created_ms, revision) VALUES ($1, 1) RETURNING holder_id",
+    async fn unlink(&self, group: GroupId, account: AccountId) -> Result<(), IdentityError> {
+        let mut tx = self.begin_linking(group).await?;
+        require_known(&mut tx, account).await?;
+        let removed = sqlx::query(
+            "DELETE FROM account_link WHERE group_id = $1 AND (low_account = $2 OR high_account = $2)",
         )
-        .bind(at.get())
-        .fetch_one(&mut *tx)
+        .bind(group.get())
+        .bind(account.get())
+        .execute(&mut *tx)
         .await
         .map_err(backend)?
-        .get("holder_id");
-        sqlx::query("UPDATE account SET holder_id = $1 WHERE account_id = $2")
-            .bind(fresh)
-            .bind(account.get())
-            .execute(&mut *tx)
-            .await
-            .map_err(backend)?;
-        sqlx::query("UPDATE holder SET revision = revision + 1 WHERE holder_id = $1")
-            .bind(old)
-            .execute(&mut *tx)
-            .await
-            .map_err(backend)?;
-        let holder = holder_row(&mut tx, fresh).await?;
-        tx.commit().await.map_err(backend)?;
-        Ok(holder)
+        .rows_affected();
+        if removed == 0 {
+            return Err(IdentityError::NotLinked);
+        }
+        tx.commit().await.map_err(backend)
     }
 
     async fn add_evidence(
         &self,
         group: GroupId,
         text: &str,
-        target: AliasTarget,
+        account: AccountId,
         evidence: EvidenceRecord,
         at: UnixMillis,
     ) -> Result<Alias, IdentityError> {
         let text = normalize_alias(text)?;
         let mut tx = self.pool.begin().await.map_err(backend)?;
         let alias = self
-            .add_evidence_tx(&mut tx, group, &text, target, evidence, at)
+            .add_evidence_tx(&mut tx, group, &text, account, evidence, at)
             .await?;
         tx.commit().await.map_err(backend)?;
         Ok(alias)
@@ -435,9 +344,9 @@ impl IdentityStore for PgIdentityStore {
         &self,
         group: GroupId,
         text: &str,
-        target: AliasTarget,
+        accounts: &[AccountId],
         at: UnixMillis,
-    ) -> Result<Alias, IdentityError> {
+    ) -> Result<Vec<Alias>, IdentityError> {
         let text = normalize_alias(text)?;
         let mut tx = self.pool.begin().await.map_err(backend)?;
         sqlx::query(
@@ -448,56 +357,51 @@ impl IdentityStore for PgIdentityStore {
         .execute(&mut *tx)
         .await
         .map_err(backend)?;
-        let t = target_cols(target);
+        for account in accounts {
+            require_known(&mut tx, *account).await?;
+        }
         let taken = sqlx::query(
-            "SELECT 1 FROM alias WHERE group_id = $1 AND text = $2 AND status = 'confirmed' AND NOT removed \
-             AND NOT (target_kind = $3 AND target_account IS NOT DISTINCT FROM $4 AND target_holder IS NOT DISTINCT FROM $5)",
+            "SELECT 1 FROM alias WHERE group_id = $1 AND text = $2 AND status = 'confirmed' \
+             AND NOT removed AND NOT (account_id = ANY($3))",
         )
         .bind(group.get())
         .bind(&text)
-        .bind(t.kind)
-        .bind(t.account)
-        .bind(t.holder)
+        .bind(ids(accounts))
         .fetch_optional(&mut *tx)
         .await
         .map_err(backend)?;
         if taken.is_some() {
             return Err(IdentityError::NameTaken);
         }
-        let alias = self
-            .add_evidence_tx(
-                &mut tx,
-                group,
-                &text,
-                target,
-                EvidenceRecord {
-                    kind: EvidenceKind::Manual,
-                    support: None,
-                },
-                at,
-            )
-            .await?;
+        let manual = EvidenceRecord {
+            kind: EvidenceKind::Manual,
+            support: None,
+        };
+        let mut aliases = Vec::with_capacity(accounts.len());
+        for account in accounts {
+            aliases.push(
+                self.add_evidence_tx(&mut tx, group, &text, *account, manual, at)
+                    .await?,
+            );
+        }
         tx.commit().await.map_err(backend)?;
-        Ok(alias)
+        Ok(aliases)
     }
 
     async fn remove_name(
         &self,
         group: GroupId,
         text: &str,
-        target: AliasTarget,
+        accounts: &[AccountId],
     ) -> Result<bool, IdentityError> {
         let text = normalize_alias(text)?;
-        let t = target_cols(target);
         let result = sqlx::query(
-            "UPDATE alias SET removed = true, status = 'inactive' WHERE group_id = $1 AND text = $2 AND target_kind = $3 \
-             AND target_account IS NOT DISTINCT FROM $4 AND target_holder IS NOT DISTINCT FROM $5 AND NOT removed",
+            "UPDATE alias SET removed = true, status = 'inactive' WHERE group_id = $1 AND text = $2 \
+             AND account_id = ANY($3) AND NOT removed",
         )
         .bind(group.get())
         .bind(text)
-        .bind(t.kind)
-        .bind(t.account)
-        .bind(t.holder)
+        .bind(ids(accounts))
         .execute(&self.pool)
         .await
         .map_err(backend)?;
@@ -506,62 +410,39 @@ impl IdentityStore for PgIdentityStore {
 
     async fn resolve(&self, group: GroupId, text: &str) -> Result<Resolution, IdentityError> {
         let text = normalize_alias(text)?;
-        let mut tx = self.pool.begin().await.map_err(backend)?;
-        let rows = sqlx::query("SELECT target_kind, target_account, target_holder FROM alias WHERE group_id = $1 AND text = $2 AND status = 'confirmed'")
-            .bind(group.get())
-            .bind(text)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(backend)?;
-        let mut targets = Vec::new();
-        for row in rows {
-            targets.push(match row.get::<String, _>("target_kind").as_str() {
-                "account" => AliasTarget::Account(
-                    AccountId::new(row.get::<Option<i64>, _>("target_account").unwrap_or(0))
-                        .map_err(backend)?,
-                ),
-                _ => AliasTarget::Holder(HolderId(
-                    root_of(
-                        &mut tx,
-                        row.get::<Option<i64>, _>("target_holder").unwrap_or(0),
-                    )
-                    .await?,
-                )),
-            });
-        }
-        Ok(Resolution::from_targets(targets))
+        let found: Vec<i64> = sqlx::query_scalar(
+            "SELECT account_id FROM alias WHERE group_id = $1 AND text = $2 AND status = 'confirmed'",
+        )
+        .bind(group.get())
+        .bind(text)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(Resolution::from_targets(accounts_of(found)?))
     }
 
     async fn names_of(
         &self,
         group: GroupId,
-        target: AliasTarget,
+        accounts: &[AccountId],
     ) -> Result<Vec<Alias>, IdentityError> {
-        let rows = match target {
-            AliasTarget::Account(a) => sqlx::query(&format!(
-                "SELECT {ALIAS_COLS} FROM alias WHERE group_id = $1 AND target_kind = 'account' AND target_account = $2 AND status <> 'inactive' \
-                 ORDER BY confidence DESC, text COLLATE \"C\""
-            ))
-            .bind(group.get())
-            .bind(a.get())
-            .fetch_all(&self.pool)
-            .await,
-            AliasTarget::Holder(h) => {
-                let mut tx = self.pool.begin().await.map_err(backend)?;
-                let root = root_of(&mut tx, h.0).await?;
-                sqlx::query(&format!(
-                    "WITH RECURSIVE tree(id) AS (SELECT $2::bigint UNION ALL SELECT h.holder_id FROM holder h JOIN tree t ON h.merged_into = t.id) \
-                     SELECT {ALIAS_COLS} FROM alias WHERE group_id = $1 AND target_kind = 'holder' AND target_holder IN (SELECT id FROM tree) \
-                     AND status <> 'inactive' ORDER BY confidence DESC, text COLLATE \"C\""
-                ))
-                .bind(group.get())
-                .bind(root)
-                .fetch_all(&mut *tx)
-                .await
-            }
-        }
+        let rows = sqlx::query(&format!(
+            "SELECT DISTINCT ON (text) {ALIAS_COLS} FROM alias \
+             WHERE group_id = $1 AND account_id = ANY($2) AND status <> 'inactive' \
+             ORDER BY text, confidence DESC, alias_id"
+        ))
+        .bind(group.get())
+        .bind(ids(accounts))
+        .fetch_all(&self.pool)
+        .await
         .map_err(backend)?;
-        rows.iter().map(to_alias).collect()
+        let mut names = rows.iter().map(to_alias).collect::<Result<Vec<_>, _>>()?;
+        names.sort_by(|a, b| {
+            b.confidence
+                .total_cmp(&a.confidence)
+                .then(a.text.cmp(&b.text))
+        });
+        Ok(names)
     }
 
     async fn expire_candidates(&self, before: UnixMillis) -> Result<usize, IdentityError> {
@@ -588,19 +469,14 @@ impl IdentityStore for PgIdentityStore {
             return Err(LinkError::SelfLink.into());
         }
         let ttl_ms = i64::try_from(self.policy.invitation_ttl.as_millis()).unwrap_or(i64::MAX);
-        let mut tx = self.pool.begin().await.map_err(backend)?;
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('link:' || $1::text, 0))")
-            .bind(group.get())
-            .execute(&mut *tx)
-            .await
-            .map_err(backend)?;
-        let (hi, ht) = (
-            holder_id_of(&mut tx, initiator).await?,
-            holder_id_of(&mut tx, target).await?,
-        );
-        if hi == ht {
+        let mut tx = self.begin_linking(group).await?;
+        require_known(&mut tx, initiator).await?;
+        require_known(&mut tx, target).await?;
+        let initiator_linked = linked_tx(&mut tx, group, initiator).await?;
+        if initiator_linked.contains(&target) {
             return Err(LinkError::AlreadyLinked.into());
         }
+        let target_linked = linked_tx(&mut tx, group, target).await?;
         sqlx::query("UPDATE link_invitation SET state = 'expired' WHERE group_id = $1 AND state = 'pending' AND created_ms <= $2")
             .bind(group.get())
             .bind(now.get() - ttl_ms)
@@ -619,20 +495,8 @@ impl IdentityStore for PgIdentityStore {
         if busy.is_some() {
             return Err(LinkError::Busy.into());
         }
-        let ri: i32 = sqlx::query("SELECT revision FROM holder WHERE holder_id = $1")
-            .bind(hi)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(backend)?
-            .get("revision");
-        let rt: i32 = sqlx::query("SELECT revision FROM holder WHERE holder_id = $1")
-            .bind(ht)
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(backend)?
-            .get("revision");
         sqlx::query(
-            "INSERT INTO link_invitation (group_id, initiator, target, created_by, created_ms, initiator_revision, target_revision, state) \
+            "INSERT INTO link_invitation (group_id, initiator, target, created_by, created_ms, initiator_linked, target_linked, state) \
              VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')",
         )
         .bind(group.get())
@@ -640,8 +504,8 @@ impl IdentityStore for PgIdentityStore {
         .bind(target.get())
         .bind(message.get())
         .bind(now.get())
-        .bind(ri)
-        .bind(rt)
+        .bind(ids(&initiator_linked))
+        .bind(ids(&target_linked))
         .execute(&mut *tx)
         .await
         .map_err(backend)?;
@@ -652,8 +516,8 @@ impl IdentityStore for PgIdentityStore {
             target,
             created_by: message,
             created_at: now,
-            initiator_revision: u32::try_from(ri).map_err(backend)?,
-            target_revision: u32::try_from(rt).map_err(backend)?,
+            initiator_linked,
+            target_linked,
             state: InvitationState::Pending,
         })
     }
@@ -664,34 +528,23 @@ impl IdentityStore for PgIdentityStore {
         confirming: AccountId,
         message: MessageId,
         now: UnixMillis,
-    ) -> Result<MergeOutcome, IdentityError> {
-        let mut tx = self.pool.begin().await.map_err(backend)?;
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('link:' || $1::text, 0))")
-            .bind(group.get())
-            .execute(&mut *tx)
-            .await
-            .map_err(backend)?;
-        sqlx::query(TOPOLOGY_LOCK)
-            .execute(&mut *tx)
-            .await
-            .map_err(backend)?;
+    ) -> Result<LinkOutcome, IdentityError> {
+        let mut tx = self.begin_linking(group).await?;
 
         // Replaying the confirming message is a no-op.
-        let replay = sqlx::query("SELECT initiator FROM link_invitation WHERE group_id = $1 AND state = 'applied' AND confirmed_by = $2 AND target = $3")
+        let replay = sqlx::query("SELECT 1 FROM link_invitation WHERE group_id = $1 AND state = 'applied' AND confirmed_by = $2 AND target = $3")
             .bind(group.get())
             .bind(message.get())
             .bind(confirming.get())
             .fetch_optional(&mut *tx)
             .await
             .map_err(backend)?;
-        if let Some(row) = replay {
-            let initiator = AccountId::new(row.get("initiator")).map_err(backend)?;
-            let holder = holder_id_of(&mut tx, initiator).await?;
-            return Ok(MergeOutcome::AlreadyLinked(HolderId(holder)));
+        if replay.is_some() {
+            return Ok(LinkOutcome::AlreadyLinked);
         }
 
         let row = sqlx::query(
-            "SELECT invitation_id, initiator, target, created_by, created_ms, initiator_revision, target_revision FROM link_invitation \
+            "SELECT invitation_id, initiator, target, created_by, created_ms, initiator_linked, target_linked FROM link_invitation \
              WHERE group_id = $1 AND state = 'pending' AND (initiator = $2 OR target = $2)",
         )
         .bind(group.get())
@@ -707,19 +560,19 @@ impl IdentityStore for PgIdentityStore {
             target: AccountId::new(row.get("target")).map_err(backend)?,
             created_by: MessageId::new(row.get("created_by")).map_err(backend)?,
             created_at: UnixMillis::new(row.get("created_ms")),
-            initiator_revision: u32::try_from(row.get::<i32, _>("initiator_revision"))
-                .map_err(backend)?,
-            target_revision: u32::try_from(row.get::<i32, _>("target_revision"))
-                .map_err(backend)?,
+            initiator_linked: accounts_of(row.get("initiator_linked"))?,
+            target_linked: accounts_of(row.get("target_linked"))?,
             state: InvitationState::Pending,
         };
-        let hi = holder_id_of(&mut tx, invitation.initiator).await?;
-        let ht = holder_id_of(&mut tx, invitation.target).await?;
-        let ri = holder_row(&mut tx, hi).await?.revision;
-        let rt = holder_row(&mut tx, ht).await?.revision;
-        if let Err(error) =
-            invitation.check_confirm(confirming, now, self.policy.invitation_ttl, ri, rt)
-        {
+        let now_initiator = linked_tx(&mut tx, group, invitation.initiator).await?;
+        let now_target = linked_tx(&mut tx, group, invitation.target).await?;
+        if let Err(error) = invitation.check_confirm(
+            confirming,
+            now,
+            self.policy.invitation_ttl,
+            &now_initiator,
+            &now_target,
+        ) {
             // An expired or stale invitation is closed for good; keep that change.
             let closed = match error {
                 LinkError::Expired => Some("expired"),
@@ -737,8 +590,13 @@ impl IdentityStore for PgIdentityStore {
             }
             return Err(error.into());
         }
-        let outcome = merge_tx(&mut tx, invitation.initiator, invitation.target).await?;
-        sqlx::query("UPDATE link_invitation SET state = 'applied', confirmed_by = $2 WHERE invitation_id = $1").bind(id).bind(message.get()).execute(&mut *tx).await.map_err(backend)?;
+        let outcome = link_tx(&mut tx, group, invitation.initiator, invitation.target, now).await?;
+        sqlx::query("UPDATE link_invitation SET state = 'applied', confirmed_by = $2 WHERE invitation_id = $1")
+            .bind(id)
+            .bind(message.get())
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
         tx.commit().await.map_err(backend)?;
         Ok(outcome)
     }

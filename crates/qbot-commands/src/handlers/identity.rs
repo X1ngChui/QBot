@@ -1,5 +1,5 @@
 use qbot_i18n::Msg;
-use qbot_memory::{IdentityError, MergeOutcome};
+use qbot_memory::{IdentityError, LinkOutcome};
 
 use super::Reply;
 use crate::fail::Fail;
@@ -56,10 +56,7 @@ pub(crate) async fn unlink(cx: &Cx<'_>) -> Reply {
     }
     match cx.req.mentions.as_slice() {
         [] => {
-            cx.deps
-                .identity
-                .split(cx.req.sender, cx.deps.clock.now())
-                .await?;
+            cx.deps.identity.unlink(cx.group(), cx.req.sender).await?;
             Ok(cx.t(&Msg::UnlinkDone {}))
         }
         // An owner detaching someone else's account.
@@ -67,13 +64,13 @@ pub(crate) async fn unlink(cx: &Cx<'_>) -> Reply {
             if !cx.owner {
                 return Err(Msg::UnlinkOwnerOnly {}.into());
             }
-            if cx.deps.identity.holder_of(*account).await?.is_none() {
+            if !cx.deps.identity.is_known(*account).await? {
                 return Err(Msg::UnlinkUnknown {
                     account: account.get().to_string(),
                 }
                 .into());
             }
-            match cx.deps.identity.split(*account, cx.deps.clock.now()).await {
+            match cx.deps.identity.unlink(cx.group(), *account).await {
                 Ok(_) => Ok(cx.t(&Msg::UnlinkForced {})),
                 Err(IdentityError::NotLinked) => Err(Fail::Say(Msg::NotLinked {})),
                 Err(other) => Err(other.into()),
@@ -92,15 +89,20 @@ async fn link_directly(cx: &Cx<'_>) -> Reply {
         return Err(Msg::LinkOwnerOnly {}.into());
     }
     for account in [a, b] {
-        if cx.deps.identity.holder_of(*account).await?.is_none() {
+        if !cx.deps.identity.is_known(*account).await? {
             return Err(Msg::LinkUnknown {
                 account: account.get().to_string(),
             }
             .into());
         }
     }
-    match cx.deps.identity.merge(*a, *b).await? {
-        MergeOutcome::Merged { .. } => Ok(cx.t(&Msg::LinkForced {})),
-        MergeOutcome::AlreadyLinked(_) => Ok(cx.t(&Msg::LinkAlready {})),
+    match cx
+        .deps
+        .identity
+        .link(cx.group(), *a, *b, cx.deps.clock.now())
+        .await?
+    {
+        LinkOutcome::Linked => Ok(cx.t(&Msg::LinkForced {})),
+        LinkOutcome::AlreadyLinked => Ok(cx.t(&Msg::LinkAlready {})),
     }
 }

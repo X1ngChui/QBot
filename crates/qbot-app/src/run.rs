@@ -112,7 +112,7 @@ impl From<ConfigErrors> for RunError {
 struct NoLogs;
 
 impl qbot_commands::RecentLogs for NoLogs {
-    fn recent(&self, _: usize) -> Vec<qbot_commands::LogLine> {
+    fn recent(&self, _: GroupId, _: usize) -> Vec<qbot_commands::LogLine> {
         Vec::new()
     }
 }

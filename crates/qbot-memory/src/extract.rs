@@ -9,7 +9,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use qbot_context::{AssistantPart, AssistantTurn};
-use qbot_core::CallId;
+use qbot_core::{CallId, GroupId};
 use qbot_llm::{
     Content, ConvItem, Conversation, FinishReason, LlmError, Message, Provider, ReasoningEffort,
     Request, Role, ToolChoice, ToolOutput, ToolSpec, ToolStatus, Usage,
@@ -56,6 +56,8 @@ pub struct EvidenceArg {
 /// The slice to summarize and its neighbors.
 #[derive(Debug, Clone, Copy)]
 pub struct SliceContext<'a> {
+    /// The group the lines are from.
+    pub group: GroupId,
     /// The nearest batch before the slice. Context only.
     pub previous: &'a [SliceLine],
     /// The slice. The episode's source range.
@@ -192,12 +194,21 @@ impl EpisodeExtractor {
                     if attempt < MAX_ATTEMPTS =>
                 {
                     accepted = kept;
-                    tracing::warn!(attempt, %detail, "extraction answer unreadable; asking again");
+                    tracing::warn!(
+                        group = ctx.group.get(),
+                        attempt,
+                        %detail,
+                        "extraction answer unreadable; asking again"
+                    );
                     continue;
                 }
                 (Err(error), None) => return Err(error.into()),
                 (Err(error), Some(kept)) => {
-                    tracing::warn!(%error, "the findings correction failed; keeping the episode");
+                    tracing::warn!(
+                        group = ctx.group.get(),
+                        %error,
+                        "the findings correction failed; keeping the episode"
+                    );
                     return Ok(Extracted { usage, ..kept });
                 }
             };
@@ -211,7 +222,11 @@ impl EpisodeExtractor {
             // model reasons varies from try to try, so the same request is sent again.
             if calls.is_empty() && response_finish == FinishReason::Length {
                 if attempt < MAX_ATTEMPTS {
-                    tracing::warn!(attempt, "extraction answer cut off; asking again");
+                    tracing::warn!(
+                        group = ctx.group.get(),
+                        attempt,
+                        "extraction answer cut off; asking again"
+                    );
                     continue;
                 }
                 return match accepted {

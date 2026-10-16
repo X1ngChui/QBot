@@ -191,6 +191,8 @@ impl RunHistory for PgRunLog {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogLine {
     pub at: UnixMillis,
+    /// The group the event was about (its `group` field), if any.
+    pub group: Option<GroupId>,
     /// `WARN` or `ERROR`.
     pub level: String,
     /// The message and its fields, on one line.
@@ -199,6 +201,7 @@ pub struct LogLine {
 
 /// The process's recent warnings and errors, for `/logs`.
 pub trait RecentLogs: Send + Sync {
-    /// The newest `limit` lines, oldest first.
-    fn recent(&self, limit: usize) -> Vec<LogLine>;
+    /// The newest `limit` lines about `group` or about no group, oldest first. Another group's
+    /// lines are never shown: what went wrong there may quote its chat.
+    fn recent(&self, group: GroupId, limit: usize) -> Vec<LogLine>;
 }

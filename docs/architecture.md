@@ -25,8 +25,8 @@ reading, opening pictures, and the group's scheduled tasks.
 R6. Group-scoped memory learned from chat: episodes with embeddings, names, facts about members
 and group knowledge, each grounded in verbatim quotes, with confidence that fades. Notes written
 by hand are a separate store with their own commands.
-R7. Identity: accounts belong to people; linking and splitting with revision-checked
-confirmation; stable member numbers per group.
+R7. Identity: accounts are linked in a group, with a confirmation that lapses if either side's
+links there changed; stable member numbers per group.
 R8. Media: pictures described once by content and archived as text, originals opened on demand;
 voice transcribed on the CPU in the process.
 R9. Commands without model calls for members and owners (section 12).
@@ -39,6 +39,8 @@ description, embeddings, web searches and page reads) is counted with its reques
 hits, credits and latency, by the work it served; a run that fails logs why (`/logs`). Nothing
 refuses work on cost.
 R13. Localization: member-facing text comes from message catalogs.
+R14. Groups are separate: nothing learned or stored in one group is shown in, used by or acted on
+from another; the one exception is the owners' `/stats global` totals (section 8).
 
 ## 2. Principles
 
@@ -59,6 +61,9 @@ R13. Localization: member-facing text comes from message catalogs.
   `prompts/wording.toml`; member-facing text is in `locales/`.
 - **No CJK in Rust code or comments.** It lives only in catalogs, prompts, personas and fixtures;
   tests build CJK input from `\u` escapes.
+- **Every read of group data names its group.** A query, tool, command or prompt block that
+  shows what a group said or what the bot keeps about it takes the group and filters by it
+  first (section 8).
 
 ## 3. Workspace
 
@@ -367,6 +372,26 @@ episode and its findings in one validated tool call; consolidation turns finding
 facts and group knowledge; recall ranks episodes by similarity decaying with age; embeddings are
 a derived index the nightly run keeps complete for the configured embedding model.
 
+**Groups are separate.** Except the owners' `/stats global` (totals of runs, provider calls and
+tokens over all groups), nothing learned or stored in one group becomes visible in, or changes
+what happens in, another: not in a prompt, a tool result, a command reply or `/logs`. Every
+record is one of these:
+
+| Scope | Records | Notes |
+| --- | --- | --- |
+| Global, never shown | `account` (that a login exists, first seen) | the key other records point at; a member's identity reaches a group only through that group's records |
+| Global, by content | picture descriptions and voice transcripts (`media_cache`) | keyed by a digest of the bytes and made from the bytes alone (the describer and recognizer see nothing else), so a hit gives a group only what it could get from the same picture or clip it received itself; nothing learned from any group's conversation enters them. A forwarded picture is described only on a hit, which says only that identical bytes were seen before |
+| Global, owners | `usage_event`, `run` totals for `/stats global` and the daily report | counts and tokens, no text; the report goes to the owners privately |
+| Process, owners | warnings and errors for `/logs` | a line about a group (its `group` field) is shown only in that group; a line about no group is shown everywhere, so it keeps only its fixed message and numeric fields, never free text such as an error or a model's answer (the full line stays in the process log) |
+| Group | archive and `media_ref`, member numbers, blocks, mute, links (`account_link`), names, notes, facts and group knowledge, episodes and their embeddings, tasks and recurring schedules, runs and their transcripts, invitations | read only with the group's id |
+
+Nothing else crosses: no name, fact, note, relationship (link), chat text, memory, task context
+or anything else derived from a group's conversation is shown or used in another group.
+Linking is per group: a person in a group is the accounts linked to each other there
+(`IdentityStore::linked`), and a link made elsewhere does not join their numbers, names, notes,
+facts, blocks, `/top` rows or command authority. Names, notes and facts about an account are
+kept per group and read only from the group's own rows.
+
 ## 9. Media (`qbot-media`, `qbot-asr`)
 
 Three kinds of state are kept apart. The **archived line** is durable conversational state: a
@@ -499,15 +524,15 @@ two stores.
 | `/name` `add` `remove` | member | names |
 | `/forget N`, `/forget group N` | member / owner | learned memory only: a member's fact, group knowledge |
 | `/group` | member | what the bot learned about the group |
-| `/link`, `/unlink`; `/link @a @b`, `/unlink @a` | member; owner | linking accounts |
+| `/link`, `/unlink`; `/link @a @b`, `/unlink @a` | member; owner | linking accounts in this group |
 | `/stats`, `/top`, `/help` | member | today's replies and provider calls by work and kind; replies started |
 | `/tasks`, `/members`, `/block [--linked]`, `/mute` | owner | the group's tasks, roster, blocks, mute |
 | `/runs [N]` | owner | the latest runs, or one run's steps |
-| `/logs [n]` | owner | recent warnings and errors (the last 200) |
+| `/logs [n]` | owner | recent warnings and errors (the last 200) about this group or no group |
 
 Replies quote the command, mention the sender, and are split at QQ's 2,000-character message
 limit. Mute and block hold for commands as for runs: in a muted group only owners are answered
-(so `/mute off` works), and a blocked member gets no answer and so cannot write notes either. Members act on their own (linked) accounts, owners on anyone. A member's name in a reply is
+(so `/mute off` works), and a blocked member gets no answer and so cannot write notes either. Members act on their own accounts and those linked to them in the group, owners on anyone. A member's name in a reply is
 their current group display name, read live from the platform.
 
 ## 13. Configuration
@@ -677,8 +702,8 @@ through it.
 - A recalled message stays in the archive, in later prompts, in search and in memory; the
   recall notice does not say which message it was.
 - `/forget` removes one learned fact; a later episode can learn it again.
-- Account links are global across groups, and every run sees every recorded member's names,
-  notes and facts; only the commands limit what a member may look up.
+- Every run sees every recorded member's names, notes and facts of its group; only the
+  commands limit what a member may look up.
 - A slice the provider refuses with an error that is not classed as permanent is tried again on
   every filled batch and every night, and holds back that group's later slices.
 - Messages shown by `search_history` and `read_episode` cannot be quoted, opened or used to

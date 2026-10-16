@@ -364,10 +364,13 @@ impl Inner {
         {
             Ok(true) => {}
             Ok(false) => tracing::warn!(
+                group = job.group.get(),
                 message = job.message.get(),
                 "no marker to fill in the archived line"
             ),
-            Err(error) => tracing::error!(%error, "could not fill a media marker"),
+            Err(error) => {
+                tracing::error!(group = job.group.get(), %error, "could not fill a media marker")
+            }
         }
     }
 }

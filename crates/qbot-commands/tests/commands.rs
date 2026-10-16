@@ -230,9 +230,15 @@ impl RunHistory for FakeRuns {
 
 struct FakeLogs(Vec<LogLine>);
 impl RecentLogs for FakeLogs {
-    fn recent(&self, limit: usize) -> Vec<LogLine> {
-        let skip = self.0.len().saturating_sub(limit);
-        self.0[skip..].to_vec()
+    fn recent(&self, group: GroupId, limit: usize) -> Vec<LogLine> {
+        let lines: Vec<LogLine> = self
+            .0
+            .iter()
+            .filter(|l| l.group.is_none_or(|g| g == group))
+            .cloned()
+            .collect();
+        let skip = lines.len().saturating_sub(limit);
+        lines[skip..].to_vec()
     }
 }
 
@@ -313,11 +319,19 @@ async fn rig() -> Rig {
         logs: Arc::new(FakeLogs(vec![
             LogLine {
                 at: UnixMillis::new(T0),
+                group: GroupId::new(900).ok(),
                 level: "WARN".into(),
                 text: "an extraction job could not be queued group=900".into(),
             },
             LogLine {
+                at: UnixMillis::new(T0 + 30_000),
+                group: GroupId::new(777).ok(),
+                level: "WARN".into(),
+                text: "another group's trouble group=777".into(),
+            },
+            LogLine {
                 at: UnixMillis::new(T0 + 60_000),
+                group: None,
                 level: "ERROR".into(),
                 text: "command failed in storage".into(),
             },
@@ -352,6 +366,10 @@ async fn rig() -> Rig {
 
 impl Rig {
     fn request(&self, sender: i64, text: &str, mentions: &[i64]) -> CommandRequest {
+        self.request_in(900, sender, text, mentions)
+    }
+
+    fn request_in(&self, group: i64, sender: i64, text: &str, mentions: &[i64]) -> CommandRequest {
         let word = text.split_whitespace().next().unwrap().to_owned();
         let args = text
             .trim_start()
@@ -360,7 +378,7 @@ impl Rig {
             .trim()
             .to_owned();
         CommandRequest {
-            group: GroupId::new(900).unwrap(),
+            group: GroupId::new(group).unwrap(),
             message: MessageId::new(self.next_message.fetch_add(1, Ordering::SeqCst)).unwrap(),
             sender: acct(sender),
             at: UnixMillis::new(T0),
@@ -371,8 +389,12 @@ impl Rig {
     }
 
     async fn say(&self, sender: i64, text: &str, mentions: &[i64]) -> String {
+        self.say_in(900, sender, text, mentions).await
+    }
+
+    async fn say_in(&self, group: i64, sender: i64, text: &str, mentions: &[i64]) -> String {
         self.router
-            .respond(&self.request(sender, text, mentions))
+            .respond(&self.request_in(group, sender, text, mentions))
             .await
             .expect("a recognised command")
     }
@@ -571,17 +593,65 @@ async fn linking_needs_an_invitation_and_the_invited_account_to_confirm() {
     );
     assert_eq!(
         rig.say(ALICE, "/unlink", &[]).await,
-        "This account is not linked to any other account, so there is nothing to detach."
+        "This account is not linked to another account in this group, so there is nothing to detach."
+    );
+    assert_eq!(
+        rig.identity
+            .linked(GroupId::new(900).unwrap(), acct(BOB))
+            .await
+            .unwrap(),
+        [acct(BOB)]
+    );
+}
+
+#[tokio::test]
+async fn a_link_made_in_another_group_is_not_this_groups_to_see_or_use() {
+    let rig = rig().await;
+    assert_eq!(
+        rig.say_in(901, OWNER, "/link", &[ALICE, BOB]).await,
+        "The two accounts are now linked."
+    );
+    let who = rig.say(OWNER, "/who --linked", &[ALICE]).await;
+    assert!(!who.contains("Linked accounts"), "{who}");
+    assert_eq!(
+        rig.say(ALICE, "/who", &[BOB]).await,
+        "You can only act on your own account or on accounts you have confirmed as linked."
+    );
+    let top = rig.say(ALICE, "/top --linked", &[]).await;
+    assert!(
+        top.contains("1. Alice  9 replies") && !top.contains("accounts)"),
+        "{top}"
+    );
+    assert_eq!(
+        rig.say(ALICE, "/name add --linked Ally", &[]).await,
+        "Recorded: Alice is also called \"Ally\"."
+    );
+    assert_eq!(
+        rig.say(OWNER, "/name", &[BOB]).await,
+        "Bob has no names on record."
+    );
+    assert_eq!(
+        rig.say(ALICE, "/unlink", &[]).await,
+        "This account is not linked to another account in this group, so there is nothing to detach."
     );
     assert!(
-        rig.identity
-            .holder_of(acct(BOB))
+        rig.say(ALICE, "/link", &[BOB])
             .await
-            .unwrap()
-            .unwrap()
-            .accounts
-            .len()
-            == 1
+            .starts_with("Invited Bob"),
+        "not refused as already linked"
+    );
+    rig.say(ALICE, "/link cancel", &[]).await;
+    rig.say(OWNER, "/block add --linked", &[ALICE]).await;
+    let blocks = rig.say(OWNER, "/block", &[]).await;
+    assert!(
+        blocks.contains("- Alice") && !blocks.contains("- Bob"),
+        "{blocks}"
+    );
+    // Where it was made, the link holds.
+    assert!(
+        rig.say_in(901, OWNER, "/who --linked", &[ALICE])
+            .await
+            .contains("Linked accounts: 2")
     );
 }
 
@@ -602,7 +672,7 @@ async fn owners_link_and_unlink_other_accounts_directly() {
     );
     assert_eq!(
         rig.say(OWNER, "/link", &[ALICE, BOB]).await,
-        "These two accounts are already linked."
+        "These two accounts are already linked in this group."
     );
     assert_eq!(
         rig.say(ALICE, "/unlink", &[BOB]).await,
@@ -614,7 +684,7 @@ async fn owners_link_and_unlink_other_accounts_directly() {
     );
     assert_eq!(
         rig.say(OWNER, "/unlink", &[BOB]).await,
-        "This account is not linked to any other account, so there is nothing to detach."
+        "This account is not linked to another account in this group, so there is nothing to detach."
     );
     assert_eq!(
         rig.say(OWNER, "/unlink", &[ALICE, BOB]).await,
@@ -1243,6 +1313,10 @@ async fn logs_shows_the_latest_warnings_and_errors() {
     let all = rig.say(OWNER, "/logs", &[]).await;
     assert!(all.starts_with("Latest warnings and errors (2):"), "{all}");
     assert!(all.contains("WARN an extraction job could not be queued group=900"));
+    assert!(
+        !all.contains("group=777"),
+        "another group's lines stay there: {all}"
+    );
     assert!(
         all.ends_with("ERROR command failed in storage"),
         "newest last: {all}"

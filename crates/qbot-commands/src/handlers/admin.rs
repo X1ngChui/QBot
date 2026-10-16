@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use qbot_core::AccountId;
 use qbot_i18n::Msg;
-use qbot_memory::{AliasStatus, AliasTarget};
+use qbot_memory::AliasStatus;
 
 use super::{Reply, period_start};
 use crate::args;
@@ -44,15 +44,16 @@ pub(crate) async fn mute(cx: &Cx<'_>) -> Reply {
     }))
 }
 
-/// The accounts a block applies to: the one account, or everyone currently linked to it.
+/// The accounts a block applies to: the one account, or everyone linked to it in this group.
 async fn block_accounts(cx: &Cx<'_>, target: AccountId, all: bool) -> Result<Vec<AccountId>, Fail> {
-    let holder = cx
-        .deps
-        .identity
-        .holder_of(target)
-        .await?
-        .ok_or(Fail::Say(Msg::UnknownAccount {}))?;
-    Ok(if all { holder.accounts } else { vec![target] })
+    if !cx.deps.identity.is_known(target).await? {
+        return Err(Fail::Say(Msg::UnknownAccount {}));
+    }
+    if all {
+        cx.linked_accounts(target).await
+    } else {
+        Ok(vec![target])
+    }
 }
 
 pub(crate) async fn block(cx: &Cx<'_>) -> Reply {
@@ -167,7 +168,7 @@ pub(crate) async fn members(cx: &Cx<'_>) -> Reply {
         let names = cx
             .deps
             .identity
-            .names_of(cx.group(), AliasTarget::Account(row.account))
+            .names_of(cx.group(), &[row.account])
             .await?;
         let names: Vec<String> = names
             .into_iter()
@@ -281,12 +282,8 @@ pub(crate) async fn top(cx: &Cx<'_>) -> Reply {
     if all {
         let mut by_person: BTreeMap<i64, usize> = BTreeMap::new();
         for row in rows {
-            let person = cx
-                .deps
-                .identity
-                .holder_of(row.account)
-                .await?
-                .map_or(-row.account.get(), |h| h.id.0);
+            // A person is named by their lowest account linked in this group.
+            let person = cx.linked_accounts(row.account).await?[0].get();
             let tokens = row.input_tokens + row.output_tokens;
             match by_person.get(&person) {
                 Some(&at) => {

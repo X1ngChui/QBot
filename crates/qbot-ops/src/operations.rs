@@ -124,17 +124,23 @@ impl Operations {
     /// errors are reported together.
     pub async fn extract_all(&self) -> Result<usize, JobError> {
         let groups = self.housekeeping.groups().await.map_err(failed)?;
-        let (mut episodes, mut errors) = (0, Vec::new());
+        let (mut episodes, mut failed_groups) = (0, 0);
         for group in groups {
             match self.extractor.extract_group(group).await {
                 Ok(n) => episodes += n,
-                Err(error) => errors.push(format!("group {}: {error}", group.get())),
+                // Logged under its group: what went wrong may quote the group's chat.
+                Err(error) => {
+                    failed_groups += 1;
+                    tracing::error!(group = group.get(), %error, "extraction failed for the group");
+                }
             }
         }
-        if errors.is_empty() {
+        if failed_groups == 0 {
             Ok(episodes)
         } else {
-            Err(JobError(errors.join("; ")))
+            Err(JobError(format!(
+                "extraction failed in {failed_groups} group(s)"
+            )))
         }
     }
 

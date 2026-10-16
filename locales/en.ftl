@@ -95,12 +95,12 @@ detail-link =
     /link @account
     /link confirm
     /link cancel
-    Sends a link invitation to another account. The invited account confirms in this group; either side may cancel here. An account can be in only one pending invitation per group.
+    Sends a link invitation to another account. The invited account confirms in this group; either side may cancel here. An account can be in only one pending invitation per group. A link holds only in the group where it was made.
     Owner: /link @accountA @accountB links two accounts at once, without an invitation.
 what-unlink = Unlink this account
 detail-unlink =
     /unlink
-    Detaches only the account that sends the command; the other accounts stay linked.
+    Detaches only the account that sends the command, in this group; the other accounts stay linked.
     Owner: /unlink @account detaches that account.
 what-stats = Show usage
 detail-stats =
@@ -140,7 +140,7 @@ detail-runs =
 what-logs = Show recent warnings and errors
 detail-logs =
     /logs [count]
-    The bot's latest warnings and errors since it started, newest last.
+    The bot's latest warnings and errors since it started, newest last: those about this group in full, and those about no group without their details.
 what-help = Show the command list
 detail-help = /help [command]
 who-no_record = This account has no record in this group.
@@ -164,14 +164,14 @@ link-cancelled = Cancelled the pending link invitation in this group.
 link-nothing_pending = There is no pending invitation involving this account in this group.
 link-invited = Invited { $target } to link. The invited account should send /link confirm in this group within { $seconds } seconds.
 link-self = An account cannot be linked with itself.
-link-already = These two accounts are already linked.
+link-already = These two accounts are already linked in this group.
 link-busy = An account involved already has a pending invitation in this group; deal with that one first.
 link-no_invitation = This account has no pending invitation to confirm in this group.
 link-expired = The invitation has expired; send a new one.
 link-not_target = Only the invited account can confirm.
 link-stale = An account involved changed since the invitation; send a new one.
 link-bot = The bot's own account cannot be linked.
-unlink-not_linked = This account is not linked to any other account, so there is nothing to detach.
+unlink-not_linked = This account is not linked to another account in this group, so there is nothing to detach.
 unlink-done = Unlinked this account; the others stay linked.
 link-unknown_account = Account { $account } has no record and cannot be linked.
 link-forced = The two accounts are now linked.

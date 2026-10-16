@@ -185,6 +185,7 @@ impl EpisodeJobs {
                 None => Background::default(),
             };
             let ctx = SliceContext {
+                group,
                 previous: &previous,
                 target: &target,
                 next: &next,

@@ -316,7 +316,9 @@ impl Pipeline {
             }
             match supervisor.submit_spontaneous(group, author).await {
                 Ok(_handle) => {}
-                Err(Rejected::Environment(error)) => tracing::error!(%error, "admission failed"),
+                Err(Rejected::Environment(error)) => {
+                    tracing::error!(group = group.get(), %error, "admission failed")
+                }
                 Err(rejected) => {
                     tracing::debug!(
                         group = group.get(),
@@ -334,7 +336,11 @@ impl Pipeline {
             .quoted_author(group, quoted)
             .await
             .unwrap_or_else(|error| {
-                tracing::warn!(%error, "could not tell who wrote the quoted message");
+                tracing::warn!(
+                    group = group.get(),
+                    %error,
+                    "could not tell who wrote the quoted message"
+                );
                 None
             })
     }
@@ -465,7 +471,9 @@ async fn submit(supervisor: &Supervisor, request: TriggerRequest) {
     let group = request.group;
     match supervisor.submit(request).await {
         Ok(_handle) => {}
-        Err(Rejected::Environment(error)) => tracing::error!(%error, "admission failed"),
+        Err(Rejected::Environment(error)) => {
+            tracing::error!(group = group.get(), %error, "admission failed")
+        }
         // A full queue drops a reply someone is waiting for: worth seeing in /logs.
         Err(Rejected::Overloaded) => {
             tracing::warn!(

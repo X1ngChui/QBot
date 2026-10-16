@@ -85,12 +85,12 @@ detail-link =
     /link @另一个账号
     /link confirm
     /link cancel
-    向对方账号发出关联邀请；受邀账号在本群确认，任一方可在本群取消。每个账号在本群同时至多参与一份待确认邀请。
+    向对方账号发出关联邀请；受邀账号在本群确认，任一方可在本群取消。每个账号在本群同时至多参与一份待确认邀请。关联只在建立它的群内有效。
     owner：/link @账号A @账号B 直接关联两个账号，无需邀请。
 what-unlink = 解除当前账号关联
 detail-unlink =
     /unlink
-    只剥离发送指令的账号，其余账号保持关联。
+    只在本群剥离发送指令的账号，其余账号保持关联。
     owner：/unlink @账号 剥离该账号。
 what-stats = 查看用量
 detail-stats =
@@ -130,7 +130,7 @@ detail-runs =
 what-logs = 查看最近的警告和错误
 detail-logs =
     /logs [条数]
-    bot 启动以来最近的警告和错误，最新的在最后。
+    bot 启动以来最近的警告和错误，最新的在最后：与本群有关的完整显示，与任何群无关的不显示细节。
 what-help = 显示指令列表
 detail-help = /help [指令名]
 who-no_record = 本群暂无该账号资料。
@@ -156,14 +156,14 @@ link-invited =
     已向 { $target } 发出关联邀请。
     请受邀账号在本群 { $seconds } 秒内发送：/link confirm
 link-self = 不能把账号与自身关联。
-link-already = 这两个账号已经关联。
+link-already = 这两个账号已在本群关联。
 link-busy = 相关账号在本群已有待处理的关联邀请，请先处理该邀请。
 link-no_invitation = 本群没有该账号可确认的待处理邀请。
 link-expired = 关联邀请已过期，请重新发起。
 link-not_target = 只有受邀账号可以确认。
 link-stale = 账号关联关系已变化，请重新发起。
 link-bot = 不能关联机器人账号。
-unlink-not_linked = 这个账号没有和别的账号合并过，不需要拆分。
+unlink-not_linked = 这个账号在本群没有关联其他账号，不需要剥离。
 unlink-done = 已解除当前账号的关联，其余账号保持关联。
 link-unknown_account = 账号 { $account } 尚无记录，无法关联。
 link-forced = 两个账号现已关联。

@@ -143,7 +143,7 @@ pub(crate) async fn logs(cx: &Cx<'_>) -> Reply {
         [n] => args::positive(n)? as usize,
         _ => return Err(Msg::UsageLogs {}.into()),
     };
-    let lines = cx.deps.logs.recent(limit);
+    let lines = cx.deps.logs.recent(cx.group(), limit);
     if lines.is_empty() {
         return Ok(cx.t(&Msg::LogsEmpty {}));
     }

@@ -30,12 +30,10 @@ impl Cx<'_> {
         args::fit(text, limit, &self.t(&Msg::Truncated {}))
     }
 
-    /// The accounts one person has: the holder's accounts, or just this one if none is known.
+    /// The accounts of one person in this group: `account` and those linked to it here.
+    /// Links made in other groups are not this group's to see or act on.
     pub async fn linked_accounts(&self, account: AccountId) -> Result<Vec<AccountId>, Fail> {
-        Ok(match self.deps.identity.holder_of(account).await? {
-            Some(holder) => holder.accounts,
-            None => vec![account],
-        })
+        Ok(self.deps.identity.linked(self.group(), account).await?)
     }
 
     /// Who a command acts on: the one mentioned account, or the sender. Members may only act

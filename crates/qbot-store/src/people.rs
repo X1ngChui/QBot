@@ -1,6 +1,7 @@
 //! What the bot keeps about the people of a group, as one read model: who is blocked, which
 //! member numbers are one person, the names they go by, the notes members wrote about them and
-//! the facts learned from chat. Every run shows it, so it is read whole and ordered
+//! the facts learned from chat. Every record is the group's own: links made in other groups and
+//! anything stored there play no part. Every run shows it, so it is read whole and ordered
 //! deterministically: it changes only when the stored records do.
 
 use std::collections::{BTreeMap, HashMap};
@@ -78,31 +79,50 @@ impl PgArchive {
     /// is not in force). Records about an account with no member number here are not shown.
     pub async fn people(&self, group: GroupId, now: UnixMillis) -> Result<GroupPeople, StoreError> {
         let (pool, g) = (self.pool(), group.get());
-        // Each numbered account's number and current (unmerged) holder: the person.
-        let mut numbered: HashMap<i64, (MemberNo, i64)> = HashMap::new();
-        for row in sqlx::query(
-            "SELECT m.number, m.account_id, a.holder_id FROM member_number m \
-             JOIN account a ON a.account_id = m.account_id WHERE m.group_id = $1",
-        )
-        .bind(g)
-        .fetch_all(pool)
-        .await?
+        let mut numbers: HashMap<i64, MemberNo> = HashMap::new();
+        for row in sqlx::query("SELECT number, account_id FROM member_number WHERE group_id = $1")
+            .bind(g)
+            .fetch_all(pool)
+            .await?
         {
-            numbered.insert(
-                row.get("account_id"),
-                (member_no(row.get("number"))?, row.get("holder_id")),
+            numbers.insert(row.get("account_id"), member_no(row.get("number"))?);
+        }
+        // One person per set of accounts linked to each other in this group, named by its
+        // lowest account.
+        let mut person: BTreeMap<i64, i64> = numbers.keys().map(|a| (*a, *a)).collect();
+        fn find(person: &mut BTreeMap<i64, i64>, account: i64) -> i64 {
+            let parent = *person.entry(account).or_insert(account);
+            if parent == account {
+                return account;
+            }
+            let root = find(person, parent);
+            person.insert(account, root);
+            root
+        }
+        for row in
+            sqlx::query("SELECT low_account, high_account FROM account_link WHERE group_id = $1")
+                .bind(g)
+                .fetch_all(pool)
+                .await?
+        {
+            let (a, b) = (
+                find(&mut person, row.get("low_account")),
+                find(&mut person, row.get("high_account")),
             );
+            person.insert(a.max(b), a.min(b));
         }
         let mut people: BTreeMap<i64, Person> = BTreeMap::new();
-        for (account, (number, holder)) in &numbered {
-            let account = AccountId::new(*account).map_err(corrupt)?;
+        let mut numbered: HashMap<i64, (MemberNo, i64)> = HashMap::new();
+        for (account, number) in &numbers {
+            let root = find(&mut person, *account);
+            numbered.insert(*account, (*number, root));
             people
-                .entry(*holder)
+                .entry(root)
                 .or_default()
                 .members
-                .push((*number, account));
+                .push((*number, AccountId::new(*account).map_err(corrupt)?));
         }
-        let holder = |account: i64| numbered.get(&account).map(|(_, h)| *h);
+        let person_of = |account: i64| numbered.get(&account).map(|(_, h)| *h);
 
         let blocked: Vec<i64> = sqlx::query_scalar(
             "SELECT account_id FROM group_block \
@@ -118,27 +138,17 @@ impl PgArchive {
             }
         }
 
-        // Names in force, of an account or of a person (a holder merged into another one counts
-        // as the one it was merged into).
+        // Names in force.
         let names = sqlx::query(
-            "WITH RECURSIVE up(start, id, next) AS ( \
-                 SELECT holder_id, holder_id, merged_into FROM holder WHERE holder_id IN \
-                     (SELECT target_holder FROM alias WHERE group_id = $1 AND target_holder IS NOT NULL) \
-               UNION ALL \
-                 SELECT up.start, h.holder_id, h.merged_into FROM up JOIN holder h ON h.holder_id = up.next) \
-             SELECT a.text, a.status = 'confirmed' AS confirmed, a.target_account, r.id AS root \
-             FROM alias a LEFT JOIN up r ON r.start = a.target_holder AND r.next IS NULL \
-             WHERE a.group_id = $1 AND NOT a.removed AND a.status IN ('candidate', 'confirmed')",
+            "SELECT text, status = 'confirmed' AS confirmed, account_id FROM alias \
+             WHERE group_id = $1 AND NOT removed AND status IN ('candidate', 'confirmed')",
         )
         .bind(g)
         .fetch_all(pool)
         .await?;
         for row in names {
-            let target = match row.get::<Option<i64>, _>("target_account") {
-                Some(account) => holder(account),
-                None => row.get::<Option<i64>, _>("root"),
-            };
-            let Some(person) = target.and_then(|h| people.get_mut(&h)) else {
+            let Some(person) = person_of(row.get("account_id")).and_then(|h| people.get_mut(&h))
+            else {
                 continue;
             };
             let (text, confirmed): (String, bool) = (row.get("text"), row.get("confirmed"));
@@ -155,7 +165,8 @@ impl PgArchive {
         .fetch_all(pool)
         .await?
         {
-            if let Some(person) = holder(row.get("account_id")).and_then(|h| people.get_mut(&h)) {
+            if let Some(person) = person_of(row.get("account_id")).and_then(|h| people.get_mut(&h))
+            {
                 person.notes.push(KnownNote {
                     text: row.get("text"),
                     updated: UnixMillis::new(row.get("updated_ms")),
@@ -174,7 +185,7 @@ impl PgArchive {
         .await?
         {
             if let Some(person) =
-                holder(row.get("subject_account")).and_then(|h| people.get_mut(&h))
+                person_of(row.get("subject_account")).and_then(|h| people.get_mut(&h))
             {
                 person.facts.push(KnownFact {
                     predicate: row.get("predicate"),
