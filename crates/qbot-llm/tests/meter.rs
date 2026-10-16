@@ -151,3 +151,27 @@ async fn a_provider_without_cache_figures_says_so() {
         Some(CacheUsage::NotReported)
     );
 }
+
+#[tokio::test]
+async fn an_unreadable_answer_is_still_counted_with_its_tokens() {
+    let raw = SimStep::Raw(serde_json::json!({
+        "id": "r", "status": "completed", "model": "m",
+        "output": [{"type": "function_call", "id": "fc", "call_id": "c1", "name": "send_messages",
+                    "arguments": "{\"messages\": [\"he said \"hi\"\"]}", "status": "completed"}],
+        "usage": {"input_tokens": 100, "output_tokens": 20}
+    }));
+    let (_, provider, meter) = metered_provider(true, StateMode::Stateless, vec![raw]);
+    let (tools, conv) = (tools(), base_conversation());
+    let error = provider
+        .respond(request(&conv, &tools, None))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, LlmError::MalformedCall(_)), "{error:?}");
+    let call = &meter.calls()[0];
+    assert_eq!(call.error, Some("malformed_call"));
+    assert_eq!(
+        call.tokens.map(|t| (t.input_tokens, t.output_tokens)),
+        Some((100, 20)),
+        "billed tokens are recorded although the answer was unusable"
+    );
+}

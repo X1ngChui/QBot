@@ -54,7 +54,7 @@ paid API. Build the image with `docker build -f deploy/Dockerfile .`; deployment
 - **Message path:** `qbot-gateway` parses OneBot frames, renders a message to archive text with
   ASCII markers, archives it (`UNIQUE (group_id, message_id)` is the only dedup gate), then routes
   the bot's own line to the echo board, a command word to `qbot-commands`, or a trigger (@, a
-  nickname as a whole jieba token, a quote of a bot line) to the supervisor.
+  nickname (effectively anywhere in Chinese text, a whole word in Latin), a quote of a bot line) to the supervisor.
 - **Runs:** `qbot-agent`. Every trigger or due task is its own run with its own deadline over an
   append-only transcript (`qbot-context`). The model speaks only through `send_messages`
   (`{messages, end_turn?}`: QQ messages sent in order in the chat's marker syntax, each

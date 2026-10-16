@@ -105,6 +105,7 @@ pub fn render_report(
             runs: data.runs,
             addressed: data.runs_addressed,
             wake: data.runs_wake,
+            spontaneous: data.runs_spontaneous,
         }),
     ];
     if !data.run_ends.is_empty() {

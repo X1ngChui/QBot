@@ -41,7 +41,13 @@ where
     loop {
         attempt += 1;
         crate::meter::count_request();
-        let error = match send().await {
+        let sent = match policy.attempt_timeout {
+            Some(limit) => tokio::time::timeout(limit, send())
+                .await
+                .unwrap_or(Err(LlmError::Timeout)),
+            None => send().await,
+        };
+        let error = match sent {
             Ok(response) if (200..300).contains(&response.status) => {
                 return Ok(response);
             }

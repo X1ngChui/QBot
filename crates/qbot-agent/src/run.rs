@@ -285,6 +285,9 @@ impl Run<'_> {
         } else {
             choice.clone()
         };
+        // An unreadable tool call is asked for again once in a turn: nothing ran, so the same
+        // request is safe to repeat, and it usually comes back readable.
+        let mut asked_again = false;
         let answer = loop {
             let view = project(&self.transcript)
                 .map_err(|e| self.environment("projecting the transcript", &e))?;
@@ -302,6 +305,16 @@ impl Run<'_> {
             let call = attributed(self.attribution(), self.deps.provider.respond(request));
             match self.bounded(call).await? {
                 Err(LlmError::ContextTooLong) if !self.recaps.is_empty() => self.compact().await?,
+                Err(LlmError::MalformedCall(detail)) if !asked_again => {
+                    tracing::info!(
+                        group = self.input.group.get(),
+                        run = self.input.run.get(),
+                        turn = self.turns,
+                        %detail,
+                        "the model's tool call could not be read; asking again"
+                    );
+                    asked_again = true;
+                }
                 answer => break answer,
             }
         };
@@ -348,6 +361,7 @@ impl Run<'_> {
             view: &self.view,
             state: &self.state,
             clock: &*self.deps.clock,
+            renderer: &*self.deps.renderer,
         };
         let executed = {
             // Tools that reach a provider (recall, web search) are this turn's calls too.

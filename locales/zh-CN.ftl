@@ -161,7 +161,6 @@ link-busy = 相关账号在本群已有待处理的关联邀请，请先处理�
 link-no_invitation = 本群没有该账号可确认的待处理邀请。
 link-expired = 关联邀请已过期，请重新发起。
 link-not_target = 只有受邀账号可以确认。
-link-out_of_order = 确认消息不在邀请之后，无法确认邀请。
 link-stale = 账号关联关系已变化，请重新发起。
 link-bot = 不能关联机器人账号。
 unlink-not_linked = 这个账号没有和别的账号合并过，不需要拆分。
@@ -362,7 +361,7 @@ detail-forget =
     /forget group 编号（仅 owner）
     删除 bot 自己学到的内容：/who 中同一范围的第 N 条自动归纳，或 /group 中的第 N 条群知识。不影响人工备注；备注请用 /note 管理。
 report-title = 每日报告｜{ $date }
-report-runs = 回复：{ $runs } 次（被叫 { $addressed }，定时 { $wake }）
+report-runs = 回复：{ $runs } 次（被叫 { $addressed }，定时 { $wake }，主动 { $spontaneous }）
 report-ends = 结束方式：{ $ends }
 report-errors = 模型错误：{ $errors }
 report-count_entry = { $label } { $count }

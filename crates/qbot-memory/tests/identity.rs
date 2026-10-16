@@ -111,22 +111,20 @@ fn the_pure_confirmation_rules_do_not_need_a_store() {
         target_revision: 0,
         state: InvitationState::Pending,
     };
-    let confirm = |who: i64, message: i64, after: u64, ri: u32, rt: u32| {
+    let confirm = |who: i64, after: u64, ri: u32, rt: u32| {
         inv.check_confirm(
             qbot_core::AccountId::new(who).unwrap(),
-            qbot_core::MessageId::new(message).unwrap(),
             t.plus(Duration::from_secs(after)),
             ttl,
             ri,
             rt,
         )
     };
-    assert_eq!(confirm(2, 11, 5, 0, 0), Ok(()));
-    assert_eq!(confirm(1, 11, 5, 0, 0), Err(LinkError::NotTheTarget));
-    assert_eq!(confirm(2, 10, 5, 0, 0), Err(LinkError::OutOfOrder));
-    assert_eq!(confirm(2, 11, 600, 0, 0), Err(LinkError::Expired));
-    assert_eq!(confirm(2, 11, 5, 1, 0), Err(LinkError::Stale));
-    assert_eq!(confirm(2, 11, 5, 0, 3), Err(LinkError::Stale));
+    assert_eq!(confirm(2, 5, 0, 0), Ok(()));
+    assert_eq!(confirm(1, 5, 0, 0), Err(LinkError::NotTheTarget));
+    assert_eq!(confirm(2, 600, 0, 0), Err(LinkError::Expired));
+    assert_eq!(confirm(2, 5, 1, 0), Err(LinkError::Stale));
+    assert_eq!(confirm(2, 5, 0, 3), Err(LinkError::Stale));
 }
 
 #[test]

@@ -171,9 +171,39 @@ impl CommandRouter {
         }
     }
 
-    /// The reply text for a request.
+    /// Whether a command from this sender gets no answer at all: in a muted group only owners
+    /// are answered (so `/mute off` works), and a blocked member is not answered, as neither
+    /// gets a reply from a run. A store that cannot say does not silence anyone.
+    async fn ignored(&self, req: &CommandRequest) -> bool {
+        if self.deps.settings.owners.contains(&req.sender) {
+            return false;
+        }
+        let admin = &self.deps.admin;
+        let muted = admin.is_muted(req.group).await.unwrap_or_else(|error| {
+            tracing::warn!(%error, "could not tell whether the group is muted");
+            false
+        });
+        let blocked = match admin.blocks(req.group).await {
+            Ok(rules) => rules.iter().any(|rule| rule.account == req.sender),
+            Err(error) => {
+                tracing::warn!(%error, "could not tell whether the sender is blocked");
+                false
+            }
+        };
+        muted || blocked
+    }
+
+    /// The reply text for a request, or `None` when the command is not answered.
     pub async fn respond(&self, req: &CommandRequest) -> Option<String> {
         let command = Command::from_word(&req.word)?;
+        if self.ignored(req).await {
+            tracing::debug!(
+                group = req.group.get(),
+                command = command.name(),
+                "command not answered: muted group or blocked sender"
+            );
+            return None;
+        }
         let text = match self.dispatch(command, req).await {
             Ok(text) => text,
             Err(Fail::Say(msg)) => self.deps.locales.render(&msg),

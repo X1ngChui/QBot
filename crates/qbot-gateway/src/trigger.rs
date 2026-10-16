@@ -1,5 +1,6 @@
-//! Who gets an answer. The bot speaks when spoken to: an @, one of its nicknames as a whole
-//! word, or a quote of one of its own lines. There is nothing to tune and no model involved.
+//! Whether a message addresses the bot: an @, one of its nicknames, or a quote of one of its own
+//! lines. No model is involved. (A message that does not may still start a spontaneous run;
+//! that roll is the pipeline's.)
 
 use std::collections::BTreeMap;
 

@@ -5,18 +5,20 @@ quoted, and when one of its own scheduled tasks comes due; it remembers what eac
 about and who its members are; it reads pictures and listens to voice messages; and otherwise it
 stays out of the way.
 
-- **Speaks only when addressed.** An @, a nickname as a whole word, a quote of one of its messages,
-  or a due group task starts a reply. The model decides whether to say anything, whom to mention
+- **Speaks when addressed.** An @, one of its nicknames in a message, a quote of one of its
+  messages, or a due group task starts a reply; optionally it also joins in on its own now and then
+  (`replies.spontaneous_chance`, off by default). The model decides whether to say anything, whom to mention
   and what to quote, and sends real QQ messages (mentions, quotes, faces, dice, contact cards).
 - **Memory grounded in the chat.** The archive of every message is the source of truth. Episodes
   summarize fixed stretches of it; names, facts about members and the group's own terms are
   extracted from verbatim quotes, checked by code, and fade unless confirmed again. Notes members
-  write by hand are kept separately. Members see and delete what is known about them.
+  write by hand are kept separately. Members see what is known about them and remove notes, names
+and learned facts (a removed fact can be learned again from later chat).
 - **Identity, not nicknames.** Accounts belong to people; linking needs confirmation; every member
   has a stable number in the group, so people sharing a name are never confused.
 - **Pictures and voice.** Pictures are described once and archived as text, and the model can look
   at an original itself; voice clips are transcribed on the CPU, in the process.
-- **Tools.** Search the group's history, recall earlier conversations by meaning, look a member up,
+- **Tools.** Search the group's history, recall earlier conversations by meaning,
   search the web and read pages, open pictures, and manage the group's scheduled tasks.
 - **Operations built in.** Nightly memory extraction, verified database backups, a daily report to
   the owners, and a single-instance lease. Usage is counted; nothing refuses work on cost.

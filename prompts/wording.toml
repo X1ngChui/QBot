@@ -156,6 +156,7 @@ gone = "the picture can no longer be fetched"
 # How tool outcomes read in the transcript.
 [outcome]
 failed = "[tool failed: {why}; the effect is not confirmed]"
+not_run = "[tool not run: the arguments were invalid; nothing happened, so correct them and call it again]"
 invalid_arguments = "invalid arguments"
 execution = "execution error"
 unavailable = "unavailable"

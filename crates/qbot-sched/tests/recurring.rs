@@ -166,7 +166,7 @@ async fn the_loop_sleeps_until_the_occurrence_and_stops_on_shutdown() {
         "the job exists after midnight"
     );
     stop.cancel();
-    task.await.unwrap().unwrap();
+    task.await.unwrap();
 }
 
 #[tokio::test]
@@ -244,5 +244,5 @@ async fn a_sleep_that_ends_just_before_the_occurrence_still_fires_it() {
         "tonight's occurrence fired"
     );
     stop.cancel();
-    task.await.unwrap().unwrap();
+    task.await.unwrap();
 }

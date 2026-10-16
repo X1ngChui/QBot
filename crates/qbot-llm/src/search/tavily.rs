@@ -41,13 +41,16 @@ pub struct TavilyConfig {
 
 impl TavilyConfig {
     /// Five results a search and three passages a page: enough to answer from, little enough
-    /// to read. One search or page read is given 20 seconds, retries included.
+    /// to read. One search or page read is given 20 seconds, retries included, and each attempt 10.
     pub fn new(depth: SearchDepth, extract_depth: SearchDepth) -> Self {
         Self {
             max_results: 5,
             depth,
             timeout: Duration::from_secs(20),
-            retry: RetryPolicy::default(),
+            retry: RetryPolicy {
+                attempt_timeout: Some(Duration::from_secs(10)),
+                ..RetryPolicy::default()
+            },
             extract: ExtractConfig {
                 depth: extract_depth,
                 chunks_per_source: 3,

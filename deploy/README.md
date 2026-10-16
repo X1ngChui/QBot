@@ -45,8 +45,12 @@ from (Figment reports the problems it finds in the merged result). After that, e
 check (ranges, formats, cron expressions, time zones) runs and reports *all* its problems
 together. The process does not start on any of them. Secrets are not configuration and never
 travel through these layers (see "Secrets").
-`docker compose run --rm qbot check-config` lists every layer applied and checks the secrets and
-that `/var/lib/qbot` is writable. `qbot print-config` shows the effective configuration (secret
+`docker compose run --rm qbot check-config` lists every layer applied and checks everything
+`run` checks before it connects to anything: the secrets, that `/var/lib/qbot` is writable, the
+locale, the persona files, the voice model's files and the backup tools. A deployment that
+passes it starts. Run it against a new image before switching to it:
+`QBOT_IMAGE=<new tag> docker compose run --rm qbot check-config`. Log verbosity follows `RUST_LOG`
+(default `info`). `qbot print-config` shows the effective configuration (secret
 names, never values); `qbot print-defaults` shows the baked-in layer.
 
 ## What goes where
@@ -82,15 +86,17 @@ know. So once a release has migrated the schema, the previous image cannot simpl
 again: rolling back means restoring the database as it was before the upgrade. Commands run in
 this directory.
 
-**Before an upgrade that adds a migration**, keep the running image's tag and take a verified dump:
+**Before every upgrade**, keep the running image's tag and take a verified dump (a few seconds;
+cheaper than working out whether a release migrates). Without it, switching back to the previous
+tag after a migrating release makes the old binary refuse the database and restart in a loop.
 
 ```bash
-f=data/qbot/backups/qbot-$(date +%Y%m%d-%H%M%S).dump
+f=data/qbot/backups/qbot-$(date -u +%Y%m%d-%H%M%S).dump
 docker compose exec -T postgres pg_dump -U qbot -d qbot -Fc > "$f"
 docker compose exec -T postgres pg_restore -l < "$f" | grep -c 'TABLE DATA'   # must be > 0
 ```
 
-The name matches the nightly backups, so normal rotation retires it later.
+The name matches the nightly backups (UTC, like theirs), so normal rotation retires it later.
 
 **To roll back**, recreate the database from that dump and start the previous image. Recreating
 (rather than `pg_restore --clean`) also removes anything the newer migrations created outside
@@ -156,7 +162,7 @@ The bot runs its own maintenance; nothing outside the container is needed.
 - **Nightly run**, in order: memory extraction for every group (after embedding any episode the
   configured embedding model has no vector for, so a new embedding model needs no other step),
   decay (stale name candidates, cached picture descriptions older than 15 days, faded facts), a verified
-  `pg_dump`, then cleanup (finished timers after 30 days, old runs, NapCat's file cache). Every
+  `pg_dump`, then cleanup (finished timers and runs after `maintenance.records_keep_days`, NapCat's file cache). Every
   stage runs even if an earlier one failed. A failed decay, backup or cleanup fails the job, which
   is retried with backoff; a failed extraction is logged (`extraction failed`) and tried again with
   the group's next filled batch or the next night. A slice the provider refuses for good is
@@ -165,7 +171,10 @@ The bot runs its own maintenance; nothing outside the container is needed.
   temporary name, listed with `pg_restore` (it must parse and contain the chat archive) and only
   then renamed into place; the newest `maintenance.backups` are kept (0 makes none). The image
   carries PostgreSQL 17 client tools; outside the image set `maintenance.postgres_bin_dir`.
-  Missing tools stop startup. Restore with `pg_restore --clean --if-exists -d qbot FILE`.
+  Missing tools stop startup. To restore, use the rollback recipe above (stop qbot, drop and
+  recreate the database, `pg_restore --exit-on-error`), with the current image. Backups live on
+  the same disk as the database, so a lost disk or host takes both: copy the newest dump
+  elsewhere once a day (a host cron job with `rclone` or `scp` is enough).
 - **Daily report** to every account in `bot.owners`, as a private message: yesterday's replies, how
   they ended, model calls and tokens of replies (with the cache share), tool failures, chat volume, groups,
   new episodes, job failures and the age of the last backup. It needs the platform connection; if

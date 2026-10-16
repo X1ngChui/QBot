@@ -49,7 +49,7 @@ impl AsrConfig {
 pub enum AsrError {
     #[error(
         "speech model file {path} is missing; download the SenseVoice bundle (model.int8.onnx and tokens.txt) into {dir} \
-         (see deploy/fetch_asr_model.sh), or set asr.enabled = false"
+         (see deploy/fetch_asr_model.sh), or set media.transcribe_voice = false"
     )]
     MissingModel { path: PathBuf, dir: PathBuf },
     #[error("the speech recognizer could not be created from {0}; the model files may be damaged")]
@@ -77,6 +77,13 @@ fn require(dir: &Path, name: &str) -> Result<String, AsrError> {
             dir: dir.to_owned(),
         })
     }
+}
+
+/// Whether the model's files are in place, without loading it: what `check-config` checks.
+pub fn check_files(cfg: &AsrConfig) -> Result<(), AsrError> {
+    require(&cfg.model_dir, MODEL_FILE)?;
+    require(&cfg.model_dir, TOKENS_FILE)?;
+    Ok(())
 }
 
 impl SherpaTranscriber {

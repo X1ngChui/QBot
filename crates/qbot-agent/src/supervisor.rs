@@ -277,10 +277,29 @@ impl Supervisor {
             .begin(request.group, &request.trigger)
             .await
             .map_err(Rejected::Environment)?;
-        let deadline = Instant::now() + inner.cfg.reply_deadline;
+        let admitted = Instant::now();
+        let deadline = admitted + inner.cfg.reply_deadline;
+        let trigger = match &request.trigger {
+            Trigger::Addressed { .. } => "addressed",
+            Trigger::Wake { .. } => "wake",
+            Trigger::Spontaneous => "spontaneous",
+        };
         let (tx, rx) = oneshot::channel();
         let task = async move {
             let report = drive(&inner, run, request, deadline).await;
+            // One line per run, so the log alone shows whether the bot is replying and how fast.
+            tracing::info!(
+                group = report.group.get(),
+                run = report.run.get(),
+                trigger,
+                end = report.end.as_str(),
+                ms = u64::try_from(admitted.elapsed().as_millis()).unwrap_or(u64::MAX),
+                turns = report.turns,
+                sends = report.sends,
+                input_tokens = report.usage.input_tokens,
+                output_tokens = report.usage.output_tokens,
+                "run ended"
+            );
             drop(claim);
             drop(reservation);
             finished.freed.notify_one();

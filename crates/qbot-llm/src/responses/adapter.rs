@@ -17,7 +17,7 @@ use crate::provider::{Provider, ReplayPlan, plan_replay};
 use crate::request::{Request, validate_request};
 use crate::response::{Continuation, Response, ResponseMeta};
 
-use super::parse::{Parsed, STATE_LOST, parse_response};
+use super::parse::{Parsed, STATE_LOST, parse_response, parse_usage};
 use super::retry::{post_with_retry, upload_with_retry};
 use super::transport::{HttpResponse, Transport, Upload};
 use super::wire::{ImageSource, build_body, image_keys};
@@ -237,8 +237,9 @@ impl Provider for ResponsesProvider {
             let response = self.dispatch(&request).await?;
             let value: Value = serde_json::from_slice(&response.body)
                 .map_err(|e| LlmError::Protocol(format!("response is not JSON: {e}")))?;
+            // Billed whether or not the output is usable, so counted before it is checked.
+            meter::add_tokens(parse_usage(value.get("usage")));
             let parsed = parse_response(self.info.id.as_str(), &value, &self.info.model)?;
-            meter::add_tokens(parsed.usage);
             Self::assemble(
                 &self.info,
                 self.cfg.state,

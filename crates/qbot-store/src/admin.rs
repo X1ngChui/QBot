@@ -84,6 +84,7 @@ pub struct ReportData {
     pub runs: u64,
     pub runs_addressed: u64,
     pub runs_wake: u64,
+    pub runs_spontaneous: u64,
     /// Runs by how they ended (`delivered`, `deadline`, `model_error`, ...), most common first.
     pub run_ends: Vec<(String, u64)>,
     /// Model error classes behind `model_error` runs, most common first.
@@ -358,6 +359,7 @@ impl PgAdmin {
             "SELECT count(*)::bigint AS runs, \
                     count(*) FILTER (WHERE trigger_kind = 'addressed')::bigint AS addressed, \
                     count(*) FILTER (WHERE trigger_kind = 'wake')::bigint AS wake, \
+                    count(*) FILTER (WHERE trigger_kind = 'spontaneous')::bigint AS spontaneous, \
                     count(DISTINCT group_id)::bigint AS groups \
              FROM run WHERE started_ms >= $1 AND started_ms < $2",
         )
@@ -423,6 +425,7 @@ impl PgAdmin {
             runs: count(&runs, "runs"),
             runs_addressed: count(&runs, "addressed"),
             runs_wake: count(&runs, "wake"),
+            runs_spontaneous: count(&runs, "spontaneous"),
             run_ends: pairs(run_ends),
             error_classes: pairs(error_classes),
             usage,

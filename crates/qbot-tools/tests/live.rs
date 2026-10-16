@@ -127,6 +127,7 @@ async fn the_model_searches_the_web_and_answers_from_the_results() {
         view: &view,
         state: &state,
         clock: &clock,
+        renderer: &qbot_llm::PlainRenderer,
     };
     let mut items = conv.items().to_vec();
     items.push(ConvItem::Assistant(first.turn.clone()));
@@ -202,6 +203,7 @@ async fn read_live(url: &str, question: Option<&str>, max_chars: usize) -> Strin
         view: &view,
         state: &state,
         clock: &clock,
+        renderer: &qbot_llm::PlainRenderer,
     };
     let out = ReadUrl::new(tavily_reader(), max_chars)
         .call(

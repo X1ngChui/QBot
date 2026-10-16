@@ -24,6 +24,11 @@ pub enum LlmError {
     /// The provider answered, but not in a shape the contract allows.
     #[error("malformed provider output: {0}")]
     Protocol(String),
+    /// The model wrote a tool call whose arguments cannot be read (not JSON, or not an object),
+    /// for example a quotation mark left unescaped inside a string. The answer is lost, not
+    /// wrong: nothing ran, and the same request asked again usually comes back readable.
+    #[error("unreadable tool call: {0}")]
+    MalformedCall(String),
     #[error("provider does not support {0}")]
     Unsupported(&'static str),
     /// The caller handed over a conversation that breaks the contract.
@@ -60,6 +65,7 @@ impl LlmError {
             LlmError::ContextTooLong => "context_too_long",
             LlmError::ContentFiltered => "content_filtered",
             LlmError::Protocol(_) => "protocol",
+            LlmError::MalformedCall(_) => "malformed_call",
             LlmError::Unsupported(_) => "unsupported",
             LlmError::InvalidConversation(_) => "invalid_conversation",
             LlmError::QuotaExhausted(_) => "quota_exhausted",

@@ -15,6 +15,11 @@ pub const DEFAULT_KEY: i64 = 0x5142_4F54;
 pub enum LeaseError {
     #[error("another instance holds the runtime lease")]
     Held,
+    /// The connection holding the lease went away (a database restart, say) or stopped answering.
+    #[error(
+        "the database connection holding the runtime lease was lost (was the database restarted?)"
+    )]
+    Lost,
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
 }

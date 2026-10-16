@@ -428,6 +428,13 @@ async fn submit(supervisor: &Supervisor, request: TriggerRequest) {
     match supervisor.submit(request).await {
         Ok(_handle) => {}
         Err(Rejected::Environment(error)) => tracing::error!(%error, "admission failed"),
+        // A full queue drops a reply someone is waiting for: worth seeing in /logs.
+        Err(Rejected::Overloaded) => {
+            tracing::warn!(
+                group = group.get(),
+                "the reply queue is full; trigger dropped"
+            )
+        }
         Err(rejected) => tracing::info!(group = group.get(), ?rejected, "trigger not admitted"),
     }
 }

@@ -12,7 +12,8 @@ use qbot_agent::{Archive, ContextSource, GroupPolicy, RunDeps, RunLog, Superviso
 use qbot_asr::{AsrConfig, AsrError, SherpaTranscriber};
 use qbot_commands::{CommandRouter, CommandSettings, Deps, PgGroupAdmin};
 use qbot_config::{
-    ConfigErrors, Env, Loaded, SecretKey, SecretResolver, Service, prepare_directories,
+    ConfigErrors, Env, Loaded, ResolvedPaths, SecretKey, SecretResolver, Secrets, Service,
+    prepare_directories,
 };
 use qbot_core::{Clock, GroupId, SystemClock};
 use qbot_gateway::bridge::Bridge;
@@ -97,6 +98,8 @@ pub enum RunError {
     Recovery(String),
     #[error("gateway: {0}")]
     Gateway(String),
+    #[error("{0} stopped by itself")]
+    Stopped(&'static str),
 }
 
 impl From<ConfigErrors> for RunError {
@@ -161,6 +164,54 @@ impl std::fmt::Debug for Options {
     }
 }
 
+/// Everything about a deployment that can be checked without the database or the platform:
+/// configuration, secrets, state directories, locale, personas, time zone, the voice model's
+/// files and the backup tools. `run` checks it all before it touches either, and `check-config`
+/// reports exactly this, so a deployment that passes the check also starts.
+pub struct Preflight {
+    pub paths: ResolvedPaths,
+    pub resolver: SecretResolver,
+    pub secrets: Secrets,
+    pub locales: Locales,
+    pub personas: Personas,
+    pub zone: jiff::tz::TimeZone,
+}
+
+impl std::fmt::Debug for Preflight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Preflight").finish_non_exhaustive()
+    }
+}
+
+pub async fn preflight(loaded: &Loaded, env: Arc<dyn Env>) -> Result<Preflight, RunError> {
+    let config = &loaded.config;
+    let paths = config.paths(&loaded.layout);
+    prepare_directories(&paths)?;
+    let resolver = SecretResolver::new(env, loaded.layout.secrets_dir.clone());
+    let secrets = config.ready_to_run(&resolver)?;
+    let locales =
+        Locales::load(&config.bot.locale, &paths.locales_dir).map_err(RunError::Locale)?;
+    let personas = Personas::load(&paths.personas_dir).map_err(RunError::Personas)?;
+    let zone = jiff::tz::TimeZone::get(&config.bot.timezone)
+        .map_err(|_| UnknownZone(config.bot.timezone.clone()))?;
+    if config.media.transcribe_voice {
+        qbot_asr::check_files(&AsrConfig::new(&paths.models_dir))?;
+    }
+    let ops = config.ops_config(&paths, secrets.database_password.expose(), zone.clone());
+    if let Some(backup) = &ops.backup {
+        // A missing client is an error now, not at two in the morning.
+        check_tools(backup).await?;
+    }
+    Ok(Preflight {
+        paths,
+        resolver,
+        secrets,
+        locales,
+        personas,
+        zone,
+    })
+}
+
 pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     let Options {
         env,
@@ -168,15 +219,15 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         ready,
         logs,
     } = options;
+    let Preflight {
+        paths,
+        resolver,
+        secrets,
+        locales,
+        personas,
+        zone,
+    } = preflight(&loaded, env).await?;
     let config = loaded.config;
-    let paths = config.paths(&loaded.layout);
-    prepare_directories(&paths)?;
-    let resolver = SecretResolver::new(env, loaded.layout.secrets_dir.clone());
-    let secrets = config.ready_to_run(&resolver)?;
-
-    let locales =
-        Locales::load(&config.bot.locale, &paths.locales_dir).map_err(RunError::Locale)?;
-    let personas = Personas::load(&paths.personas_dir).map_err(RunError::Personas)?;
     // Validated by `validate` and `ready_to_run`.
     let (Some(bot), Some(listen)) = (config.bot_account(), config.gateway_listen()) else {
         return Err(RunError::Config(ConfigErrors(Vec::new())));
@@ -185,8 +236,9 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     // The database, and the single-instance lease before anything is recovered or started.
     let url = config.database_url(secrets.database_password.expose());
     let store = Store::connect(&url).await?;
-    store.migrate().await?;
+    // The lease first: a second process must not change the schema under a running one.
     let lease = RuntimeLease::acquire(&url, DEFAULT_KEY).await?;
+    store.migrate().await?;
     let lease_lost = CancellationToken::new();
     let lease = lease.watch(LEASE_CHECK, lease_lost.clone());
 
@@ -362,13 +414,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         Arc::new(policy.clone()) as Arc<dyn GroupPolicy>,
     );
     // Background work: the nightly pipeline, backups and the daily report.
-    let zone = jiff::tz::TimeZone::get(&config.bot.timezone)
-        .map_err(|_| UnknownZone(config.bot.timezone.clone()))?;
     let ops_config = config.ops_config(&paths, secrets.database_password.expose(), zone.clone());
-    if let Some(backup) = &ops_config.backup {
-        // A missing client is an error now, not at two in the morning.
-        check_tools(backup).await?;
-    }
     // The language the bot writes in comes with the locale.
     let writing_language = locales.render(&Msg::WritingLanguage {});
     let builder = EpisodeBuilder::new(
@@ -508,6 +554,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     if access_token.is_none() {
         tracing::warn!("gateway authentication is off (gateway.access_token_secret is empty)");
     }
+    let bridge_watch = bridge.clone();
     let server = GatewayServer {
         pipeline: pipeline.clone(),
         bridge,
@@ -532,19 +579,25 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         let _ = ready.send(bound);
     }
 
-    let scheduler_task = {
+    let mut scheduler_task = {
         let (scheduler, stop) = (scheduler.clone(), stop.clone());
         tokio::spawn(async move { scheduler.run(stop).await })
     };
-    let recurring_task = {
+    let mut recurring_task = {
         let (recurring, stop) = (recurring.clone(), stop.clone());
         tokio::spawn(async move { recurring.run(stop).await })
     };
+    let watch_task = tokio::spawn(qbot_gateway::server::warn_while_disconnected(
+        bridge_watch,
+        qbot_gateway::server::DISCONNECTED_WARN_AFTER,
+        stop.clone(),
+    ));
     let mut server_task = tokio::spawn(serve(listener, server, stop.clone()));
 
-    // The gateway ending on its own leaves a process that hears nothing: it stops too, so the
-    // container restarts.
+    // Each of these ends only when told to. One that ends by itself (a panic, say) leaves a
+    // process that hears nothing or schedules nothing: it stops too, so the container restarts.
     let mut served = None;
+    let mut ended_early: Option<&'static str> = None;
     let reason = tokio::select! {
         () = shutdown.cancelled() => "shutdown requested",
         () = lease_lost.cancelled() => "the database lease was lost",
@@ -552,8 +605,26 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
             served = Some(ended);
             "the gateway server stopped"
         }
+        ended = &mut scheduler_task => {
+            if let Err(error) = ended {
+                tracing::error!(%error, "the scheduler task panicked");
+            }
+            ended_early = Some("the scheduler");
+            "the scheduler stopped"
+        }
+        ended = &mut recurring_task => {
+            if let Err(error) = ended {
+                tracing::error!(%error, "the recurring schedules task panicked");
+            }
+            ended_early = Some("the recurring schedules");
+            "the recurring schedules stopped"
+        }
     };
-    tracing::info!(reason, "stopping");
+    if shutdown.is_cancelled() {
+        tracing::info!(reason, "stopping");
+    } else {
+        tracing::warn!(reason, "stopping");
+    }
 
     // Stop taking input, then end what is in flight without waiting out long work: runs are
     // cancelled (recorded as such) before anything that could wait on one, commands finish,
@@ -567,18 +638,26 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     supervisor.shutdown().await;
     pipeline.finish().await;
     media.shutdown().await;
-    if let Err(error) = scheduler_task.await {
+    if ended_early != Some("the scheduler")
+        && let Err(error) = scheduler_task.await
+    {
         tracing::error!(%error, "the scheduler task panicked");
     }
-    match recurring_task.await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::error!(%error, "the recurring schedules stopped"),
-        Err(error) => tracing::error!(%error, "the recurring schedules task panicked"),
+    if ended_early != Some("the recurring schedules")
+        && let Err(error) = recurring_task.await
+    {
+        tracing::error!(%error, "the recurring schedules task panicked");
+    }
+    if let Err(error) = watch_task.await {
+        tracing::error!(%error, "the connection watch task panicked");
     }
     recorder.shutdown().await;
     lease.release().await;
     if lease_lost.is_cancelled() {
-        return Err(RunError::Lease(LeaseError::Held));
+        return Err(RunError::Lease(LeaseError::Lost));
+    }
+    if let Some(what) = ended_early {
+        return Err(RunError::Stopped(what));
     }
     match served {
         // Serving ends only when told to; ending before that is a failure.

@@ -23,6 +23,7 @@ fn embedder(server: Arc<SimEmbeddingServer>) -> HttpEmbedder {
         retries: 2,
         base: Duration::from_millis(100),
         jitter: false,
+        attempt_timeout: None,
     };
     HttpEmbedder::new(cfg, server)
 }

@@ -109,6 +109,7 @@ async fn pictures_open_by_message_and_position_and_are_fetched_once() {
         view: &view,
         state: &state,
         clock: &SystemClock,
+        renderer: &qbot_llm::PlainRenderer,
     };
 
     let out = tool

@@ -501,22 +501,19 @@ async fn invitations(store: &dyn IdentityStore) {
         "only the invited account confirms"
     );
     assert_eq!(
-        store.confirm(g, b, msg(9), at(110)).await.unwrap_err(),
-        IdentityError::Link(LinkError::OutOfOrder),
-        "must come after the invitation"
-    );
-    assert_eq!(
         store.confirm(g, d, msg(20), at(110)).await.unwrap_err(),
         IdentityError::Link(LinkError::NoInvitation)
     );
-    let applied = store.confirm(g, b, msg(20), at(110)).await.unwrap();
+    // Message ids are hashes, not a sequence: a confirmation whose id is lower than the
+    // invitation's is as good as any.
+    let applied = store.confirm(g, b, msg(9), at(110)).await.unwrap();
     assert!(matches!(applied, MergeOutcome::Merged { .. }));
     assert_eq!(
         store.holder_of(a).await.unwrap().unwrap().accounts,
         vec![a, b]
     );
     assert_eq!(
-        store.confirm(g, b, msg(20), at(111)).await.unwrap(),
+        store.confirm(g, b, msg(9), at(111)).await.unwrap(),
         MergeOutcome::AlreadyLinked(store.holder_of(a).await.unwrap().unwrap().id),
         "replaying the confirming message is a no-op"
     );

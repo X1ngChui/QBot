@@ -56,6 +56,7 @@ fn tavily(transport: Arc<Scripted>, max_results: u32) -> TavilySearch {
                 retries: 2,
                 base: Duration::from_millis(1),
                 jitter: false,
+                attempt_timeout: None,
             },
             extract: qbot_llm::search::ExtractConfig {
                 depth: qbot_llm::search::SearchDepth::Basic,

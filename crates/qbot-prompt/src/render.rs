@@ -39,6 +39,16 @@ impl PromptRenderer {
 }
 
 impl Renderer for PromptRenderer {
+    fn time(&self, at: UnixMillis) -> String {
+        Timestamp::from_millisecond(at.get())
+            .map(|t| {
+                t.to_zoned(self.zone.clone())
+                    .strftime("%Y-%m-%d %H:%M %:z")
+                    .to_string()
+            })
+            .unwrap_or_else(|_| format!("{}ms", at.get()))
+    }
+
     fn chat(&self, batch: &ChatBatch) -> String {
         batch
             .lines()
@@ -55,6 +65,8 @@ impl Renderer for PromptRenderer {
     fn outcome_note(&self, outcome: &Outcome) -> Option<String> {
         match outcome {
             Outcome::Ok => None,
+            // Nothing ran: unlike a failure, the call can simply be corrected and made again.
+            Outcome::Error(ErrorKind::InvalidArguments) => Some(say(Text::OutcomeNotRun {})),
             Outcome::Error(kind) => Some(say(Text::OutcomeFailed {
                 why: say(match kind {
                     ErrorKind::InvalidArguments => Text::OutcomeInvalidArguments {},
@@ -72,5 +84,21 @@ impl Renderer for PromptRenderer {
             })),
             Outcome::Interrupted => Some(say(Text::OutcomeInterrupted {})),
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_times_are_local_with_their_offset() {
+        let renderer = PromptRenderer::new(TimeZone::get("Asia/Shanghai").unwrap());
+        // 2026-10-14T10:30:00Z
+        assert_eq!(
+            renderer.time(UnixMillis::new(1_791_973_800_000)),
+            "2026-10-14 18:30 +08:00"
+        );
     }
 }

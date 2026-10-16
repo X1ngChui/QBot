@@ -66,6 +66,10 @@ services:
       - text_api_key
       - embedding_api_key
       - onebot_access_token
+      # With providers.vision.enabled or providers.search.enabled (here, or in an override
+      # file), also these two, and their entries at the end of this file:
+      # - vision_api_key
+      # - search_api_key
     logging:
       driver: json-file
       options: { max-size: "20m", max-file: "3" }
@@ -95,3 +99,7 @@ secrets:
     file: ./secrets/embedding_api_key
   onebot_access_token:
     file: ./secrets/onebot_access_token
+  # vision_api_key:
+  #   file: ./secrets/vision_api_key
+  # search_api_key:
+  #   file: ./secrets/search_api_key

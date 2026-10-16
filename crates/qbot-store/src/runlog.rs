@@ -182,7 +182,21 @@ impl PgRunLog {
         for run_id in &open {
             let run =
                 RunId::new(u64::try_from(*run_id).map_err(|_| StoreError::corrupt("run id"))?);
-            let items = self.load_items(run).await?;
+            // A log this process cannot read (an item another image wrote, say) is closed as it
+            // is: the run record is diagnostic, and it must never keep the bot from starting.
+            let items = match self.load_items(run).await {
+                Ok(items) => items,
+                Err(error) => {
+                    tracing::warn!(run = run_id, %error, "open run has an unreadable log; closing it as is");
+                    sqlx::query("UPDATE run SET ended_ms = $2, end_reason = $3 WHERE run_id = $1 AND ended_ms IS NULL")
+                        .bind(run_id)
+                        .bind(self.clock.now().get())
+                        .bind(RunEnd::Interrupted.as_str())
+                        .execute(&self.pool)
+                        .await?;
+                    continue;
+                }
+            };
             let recorded_end = items.iter().find_map(|item| match item {
                 Item::Meta(Meta::RunEnded(end)) => Some(*end),
                 _ => None,

@@ -2,8 +2,8 @@
 
 QBot is an AI member of QQ group chats. NapCat (OneBot v11) connects to it over a reverse
 WebSocket; it archives every group message, answers when it is addressed or when one of its own
-scheduled tasks comes due, remembers what the group talks about, and keeps out of the way
-otherwise. This document describes how it works and why. Memory (identity,
+scheduled tasks comes due, may join in on its own now and then, remembers what the group talks
+about, and keeps out of the way otherwise. This document describes how it works and why. Memory (identity,
 episodes, recall) has its own document, [memory.md](memory.md).
 
 ## 1. What the product does
@@ -15,9 +15,10 @@ member's contact card. The bot knows only the group it is in and never sends or 
 group's card.
 R2. Archive every event exactly once. A unique-key insert is the only dedup gate; a duplicate
 stops all further effects. The bot's own lines come only from the platform's echo.
-R3. Speak only when caused: an @ of the bot, a nickname as a whole word, a quote of one of the
-bot's lines, or a due group task. A muted group gets nothing; a blocked member cannot start a
-reply but stays in context.
+R3. Speak only when caused: an @ of the bot, one of its nicknames in a message, a quote of one of
+the bot's lines, a due group task, or (at `replies.spontaneous_chance`) a look at the chat on its
+own. A muted group gets nothing, commands included except an owner's; a blocked member cannot
+start a reply or get a command answered, but stays in context.
 R4. Reply through tools: the model decides whether to speak, whom to mention and what to quote.
 R5. Tools: send, stay silent, archive search, episode recall and reading, web search and page
 reading, opening pictures, and the group's scheduled tasks.
@@ -142,11 +143,18 @@ scheduler and memory depend on no database or platform. Its Postgres adapter liv
   number (rewriting `[at:ACCOUNT]` to `[at:N]`) and records each media item's platform
   reference. `UNIQUE (group_id, message_id)` with `ON CONFLICT DO NOTHING` is the only dedup gate.
   Notices are archived under a synthetic message id derived from their content (at and above
-  2^52), so redelivery deduplicates them too.
+  2^52), so redelivery deduplicates them too. NapCat's message ids are 31-bit hashes of QQ's
+  own ids (measured: about half of consecutive ids in a group decrease): unique in practice,
+  never ordered. Nothing compares them for order; order is the archive ordinal. In a group of
+  n lines the chance that two ids ever collide is about n²/2³² (about 17% at 28,000 lines);
+  a colliding message would be taken for a duplicate and dropped.
 - **Routing**: the bot's own line goes to the echo board; a recognised command word runs the
-  command on its own task; otherwise a trigger (an @ of the bot, a nickname as a whole jieba
-  token, or a quote of a bot line) submits a run. Mute and block are decided by the supervisor,
-  not here. A filled batch queues the group's extraction job.
+  command on its own task; otherwise a trigger (an @ of the bot, a nickname, or a quote of a bot
+  line) submits a run. A nickname counts in Chinese text wherever it appears (jieba always cuts
+  it out), in Latin text as a whole word; so a member who talks *about* the bot by a nickname
+  that is an ordinary word starts a run too. Mute and block are decided by the supervisor for
+  runs and by the command router for commands, not here. A filled batch queues the group's
+  extraction job.
 - **Delivery**: `send_group_msg`, correlated by `echo` token, then a wait for the platform's
   report of the bot's own message (`message_sent`), which is how dice and rock-paper-scissors
   results become known. A failed send is returned to the model as an error of one of two kinds:
@@ -217,6 +225,10 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
   a tool that ends it (`send_messages` by default, `stay_silent`), the deadline, `max_turns`, or a
   model error. A run that ends on a model or environment error (the archive, the run log, an
   opened context) logs the cause as a warning; its record keeps the end and the error class.
+  A model turn whose tool call cannot be read (arguments that are not JSON, typically a quotation
+  mark left unescaped) is asked for again once: nothing ran, so the same request is safe to
+  repeat. Every run logs one INFO line when it ends (trigger, end, duration, turns, sends,
+  tokens).
 - **Speaking.** Only `send_messages` reaches the group: `{messages: [text, ..], end_turn?}`, each
   item one QQ message in the chat's own marker syntax (`[reply:ID]` first, `[at:N]`,
   `[face:N]`; `[dice]`, `[rps]`, `[contact:N]` alone, never a game result), parsed strictly with
@@ -253,10 +265,13 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
   provider that declares `Never` gets `Auto` and the note alone.
 - **Executor.** Reads run concurrently, then writes (sends included) one at a time in call order; a refused call gets
   a typed refusal; every call executes (no deduplication), so the prompt teaches the model not to
-  repeat a write.
+  repeat a write. A call with invalid arguments is marked as not run (nothing happened, correct
+  it and call again), unlike a failure, whose effect is not confirmed.
 - **Tools** (`Tool` trait): the argument schema is generated from the Rust type (schemars, nested
   types inlined); descriptions of the tool and its parameters come from `wording.toml` by field
-  path. The tool set is fixed for the whole run, so the cached prefix does not change.
+  path. The tool set is fixed for the whole run, so the cached prefix does not change. Tools show
+  chat lines exactly as the chat does and times in the bot's zone with their offset, through the
+  run's renderer (`ToolCx::renderer`), so the model never converts zones.
 
 ## 7. The prompt (`qbot-prompt`, `qbot-wording`, `qbot-i18n`)
 
@@ -399,9 +414,10 @@ the `media_ref` row the platform reference came in.
 
 - One `timer` table. A `wake` is a group task: at most once, never replayed (a claim open at
   startup is marked interrupted). A `job` (extract, nightly, decay, backup, cleanup, report) is
-  idempotent: claimed with a lease renewed while it runs, retried with backoff, failed for good
-  after five attempts, each failure logged. A job running at shutdown is dropped with its claim
-  in place, and startup queues it again.
+  idempotent: claimed with a lease renewed while it runs (a failed renewal is tried again at the
+  next beat, a third of the lease later), retried with backoff, failed for good after five
+  attempts, each failure logged. A job that panics counts as a failed attempt. A job running at
+  shutdown is dropped with its claim in place, and startup queues it again.
 - **Group tasks** are created by the model or an owner, owned by the group, and bounded where a
   model could otherwise loop: at least five minutes ahead, at most 50 pending per group, follow-up
   chains at most 24 deep. Update and cancel apply to pending tasks only.
@@ -431,9 +447,12 @@ the `media_ref` row the platform reference came in.
 - **The output length is the provider's.** No request carries a local output cap: the provider
   determines the usable range (DeepSeek returned a 44,000-token answer unprompted), and a local
   cap only adds a way for a long but valid answer to be cut off. A reply is bounded by its
-  deadline; other calls by a per-call deadline (ten minutes for text, two for a picture).
+  deadline; other calls by a per-call deadline (ten minutes for text, two for a picture). Each
+  HTTP attempt has its own bound inside that deadline (200 s text, 40 s picture, 10 s embedding
+  and search), so a request that stalls (accepted, then silent) is tried again rather than
+  spending the whole deadline: before this bound, 11% of picture calls were lost that way.
 - **Errors** are one taxonomy (`Auth`, `RateLimited`, `Unavailable`, `Timeout`, `ContextTooLong`,
-  `QuotaExhausted`, `Protocol`, ...). Retries live in the adapter: bounded, transient failures
+  `QuotaExhausted`, `Protocol`, `MalformedCall`, ...). Retries live in the adapter: bounded, transient failures
   only (a connection error, a status that says to try again), honoring Retry-After. A used-up plan (HTTP 402, Tavily 432/433)
   is `QuotaExhausted` and never retried.
 - **Embeddings**: an OpenAI-compatible endpoint, split into requests of `max_batch` inputs,
@@ -479,7 +498,8 @@ two stores.
 | `/logs [n]` | owner | recent warnings and errors (the last 200) |
 
 Replies quote the command, mention the sender, and are split at QQ's 2,000-character message
-limit. Members act on their own (linked) accounts, owners on anyone. A member's name in a reply is
+limit. Mute and block hold for commands as for runs: in a muted group only owners are answered
+(so `/mute off` works), and a blocked member gets no answer and so cannot write notes either. Members act on their own (linked) accounts, owners on anyone. A member's name in a reply is
 their current group display name, read live from the platform.
 
 ## 13. Configuration
@@ -571,8 +591,8 @@ spend.
   overlap, whether episodes or skipped (`slice_skip`): range exclusion constraints, and a check
   across the two tables under the group's slice lock. One active fact per subject, predicate and key (a partial
   unique index).
-- **Single instance**: the process holds a Postgres advisory-lock session lease, checked every ten
-  seconds, and shuts down if it loses it. A check that does not answer within the interval
+- **Single instance**: the process takes a Postgres advisory-lock session lease before it migrates
+  or recovers anything, checks it every ten seconds, and shuts down if it loses it. A check that does not answer within the interval
   counts as lost: on a hung connection only an answer proves the lock is still held.
 - Database tests need a disposable server in `QBOT_TEST_DATABASE_URL`; each test creates and
   drops its own database.
@@ -595,8 +615,12 @@ spend.
   lets commands finish, drops media work (its markers stay bare) and running jobs (queued again
   at the next start), writes the usage records, and releases the lease. Nothing waits out a
   model call, so the container stops within its grace period. The process also stops, with an
-  error, if the gateway server ends by itself or the lease is lost, so the container restarts
-  instead of running deaf.
+  error, if the gateway server, the scheduler or the recurring schedules end by themselves or the
+  lease is lost, so the container restarts instead of running deaf. While no platform connection
+  is attached, a WARN is logged after ten minutes and then hourly: an expired QQ session is
+  otherwise silent. Startup closes a stored run it cannot read as interrupted rather than refusing
+  to start. `check-config` runs every check `run` makes before connecting (secrets, directories,
+  locale, personas, voice model files, backup tools).
 - **Usage**: one `usage_event` table, written off the hot path by one writer: a reply run's end and
   each of its tool calls (`UsageSink`), and every provider call of any work (`Meter`): its
   purpose, kind (`model`, `embedding`, `search`, `extract`), provider and model, requests,
@@ -639,3 +663,16 @@ through it.
 - `open_images` cannot open pictures inside forwarded records whose content was not delivered.
 - History search scans the group's lines; a `pg_trgm` index is the step if archives grow large.
 - OpenAI-style providers are covered by the simulated server, not by a live test.
+- Runs of one group overlap (decision 1), and nothing tells a run what another is answering: a
+  member who repeats or rephrases a question within seconds gets it answered twice (measured in
+  production).
+- A recalled message stays in the archive, in later prompts, in search and in memory; the
+  recall notice does not say which message it was.
+- `/forget` removes one learned fact; a later episode can learn it again.
+- Account links are global across groups, and every run sees every recorded member's names,
+  notes and facts; only the commands limit what a member may look up.
+- A slice the provider refuses with an error that is not classed as permanent is tried again on
+  every filled batch and every night, and holds back that group's later slices.
+- Messages shown by `search_history` and `read_episode` cannot be quoted, opened or used to
+  address their authors: the run's view knows only what its context showed.
+- The people block has no size bound (about 15 KB in the largest group today).

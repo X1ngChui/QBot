@@ -516,6 +516,7 @@ async fn lines_become_episodes_which_recall_finds_and_read_episode_opens() {
         view: &view,
         state: &state,
         clock: &clock2,
+        renderer: &qbot_llm::PlainRenderer,
     };
     let found = set
         .get("recall_episodes")

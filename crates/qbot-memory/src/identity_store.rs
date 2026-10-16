@@ -533,7 +533,7 @@ impl IdentityStore for MemoryIdentityStore {
             inner.holder_of(invitation.target)?,
         );
         let (ri, rt) = (inner.holders[&hi].revision, inner.holders[&ht].revision);
-        match invitation.check_confirm(confirming, message, now, ttl, ri, rt) {
+        match invitation.check_confirm(confirming, now, ttl, ri, rt) {
             Ok(()) => {}
             Err(error @ (LinkError::Expired | LinkError::Stale)) => {
                 inner.invitations[index].invitation.state = if error == LinkError::Expired {

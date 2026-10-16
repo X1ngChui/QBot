@@ -29,6 +29,7 @@ tracing.workspace = true
 [dev-dependencies]
 qbot-tools.workspace = true
 tokio-tungstenite.workspace = true
+tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "test-util", "net"] }
 
 [lints]

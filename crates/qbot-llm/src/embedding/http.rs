@@ -27,7 +27,7 @@ pub struct EmbeddingConfig {
 
 impl EmbeddingConfig {
     /// An OpenAI-compatible embeddings endpoint. One request (a batch) is given 30 seconds,
-    /// retries included.
+    /// retries included, and each attempt 10.
     pub fn new(model: impl Into<String>, dims: usize, max_batch: usize) -> Self {
         Self {
             id: ProviderId::new("embedding"),
@@ -35,7 +35,10 @@ impl EmbeddingConfig {
             dims,
             max_batch,
             timeout: std::time::Duration::from_secs(30),
-            retry: RetryPolicy::default(),
+            retry: RetryPolicy {
+                attempt_timeout: Some(std::time::Duration::from_secs(10)),
+                ..RetryPolicy::default()
+            },
         }
     }
 

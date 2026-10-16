@@ -179,14 +179,15 @@ impl Recurring {
         self.next_occurrence(now).map(|at| at.since(now))
     }
 
-    /// Catch up, then fire each occurrence as it arrives, until `shutdown`.
-    pub async fn run(&self, shutdown: CancellationToken) -> Result<(), StoreError> {
+    /// Catch up, then fire each occurrence as it arrives, until `shutdown`. A store that fails
+    /// is tried again, so this ends only when told to.
+    pub async fn run(&self, shutdown: CancellationToken) {
         // A long sleep is re-evaluated at least hourly, which also absorbs clock changes.
         const LONGEST: Duration = Duration::from_secs(3600);
         while let Err(error) = self.catch_up().await {
             tracing::error!(%error, "recurring schedules could not catch up; retrying");
             tokio::select! {
-                () = shutdown.cancelled() => return Ok(()),
+                () = shutdown.cancelled() => return,
                 () = tokio::time::sleep(Duration::from_secs(30)) => {}
             }
         }
@@ -197,7 +198,7 @@ impl Recurring {
                 .filter(|at| at.since(now) <= LONGEST);
             let wait = target.map_or(LONGEST, |at| at.since(now));
             tokio::select! {
-                () = shutdown.cancelled() => return Ok(()),
+                () = shutdown.cancelled() => return,
                 () = tokio::time::sleep(wait) => {}
             }
             // A sleep can end a moment before the occurrence it waited for. That occurrence is
@@ -209,7 +210,7 @@ impl Recurring {
             while let Err(error) = self.fire_through(at).await {
                 tracing::error!(%error, "a recurring job could not be created; retrying");
                 tokio::select! {
-                    () = shutdown.cancelled() => return Ok(()),
+                    () = shutdown.cancelled() => return,
                     () = tokio::time::sleep(Duration::from_secs(30)) => {}
                 }
             }

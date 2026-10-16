@@ -15,12 +15,6 @@ use serde::Deserialize;
 /// Tasks per page in listings. A presentation size, not a limit on tasks.
 const PAGE: usize = 5;
 
-/// RFC 3339 in UTC.
-pub(crate) fn format_time(at: UnixMillis) -> String {
-    jiff::Timestamp::from_millisecond(at.get())
-        .map_or_else(|_| format!("{}ms", at.get()), |t| t.to_string())
-}
-
 /// An RFC 3339 instant; the offset is required.
 fn parse_time(text: &str) -> Result<UnixMillis, ToolError> {
     let parsed: jiff::Timestamp = text.parse().map_err(|_| {
@@ -40,7 +34,7 @@ fn when(run_at: Option<&str>, delay_seconds: Option<u64>) -> Result<Option<When>
     }
 }
 
-fn describe(timer: &Timer) -> String {
+fn describe(cx: &ToolCx<'_>, timer: &Timer) -> String {
     let state = say(match &timer.state {
         TimerState::Pending => Text::TasksPending {},
         TimerState::Claimed { .. } => Text::TasksRunning {},
@@ -51,17 +45,17 @@ fn describe(timer: &Timer) -> String {
     say(Text::TasksLine {
         id: timer.id.get().to_string(),
         state,
-        due: format_time(timer.due_at),
+        due: cx.renderer.time(timer.due_at),
         intent: timer.wake().map_or("", |w| w.intent.as_str()).to_owned(),
     })
 }
 
-fn map_error(error: TaskError) -> ToolError {
+fn map_error(cx: &ToolCx<'_>, error: TaskError) -> ToolError {
     let invalid = |text| ToolError::InvalidArguments(say(text));
     match error {
         TaskError::EmptyIntent => invalid(Text::TasksEmptyIntent {}),
         TaskError::TooSoon { earliest } => invalid(Text::TasksTooSoon {
-            earliest: format_time(earliest),
+            earliest: cx.renderer.time(earliest),
         }),
         TaskError::NothingToChange => invalid(Text::TasksNothingToChange {}),
         TaskError::NotFound => invalid(Text::TasksNotFound {}),
@@ -123,9 +117,9 @@ impl Tool for ScheduleTask {
             .0
             .create(cx.group, &args.intent, when, parent, Origin::Model)
             .await
-            .map_err(map_error)?;
+            .map_err(|e| map_error(cx, e))?;
         Ok(ToolOutput::text(say(Text::ScheduleTaskScheduled {
-            task: describe(&timer),
+            task: describe(cx, &timer),
         })))
     }
 }
@@ -157,7 +151,7 @@ impl Tool for ListScheduledTasks {
             .0
             .list(cx.group, page * PAGE, PAGE + 1)
             .await
-            .map_err(map_error)?;
+            .map_err(|e| map_error(cx, e))?;
         if tasks.is_empty() {
             return Ok(ToolOutput::text(say(if page == 0 {
                 Text::ListTasksNone {}
@@ -166,7 +160,7 @@ impl Tool for ListScheduledTasks {
             })));
         }
         let more = tasks.len() > PAGE;
-        let mut lines: Vec<String> = tasks.iter().take(PAGE).map(describe).collect();
+        let mut lines: Vec<String> = tasks.iter().take(PAGE).map(|t| describe(cx, t)).collect();
         if more {
             lines.push(say(Text::ListTasksMore {
                 page: (page + 1).to_string(),
@@ -202,8 +196,8 @@ impl Tool for GetScheduledTask {
             .0
             .get(cx.group, TimerId::new(args.id))
             .await
-            .map_err(map_error)?;
-        Ok(ToolOutput::text(describe(&timer)))
+            .map_err(|e| map_error(cx, e))?;
+        Ok(ToolOutput::text(describe(cx, &timer)))
     }
 }
 
@@ -228,9 +222,9 @@ impl Tool for CancelScheduledTask {
             .0
             .cancel(cx.group, TimerId::new(args.id))
             .await
-            .map_err(map_error)?;
+            .map_err(|e| map_error(cx, e))?;
         Ok(ToolOutput::text(say(Text::CancelTaskCancelled {
-            task: describe(&timer),
+            task: describe(cx, &timer),
         })))
     }
 }
@@ -275,9 +269,9 @@ impl Tool for UpdateScheduledTask {
                 when,
             )
             .await
-            .map_err(map_error)?;
+            .map_err(|e| map_error(cx, e))?;
         Ok(ToolOutput::text(say(Text::UpdateTaskUpdated {
-            task: describe(&timer),
+            task: describe(cx, &timer),
         })))
     }
 }

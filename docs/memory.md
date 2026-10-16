@@ -131,7 +131,8 @@ else the account nickname. These docs say "group nickname" and "group display na
   distinct episode capped at 0.7, combined as independent evidence. A name resolves only when
   confirmed (at 0.75), so extraction alone never confirms: only a person does. Two confirmed targets for a name is *ambiguous*, never a guess.
 - *Invitations* to link accounts: ten minutes, one pending per
-  account per group, only the target confirms, the confirmation must come after the invitation, an
+  account per group, only the target confirms (once: the archive runs each message once, and a
+  confirmed invitation is no longer pending; message ids are hashes and are never compared), an
   expired or stale (a holder changed) invitation is closed, replaying the confirming message is a
   no-op.
 

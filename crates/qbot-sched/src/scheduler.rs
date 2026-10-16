@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::FutureExt;
 use qbot_agent::{Rejected, Supervisor, Trigger, TriggerRequest};
 use qbot_context::RunEnd;
 use qbot_core::{Clock, GroupId, TimerId, UnixMillis};
@@ -293,27 +294,34 @@ impl Scheduler {
             // The job's slot is given back however the task ends, a panicking job included.
             let _slot = Slot { active, wake };
             // While the job runs its lease is kept fresh, so a long job is not mistaken for a
-            // dead one and taken over by a second run. The heartbeat ends with the job, also if
-            // the job panics.
+            // dead one and taken over by a second run. A failed extension is tried again at the
+            // next beat: the lease is three beats long, so one database blip does not let it
+            // lapse. The heartbeat ends with the job.
             let heartbeat = {
                 let (store, clock, lease) = (store.clone(), clock.clone(), cfg.job_lease);
                 AbortOnDropHandle::new(tokio::spawn(async move {
                     let every = (lease / 3).max(Duration::from_millis(1));
                     loop {
                         tokio::time::sleep(every).await;
-                        if store
-                            .extend_lease(id, clock.now().plus(lease))
-                            .await
-                            .is_err()
-                        {
-                            break;
+                        if let Err(error) = store.extend_lease(id, clock.now().plus(lease)).await {
+                            tracing::warn!(%error, ?kind, "a running job's lease could not be extended");
                         }
                     }
                 }))
             };
+            // A panic in a job is a failure like any other, so it is retried and finally given
+            // up on instead of leaving its claim to be taken again and again.
+            let run = std::panic::AssertUnwindSafe(jobs.run(kind, group)).catch_unwind();
             let result = tokio::select! {
                 () = stop.cancelled() => return,
-                result = jobs.run(kind, group) => result,
+                result = run => result.unwrap_or_else(|panic| {
+                    let what = panic
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_owned())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_default();
+                    Err(JobError(format!("the job panicked: {what}")))
+                }),
             };
             drop(heartbeat);
             let recorded = match result {

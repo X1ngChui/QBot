@@ -4,34 +4,48 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use qbot_agent::{Effect, Tool, ToolCx, ToolError, ToolOutput, ToolSet, ToolSetError};
-use qbot_context::RefusalReason;
+use qbot_context::{ChatBatch, ChatLine, RefusalReason, Speaker};
+use qbot_core::MemberNo;
 use qbot_memory::{Episode, EpisodeId, EpisodeStore, Recall, SliceLine};
 use qbot_wording::{Text, say};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::tasks::format_time;
-
-fn describe(episode: &Episode) -> String {
+fn describe(cx: &ToolCx<'_>, episode: &Episode) -> String {
     let e = &episode.episode;
     say(Text::RecallEpisodesEpisode {
         id: episode.id.get().to_string(),
-        start: format_time(e.started),
-        end: format_time(e.ended),
+        start: cx.renderer.time(e.started),
+        end: cx.renderer.time(e.ended),
         count: e.line_count.to_string(),
         title: e.title.clone(),
         summary: e.summary.clone(),
     })
 }
 
-fn render(line: &SliceLine) -> String {
-    match (line.speaker, line.member_no) {
-        (None, _) => format!("[msg:{}] bot: {}", line.message.get(), line.text),
-        (Some(_), Some(n)) => format!("[msg:{}] member:{n}: {}", line.message.get(), line.text),
-        (Some(a), None) => format!(
-            "[msg:{}] account:{}: {}",
+/// A line of an episode as the chat shows it. A line whose author has no member number (an
+/// account the archive could not number) keeps the account.
+fn render(cx: &ToolCx<'_>, line: &SliceLine) -> String {
+    let speaker = match (line.speaker, line.member_no) {
+        (None, _) => Some(Speaker::Bot),
+        (Some(account), Some(n)) => Some(Speaker::Member {
+            account,
+            number: MemberNo::new(n),
+        }),
+        (Some(_), None) => None,
+    };
+    match speaker {
+        Some(speaker) => cx.renderer.chat(&ChatBatch::new(vec![ChatLine {
+            message: line.message,
+            speaker,
+            at: line.at,
+            text: line.text.clone(),
+        }])),
+        None => format!(
+            "[msg:{}] {} account:{}: {}",
             line.message.get(),
-            a.get(),
+            cx.renderer.time(line.at),
+            line.speaker.map_or(0, |a| a.get()),
             line.text
         ),
     }
@@ -84,7 +98,7 @@ impl Tool for RecallEpisodes {
         }
         Ok(ToolOutput::text(
             hits.iter()
-                .map(|h| describe(&h.episode))
+                .map(|h| describe(cx, &h.episode))
                 .collect::<Vec<_>>()
                 .join("\n"),
         ))
@@ -143,8 +157,8 @@ impl Tool for ReadEpisode {
             .lines(cx.group, e.first_ordinal, e.last_ordinal)
             .await
             .map_err(unavailable)?;
-        let mut out = vec![describe(&episode)];
-        out.extend(lines.iter().map(render));
+        let mut out = vec![describe(cx, &episode)];
+        out.extend(lines.iter().map(|line| render(cx, line)));
         Ok(ToolOutput::text(out.join("\n")))
     }
 }

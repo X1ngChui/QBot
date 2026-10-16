@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use qbot_app::{Options, run};
-use qbot_config::{Loaded, ProcessEnv, SecretResolver, Source, load, prepare_directories};
+use qbot_config::{Loaded, ProcessEnv, Source, load};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
@@ -39,12 +39,16 @@ fn describe(source: &Source) -> String {
     }
 }
 
-fn check(loaded: &Loaded) -> Result<(), qbot_config::ConfigErrors> {
-    let paths = loaded.config.paths(&loaded.layout);
-    prepare_directories(&paths)?;
-    let resolver = SecretResolver::new(Arc::new(ProcessEnv), loaded.layout.secrets_dir.clone());
-    loaded.config.ready_to_run(&resolver)?;
-    Ok(())
+/// Everything `run` checks before it connects to anything (see `qbot_app::preflight`).
+fn check(loaded: &Loaded) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("cannot start the async runtime: {e}"))?;
+    runtime
+        .block_on(qbot_app::preflight(loaded, Arc::new(ProcessEnv)))
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 fn main() -> ExitCode {
@@ -62,10 +66,13 @@ fn main() -> ExitCode {
             let logs = qbot_app::logs::LogBuffer::new(qbot_app::logs::KEPT_LINES);
             tracing_subscriber::registry()
                 .with(
-                    tracing_subscriber::fmt::layer().with_filter(
-                        tracing_subscriber::EnvFilter::try_from_default_env()
-                            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-                    ),
+                    tracing_subscriber::fmt::layer()
+                        // Colour codes only on a terminal, not in `docker compose logs`.
+                        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
+                        .with_filter(
+                            tracing_subscriber::EnvFilter::try_from_default_env()
+                                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                        ),
                 )
                 .with(logs.layer())
                 .init();
@@ -127,12 +134,12 @@ fn main() -> ExitCode {
             match check(&loaded) {
                 Ok(()) => {
                     println!(
-                        "ok: configuration is valid, secrets are present, state directories are writable"
+                        "ok: configuration is valid, secrets are present, state directories are writable, and the locale, personas, voice model and backup tools are in place"
                     );
                     ExitCode::SUCCESS
                 }
                 Err(errors) => {
-                    eprint!("{errors}");
+                    eprintln!("{errors}");
                     ExitCode::FAILURE
                 }
             }

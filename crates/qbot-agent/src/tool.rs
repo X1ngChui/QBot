@@ -167,6 +167,8 @@ pub struct ToolCx<'a> {
     pub view: &'a ChatView,
     pub state: &'a RunState,
     pub clock: &'a dyn Clock,
+    /// How chat lines and times are shown to the model, so tool output reads like the chat.
+    pub renderer: &'a dyn qbot_llm::Renderer,
 }
 
 #[async_trait]

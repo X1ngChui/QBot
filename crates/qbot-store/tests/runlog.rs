@@ -332,3 +332,26 @@ async fn a_log_that_breaks_its_own_invariants_is_closed_rather_than_blocking_sta
     );
     db.drop_db().await;
 }
+
+/// An open run whose stored item this image cannot read (written by another image whose `Item`
+/// shape differs) is closed as it is; startup recovery must not fail on a diagnostic record.
+#[tokio::test]
+async fn an_open_run_with_an_unreadable_item_is_closed_rather_than_blocking_startup() {
+    let db = db!();
+    let log = PgRunLog::new(db.pool().clone(), ManualClock::new(T0));
+    let run = log.begin(group(), &addressed()).await.unwrap();
+    sqlx::query("INSERT INTO run_item (run_id, seq, kind, payload) VALUES ($1, 0, 'meta', $2)")
+        .bind(i64::try_from(run.get()).unwrap())
+        .bind(json!({ "Meta": { "SomeVariantThisImageDoesNotKnow": {} } }))
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(log.recover_open_runs().await.unwrap(), 1);
+    let end: Option<String> = sqlx::query_scalar("SELECT end_reason FROM run WHERE run_id = $1")
+        .bind(i64::try_from(run.get()).unwrap())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(end.as_deref(), Some("interrupted"));
+    db.drop_db().await;
+}

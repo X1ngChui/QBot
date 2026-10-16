@@ -531,7 +531,7 @@ async fn a_platform_message_becomes_a_stored_reply_and_commands_change_behaviour
         .unwrap();
     assert_eq!(archived, 1);
 
-    // 4. A non-owner is refused an owner command, in words.
+    // 4. In a muted group a member's command gets no answer either; only owners are answered.
     napcat
         .send(group_message(
             4,
@@ -540,12 +540,12 @@ async fn a_platform_message_becomes_a_stored_reply_and_commands_change_behaviour
         ))
         .await
         .unwrap();
-    let action = next_action(&mut napcat).await;
-    assert_eq!(
-        action["params"]["message"][2]["data"]["text"],
-        " This action needs bot-owner permission."
+    assert!(
+        tokio::time::timeout(Duration::from_millis(800), napcat.next())
+            .await
+            .is_err(),
+        "the bot said nothing in the muted group"
     );
-    accept(&mut napcat, &action, 9003).await;
 
     // Graceful shutdown ends with Ok and flushes usage.
     bot.stop.cancel();

@@ -30,6 +30,7 @@ async fn call(search: Arc<FakeSearch>, query: &str) -> Result<String, ToolError>
         view: &view,
         state: &state,
         clock: &clock,
+        renderer: &qbot_llm::PlainRenderer,
     };
     let out = WebSearchTool::new(search)
         .call(
@@ -110,6 +111,7 @@ async fn read(
         view: &view,
         state: &state,
         clock: &clock,
+        renderer: &qbot_llm::PlainRenderer,
     };
     let out = ReadUrl::new(search, max_chars)
         .call(

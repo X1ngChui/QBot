@@ -41,6 +41,10 @@ pub struct RetryPolicy {
     pub retries: u32,
     pub base: Duration,
     pub jitter: bool,
+    /// Longest one HTTP request may take before it counts as timed out and is tried again. A
+    /// provider that accepts a connection and then sends nothing would otherwise use up the
+    /// whole call's deadline on its first attempt. `None` leaves an attempt to the call deadline.
+    pub attempt_timeout: Option<Duration>,
 }
 
 impl Default for RetryPolicy {
@@ -49,6 +53,7 @@ impl Default for RetryPolicy {
             retries: 2,
             base: Duration::from_millis(500),
             jitter: true,
+            attempt_timeout: None,
         }
     }
 }

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use qbot_agent::{Archive, Effect, HistoryQuery, Tool, ToolCx, ToolError, ToolOutput};
-use qbot_context::Speaker;
+use qbot_context::ChatBatch;
 use qbot_wording::{Text, say};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -91,20 +91,7 @@ impl Tool for SearchHistory {
         if lines.is_empty() {
             return Ok(ToolOutput::text(say(Text::SearchHistoryNoMatches {})));
         }
-        let rendered: Vec<String> = lines
-            .iter()
-            .map(|line| match line.speaker {
-                Speaker::Bot => format!("[msg:{}] bot: {}", line.message.get(), line.text),
-                Speaker::Member { number, .. } => {
-                    format!(
-                        "[msg:{}] member:{}: {}",
-                        line.message.get(),
-                        number.get(),
-                        line.text
-                    )
-                }
-            })
-            .collect();
-        Ok(ToolOutput::text(rendered.join("\n")))
+        // Newest first, each line as the chat shows it.
+        Ok(ToolOutput::text(cx.renderer.chat(&ChatBatch::new(lines))))
     }
 }

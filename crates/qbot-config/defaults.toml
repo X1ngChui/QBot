@@ -63,7 +63,8 @@ spontaneous_chance = 0.0
 
 [history]
 # What a reply is shown of the chat, in batches of lines. Batches are also the unit memory is
-# extracted in.
+# extracted in. Treat it as fixed once a group has memory: after a change, extraction resumes
+# at the next whole batch of the new grid, so up to one batch of lines gets no episode.
 batch_lines = 30
 # The newest batches, shown line by line (counting the one being filled).
 raw_batches = 4

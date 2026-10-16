@@ -139,6 +139,7 @@ fn data() -> ReportData {
         runs: 12,
         runs_addressed: 10,
         runs_wake: 2,
+        runs_spontaneous: 0,
         run_ends: vec![("delivered".into(), 9), ("deadline".into(), 3)],
         error_classes: vec![("timeout".into(), 3)],
         usage: UsageSummary {
@@ -369,7 +370,7 @@ fn the_report_reads_as_a_short_summary() {
     assert_eq!(
         text,
         "Daily report | 2026-10-03\n\
-         Replies: 12 (10 addressed, 2 scheduled)\n\
+         Replies: 12 (10 addressed, 2 scheduled, 0 on its own)\n\
          How runs ended: delivered 9, deadline 3\n\
          Model errors: timeout 3\n\
          Tool calls: 20 (1 not ok)\n\

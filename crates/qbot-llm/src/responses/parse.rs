@@ -115,14 +115,14 @@ pub(crate) fn parse_response(
                         .map_err(|e| {
                             // The start of what came, so the log shows what the model did.
                             let head: String = raw_args.chars().take(120).collect();
-                            LlmError::Protocol(format!(
+                            LlmError::MalformedCall(format!(
                                 "function_call {name} arguments are not JSON ({e}): {head:?}"
                             ))
                         })?;
                 if !arguments.is_object() {
-                    return Err(LlmError::Protocol(
-                        "function_call arguments are not an object".into(),
-                    ));
+                    return Err(LlmError::MalformedCall(format!(
+                        "function_call {name} arguments are not an object"
+                    )));
                 }
                 parts.push(AssistantPart::Call(ToolCall {
                     id,
@@ -201,7 +201,7 @@ fn reasoning_summary(item: &Value) -> Option<String> {
     }
 }
 
-fn parse_usage(usage: Option<&Value>) -> Usage {
+pub(crate) fn parse_usage(usage: Option<&Value>) -> Usage {
     let Some(usage) = usage.filter(|u| u.is_object()) else {
         return Usage {
             input_tokens: 0,

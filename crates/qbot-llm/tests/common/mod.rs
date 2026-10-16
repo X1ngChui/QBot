@@ -85,6 +85,7 @@ pub fn fast_retry() -> RetryPolicy {
         retries: 2,
         base: Duration::from_millis(100),
         jitter: false,
+        attempt_timeout: None,
     }
 }
 

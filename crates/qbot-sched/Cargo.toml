@@ -13,6 +13,7 @@ qbot-core.workspace = true
 qbot-context.workspace = true
 qbot-agent.workspace = true
 async-trait.workspace = true
+futures-util.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util = { workspace = true, features = ["rt"] }

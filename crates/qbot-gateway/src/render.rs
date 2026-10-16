@@ -62,14 +62,23 @@ fn sender_name(raw: &str) -> String {
 /// (so no account numbers), quotes point at messages that are not on screen, and a record inside
 /// a record is not expanded.
 fn render_into(out: &mut String, segments: &[Segment], ctx: &RenderContext, nested: bool) {
-    // Consecutive text is escaped as one run: two pieces must not join into a marker.
+    // Consecutive text is escaped as one run: two pieces must not join into a marker. A
+    // forwarded message is shown on one line, so its line breaks go before escaping: escaping
+    // first and joining after could make `[at` and `:all]` from two lines one marker.
+    let escape = |text: String| {
+        if nested {
+            escape_markers(&text.replace(['\n', '\r'], " "))
+        } else {
+            escape_markers(&text)
+        }
+    };
     let mut typed = String::new();
     for segment in segments {
         if let Segment::Text(text) | Segment::Markdown(text) = segment {
             typed.push_str(text);
             continue;
         }
-        out.push_str(&escape_markers(&std::mem::take(&mut typed)));
+        out.push_str(&escape(std::mem::take(&mut typed)));
         match segment {
             Segment::Text(_) | Segment::Markdown(_) => {}
             Segment::At(Mention::All) => out.push_str("[at:all]"),
@@ -151,7 +160,7 @@ fn render_into(out: &mut String, segments: &[Segment], ctx: &RenderContext, nest
             Segment::Other(kind) => out.push_str(&format!("[unsupported:{}]", label(kind))),
         }
     }
-    out.push_str(&escape_markers(&typed));
+    out.push_str(&escape(typed));
 }
 
 /// A card as its marker. Every value is outside text inside a marker.

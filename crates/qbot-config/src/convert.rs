@@ -12,7 +12,7 @@ use qbot_core::{AccountId, HistoryWindow, SliceGrid};
 use qbot_llm::ReasoningEffort;
 use qbot_llm::embedding::EmbeddingConfig;
 use qbot_llm::net::Route;
-use qbot_llm::responses::{ResponsesConfig, StateMode};
+use qbot_llm::responses::{ResponsesConfig, RetryPolicy, StateMode};
 use qbot_llm::search::TavilyConfig;
 use qbot_media::MediaConfig;
 use qbot_memory::RecallParams;
@@ -34,6 +34,11 @@ const QUEUE_PER_SLOT: usize = 10;
 const TEXT_CALL_DEADLINE: Duration = Duration::from_secs(10 * 60);
 /// Deadline for describing one picture, retries included: a sentence or two.
 const VISION_CALL_DEADLINE: Duration = Duration::from_secs(2 * 60);
+/// One text request: a third of the call deadline, so a request that stalls is tried again
+/// within it.
+const TEXT_ATTEMPT: Duration = Duration::from_secs(200);
+/// One picture request: a description takes a few seconds; a stalled request is tried again.
+const VISION_ATTEMPT: Duration = Duration::from_secs(40);
 
 /// The fixed layout under the configuration and data directories.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,18 +202,28 @@ impl Config {
 
     pub fn text_provider(&self) -> ResponsesConfig {
         let t = &self.providers.text;
+        let base = responses(t.kind, &t.model);
         ResponsesConfig {
             timeout: Some(TEXT_CALL_DEADLINE),
-            ..responses(t.kind, &t.model)
+            retry: RetryPolicy {
+                attempt_timeout: Some(TEXT_ATTEMPT),
+                ..base.retry
+            },
+            ..base
         }
     }
 
     pub fn vision_provider(&self) -> ResponsesConfig {
         let v = &self.providers.vision;
+        let base = responses(v.kind, &v.model);
         ResponsesConfig {
             state: StateMode::Stateless,
             timeout: Some(VISION_CALL_DEADLINE),
-            ..responses(v.kind, &v.model)
+            retry: RetryPolicy {
+                attempt_timeout: Some(VISION_ATTEMPT),
+                ..base.retry
+            },
+            ..base
         }
     }
 

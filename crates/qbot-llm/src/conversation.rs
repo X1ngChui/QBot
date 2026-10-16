@@ -70,6 +70,9 @@ pub trait Renderer: Send + Sync {
     fn summary(&self, text: &str) -> String;
     /// Text prepended to a tool result whose outcome is not a plain success.
     fn outcome_note(&self, outcome: &Outcome) -> Option<String>;
+    /// An instant as tools show it (a task's due time, an episode's span): in the zone the chat
+    /// is shown in, with its offset, so the model never converts between zones.
+    fn time(&self, at: qbot_core::UnixMillis) -> String;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -104,6 +107,12 @@ impl Renderer for PlainRenderer {
             Outcome::Refused(reason) => Some(format!("[refused: {reason:?}]")),
             Outcome::Interrupted => Some("[interrupted: effect unknown]".to_owned()),
         }
+    }
+
+    /// RFC 3339 in UTC.
+    fn time(&self, at: qbot_core::UnixMillis) -> String {
+        jiff::Timestamp::from_millisecond(at.get())
+            .map_or_else(|_| format!("{}ms", at.get()), |t| t.to_string())
     }
 }
 

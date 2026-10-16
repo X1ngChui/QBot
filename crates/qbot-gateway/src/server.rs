@@ -127,6 +127,49 @@ async fn connection(server: GatewayServer, socket: WebSocket) {
     tracing::info!("platform disconnected");
 }
 
+/// How long the platform may be away before it is worth a warning: a restart of NapCat or a
+/// reconnect takes seconds, an expired QQ session lasts until someone logs in again.
+pub const DISCONNECTED_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Warn while no platform connection is attached: after `after`, then every hour, and say when
+/// it is back. Without it, a lasting outage (an expired QQ session, NapCat down) leaves one INFO
+/// line and nothing else, while the bot hears and says nothing.
+pub async fn warn_while_disconnected(
+    bridge: Arc<Bridge>,
+    after: std::time::Duration,
+    cancel: CancellationToken,
+) {
+    let check = (after / 10).max(std::time::Duration::from_millis(10));
+    let mut since = (!bridge.is_connected()).then(tokio::time::Instant::now);
+    let mut next_warning = after;
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            () = tokio::time::sleep(check) => {}
+        }
+        if bridge.is_connected() {
+            if let Some(down) = since.take()
+                && down.elapsed() >= after
+            {
+                tracing::info!(
+                    minutes = down.elapsed().as_secs() / 60,
+                    "the platform is connected again"
+                );
+            }
+            next_warning = after;
+            continue;
+        }
+        let down = *since.get_or_insert_with(tokio::time::Instant::now);
+        if down.elapsed() >= next_warning {
+            tracing::warn!(
+                minutes = down.elapsed().as_secs() / 60,
+                "no platform connection: the bot hears and says nothing until NapCat reconnects"
+            );
+            next_warning += std::time::Duration::from_secs(3600);
+        }
+    }
+}
+
 /// Serve until `cancel` fires. Open connections are closed by the shutdown.
 pub async fn serve(
     listener: TcpListener,
@@ -136,4 +179,71 @@ pub async fn serve(
     axum::serve(listener, server.router())
         .with_graceful_shutdown(async move { cancel.cancelled().await })
         .await
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use tokio_util::sync::CancellationToken;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    use super::*;
+
+    /// Collects the warnings logged while the guard is held.
+    #[derive(Clone, Default)]
+    struct Warnings(Arc<Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(event.metadata().name().to_owned());
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_lasting_outage_is_warned_about_after_ten_minutes_then_hourly() {
+        let warnings = Warnings::default();
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(warnings.clone()));
+        let bridge = Arc::new(Bridge::new());
+        let cancel = CancellationToken::new();
+        let watch = tokio::spawn(warn_while_disconnected(
+            bridge.clone(),
+            DISCONNECTED_WARN_AFTER,
+            cancel.clone(),
+        ));
+        let count = || {
+            warnings
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len()
+        };
+        tokio::time::sleep(Duration::from_secs(9 * 60)).await;
+        assert_eq!(count(), 0, "a short gap is not worth a warning");
+        tokio::time::sleep(Duration::from_secs(2 * 60)).await;
+        assert_eq!(count(), 1, "warned after ten minutes");
+        tokio::time::sleep(Duration::from_secs(30 * 60)).await;
+        assert_eq!(count(), 1, "not again within the hour");
+        tokio::time::sleep(Duration::from_secs(40 * 60)).await;
+        assert_eq!(count(), 2, "then hourly");
+        // Connected: no more warnings.
+        let (out, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let _attached = bridge.attach(out);
+        tokio::time::sleep(Duration::from_secs(3 * 3600)).await;
+        assert_eq!(count(), 2);
+        cancel.cancel();
+        watch.await.unwrap();
+    }
 }

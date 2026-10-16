@@ -191,6 +191,7 @@ wording! {
     "tasks.nothing_to_change" => TasksNothingToChange {},
     "tasks.storage" => TasksStorage {},
     "outcome.failed" => OutcomeFailed { why },
+    "outcome.not_run" => OutcomeNotRun {},
     "outcome.invalid_arguments" => OutcomeInvalidArguments {},
     "outcome.execution" => OutcomeExecution {},
     "outcome.unavailable" => OutcomeUnavailable {},
@@ -283,10 +284,33 @@ impl Text {
         let Some(template) = TEXTS.get(self.key()) else {
             return self.key().to_owned();
         };
-        let mut out = template.clone();
-        for (name, value) in self.slots() {
-            out = out.replace(&format!("{{{name}}}"), value);
+        // One pass over the template: a value is never read again as a slot, so text a member
+        // wrote that happens to contain `{date}` stays as written.
+        let slots = self.slots();
+        let mut out = String::with_capacity(template.len());
+        let mut rest = template.as_str();
+        while let Some(open) = rest.find('{') {
+            out.push_str(&rest[..open]);
+            let after = &rest[open + 1..];
+            let filled = after.find('}').and_then(|close| {
+                let name = &after[..close];
+                slots
+                    .iter()
+                    .find(|(slot, _)| *slot == name)
+                    .map(|(_, value)| (close, value))
+            });
+            match filled {
+                Some((close, value)) => {
+                    out.push_str(value);
+                    rest = &after[close + 1..];
+                }
+                None => {
+                    out.push('{');
+                    rest = after;
+                }
+            }
         }
+        out.push_str(rest);
         out
     }
 }
@@ -361,5 +385,14 @@ mod tests {
             "at most 4 messages can be sent per run, so only 1 more now; nothing was sent"
         );
         assert_eq!(say(Text::StaySilentResult {}), "staying silent");
+        // A value is filled in once and never read again as a slot.
+        let shown = say(Text::PromptPersonNote {
+            text: "bring the {date} cake".to_owned(),
+            date: "2026-10-01".to_owned(),
+        });
+        assert!(
+            shown.contains("bring the {date} cake") && shown.contains("2026-10-01"),
+            "{shown}"
+        );
     }
 }

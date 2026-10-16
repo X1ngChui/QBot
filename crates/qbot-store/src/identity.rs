@@ -718,7 +718,7 @@ impl IdentityStore for PgIdentityStore {
         let ri = holder_row(&mut tx, hi).await?.revision;
         let rt = holder_row(&mut tx, ht).await?.revision;
         if let Err(error) =
-            invitation.check_confirm(confirming, message, now, self.policy.invitation_ttl, ri, rt)
+            invitation.check_confirm(confirming, now, self.policy.invitation_ttl, ri, rt)
         {
             // An expired or stale invitation is closed for good; keep that change.
             let closed = match error {

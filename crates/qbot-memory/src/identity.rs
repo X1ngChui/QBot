@@ -228,8 +228,6 @@ pub enum LinkError {
     Expired,
     #[error("only the invited account can confirm")]
     NotTheTarget,
-    #[error("the confirmation does not come after the invitation")]
-    OutOfOrder,
     #[error(
         "an account involved was linked or split since the invitation, so it no longer applies"
     )]
@@ -241,12 +239,12 @@ impl Invitation {
         now.since(self.created_at) >= ttl
     }
 
-    /// The rules for a confirmation, independent of storage. `confirming_message` is the message
-    /// in which the target confirmed; message ids increase with time.
+    /// The rules for a confirmation, independent of storage. A confirmation cannot be replayed:
+    /// the archive runs each message once, and a confirmed invitation is no longer pending. Message
+    /// ids say nothing about order (the platform's are hashes), so they are not compared.
     pub fn check_confirm(
         &self,
         confirming: AccountId,
-        confirming_message: MessageId,
         now: UnixMillis,
         ttl: Duration,
         initiator_revision: u32,
@@ -260,9 +258,6 @@ impl Invitation {
         }
         if self.is_expired(now, ttl) {
             return Err(LinkError::Expired);
-        }
-        if confirming_message <= self.created_by {
-            return Err(LinkError::OutOfOrder);
         }
         if initiator_revision != self.initiator_revision || target_revision != self.target_revision
         {

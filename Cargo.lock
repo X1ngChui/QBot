@@ -2317,6 +2317,7 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2338,6 +2339,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "httpdate",
+ "jiff",
  "moka",
  "png",
  "proptest",
@@ -2446,6 +2448,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "croner",
+ "futures-util",
  "qbot-agent",
  "qbot-context",
  "qbot-core",

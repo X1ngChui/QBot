@@ -34,7 +34,6 @@ pub fn link_msg(error: &LinkError) -> Msg {
         LinkError::NoInvitation => Msg::LinkNoInvitation {},
         LinkError::Expired => Msg::LinkExpired {},
         LinkError::NotTheTarget => Msg::LinkNotTarget {},
-        LinkError::OutOfOrder => Msg::LinkOutOfOrder {},
         LinkError::Stale => Msg::LinkStale {},
     }
 }

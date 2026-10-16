@@ -169,7 +169,6 @@ link-busy = An account involved already has a pending invitation in this group; 
 link-no_invitation = This account has no pending invitation to confirm in this group.
 link-expired = The invitation has expired; send a new one.
 link-not_target = Only the invited account can confirm.
-link-out_of_order = The confirmation does not come after the invitation.
 link-stale = An account involved changed since the invitation; send a new one.
 link-bot = The bot's own account cannot be linked.
 unlink-not_linked = This account is not linked to any other account, so there is nothing to detach.
@@ -331,7 +330,7 @@ detail-forget =
     /forget group N (owner only)
     Removes what the bot learned on its own: the learned fact numbered N in /who (same scope), or the group knowledge numbered N in /group. Notes people wrote are not affected; use /note for those.
 report-title = Daily report | { $date }
-report-runs = Replies: { $runs } ({ $addressed } addressed, { $wake } scheduled)
+report-runs = Replies: { $runs } ({ $addressed } addressed, { $wake } scheduled, { $spontaneous } on its own)
 report-ends = How runs ended: { $ends }
 report-errors = Model errors: { $errors }
 report-count_entry = { $label } { $count }
