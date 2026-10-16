@@ -518,39 +518,45 @@ the `media_ref` row the platform reference came in.
 Commands run without a model call. Each acts on one kind of information, so no command touches
 two stores.
 
-| Command | Who | Acts on |
-| --- | --- | --- |
-| `/who [--linked] [@m]` | member | everything on record: names, notes written by people, facts learned from chat |
-| `/note` `add` `edit N` `remove N` `clear` | member | notes only |
-| `/name` `add` `remove` | member | names |
-| `/forget N`, `/forget group N` | member / owner | learned memory only: a member's fact, group knowledge |
-| `/group` | member | what the bot learned about the group |
-| `/link`, `/unlink`; `/link @a @b`, `/unlink @a` | member; owner | linking accounts in this group |
-| `/stats`, `/top`, `/help` | member | today's replies and provider calls by work and kind; replies started |
-| `/block [--linked]`, `/mute` | owner, delegated admin | the group's blocks, mute |
-| `/admin`, `/admin add @m`, `/admin remove @m` | owner | the group's delegated admins |
-| `/tasks`, `/members` | owner | the group's tasks, roster |
-| `/runs [N]` | owner | the latest runs, or one run's steps |
-| `/logs [n]` | owner | recent warnings and errors (the last 200) about this group or no group |
+Who may do what, in the group where the command is sent. *Self* is the sender and the accounts
+linked to them in this group; an *ordinary member* is a person of this group none of whose
+accounts linked here is a bot owner's or a delegated admin's.
+
+| Command | Member | Delegated admin (its group only) | Bot owner |
+| --- | --- | --- | --- |
+| `/who [--linked] [@m]`: names, notes, learned facts on record | self | self, ordinary members | anyone |
+| `/note` `add` `edit N` `remove N` `clear` | self | self, ordinary members, except notes a bot owner wrote | anyone |
+| `/name` `add` `remove` | self | self, ordinary members | anyone |
+| `/forget [--linked] [@m] N`: a learned fact | self | self, ordinary members | anyone |
+| `/forget group N`: group knowledge | no | no | yes |
+| `/group`, `/stats`, `/top`, `/help` | yes | yes | yes |
+| `/stats global` | no | no | yes |
+| `/link @m`, `/link confirm`, `/link cancel`, `/unlink` | self | self | self |
+| `/link @a @b`, `/unlink @m` | no | no | yes |
+| `/mute`, `/block [--linked]` | no | ordinary members; never a bot owner's block | yes; the bot and bot owners cannot be blocked |
+| `/members`: the roster | no | yes | yes |
+| `/admin`, `/admin add @m`, `/admin remove @m` | no | no | yes |
+| `/tasks`, `/runs [N]`, `/logs [n]` | no | no | yes |
 
 Replies quote the command, mention the sender, and are split at QQ's 2,000-character message
 limit. Mute and block hold for commands as for runs: in a muted group only bot owners are
 answered, and delegated admins for `/mute` and `/block` (so `/mute off` works), and a blocked
 member gets no answer and so cannot write notes either.
 
-**Authority** has three levels and is not taken from QQ's own group roles. *Bot owners*
-(`owners` in the configuration) may do everything everywhere. A *delegated admin* is an account
-a bot owner made one with `/admin add` in one group (`group_admin`); there, and only there, it may
-use `/mute` and `/block`, and nothing else owner-only: it cannot change the admin list, so
-delegated authority never passes itself on. It blocks only ordinary members: not the bot, a bot
-owner (nor a bot owner's account linked to them in the group) or another delegated admin. Lower
-authority never overrides higher: each block records whether a bot owner set it
-(`group_block.by_owner`), a delegated admin can neither change nor lift a bot owner's block in
-force, and a bot owner can change or lift any block (taking it over). The grant belongs to that account alone: a
-linked account, in the group or elsewhere, gets nothing from it. Everyone else is a *member*.
-Whether the sender is a delegated admin is read from the database, and only for the commands it
-can matter to; when it cannot be read, nothing is granted. Members act on their own accounts and those linked to them in the group, owners on anyone. A member's name in a reply is
-their current group display name, read live from the platform.
+**Authority** has three levels and is not taken from QQ's own group roles: bot owner > delegated
+admin > member. *Bot owners* (`owners` in the configuration) may do everything everywhere. A
+*delegated admin* is an account a bot owner made one with `/admin add` in one group
+(`group_admin`); there, and only there, it may manage the group's ordinary members as the table
+says. It never gains what is global or about how the bot runs (`/stats global`, `/tasks`,
+`/runs`, `/logs`, identity links of others), never changes the admin list (so delegated
+authority never passes itself on), and never acts on a bot owner or another delegated admin,
+counting the accounts linked to them in the group. Lower authority never undoes higher: a
+delegated admin can neither change nor lift a bot owner's block (`group_block.by_owner`) nor
+change or remove a note a bot owner wrote, while a bot owner can change anything. The grant
+belongs to that account alone: a linked account, in the group or elsewhere, gets nothing from
+it. Whether the sender is a delegated admin is read from the database, and only for the
+commands it can matter to; when it cannot be read, nothing is granted. A member's name in a
+reply is their current group display name, read live from the platform.
 
 ## 13. Configuration
 

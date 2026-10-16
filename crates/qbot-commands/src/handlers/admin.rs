@@ -6,7 +6,7 @@ use qbot_i18n::Msg;
 use qbot_memory::AliasStatus;
 use qbot_store::BlockedBy;
 
-use super::{Reply, period_start};
+use super::{Rank, Reply, period_start};
 use crate::args;
 use crate::fail::Fail;
 use crate::router::Cx;
@@ -120,16 +120,22 @@ async fn block_accounts(cx: &Cx<'_>, target: AccountId, all: bool) -> Result<Vec
     }
 }
 
-/// What a delegated admin may not do to these accounts: change or lift a bot owner's block
-/// (authority never overrides a higher one), or block another delegated admin. Bot owners may do
+/// What a delegated admin may not do: block or unblock anyone but an ordinary member (the
+/// person `target` belongs to here holds no bot owner's or delegated admin's account), or change
+/// or lift a bot owner's block (lower authority never overrides higher). Bot owners may do
 /// anything. Checked for every account before any is touched.
 async fn delegated_may_act_on(
     cx: &Cx<'_>,
+    target: AccountId,
     accounts: &[AccountId],
-    adding: bool,
 ) -> Result<(), Fail> {
     if cx.owner {
         return Ok(());
+    }
+    match cx.rank_of(target).await? {
+        Rank::Member => {}
+        Rank::BotOwner => return Err(Msg::BlockCannot {}.into()),
+        Rank::DelegatedAdmin => return Err(Msg::BlockDelegatedTarget {}.into()),
     }
     let rules = cx.deps.admin.blocks(cx.group()).await?;
     for account in accounts {
@@ -141,9 +147,6 @@ async fn delegated_may_act_on(
                 label: cx.name_of(*account).await,
             }
             .into());
-        }
-        if adding && cx.deps.admin.is_admin(cx.group(), *account).await? {
-            return Err(Msg::BlockDelegatedTarget {}.into());
         }
     }
     Ok(())
@@ -189,7 +192,7 @@ pub(crate) async fn block(cx: &Cx<'_>) -> Reply {
             return Err(Msg::UsageBlockRemove {}.into());
         }
         let accounts = block_accounts(cx, target, all).await?;
-        delegated_may_act_on(cx, &accounts, false).await?;
+        delegated_may_act_on(cx, target, &accounts).await?;
         let mut removed = false;
         for account in accounts {
             removed |= cx
@@ -209,11 +212,10 @@ pub(crate) async fn block(cx: &Cx<'_>) -> Reply {
         return Err(Msg::UsageBlockAdd {}.into());
     }
     let accounts = block_accounts(cx, target, all).await?;
-    let own = cx.linked_accounts(target).await?;
-    if target == cx.deps.settings.bot || own.iter().any(|a| cx.is_owner(*a)) {
+    if target == cx.deps.settings.bot || cx.rank_of(target).await? == Rank::BotOwner {
         return Err(Msg::BlockCannot {}.into());
     }
-    delegated_may_act_on(cx, &accounts, true).await?;
+    delegated_may_act_on(cx, target, &accounts).await?;
     let until = match rest.first() {
         None => None,
         Some(text) => {

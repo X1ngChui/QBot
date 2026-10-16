@@ -4,6 +4,7 @@
 writing-language = English
 command-owner_only = This action needs bot-owner permission.
 command-delegated_only = This action needs bot-owner permission, or to be an admin a bot owner delegated in this group.
+command-delegated_target = A delegated admin can act only on ordinary members of this group, not on a bot owner or another delegated admin.
 command-authority_unknown = Could not check your permissions just now, so nothing was done; try again.
 command-outcome_unknown = Could not confirm the result of that action. It may or may not have happened; check before repeating it.
 command-unknown_account = That account has no record yet, so this cannot be done.
@@ -79,13 +80,13 @@ help-detail =
 what-who = Show what is on record about a member
 detail-who =
     /who [--linked] [@account]
-    Shows names, notes people wrote, and what the bot learned from chat, each numbered separately. Shows the exact account by default; --linked includes its linked accounts.
+    Shows names, notes people wrote, and what the bot learned from chat, each numbered separately. Shows the exact account by default; --linked includes its linked accounts. Members see their own record; delegated admins also ordinary members' in this group; owners anyone's.
 what-name = Manage the names a member is called by
 detail-name =
     /name [--linked] [@account]
     /name add [--linked] [@account] name
     /name remove [--linked] [@account] name
-    Names are backed by evidence; a name added by hand counts as confirmed. --linked applies to the person behind all linked accounts.
+    Names are backed by evidence; a name added by hand counts as confirmed. --linked applies to the person behind all linked accounts. Members manage their own names; delegated admins also ordinary members' in this group; owners anyone's.
 what-note = Manage notes people wrote about a member
 detail-note =
     /note [--linked] [@account]
@@ -93,22 +94,23 @@ detail-note =
     /note edit [--linked] [@account] N text
     /note remove [--linked] [@account] N
     /note clear [--linked] [@account]
-    Notes are written by hand and kept exactly as written; the bot can read them but never changes them, and they are separate from what it learns from chat (see /forget). Members manage notes about their own accounts; owners about anyone. Numbers come from /note or /who in the same scope.
-what-admin = Choose who may manage /mute and /block here
+    Notes are written by hand and kept exactly as written; the bot can read them but never changes them, and they are separate from what it learns from chat (see /forget). Members manage notes about their own accounts; delegated admins also about ordinary members in this group, except notes a bot owner wrote; owners about anyone. Numbers come from /note or /who in the same scope.
+what-admin = Choose this group's delegated admins
 detail-admin =
     /admin
     /admin add @account
     /admin remove @account
-    Delegated admins may use /mute and /block in this group only. Only a bot owner adds or removes them; the permission belongs to that account alone, not to accounts linked to it.
+    In this group only, a delegated admin may use /mute, /block and /members, and manage the names, notes and learned facts of ordinary members (/who, /name, /note, /forget); never of a bot owner or another delegated admin, and never a bot owner's notes or blocks. Only a bot owner adds or removes delegated admins; the permission belongs to that account alone, not to accounts linked to it.
 usage-admin = Usage: /admin, /admin add @account or /admin remove @account
 admin-list_empty = This group has no delegated admins.
-admin-list_header = Delegated admins of this group (may use /mute and /block here):
+admin-list_header = Delegated admins of this group:
 admin-list_row = - { $label }
-admin-added = { $label } is now a delegated admin of this group and may use /mute and /block here.
+admin-added = { $label } is now a delegated admin of this group (see /help admin for what that allows).
 admin-already = { $label } is already a delegated admin of this group.
 admin-removed = { $label } is no longer a delegated admin of this group.
 admin-remove_none = { $label } is not a delegated admin of this group.
 admin-bot = The bot cannot be an admin.
+note-owner_authored = A bot owner wrote that note; only a bot owner or the member it is about can change or remove it.
 admin-bot_owner = Bot owners already have every permission.
 what-link = Confirm your linked accounts
 detail-link =
@@ -350,7 +352,7 @@ what-forget = Remove something the bot learned from chat
 detail-forget =
     /forget [--linked] [@account] N
     /forget group N (owner only)
-    Removes what the bot learned on its own: the learned fact numbered N in /who (same scope), or the group knowledge numbered N in /group. Notes people wrote are not affected; use /note for those.
+    Removes what the bot learned on its own: the learned fact numbered N in /who (same scope), or the group knowledge numbered N in /group. Notes people wrote are not affected; use /note for those. Members forget what was learned about them; delegated admins also about ordinary members in this group; owners about anyone.
 report-title = Daily report | { $date }
 report-runs = Replies: { $runs } ({ $addressed } addressed, { $wake } scheduled, { $spontaneous } on its own)
 report-ends = How runs ended: { $ends }

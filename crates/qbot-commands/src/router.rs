@@ -91,10 +91,10 @@ pub struct CommandRouter {
     deps: Deps,
 }
 
-/// Who a command's sender is. A delegated admin is told apart only for the commands they may
-/// use; `Unknown` is a store that could not say, which grants nothing.
+/// Who a command's sender is. A delegated admin is told apart only for the commands where it
+/// matters; `Unknown` is a store that could not say, which grants nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Standing {
+pub(crate) enum Standing {
     BotOwner,
     DelegatedAdmin,
     Member,
@@ -105,7 +105,9 @@ enum Standing {
 pub(crate) struct Cx<'a> {
     pub deps: &'a Deps,
     pub req: &'a CommandRequest,
+    /// The sender is a bot owner.
     pub owner: bool,
+    pub standing: Standing,
 }
 
 impl Cx<'_> {
@@ -158,7 +160,7 @@ impl CommandRouter {
         if self.deps.settings.owners.contains(&req.sender) {
             return Standing::BotOwner;
         }
-        if !command.delegated() {
+        if !command.delegated() && !command.targets_members() {
             return Standing::Member;
         }
         match self.deps.admin.is_admin(req.group, req.sender).await {
@@ -196,6 +198,7 @@ impl CommandRouter {
             deps: &self.deps,
             req,
             owner: standing == Standing::BotOwner,
+            standing,
         };
         match command {
             Command::Help => handlers::help(&cx).await,
@@ -222,7 +225,7 @@ impl CommandRouter {
     /// owners are answered, and the group's delegated admins for `/mute` and `/block` (so they
     /// can unmute it); a blocked member is not answered, as neither gets a reply from a run. A
     /// store that cannot say whether the group is muted or the sender blocked silences no one.
-    async fn ignored(&self, req: &CommandRequest, standing: Standing) -> bool {
+    async fn ignored(&self, command: Command, req: &CommandRequest, standing: Standing) -> bool {
         if standing == Standing::BotOwner {
             return false;
         }
@@ -238,14 +241,14 @@ impl CommandRouter {
                 false
             }
         };
-        blocked || (muted && standing != Standing::DelegatedAdmin)
+        blocked || (muted && !(standing == Standing::DelegatedAdmin && command.manages_admission()))
     }
 
     /// The reply text for a request, or `None` when the command is not answered.
     pub async fn respond(&self, req: &CommandRequest) -> Option<String> {
         let command = Command::from_word(&req.word)?;
         let standing = self.standing(command, req).await;
-        if self.ignored(req, standing).await {
+        if self.ignored(command, req, standing).await {
             tracing::debug!(
                 group = req.group.get(),
                 command = command.name(),

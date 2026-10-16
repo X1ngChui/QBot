@@ -101,7 +101,22 @@ impl Command {
 
     /// Owner-only commands a bot owner's delegated admin of a group may also use there.
     pub fn delegated(self) -> bool {
+        matches!(self, Command::Mute | Command::Block | Command::Members)
+    }
+
+    /// The commands a delegated admin is answered for in a muted group: those that manage who
+    /// the bot answers, so the group can be unmuted.
+    pub fn manages_admission(self) -> bool {
         matches!(self, Command::Mute | Command::Block)
+    }
+
+    /// Commands that act on a member (`@account`, else the sender), where a delegated admin
+    /// may reach the group's ordinary members.
+    pub fn targets_members(self) -> bool {
+        matches!(
+            self,
+            Command::Who | Command::Note | Command::Name | Command::Forget
+        )
     }
 
     pub fn category(self) -> Category {

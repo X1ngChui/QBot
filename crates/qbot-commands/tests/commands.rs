@@ -476,7 +476,7 @@ async fn help_lists_commands_by_category_and_explains_one() {
         "{all}"
     );
     assert!(
-        all.contains("/admin  Choose who may manage /mute and /block here (owner only)"),
+        all.contains("/admin  Choose this group's delegated admins (owner only)"),
         "{all}"
     );
     assert!(
@@ -503,14 +503,14 @@ async fn help_lists_commands_by_category_and_explains_one() {
 #[tokio::test]
 async fn owner_only_commands_are_refused_for_members() {
     let rig = rig().await;
-    for text in ["/members", "/tasks", "/runs", "/logs", "/admin"] {
+    for text in ["/tasks", "/runs", "/logs", "/admin"] {
         assert_eq!(
             rig.say(ALICE, text, &[]).await,
             "This action needs bot-owner permission.",
             "{text}"
         );
     }
-    for text in ["/mute on", "/block"] {
+    for text in ["/mute on", "/block", "/members"] {
         assert_eq!(rig.say(ALICE, text, &[]).await, DELEGATED_ONLY, "{text}");
     }
     assert_eq!(
@@ -1437,7 +1437,7 @@ async fn owners_grant_list_and_revoke_delegated_admins_per_group() {
     );
     assert_eq!(
         rig.say(OWNER, "/admin add", &[ADAM]).await,
-        "Adam is now a delegated admin of this group and may use /mute and /block here."
+        "Adam is now a delegated admin of this group (see /help admin for what that allows)."
     );
     assert_eq!(
         rig.say(OWNER, "/admin add", &[ADAM]).await,
@@ -1445,7 +1445,7 @@ async fn owners_grant_list_and_revoke_delegated_admins_per_group() {
     );
     assert_eq!(
         rig.say(OWNER, "/admin", &[]).await,
-        "Delegated admins of this group (may use /mute and /block here):\n- Adam"
+        "Delegated admins of this group:\n- Adam"
     );
     assert_eq!(
         rig.say_in(901, OWNER, "/admin", &[]).await,
@@ -1526,7 +1526,7 @@ async fn a_delegated_admin_mutes_and_blocks_in_their_group_and_nothing_more() {
         rig.say(ADAM, "/admin", &[]).await,
         "This action needs bot-owner permission."
     );
-    for text in ["/tasks", "/members", "/runs", "/logs", "/stats global"] {
+    for text in ["/tasks", "/runs", "/logs", "/stats global"] {
         assert_eq!(
             rig.say(ADAM, text, &[]).await,
             "This action needs bot-owner permission.",
@@ -1687,5 +1687,244 @@ async fn a_bot_owners_block_is_not_a_delegated_admins_to_change_or_lift() {
         rig.say(OWNER, "/block remove", &[BOB])
             .await
             .starts_with("Removed the reply block: Bob")
+    );
+}
+
+const ADMIN_TARGET: &str = "A delegated admin can act only on ordinary members of this group, not on a bot owner or another delegated admin.";
+const OWN_ONLY: &str =
+    "You can only act on your own account or on accounts you have confirmed as linked.";
+
+#[tokio::test]
+async fn members_act_on_themselves_and_nobody_else() {
+    use qbot_memory::facts::FactStore;
+    let rig = rig().await;
+    rig.facts
+        .observe(&observation(ALICE, "likes", "cats", 1))
+        .await
+        .unwrap();
+    assert_eq!(
+        rig.say(ALICE, "/note add likes cats", &[]).await,
+        "Added note 1 about Alice."
+    );
+    assert!(
+        rig.say(ALICE, "/name add Ali", &[])
+            .await
+            .starts_with("Recorded: Alice")
+    );
+    assert!(
+        rig.say(ALICE, "/who", &[])
+            .await
+            .contains("Account record | Alice")
+    );
+    assert_eq!(
+        rig.say(ALICE, "/forget 1", &[]).await,
+        "Forgot 1. likes: cats."
+    );
+    for text in [
+        "/who",
+        "/note add hi",
+        "/name add Bobby",
+        "/forget 1",
+        "/note",
+    ] {
+        assert_eq!(rig.say(ALICE, text, &[BOB]).await, OWN_ONLY, "{text}");
+    }
+}
+
+#[tokio::test]
+async fn a_delegated_admin_manages_ordinary_members_of_its_group() {
+    use qbot_memory::facts::FactStore;
+    let rig = rig().await;
+    rig.say(OWNER, "/admin add", &[ADAM]).await;
+    rig.facts
+        .observe(&observation(BOB, "likes", "tea", 1))
+        .await
+        .unwrap();
+    assert!(
+        rig.say(ADAM, "/who", &[BOB])
+            .await
+            .contains("Account record | Bob")
+    );
+    assert_eq!(
+        rig.say(ADAM, "/note add keeps the group rules", &[BOB])
+            .await,
+        "Added note 1 about Bob."
+    );
+    assert_eq!(
+        rig.say(ADAM, "/note edit 1 keeps the rules well", &[BOB])
+            .await,
+        "Changed note 1."
+    );
+    assert!(
+        rig.say(ADAM, "/note remove 1", &[BOB])
+            .await
+            .starts_with("Removed note 1")
+    );
+    assert_eq!(
+        rig.say(ADAM, "/name add Bobby", &[BOB]).await,
+        "Recorded: Bob is also called \"Bobby\"."
+    );
+    assert_eq!(
+        rig.say(ADAM, "/name remove Bobby", &[BOB]).await,
+        "Removed the name \"Bobby\" from Bob."
+    );
+    assert_eq!(
+        rig.say(ADAM, "/forget 1", &[BOB]).await,
+        "Forgot 1. likes: tea."
+    );
+    assert!(
+        rig.say(ADAM, "/members", &[])
+            .await
+            .contains("members on record")
+    );
+    // A note an admin or the member wrote is the admin's to manage; a bot owner's is not.
+    rig.say(OWNER, "/note add trusted with the keys", &[ALICE])
+        .await;
+    rig.say(ADAM, "/note add new here", &[ALICE]).await;
+    let protected = "A bot owner wrote that note; only a bot owner or the member it is about can change or remove it.";
+    assert_eq!(rig.say(ADAM, "/note edit 1 x", &[ALICE]).await, protected);
+    assert_eq!(rig.say(ADAM, "/note remove 1", &[ALICE]).await, protected);
+    assert_eq!(rig.say(ADAM, "/note clear", &[ALICE]).await, protected);
+    assert_eq!(
+        rig.say(ADAM, "/note edit 2 settling in", &[ALICE]).await,
+        "Changed note 2."
+    );
+    assert!(
+        rig.say(ALICE, "/note remove 1", &[])
+            .await
+            .starts_with("Removed note 1"),
+        "the member it is about may"
+    );
+}
+
+#[tokio::test]
+async fn a_delegated_admin_has_no_reach_outside_its_group() {
+    let rig = rig().await;
+    rig.say(OWNER, "/admin add", &[ADAM]).await;
+    for text in ["/who", "/note add hi", "/name add Bobby", "/forget 1"] {
+        assert_eq!(
+            rig.say_in(901, ADAM, text, &[BOB]).await,
+            OWN_ONLY,
+            "{text}"
+        );
+    }
+    assert_eq!(rig.say_in(901, ADAM, "/members", &[]).await, DELEGATED_ONLY);
+    // An account linked to the admin, here or elsewhere, has no admin reach.
+    rig.say_in(901, OWNER, "/link", &[ADAM, CAROL]).await;
+    rig.say(OWNER, "/link", &[ADAM, ALICE]).await;
+    for sender in [CAROL, ALICE] {
+        assert_eq!(rig.say(sender, "/note add hi", &[BOB]).await, OWN_ONLY);
+    }
+}
+
+#[tokio::test]
+async fn a_delegated_admin_takes_no_owner_level_action() {
+    let rig = rig().await;
+    rig.say(OWNER, "/admin add", &[ADAM]).await;
+    for text in [
+        "/tasks",
+        "/runs",
+        "/logs",
+        "/stats global",
+        "/forget group 1",
+    ] {
+        assert_eq!(
+            rig.say(ADAM, text, &[]).await,
+            "This action needs bot-owner permission.",
+            "{text}"
+        );
+    }
+    for (text, mentions) in [("/admin add", &[ALICE][..]), ("/admin remove", &[ADAM][..])] {
+        assert_eq!(
+            rig.say(ADAM, text, mentions).await,
+            "This action needs bot-owner permission.",
+            "{text}"
+        );
+    }
+    assert_eq!(
+        rig.say(ADAM, "/link", &[ALICE, BOB]).await,
+        "Linking two other accounts directly needs bot-owner permission; use /link @account to invite."
+    );
+    assert_eq!(
+        rig.say(ADAM, "/unlink", &[BOB]).await,
+        "Detaching another account needs bot-owner permission; /unlink detaches only your own."
+    );
+}
+
+#[tokio::test]
+async fn a_delegated_admin_cannot_manage_bot_owners_or_other_admins() {
+    let rig = rig().await;
+    rig.say(OWNER, "/admin add", &[ADAM]).await;
+    rig.say(OWNER, "/admin add", &[AVA]).await;
+    for target in [OWNER, AVA] {
+        for text in ["/who", "/note", "/note add hi", "/name add X", "/forget 1"] {
+            assert_eq!(
+                rig.say(ADAM, text, &[target]).await,
+                ADMIN_TARGET,
+                "{text} {target}"
+            );
+        }
+    }
+    // A bot owner's or another admin's account linked to them here counts as them.
+    rig.say(OWNER, "/link", &[OWNER, CAROL]).await;
+    rig.say(OWNER, "/link", &[AVA, BOB]).await;
+    for target in [CAROL, BOB] {
+        assert_eq!(rig.say(ADAM, "/note add hi", &[target]).await, ADMIN_TARGET);
+    }
+    assert_eq!(
+        rig.say(ADAM, "/block add", &[BOB]).await,
+        "A delegated admin can block only ordinary members, not another delegated admin."
+    );
+    assert_eq!(
+        rig.say(ADAM, "/block add", &[CAROL]).await,
+        "The bot and bot owners cannot be blocked."
+    );
+    // An admin still manages themselves.
+    assert_eq!(
+        rig.say(ADAM, "/note add my own note", &[]).await,
+        "Added note 1 about Adam."
+    );
+    // In a muted group none of it is answered.
+    rig.say(OWNER, "/mute on", &[]).await;
+    assert!(
+        rig.router
+            .respond(&rig.request(ADAM, "/note add hi", &[ALICE]))
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn bot_owners_keep_full_authority_over_everyone() {
+    let rig = rig().await;
+    rig.say(OWNER, "/admin add", &[ADAM]).await;
+    rig.say(ADAM, "/note add written by an admin", &[ALICE])
+        .await;
+    assert_eq!(
+        rig.say(OWNER, "/note remove 1", &[ALICE]).await,
+        "Removed note 1: written by an admin"
+    );
+    assert_eq!(
+        rig.say(OWNER, "/note add about an admin", &[ADAM]).await,
+        "Added note 1 about Adam."
+    );
+    assert!(
+        rig.say(OWNER, "/who", &[ADAM])
+            .await
+            .contains("Account record | Adam")
+    );
+    assert_eq!(
+        rig.say(OWNER, "/name add Ad", &[ADAM]).await,
+        "Recorded: Adam is also called \"Ad\"."
+    );
+    assert!(
+        rig.say(OWNER, "/block add", &[ADAM])
+            .await
+            .starts_with("Blocked replies to Adam")
+    );
+    assert!(
+        rig.say_in(901, OWNER, "/who", &[ALICE])
+            .await
+            .contains("Account record | Alice")
     );
 }

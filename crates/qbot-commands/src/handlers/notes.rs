@@ -51,6 +51,19 @@ fn all_flag<'a>(words: &'a [&'a str]) -> (bool, &'a [&'a str]) {
     }
 }
 
+/// A delegated admin managing someone else's notes may not change or remove what a bot owner
+/// wrote: lower authority never undoes higher. The member the notes are about, and bot owners,
+/// may.
+async fn may_change(cx: &Cx<'_>, account: AccountId, notes: &[&Note]) -> Result<(), Fail> {
+    if cx.owner || !cx.on_someone_else(account).await? {
+        return Ok(());
+    }
+    if notes.iter().any(|note| cx.is_owner(note.author)) {
+        return Err(Msg::NoteOwnerAuthored {}.into());
+    }
+    Ok(())
+}
+
 fn pick<'n>(notes: &'n [Note], number: &str) -> Result<(u64, &'n Note), Fail> {
     let index = args::positive(number)?;
     notes
@@ -113,6 +126,7 @@ pub(crate) async fn note(cx: &Cx<'_>) -> Reply {
             let account = subject(cx).await?;
             let notes = scoped(cx, account, all).await?;
             let (index, note) = pick(&notes, number)?;
+            may_change(cx, account, &[note]).await?;
             let changed = cx
                 .deps
                 .notes
@@ -138,6 +152,7 @@ pub(crate) async fn note(cx: &Cx<'_>) -> Reply {
             let account = subject(cx).await?;
             let notes = scoped(cx, account, all).await?;
             let (index, note) = pick(&notes, number)?;
+            may_change(cx, account, &[note]).await?;
             let removed = cx
                 .deps
                 .notes
@@ -163,6 +178,8 @@ pub(crate) async fn note(cx: &Cx<'_>) -> Reply {
             } else {
                 vec![account]
             };
+            let notes = scoped(cx, account, all).await?;
+            may_change(cx, account, &notes.iter().collect::<Vec<_>>()).await?;
             let count = cx
                 .deps
                 .notes

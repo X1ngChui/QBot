@@ -2,6 +2,7 @@
 writing-language = Simplified Chinese
 command-owner_only = 该操作需要 bot owner 权限。
 command-delegated_only = 该操作需要 bot owner 权限，或由 bot owner 授权的本群管理员身份。
+command-delegated_target = 授权管理员只能操作本群的普通成员，不能操作 bot owner 或其他授权管理员。
 command-authority_unknown = 暂时无法确认你的权限，未执行任何操作，请稍后再试。
 command-outcome_unknown = 未能确认操作结果，可能已经生效，也可能没有，请先确认再重试。
 command-unknown_account = 目标账号暂无资料，无法执行此操作。
@@ -69,13 +70,13 @@ help-detail =
 what-who = 查看成员的资料
 detail-who =
     /who [--linked] [@账号]
-    显示称呼、人工备注和从聊天中自动归纳的内容，各自分别编号。默认查看当前精确账号；--linked 包括关联账号。
+    显示称呼、人工备注和从聊天中自动归纳的内容，各自分别编号。默认查看当前精确账号；--linked 包括关联账号。成员查看自己的记录；授权管理员还可查看本群普通成员的；owner 可查看任何人的。
 what-name = 管理成员的称呼
 detail-name =
     /name [--linked] [@账号]
     /name add [--linked] [@账号] 称呼
     /name remove [--linked] [@账号] 称呼
-    称呼由证据支撑；手动添加的称呼视为已确认。--linked 作用于所有关联账号背后的同一个人。
+    称呼由证据支撑；手动添加的称呼视为已确认。--linked 作用于所有关联账号背后的同一个人。成员管理自己的称呼；授权管理员还可管理本群普通成员的；owner 可管理任何人的。
 what-note = 管理人工备注
 detail-note =
     /note [--linked] [@账号]
@@ -83,22 +84,23 @@ detail-note =
     /note edit [--linked] [@账号] 编号 内容
     /note remove [--linked] [@账号] 编号
     /note clear [--linked] [@账号]
-    备注由人手写，按原文保存；bot 可以读到但不会修改，也与它从聊天中学到的内容分开（见 /forget）。成员管理自己账号的备注，owner 可管理任何人的。编号来自同一范围的 /note 或 /who。
-what-admin = 设置谁可以在本群管理 /mute 和 /block
+    备注由人手写，按原文保存；bot 可以读到但不会修改，也与它从聊天中学到的内容分开（见 /forget）。成员管理自己账号的备注；授权管理员还可管理本群普通成员的备注（bot owner 写的除外）；owner 可管理任何人的。编号来自同一范围的 /note 或 /who。
+what-admin = 设置本群的授权管理员
 detail-admin =
     /admin
     /admin add @账号
     /admin remove @账号
-    授权管理员只能在本群使用 /mute 和 /block。只有 bot owner 能添加或移除授权管理员；权限只属于该账号本身，不随关联账号转移。
+    授权管理员只在本群有效：可使用 /mute、/block 和 /members，并管理普通成员的称呼、备注和自动归纳内容（/who、/name、/note、/forget）；不能操作 bot owner 或其他授权管理员，也不能改动 bot owner 写的备注或设置的屏蔽。只有 bot owner 能添加或移除授权管理员；权限只属于该账号本身，不随关联账号转移。
 usage-admin = 用法：/admin、/admin add @账号 或 /admin remove @账号
 admin-list_empty = 本群没有授权管理员。
-admin-list_header = 本群的授权管理员（可在本群使用 /mute 和 /block）：
+admin-list_header = 本群的授权管理员：
 admin-list_row = - { $label }
-admin-added = 已将 { $label } 设为本群授权管理员，可在本群使用 /mute 和 /block。
+admin-added = 已将 { $label } 设为本群授权管理员（权限范围见 /help admin）。
 admin-already = { $label } 已经是本群授权管理员。
 admin-removed = { $label } 不再是本群授权管理员。
 admin-remove_none = { $label } 不是本群授权管理员。
 admin-bot = 机器人不能成为管理员。
+note-owner_authored = 这条备注由 bot owner 写下，只有 bot owner 或备注所指的成员本人能修改或删除。
 admin-bot_owner = bot owner 已拥有全部权限。
 what-link = 确认自己的关联账号
 detail-link =
@@ -381,7 +383,7 @@ what-forget = 删除 bot 从聊天中自动学到的内容
 detail-forget =
     /forget [--linked] [@账号] 编号
     /forget group 编号（仅 owner）
-    删除 bot 自己学到的内容：/who 中同一范围的第 N 条自动归纳，或 /group 中的第 N 条群知识。不影响人工备注；备注请用 /note 管理。
+    删除 bot 自己学到的内容：/who 中同一范围的第 N 条自动归纳，或 /group 中的第 N 条群知识。不影响人工备注；备注请用 /note 管理。成员删除关于自己的内容；授权管理员还可删除本群普通成员的；owner 可删除任何人的。
 report-title = 每日报告｜{ $date }
 report-runs = 回复：{ $runs } 次（被叫 { $addressed }，定时 { $wake }，主动 { $spontaneous }）
 report-ends = 结束方式：{ $ends }

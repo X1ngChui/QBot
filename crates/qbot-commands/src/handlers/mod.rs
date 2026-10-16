@@ -12,7 +12,7 @@ use qbot_i18n::Msg;
 
 use crate::args;
 use crate::fail::Fail;
-use crate::router::Cx;
+use crate::router::{Cx, Standing};
 
 pub(crate) use admin::{admin, block, members, mute, stats, top};
 pub(crate) use identity::{link, unlink};
@@ -22,6 +22,15 @@ pub(crate) use profile::{forget, group, help, name, who};
 pub(crate) use tasks::tasks;
 
 pub(crate) type Reply = Result<String, Fail>;
+
+/// Where a person of this group stands, judged by every account linked to theirs here: one bot
+/// owner's or delegated admin's account makes the whole person one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Rank {
+    BotOwner,
+    DelegatedAdmin,
+    Member,
+}
 
 impl Cx<'_> {
     /// Keep a reply to one message.
@@ -36,21 +45,58 @@ impl Cx<'_> {
         Ok(self.deps.identity.linked(self.group(), account).await?)
     }
 
-    /// Who a command acts on: the one mentioned account, or the sender. Members may only act
-    /// on themselves and their confirmed links; owners may act on anyone.
+    /// Where the person `account` belongs to stands in this group.
+    pub async fn rank_of(&self, account: AccountId) -> Result<Rank, Fail> {
+        let person = self.linked_accounts(account).await?;
+        if person.iter().any(|a| self.is_owner(*a)) {
+            return Ok(Rank::BotOwner);
+        }
+        for a in &person {
+            if self.deps.admin.is_admin(self.group(), *a).await? {
+                return Ok(Rank::DelegatedAdmin);
+            }
+        }
+        Ok(Rank::Member)
+    }
+
+    /// Who a command acts on: the one mentioned account, or the sender. Everyone may act on
+    /// themselves and the accounts linked to them here; a delegated admin also on the group's
+    /// ordinary members (never a bot owner or another delegated admin); a bot owner on anyone.
     pub async fn target(&self) -> Result<AccountId, Fail> {
         let mentions = &self.req.mentions;
         if mentions.len() > 1 {
             return Err(Msg::MentionsMax { max: 1 }.into());
         }
         let account = mentions.first().copied().unwrap_or(self.req.sender);
-        if !self.owner && account != self.req.sender {
-            let own = self.linked_accounts(self.req.sender).await?;
-            if !own.contains(&account) {
-                return Err(Msg::OwnAccountsOnly {}.into());
-            }
+        if self.owner
+            || account == self.req.sender
+            || self
+                .linked_accounts(self.req.sender)
+                .await?
+                .contains(&account)
+        {
+            return Ok(account);
         }
-        Ok(account)
+        match self.standing {
+            Standing::DelegatedAdmin => match self.rank_of(account).await? {
+                Rank::Member => Ok(account),
+                Rank::BotOwner | Rank::DelegatedAdmin => {
+                    Err(Msg::DelegatedTargetNotOrdinary {}.into())
+                }
+            },
+            Standing::Unknown => Err(Msg::AuthorityUnknown {}.into()),
+            Standing::BotOwner | Standing::Member => Err(Msg::OwnAccountsOnly {}.into()),
+        }
+    }
+
+    /// Whether the command acts on someone other than the sender's own person: a delegated
+    /// admin's management of another member, or a bot owner's.
+    pub async fn on_someone_else(&self, account: AccountId) -> Result<bool, Fail> {
+        Ok(account != self.req.sender
+            && !self
+                .linked_accounts(self.req.sender)
+                .await?
+                .contains(&account))
     }
 
     pub fn join_names(&self, parts: &[String]) -> String {
