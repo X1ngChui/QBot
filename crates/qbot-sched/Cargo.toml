@@ -9,6 +9,7 @@ license.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
 croner.workspace = true
+jiff.workspace = true
 qbot-core.workspace = true
 qbot-context.workspace = true
 qbot-agent.workspace = true

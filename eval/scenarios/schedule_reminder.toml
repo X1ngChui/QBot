@@ -20,7 +20,7 @@ send = "required"
 send_calls_at_most = 1
 tools_required = ["schedule_task"]
 rubric = [
-  "The bot created exactly one scheduled task (schedule_task succeeded once).",
+  "The bot created exactly one scheduled task (schedule_task succeeded once), a one-time task: the call has no repeat.",
   "The task is due on 2026-10-06 at 09:00 in UTC+08:00 (an RFC 3339 run_at of 2026-10-06T09:00:00+08:00, or an equivalent delay).",
   "The task's intent says what to remind about (the weekly report) and for whom (member:1 or 小林), in words that stay true later: no relative words like 'tomorrow' without a date, and no message ids.",
   "The bot's confirmation message was sent after the schedule_task call succeeded, and does not claim anything the tool results do not show.",

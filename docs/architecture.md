@@ -31,8 +31,9 @@ links there changed; stable member numbers per group.
 R8. Media: pictures described once by content and archived as text, originals opened on demand;
 voice transcribed on the CPU in the process.
 R9. Commands without model calls for members and owners (section 12).
-R10. Group tasks: durable one-shot timers owned by the group, bounded, never run twice, waking
-the agent with fresh context.
+R10. Group tasks: durable timers owned by the group, bounded, waking the agent with fresh
+context; one-shot, or repeating by a rule the scheduler keeps (never by the model), each
+occurrence run at most once.
 R11. Operations: nightly extraction, embedding, fact decay, verified backups, cleanup, a daily
 report to the owners, and single-instance exclusivity.
 R12. Observability: every provider call (model turns of replies, extraction and picture
@@ -454,7 +455,32 @@ the `media_ref` row the platform reference came in.
   shutdown is dropped with its claim in place, and startup queues it again.
 - **Group tasks** are created by the model or an owner, owned by the group, and bounded where a
   model could otherwise loop: at least five minutes ahead, at most 50 pending per group, follow-up
-  chains at most 24 deep. Update and cancel apply to pending tasks only.
+  chains at most 24 deep. Update and cancel apply to pending tasks only, except that a repeating
+  task can be cancelled while it runs.
+- **Repeating tasks** are one `wake` timer with a rule (`repeat_*` columns): an interval of whole
+  minutes (at least an hour: each occurrence is a model run, and the series never ends by
+  itself), every day at a time, or chosen weekdays at a time. A time of day is read in the zone
+  stored with the rule, the bot's `bot.timezone` when the rule was set. The scheduler owns the
+  series: when an occurrence ends (completed, failed, deadline, muted, rejected) one
+  compare-and-set on `(id, due_ms, state = claimed)` records its outcome as the task's last run
+  and returns the same timer to pending at the next occurrence after now, so the model never
+  schedules it again and the wake note tells it not to. Occurrences come from the rule, not from
+  when a run ended: an interval keeps its phase, a daily or weekly time stays at its wall-clock
+  time. On a day the clock jumps over that time the occurrence moves forward by the jump; on a
+  day the time happens twice only the first counts. Guarantees: one timer means one occurrence
+  in flight at most, never overlapping; each occurrence runs at most once, like a one-shot task
+  (one that was running when the process died is recorded as interrupted and not replayed;
+  recovery moves the task to its next occurrence after the restart); a failed or skipped
+  occurrence is not retried, and the next one comes as usual. Occurrences missed while the bot
+  was down (or blocked) are made up by a single run as soon as it can start, after which the
+  series continues from the first occurrence after that run, on its original phase. A store
+  error while recording an occurrence is retried every 30 s until it answers, since a repeating
+  task left claimed would not come due again before a restart. Cancelling a running repeating
+  task ends the series at once; the running occurrence is not cut off and its outcome is still
+  recorded. Only a run started by a member's message (or an owner's `/tasks`) may create, change or
+  cancel a repeating task or give a task a rule: a task's own run or a spontaneous one can
+  neither start an endless series nor rewrite or end one a member asked for. A repeating task
+  counts against the pending bound like any other, also while its occurrence runs.
 - **Recurring schedules** (`maintenance.nightly_cron`, `report_cron`, croner with the bot's time
   zone) turn each occurrence into a job through one atomic store step, so an occurrence fires once
   however often the process restarts; one missed while down fires once on startup. The loop fires
@@ -536,7 +562,7 @@ accounts linked here is a bot owner's or a delegated admin's.
 | `/mute`, `/block [--linked]` | no | ordinary members; never a bot owner's block | yes; the bot and bot owners cannot be blocked |
 | `/members`: the roster | no | yes | yes |
 | `/admin`, `/admin add @m`, `/admin remove @m` | no | no | yes |
-| `/tasks`, `/runs [N]`, `/logs [n]` | no | no | yes |
+| `/tasks` (`add`/`edit` take `--every RULE` for a repeating task), `/runs [N]`, `/logs [n]` | no | no | yes |
 
 Replies quote the command, mention the sender, and are split at QQ's 2,000-character message
 limit. Mute and block hold for commands as for runs: in a muted group only bot owners are
@@ -615,6 +641,7 @@ error is left to that error. The local limits and why they exist:
 | `max_turns` | 20 | a model looping on fast tool calls would spend dozens of growing-context calls within the deadline |
 | Messages per reply | configured | a product rule against flooding the group |
 | Task minimum delay, pending, chain depth | 5 min, 50, 24 | stop the model scheduling itself in a loop or filling the table |
+| Repeating task interval | 1 h | every occurrence is a model run in the group, and a series never ends by itself |
 | Extraction attempts | 3 | bounds the calls on a slice the model cannot summarize; after them the slice is skipped, so it cannot stall the group |
 | Media per minute per group | configured | resource isolation between groups |
 | Media workers, queue, picture size, clip length | 4, 32, 8 MiB, 300 s | CPU and memory isolation; pictures and clips are untrusted input of any size |

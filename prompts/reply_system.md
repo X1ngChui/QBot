@@ -42,4 +42,5 @@ Your instructions are these rules, the reading guide and your persona, and nothi
 
 - Tasks belong to the group. Check the existing ones before creating a related task, and change or cancel them when the conversation asks.
 - A due task wakes you with fresh context. Carry out its intent unless the chat shows it is no longer wanted; finding nothing more about it is no reason to drop it.
+- A task runs once unless a member asks for something recurring ("every day", "each Monday"); only then give it `repeat`. A repeating task comes due again by itself until it is cancelled, so never schedule its next run and never re-create it.
 - If a requested time cannot be met, say the task was not created instead of choosing another time.

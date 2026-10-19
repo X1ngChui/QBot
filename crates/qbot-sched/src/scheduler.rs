@@ -2,8 +2,9 @@
 //!
 //! A due group task is claimed only after supervisor capacity has been reserved for it, so a
 //! claimed task can always start; without capacity it simply stays pending. Group tasks are
-//! at-most-once (a claim is never replayed); background jobs are idempotent and retried with
-//! backoff. One loop sleeps until the next due instant and is woken early by task changes and
+//! at-most-once (a claim is never replayed); a repeating task is one timer, so at most one of its
+//! occurrences runs at a time, and once one ends the timer is pending again at the next
+//! occurrence after now. Background jobs are idempotent and retried with backoff. One loop sleeps until the next due instant and is woken early by task changes and
 //! by freed capacity. On shutdown a running job is dropped where it is: its claim stays, and
 //! the next start puts it back in the queue.
 
@@ -20,7 +21,8 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 
-use crate::store::TimerStore;
+use crate::repeat::Repeat;
+use crate::store::{StoreError, TimerStore};
 use crate::timer::{JobKind, Timer, TimerKind, TimerOutcome};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -114,11 +116,26 @@ impl Scheduler {
 
     /// Recover from a previous process, then tick until `shutdown`.
     pub async fn run(&self, shutdown: CancellationToken) {
-        while let Err(error) = self.store.recover().await {
-            tracing::error!(%error, "scheduled work could not be recovered; retrying");
-            tokio::select! {
-                () = shutdown.cancelled() => return,
-                () = tokio::time::sleep(STORE_RETRY) => {}
+        loop {
+            match self.store.recover(self.clock.now()).await {
+                Ok(recovery) => {
+                    if recovery != crate::store::Recovery::default() {
+                        tracing::warn!(
+                            interrupted = recovery.interrupted,
+                            rescheduled = recovery.rescheduled,
+                            requeued = recovery.requeued,
+                            "scheduled work left running by the previous process was recovered"
+                        );
+                    }
+                    break;
+                }
+                Err(error) => {
+                    tracing::error!(%error, "scheduled work could not be recovered; retrying");
+                    tokio::select! {
+                        () = shutdown.cancelled() => return,
+                        () = tokio::time::sleep(STORE_RETRY) => {}
+                    }
+                }
             }
         }
         loop {
@@ -230,13 +247,14 @@ impl Scheduler {
             .unwrap_or_else(PoisonError::into_inner)
             .wake_groups
             .insert(spec.group);
-        let (store, supervisor, wake, active) = (
+        let (store, supervisor, wake, active, clock) = (
             self.store.clone(),
             self.supervisor.clone(),
             self.wake.clone(),
             self.active.clone(),
+            self.clock.clone(),
         );
-        let id = timer.id;
+        let (id, occurrence, stop) = (timer.id, timer.due_at, self.stop.clone());
         self.spawn(async move {
             let request = TriggerRequest {
                 group: spec.group,
@@ -244,6 +262,7 @@ impl Scheduler {
                     timer: id,
                     intent: spec.intent,
                     chain: spec.chain,
+                    repeats: spec.repeat.is_some(),
                 },
             };
             let outcome = match supervisor.submit_reserved(reservation, request).await {
@@ -254,15 +273,19 @@ impl Scheduler {
                         .map_or(RunEnd::Cancelled, |report| report.end),
                 )),
                 Err(Rejected::Muted) => Some(TimerOutcome::SkippedMuted),
-                // Shutting down: leave the claim in place; startup recovery marks it interrupted.
+                // Shutting down: leave the claim in place; startup recovery marks the occurrence
+                // interrupted (a repeating task then waits for its next occurrence).
                 Err(Rejected::ShuttingDown) => None,
                 Err(_) => Some(TimerOutcome::Ran(RunEnd::Environment)),
             };
-            if let Some(outcome) = outcome
-                && let Err(error) = store.finish(id, outcome).await
-            {
-                // The claim stays; startup recovery marks the task interrupted.
-                tracing::error!(%error, task = id.get(), "a finished task could not be recorded");
+            if let Some(outcome) = outcome {
+                let finished = Finished {
+                    id,
+                    occurrence,
+                    repeat: spec.repeat,
+                    outcome,
+                };
+                finished.record(&*store, &*clock, &stop).await;
             }
             active
                 .lock()
@@ -347,6 +370,52 @@ impl Scheduler {
 
     fn spawn(&self, task: impl std::future::Future<Output = ()> + Send + 'static) {
         self.tasks.spawn(task);
+    }
+}
+
+/// A group task's run that ended, to be recorded.
+struct Finished {
+    id: TimerId,
+    occurrence: UnixMillis,
+    repeat: Option<Repeat>,
+    outcome: TimerOutcome,
+}
+
+impl Finished {
+    /// Record the outcome: a one-shot task is done; a repeating task is pending again at its
+    /// next occurrence after now. A store that fails is tried again until it answers or the
+    /// scheduler stops, since a repeating task left claimed would not come due again until a
+    /// restart. A retry that finds the claim already gone means an earlier try went through.
+    async fn record(self, store: &dyn TimerStore, clock: &dyn Clock, stop: &CancellationToken) {
+        let mut retried = false;
+        loop {
+            let result = match &self.repeat {
+                Some(repeat) => {
+                    let next = repeat.next_after(self.occurrence, clock.now());
+                    store
+                        .finish_occurrence(self.id, self.occurrence, self.outcome.clone(), next)
+                        .await
+                }
+                None => store.finish(self.id, self.outcome.clone()).await,
+            };
+            match result {
+                Ok(()) => return,
+                Err(StoreError::NotPending(_)) if retried => return,
+                Err(error @ (StoreError::NotPending(_) | StoreError::NotFound)) => {
+                    tracing::error!(%error, task = self.id.get(), "a finished task could not be recorded");
+                    return;
+                }
+                Err(error) => {
+                    // The claim stays meanwhile; if the process stops, startup recovery handles it.
+                    tracing::error!(%error, task = self.id.get(), "a finished task could not be recorded; retrying");
+                    tokio::select! {
+                        () = stop.cancelled() => return,
+                        () = tokio::time::sleep(STORE_RETRY) => {}
+                    }
+                    retried = true;
+                }
+            }
+        }
     }
 }
 

@@ -9,8 +9,10 @@ use async_trait::async_trait;
 use qbot_agent::Chain;
 use qbot_core::{ChainId, GroupId, TimerId, UnixMillis};
 
+use qbot_context::RunEnd;
+
 use crate::timer::{
-    JobKind, NewWake, Timer, TimerKind, TimerOutcome, TimerState, WakeEdit, WakeSpec,
+    JobKind, LastRun, NewWake, Timer, TimerKind, TimerOutcome, TimerState, WakeEdit, WakeSpec,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -29,13 +31,16 @@ pub enum StoreError {
 pub struct Recovery {
     /// At-most-once timers that were claimed when the process died.
     pub interrupted: usize,
+    /// Repeating tasks whose occurrence was interrupted, pending again at a later occurrence.
+    pub rescheduled: usize,
     /// Idempotent jobs returned to pending.
     pub requeued: usize,
 }
 
 #[async_trait]
 pub trait TimerStore: Send + Sync {
-    /// Insert a task, enforcing the per-group pending bound atomically with the insert.
+    /// Insert a task, enforcing the per-group pending bound atomically with the insert. A
+    /// repeating task whose occurrence is running counts as pending.
     async fn insert_wake(
         &self,
         due_at: UnixMillis,
@@ -62,7 +67,10 @@ pub trait TimerStore: Send + Sync {
         id: TimerId,
         edit: WakeEdit,
     ) -> Result<Timer, StoreError>;
-    async fn cancel_pending_wake(&self, group: GroupId, id: TimerId) -> Result<Timer, StoreError>;
+    /// Cancel a pending task, or a repeating task whose occurrence is running: that occurrence
+    /// is not cut off, and nothing is scheduled after it. A running one-shot task is not
+    /// cancelled.
+    async fn cancel_wake(&self, group: GroupId, id: TimerId) -> Result<Timer, StoreError>;
     /// Claim the oldest due pending task whose group is not in `exclude`. The claim is
     /// single-attempt: it is never replayed.
     async fn claim_due_wake(
@@ -77,6 +85,17 @@ pub trait TimerStore: Send + Sync {
         lease: Duration,
     ) -> Result<Option<Timer>, StoreError>;
     async fn finish(&self, id: TimerId, outcome: TimerOutcome) -> Result<(), StoreError>;
+    /// Record how the running occurrence `occurrence` of a repeating task ended and return the
+    /// task to pending, due at `next`. One compare-and-set on the claim: a second call for the
+    /// same occurrence finds nothing to change (`NotPending`). A task cancelled while the
+    /// occurrence ran keeps its cancellation and only records the outcome.
+    async fn finish_occurrence(
+        &self,
+        id: TimerId,
+        occurrence: UnixMillis,
+        outcome: TimerOutcome,
+        next: UnixMillis,
+    ) -> Result<(), StoreError>;
     /// Return a claimed job to pending, due again at `at`.
     async fn retry_job(&self, id: TimerId, at: UnixMillis) -> Result<(), StoreError>;
     /// Push a claimed job's lease out to `until`, so a long job is not taken over while it runs.
@@ -95,8 +114,11 @@ pub trait TimerStore: Send + Sync {
     async fn seed_recurrence(&self, name: &str, occurrence: UnixMillis) -> Result<(), StoreError>;
     /// Earliest instant at which something may need attention.
     async fn next_due(&self) -> Result<Option<UnixMillis>, StoreError>;
-    /// Startup recovery. Safe only while this process holds the exclusive runtime lease.
-    async fn recover(&self) -> Result<Recovery, StoreError>;
+    /// Startup recovery at `now`. Safe only while this process holds the exclusive runtime lease.
+    /// A claimed one-shot task is marked interrupted; a claimed repeating task records its
+    /// occurrence as interrupted and is pending again at its first occurrence after `now`, so the
+    /// interrupted occurrence is not replayed and the series goes on.
+    async fn recover(&self, now: UnixMillis) -> Result<Recovery, StoreError>;
 }
 
 #[derive(Default)]
@@ -152,10 +174,16 @@ impl TimerStore for MemoryTimerStore {
         max_pending: usize,
     ) -> Result<Timer, StoreError> {
         let mut inner = self.lock();
+        // A repeating task whose occurrence runs is pending again soon, so it counts too.
         let pending = inner
             .timers
             .values()
-            .filter(|t| is_wake_of(t, new.group) && t.state.is_pending())
+            .filter(|t| {
+                is_wake_of(t, new.group)
+                    && (t.state.is_pending()
+                        || (matches!(t.state, TimerState::Claimed { .. })
+                            && t.wake().is_some_and(|w| w.repeat.is_some())))
+            })
             .count();
         if pending >= max_pending {
             return Err(StoreError::TooManyPending { limit: max_pending });
@@ -174,6 +202,8 @@ impl TimerStore for MemoryTimerStore {
                 intent: new.intent,
                 chain,
                 origin: new.origin,
+                repeat: new.repeat,
+                last: None,
             }),
             state: TimerState::Pending,
             attempts: 0,
@@ -245,20 +275,31 @@ impl TimerStore for MemoryTimerStore {
         if let Some(due_at) = edit.due_at {
             timer.due_at = due_at;
         }
-        if let (Some(intent), TimerKind::Wake(spec)) = (edit.intent, &mut timer.kind) {
-            spec.intent = intent;
+        if let TimerKind::Wake(spec) = &mut timer.kind {
+            if let Some(intent) = edit.intent {
+                spec.intent = intent;
+            }
+            if let Some(repeat) = edit.repeat {
+                spec.repeat = Some(repeat);
+            }
         }
         Ok(timer.clone())
     }
 
-    async fn cancel_pending_wake(&self, group: GroupId, id: TimerId) -> Result<Timer, StoreError> {
+    async fn cancel_wake(&self, group: GroupId, id: TimerId) -> Result<Timer, StoreError> {
         let mut inner = self.lock();
         let timer = inner
             .timers
             .get_mut(&id)
             .filter(|t| is_wake_of(t, group))
             .ok_or(StoreError::NotFound)?;
-        if !timer.state.is_pending() {
+        let repeating = timer.wake().is_some_and(|w| w.repeat.is_some());
+        let cancellable = match timer.state {
+            TimerState::Pending => true,
+            TimerState::Claimed { .. } => repeating,
+            _ => false,
+        };
+        if !cancellable {
             return Err(StoreError::NotPending(timer.state.clone()));
         }
         timer.state = TimerState::Cancelled;
@@ -327,6 +368,37 @@ impl TimerStore for MemoryTimerStore {
             return Err(StoreError::NotPending(timer.state.clone()));
         }
         timer.state = TimerState::Done(outcome);
+        Ok(())
+    }
+
+    async fn finish_occurrence(
+        &self,
+        id: TimerId,
+        occurrence: UnixMillis,
+        outcome: TimerOutcome,
+        next: UnixMillis,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.lock();
+        let timer = inner.timers.get_mut(&id).ok_or(StoreError::NotFound)?;
+        let matches = timer.due_at == occurrence
+            && timer.wake().is_some_and(|w| w.repeat.is_some())
+            && matches!(
+                timer.state,
+                TimerState::Claimed { .. } | TimerState::Cancelled
+            );
+        if !matches {
+            return Err(StoreError::NotPending(timer.state.clone()));
+        }
+        if matches!(timer.state, TimerState::Claimed { .. }) {
+            timer.state = TimerState::Pending;
+            timer.due_at = next;
+        }
+        if let TimerKind::Wake(spec) = &mut timer.kind {
+            spec.last = Some(LastRun {
+                due_at: occurrence,
+                outcome,
+            });
+        }
         Ok(())
     }
 
@@ -413,11 +485,23 @@ impl TimerStore for MemoryTimerStore {
             .min())
     }
 
-    async fn recover(&self) -> Result<Recovery, StoreError> {
+    async fn recover(&self, now: UnixMillis) -> Result<Recovery, StoreError> {
         let mut inner = self.lock();
         let mut report = Recovery::default();
         for timer in inner.timers.values_mut() {
             if !matches!(timer.state, TimerState::Claimed { .. }) {
+                continue;
+            }
+            if let TimerKind::Wake(spec) = &mut timer.kind
+                && let Some(repeat) = &spec.repeat
+            {
+                spec.last = Some(LastRun {
+                    due_at: timer.due_at,
+                    outcome: TimerOutcome::Ran(RunEnd::Interrupted),
+                });
+                timer.due_at = repeat.next_after(timer.due_at, now);
+                timer.state = TimerState::Pending;
+                report.rescheduled += 1;
                 continue;
             }
             match timer.kind.delivery() {

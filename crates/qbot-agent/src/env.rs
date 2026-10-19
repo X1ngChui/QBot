@@ -114,6 +114,8 @@ pub enum Trigger {
         timer: TimerId,
         intent: String,
         chain: Chain,
+        /// The task repeats: the scheduler already holds its next occurrence.
+        repeats: bool,
     },
     /// The bot looked at the conversation on its own (`replies.spontaneous_chance`). Nobody
     /// asked: no member is waiting for an answer and no message started it.

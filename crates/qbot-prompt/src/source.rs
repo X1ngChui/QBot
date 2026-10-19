@@ -651,8 +651,11 @@ impl PromptContext {
                 timer,
                 intent,
                 chain,
+                repeats,
             } => {
                 let (task, depth) = (timer.get().to_string(), chain.depth.to_string());
+                // A flag: any non-empty value turns the template's paragraph on.
+                let repeats = if *repeats { "yes" } else { "" };
                 (
                     Template::TriggerWake,
                     render_template(
@@ -663,6 +666,7 @@ impl PromptContext {
                             ("task", &task),
                             ("depth", &depth),
                             ("intent", intent),
+                            ("repeats", repeats),
                             ("names", names),
                         ],
                     )?,

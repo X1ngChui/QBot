@@ -157,6 +157,7 @@ fn stack_on(db: TestDb, script: Vec<Step>) -> Stack {
         clock.clone(),
         TaskLimits::default(),
         wake.clone(),
+        qbot_sched::Zone::get("UTC").unwrap(),
     );
     let delivery = Arc::new(PgDelivery {
         archive: archive.clone(),
@@ -404,6 +405,7 @@ async fn muting_stops_admission_and_a_task_wakes_the_agent_once_it_is_due() {
                 intent: "ask about the meeting".into(),
                 chain: None,
                 origin: Origin::Owner,
+                repeat: None,
             },
             50,
         )
@@ -468,6 +470,7 @@ async fn after_a_crash_claimed_tasks_are_interrupted_and_open_runs_are_closed_ne
                 intent: "was running".into(),
                 chain: None,
                 origin: Origin::Model,
+                repeat: None,
             },
             50,
         )
@@ -490,6 +493,7 @@ async fn after_a_crash_claimed_tasks_are_interrupted_and_open_runs_are_closed_ne
                     id: qbot_core::ChainId::new(task.id.get()),
                     depth: 0,
                 },
+                repeats: false,
             },
         )
         .await
@@ -528,7 +532,7 @@ async fn after_a_crash_claimed_tasks_are_interrupted_and_open_runs_are_closed_ne
         db,
         vec![Step::Reply(FakeReply::new().text("should never run"))],
     );
-    let recovery = after.timers.recover().await.unwrap();
+    let recovery = after.timers.recover(SystemClock.now()).await.unwrap();
     let closed = after.log.recover_open_runs().await.unwrap();
     assert_eq!((recovery.interrupted, recovery.requeued, closed), (1, 0, 1));
     assert_eq!(

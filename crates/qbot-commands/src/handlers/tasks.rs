@@ -3,7 +3,7 @@ use std::str::FromStr;
 use jiff::Timestamp;
 use qbot_core::{TimerId, UnixMillis};
 use qbot_i18n::Msg;
-use qbot_sched::{Origin, Timer, TimerOutcome, TimerState, When};
+use qbot_sched::{Origin, Repeat, Rule, Timer, TimerOutcome, TimerState, When, interval_text};
 
 use super::Reply;
 use crate::args;
@@ -25,6 +25,41 @@ fn state_text(cx: &Cx<'_>, timer: &Timer) -> String {
     })
 }
 
+fn outcome_text(cx: &Cx<'_>, outcome: &TimerOutcome) -> String {
+    match outcome {
+        TimerOutcome::Ran(end) => end.as_str().to_owned(),
+        TimerOutcome::SkippedMuted => cx.t(&Msg::TasksSkippedMuted {}),
+        TimerOutcome::JobOk => "ok".to_owned(),
+        TimerOutcome::JobFailed(reason) => reason.clone(),
+    }
+}
+
+fn rule_text(cx: &Cx<'_>, repeat: &Repeat) -> String {
+    let zone = repeat.zone.name().to_owned();
+    cx.t(&match repeat.rule {
+        Rule::Interval(period) => Msg::TasksRepeatInterval {
+            interval: interval_text(period),
+        },
+        Rule::Daily(time) => Msg::TasksRepeatDaily {
+            time: time.to_string(),
+            zone,
+        },
+        Rule::Weekly(days, time) => Msg::TasksRepeatWeekly {
+            days: days
+                .codes()
+                .map(|day| {
+                    cx.t(&Msg::TasksWeekday {
+                        day: day.to_owned(),
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join(&cx.t(&Msg::ListSeparator {})),
+            time: time.to_string(),
+            zone,
+        },
+    })
+}
+
 fn task_text(cx: &Cx<'_>, timer: &Timer, preview: bool) -> String {
     let intent = timer.wake().map(|w| w.intent.clone()).unwrap_or_default();
     let intent = if preview {
@@ -38,15 +73,27 @@ fn task_text(cx: &Cx<'_>, timer: &Timer, preview: bool) -> String {
         due: cx.iso_time(timer.due_at),
         intent,
     });
-    if let (false, TimerState::Done(outcome)) = (preview, &timer.state) {
-        let outcome = match outcome {
-            TimerOutcome::Ran(end) => end.as_str().to_owned(),
-            TimerOutcome::SkippedMuted => cx.t(&Msg::TasksSkippedMuted {}),
-            TimerOutcome::JobOk => "ok".to_owned(),
-            TimerOutcome::JobFailed(reason) => reason.clone(),
-        };
+    if let Some(repeat) = timer.wake().and_then(|w| w.repeat.as_ref()) {
         text.push('\n');
-        text.push_str(&cx.t(&Msg::TasksDetailOutcome { outcome }));
+        text.push_str(&cx.t(&Msg::TasksDetailRepeat {
+            rule: rule_text(cx, repeat),
+        }));
+    }
+    if preview {
+        return text;
+    }
+    if let Some(last) = timer.wake().and_then(|w| w.last.as_ref()) {
+        text.push('\n');
+        text.push_str(&cx.t(&Msg::TasksDetailLastRun {
+            due: cx.iso_time(last.due_at),
+            outcome: outcome_text(cx, &last.outcome),
+        }));
+    }
+    if let TimerState::Done(outcome) = &timer.state {
+        text.push('\n');
+        text.push_str(&cx.t(&Msg::TasksDetailOutcome {
+            outcome: outcome_text(cx, outcome),
+        }));
     }
     text
 }
@@ -63,33 +110,38 @@ fn map<'a>(cx: &'a Cx<'_>) -> impl Fn(qbot_sched::TaskError) -> Fail + 'a {
     move |error| task_fail(error, |at| cx.iso_time(at))
 }
 
-/// `--at TIME` or `--in DURATION` pairs, at most one of them.
-fn time_options(tokens: &[&str]) -> Result<Option<When>, Fail> {
+/// `--at TIME` or `--in DURATION` (at most one of them) and `--every RULE` pairs.
+fn time_options(tokens: &[&str]) -> Result<(Option<When>, Option<Rule>), Fail> {
     if !tokens.len().is_multiple_of(2) {
         return Err(Msg::TasksOptionValue {}.into());
     }
-    let (mut at, mut within) = (None, None);
+    let (mut at, mut within, mut every) = (None, None, None);
     for pair in tokens.chunks(2) {
         let slot = match pair[0] {
             "--at" => &mut at,
             "--in" => &mut within,
+            "--every" => &mut every,
             _ => return Err(Msg::TasksOptionDupe {}.into()),
         };
         if slot.replace(pair[1]).is_some() {
             return Err(Msg::TasksOptionDupe {}.into());
         }
     }
-    match (at, within) {
-        (Some(_), Some(_)) => Err(Msg::TasksAtInConflict {}.into()),
+    let rule = every
+        .map(|rule| rule.parse::<Rule>().map_err(|_| Msg::TasksBadEvery {}))
+        .transpose()?;
+    let when = match (at, within) {
+        (Some(_), Some(_)) => return Err(Msg::TasksAtInConflict {}.into()),
         (Some(at), None) => {
             let parsed = Timestamp::from_str(at).map_err(|_| Msg::TasksBadTime {})?;
-            Ok(Some(When::At(UnixMillis::new(parsed.as_millisecond()))))
+            Some(When::At(UnixMillis::new(parsed.as_millisecond())))
         }
-        (None, Some(within)) => Ok(Some(When::After(
+        (None, Some(within)) => Some(When::After(
             args::duration(within).ok_or(Msg::DurationInvalid {})?,
-        ))),
-        (None, None) => Ok(None),
-    }
+        )),
+        (None, None) => None,
+    };
+    Ok((when, rule))
 }
 
 pub(crate) async fn tasks(cx: &Cx<'_>) -> Reply {
@@ -159,9 +211,16 @@ pub(crate) async fn tasks(cx: &Cx<'_>) -> Reply {
                 })));
             }
             match cx.deps.tasks.cancel(group, id).await {
-                Ok(timer) => Ok(cx.fit(&cx.t(&Msg::TasksCancelled {
-                    task: task_text(cx, &timer, false),
-                }))),
+                Ok(timer) => {
+                    let task = task_text(cx, &timer, false);
+                    Ok(
+                        cx.fit(&cx.t(&if timer.wake().is_some_and(|w| w.repeat.is_some()) {
+                            Msg::TasksCancelledRepeating { task }
+                        } else {
+                            Msg::TasksCancelled { task }
+                        })),
+                    )
+                }
                 Err(qbot_sched::TaskError::NotFound | qbot_sched::TaskError::NotPending) => {
                     Err(Msg::TasksNotFoundCancel {}.into())
                 }
@@ -169,20 +228,29 @@ pub(crate) async fn tasks(cx: &Cx<'_>) -> Reply {
             }
         }
         "add" => {
-            let when = time_options(&tokens)?;
+            let (when, rule) = time_options(&tokens)?;
             let content = content.map(str::to_owned);
             if content.as_deref() == Some("") {
                 return Err(Msg::TasksEmptyContent {}.into());
             }
-            let (Some(when), Some(content)) = (when, content) else {
+            let Some(content) = content else {
                 return Err(Msg::UsageTasksAdd {}.into());
             };
-            let timer = cx
-                .deps
-                .tasks
-                .create(group, &content, when, None, Origin::Owner)
-                .await
-                .map_err(map(cx))?;
+            let tasks = &cx.deps.tasks;
+            let created = match (rule, when) {
+                (Some(rule), when) => {
+                    tasks
+                        .create_repeating(group, &content, rule, when, None, Origin::Owner)
+                        .await
+                }
+                (None, Some(when)) => {
+                    tasks
+                        .create(group, &content, when, None, Origin::Owner)
+                        .await
+                }
+                (None, None) => return Err(Msg::UsageTasksAdd {}.into()),
+            };
+            let timer = created.map_err(map(cx))?;
             Ok(cx.fit(&cx.t(&Msg::TasksCreated {
                 task: task_text(cx, &timer, false),
             })))
@@ -192,11 +260,11 @@ pub(crate) async fn tasks(cx: &Cx<'_>) -> Reply {
                 return Err(Msg::UsageTasksEdit {}.into());
             }
             let id = parse_id(tokens.remove(0))?;
-            let when = time_options(&tokens)?;
+            let (when, rule) = time_options(&tokens)?;
             if content == Some("") {
                 return Err(Msg::TasksEmptyContent {}.into());
             }
-            match cx.deps.tasks.update(group, id, content, when).await {
+            match cx.deps.tasks.update(group, id, content, when, rule).await {
                 Ok(timer) => Ok(cx.fit(&cx.t(&Msg::TasksEdited {
                     task: task_text(cx, &timer, false),
                 }))),

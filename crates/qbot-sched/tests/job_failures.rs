@@ -13,15 +13,24 @@ use async_trait::async_trait;
 use common::*;
 use qbot_core::{GroupId, TimerId, UnixMillis};
 use qbot_sched::{
-    JobKind, MemoryTimerStore, NewWake, Recovery, Scheduler, SchedulerConfig, StoreError, Timer,
-    TimerOutcome, TimerStore, WakeEdit,
+    JobKind, MemoryTimerStore, NewWake, Origin, Recovery, Rule, Scheduler, SchedulerConfig,
+    StoreError, TaskLimits, TaskService, Timer, TimerOutcome, TimerState, TimerStore, WakeEdit,
+    Zone,
 };
 use tokio::time::sleep;
 
-/// The memory store, except that the first `extend_lease` fails (a database blip).
+/// The memory store, except that the first `fail` lease extensions and the first `fail_finish`
+/// recordings of a repeating task's occurrence fail (a database blip).
 struct FlakyLease {
     inner: Arc<MemoryTimerStore>,
     fail: AtomicUsize,
+    fail_finish: AtomicUsize,
+}
+
+fn take(counter: &AtomicUsize) -> bool {
+    counter
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .is_ok()
 }
 
 #[async_trait]
@@ -56,8 +65,8 @@ impl TimerStore for FlakyLease {
     ) -> Result<Timer, StoreError> {
         self.inner.edit_pending_wake(g, id, e).await
     }
-    async fn cancel_pending_wake(&self, g: GroupId, id: TimerId) -> Result<Timer, StoreError> {
-        self.inner.cancel_pending_wake(g, id).await
+    async fn cancel_wake(&self, g: GroupId, id: TimerId) -> Result<Timer, StoreError> {
+        self.inner.cancel_wake(g, id).await
     }
     async fn claim_due_wake(
         &self,
@@ -76,15 +85,23 @@ impl TimerStore for FlakyLease {
     async fn finish(&self, id: TimerId, o: TimerOutcome) -> Result<(), StoreError> {
         self.inner.finish(id, o).await
     }
+    async fn finish_occurrence(
+        &self,
+        id: TimerId,
+        occurrence: UnixMillis,
+        o: TimerOutcome,
+        next: UnixMillis,
+    ) -> Result<(), StoreError> {
+        if take(&self.fail_finish) {
+            return Err(StoreError::Backend("connection reset".into()));
+        }
+        self.inner.finish_occurrence(id, occurrence, o, next).await
+    }
     async fn retry_job(&self, id: TimerId, at: UnixMillis) -> Result<(), StoreError> {
         self.inner.retry_job(id, at).await
     }
     async fn extend_lease(&self, id: TimerId, until: UnixMillis) -> Result<(), StoreError> {
-        if self
-            .fail
-            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok()
-        {
+        if take(&self.fail) {
             return Err(StoreError::Backend("pool timed out".into()));
         }
         self.inner.extend_lease(id, until).await
@@ -103,8 +120,8 @@ impl TimerStore for FlakyLease {
     async fn next_due(&self) -> Result<Option<UnixMillis>, StoreError> {
         self.inner.next_due().await
     }
-    async fn recover(&self) -> Result<Recovery, StoreError> {
-        self.inner.recover().await
+    async fn recover(&self, now: UnixMillis) -> Result<Recovery, StoreError> {
+        self.inner.recover(now).await
     }
 }
 
@@ -120,6 +137,7 @@ async fn one_failed_lease_extension_does_not_let_a_running_job_start_again() {
     let flaky = Arc::new(FlakyLease {
         inner: r.store.clone(),
         fail: AtomicUsize::new(1),
+        fail_finish: AtomicUsize::new(0),
     });
     flaky
         .insert_job(UnixMillis::new(START), JobKind::Nightly, None)
@@ -146,6 +164,66 @@ async fn one_failed_lease_extension_does_not_let_a_running_job_start_again() {
         runs, 1,
         "the job was started {runs} times while its first run was still going"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_store_failure_while_recording_an_occurrence_does_not_stop_a_repeating_task() {
+    let r = rig((0..3).map(|_| done()).collect(), 4);
+    let flaky = Arc::new(FlakyLease {
+        inner: r.store.clone(),
+        fail: AtomicUsize::new(0),
+        fail_finish: AtomicUsize::new(2),
+    });
+    let wake = Arc::new(tokio::sync::Notify::new());
+    let service = TaskService::new(
+        flaky.clone(),
+        r.clock.clone(),
+        TaskLimits::default(),
+        wake.clone(),
+        Zone::get("UTC").unwrap(),
+    );
+    let hour = Duration::from_secs(3600);
+    let id = service
+        .create_repeating(
+            group(),
+            "post the hourly status",
+            Rule::interval(hour).unwrap(),
+            None,
+            None,
+            Origin::Owner,
+        )
+        .await
+        .unwrap()
+        .id;
+    let scheduler = Arc::new(Scheduler::new(
+        flaky.clone(),
+        r.supervisor.clone(),
+        r.clock.clone(),
+        r.jobs.clone(),
+        SchedulerConfig::default(),
+        wake,
+    ));
+    let handle = tokio::spawn({
+        let (scheduler, shutdown) = (scheduler.clone(), r.shutdown.clone());
+        async move { scheduler.run(shutdown).await }
+    });
+    // The first occurrence runs; recording it fails twice and is tried again.
+    sleep(hour + mins(3)).await;
+    let timer = r.timer(id).await;
+    assert_eq!(
+        (timer.state.clone(), timer.due_at),
+        (TimerState::Pending, UnixMillis::new(START).plus(2 * hour)),
+        "the task is pending at its next occurrence once the store answers"
+    );
+    assert_eq!(
+        timer.wake().unwrap().last.as_ref().map(|l| l.due_at),
+        Some(UnixMillis::new(START).plus(hour))
+    );
+    sleep(hour).await;
+    let runs = r.fake.recorded().len();
+    r.shutdown.cancel();
+    handle.await.unwrap();
+    assert_eq!(runs, 2, "the next occurrence ran on schedule");
 }
 
 /// A job that panics (a bug on one group's data, say).

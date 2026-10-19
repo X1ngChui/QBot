@@ -1263,3 +1263,93 @@ async fn the_model_can_open_a_picture_and_mentions_become_member_numbers() {
     db.drop().await;
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repeating_task_runs_through_the_service_and_comes_due_again_as_the_same_task() {
+    let Some(db) = database().await else { return };
+    let root = scratch();
+    let sim = Arc::new(SimServer::new([SimStep::Reply(
+        FakeReply::new().call("send_messages", json!({ "messages": ["hourly status"] })),
+    )]));
+    let llm = mock_llm(sim.clone()).await;
+    // A repeating task due in two seconds, and a one-shot task written as before the repeat
+    // columns existed, due tomorrow.
+    let store = qbot_store::Store::connect(&db.url).await.unwrap();
+    store.migrate().await.unwrap();
+    let due = jiff::Timestamp::now().as_millisecond() + 2_000;
+    let repeating: i64 = sqlx::query_scalar(
+        "INSERT INTO timer (kind, due_ms, state, created_ms, group_id, intent, chain_id, chain_depth, origin, \
+                            repeat_kind, repeat_interval_ms, repeat_zone) \
+         VALUES ('wake', $1, 'pending', $1, 900, 'post the hourly status', 1, 0, 'owner', 'interval', 3600000, 'UTC') \
+         RETURNING id",
+    )
+    .bind(due)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    let one_shot: i64 = sqlx::query_scalar(
+        "INSERT INTO timer (kind, due_ms, state, created_ms, group_id, intent, chain_id, chain_depth, origin) \
+         VALUES ('wake', $1, 'pending', $1, 900, 'tomorrow', 2, 0, 'model') RETURNING id",
+    )
+    .bind(due + 86_400_000)
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    let bot = start(&db, llm, &root, None).await;
+    let pool = db.pool().await;
+    let mut napcat = connect(bot.addr, "sesame").await.unwrap();
+
+    let action = serve_until_send(&mut napcat, None).await;
+    assert_eq!(
+        action["params"]["message"][0],
+        json!({"type": "text", "data": {"text": "hourly status"}})
+    );
+    let note = sim.requests()[0].to_string();
+    assert!(
+        note.contains("post the hourly status") && note.contains("This task repeats by itself"),
+        "{note}"
+    );
+    accept(&mut napcat, &action, 9101).await;
+    eventually("the occurrence to be recorded", || async {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT last_outcome_detail FROM timer WHERE id = $1",
+        )
+        .bind(repeating)
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .as_deref()
+            == Some("delivered")
+    })
+    .await;
+    let (state, due_ms, last_due): (String, i64, Option<i64>) =
+        sqlx::query_as("SELECT state, due_ms, last_due_ms FROM timer WHERE id = $1")
+            .bind(repeating)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        (state.as_str(), due_ms, last_due),
+        ("pending", due + 3_600_000, Some(due)),
+        "the same task is pending one interval after the occurrence"
+    );
+    let (count, untouched): (i64, String) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM timer WHERE kind = 'wake'), \
+                (SELECT state FROM timer WHERE id = $1)",
+    )
+    .bind(one_shot)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((count, untouched.as_str()), (2, "pending"));
+
+    bot.stop.cancel();
+    tokio::time::timeout(Duration::from_secs(30), bot.finished)
+        .await
+        .expect("shutdown in time")
+        .unwrap()
+        .unwrap();
+    pool.close().await;
+    db.drop().await;
+    std::fs::remove_dir_all(&root).ok();
+}

@@ -76,6 +76,7 @@ async fn mute_is_checked_first_and_wakeups_have_no_block_gate() {
                 id: ChainId::new(1),
                 depth: 0,
             },
+            repeats: false,
         },
     };
     assert_eq!(sup.submit(wake.clone()).await.unwrap_err(), Rejected::Muted);

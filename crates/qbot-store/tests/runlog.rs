@@ -152,6 +152,7 @@ async fn wake_triggers_are_recorded_with_their_chain() {
             id: ChainId::new(1),
             depth: 2,
         },
+        repeats: false,
     };
     let run = log.begin(group(), &trigger).await.unwrap();
     let stored: serde_json::Value = sqlx::query_scalar("SELECT trigger FROM run WHERE run_id = $1")
@@ -161,7 +162,7 @@ async fn wake_triggers_are_recorded_with_their_chain() {
         .unwrap();
     assert_eq!(
         stored,
-        json!({ "timer": 3, "intent": "check the oven", "chain": 1, "depth": 2 })
+        json!({ "timer": 3, "intent": "check the oven", "chain": 1, "depth": 2, "repeats": false })
     );
     db.drop_db().await;
 }

@@ -10,8 +10,11 @@ use qbot_agent::Chain;
 use qbot_context::RunEnd;
 use qbot_core::{ChainId, GroupId, TimerId, UnixMillis};
 
+use crate::repeat::{Repeat, Rule, TimeOfDay, Weekdays, Zone};
 use crate::store::{StoreError, TimerStore};
-use crate::timer::{JobKind, NewWake, Origin, TimerKind, TimerOutcome, TimerState, WakeEdit};
+use crate::timer::{
+    JobKind, LastRun, NewWake, Origin, TimerKind, TimerOutcome, TimerState, WakeEdit,
+};
 
 fn at(seconds: i64) -> UnixMillis {
     UnixMillis::new(1_800_000_000_000 + seconds * 1000)
@@ -27,6 +30,7 @@ fn wake(group: GroupId, intent: &str) -> NewWake {
         intent: intent.into(),
         chain: None,
         origin: Origin::Model,
+        repeat: None,
     }
 }
 
@@ -38,6 +42,7 @@ pub async fn run(store: &dyn TimerStore) {
     jobs(store).await;
     next_due_and_recovery(store).await;
     leases_and_recurrences(store).await;
+    repeating(store).await;
 }
 
 /// Finish everything still pending, so each step starts from an empty store.
@@ -115,7 +120,7 @@ async fn inserting(store: &dyn TimerStore) {
         .unwrap();
 
     // Only pending tasks count against it.
-    store.cancel_pending_wake(a, root.id).await.unwrap();
+    store.cancel_wake(a, root.id).await.unwrap();
     store
         .insert_wake(at(900), wake(a, "fits again"), 3)
         .await
@@ -214,6 +219,7 @@ async fn editing_and_cancelling(store: &dyn TimerStore) {
     let edit = WakeEdit {
         intent: Some("water the ferns".into()),
         due_at: Some(at(900)),
+        repeat: None,
     };
     assert_eq!(
         store
@@ -235,6 +241,7 @@ async fn editing_and_cancelling(store: &dyn TimerStore) {
             WakeEdit {
                 intent: None,
                 due_at: Some(at(950)),
+                repeat: None,
             },
         )
         .await
@@ -246,20 +253,20 @@ async fn editing_and_cancelling(store: &dyn TimerStore) {
     );
 
     assert_eq!(
-        store.cancel_pending_wake(b, t.id).await.unwrap_err(),
+        store.cancel_wake(b, t.id).await.unwrap_err(),
         StoreError::NotFound
     );
     assert_eq!(
         store
-            .cancel_pending_wake(a, TimerId::new(9_999_999))
+            .cancel_wake(a, TimerId::new(9_999_999))
             .await
             .unwrap_err(),
         StoreError::NotFound
     );
-    let cancelled = store.cancel_pending_wake(a, t.id).await.unwrap();
+    let cancelled = store.cancel_wake(a, t.id).await.unwrap();
     assert_eq!(cancelled.state, TimerState::Cancelled);
     assert!(matches!(
-        store.cancel_pending_wake(a, t.id).await.unwrap_err(),
+        store.cancel_wake(a, t.id).await.unwrap_err(),
         StoreError::NotPending(TimerState::Cancelled)
     ));
     assert!(matches!(
@@ -270,7 +277,7 @@ async fn editing_and_cancelling(store: &dyn TimerStore) {
         StoreError::NotPending(_)
     ));
 
-    // A claimed task can no longer be changed.
+    // A claimed one-shot task can no longer be changed or cancelled.
     let running = store
         .insert_wake(at(1), wake(a, "running"), 50)
         .await
@@ -281,7 +288,7 @@ async fn editing_and_cancelling(store: &dyn TimerStore) {
         .unwrap()
         .unwrap();
     assert!(matches!(
-        store.cancel_pending_wake(a, running.id).await.unwrap_err(),
+        store.cancel_wake(a, running.id).await.unwrap_err(),
         StoreError::NotPending(TimerState::Claimed { .. })
     ));
 }
@@ -436,7 +443,7 @@ async fn jobs(store: &dyn TimerStore) {
 async fn next_due_and_recovery(store: &dyn TimerStore) {
     drain(store).await;
     // Earlier steps left some timers claimed; recovery clears them, so counts below are fresh.
-    store.recover().await.unwrap();
+    store.recover(at(0)).await.unwrap();
     drain(store).await;
     assert_eq!(store.next_due().await.unwrap(), None);
 
@@ -474,7 +481,7 @@ async fn next_due_and_recovery(store: &dyn TimerStore) {
         .unwrap()
         .unwrap();
     assert_eq!(running.id, soon.id);
-    let report = store.recover().await.unwrap();
+    let report = store.recover(at(0)).await.unwrap();
     assert_eq!((report.interrupted, report.requeued), (1, 1));
     assert_eq!(
         store.get(soon.id).await.unwrap().unwrap().state,
@@ -485,7 +492,7 @@ async fn next_due_and_recovery(store: &dyn TimerStore) {
         TimerState::Pending
     );
     assert_eq!(
-        store.recover().await.unwrap(),
+        store.recover(at(0)).await.unwrap(),
         Default::default(),
         "recovery is idempotent"
     );
@@ -619,4 +626,293 @@ async fn leases_and_recurrences(store: &dyn TimerStore) {
             (at(6000), JobKind::Cleanup)
         ]
     );
+}
+
+fn hourly() -> Repeat {
+    Repeat {
+        rule: Rule::interval(Duration::from_secs(3600)).unwrap(),
+        zone: Zone::get("UTC").unwrap(),
+    }
+}
+
+fn repeating_wake(group: GroupId, intent: &str, repeat: Repeat) -> NewWake {
+    NewWake {
+        repeat: Some(repeat),
+        ..wake(group, intent)
+    }
+}
+
+async fn repeating(store: &dyn TimerStore) {
+    drain(store).await;
+    store.recover(at(0)).await.unwrap();
+    drain(store).await;
+    let (g, other) = (group(8001), group(8002));
+
+    // Every kind of rule and its zone are kept as given.
+    let rules = [
+        hourly(),
+        Repeat {
+            rule: Rule::Daily(TimeOfDay::new(8, 0).unwrap()),
+            zone: Zone::get("Asia/Shanghai").unwrap(),
+        },
+        Repeat {
+            rule: Rule::Weekly(
+                Weekdays::from_codes(["mon", "sun"]).unwrap(),
+                TimeOfDay::new(23, 59).unwrap(),
+            ),
+            zone: Zone::get("America/New_York").unwrap(),
+        },
+    ];
+    for repeat in rules {
+        let t = store
+            .insert_wake(at(50_000), repeating_wake(g, "kept", repeat.clone()), 50)
+            .await
+            .unwrap();
+        let read = store.get(t.id).await.unwrap().unwrap();
+        assert_eq!(read, t);
+        assert_eq!(read.wake().unwrap().repeat, Some(repeat));
+        assert_eq!(read.wake().unwrap().last, None);
+        store.cancel_wake(g, t.id).await.unwrap();
+    }
+
+    // An occurrence that ends returns the same task to pending at the next occurrence.
+    let t = store
+        .insert_wake(at(1000), repeating_wake(g, "hourly", hourly()), 50)
+        .await
+        .unwrap();
+    let claimed = store
+        .claim_due_wake(at(1000), &HashSet::new())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.id, t.id);
+    assert!(
+        matches!(
+            store
+                .finish_occurrence(
+                    t.id,
+                    at(999),
+                    TimerOutcome::Ran(RunEnd::Completed),
+                    at(4600)
+                )
+                .await
+                .unwrap_err(),
+            StoreError::NotPending(TimerState::Claimed { .. })
+        ),
+        "the occurrence is part of the compare-and-set"
+    );
+    store
+        .finish_occurrence(
+            t.id,
+            at(1000),
+            TimerOutcome::Ran(RunEnd::ModelError),
+            at(4600),
+        )
+        .await
+        .unwrap();
+    let after = store.get(t.id).await.unwrap().unwrap();
+    assert_eq!(
+        (after.state.clone(), after.due_at, after.attempts),
+        (TimerState::Pending, at(4600), 1),
+        "a failed occurrence does not end the task"
+    );
+    assert_eq!(
+        after.wake().unwrap().last,
+        Some(LastRun {
+            due_at: at(1000),
+            outcome: TimerOutcome::Ran(RunEnd::ModelError)
+        })
+    );
+    assert!(
+        matches!(
+            store
+                .finish_occurrence(
+                    t.id,
+                    at(1000),
+                    TimerOutcome::Ran(RunEnd::Completed),
+                    at(8200)
+                )
+                .await
+                .unwrap_err(),
+            StoreError::NotPending(TimerState::Pending)
+        ),
+        "an occurrence is finished once"
+    );
+    assert_eq!(store.get(t.id).await.unwrap().unwrap(), after);
+    assert!(
+        store
+            .claim_due_wake(at(4599), &HashSet::new())
+            .await
+            .unwrap()
+            .is_none(),
+        "not due before its next occurrence"
+    );
+    let again = store
+        .claim_due_wake(at(4600), &HashSet::new())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((again.id, again.attempts), (t.id, 2));
+    assert!(
+        store
+            .claim_due_wake(at(100_000), &HashSet::new())
+            .await
+            .unwrap()
+            .is_none(),
+        "a running occurrence is the task's only claim"
+    );
+    // A running repeating task is pending again soon, so it holds its place under the bound.
+    assert_eq!(
+        store
+            .insert_wake(at(90_000), wake(g, "no room"), 1)
+            .await
+            .unwrap_err(),
+        StoreError::TooManyPending { limit: 1 }
+    );
+    let room = store
+        .insert_wake(at(90_000), wake(g, "room"), 2)
+        .await
+        .unwrap();
+    store.cancel_wake(g, room.id).await.unwrap();
+
+    // Cancelling while an occurrence runs ends the task now; the run's outcome is still kept.
+    assert_eq!(
+        store.cancel_wake(other, t.id).await.unwrap_err(),
+        StoreError::NotFound,
+        "scoped to the group"
+    );
+    let cancelled = store.cancel_wake(g, t.id).await.unwrap();
+    assert_eq!(cancelled.state, TimerState::Cancelled);
+    assert!(store.list_active_wakes(g, 0, 10).await.unwrap().is_empty());
+    store
+        .finish_occurrence(
+            t.id,
+            at(4600),
+            TimerOutcome::Ran(RunEnd::Completed),
+            at(8200),
+        )
+        .await
+        .unwrap();
+    let ended = store.get(t.id).await.unwrap().unwrap();
+    assert_eq!(
+        (ended.state.clone(), ended.due_at),
+        (TimerState::Cancelled, at(4600))
+    );
+    assert_eq!(
+        ended.wake().unwrap().last.as_ref().map(|l| l.due_at),
+        Some(at(4600))
+    );
+    assert!(
+        store
+            .claim_due_wake(at(100_000), &HashSet::new())
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    // One-shot tasks are untouched by occurrences.
+    let one = store
+        .insert_wake(at(2000), wake(g, "once"), 50)
+        .await
+        .unwrap();
+    store
+        .claim_due_wake(at(2000), &HashSet::new())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        store
+            .finish_occurrence(
+                one.id,
+                at(2000),
+                TimerOutcome::Ran(RunEnd::Completed),
+                at(9000)
+            )
+            .await
+            .unwrap_err(),
+        StoreError::NotPending(TimerState::Claimed { .. })
+    ));
+    store
+        .finish(one.id, TimerOutcome::Ran(RunEnd::Completed))
+        .await
+        .unwrap();
+
+    // An edit can make a pending task repeat, or replace its rule.
+    let plain = store
+        .insert_wake(at(3000), wake(g, "plain"), 50)
+        .await
+        .unwrap();
+    let daily = Repeat {
+        rule: Rule::Daily(TimeOfDay::new(7, 30).unwrap()),
+        zone: Zone::get("UTC").unwrap(),
+    };
+    let edited = store
+        .edit_pending_wake(
+            g,
+            plain.id,
+            WakeEdit {
+                repeat: Some(daily.clone()),
+                ..WakeEdit::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (edited.wake().unwrap().repeat.clone(), edited.due_at),
+        (Some(daily), at(3000))
+    );
+    let replaced = store
+        .edit_pending_wake(
+            g,
+            plain.id,
+            WakeEdit {
+                intent: Some("plain, hourly".into()),
+                repeat: Some(hourly()),
+                ..WakeEdit::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(replaced.wake().unwrap().repeat, Some(hourly()));
+    store.cancel_wake(g, plain.id).await.unwrap();
+
+    // Recovery: a repeating task's interrupted occurrence is recorded and not replayed; the task
+    // is pending at its first occurrence after now. A one-shot claim is interrupted as before.
+    let series = store
+        .insert_wake(at(20_000), repeating_wake(g, "series", hourly()), 50)
+        .await
+        .unwrap();
+    let single = store
+        .insert_wake(at(20_000), wake(other, "single"), 50)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        store
+            .claim_due_wake(at(20_000), &HashSet::new())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    let restart = at(20_000 + 3 * 3600 + 10);
+    let report = store.recover(restart).await.unwrap();
+    assert_eq!((report.interrupted, report.rescheduled), (1, 1));
+    let resumed = store.get(series.id).await.unwrap().unwrap();
+    assert_eq!(
+        (resumed.state.clone(), resumed.due_at),
+        (TimerState::Pending, at(20_000 + 4 * 3600)),
+        "the occurrences missed while down are passed over, the phase kept"
+    );
+    assert_eq!(
+        resumed.wake().unwrap().last,
+        Some(LastRun {
+            due_at: at(20_000),
+            outcome: TimerOutcome::Ran(RunEnd::Interrupted)
+        })
+    );
+    assert_eq!(
+        store.get(single.id).await.unwrap().unwrap().state,
+        TimerState::Interrupted
+    );
+    assert_eq!(store.recover(restart).await.unwrap(), Default::default());
+    store.cancel_wake(g, series.id).await.unwrap();
 }

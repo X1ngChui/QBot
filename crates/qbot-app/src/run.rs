@@ -308,6 +308,8 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         clock.clone(),
         Default::default(),
         wake.clone(),
+        qbot_sched::Zone::get(&config.bot.timezone)
+            .map_err(|_| UnknownZone(config.bot.timezone.clone()))?,
     );
     // Pictures and clips are fetched through the platform connection.
     let fetcher: Arc<OneBotFetcher> = Arc::new(

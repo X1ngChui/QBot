@@ -3,6 +3,9 @@ This run: your scheduled task {{task}} came due (depth {{depth}}: how many tasks
 
 Intent:
 {{intent}}
+{% if repeats %}
+This task repeats by itself: its next run is already scheduled, so do only what this run needs and do not schedule the next one.
+{% endif %}
 {% if names %}
 Names in this chat now:
 {{names}}

@@ -351,6 +351,7 @@ async fn rig() -> Rig {
         clock.clone(),
         TaskLimits::default(),
         Arc::new(Notify::new()),
+        qbot_sched::Zone::get("Asia/Shanghai").unwrap(),
     );
     let sent = Arc::new(Sent::default());
     let facts = Arc::new(qbot_memory::facts::MemoryFactStore::new());
@@ -948,7 +949,7 @@ async fn tasks_can_be_created_listed_changed_and_cancelled() {
     );
     assert_eq!(
         rig.say(OWNER, "/tasks edit 1", &[]).await,
-        "Editing a task needs new content or a new time."
+        "Editing a task needs new content, a new time or a new rule."
     );
     assert!(
         rig.say(OWNER, "/tasks cancel 1", &[])
@@ -982,11 +983,11 @@ async fn task_arguments_are_validated_with_specific_messages() {
     );
     assert_eq!(
         rig.say(OWNER, "/tasks add --in 30m", &[]).await,
-        "Usage: /tasks add (--at TIME | --in DURATION) -- content"
+        "Usage: /tasks add (--at TIME | --in DURATION | --every RULE [--at TIME | --in DURATION]) -- content"
     );
     assert_eq!(
         rig.say(OWNER, "/tasks add -- x", &[]).await,
-        "Usage: /tasks add (--at TIME | --in DURATION) -- content"
+        "Usage: /tasks add (--at TIME | --in DURATION | --every RULE [--at TIME | --in DURATION]) -- content"
     );
     assert_eq!(
         rig.say(
@@ -1004,11 +1005,11 @@ async fn task_arguments_are_validated_with_specific_messages() {
     assert_eq!(
         rig.say(OWNER, "/tasks add --in 30m --in 40m -- x", &[])
             .await,
-        "Only one --at or --in is accepted, and no other options."
+        "Each of --at, --in and --every is accepted once, and no other options."
     );
     assert_eq!(
         rig.say(OWNER, "/tasks add --when 30m -- x", &[]).await,
-        "Only one --at or --in is accepted, and no other options."
+        "Each of --at, --in and --every is accepted once, and no other options."
     );
     assert_eq!(
         rig.say(OWNER, "/tasks add --in 30m --", &[]).await,
@@ -1926,5 +1927,105 @@ async fn bot_owners_keep_full_authority_over_everyone() {
         rig.say_in(901, OWNER, "/who", &[ALICE])
             .await
             .contains("Account record | Alice")
+    );
+}
+
+#[tokio::test]
+async fn repeating_tasks_are_made_shown_changed_and_cancelled_by_bot_owners_only() {
+    let rig = rig().await;
+    rig.say(OWNER, "/admin add", &[ADAM]).await;
+    for sender in [ALICE, ADAM] {
+        assert_eq!(
+            rig.say(sender, "/tasks add --every daily@09:00 -- x", &[])
+                .await,
+            "This action needs bot-owner permission.",
+            "permissions are unchanged"
+        );
+    }
+    // It is 16:00 in the bot's zone, so today's 09:00 has passed.
+    let created = rig
+        .say(
+            OWNER,
+            "/tasks add --every daily@09:00 -- say good morning",
+            &[],
+        )
+        .await;
+    assert!(
+        created.starts_with(
+            "Created the task:\n1\nState: pending | Due: 2027-01-16T09:00:00+08:00\nsay good morning\nRepeats every day at 09:00 (Asia/Shanghai); the due time is the next run."
+        ),
+        "{created}"
+    );
+    let list = rig.say(OWNER, "/tasks", &[]).await;
+    assert!(list.contains("Repeats every day at 09:00"), "{list}");
+    let weekly = rig
+        .say(
+            OWNER,
+            "/tasks add --every mon,thu@20:30 -- weekly topic",
+            &[],
+        )
+        .await;
+    assert!(
+        weekly.contains("Due: 2027-01-18T20:30:00+08:00")
+            && weekly.contains("Repeats every Monday, Thursday at 20:30 (Asia/Shanghai)"),
+        "{weekly}"
+    );
+    let interval = rig
+        .say(OWNER, "/tasks add --every 2h --in 30m -- drink water", &[])
+        .await;
+    assert!(
+        interval.contains("Due: 2027-01-15T16:30:00+08:00")
+            && interval.contains("Repeats every 2h"),
+        "{interval}"
+    );
+    let once = rig.say(OWNER, "/tasks add --in 1h -- once", &[]).await;
+    assert!(!once.contains("Repeats"), "{once}");
+
+    let edited = rig.say(OWNER, "/tasks edit 1 --every 3d", &[]).await;
+    assert!(
+        edited.contains("Repeats every 3d") && edited.contains("Due: 2027-01-18T16:00:00+08:00"),
+        "{edited}"
+    );
+    let made = rig
+        .say(OWNER, "/tasks edit 4 --every daily@18:00", &[])
+        .await;
+    assert!(made.contains("Repeats every day at 18:00"), "{made}");
+
+    assert_eq!(
+        rig.say(OWNER, "/tasks add --every 30m -- x", &[]).await,
+        "A repeating task's interval must be at least 1h."
+    );
+    assert_eq!(
+        rig.say(OWNER, "/tasks add --every sometimes -- x", &[])
+            .await,
+        "--every needs an interval (2h, 3d), daily@HH:MM, or days@HH:MM such as mon,thu@20:30."
+    );
+    assert_eq!(
+        rig.say(OWNER, "/tasks add --every daily@09:00 --every 2h -- x", &[])
+            .await,
+        "Each of --at, --in and --every is accepted once, and no other options."
+    );
+
+    // Another group sees and changes none of it.
+    assert_eq!(
+        rig.say_in(901, OWNER, "/tasks", &[]).await,
+        "This group has no pending or running tasks."
+    );
+    assert_eq!(
+        rig.say_in(901, OWNER, "/tasks cancel 1", &[]).await,
+        "This group has no such task, or it is no longer pending and so cannot be cancelled."
+    );
+    assert_eq!(
+        rig.say_in(901, OWNER, "/tasks edit 1 --every 2h", &[])
+            .await,
+        "This group has no such task, or it is no longer pending and so cannot be changed."
+    );
+
+    let cancelled = rig.say(OWNER, "/tasks cancel 1", &[]).await;
+    assert!(
+        cancelled.starts_with(
+            "Cancelled the repeating task; nothing more is scheduled for it, and a run already under way finishes:"
+        ) && cancelled.contains("State: cancelled"),
+        "{cancelled}"
     );
 }

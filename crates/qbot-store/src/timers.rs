@@ -10,8 +10,9 @@ use qbot_agent::Chain;
 use qbot_context::RunEnd;
 use qbot_core::{ChainId, Clock, GroupId, TimerId, UnixMillis};
 use qbot_sched::{
-    JobKind, NewWake, Origin, Recovery, StoreError as TimerStoreError, Timer, TimerKind,
-    TimerOutcome, TimerState, TimerStore, WakeEdit, WakeSpec,
+    JobKind, LastRun, NewWake, Origin, Recovery, Repeat, Rule, StoreError as TimerStoreError,
+    TimeOfDay, Timer, TimerKind, TimerOutcome, TimerState, TimerStore, WakeEdit, WakeSpec,
+    Weekdays, Zone,
 };
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
@@ -19,7 +20,97 @@ use sqlx::{PgPool, Row};
 use crate::error::StoreError;
 
 const COLS: &str = "id, kind, due_ms, state, attempts, lease_until_ms, outcome, outcome_detail, \
-                    group_id, intent, chain_id, chain_depth, origin, job_kind";
+                    group_id, intent, chain_id, chain_depth, origin, job_kind, \
+                    repeat_kind, repeat_interval_ms, repeat_minute, repeat_days, repeat_zone, \
+                    last_due_ms, last_outcome, last_outcome_detail";
+
+/// A repeat rule as its columns: kind, interval, minute of day, weekdays, zone.
+type RepeatColumns = (
+    Option<&'static str>,
+    Option<i64>,
+    Option<i32>,
+    Option<i16>,
+    Option<String>,
+);
+
+fn repeat_columns(repeat: Option<&Repeat>) -> Result<RepeatColumns, TimerStoreError> {
+    let Some(repeat) = repeat else {
+        return Ok((None, None, None, None, None));
+    };
+    let zone = Some(repeat.zone.name().to_owned());
+    Ok(match repeat.rule {
+        Rule::Interval(period) => (
+            Some("interval"),
+            Some(i64::try_from(period.as_millis()).map_err(backend)?),
+            None,
+            None,
+            zone,
+        ),
+        Rule::Daily(time) => (
+            Some("daily"),
+            None,
+            Some(i32::from(time.minute_of_day())),
+            None,
+            zone,
+        ),
+        Rule::Weekly(days, time) => (
+            Some("weekly"),
+            None,
+            Some(i32::from(time.minute_of_day())),
+            Some(i16::from(days.bits())),
+            zone,
+        ),
+    })
+}
+
+fn repeat_parse(row: &PgRow) -> Result<Option<Repeat>, StoreError> {
+    let Some(kind) = row.get::<Option<String>, _>("repeat_kind") else {
+        return Ok(None);
+    };
+    let time = || {
+        row.get::<Option<i32>, _>("repeat_minute")
+            .and_then(|m| u16::try_from(m).ok())
+            .and_then(TimeOfDay::from_minute_of_day)
+            .ok_or_else(|| StoreError::corrupt("repeat time"))
+    };
+    let rule = match kind.as_str() {
+        "interval" => row
+            .get::<Option<i64>, _>("repeat_interval_ms")
+            .and_then(|ms| u64::try_from(ms).ok())
+            .and_then(|ms| Rule::interval(Duration::from_millis(ms)))
+            .ok_or_else(|| StoreError::corrupt("repeat interval"))?,
+        "daily" => Rule::Daily(time()?),
+        "weekly" => Rule::Weekly(
+            row.get::<Option<i16>, _>("repeat_days")
+                .and_then(|d| u8::try_from(d).ok())
+                .and_then(Weekdays::from_bits)
+                .ok_or_else(|| StoreError::corrupt("repeat days"))?,
+            time()?,
+        ),
+        other => {
+            return Err(StoreError::corrupt(format!(
+                "unknown repeat kind {other:?}"
+            )));
+        }
+    };
+    let zone = row
+        .get::<Option<String>, _>("repeat_zone")
+        .ok_or_else(|| StoreError::corrupt("repeat without a zone"))?;
+    let zone = Zone::get(&zone).map_err(|e| StoreError::corrupt(e.to_string()))?;
+    Ok(Some(Repeat { rule, zone }))
+}
+
+fn last_parse(row: &PgRow) -> Result<Option<LastRun>, StoreError> {
+    let Some(due) = row.get::<Option<i64>, _>("last_due_ms") else {
+        return Ok(None);
+    };
+    let kind: Option<String> = row.get("last_outcome");
+    let kind = kind.ok_or_else(|| StoreError::corrupt("last run without an outcome"))?;
+    Ok(Some(LastRun {
+        due_at: UnixMillis::new(due),
+        outcome: outcome_parse(&kind, row.get("last_outcome_detail"))?,
+    }))
+}
 
 #[derive(Clone)]
 pub struct PgTimerStore {
@@ -127,6 +218,8 @@ fn to_timer(row: &PgRow) -> Result<Timer, StoreError> {
                     depth: u32::try_from(depth).map_err(|_| StoreError::corrupt("chain depth"))?,
                 },
                 origin,
+                repeat: repeat_parse(row)?,
+                last: last_parse(row)?,
             })
         }
         "job" => {
@@ -207,7 +300,8 @@ impl TimerStore for PgTimerStore {
             .await
             .map_err(backend)?;
         let pending: i64 = sqlx::query(
-            "SELECT count(*) AS n FROM timer WHERE kind = 'wake' AND group_id = $1 AND state = 'pending'",
+            "SELECT count(*) AS n FROM timer WHERE kind = 'wake' AND group_id = $1 \
+               AND (state = 'pending' OR (state = 'claimed' AND repeat_kind IS NOT NULL))",
         )
         .bind(new.group.get())
         .fetch_one(&mut *tx)
@@ -219,10 +313,12 @@ impl TimerStore for PgTimerStore {
         }
         let sql = format!(
             "WITH n AS (SELECT nextval(pg_get_serial_sequence('timer', 'id')) AS id) \
-             INSERT INTO timer (id, kind, due_ms, state, created_ms, group_id, intent, chain_id, chain_depth, origin) \
-             SELECT n.id, 'wake', $1, 'pending', $2, $3, $4, COALESCE($5::bigint, n.id), $6, $7 FROM n \
+             INSERT INTO timer (id, kind, due_ms, state, created_ms, group_id, intent, chain_id, chain_depth, origin, \
+                                repeat_kind, repeat_interval_ms, repeat_minute, repeat_days, repeat_zone) \
+             SELECT n.id, 'wake', $1, 'pending', $2, $3, $4, COALESCE($5::bigint, n.id), $6, $7, $8, $9, $10, $11, $12 FROM n \
              RETURNING {COLS}"
         );
+        let (repeat_kind, interval, minute, days, zone) = repeat_columns(new.repeat.as_ref())?;
         let (chain_id, depth) = match new.chain {
             Some(chain) => (
                 Some(i64::try_from(chain.id.get()).map_err(backend)?),
@@ -241,6 +337,11 @@ impl TimerStore for PgTimerStore {
                 Origin::Model => "model",
                 Origin::Owner => "owner",
             })
+            .bind(repeat_kind)
+            .bind(interval)
+            .bind(minute)
+            .bind(days)
+            .bind(zone)
             .fetch_one(&mut *tx)
             .await
             .map_err(backend)?;
@@ -303,14 +404,27 @@ impl TimerStore for PgTimerStore {
         id: TimerId,
         edit: WakeEdit,
     ) -> Result<Timer, TimerStoreError> {
+        // $5 says whether the rule changes; a rule is replaced as a whole, never cleared.
+        let (repeat_kind, interval, minute, days, zone) = repeat_columns(edit.repeat.as_ref())?;
         let row = sqlx::query(&format!(
-            "UPDATE timer SET intent = COALESCE($3, intent), due_ms = COALESCE($4, due_ms) \
+            "UPDATE timer SET intent = COALESCE($3, intent), due_ms = COALESCE($4, due_ms), \
+                repeat_kind = CASE WHEN $5 THEN $6 ELSE repeat_kind END, \
+                repeat_interval_ms = CASE WHEN $5 THEN $7 ELSE repeat_interval_ms END, \
+                repeat_minute = CASE WHEN $5 THEN $8 ELSE repeat_minute END, \
+                repeat_days = CASE WHEN $5 THEN $9 ELSE repeat_days END, \
+                repeat_zone = CASE WHEN $5 THEN $10 ELSE repeat_zone END \
              WHERE id = $1 AND group_id = $2 AND kind = 'wake' AND state = 'pending' RETURNING {COLS}"
         ))
         .bind(id_i64(id)?)
         .bind(group.get())
         .bind(edit.intent)
         .bind(edit.due_at.map(UnixMillis::get))
+        .bind(repeat_kind.is_some())
+        .bind(repeat_kind)
+        .bind(interval)
+        .bind(minute)
+        .bind(days)
+        .bind(zone)
         .fetch_optional(&self.pool)
         .await
         .map_err(backend)?;
@@ -320,14 +434,12 @@ impl TimerStore for PgTimerStore {
         }
     }
 
-    async fn cancel_pending_wake(
-        &self,
-        group: GroupId,
-        id: TimerId,
-    ) -> Result<Timer, TimerStoreError> {
+    async fn cancel_wake(&self, group: GroupId, id: TimerId) -> Result<Timer, TimerStoreError> {
         let row = sqlx::query(&format!(
             "UPDATE timer SET state = 'cancelled' \
-             WHERE id = $1 AND group_id = $2 AND kind = 'wake' AND state = 'pending' RETURNING {COLS}"
+             WHERE id = $1 AND group_id = $2 AND kind = 'wake' \
+               AND (state = 'pending' OR (state = 'claimed' AND repeat_kind IS NOT NULL)) \
+             RETURNING {COLS}"
         ))
         .bind(id_i64(id)?)
         .bind(group.get())
@@ -389,6 +501,37 @@ impl TimerStore for PgTimerStore {
              WHERE id = $1 AND state = 'claimed'",
         )
         .bind(id_i64(id)?)
+        .bind(kind)
+        .bind(detail)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        if result.rows_affected() == 0 {
+            return Err(self.explain_miss(id, None).await);
+        }
+        Ok(())
+    }
+
+    async fn finish_occurrence(
+        &self,
+        id: TimerId,
+        occurrence: UnixMillis,
+        outcome: TimerOutcome,
+        next: UnixMillis,
+    ) -> Result<(), TimerStoreError> {
+        let (kind, detail) = outcome_columns(&outcome);
+        // Every right-hand side reads the row as it was, so last_due_ms takes the occurrence.
+        let result = sqlx::query(
+            "UPDATE timer SET \
+                state = CASE WHEN state = 'claimed' THEN 'pending' ELSE state END, \
+                due_ms = CASE WHEN state = 'claimed' THEN $3 ELSE due_ms END, \
+                last_due_ms = due_ms, last_outcome = $4, last_outcome_detail = $5 \
+             WHERE id = $1 AND due_ms = $2 AND kind = 'wake' AND repeat_kind IS NOT NULL \
+               AND state IN ('claimed', 'cancelled')",
+        )
+        .bind(id_i64(id)?)
+        .bind(occurrence.get())
+        .bind(next.get())
         .bind(kind)
         .bind(detail)
         .execute(&self.pool)
@@ -483,8 +626,45 @@ impl TimerStore for PgTimerStore {
         Ok(row.get::<Option<i64>, _>("next").map(UnixMillis::new))
     }
 
-    async fn recover(&self) -> Result<Recovery, TimerStoreError> {
+    async fn recover(&self, now: UnixMillis) -> Result<Recovery, TimerStoreError> {
         let mut tx = self.pool.begin().await.map_err(backend)?;
+        // A repeating task's interrupted occurrence is recorded, and the task moves on to its
+        // first occurrence after now; the rule is evaluated here, not in SQL.
+        let claimed = sqlx::query(&format!(
+            "SELECT {COLS} FROM timer \
+             WHERE kind = 'wake' AND state = 'claimed' AND repeat_kind IS NOT NULL FOR UPDATE"
+        ))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(backend)?;
+        let mut rescheduled = 0;
+        for row in &claimed {
+            // A row that cannot be read is interrupted below like a one-shot task, rather than
+            // holding up the recovery of everything else.
+            let found = match timer(row) {
+                Ok(found) => found,
+                Err(error) => {
+                    tracing::error!(%error, "a repeating task could not be read; it is interrupted");
+                    continue;
+                }
+            };
+            let Some(repeat) = found.wake().and_then(|w| w.repeat.as_ref()) else {
+                continue;
+            };
+            let (kind, detail) = outcome_columns(&TimerOutcome::Ran(RunEnd::Interrupted));
+            sqlx::query(
+                "UPDATE timer SET state = 'pending', due_ms = $2, last_due_ms = due_ms, \
+                    last_outcome = $3, last_outcome_detail = $4 WHERE id = $1",
+            )
+            .bind(id_i64(found.id)?)
+            .bind(repeat.next_after(found.due_at, now).get())
+            .bind(kind)
+            .bind(detail)
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+            rescheduled += 1;
+        }
         let interrupted = sqlx::query(
             "UPDATE timer SET state = 'interrupted' WHERE kind = 'wake' AND state = 'claimed'",
         )
@@ -502,6 +682,7 @@ impl TimerStore for PgTimerStore {
         tx.commit().await.map_err(backend)?;
         Ok(Recovery {
             interrupted: usize::try_from(interrupted).unwrap_or(usize::MAX),
+            rescheduled,
             requeued: usize::try_from(requeued).unwrap_or(usize::MAX),
         })
     }

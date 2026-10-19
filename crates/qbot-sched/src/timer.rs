@@ -4,6 +4,8 @@ use qbot_agent::Chain;
 use qbot_context::RunEnd;
 use qbot_core::{GroupId, TimerId, UnixMillis};
 
+use crate::repeat::Repeat;
+
 /// Who created a group task. Recorded for observability; it grants nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
@@ -11,13 +13,25 @@ pub enum Origin {
     Owner,
 }
 
-/// A group task: wake the agent with fresh context at `due_at`.
+/// A group task: wake the agent with fresh context at `due_at`. A repeating task is one timer
+/// that returns to pending at its next occurrence after each run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WakeSpec {
     pub group: GroupId,
     pub intent: String,
     pub chain: Chain,
     pub origin: Origin,
+    pub repeat: Option<Repeat>,
+    /// The latest occurrence of a repeating task that is over.
+    pub last: Option<LastRun>,
+}
+
+/// How one occurrence of a repeating task ended. An occurrence the process died during is
+/// `Ran(RunEnd::Interrupted)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LastRun {
+    pub due_at: UnixMillis,
+    pub outcome: TimerOutcome,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -142,10 +156,14 @@ pub struct NewWake {
     pub intent: String,
     pub chain: Option<Chain>,
     pub origin: Origin,
+    pub repeat: Option<Repeat>,
 }
 
+/// A change to a pending task. `repeat` makes the task repeat by that rule (a rule is replaced,
+/// never removed: cancelling ends a repeating task).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WakeEdit {
     pub intent: Option<String>,
     pub due_at: Option<UnixMillis>,
+    pub repeat: Option<Repeat>,
 }

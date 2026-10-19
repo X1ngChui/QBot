@@ -50,8 +50,8 @@ usage-stats = Usage: /stats [global]
 usage-top = Usage: /top [--linked] [count]
 usage-tasks_list = Usage: /tasks list [page]
 usage-tasks_one = Usage: /tasks { $action } ID
-usage-tasks_add = Usage: /tasks add (--at TIME | --in DURATION) -- content
-usage-tasks_edit = Usage: /tasks edit ID [--at TIME | --in DURATION] [-- content]
+usage-tasks_add = Usage: /tasks add (--at TIME | --in DURATION | --every RULE [--at TIME | --in DURATION]) -- content
+usage-tasks_edit = Usage: /tasks edit ID [--at TIME | --in DURATION] [--every RULE] [-- content]
 usage-members = Usage: /members
 usage-block = Usage: /block add|remove [--linked] @account [duration]
 usage-block_add = Usage: /block add [--linked] @account [30m|12h|3d]
@@ -137,9 +137,11 @@ detail-tasks =
     /tasks [list [page]]
     /tasks show ID
     /tasks add (--at TIME | --in 30m|12h|3d) -- content
-    /tasks edit ID [--at TIME | --in DURATION] [-- content]
+    /tasks add --every RULE [--at TIME | --in DURATION] -- content
+    /tasks edit ID [--at TIME | --in DURATION] [--every RULE] [-- content]
     /tasks cancel ID
     Lists pending and running tasks of this group. A scheduled time is not a promise of on-time delivery.
+    RULE makes a task repeat until it is cancelled: an interval (2h, 3d), daily@08:00, or days@time such as mon,thu@20:30, in the bot's time zone; --at or --in then sets the earliest first run. Runs missed while the bot was down are made up by one run.
 what-members = List the group's members
 detail-members = /members
 what-block = Manage reply blocks
@@ -254,7 +256,9 @@ tasks-no_mentions = /tasks manages this group's tasks only and takes no member t
 tasks-bad_id = Invalid task ID or arguments. See /help tasks.
 tasks-unknown_action = Unknown task action. See /help tasks.
 tasks-option_value = Each time option needs exactly one value.
-tasks-option_dupe = Only one --at or --in is accepted, and no other options.
+tasks-option_dupe = Each of --at, --in and --every is accepted once, and no other options.
+tasks-bad_every = --every needs an interval (2h, 3d), daily@HH:MM, or days@HH:MM such as mon,thu@20:30.
+tasks-interval_too_short = A repeating task's interval must be at least { $min }.
 tasks-at_in_conflict = Use either --at or --in, not both.
 tasks-bad_time = --at needs an RFC 3339 time with a UTC offset, for example 2030-01-02T09:00:00+08:00.
 tasks-empty_content = The task content must not be empty.
@@ -272,6 +276,9 @@ tasks-shown =
 tasks-cancelled =
     Cancelled the task:
     { $task }
+tasks-cancelled_repeating =
+    Cancelled the repeating task; nothing more is scheduled for it, and a run already under way finishes:
+    { $task }
 tasks-created =
     Created the task:
     { $task }
@@ -283,6 +290,20 @@ tasks-detail =
     State: { $state } | Due: { $due }
     { $intent }
 tasks-detail_outcome = Result: { $outcome }
+tasks-detail_repeat = Repeats { $rule }; the due time is the next run.
+tasks-detail_last_run = Last run (due { $due }): { $outcome }
+tasks-repeat_interval = every { $interval }
+tasks-repeat_daily = every day at { $time } ({ $zone })
+tasks-repeat_weekly = every { $days } at { $time } ({ $zone })
+tasks-weekday = { $day ->
+        [mon] Monday
+        [tue] Tuesday
+        [wed] Wednesday
+        [thu] Thursday
+        [fri] Friday
+        [sat] Saturday
+       *[sun] Sunday
+    }
 tasks-state_pending = pending
 tasks-state_running = running
 tasks-state_done = finished
@@ -293,7 +314,7 @@ tasks-skipped_muted = skipped (the group was muted)
 tasks-too_soon = The time is too soon; the earliest allowed is { $earliest }.
 tasks-too_many = This group already has { $limit } pending tasks.
 tasks-chain_deep = The follow-up chain is already { $limit } tasks deep.
-tasks-nothing_to_change = Editing a task needs new content or a new time.
+tasks-nothing_to_change = Editing a task needs new content, a new time or a new rule.
 tasks-empty_intent = The task content must not be empty.
 who-facts = Learned from chat ({ $count }):
 who-no_facts = Learned from chat: nothing yet

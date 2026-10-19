@@ -259,6 +259,7 @@ async fn a_wake_note_states_the_task_and_that_it_is_not_a_message() {
                     id: ChainId::new(3),
                     depth: 2,
                 },
+                repeats: false,
             },
         )
         .await
@@ -270,6 +271,32 @@ async fn a_wake_note_states_the_task_and_that_it_is_not_a_message() {
         "{note}"
     );
     assert!(note.contains("No one has just asked for anything"));
+    assert!(
+        !note.contains("repeats"),
+        "a one-shot task says nothing of repeating: {note}"
+    );
+
+    let repeating = ctx
+        .open(
+            GroupId::new(900).unwrap(),
+            &Trigger::Wake {
+                timer: TimerId::new(13),
+                intent: "post the weekly topic".into(),
+                chain: Chain {
+                    id: ChainId::new(13),
+                    depth: 0,
+                },
+                repeats: true,
+            },
+        )
+        .await
+        .unwrap();
+    let note = repeating.trigger_note.unwrap().text;
+    assert!(
+        note.contains("This task repeats by itself")
+            && note.contains("do not schedule the next one"),
+        "{note}"
+    );
 }
 
 #[test]
@@ -957,6 +984,7 @@ async fn members_the_context_names_can_be_addressed_though_they_did_not_speak() 
             id: qbot_core::ChainId::new(1),
             depth: 0,
         },
+        repeats: false,
     };
     let opened = ctx.open(g, &wake).await.unwrap();
     let numbers: Vec<u32> = opened.members.iter().map(|(n, _)| n.get()).collect();

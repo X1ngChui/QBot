@@ -78,7 +78,7 @@ async fn updating_and_cancelling_replan_the_scheduler() {
     sleep(SETTLE).await;
 
     r.service
-        .update(group(), moved, None, Some(When::After(mins(20))))
+        .update(group(), moved, None, Some(When::After(mins(20))), None)
         .await
         .unwrap();
     r.service.cancel(group(), cancelled).await.unwrap();
@@ -394,7 +394,7 @@ async fn shutting_down_drops_a_running_job_which_the_next_start_queues_again() {
         matches!(r.state(id).await, TimerState::Claimed { .. }),
         "the claim stays: neither done nor failed"
     );
-    r.store.recover().await.unwrap();
+    r.store.recover(r.clock_now()).await.unwrap();
     assert_eq!(r.state(id).await, TimerState::Pending);
 }
 

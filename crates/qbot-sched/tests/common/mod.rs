@@ -15,7 +15,7 @@ use qbot_llm::ReasoningEffort;
 use qbot_llm::fake::{FakeProvider, FakeReply, Step};
 use qbot_sched::{
     JobError, JobKind, JobRunner, MemoryTimerStore, Scheduler, SchedulerConfig, TaskLimits,
-    TaskService, Timer, TimerState, TokioClock,
+    TaskService, Timer, TimerState, TokioClock, Zone,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -146,6 +146,7 @@ pub fn rig_with(script: Vec<Step>, capacity: usize, cfg: SchedulerConfig) -> Rig
         clock.clone(),
         TaskLimits::default(),
         wake.clone(),
+        Zone::get("UTC").unwrap(),
     );
     let jobs = Arc::new(ScriptedJobs::default());
     *jobs.clock.lock().unwrap() = Some(clock.clone());

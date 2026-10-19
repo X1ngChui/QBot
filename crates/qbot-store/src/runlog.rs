@@ -85,8 +85,9 @@ fn trigger_json(trigger: &Trigger) -> Value {
             timer,
             intent,
             chain,
+            repeats,
         } => {
-            json!({ "timer": timer.get(), "intent": intent, "chain": chain.id.get(), "depth": chain.depth })
+            json!({ "timer": timer.get(), "intent": intent, "chain": chain.id.get(), "depth": chain.depth, "repeats": repeats })
         }
         Trigger::Spontaneous => json!({}),
     }

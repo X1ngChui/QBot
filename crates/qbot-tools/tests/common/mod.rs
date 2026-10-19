@@ -14,7 +14,7 @@ use qbot_llm::ReasoningEffort;
 use qbot_llm::fake::{FakeProvider, FakeReply, Step};
 use qbot_sched::{
     JobError, JobKind, JobRunner, MemoryTimerStore, Scheduler, SchedulerConfig, TaskLimits,
-    TaskService, Timer, TimerStore, TokioClock,
+    TaskService, Timer, TimerStore, TokioClock, Zone,
 };
 use qbot_tools::standard_tools;
 use serde_json::{Value, json};
@@ -22,6 +22,9 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 pub const START: i64 = 1_800_000_000_000; // 2027-01-15T08:00:00Z
+
+/// The bot's time zone in these tests: 2027-01-15T08:00:00Z is 16:00 there.
+pub const ZONE: &str = "Asia/Shanghai";
 
 pub fn group() -> GroupId {
     GroupId::new(555).unwrap()
@@ -61,6 +64,7 @@ pub fn rig(script: Vec<Step>) -> Rig {
         clock.clone(),
         TaskLimits::default(),
         wake.clone(),
+        Zone::get(ZONE).unwrap(),
     );
     let tools = standard_tools(
         world.clone() as Arc<dyn Delivery>,

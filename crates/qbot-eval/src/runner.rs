@@ -436,6 +436,7 @@ impl Runner {
             clock.clone(),
             TaskLimits::default(),
             Arc::new(Notify::new()),
+            qbot_sched::Zone::get(TIMEZONE).map_err(|e| e.to_string())?,
         );
         let episodes = Arc::new(MemoryEpisodeStore::default());
         let recall = Arc::new(Recall::new(
@@ -501,6 +502,7 @@ impl Runner {
                     id: ChainId::new(1),
                     depth: 0,
                 },
+                repeats: false,
             },
             (None, None) if scenario.trigger.spontaneous => Trigger::Spontaneous,
             (None, None) => return Err("no trigger".into()),

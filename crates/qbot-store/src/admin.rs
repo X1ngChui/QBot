@@ -450,8 +450,10 @@ impl PgAdmin {
             "SELECT count(*) FILTER (WHERE kind = 'job' AND state = 'pending')::bigint AS pending, \
                     count(*) FILTER (WHERE kind = 'job' AND state = 'done' AND outcome = 'job_failed' \
                                      AND created_ms >= $1 AND created_ms < $2)::bigint AS failed, \
-                    count(*) FILTER (WHERE kind = 'wake' AND state = 'interrupted' \
-                                     AND created_ms >= $1 AND created_ms < $2)::bigint AS interrupted \
+                    count(*) FILTER (WHERE kind = 'wake' AND ((state = 'interrupted' \
+                                     AND created_ms >= $1 AND created_ms < $2) \
+                                     OR (last_outcome = 'ran' AND last_outcome_detail = 'interrupted' \
+                                     AND last_due_ms >= $1 AND last_due_ms < $2)))::bigint AS interrupted \
              FROM timer",
         )
         .bind(from)

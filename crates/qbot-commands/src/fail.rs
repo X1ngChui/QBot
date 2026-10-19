@@ -67,6 +67,9 @@ pub fn task_fail(error: TaskError, earliest: impl Fn(qbot_core::UnixMillis) -> S
             limit: u64::try_from(limit).unwrap_or(u64::MAX),
         }),
         TaskError::ChainTooDeep { limit } => Fail::Say(Msg::TasksChainDeep { limit }),
+        TaskError::IntervalTooShort { min } => Fail::Say(Msg::TasksIntervalTooShort {
+            min: qbot_sched::interval_text(min),
+        }),
         TaskError::NotFound | TaskError::NotPending => Fail::Say(Msg::TasksNotFound {}),
         TaskError::NothingToChange => Fail::Say(Msg::TasksNothingToChange {}),
         TaskError::Storage(message) => Fail::Storage(message),

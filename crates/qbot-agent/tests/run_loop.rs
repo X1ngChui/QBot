@@ -523,6 +523,7 @@ async fn a_wake_trigger_carries_its_intent_as_a_lower_trust_note() {
             id: qbot_core::ChainId::new(1),
             depth: 0,
         },
+        repeats: false,
     };
     run_once(&h, wake).await;
     let conv = &h.fake.recorded()[0].conversation;

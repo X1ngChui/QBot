@@ -1,0 +1,27 @@
+description = "A member asks for a reminder every weekday morning. The bot should create one repeating task with a structured rule (not a one-time task, and not an intent that tells it to schedule itself again), and confirm only after the task was created."
+
+start = "2026-10-05T21:30:00+08:00"
+
+members = [
+  { number = 1, account = 10001, name = "小林" },
+  { number = 2, account = 10002, name = "阿杰" },
+]
+
+chat = [
+  { member = 2, text = "又忘记打卡了" },
+  { member = 1, text = "[at:bot] 以后每个工作日早上八点四十提醒大家打卡" },
+]
+
+trigger = { line = 2 }
+
+[expect]
+send = "required"
+send_calls_at_most = 1
+tools_required = ["schedule_task"]
+rubric = [
+  "The bot created exactly one scheduled task (schedule_task succeeded once).",
+  "The task repeats: schedule_task was called with repeat \"weekly\", repeat_weekdays mon, tue, wed, thu and fri, and repeat_time \"08:40\".",
+  "The task's intent says what each run is for (reminding the group to clock in) and does not ask the bot to schedule the next run.",
+  "The bot's confirmation was sent after the schedule_task call succeeded, and does not claim anything the tool results do not show.",
+  "The confirmation is short and in Chinese.",
+]

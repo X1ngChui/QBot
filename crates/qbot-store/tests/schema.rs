@@ -115,6 +115,38 @@ async fn constraints_reject_invalid_rows() {
     assert!(rejected(&db, "INSERT INTO timer (kind, due_ms, state, created_ms, job_kind) VALUES ('job', 0, 'pending', 0, 'mystery')").await);
     sqlx::query("INSERT INTO timer (kind, due_ms, state, created_ms, job_kind) VALUES ('job', 0, 'pending', 0, 'decay')").execute(db.pool()).await.unwrap();
 
+    // Repeat rules: each kind has exactly its own fields and a zone, only on wakes; a last run
+    // only on a repeating task.
+    let wake = "INSERT INTO timer (kind, due_ms, state, created_ms, group_id, intent, chain_id, chain_depth, origin";
+    let values = "VALUES ('wake', 0, 'pending', 0, 1, 'x', 1, 0, 'model'";
+    for bad in [
+        "repeat_kind, repeat_zone) {v}, 'interval', 'UTC')",
+        "repeat_kind, repeat_interval_ms) {v}, 'interval', 3600000)",
+        "repeat_kind, repeat_interval_ms, repeat_zone) {v}, 'interval', 90000, 'UTC')",
+        "repeat_kind, repeat_interval_ms, repeat_minute, repeat_zone) {v}, 'interval', 3600000, 60, 'UTC')",
+        "repeat_kind, repeat_minute, repeat_zone) {v}, 'daily', 1440, 'UTC')",
+        "repeat_kind, repeat_minute, repeat_days, repeat_zone) {v}, 'daily', 60, 1, 'UTC')",
+        "repeat_kind, repeat_minute, repeat_zone) {v}, 'weekly', 60, 'UTC')",
+        "repeat_kind, repeat_minute, repeat_days, repeat_zone) {v}, 'weekly', 60, 128, 'UTC')",
+        "repeat_kind, repeat_minute, repeat_zone) {v}, 'monthly', 60, 'UTC')",
+        "repeat_zone) {v}, 'UTC')",
+        "last_due_ms, last_outcome) {v}, 0, 'ran')",
+        "repeat_kind, repeat_minute, repeat_zone, last_due_ms) {v}, 'daily', 60, 'UTC', 0)",
+        "repeat_kind, repeat_minute, repeat_zone, last_due_ms, last_outcome) {v}, 'daily', 60, 'UTC', 0, 'job_ok')",
+    ] {
+        let sql = format!("{wake}, {}", bad.replace("{v}", values));
+        assert!(rejected(&db, &sql).await, "{sql}");
+    }
+    assert!(rejected(&db, "INSERT INTO timer (kind, due_ms, state, created_ms, job_kind, repeat_kind, repeat_minute, repeat_zone) VALUES ('job', 0, 'pending', 0, 'decay', 'daily', 60, 'UTC')").await);
+    for good in [
+        "repeat_kind, repeat_interval_ms, repeat_zone) {v}, 'interval', 3600000, 'UTC')",
+        "repeat_kind, repeat_minute, repeat_zone, last_due_ms, last_outcome, last_outcome_detail) {v}, 'daily', 0, 'Asia/Shanghai', 0, 'ran', 'completed')",
+        "repeat_kind, repeat_minute, repeat_days, repeat_zone) {v}, 'weekly', 1439, 127, 'UTC')",
+    ] {
+        let sql = format!("{wake}, {}", good.replace("{v}", values));
+        sqlx::query(&sql).execute(db.pool()).await.unwrap();
+    }
+
     // Ordinals are unique per group and start at 1.
     assert!(rejected(&db, "INSERT INTO chat_line (group_id, ordinal, message_id, speaker, at_ms, text) VALUES (1, 1, 5, 'bot', 0, 'same ordinal')").await);
     assert!(rejected(&db, "INSERT INTO chat_line (group_id, ordinal, message_id, speaker, at_ms, text) VALUES (1, 0, 6, 'bot', 0, 'zero')").await);

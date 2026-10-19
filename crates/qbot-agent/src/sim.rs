@@ -291,11 +291,17 @@ impl ContextSource for SimWorld {
         let window: Vec<ChatLine> = world.lines.iter().map(|a| a.line.clone()).collect();
         let cursor = world.lines.last().map_or(ArchiveCursor(0), |a| a.seq);
         let trigger_note = match trigger {
-            Trigger::Wake { timer, intent, .. } => Some(Instruction {
+            Trigger::Wake {
+                timer,
+                intent,
+                repeats,
+                ..
+            } => Some(Instruction {
                 role: InstructionRole::Trigger,
                 text: format!(
-                    "[scheduled task {} woke up; its stored intent: {intent}]",
-                    timer.get()
+                    "[scheduled task {} woke up{}; its stored intent: {intent}]",
+                    timer.get(),
+                    if *repeats { " (it repeats)" } else { "" }
                 ),
                 template_hash: "sim".into(),
             }),

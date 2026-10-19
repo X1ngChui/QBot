@@ -39,9 +39,9 @@ usage-unlink = 用法：/unlink
 usage-stats = 用法：/stats [global]
 usage-top = 用法：/top [--linked] [数量]
 usage-tasks_list = 用法：/tasks list [页码]
-usage-tasks_one = 用法：/tasks { $action } UUID
-usage-tasks_add = 用法：/tasks add (--at 时间 | --in 时长) -- 内容
-usage-tasks_edit = 用法：/tasks edit UUID [--at 时间 | --in 时长] [-- 内容]
+usage-tasks_one = 用法：/tasks { $action } ID
+usage-tasks_add = 用法：/tasks add (--at 时间 | --in 时长 | --every 规则 [--at 时间 | --in 时长]) -- 内容
+usage-tasks_edit = 用法：/tasks edit ID [--at 时间 | --in 时长] [--every 规则] [-- 内容]
 usage-members = 用法：/members
 usage-block = 用法：/block add|remove [--linked] @账号 [时长]
 usage-block_add = 用法：/block add [--linked] @账号 [30m|12h|3d]
@@ -125,11 +125,13 @@ detail-top =
 what-tasks = 管理本群定时任务
 detail-tasks =
     /tasks [list [页码]]
-    /tasks show UUID
+    /tasks show ID
     /tasks add (--at 时间 | --in 30m|12h|3d) -- 内容
-    /tasks edit UUID [--at 时间 | --in 时长] [-- 内容]
-    /tasks cancel UUID
+    /tasks add --every 规则 [--at 时间 | --in 时长] -- 内容
+    /tasks edit ID [--at 时间 | --in 时长] [--every 规则] [-- 内容]
+    /tasks cancel ID
     列出本群待执行与执行中的任务。预约时间不保证准点送达。
+    规则让任务重复执行直到取消：间隔（2h、3d）、daily@08:00，或 星期@时间（如 mon,thu@20:30），按机器人所在时区；此时 --at 或 --in 指定最早的首次执行。机器人停机期间错过的多次执行只补一次。
 what-members = 查看全群成员目录
 detail-members = /members
 what-block = 管理回复屏蔽
@@ -231,7 +233,9 @@ tasks-no_mentions = /tasks 只管理本群任务，不接收成员目标。
 tasks-bad_id = 任务 ID 或参数格式无效。用法见 /help tasks。
 tasks-unknown_action = 未知任务操作。用法见 /help tasks。
 tasks-option_value = 时间选项必须包含一个值。
-tasks-option_dupe = 只接受一次 --at 或 --in，不接受其它选项。
+tasks-option_dupe = --at、--in、--every 各只接受一次，不接受其它选项。
+tasks-bad_every = --every 需要间隔（2h、3d）、daily@时:分，或 星期@时:分（如 mon,thu@20:30）。
+tasks-interval_too_short = 重复任务的间隔至少为 { $min }。
 tasks-at_in_conflict = --at 与 --in 只能选一个。
 tasks-bad_time = --at 需要带时区的 RFC 3339 时间，例如 2030-01-02T09:00:00+08:00。
 tasks-empty_content = 任务内容不能为空。
@@ -239,7 +243,7 @@ tasks-list_empty = 本群暂无待执行或执行中的任务。
 tasks-list_page_empty = 此页没有任务，请查看前面的页码。
 tasks-list_header = 本群活动任务｜第 { $page } 页（待执行、执行中）
 tasks-list_next = 下一页：/tasks list { $page }
-tasks-list_footer = 完整内容与结果：/tasks show UUID
+tasks-list_footer = 完整内容与结果：/tasks show ID
 tasks-not_found_cancel = 本群没有该任务，或任务已不处于可取消的待执行状态。
 tasks-not_found_edit = 本群没有该任务，或任务已不处于可修改的待执行状态。
 tasks-not_found = 本群没有该任务。
@@ -248,6 +252,9 @@ tasks-shown =
     { $task }
 tasks-cancelled =
     已取消本群任务：
+    { $task }
+tasks-cancelled_repeating =
+    已取消本群重复任务，之后不再执行；正在进行的这一次会执行完：
     { $task }
 tasks-created =
     已创建本群任务：
@@ -260,6 +267,20 @@ tasks-detail =
     状态：{ $state }｜预约时间：{ $due }
     { $intent }
 tasks-detail_outcome = 执行结果：{ $outcome }
+tasks-detail_repeat = 重复：{ $rule }；预约时间为下一次执行。
+tasks-detail_last_run = 上次执行（预约 { $due }）：{ $outcome }
+tasks-repeat_interval = 每 { $interval }
+tasks-repeat_daily = 每天 { $time }（{ $zone }）
+tasks-repeat_weekly = 每{ $days } { $time }（{ $zone }）
+tasks-weekday = { $day ->
+        [mon] 周一
+        [tue] 周二
+        [wed] 周三
+        [thu] 周四
+        [fri] 周五
+        [sat] 周六
+       *[sun] 周日
+    }
 tasks-state_pending = 待执行
 tasks-state_running = 执行中
 tasks-state_done = 已结束
@@ -270,7 +291,7 @@ tasks-skipped_muted = 已跳过（本群静音）
 tasks-too_soon = 预约时间过近，最早可预约 { $earliest }。
 tasks-too_many = 本群待执行任务数量已达上限（{ $limit }）。
 tasks-chain_deep = 本群任务续链深度已达上限（{ $limit }）。
-tasks-nothing_to_change = 修改任务至少需要内容或新的预约时间。
+tasks-nothing_to_change = 修改任务至少需要内容、新的预约时间或新的规则。
 tasks-empty_intent = 任务内容不能为空。
 who-facts = 自动归纳：{ $count } 条
 who-no_facts = 自动归纳：暂无

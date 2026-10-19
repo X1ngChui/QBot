@@ -2449,6 +2449,7 @@ dependencies = [
  "chrono-tz",
  "croner",
  "futures-util",
+ "jiff",
  "qbot-agent",
  "qbot-context",
  "qbot-core",
