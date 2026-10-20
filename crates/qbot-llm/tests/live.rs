@@ -762,3 +762,187 @@ async fn deepseek_forces_tools_only_without_reasoning_and_cannot_return_to_reaso
     eprintln!("[forced] after, with reasoning -> {thinking:?}");
     assert!(matches!(thinking, LlmError::InvalidRequest(ref m) if m.contains("reasoning_text")));
 }
+
+/// What DeepSeek does with a forced tool choice while thinking, asked of the API itself: raw
+/// request bodies, so the adapter's own guard is not what is measured. Measured 2026-10-21 on
+/// `deepseek-flash` (DeepSeek-V4.1-Flash-1017), Responses and Chat Completions alike: every
+/// effort refuses `required` and a named function ("Thinking mode does not support this
+/// tool_choice"), without thinking it is honoured, and a thinking turn after it is refused. If
+/// a model lifts this, the first assertion fails and `ForcedToolChoice` can be revisited.
+#[tokio::test]
+#[ignore = "calls paid provider APIs"]
+async fn deepseek_forced_tool_choice_with_thinking_on_the_real_api() {
+    use qbot_llm::responses::Transport;
+    let endpoint = env_or("QBOT_LIVE_TEXT_ENDPOINT", "https://api.deepseek.com");
+    let transport = ReqwestTransport::new(
+        endpoint,
+        KeySource::Static(secret("text_api_key")),
+        &qbot_llm::net::Route::Direct,
+    )
+    .unwrap();
+    let model = env_or("QBOT_LIVE_TEXT_MODEL", "deepseek-flash");
+    let tool = json!({
+        "type": "function", "name": "get_weather", "description": "Current weather for a city.",
+        "parameters": {
+            "type": "object", "properties": { "city": { "type": "string" } },
+            "required": ["city"], "additionalProperties": false
+        },
+        "strict": false
+    });
+    let input = json!([
+        { "role": "system", "content": "Use get_weather before answering." },
+        { "role": "user", "content": "Weather in Paris?" }
+    ]);
+    let post = |body: serde_json::Value| {
+        let transport = &transport;
+        async move {
+            let response = transport.post("/responses", &body).await.unwrap();
+            let value: serde_json::Value =
+                serde_json::from_slice(&response.body).unwrap_or(serde_json::Value::Null);
+            (response.status, value)
+        }
+    };
+    let kinds = |value: &serde_json::Value| -> Vec<String> {
+        value["output"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|i| i["type"].as_str().unwrap_or("?").to_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let error = |value: &serde_json::Value| value["error"]["message"].to_string();
+
+    let mut accepted = Vec::new();
+    for effort in ["low", "high", "max"] {
+        for choice in [
+            json!("required"),
+            json!({ "type": "function", "name": "get_weather" }),
+        ] {
+            let (status, value) = post(json!({
+                "model": model, "input": input, "tools": [tool], "tool_choice": choice,
+                "reasoning": { "effort": effort }, "stream": false, "store": false
+            }))
+            .await;
+            let output = kinds(&value);
+            eprintln!(
+                "[forced+thinking] model={model} effort={effort} tool_choice={choice} -> status={status} output={output:?} error={}",
+                error(&value)
+            );
+            let thought = output.iter().any(|k| k == "reasoning");
+            let called = output.iter().any(|k| k == "function_call");
+            accepted.push((effort, status == 200 && called, thought, value));
+        }
+    }
+
+    // A thinking turn after a forced turn made with thinking on (when that was accepted), and
+    // after one made without thinking: the second limitation the adapter assumes.
+    let follow = |first: serde_json::Value| {
+        let (input, model, tool, post) = (&input, &model, &tool, &post);
+        async move {
+            let mut items = input.as_array().unwrap().clone();
+            let mut call_id = String::new();
+            for item in first["output"].as_array().cloned().unwrap_or_default() {
+                if item["type"] == "function_call" {
+                    call_id = item["call_id"].as_str().unwrap_or_default().to_owned();
+                }
+                items.push(item);
+            }
+            items.push(json!({ "type": "function_call_output", "call_id": call_id,
+                           "output": "Paris: 17 degrees, light rain." }));
+            post(json!({
+                "model": model, "input": items, "tools": [tool],
+                "reasoning": { "effort": "high" }, "stream": false, "store": false
+            }))
+            .await
+        }
+    };
+    assert!(
+        accepted.iter().all(|(_, ok, _, _)| !*ok),
+        "a forced tool choice was accepted with thinking on: revisit ForcedToolChoice"
+    );
+    if let Some((_, _, _, first)) = accepted.iter().find(|(_, ok, thought, _)| *ok && *thought) {
+        let (status, value) = follow(first.clone()).await;
+        eprintln!(
+            "[thinking after forced+thinking] status={status} output={:?} error={}",
+            kinds(&value),
+            error(&value)
+        );
+    }
+    let (status, unthought) = post(json!({
+        "model": model, "input": input, "tools": [tool], "tool_choice": "required",
+        "reasoning": { "effort": "none" }, "stream": false, "store": false
+    }))
+    .await;
+    eprintln!(
+        "[forced, no thinking] status={status} output={:?}",
+        kinds(&unthought)
+    );
+    let (status, value) = follow(unthought).await;
+    eprintln!(
+        "[thinking after forced, no thinking] status={status} output={:?} error={}",
+        kinds(&value),
+        error(&value)
+    );
+    assert_eq!(
+        status, 400,
+        "a thinking turn after a forced one without thinking"
+    );
+
+    // The version-pinned name, if the API knows it.
+    let (status, value) = post(json!({
+        "model": "deepseek-v4.1-flash-1017", "input": input, "stream": false, "store": false,
+        "reasoning": { "effort": "none" }
+    }))
+    .await;
+    eprintln!(
+        "[model name deepseek-v4.1-flash-1017] status={status} model={} error={}",
+        value["model"],
+        error(&value)
+    );
+
+    // The Chat Completions API (the format DeepSeek's thinking-mode guide documents), which the
+    // adapter does not use: is the restriction the same there?
+    for choice in [
+        json!("required"),
+        json!({ "type": "function", "function": { "name": "get_weather" } }),
+    ] {
+        let response = transport
+            .post(
+                "/chat/completions",
+                &json!({
+                    "model": model,
+                    "messages": input,
+                    "tools": [{ "type": "function", "function": {
+                        "name": "get_weather", "description": "Current weather for a city.",
+                        "parameters": tool["parameters"] } }],
+                    "tool_choice": choice,
+                    "thinking": { "type": "enabled" },
+                    "reasoning_effort": "high",
+                    "stream": false
+                }),
+            )
+            .await
+            .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&response.body).unwrap_or(serde_json::Value::Null);
+        let message = &value["choices"][0]["message"];
+        eprintln!(
+            "[chat completions forced+thinking] tool_choice={choice} -> status={} tool_calls={} reasoning_content={} error={}",
+            response.status,
+            message["tool_calls"].as_array().map_or(0, Vec::len),
+            message["reasoning_content"]
+                .as_str()
+                .is_some_and(|r| !r.is_empty()),
+            error(&value)
+        );
+    }
+
+    let summary: Vec<(&str, bool, bool)> = accepted
+        .iter()
+        .map(|(effort, ok, thought, _)| (*effort, *ok, *thought))
+        .collect();
+    eprintln!("[summary] (effort, forced call accepted, reasoning present) = {summary:?}");
+}

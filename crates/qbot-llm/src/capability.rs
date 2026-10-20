@@ -66,8 +66,9 @@ pub struct Capabilities {
 pub enum ForcedToolChoice {
     Always,
     /// Only with reasoning off (`ReasoningEffort::Off`), and once a conversation has a turn
-    /// made without reasoning, later turns must stay without it. DeepSeek's Responses API
-    /// (checked 2026-10-05, deepseek-flash and deepseek-v4-pro, every effort): a forced
+    /// made without reasoning, later turns must stay without it. DeepSeek (checked 2026-10-05 on
+    /// deepseek-flash and deepseek-v4-pro, and again 2026-10-21 on deepseek-flash as
+    /// DeepSeek-V4.1-Flash-1017, Responses and Chat Completions, every effort): a forced
     /// `tool_choice` with thinking on is refused ("Thinking mode does not support this
     /// tool_choice"), and a thinking turn after a non-thinking one is refused ("The
     /// `reasoning_text` in the thinking mode must be passed back to the API").

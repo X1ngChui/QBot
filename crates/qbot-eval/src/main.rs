@@ -9,7 +9,8 @@
 //! The report goes to `eval/results/<time>/` (`report.md`, `results.json`). The key is read from
 //! `deploy/secrets/text_api_key` (or `QBOT_EVAL_SECRETS_DIR`) into memory only. Models:
 //! `QBOT_EVAL_MODEL` (default `deepseek-flash`, the reply model) and `QBOT_EVAL_JUDGE_MODEL`
-//! (default `deepseek-v4-pro`); `QBOT_EVAL_ENDPOINT` overrides the endpoint.
+//! (default `deepseek-flash` too, which DeepSeek serves as DeepSeek-V4.1-Flash-1017, stronger than
+//! V4 Pro); `QBOT_EVAL_ENDPOINT` overrides the endpoint.
 
 mod judge;
 mod runner;
@@ -225,7 +226,7 @@ async fn main() -> ExitCode {
 async fn real_main() -> Result<bool, String> {
     let args = args()?;
     let model = env_or("QBOT_EVAL_MODEL", "deepseek-flash");
-    let judge_model = env_or("QBOT_EVAL_JUDGE_MODEL", "deepseek-v4-pro");
+    let judge_model = env_or("QBOT_EVAL_JUDGE_MODEL", "deepseek-flash");
     let runner = Runner {
         provider: provider(&model)?,
         personas: persona(args.persona.as_deref())?,

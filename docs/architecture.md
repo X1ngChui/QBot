@@ -288,9 +288,11 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
 - **Tool choice per turn.** Every turn of a run must call a tool (a turn without one ends the
   run), but a turn asks for `ToolChoice::Auto`, not a forced choice: the reply keeps its
   reasoning, and DeepSeek's Responses API refuses any forced `tool_choice` (`required` or a
-  named function) whenever thinking is on, which it is by default (re-measured 2026-10-14:
-  "Thinking mode does not support this tool_choice"; with `reasoning.effort = none` a forced
-  choice is accepted). In thinking mode the model tends to answer in plain text when the
+  named function) whenever thinking is on, which it is by default (re-measured 2026-10-14, and
+  2026-10-21 on `deepseek-flash` as DeepSeek-V4.1-Flash-1017 through both the Responses and the
+  Chat Completions API, efforts low, high and max: "Thinking mode does not support this
+  tool_choice"; with `reasoning.effort = none` a forced choice is accepted; the live test
+  `deepseek_forced_tool_choice_with_thinking_on_the_real_api` measures it). In thinking mode the model tends to answer in plain text when the
   request ends on chat rather than on an instruction (6 of 6 replays of a real reply request,
   against 0 of 6 without thinking), so every trigger note ends by saying to reply through
   `send_messages` or `stay_silent`; with that line, 11 of 12 replays called a tool directly.
