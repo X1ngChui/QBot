@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use qbot_core::{AccountId, GroupId, SliceGrid};
+use qbot_core::{AccountId, GroupId, MessageId, SliceGrid};
 use qbot_llm::{Attribution, Purpose, attributed};
 use qbot_sched::{JobError, JobKind, JobRunner};
 
@@ -177,13 +177,30 @@ impl EpisodeJobs {
                 None => Vec::new(),
             };
 
-            let background = match &self.background {
+            let mut background = match &self.background {
                 Some(source) => source
                     .background(group, &members(&[&previous, &target, &next]))
                     .await
                     .map_err(failed)?,
                 None => Background::default(),
             };
+            // The chat these lines continue: the episode just before, and lines further back
+            // that they quote.
+            let start = *plan.target.start();
+            background.earlier = self
+                .store
+                .ending_within(group, start.saturating_sub(1), start.saturating_sub(1))
+                .await
+                .map_err(failed)?
+                .pop()
+                .map(|e| (e.episode.title, e.episode.summary));
+            let shown = &[&previous[..], &target[..], &next[..]];
+            let first_shown = previous.first().map_or(start, |l| l.ordinal);
+            background.quoted = self
+                .store
+                .quoted(group, &quoted_unshown(shown), first_shown)
+                .await
+                .map_err(failed)?;
             let ctx = SliceContext {
                 group,
                 previous: &previous,
@@ -233,6 +250,27 @@ impl EpisodeJobs {
             stored += 1;
         }
     }
+}
+
+/// The messages the lines quote (`[reply:ID]`) that are not among them.
+fn quoted_unshown(parts: &[&[SliceLine]]) -> Vec<MessageId> {
+    let lines = || parts.iter().flat_map(|part| part.iter());
+    let shown: std::collections::HashSet<MessageId> = lines().map(|l| l.message).collect();
+    let mut wanted: Vec<MessageId> = lines()
+        .flat_map(|line| {
+            line.text
+                .match_indices("[reply:")
+                .map(move |(at, _)| &line.text[at + 7..])
+        })
+        .filter_map(|rest| {
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse().ok().and_then(|id| MessageId::new(id).ok())
+        })
+        .filter(|id| !shown.contains(id))
+        .collect();
+    wanted.sort();
+    wanted.dedup();
+    wanted
 }
 
 /// The members the lines involve, by number: who wrote them (with the account) and who they

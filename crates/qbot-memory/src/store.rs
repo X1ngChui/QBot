@@ -3,7 +3,7 @@
 use std::sync::{Mutex, PoisonError};
 
 use async_trait::async_trait;
-use qbot_core::{GroupId, UnixMillis};
+use qbot_core::{GroupId, MessageId, UnixMillis};
 
 use crate::episode::{Episode, EpisodeId, Hit, NewEpisode};
 use crate::slice::SliceLine;
@@ -30,6 +30,15 @@ pub trait EpisodeStore: Send + Sync {
         group: GroupId,
         first_ordinal: u64,
         last_ordinal: u64,
+    ) -> Result<Vec<SliceLine>, MemoryError>;
+
+    /// For each of `messages`, the newest line of the group with that message id and an ordinal
+    /// below `before`, oldest first: the lines a quote points at.
+    async fn quoted(
+        &self,
+        group: GroupId,
+        messages: &[MessageId],
+        before: u64,
     ) -> Result<Vec<SliceLine>, MemoryError>;
 
     /// The highest archived ordinal of the group, 0 when empty.
@@ -193,6 +202,29 @@ impl EpisodeStore for MemoryEpisodeStore {
             .map(|(_, l)| l.clone())
             .collect();
         found.sort_by_key(|l| l.ordinal);
+        Ok(found)
+    }
+
+    async fn quoted(
+        &self,
+        group: GroupId,
+        messages: &[MessageId],
+        before: u64,
+    ) -> Result<Vec<SliceLine>, MemoryError> {
+        let inner = self.lock();
+        let mut found: Vec<SliceLine> = messages
+            .iter()
+            .filter_map(|message| {
+                inner
+                    .lines
+                    .iter()
+                    .filter(|(g, l)| *g == group && l.message == *message && l.ordinal < before)
+                    .max_by_key(|(_, l)| l.ordinal)
+                    .map(|(_, l)| l.clone())
+            })
+            .collect();
+        found.sort_by_key(|l| l.ordinal);
+        found.dedup_by_key(|l| l.ordinal);
         Ok(found)
     }
 

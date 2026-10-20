@@ -376,6 +376,28 @@ async fn deleting_an_episode_removes_its_embedding_and_lines_carry_member_number
     assert_eq!(store.last_ordinal(g).await.unwrap(), 4);
     assert_eq!(store.last_ordinal(group(9)).await.unwrap(), 0);
 
+    // Quoted lines: the newest with each id before the given ordinal, oldest first, own group
+    // only; an id with no line, or only lines from that ordinal on, gives nothing.
+    archive
+        .append(member(group(9), 2, 30, "another group"))
+        .await
+        .unwrap();
+    let id = |n: i64| MessageId::new(n).unwrap();
+    let quoted = store
+        .quoted(g, &[id(3), id(1), id(77), id(4)], 4)
+        .await
+        .unwrap();
+    let shown: Vec<(u64, &str)> = quoted
+        .iter()
+        .map(|l| (l.ordinal, l.text.as_str()))
+        .collect();
+    assert_eq!(shown, [(1, "from ten"), (3, "bot line")]);
+    assert!(store.quoted(g, &[], 4).await.unwrap().is_empty());
+    assert_eq!(
+        store.quoted(group(9), &[id(2)], 10).await.unwrap()[0].text,
+        "another group"
+    );
+
     let e = store
         .insert(&episode(g, 1, 4, "x"), &[1.0], "m")
         .await

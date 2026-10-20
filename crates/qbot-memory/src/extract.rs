@@ -25,7 +25,7 @@ use crate::slice::{Background, SliceLine};
 
 pub const TOOL_NAME: &str = "submit_episode";
 /// Version of the prompt and validation rules, recorded on every episode.
-pub const METHOD: &str = "slice-v3";
+pub const METHOD: &str = "slice-v4";
 
 /// The extraction instructions; `{language}` and `{predicates}` are filled per call.
 const SYSTEM: &str = include_str!("../../../prompts/extract.md");
@@ -45,6 +45,8 @@ pub struct SubmitArgs {
     pub facts: Vec<FactArg>,
     #[serde(default)]
     pub knowledge: Vec<KnowledgeArg>,
+    #[serde(default)]
+    pub ended: Vec<FactArg>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -255,6 +257,7 @@ impl EpisodeExtractor {
                                     &args.names,
                                     &args.facts,
                                     &args.knowledge,
+                                    &args.ended,
                                     ctx,
                                     &self.predicates,
                                 );
@@ -381,15 +384,58 @@ fn parameters() -> Vec<(&'static str, String)> {
         ("knowledge.text", say(Text::ExtractParamKnowledgeText {})),
         ("knowledge.line", say(Text::ExtractParamLine {})),
         ("knowledge.quote", say(Text::ExtractParamQuote {})),
+        ("ended", say(Text::ExtractParamEnded {})),
+        ("ended.member", say(Text::ExtractParamFactMember {})),
+        ("ended.predicate", say(Text::ExtractParamFactPredicate {})),
+        ("ended.object", say(Text::ExtractParamEndedObject {})),
+        ("ended.line", say(Text::ExtractParamLine {})),
+        ("ended.quote", say(Text::ExtractParamQuote {})),
     ]
 }
 
-/// The target and its context, as the model sees them. Only target lines are numbered.
+/// Text written from chat, as it may stand in the prompt: marker-escaped, on one line.
+fn one_line(text: &str) -> String {
+    qbot_core::marker::escape_markers(&text.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// A full local date and time with the weekday, so the model can turn "tomorrow" into a date.
+fn full_time(zone: &jiff::tz::TimeZone, at: qbot_core::UnixMillis) -> String {
+    jiff::Timestamp::from_millisecond(at.get())
+        .map(|t| {
+            t.to_zoned(zone.clone())
+                .strftime("%Y-%m-%d %a %H:%M")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+/// The target and its context, as the model sees them: who is who and what the group is, what
+/// the chat was about before, lines quoted from further back, then the lines. Only target lines
+/// are numbered, and the target names its dates in full.
 pub fn render(ctx: &SliceContext<'_>) -> String {
-    let zone = &ctx.background.zone;
+    let background = ctx.background;
+    let zone = &background.zone;
     let mut out = String::new();
-    if !ctx.background.text.is_empty() {
-        let _ = writeln!(out, "{}\n", ctx.background.text.trim_end());
+    if !background.text.is_empty() {
+        let _ = writeln!(out, "{}\n", background.text.trim_end());
+    }
+    if let Some((title, summary)) = &background.earlier {
+        let _ = writeln!(
+            out,
+            "{}\n",
+            // Written from chat: escaped like it, and on one line so it opens no section.
+            say(Text::ExtractEarlier {
+                title: one_line(title),
+                summary: one_line(summary),
+            })
+        );
+    }
+    if !background.quoted.is_empty() {
+        let _ = writeln!(out, "{}", say(Text::ExtractQuoted {}));
+        for line in &background.quoted {
+            let _ = writeln!(out, "{}", line.render(zone));
+        }
+        out.push('\n');
     }
     if !ctx.previous.is_empty() {
         let _ = writeln!(out, "{}", say(Text::ExtractContextBefore {}));
@@ -398,7 +444,28 @@ pub fn render(ctx: &SliceContext<'_>) -> String {
         }
         out.push('\n');
     }
-    let _ = writeln!(out, "{}", say(Text::ExtractTarget {}));
+    let (from, to) = match (ctx.target.first(), ctx.target.last()) {
+        (Some(first), Some(last)) => (full_time(zone, first.at), full_time(zone, last.at)),
+        _ => Default::default(),
+    };
+    let _ = writeln!(
+        out,
+        "{}",
+        say(Text::ExtractTarget {
+            from,
+            to,
+            // The name where the zone has one; its offset at the start in any case.
+            zone: ctx.target.first().map_or_else(String::new, |first| {
+                let offset = jiff::Timestamp::from_millisecond(first.at.get())
+                    .map(|t| t.to_zoned(zone.clone()).strftime("UTC%:z").to_string())
+                    .unwrap_or_default();
+                match zone.iana_name() {
+                    Some(name) => format!("{name}, {offset}"),
+                    None => offset,
+                }
+            }),
+        })
+    );
     for (i, line) in ctx.target.iter().enumerate() {
         let _ = writeln!(out, "#{} {}", i + 1, line.render(zone));
     }

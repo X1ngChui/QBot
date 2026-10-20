@@ -99,10 +99,10 @@ async fn capacity_bounds_active_plus_waiting_runs() {
     let sup = supervisor(&h, cfg(2, 1, 60));
     h.world.say(1, 1, "hello");
     let first = sup.submit(request(1, 1)).await.unwrap();
-    let second = sup.submit(request(1, 2)).await.unwrap();
+    let second = sup.submit(request(2, 2)).await.unwrap();
     assert_eq!(sup.active(), 2);
     assert_eq!(
-        sup.submit(request(1, 3)).await.unwrap_err(),
+        sup.submit(request(3, 3)).await.unwrap_err(),
         Rejected::Overloaded
     );
 
@@ -110,7 +110,7 @@ async fn capacity_bounds_active_plus_waiting_runs() {
     let b = second.finished().await.unwrap();
     assert_eq!((a.end, b.end), (RunEnd::Completed, RunEnd::Completed));
     assert_eq!(sup.active(), 0, "capacity is released when runs finish");
-    assert!(sup.submit(request(1, 4)).await.is_ok());
+    assert!(sup.submit(request(4, 4)).await.is_ok());
 }
 
 #[tokio::test(start_paused = true)]
@@ -122,7 +122,7 @@ async fn concurrency_bounds_runs_calling_the_model_at_once() {
     h.world.say(1, 1, "hello");
     let started = tokio::time::Instant::now();
     let a = sup.submit(request(1, 1)).await.unwrap();
-    let b = sup.submit(request(1, 2)).await.unwrap();
+    let b = sup.submit(request(2, 2)).await.unwrap();
     a.finished().await.unwrap();
     b.finished().await.unwrap();
     assert!(
@@ -211,7 +211,7 @@ async fn queue_wait_counts_against_the_deadline() {
     let sup = supervisor(&h, cfg(8, 1, 5));
     h.world.say(1, 1, "hello");
     let a = sup.submit(request(1, 1)).await.unwrap();
-    let b = sup.submit(request(1, 2)).await.unwrap();
+    let b = sup.submit(request(2, 2)).await.unwrap();
     let a = a.finished().await.unwrap();
     let b = b.finished().await.unwrap();
     assert_eq!(a.end, RunEnd::Completed);
@@ -229,7 +229,7 @@ async fn a_run_still_queued_at_its_deadline_never_starts() {
     let sup = supervisor(&h, cfg(8, 1, 5));
     h.world.say(1, 1, "hello");
     let a = sup.submit(request(1, 1)).await.unwrap();
-    let b = sup.submit(request(1, 2)).await.unwrap();
+    let b = sup.submit(request(2, 2)).await.unwrap();
     let (a, b) = (a.finished().await.unwrap(), b.finished().await.unwrap());
     assert_eq!(a.end, RunEnd::Deadline);
     assert_eq!((b.end, b.turns), (RunEnd::Deadline, 0));
@@ -324,7 +324,7 @@ async fn every_run_gets_a_finished_record_even_one_that_never_started() {
     let sup = supervisor(&h, cfg(8, 1, 5));
     h.world.say(1, 1, "hello");
     let a = sup.submit(request(1, 1)).await.unwrap();
-    let b = sup.submit(request(1, 2)).await.unwrap();
+    let b = sup.submit(request(2, 2)).await.unwrap();
     let (a, b) = (a.finished().await.unwrap(), b.finished().await.unwrap());
     assert_eq!(h.world.summary(a.run).unwrap().end, RunEnd::Deadline);
     let queued = h.world.summary(b.run).unwrap();
@@ -355,4 +355,231 @@ async fn opening_a_runs_context_is_bounded_by_the_deadline_and_by_shutdown() {
         .expect("shutdown does not wait out the open");
     assert_eq!(handle.finished().await.unwrap().end, RunEnd::Cancelled);
     assert!(h.fake.recorded().is_empty(), "no model call");
+}
+
+fn addressed_message(trigger: &Trigger) -> i64 {
+    match trigger {
+        Trigger::Addressed { message, .. } => message.get(),
+        other => panic!("not addressed: {other:?}"),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_members_second_message_waits_for_their_run_and_sees_its_reply() {
+    let h = harness(vec![
+        reply_ok(FakeReply::new().call("slow", json!({ "ms": 3000 }))),
+        reply_ok(say("hello there")),
+        reply_ok(say("pork belly")),
+    ]);
+    let sup = supervisor(&h, cfg(8, 4, 60));
+    h.world.say(1, 1, "hi bot");
+    h.world.say(1, 1, "which cut for braised pork?");
+    let first = sup.submit(request(1, 101)).await.unwrap();
+    let second = sup.submit(request(1, 102)).await.unwrap();
+    assert_eq!(sup.active(), 2, "the waiting run holds its place");
+    let (a, b) = (
+        first.finished().await.unwrap(),
+        second.finished().await.unwrap(),
+    );
+    assert_eq!((a.end, b.end), (RunEnd::Delivered, RunEnd::Delivered));
+    let opened: Vec<i64> = h.world.opened().iter().map(addressed_message).collect();
+    assert_eq!(opened, [101, 102], "the second opened only after the first");
+    let calls = h.fake.recorded();
+    assert_eq!(calls.len(), 3);
+    let seen = format!("{:?}", calls[2].conversation);
+    assert!(
+        seen.contains("hello there"),
+        "the second run sees the first one's reply: {seen}"
+    );
+    assert_eq!(sup.active(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_further_message_folds_into_the_waiting_run_which_answers_the_newest() {
+    let h = harness(vec![
+        reply_ok(FakeReply::new().call("slow", json!({ "ms": 3000 }))),
+        reply_ok(say("first")),
+        reply_ok(say("second")),
+    ]);
+    let sup = supervisor(&h, cfg(8, 4, 60));
+    for text in ["hi", "a question", "never mind, another one"] {
+        h.world.say(1, 1, text);
+    }
+    let first = sup.submit(request(1, 101)).await.unwrap();
+    let second = sup.submit(request(1, 102)).await.unwrap();
+    assert_eq!(
+        sup.submit(request(1, 103)).await.unwrap_err(),
+        Rejected::Folded
+    );
+    assert_eq!(sup.active(), 2, "a folded message takes no capacity");
+    first.finished().await.unwrap();
+    second.finished().await.unwrap();
+    let opened: Vec<i64> = h.world.opened().iter().map(addressed_message).collect();
+    assert_eq!(
+        opened,
+        [101, 103],
+        "the waiting run took over the newest message"
+    );
+    assert_eq!(
+        h.world.logged_runs().len(),
+        2,
+        "no run for the folded message"
+    );
+    assert_eq!(h.world.sent().len(), 2);
+
+    // Once the waiting run has started, the member's next message waits behind it again.
+    h.world.say(1, 1, "and later");
+    let later = sup.submit(request(1, 104)).await.unwrap();
+    assert!(later.finished().await.is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn other_members_and_scheduled_runs_do_not_wait_for_a_members_turn() {
+    let h = harness(vec![
+        reply_ok(FakeReply::new().call("slow", json!({ "ms": 5000 }))),
+        reply_ok(say("for the other member")),
+        reply_ok(FakeReply::new().text("task done")),
+        reply_ok(say("for the first member")),
+    ]);
+    let sup = supervisor(&h, cfg(8, 4, 60));
+    h.world.say(1, 1, "a slow question");
+    h.world.say(2, 2, "a quick one");
+    let slow = sup.submit(request(1, 101)).await.unwrap();
+    let other = sup.submit(request(2, 102)).await.unwrap();
+    let wake = sup
+        .submit(TriggerRequest {
+            group: group(),
+            trigger: Trigger::Wake {
+                timer: TimerId::new(1),
+                intent: "remind".into(),
+                chain: Chain {
+                    id: ChainId::new(1),
+                    depth: 0,
+                },
+                repeats: false,
+            },
+        })
+        .await
+        .unwrap();
+    let started = tokio::time::Instant::now();
+    assert_eq!(other.finished().await.unwrap().end, RunEnd::Delivered);
+    assert!(wake.finished().await.is_some());
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "neither waited for the slow run: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(slow.finished().await.unwrap().end, RunEnd::Delivered);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_waiting_run_ends_at_its_deadline_or_shutdown_without_a_model_call() {
+    let h = harness(vec![reply_ok(
+        FakeReply::new().call("slow", json!({ "ms": 50_000 })),
+    )]);
+    let sup = supervisor(&h, cfg(8, 4, 5));
+    h.world.say(1, 1, "hello");
+    h.world.say(1, 1, "hello?");
+    let first = sup.submit(request(1, 101)).await.unwrap();
+    let second = sup.submit(request(1, 102)).await.unwrap();
+    let (a, b) = (
+        first.finished().await.unwrap(),
+        second.finished().await.unwrap(),
+    );
+    assert_eq!(a.end, RunEnd::Deadline);
+    assert_eq!((b.end, b.turns), (RunEnd::Deadline, 0));
+    assert_eq!(
+        h.fake.recorded().len(),
+        1,
+        "the waiting run made no model call"
+    );
+    assert_eq!(h.world.summary(b.run).unwrap().end, RunEnd::Deadline);
+    assert_eq!(sup.active(), 0);
+
+    // A run waiting at shutdown is cancelled, and nothing of the member is left behind.
+    let h = harness(vec![reply_ok(
+        FakeReply::new().call("slow", json!({ "ms": 50_000 })),
+    )]);
+    let sup = supervisor(&h, cfg(8, 4, 600));
+    h.world.say(1, 1, "hello");
+    let first = sup.submit(request(1, 101)).await.unwrap();
+    let second = sup.submit(request(1, 102)).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    sup.shutdown().await;
+    assert_eq!(first.finished().await.unwrap().end, RunEnd::Cancelled);
+    assert_eq!(second.finished().await.unwrap().end, RunEnd::Cancelled);
+    assert_eq!(sup.active(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_members_runs_take_turns_in_the_order_they_were_admitted() {
+    let h = harness(vec![
+        reply_ok(FakeReply::new().call("slow", json!({ "ms": 1000 }))),
+        reply_ok(say("first")),
+        reply_ok(say("second")),
+    ]);
+    let sup = supervisor(&h, cfg(8, 4, 60));
+    for text in ["hi", "a question", "another"] {
+        h.world.say(1, 1, text);
+    }
+    // The first run's start is slower to record, so the second one's task runs first.
+    h.world.delay_next_begin(Duration::from_millis(50));
+    let (first, second) = tokio::join!(sup.submit(request(1, 101)), sup.submit(request(1, 102)));
+    let (first, second) = (first.unwrap(), second.unwrap());
+    assert_eq!(
+        sup.submit(request(1, 103)).await.unwrap_err(),
+        Rejected::Folded,
+        "never a third run of the member"
+    );
+    assert_eq!(sup.active(), 2);
+    first.finished().await.unwrap();
+    second.finished().await.unwrap();
+    let opened: Vec<i64> = h.world.opened().iter().map(addressed_message).collect();
+    assert_eq!(
+        opened,
+        [101, 103],
+        "admission order, the folded message answered last"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_folded_message_gets_a_whole_deadline() {
+    let h = harness(vec![
+        reply_ok(FakeReply::new().call("slow", json!({ "ms": 4500 }))),
+        reply_ok(FakeReply::new().text("first done")),
+        reply_ok(FakeReply::new().call("slow", json!({ "ms": 2000 }))),
+        reply_ok(say("answered")),
+    ]);
+    let sup = supervisor(&h, cfg(8, 4, 5));
+    for text in ["hi", "a question", "and another"] {
+        h.world.say(1, 1, text);
+    }
+    let first = sup.submit(request(1, 101)).await.unwrap();
+    let second = sup.submit(request(1, 102)).await.unwrap();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(
+        sup.submit(request(1, 103)).await.unwrap_err(),
+        Rejected::Folded
+    );
+    assert_eq!(first.finished().await.unwrap().end, RunEnd::Completed);
+    // Its own deadline would have ended it at 5 s, during its 2 s of work from 4.5 s.
+    assert_eq!(second.finished().await.unwrap().end, RunEnd::Delivered);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_block_or_mute_set_while_a_run_waits_its_turn_holds() {
+    let h = harness(vec![
+        reply_ok(FakeReply::new().call("slow", json!({ "ms": 3000 }))),
+        reply_ok(FakeReply::new().text("done")),
+    ]);
+    let sup = supervisor(&h, cfg(8, 4, 60));
+    h.world.say(1, 1, "hello");
+    h.world.say(1, 1, "hello?");
+    let first = sup.submit(request(1, 101)).await.unwrap();
+    let second = sup.submit(request(1, 102)).await.unwrap();
+    h.world.block(1);
+    first.finished().await.unwrap();
+    let waited = second.finished().await.unwrap();
+    assert_eq!((waited.end, waited.turns), (RunEnd::Cancelled, 0));
+    assert_eq!(h.fake.recorded().len(), 2, "no model call after the block");
 }

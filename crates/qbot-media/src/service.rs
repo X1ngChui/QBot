@@ -363,10 +363,11 @@ impl Inner {
             .await
         {
             Ok(true) => {}
-            Ok(false) => tracing::warn!(
+            // The message was recalled while its media was worked on: nothing to fill.
+            Ok(false) => tracing::info!(
                 group = job.group.get(),
                 message = job.message.get(),
-                "no marker to fill in the archived line"
+                "no marker to fill in the archived line (recalled?)"
             ),
             Err(error) => {
                 tracing::error!(group = job.group.get(), %error, "could not fill a media marker")

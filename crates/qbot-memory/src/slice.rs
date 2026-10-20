@@ -36,12 +36,20 @@ impl SliceLine {
 }
 
 /// What the extractor is told besides the lines: who the people in them are and what the group
-/// is, rendered, and the time zone the lines' times are shown in.
+/// is, rendered, the time zone the lines' times are shown in, and the chat the lines continue.
 #[derive(Debug, Clone)]
 pub struct Background {
     /// Empty when nothing is known.
     pub text: String,
     pub zone: TimeZone,
+    /// The title and summary of the group's episode just before the slice: what the
+    /// conversation was about when the slice begins.
+    pub earlier: Option<(String, String)>,
+    /// Lines the slice and its context quote (`[reply:ID]`) from before what is shown, oldest
+    /// first: without them a reply such as "agreed" means nothing.
+    pub quoted: Vec<SliceLine>,
+    /// What members call the bot (its persona's name, its nicknames): never a member's name.
+    pub bot_names: Vec<String>,
 }
 
 impl Default for Background {
@@ -49,6 +57,9 @@ impl Default for Background {
         Self {
             text: String::new(),
             zone: TimeZone::UTC,
+            earlier: None,
+            quoted: Vec::new(),
+            bot_names: Vec::new(),
         }
     }
 }

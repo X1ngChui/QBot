@@ -58,7 +58,9 @@ impl Template {
             Template::PersonaBlock => &["bot_name", "persona"],
             Template::KnowledgeBlock => &["knowledge"],
             Template::PeopleBlock => &["entries"],
-            Template::TriggerAddressed => &["now", "timezone", "sender", "message", "names"],
+            Template::TriggerAddressed => &[
+                "now", "timezone", "sender", "message", "replied", "recalled", "names",
+            ],
             Template::TriggerWake => &[
                 "now", "timezone", "task", "depth", "intent", "repeats", "names",
             ],

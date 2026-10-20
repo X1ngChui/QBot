@@ -1,0 +1,22 @@
+description = "A member wrote the bot two messages a second apart. The run for the first one has already replied, and that reply answered the second message too. This run is for the second message: it should see that it was answered and stay silent rather than answer it again."
+
+members = [
+  { number = 1, account = 10001, name = "小林" },
+  { number = 2, account = 10002, name = "阿杰" },
+]
+
+chat = [
+  { member = 2, text = "今晚吃啥", minutes = 0 },
+  { member = 1, text = "[at:bot] 在吗", minutes = 5 },
+  { member = 1, text = "红烧肉用五花肉还是前腿肉好？", minutes = 0 },
+  { text = "在！红烧肉用五花肉，肥瘦相间炖出来才香，前腿肉偏柴", minutes = 0 },
+]
+
+trigger = { line = 3 }
+
+[expect]
+send = "forbidden"
+tools_forbidden = ["web_search", "schedule_task"]
+rubric = [
+  "The bot sends nothing, because its earlier reply already answered the question about the cut of pork.",
+]

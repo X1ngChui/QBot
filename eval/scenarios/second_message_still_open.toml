@@ -1,0 +1,26 @@
+description = "A member greeted the bot and asked a question a second later. The run for the greeting has already replied to the greeting only. This run is for the question: it should answer it, once, without greeting again or repeating the earlier reply."
+
+members = [
+  { number = 1, account = 10001, name = "小林" },
+  { number = 2, account = 10002, name = "阿杰" },
+]
+
+chat = [
+  { member = 2, text = "今晚吃啥", minutes = 0 },
+  { member = 1, text = "[at:bot] 在吗", minutes = 5 },
+  { member = 1, text = "红烧肉用五花肉还是前腿肉好？", minutes = 0 },
+  { text = "在的，怎么啦", minutes = 0 },
+]
+
+trigger = { line = 3 }
+
+[expect]
+send = "required"
+messages = [1, 2]
+send_calls_at_most = 1
+tools_forbidden = ["web_search", "schedule_task"]
+rubric = [
+  "The reply answers the question, recommending pork belly (五花肉).",
+  "The reply does not greet again or repeat the earlier reply.",
+  "The reply is short, casual and in Chinese.",
+]

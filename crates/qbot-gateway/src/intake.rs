@@ -43,6 +43,14 @@ pub trait Intake: Send + Sync {
         group: GroupId,
         message: MessageId,
     ) -> Result<Option<Option<AccountId>>, EnvError>;
+    /// Honour a recall of `message`, written by `author` (`None`: the bot): the line no longer
+    /// says anything. Returns whether a line changed.
+    async fn recall(
+        &self,
+        group: GroupId,
+        message: MessageId,
+        author: Option<AccountId>,
+    ) -> Result<bool, EnvError>;
 }
 
 #[async_trait]
@@ -76,6 +84,17 @@ impl Intake for PgArchive {
         message: MessageId,
     ) -> Result<Option<Option<AccountId>>, EnvError> {
         PgArchive::quoted_author(self, group, message)
+            .await
+            .map_err(|e| EnvError(e.to_string()))
+    }
+
+    async fn recall(
+        &self,
+        group: GroupId,
+        message: MessageId,
+        author: Option<AccountId>,
+    ) -> Result<bool, EnvError> {
+        PgArchive::recall(self, group, message, author)
             .await
             .map_err(|e| EnvError(e.to_string()))
     }

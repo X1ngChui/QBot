@@ -85,6 +85,25 @@ impl Intake for MemoryIntake {
             .find(|l| l.group == group && l.message == message)
             .map(|l| l.author))
     }
+
+    async fn recall(
+        &self,
+        group: GroupId,
+        message: MessageId,
+        author: Option<AccountId>,
+    ) -> Result<bool, EnvError> {
+        let mut lines = self.lines.lock().unwrap();
+        let Some(line) = lines
+            .iter_mut()
+            .rev()
+            .find(|l| l.group == group && l.message == message && l.author == author)
+        else {
+            return Ok(false);
+        };
+        line.text = qbot_core::marker::RECALLED.to_owned();
+        line.media.clear();
+        Ok(true)
+    }
 }
 
 #[derive(Default)]
@@ -941,5 +960,58 @@ async fn messages_are_archived_by_their_group_sequence_not_their_hashed_id() {
         "a colliding id is a new message; a replayed sequence is not"
     );
     drop(lines);
+    rig.cancel.cancel();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recalled_message_keeps_its_place_but_not_its_words() {
+    let rig = rig(vec![]).await;
+    let mut napcat = connect(&rig, Some("sesame")).await.unwrap();
+    for (id, user, text) in [(1, 7, "my phone number is 555-0100"), (2, 8, "ok")] {
+        napcat
+            .send(group_message(
+                id,
+                user,
+                json!([{"type": "text", "data": {"text": text}}]),
+            ))
+            .await
+            .unwrap();
+    }
+    let recall = |user: i64, operator: i64, id: i64| {
+        Message::text(
+            json!({"post_type": "notice", "notice_type": "group_recall", "time": 1_700_000_002,
+                   "self_id": BOT, "group_id": GROUP, "user_id": user, "operator_id": operator,
+                   "message_id": id})
+            .to_string(),
+        )
+    };
+    // Someone else's recall notice for that id names a line they did not write: nothing changes.
+    napcat.send(recall(8, 8, 1)).await.unwrap();
+    // The author recalls it; the notice is archived as before.
+    napcat.send(recall(7, 7, 1)).await.unwrap();
+    let texts = || -> Vec<String> {
+        rig.intake
+            .lines
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|l| l.text.clone())
+            .collect()
+    };
+    for _ in 0..200 {
+        if texts().len() == 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        texts(),
+        [
+            "[recalled]",
+            "ok",
+            "[notice:recalled_own_message]",
+            "[notice:recalled_own_message]"
+        ]
+    );
     rig.cancel.cancel();
 }

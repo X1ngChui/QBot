@@ -141,6 +141,14 @@ scheduler and memory depend on no database or platform. Its Postgres adapter liv
   NapCat reports group events (recalls, joins, leaves, mutes, pokes) as notices, never as
   segments; they are archived as `[notice:..]` lines. A card's fields are cut at 120 characters,
   and only an http(s) link of at most 400 characters is kept.
+- **A recall is honoured.** A recall notice names the message and its author; that author's
+  line with that id (the newest, as for a quote; the bot's own lines too, which an admin may
+  recall) keeps its ordinal, author and time, but its text becomes `[recalled]` and its media
+  references are deleted, in one transaction (`PgArchive::recall`). History, `search_history`,
+  later extraction and `open_images` then see nothing of it. Runs already under way keep what
+  they were shown, run transcripts are not rewritten (they are the operational record, kept
+  `maintenance.records_keep_days`), and memory already extracted from the line stays (`/forget`
+  removes a fact). A picture description that finishes after the recall finds no marker to fill.
 - **A received card is context, never a capability.** No account or group id a card carries is
   shown, numbered or stored: only mentions get member numbers, and `send_messages` addresses only
   members the run's context names (below). A card for another
@@ -235,6 +243,23 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
   decides that a message triggers or rolls a run. One bounded queue serves all
   runs; `replies.concurrency` runs call the model at once; queue time counts against
   `replies.deadline_secs`.
+- **A member's runs take turns.** Addressed runs one member starts in one group never overlap:
+  a message of a member whose run there is under way is admitted (run record, deadline,
+  capacity) but waits for that run to end before it waits for a model slot and opens its
+  context, so it sees the first run's reply. While one waits, a further message of the member
+  folds into it (`Rejected::Folded`: no run of its own); the waiting run then answers the newest
+  message, with a whole deadline from it, and its run record keeps the message that admitted it.
+  The member's first run takes its turn at admission, so runs take turns in admission order; when
+  a waiting run's turn comes, mute and block are checked again (a run they now refuse ends
+  `cancelled` without a model call). The pipeline hands each group's addressed triggers to one
+  queue that submits them in arrival order, each after the group's media in flight is worked on,
+  so a member's quick messages reach the supervisor as they were sent. So a member holds at most one
+  run under way and one waiting per group. Measured before this rule: 62 times in 30 days a
+  member's second message (58 within five seconds) started a run beside their first, and 40 of
+  those pairs both replied. Other members' runs, scheduled and spontaneous runs, and commands
+  are not affected. The order is held in memory only: a restart has no runs to order. When an
+  addressed run's chat shows a reply of the bot after its message, the trigger note says so and
+  to stay silent if that reply already answers it.
 - **Run loop.** Project, call the model, append, execute the calls, append the results, then the
   chat that arrived. A turn with no tool call ends the run, except as below. The run also ends on
   a tool that ends it (`send_messages` by default, `stay_silent`), the deadline, `max_turns`, or a
@@ -321,6 +346,8 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
   `history.raw_batches` verbatim, the `history.summary_batches` before them as the summaries of
   the episodes that cover them (a batch no episode covers yet stays verbatim), nothing older; that
   is reached through `search_history` and `recall_episodes`. The tiers move a batch at a time.
+  A summary names its episode (`episode 12, ...`), so `read_episode` can open its messages; before
+  it did, 12 of 20 `read_episode` calls in a month were refused ids the model had guessed.
 - **Group knowledge** enters as an instruction: the group's topic, and at most
   `memory.group_terms` (40) terms, the most recently confirmed, listed in key order so that
   confirming a term again does not change the prompt.
@@ -478,9 +505,17 @@ the `media_ref` row the platform reference came in.
   task left claimed would not come due again before a restart. Cancelling a running repeating
   task ends the series at once; the running occurrence is not cut off and its outcome is still
   recorded. Only a run started by a member's message (or an owner's `/tasks`) may create, change or
-  cancel a repeating task or give a task a rule: a task's own run or a spontaneous one can
-  neither start an endless series nor rewrite or end one a member asked for. A repeating task
-  counts against the pending bound like any other, also while its occurrence runs.
+  cancel a repeating task: a task's own run or a spontaneous one can neither start an endless
+  series nor rewrite or end one a member asked for. A repeating task counts against the pending
+  bound like any other, also while its occurrence runs.
+- **The task tools do one thing each**: `schedule_task` makes a one-shot task (`intent`, `run_at`
+  or `delay_seconds`); `schedule_repeating_task` makes a repeating one (`intent`, `rule`,
+  optional `start_at`), the rule written in the grammar `/tasks --every` uses (`6h`, `90m`,
+  `daily@08:00`, `mon,thu@08:00`) and parsed by the same `Rule::from_str`; `update_task`
+  changes a pending task's intent or time, never its rule (a new schedule is cancel and
+  schedule again; the owner's `/tasks edit --every` can still replace one); `list_tasks`,
+  `get_task` and `cancel_task` as named. Each refuses an argument that belongs to another (a
+  `rule` given to `schedule_task`), so a mistaken call is explained rather than half done.
 - **Recurring schedules** (`maintenance.nightly_cron`, `report_cron`, croner with the bot's time
   zone) turn each occurrence into a job through one atomic store step, so an occurrence fires once
   however often the process restarts; one missed while down fires once on startup. The loop fires
@@ -724,8 +759,9 @@ through it.
 
 ## 18. Decisions that shape the design
 
-1. Every trigger starts its own run; runs of one group may overlap. A blocked member's message is
-   archived and shown as marked context but never starts a run.
+1. Every trigger starts its own run; runs of one group may overlap, except that one member's
+   addressed runs in a group take turns (section 6). A blocked member's message is archived and
+   shown as marked context but never starts a run.
 2. Manual notes and learned memory stay separate in storage, commands, help and what the model is
    told: `/note` acts on notes, `/forget` on learned memory, and neither path writes the other.
 3. No contact card for a group; a member's card only for members seen in this group.
@@ -746,11 +782,10 @@ through it.
 - `open_images` cannot open pictures inside forwarded records whose content was not delivered.
 - History search scans the group's lines; a `pg_trgm` index is the step if archives grow large.
 - OpenAI-style providers are covered by the simulated server, not by a live test.
-- Runs of one group overlap (decision 1), and nothing tells a run what another is answering: a
-  member who repeats or rephrases a question within seconds gets it answered twice (measured in
-  production).
-- A recalled message stays in the archive, in later prompts, in search and in memory; the
-  recall notice does not say which message it was.
+- Runs of different members overlap (decision 1), and nothing tells a run what another is
+  answering until that one has replied: two members asking the same thing within the same
+  seconds can both be answered (13 such pairs in 30 days before the turn-taking rule).
+- Memory already extracted from a recalled message stays until it fades or is forgotten.
 - `/forget` removes one learned fact; a later episode can learn it again.
 - Every run sees every recorded member's names, notes and facts of its group; only the
   commands limit what a member may look up.

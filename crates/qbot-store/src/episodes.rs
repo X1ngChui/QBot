@@ -75,6 +75,23 @@ fn to_episode(row: &PgRow) -> Result<Episode, MemoryError> {
     })
 }
 
+/// A chat line with its author's member number, as the memory pipeline reads it.
+fn slice_line(row: &PgRow) -> Result<SliceLine, MemoryError> {
+    Ok(SliceLine {
+        ordinal: u64_of(row.get("ordinal"))?,
+        message: MessageId::new(row.get("message_id")).map_err(backend)?,
+        speaker: row
+            .get::<Option<i64>, _>("account_id")
+            .map(|a| AccountId::new(a).map_err(backend))
+            .transpose()?,
+        member_no: row
+            .get::<Option<i32>, _>("number")
+            .and_then(|n| u32::try_from(n).ok()),
+        at: UnixMillis::new(row.get("at_ms")),
+        text: row.get("text"),
+    })
+}
+
 /// One writer of a group's slices at a time. Each table's exclusion constraint decides overlap
 /// within it, but concurrent inserts checking it can deadlock on each other, and overlap between
 /// episodes and skipped slices is checked by query; under the lock both become `Overlap`.
@@ -146,23 +163,34 @@ impl EpisodeStore for PgEpisodeStore {
         .fetch_all(&self.pool)
         .await
         .map_err(backend)?;
-        rows.iter()
-            .map(|row| {
-                Ok(SliceLine {
-                    ordinal: u64_of(row.get("ordinal"))?,
-                    message: MessageId::new(row.get("message_id")).map_err(backend)?,
-                    speaker: row
-                        .get::<Option<i64>, _>("account_id")
-                        .map(|a| AccountId::new(a).map_err(backend))
-                        .transpose()?,
-                    member_no: row
-                        .get::<Option<i32>, _>("number")
-                        .and_then(|n| u32::try_from(n).ok()),
-                    at: UnixMillis::new(row.get("at_ms")),
-                    text: row.get("text"),
-                })
-            })
-            .collect()
+        rows.iter().map(slice_line).collect()
+    }
+
+    async fn quoted(
+        &self,
+        group: GroupId,
+        messages: &[MessageId],
+        before: u64,
+    ) -> Result<Vec<SliceLine>, MemoryError> {
+        if messages.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<i64> = messages.iter().map(|m| m.get()).collect();
+        let rows = sqlx::query(
+            "SELECT DISTINCT ON (l.message_id) l.ordinal, l.message_id, l.account_id, l.at_ms, l.text, m.number \
+             FROM chat_line l LEFT JOIN member_number m ON m.group_id = l.group_id AND m.account_id = l.account_id \
+             WHERE l.group_id = $1 AND l.message_id = ANY($2) AND l.ordinal < $3 \
+             ORDER BY l.message_id, l.ordinal DESC",
+        )
+        .bind(group.get())
+        .bind(&ids)
+        .bind(i64_of(before)?)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        let mut lines = rows.iter().map(slice_line).collect::<Result<Vec<_>, _>>()?;
+        lines.sort_by_key(|l| l.ordinal);
+        Ok(lines)
     }
 
     async fn last_ordinal(&self, group: GroupId) -> Result<u64, MemoryError> {

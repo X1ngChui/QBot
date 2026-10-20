@@ -5,7 +5,7 @@
 use qbot_core::{AccountId, GroupId, MessageId, UnixMillis};
 
 use crate::episode::EpisodeId;
-use crate::facts::{FactStatus, FactStore, Observation, normalize_key};
+use crate::facts::{FactStatus, FactStore, Observation, Retraction, normalize_key};
 use crate::predicates::DecayClass;
 
 fn at(seconds: i64) -> UnixMillis {
@@ -204,4 +204,24 @@ pub async fn run(store: &dyn FactStore, accounts: &[i64]) {
         .find(|f| f.key == "cats")
         .unwrap();
     assert_eq!((renewed.supports, renewed.first_seen), (1, at(110)));
+
+    // A retraction ends the active fact with the value it names, and nothing else.
+    let retraction = |group: GroupId, object: &str| Retraction {
+        group,
+        subject: subject(a),
+        predicate: "lives_in".into(),
+        key: String::new(),
+        object: object.into(),
+        at: at(120),
+    };
+    assert!(
+        !store.retract(&retraction(g, "Hangzhou")).await.unwrap(),
+        "an old value, already superseded"
+    );
+    assert!(!store.retract(&retraction(other, "Shanghai")).await.unwrap());
+    assert!(store.retract(&retraction(g, " shanghai")).await.unwrap());
+    assert!(!store.retract(&retraction(g, "Shanghai")).await.unwrap());
+    let current = store.current(g, subject(a)).await.unwrap();
+    assert!(current.iter().all(|f| f.predicate != "lives_in"));
+    assert!(current.iter().any(|f| f.key == "cats"), "other facts stay");
 }

@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 use qbot_agent::{Archive, ArchiveCursor, ArchivedLine, EnvError, HistoryQuery, TextQuery};
 use qbot_context::{ChatLine, Speaker};
+use qbot_core::marker::RECALLED;
 use qbot_core::{AccountId, GroupId, MediaKind, MemberNo, MessageId, UnixMillis};
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
@@ -237,6 +238,46 @@ impl PgArchive {
                 .transpose()
         })
         .transpose()
+    }
+
+    /// Honour a recall: the line `author` (`None`: the bot) wrote as `message` (the newest such
+    /// line, as for a quote) keeps its place, author and time, but its text becomes
+    /// [`RECALLED`] and its media references go, so nothing that reads the archive afterwards
+    /// (history, search, extraction, opening pictures) sees what it said. Returns whether a line
+    /// was changed; recalling one again, or a message the archive does not have, changes nothing.
+    pub async fn recall(
+        &self,
+        group: GroupId,
+        message: MessageId,
+        author: Option<AccountId>,
+    ) -> Result<bool, StoreError> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT seq FROM chat_line WHERE group_id = $1 AND message_id = $2 \
+             AND account_id IS NOT DISTINCT FROM $3 ORDER BY seq DESC LIMIT 1 FOR UPDATE",
+        )
+        .bind(group.get())
+        .bind(message.get())
+        .bind(author.map(AccountId::get))
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        let seq: i64 = row.get("seq");
+        let changed = sqlx::query("UPDATE chat_line SET text = $2 WHERE seq = $1 AND text <> $2")
+            .bind(seq)
+            .bind(RECALLED)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+            > 0;
+        sqlx::query("DELETE FROM media_ref WHERE line_seq = $1")
+            .bind(seq)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(changed)
     }
 
     /// Replace a stored line's text with `edit(current)`, if `edit` returns one. Used to fill in

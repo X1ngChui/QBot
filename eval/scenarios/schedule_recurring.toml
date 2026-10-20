@@ -17,11 +17,12 @@ trigger = { line = 2 }
 [expect]
 send = "required"
 send_calls_at_most = 1
-tools_required = ["schedule_task"]
+tools_required = ["schedule_repeating_task"]
+tools_forbidden = ["schedule_task"]
 rubric = [
-  "The bot created exactly one scheduled task (schedule_task succeeded once).",
-  "The task repeats: schedule_task was called with repeat \"weekly\", repeat_weekdays mon, tue, wed, thu and fri, and repeat_time \"08:40\".",
+  "The bot created exactly one task, a repeating one (schedule_repeating_task succeeded once).",
+  "The rule names the five weekdays mon, tue, wed, thu and fri at 08:40 (for example \"mon,tue,wed,thu,fri@08:40\").",
   "The task's intent says what each run is for (reminding the group to clock in) and does not ask the bot to schedule the next run.",
-  "The bot's confirmation was sent after the schedule_task call succeeded, and does not claim anything the tool results do not show.",
+  "The bot's confirmation was sent after the schedule_repeating_task call succeeded, and does not claim anything the tool results do not show.",
   "The confirmation is short and in Chinese.",
 ]

@@ -1,18 +1,22 @@
 //! Admission and lifetime of runs.
 //!
-//! Every eligible trigger becomes its own independent run; runs of one group may overlap. The
-//! supervisor decides *before a run exists* whether a trigger is allowed (mute, block, one
-//! spontaneous run per group), bounds the number of active-plus-waiting runs, bounds how many
-//! call the model at once, and gives each run one end-to-end deadline that queue time counts
-//! against.
+//! Every eligible trigger becomes its own run; runs of one group may overlap. The supervisor
+//! decides *before a run exists* whether a trigger is allowed (mute, block, one spontaneous run
+//! per group), bounds the number of active-plus-waiting runs, bounds how many call the model at
+//! once, and gives each run one end-to-end deadline that queue time counts against.
+//!
+//! Runs a member starts in a group take turns: a member's second message while their run is
+//! under way gets a run that waits for the first to end before it opens its context, so it sees
+//! the first one's reply instead of answering beside it; a further message while one waits
+//! folds into the waiting run, which then answers the newest.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use qbot_context::{RunEnd, Transcript};
-use qbot_core::{AccountId, GroupId, RunId};
+use qbot_core::{AccountId, GroupId, MessageId, RunId};
 use qbot_llm::Usage;
 use tokio::sync::{Notify, Semaphore, oneshot};
 use tokio::time::Instant;
@@ -46,6 +50,9 @@ pub enum Rejected {
     Overloaded,
     /// A spontaneous run of the group is under way; it does not get a second one.
     SpontaneousUnderWay,
+    /// The member already has a run waiting for their run under way; the message became that
+    /// run's focus (it is in the run's chat, which is read when the run opens).
+    Folded,
     ShuttingDown,
     Environment(EnvError),
 }
@@ -75,8 +82,101 @@ struct Inner {
     freed: Notify,
     /// Groups with a spontaneous run admitted and not finished.
     spontaneous: Mutex<HashSet<GroupId>>,
+    /// Members with an addressed run admitted and not finished, by group.
+    members: Mutex<HashMap<(GroupId, AccountId), Member>>,
 }
 
+/// A member's addressed runs in one group.
+struct Member {
+    /// Held by the member's run that is under way, for its whole length.
+    turn: Arc<tokio::sync::Mutex<()>>,
+    /// Runs admitted and not finished.
+    admitted: usize,
+    /// The focus of the run waiting for its turn, which a later message of the member takes over.
+    waiting: Option<Arc<Mutex<Focus>>>,
+}
+
+/// What a waiting run will answer, and by when. A message folded into the run moves both: the
+/// newest message gets a whole deadline, not what is left of the first one's.
+#[derive(Debug, Clone, Copy)]
+struct Focus {
+    message: MessageId,
+    deadline: Instant,
+}
+
+/// An addressed run's place among its member's runs, held from admission until the run ends.
+struct MemberTurn {
+    inner: Arc<Inner>,
+    key: (GroupId, AccountId),
+    turn: Arc<tokio::sync::Mutex<()>>,
+    /// The turn itself, for the member's first run: taken at admission, so runs take turns in
+    /// the order they were admitted, whichever task happens to run first.
+    held: Option<tokio::sync::OwnedMutexGuard<()>>,
+    /// Set while the run waits for an earlier run of the member to end.
+    focus: Option<Arc<Mutex<Focus>>>,
+}
+
+impl MemberTurn {
+    /// When the waiting run gives up: its own deadline, or a later one a folded message brought.
+    fn deadline(&self, own: Instant) -> Instant {
+        self.focus.as_ref().map_or(own, |focus| {
+            own.max(
+                focus
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .deadline,
+            )
+        })
+    }
+
+    /// What the run answers once its turn has come: its own message, or the newest one folded
+    /// into it while it waited. From then on a new message of the member waits for this run.
+    fn take_focus(&mut self) -> Option<Focus> {
+        let focus = self.focus.take()?;
+        let mut members = self
+            .inner
+            .members
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(member) = members.get_mut(&self.key)
+            && member
+                .waiting
+                .as_ref()
+                .is_some_and(|w| Arc::ptr_eq(w, &focus))
+        {
+            member.waiting = None;
+        }
+        let taken = *focus.lock().unwrap_or_else(PoisonError::into_inner);
+        Some(taken)
+    }
+}
+
+impl Drop for MemberTurn {
+    fn drop(&mut self) {
+        let mut members = self
+            .inner
+            .members
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(member) = members.get_mut(&self.key) else {
+            return;
+        };
+        // A run that ends while still waiting (cancelled, past its deadline, not recorded) takes
+        // no more messages.
+        if let Some(focus) = &self.focus
+            && member
+                .waiting
+                .as_ref()
+                .is_some_and(|w| Arc::ptr_eq(w, focus))
+        {
+            member.waiting = None;
+        }
+        member.admitted = member.admitted.saturating_sub(1);
+        if member.admitted == 0 {
+            members.remove(&self.key);
+        }
+    }
+}
 /// A group's one spontaneous run, held from admission until the run ends.
 struct SpontaneousClaim {
     inner: Arc<Inner>,
@@ -143,6 +243,7 @@ impl Supervisor {
                 tasks: TaskTracker::new(),
                 freed: Notify::new(),
                 spontaneous: Mutex::default(),
+                members: Mutex::default(),
             }),
         }
     }
@@ -171,10 +272,62 @@ impl Supervisor {
             })
     }
 
+    /// Start a run for `request`. An addressed run of a member whose run in the group is under
+    /// way waits for that run to end; while one waits, the member's next message folds into it
+    /// (`Rejected::Folded`) instead of starting a third. So a member holds at most one run under
+    /// way and one waiting in a group, and a quick second message is answered once, by a run that
+    /// sees the first reply.
     pub async fn submit(&self, request: TriggerRequest) -> Result<RunHandle, Rejected> {
         self.check_gates(&request).await?;
-        let reservation = self.reserve().ok_or(Rejected::Overloaded)?;
-        self.start(reservation, request, None).await
+        let Trigger::Addressed { message, sender } = request.trigger else {
+            let reservation = self.reserve().ok_or(Rejected::Overloaded)?;
+            return self.start(reservation, request, Holds::default()).await;
+        };
+        let key = (request.group, sender);
+        let (reservation, turn) = {
+            let mut members = self
+                .inner
+                .members
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let deadline = Instant::now() + self.inner.cfg.reply_deadline;
+            if let Some(focus) = members.get(&key).and_then(|m| m.waiting.as_ref()) {
+                *focus.lock().unwrap_or_else(PoisonError::into_inner) = Focus { message, deadline };
+                return Err(Rejected::Folded);
+            }
+            let reservation = self.reserve().ok_or(Rejected::Overloaded)?;
+            let member = members.entry(key).or_insert_with(|| Member {
+                turn: Arc::default(),
+                admitted: 0,
+                waiting: None,
+            });
+            member.admitted += 1;
+            // The member's only run takes its turn now; one behind a run of the member that is
+            // admitted and not finished waits for it.
+            let held = if member.admitted == 1 {
+                Arc::clone(&member.turn).try_lock_owned().ok()
+            } else {
+                None
+            };
+            let focus = (member.admitted > 1).then(|| {
+                let focus = Arc::new(Mutex::new(Focus { message, deadline }));
+                member.waiting = Some(Arc::clone(&focus));
+                focus
+            });
+            let turn = MemberTurn {
+                inner: Arc::clone(&self.inner),
+                key,
+                turn: Arc::clone(&member.turn),
+                held,
+                focus,
+            };
+            (reservation, turn)
+        };
+        let holds = Holds {
+            spontaneous: None,
+            member: Some(turn),
+        };
+        self.start(reservation, request, holds).await
     }
 
     /// Start a spontaneous run, considered because `observed` wrote a line that did not trigger
@@ -215,7 +368,11 @@ impl Supervisor {
             group,
         };
         let reservation = self.reserve().ok_or(Rejected::Overloaded)?;
-        self.start(reservation, request, Some(claim)).await
+        let holds = Holds {
+            spontaneous: Some(claim),
+            member: None,
+        };
+        self.start(reservation, request, holds).await
     }
 
     /// Start a run on capacity reserved earlier (timers). Gates still apply; a rejection
@@ -226,7 +383,7 @@ impl Supervisor {
         request: TriggerRequest,
     ) -> Result<RunHandle, Rejected> {
         self.check_gates(&request).await?;
-        self.start(reservation, request, None).await
+        self.start(reservation, request, Holds::default()).await
     }
 
     /// Cancel every run and wait for them to finish. Unfinished tool calls are recorded as
@@ -260,12 +417,13 @@ impl Supervisor {
         Ok(())
     }
 
-    /// Record the run and spawn it. `claim` is held until the run ends.
+    /// Record the run and spawn it. What it `holds` is released when the run ends, or now if it
+    /// cannot be recorded.
     async fn start(
         &self,
         reservation: Reservation,
         request: TriggerRequest,
-        claim: Option<SpontaneousClaim>,
+        holds: Holds,
     ) -> Result<RunHandle, Rejected> {
         let inner = Arc::clone(&self.inner);
         let finished = Arc::clone(&self.inner);
@@ -285,8 +443,12 @@ impl Supervisor {
             Trigger::Spontaneous => "spontaneous",
         };
         let (tx, rx) = oneshot::channel();
+        let Holds {
+            spontaneous,
+            mut member,
+        } = holds;
         let task = async move {
-            let report = drive(&inner, run, request, deadline).await;
+            let report = drive(&inner, run, request, deadline, member.as_mut()).await;
             // One line per run, so the log alone shows whether the bot is replying and how fast.
             tracing::info!(
                 group = report.group.get(),
@@ -300,7 +462,8 @@ impl Supervisor {
                 output_tokens = report.usage.output_tokens,
                 "run ended"
             );
-            drop(claim);
+            drop(spontaneous);
+            drop(member);
             drop(reservation);
             finished.freed.notify_one();
             let _ = tx.send(report);
@@ -310,8 +473,74 @@ impl Supervisor {
     }
 }
 
-async fn drive(inner: &Inner, run: RunId, request: TriggerRequest, deadline: Instant) -> RunReport {
+/// What an admitted run holds until it ends.
+#[derive(Default)]
+struct Holds {
+    spontaneous: Option<SpontaneousClaim>,
+    member: Option<MemberTurn>,
+}
+
+async fn drive(
+    inner: &Inner,
+    run: RunId,
+    mut request: TriggerRequest,
+    deadline: Instant,
+    member: Option<&mut MemberTurn>,
+) -> RunReport {
+    // A member's runs take turns, before either waits for a model slot. The turn is held until
+    // this run ends, so the member's next run opens its context after this one's reply.
+    let mut deadline = deadline;
+    let _turn = match member {
+        Some(member) => {
+            let held = match member.held.take() {
+                Some(held) => held,
+                None => loop {
+                    let until = member.deadline(deadline);
+                    tokio::select! {
+                        // Once cancelled or past the deadline, nothing more starts, whatever
+                        // else is ready.
+                        biased;
+                        () = inner.cancel.cancelled() => return finish_unstarted(inner, run, request.group, RunEnd::Cancelled).await,
+                        // A message folded in meanwhile may have moved the deadline on.
+                        () = tokio::time::sleep_until(until) => {
+                            if member.deadline(deadline) <= until {
+                                return finish_unstarted(inner, run, request.group, RunEnd::Deadline).await;
+                            }
+                        }
+                        held = Arc::clone(&member.turn).lock_owned() => break held,
+                    }
+                },
+            };
+            if let Some(focus) = member.take_focus() {
+                deadline = deadline.max(focus.deadline);
+                if let Trigger::Addressed { message, .. } = &mut request.trigger {
+                    *message = focus.message;
+                }
+                // The wait can take most of a deadline: a mute or a block set meanwhile holds.
+                if let Trigger::Addressed { sender, .. } = request.trigger {
+                    let policy = &inner.policy;
+                    let refused = match (
+                        policy.is_muted(request.group).await,
+                        policy.is_blocked(request.group, sender).await,
+                    ) {
+                        (Ok(muted), Ok(blocked)) => muted || blocked,
+                        (Err(error), _) | (_, Err(error)) => {
+                            tracing::warn!(group = request.group.get(), run = run.get(), %error, "run ended: its admission could not be checked again");
+                            true
+                        }
+                    };
+                    if refused {
+                        return finish_unstarted(inner, run, request.group, RunEnd::Cancelled)
+                            .await;
+                    }
+                }
+            }
+            Some(held)
+        }
+        None => None,
+    };
     let permit = tokio::select! {
+        biased;
         () = inner.cancel.cancelled() => return finish_unstarted(inner, run, request.group, RunEnd::Cancelled).await,
         () = tokio::time::sleep_until(deadline) => return finish_unstarted(inner, run, request.group, RunEnd::Deadline).await,
         permit = inner.permits.acquire() => permit,
@@ -326,6 +555,7 @@ async fn drive(inner: &Inner, run: RunId, request: TriggerRequest, deadline: Ins
     // Opening reads the store and asks the platform for names: bounded like the rest of the
     // run, so a stalled platform neither outlives the deadline nor holds up a shutdown.
     let opened = tokio::select! {
+        biased;
         () = inner.cancel.cancelled() => return finish_unstarted(inner, run, request.group, RunEnd::Cancelled).await,
         () = tokio::time::sleep_until(deadline) => return finish_unstarted(inner, run, request.group, RunEnd::Deadline).await,
         opened = inner.source.open(request.group, &request.trigger) => opened,

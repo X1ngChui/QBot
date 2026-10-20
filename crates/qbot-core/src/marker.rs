@@ -131,8 +131,13 @@ pub const MARKERS: &[&str] = &[
     "link",
     "unsupported",
     "notice",
+    "recalled",
     "summary of earlier conversation",
 ];
+
+/// The whole text of a line whose message was recalled (by its author or an admin): what it said
+/// is no longer kept.
+pub const RECALLED: &str = "[recalled]";
 
 /// What an escaped marker opens with instead of `[`: the fullwidth bracket, which reads the same
 /// to a person and is never a marker.

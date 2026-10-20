@@ -1,12 +1,14 @@
 //! From one platform frame to its consequences: archive first, then command or run.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use qbot_agent::{Rejected, Supervisor, Trigger, TriggerRequest};
 use qbot_core::{AccountId, GroupId, MessageId, UnixMillis};
 use qbot_media::{MediaItem, MediaJob, MediaService};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -16,7 +18,7 @@ use crate::echo::EchoBoard;
 use crate::intake::{Incoming, Intake, Stored};
 use crate::render::RenderContext;
 use crate::trigger::{self, Nicknames};
-use crate::wire::{Frame, GroupMessage, GroupNotice, Mention, Segment};
+use crate::wire::{Frame, GroupMessage, GroupNotice, Mention, NoticeKind, Segment};
 use crate::{notice, render};
 
 /// A recognised command, with everything a handler needs and nothing it must re-parse.
@@ -95,6 +97,8 @@ pub struct Pipeline {
     tasks: TaskTracker,
     /// Ends waits for media on shutdown: a run they would start is refused then anyway.
     stop: CancellationToken,
+    /// Each group's addressed triggers, submitted in order by one task per group.
+    queues: Mutex<HashMap<GroupId, mpsc::UnboundedSender<TriggerRequest>>>,
 }
 
 impl std::fmt::Debug for Pipeline {
@@ -125,6 +129,7 @@ impl Pipeline {
             echoes,
             tasks: TaskTracker::new(),
             stop: CancellationToken::new(),
+            queues: Mutex::default(),
         }
     }
 
@@ -285,18 +290,65 @@ impl Pipeline {
                 sender: m.sender,
             },
         };
-        // Pictures and clips of the group may still be being worked on, perhaps the one this
-        // message asks about: let them finish (bounded) before the run's window is taken, off the
-        // reader so other frames keep flowing.
-        if self.media.as_ref().is_some_and(|h| h.service.busy(m.group)) {
-            let (supervisor, settled) = (Arc::clone(&self.supervisor), self.settled(m.group));
+        self.submit_in_order(request);
+    }
+
+    /// Hand an addressed trigger to its group's queue, which submits the group's triggers one at
+    /// a time in the order they arrived, each after the group's pictures and clips in flight are
+    /// worked on (bounded; perhaps the one the message asks about). Off the reader, so other
+    /// frames keep flowing; in order, so a member's quick messages reach the supervisor as they
+    /// were sent, the newest last.
+    fn submit_in_order(&self, request: TriggerRequest) {
+        let group = request.group;
+        let mut queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
+        let queue = queues.entry(group).or_insert_with(|| {
+            let (tx, mut rx) = mpsc::unbounded_channel::<TriggerRequest>();
+            let supervisor = Arc::clone(&self.supervisor);
+            let media = self
+                .media
+                .as_ref()
+                .map(|hook| (Arc::clone(&hook.service), hook.wait));
+            let stop = self.stop.clone();
             self.tasks.spawn(async move {
-                if settled.await {
-                    submit(&supervisor, request).await;
+                loop {
+                    let first = tokio::select! {
+                        () = stop.cancelled() => return,
+                        next = rx.recv() => match next {
+                            Some(request) => request,
+                            None => return,
+                        },
+                    };
+                    // Everything queued meanwhile shares one wait for the group's media, so a
+                    // burst is not held up once per message.
+                    let mut batch = vec![first];
+                    while let Ok(next) = rx.try_recv() {
+                        batch.push(next);
+                    }
+                    if let Some((service, wait)) = &media
+                        && service.busy(group)
+                    {
+                        tokio::select! {
+                            () = stop.cancelled() => return,
+                            done = service.settle(group, *wait) => if !done {
+                                tracing::info!(
+                                    group = group.get(),
+                                    "media still pending; going ahead with what is there"
+                                );
+                            },
+                        }
+                    }
+                    for request in batch {
+                        submit(&supervisor, request).await;
+                    }
                 }
             });
-        } else {
-            submit(&self.supervisor, request).await;
+            tx
+        });
+        if queue.send(request).is_err() {
+            tracing::debug!(
+                group = group.get(),
+                "the pipeline is finishing; trigger dropped"
+            );
         }
     }
 
@@ -380,7 +432,34 @@ impl Pipeline {
     }
 
     async fn notice(&self, n: GroupNotice) {
-        if n.self_id != self.cfg.bot || n.subject == self.cfg.bot {
+        if n.self_id != self.cfg.bot {
+            return;
+        }
+        // A recalled message is gone for the group, so it is gone for the bot too: whoever wrote
+        // it (the bot's own lines included, which an admin may recall).
+        if let NoticeKind::Recall { .. } = n.kind
+            && let Some(message) = n
+                .discriminator
+                .trim()
+                .parse()
+                .ok()
+                .and_then(|id| MessageId::new(id).ok())
+        {
+            let author = (n.subject != self.cfg.bot).then_some(n.subject);
+            match self.intake.recall(n.group, message, author).await {
+                Ok(true) => {}
+                Ok(false) => tracing::debug!(
+                    group = n.group.get(),
+                    "a recalled message was not in the archive"
+                ),
+                Err(error) => tracing::error!(
+                    group = n.group.get(),
+                    %error,
+                    "a recalled message could not be removed from the archive"
+                ),
+            }
+        }
+        if n.subject == self.cfg.bot {
             return;
         }
         let incoming = Incoming {
@@ -480,6 +559,10 @@ async fn submit(supervisor: &Supervisor, request: TriggerRequest) {
                 group = group.get(),
                 "the reply queue is full; trigger dropped"
             )
+        }
+        // The member's waiting run answers it.
+        Err(Rejected::Folded) => {
+            tracing::debug!(group = group.get(), "folded into the member's waiting run")
         }
         Err(rejected) => tracing::info!(group = group.get(), ?rejected, "trigger not admitted"),
     }

@@ -5,7 +5,9 @@
 use async_trait::async_trait;
 use qbot_core::{AccountId, GroupId, UnixMillis};
 use qbot_memory::MemoryError;
-use qbot_memory::facts::{Fact, FactId, FactStatus, FactStore, Observation, normalize_key};
+use qbot_memory::facts::{
+    Fact, FactId, FactStatus, FactStore, Observation, Retraction, normalize_key,
+};
 use qbot_memory::predicates::DecayClass;
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
@@ -178,6 +180,40 @@ impl FactStore for PgFactStore {
         .await
         .map_err(backend)?;
         rows.iter().map(to_fact).collect()
+    }
+
+    async fn retract(&self, r: &Retraction) -> Result<bool, MemoryError> {
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('fact:' || $1::text, 0))")
+            .bind(r.group.get())
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+        let row = sqlx::query(&format!(
+            "SELECT {COLS} FROM fact WHERE group_id = $1 AND subject_account IS NOT DISTINCT FROM $2 \
+             AND predicate = $3 AND key = $4 AND status = 'active' FOR UPDATE"
+        ))
+        .bind(r.group.get())
+        .bind(r.subject.map(AccountId::get))
+        .bind(&r.predicate)
+        .bind(&r.key)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(backend)?;
+        let Some(fact) = row.as_ref().map(to_fact).transpose()? else {
+            return Ok(false);
+        };
+        if normalize_key(&fact.object) != normalize_key(&r.object) {
+            return Ok(false);
+        }
+        sqlx::query("UPDATE fact SET status = 'superseded', ended_ms = $2 WHERE fact_id = $1")
+            .bind(fact.id.0)
+            .bind(r.at.get())
+            .execute(&mut *tx)
+            .await
+            .map_err(backend)?;
+        tx.commit().await.map_err(backend)?;
+        Ok(true)
     }
 
     async fn forget(&self, group: GroupId, id: FactId) -> Result<bool, MemoryError> {

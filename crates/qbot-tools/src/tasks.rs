@@ -1,4 +1,4 @@
-//! The five group-task tools. They are thin: every rule lives in `qbot_sched::TaskService`,
+//! The six group-task tools. They are thin: every rule lives in `qbot_sched::TaskService`,
 //! which the owner's `/tasks` command uses too.
 
 use std::time::Duration;
@@ -8,8 +8,8 @@ use qbot_agent::{Effect, Tool, ToolCx, ToolError, ToolOutput, Trigger};
 use qbot_context::RefusalReason;
 use qbot_core::{TimerId, UnixMillis};
 use qbot_sched::{
-    LastRun, Origin, Repeat, Rule, TaskError, TaskService, TimeOfDay, Timer, TimerOutcome,
-    TimerState, Weekdays, When, interval_text,
+    LastRun, Origin, Repeat, Rule, TaskError, TaskService, Timer, TimerOutcome, TimerState, When,
+    interval_text,
 };
 use qbot_wording::{Text, say};
 use schemars::JsonSchema;
@@ -35,107 +35,6 @@ fn when(run_at: Option<&str>, delay_seconds: Option<u64>) -> Result<Option<When>
         (None, Some(secs)) => Ok(Some(When::After(Duration::from_secs(secs)))),
         (None, None) => Ok(None),
     }
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum RepeatKind {
-    Interval,
-    Daily,
-    Weekly,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum Weekday {
-    Mon,
-    Tue,
-    Wed,
-    Thu,
-    Fri,
-    Sat,
-    Sun,
-}
-
-impl Weekday {
-    fn code(self) -> &'static str {
-        match self {
-            Weekday::Mon => "mon",
-            Weekday::Tue => "tue",
-            Weekday::Wed => "wed",
-            Weekday::Thu => "thu",
-            Weekday::Fri => "fri",
-            Weekday::Sat => "sat",
-            Weekday::Sun => "sun",
-        }
-    }
-}
-
-/// The repeat arguments shared by `schedule_task` and `update_task`, flat so each has its own
-/// description.
-#[derive(Debug, Default, Deserialize, JsonSchema)]
-pub struct RepeatArgs {
-    pub repeat: Option<RepeatKind>,
-    pub repeat_minutes: Option<u64>,
-    pub repeat_time: Option<String>,
-    pub repeat_weekdays: Option<Vec<Weekday>>,
-}
-
-impl RepeatArgs {
-    /// The rule the arguments describe; `None` when `repeat` is absent. Each kind takes exactly
-    /// its own fields, so a stray field is an error rather than silently ignored.
-    fn rule(&self) -> Result<Option<Rule>, ToolError> {
-        let invalid = |text| ToolError::InvalidArguments(say(text));
-        let (minutes, time, days) = (
-            self.repeat_minutes,
-            self.repeat_time.as_deref(),
-            self.repeat_weekdays.as_deref(),
-        );
-        let time_of_day = |text: &str| {
-            text.parse::<TimeOfDay>().map_err(|()| {
-                invalid(Text::TasksRepeatTimeFormat {
-                    text: format!("{text:?}"),
-                })
-            })
-        };
-        let Some(kind) = self.repeat else {
-            if minutes.is_some() || time.is_some() || days.is_some() {
-                return Err(invalid(Text::TasksRepeatFields {}));
-            }
-            return Ok(None);
-        };
-        Ok(Some(match (kind, minutes, time, days) {
-            (RepeatKind::Interval, Some(minutes), None, None) => minutes
-                .checked_mul(60)
-                .map(Duration::from_secs)
-                .and_then(Rule::interval)
-                .ok_or_else(|| invalid(Text::TasksRepeatMinutes {}))?,
-            (RepeatKind::Interval, ..) => return Err(invalid(Text::TasksRepeatIntervalFields {})),
-            (RepeatKind::Daily, None, Some(time), None) => Rule::Daily(time_of_day(time)?),
-            (RepeatKind::Daily, ..) => return Err(invalid(Text::TasksRepeatDailyFields {})),
-            (RepeatKind::Weekly, None, Some(time), Some(days)) => Rule::Weekly(
-                Weekdays::from_codes(days.iter().map(|d| d.code()))
-                    .ok_or_else(|| invalid(Text::TasksRepeatWeeklyFields {}))?,
-                time_of_day(time)?,
-            ),
-            (RepeatKind::Weekly, ..) => return Err(invalid(Text::TasksRepeatWeeklyFields {})),
-        }))
-    }
-}
-
-/// The repeat parameters' descriptions; `repeat` itself is described by each tool.
-fn repeat_parameters() -> [(&'static str, String); 3] {
-    [
-        (
-            "repeat_minutes",
-            say(Text::ScheduleTaskParamRepeatMinutes {}),
-        ),
-        ("repeat_time", say(Text::ScheduleTaskParamRepeatTime {})),
-        (
-            "repeat_weekdays",
-            say(Text::ScheduleTaskParamRepeatWeekdays {}),
-        ),
-    ]
 }
 
 /// A repeating task is made only on a member's request: in a run a member's message started.
@@ -268,14 +167,16 @@ fn map_error(cx: &ToolCx<'_>, error: TaskError) -> ToolError {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+// An argument another task tool takes (a rule here, a time there) is a mistake to explain, never
+// a field to drop silently.
+#[serde(deny_unknown_fields)]
 pub struct ScheduleArgs {
     pub intent: String,
     pub run_at: Option<String>,
     pub delay_seconds: Option<u64>,
-    #[serde(flatten)]
-    pub repeat: RepeatArgs,
 }
 
+/// Schedules a task that runs once.
 #[derive(Debug, Clone)]
 pub struct ScheduleTask(pub TaskService);
 
@@ -287,47 +188,100 @@ impl Tool for ScheduleTask {
         say(Text::ScheduleTaskDescription {})
     }
     fn parameters(&self) -> Vec<(&'static str, String)> {
-        let mut params = vec![
+        vec![
             ("intent", say(Text::ScheduleTaskParamIntent {})),
             ("run_at", say(Text::ScheduleTaskParamRunAt {})),
             ("delay_seconds", say(Text::ScheduleTaskParamDelaySeconds {})),
-            ("repeat", say(Text::ScheduleTaskParamRepeat {})),
-        ];
-        params.extend(repeat_parameters());
-        params
+        ]
     }
     fn effect(&self) -> Effect {
         Effect::Write
     }
     async fn call(&self, cx: &ToolCx<'_>, args: ScheduleArgs) -> Result<ToolOutput, ToolError> {
-        let when = when(args.run_at.as_deref(), args.delay_seconds)?;
+        let when = when(args.run_at.as_deref(), args.delay_seconds)?
+            .ok_or_else(|| ToolError::InvalidArguments(say(Text::TasksNoTime {})))?;
         // A task created while handling a task continues that task's chain.
         let parent = match cx.trigger {
             Trigger::Wake { chain, .. } => Some(*chain),
             Trigger::Addressed { .. } | Trigger::Spontaneous => None,
         };
-        let created = match args.repeat.rule()? {
-            Some(rule) => {
-                check_requested(cx)?;
-                self.0
-                    .create_repeating(cx.group, &args.intent, rule, when, parent, Origin::Model)
-                    .await
-            }
-            None => {
-                let when =
-                    when.ok_or_else(|| ToolError::InvalidArguments(say(Text::TasksNoTime {})))?;
-                self.0
-                    .create(cx.group, &args.intent, when, parent, Origin::Model)
-                    .await
-            }
-        };
-        let timer = created.map_err(|e| map_error(cx, e))?;
+        let timer = self
+            .0
+            .create(cx.group, &args.intent, when, parent, Origin::Model)
+            .await
+            .map_err(|e| map_error(cx, e))?;
         Ok(ToolOutput::text(say(Text::ScheduleTaskScheduled {
             task: describe(cx, &timer),
         })))
     }
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+// An argument another task tool takes (a rule here, a time there) is a mistake to explain, never
+// a field to drop silently.
+#[serde(deny_unknown_fields)]
+pub struct ScheduleRepeatingArgs {
+    pub intent: String,
+    pub rule: String,
+    pub start_at: Option<String>,
+}
+
+/// Schedules a task that comes due again by itself, by a rule the scheduler keeps.
+#[derive(Debug, Clone)]
+pub struct ScheduleRepeatingTask(pub TaskService);
+
+#[async_trait]
+impl Tool for ScheduleRepeatingTask {
+    type Args = ScheduleRepeatingArgs;
+    const NAME: &'static str = "schedule_repeating_task";
+    fn description(&self) -> String {
+        say(Text::ScheduleRepeatingTaskDescription {})
+    }
+    fn parameters(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("intent", say(Text::ScheduleRepeatingTaskParamIntent {})),
+            (
+                "rule",
+                say(Text::ScheduleRepeatingTaskParamRule {
+                    min: interval_text(self.0.limits().min_interval),
+                }),
+            ),
+            ("start_at", say(Text::ScheduleRepeatingTaskParamStartAt {})),
+        ]
+    }
+    fn effect(&self) -> Effect {
+        Effect::Write
+    }
+    async fn call(
+        &self,
+        cx: &ToolCx<'_>,
+        args: ScheduleRepeatingArgs,
+    ) -> Result<ToolOutput, ToolError> {
+        // The same rule syntax as the owner's `/tasks add --every`; case and spaces are forgiven.
+        let written: String = args.rule.to_lowercase().split_whitespace().collect();
+        let rule: Rule = written.parse().map_err(|_| {
+            ToolError::InvalidArguments(say(Text::TasksRuleFormat {
+                text: format!("{:?}", args.rule),
+            }))
+        })?;
+        let start = args
+            .start_at
+            .as_deref()
+            .map(parse_time)
+            .transpose()?
+            .map(When::At);
+        check_requested(cx)?;
+        // Only a member's request starts a series, so it never continues a task's chain.
+        let timer = self
+            .0
+            .create_repeating(cx.group, &args.intent, rule, start, None, Origin::Model)
+            .await
+            .map_err(|e| map_error(cx, e))?;
+        Ok(ToolOutput::text(say(Text::ScheduleTaskScheduled {
+            task: describe(cx, &timer),
+        })))
+    }
+}
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ListArgs {
     pub page: Option<u32>,
@@ -440,13 +394,14 @@ impl Tool for CancelScheduledTask {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+// An argument another task tool takes (a rule here, a time there) is a mistake to explain, never
+// a field to drop silently.
+#[serde(deny_unknown_fields)]
 pub struct UpdateArgs {
     pub id: u64,
     pub intent: Option<String>,
     pub run_at: Option<String>,
     pub delay_seconds: Option<u64>,
-    #[serde(flatten)]
-    pub repeat: RepeatArgs,
 }
 
 #[derive(Debug, Clone)]
@@ -460,25 +415,18 @@ impl Tool for UpdateScheduledTask {
         say(Text::UpdateTaskDescription {})
     }
     fn parameters(&self) -> Vec<(&'static str, String)> {
-        let mut params = vec![
+        vec![
             ("id", say(Text::UpdateTaskParamId {})),
             ("intent", say(Text::UpdateTaskParamIntent {})),
             ("run_at", say(Text::UpdateTaskParamRunAt {})),
             ("delay_seconds", say(Text::UpdateTaskParamDelaySeconds {})),
-            ("repeat", say(Text::UpdateTaskParamRepeat {})),
-        ];
-        params.extend(repeat_parameters());
-        params
+        ]
     }
     fn effect(&self) -> Effect {
         Effect::Write
     }
     async fn call(&self, cx: &ToolCx<'_>, args: UpdateArgs) -> Result<ToolOutput, ToolError> {
         let when = when(args.run_at.as_deref(), args.delay_seconds)?;
-        let rule = args.repeat.rule()?;
-        if rule.is_some() {
-            check_requested(cx)?;
-        }
         check_target(&self.0, cx, TimerId::new(args.id)).await?;
         let timer = self
             .0
@@ -487,7 +435,7 @@ impl Tool for UpdateScheduledTask {
                 TimerId::new(args.id),
                 args.intent.as_deref(),
                 when,
-                rule,
+                None,
             )
             .await
             .map_err(|e| map_error(cx, e))?;

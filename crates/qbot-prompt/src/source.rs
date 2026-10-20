@@ -7,7 +7,7 @@ use qbot_agent::{
     ArchiveCursor, ContextSource, Directory, EnvError, OpenedContext, Recap, RecapWhen, Trigger,
 };
 use qbot_context::{ChatLine, Instruction, InstructionRole, Speaker};
-use qbot_core::marker::escape_markers;
+use qbot_core::marker::{RECALLED, escape_markers};
 use qbot_core::{Clock, GroupId, HistoryWindow, MemberNo, UnixMillis};
 use qbot_memory::facts::{FactStore, GROUP_TERM, GROUP_TOPIC};
 use qbot_memory::{Background, EpisodeStore, HistoryPart, MemoryError, SliceBackground, compose};
@@ -181,6 +181,8 @@ pub struct PromptContext {
     window: HistoryWindow,
     zone: TimeZone,
     timezone: String,
+    /// What members call the bot besides its persona's name.
+    bot_nicknames: Vec<String>,
 }
 
 impl std::fmt::Debug for PromptContext {
@@ -215,7 +217,19 @@ impl PromptContext {
             window: settings.window,
             zone,
             timezone: settings.timezone,
+            bot_nicknames: Vec::new(),
         })
+    }
+
+    /// The names besides its persona's that members call the bot (ot.nicknames), so memory
+    /// extraction never takes one for a member's name.
+    pub fn with_bot_nicknames(mut self, nicknames: &[String]) -> Self {
+        self.bot_nicknames = nicknames
+            .iter()
+            .map(|n| n.trim().to_owned())
+            .filter(|n| !n.is_empty())
+            .collect();
+        self
     }
 
     /// Add what the group has taught the bot to every run's instructions.
@@ -297,7 +311,7 @@ impl PromptContext {
         let keep_tail = match trigger {
             Trigger::Addressed { message, .. } => lines
                 .iter()
-                .position(|(_, l)| l.message == *message)
+                .rposition(|(_, l)| l.message == *message)
                 .map_or(0, |i| lines.len() - i),
             // Nothing to keep raw for: no message started the run.
             Trigger::Wake { .. } | Trigger::Spontaneous => 0,
@@ -314,6 +328,8 @@ impl PromptContext {
                         .take_while(|(o, _)| *o <= e.last_ordinal)
                         .count();
                     let text = say(Text::PromptRecap {
+                        // So the model can read the episode's messages without guessing its id.
+                        id: episode.id.get().to_string(),
                         start: clock_label(&self.zone, e.started),
                         end: clock_label(&self.zone, e.ended),
                         // Written from chat, and shown among the chat lines.
@@ -610,16 +626,28 @@ impl PromptContext {
         let now = self.now_label();
         let (template, text) = match trigger {
             Trigger::Addressed { message, .. } => {
-                let sender =
-                    window
-                        .iter()
-                        .find(|l| l.message == *message)
-                        .and_then(|l| match l.speaker {
-                            Speaker::Member { number, .. } => Some(number.get().to_string()),
-                            Speaker::Bot => None,
-                        });
-                let Some(sender) = sender else {
+                let Some(at) = window.iter().rposition(|l| l.message == *message) else {
                     return Ok(None);
+                };
+                let Speaker::Member { number, .. } = window[at].speaker else {
+                    return Ok(None);
+                };
+                let sender = number.get().to_string();
+                // Another run answered after the message (an earlier run of the same member, or
+                // one of someone else's): a flag, any non-empty value turns the paragraph on.
+                let replied = if window[at + 1..]
+                    .iter()
+                    .any(|l| matches!(l.speaker, Speaker::Bot))
+                {
+                    "yes"
+                } else {
+                    ""
+                };
+                // Taken back before the run could open: nothing is left to answer.
+                let recalled = if window[at].text == RECALLED {
+                    "yes"
+                } else {
+                    ""
                 };
                 let message = message.get().to_string();
                 (
@@ -631,6 +659,8 @@ impl PromptContext {
                             ("timezone", &self.timezone),
                             ("sender", &sender),
                             ("message", &message),
+                            ("replied", replied),
+                            ("recalled", recalled),
                             ("names", names),
                         ],
                     )?,
@@ -824,13 +854,19 @@ impl SliceBackground for PromptContext {
                 entries: entries.join("\n"),
             }));
         }
-        let mut about = Vec::new();
-        let operator = self
-            .personas
-            .for_group(group)
-            .group_knowledge
-            .trim()
-            .to_owned();
+        let persona = self.personas.for_group(group);
+        // Members call the bot by its names; none may become one of their own.
+        let mut bot_names = vec![persona.name.trim().to_owned()];
+        for nickname in &self.bot_nicknames {
+            if !bot_names.iter().any(|n| n.eq_ignore_ascii_case(nickname)) {
+                bot_names.push(nickname.clone());
+            }
+        }
+        bot_names.retain(|n| !n.is_empty());
+        let mut about = vec![say(Text::ExtractBackgroundBot {
+            names: escape_markers(&bot_names.join(", ")),
+        })];
+        let operator = persona.group_knowledge.trim().to_owned();
         if !operator.is_empty() {
             about.push(operator);
         }
@@ -857,9 +893,12 @@ impl SliceBackground for PromptContext {
                 text: about.join("\n"),
             }));
         }
+        // The chat before the slice is the extraction job's to add: it reads the episodes.
         Ok(Background {
             text: sections.join("\n\n"),
             zone: self.zone.clone(),
+            bot_names,
+            ..Background::default()
         })
     }
 }

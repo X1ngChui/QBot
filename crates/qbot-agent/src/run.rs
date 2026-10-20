@@ -374,6 +374,7 @@ impl Run<'_> {
             let deadline = self.input.deadline;
             let cancel = self.cancel;
             tokio::select! {
+                biased;
                 () = cancel.cancelled() => return Err(RunEnd::Cancelled),
                 result = tokio::time::timeout_at(deadline, fut) => result.map_err(|_| RunEnd::Deadline)?,
             }
@@ -490,6 +491,7 @@ impl Run<'_> {
     /// Await `future` unless the run is cancelled or past its deadline.
     async fn bounded<F: Future>(&self, future: F) -> Result<F::Output, RunEnd> {
         tokio::select! {
+            biased;
             () = self.cancel.cancelled() => Err(RunEnd::Cancelled),
             result = tokio::time::timeout_at(self.input.deadline, future) => result.map_err(|_| RunEnd::Deadline),
         }

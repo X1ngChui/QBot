@@ -34,7 +34,7 @@ pub struct FactId(pub i64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FactStatus {
     Active,
-    /// Replaced by a newer value or by its opposite.
+    /// Replaced by a newer value or by its opposite, or said to hold no longer.
     Superseded,
     /// Nothing confirmed it for long enough.
     Expired,
@@ -99,6 +99,18 @@ pub struct Observation {
     pub episode: EpisodeId,
     pub message: MessageId,
     pub quote: String,
+    pub at: UnixMillis,
+}
+
+/// A statement that a fact no longer holds ("I quit that game", "I don't live there any more"):
+/// it ends the active fact of the slot whose value it names, and nothing else.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Retraction {
+    pub group: GroupId,
+    pub subject: Option<AccountId>,
+    pub predicate: String,
+    pub key: String,
+    pub object: String,
     pub at: UnixMillis,
 }
 
@@ -175,6 +187,11 @@ pub trait FactStore: Send + Sync {
         group: GroupId,
         subject: Option<AccountId>,
     ) -> Result<Vec<Fact>, MemoryError>;
+
+    /// End the active fact the retraction names (same group, subject, predicate and key, the same
+    /// value once normalized): it is superseded as of the retraction. Returns whether one was;
+    /// a fact that was never recorded, or has another value now, is left alone.
+    async fn retract(&self, retraction: &Retraction) -> Result<bool, MemoryError>;
 
     /// Strike out an active fact of the group. Returns whether one was.
     async fn forget(&self, group: GroupId, id: FactId) -> Result<bool, MemoryError>;
@@ -321,6 +338,26 @@ impl FactStore for MemoryFactStore {
                 .then(b.id.cmp(&a.id))
         });
         Ok(found)
+    }
+
+    async fn retract(&self, r: &Retraction) -> Result<bool, MemoryError> {
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let wanted = normalize_key(&r.object);
+        match inner.facts.iter_mut().find(|f| {
+            f.status == FactStatus::Active
+                && f.group == r.group
+                && f.subject == r.subject
+                && f.predicate == r.predicate
+                && f.key == r.key
+                && normalize_key(&f.object) == wanted
+        }) {
+            Some(fact) => {
+                fact.status = FactStatus::Superseded;
+                fact.ended = Some(r.at);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     async fn forget(&self, group: GroupId, id: FactId) -> Result<bool, MemoryError> {

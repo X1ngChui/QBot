@@ -9,6 +9,7 @@ use qbot_wording::{Text, say};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::facts::normalize_key;
 use crate::identity::{AliasTextError, normalize_alias};
 use crate::predicates::Predicates;
 use crate::slice::SliceLine;
@@ -59,11 +60,18 @@ pub struct Findings {
     pub facts: Vec<FactFinding>,
     #[serde(default)]
     pub knowledge: Vec<KnowledgeFinding>,
+    /// Facts the target part says no longer hold (I quit that game), each ending the fact
+    /// recorded with that value, if there is one.
+    #[serde(default)]
+    pub ended: Vec<FactFinding>,
 }
 
 impl Findings {
     pub fn is_empty(&self) -> bool {
-        self.names.is_empty() && self.facts.is_empty() && self.knowledge.is_empty()
+        self.names.is_empty()
+            && self.facts.is_empty()
+            && self.knowledge.is_empty()
+            && self.ended.is_empty()
     }
 }
 
@@ -180,10 +188,17 @@ pub fn validate_findings(
     names: &[NameArg],
     facts: &[FactArg],
     knowledge: &[KnowledgeArg],
+    ended: &[FactArg],
     ctx: &crate::extract::SliceContext<'_>,
     predicates: &Predicates,
 ) -> (Findings, Vec<String>) {
     let members = members(&[ctx.previous, ctx.target, ctx.next]);
+    let bot_names: Vec<String> = ctx
+        .background
+        .bot_names
+        .iter()
+        .filter_map(|n| normalize_alias(n).ok())
+        .collect();
     let mut kept = Findings::default();
     let mut dropped = Vec::new();
 
@@ -197,10 +212,16 @@ pub fn validate_findings(
                     name: name.to_owned(),
                 }));
             }
-            normalize_alias(name).map_err(|e| match e {
+            let key = normalize_alias(name).map_err(|e| match e {
                 AliasTextError::Empty => say(Text::ExtractFindingNameEmpty {}),
                 AliasTextError::TooLong => say(Text::ExtractFindingNameTooLong {}),
             })?;
+            // Members call the bot by its names; those never become a member's.
+            if bot_names.contains(&key) {
+                return Err(say(Text::ExtractFindingNameBot {
+                    name: name.to_owned(),
+                }));
+            }
             Ok(NameFinding {
                 account,
                 name: name.to_owned(),
@@ -239,8 +260,10 @@ pub fn validate_findings(
         !ambiguous
     });
 
-    for (index, arg) in facts.iter().enumerate() {
-        let result = source(ctx.target, arg.line, &arg.quote).and_then(|src| {
+    // A fact and the end of one are held to the same rules: a member's line, its subject, a
+    // known predicate and a value.
+    let fact = |arg: &FactArg| {
+        source(ctx.target, arg.line, &arg.quote).and_then(|src| {
             let account = subject(&members, arg.member, &src)?;
             if predicates.get(&arg.predicate).is_none() {
                 return Err(say(Text::ExtractFindingPredicate {
@@ -258,12 +281,60 @@ pub fn validate_findings(
                 message: src.line.message,
                 quote: src.quote,
             })
-        });
-        match result {
-            Ok(finding) => kept.facts.push(finding),
+        })
+    };
+    let mut fact_lines = Vec::new();
+    for (index, arg) in facts.iter().enumerate() {
+        match fact(arg) {
+            Ok(finding) => {
+                fact_lines.push(arg.line);
+                kept.facts.push(finding);
+            }
             Err(reason) => dropped.push(problem("facts", index, reason)),
         }
     }
+    let mut ended_lines = Vec::new();
+    for (index, arg) in ended.iter().enumerate() {
+        match fact(arg) {
+            Ok(finding) => {
+                ended_lines.push(arg.line);
+                kept.ended.push(finding);
+            }
+            Err(reason) => dropped.push(problem("ended", index, reason)),
+        }
+    }
+    // A value said to hold and said to have ended in one stretch of chat: the later line is what
+    // holds now ("I quit it" ... "back on it again"), so only that item is kept, and applying the
+    // episode never both records and ends one fact.
+    let slot = |f: &FactFinding| (f.account, f.predicate.clone(), normalize_key(&f.object));
+    let latest_end: HashMap<_, u32> =
+        kept.ended
+            .iter()
+            .zip(&ended_lines)
+            .fold(HashMap::new(), |mut latest, (f, line)| {
+                let entry = latest.entry(slot(f)).or_insert(*line);
+                *entry = (*entry).max(*line);
+                latest
+            });
+    let latest_fact: HashMap<_, u32> =
+        kept.facts
+            .iter()
+            .zip(&fact_lines)
+            .fold(HashMap::new(), |mut latest, (f, line)| {
+                let entry = latest.entry(slot(f)).or_insert(*line);
+                *entry = (*entry).max(*line);
+                latest
+            });
+    let mut lines = fact_lines.into_iter();
+    kept.facts.retain(|f| {
+        let line = lines.next().unwrap_or_default();
+        latest_end.get(&slot(f)).is_none_or(|end| line > *end)
+    });
+    let mut lines = ended_lines.into_iter();
+    kept.ended.retain(|f| {
+        let line = lines.next().unwrap_or_default();
+        latest_fact.get(&slot(f)).is_none_or(|said| line >= *said)
+    });
 
     for (index, arg) in knowledge.iter().enumerate() {
         let result = source(ctx.target, arg.line, &arg.quote).and_then(|src| {

@@ -642,6 +642,11 @@ async fn history_is_raw_then_summarized_then_left_out_by_batch_count() {
         "summary-tier episodes apply at once; a raw-tier episode only as the fallback"
     );
     assert!(opened.recaps[0].text.contains("summary of trip"));
+    assert!(
+        opened.recaps[0].text.starts_with("episode 2, "),
+        "a summary names its episode, so read_episode can open it: {}",
+        opened.recaps[0].text
+    );
     assert!(!opened.recaps.iter().any(|r| r.text.contains("too old")));
 
     // The trigger is never summarized, even by the fallback.
@@ -994,4 +999,58 @@ async fn members_the_context_names_can_be_addressed_though_they_did_not_speak() 
         "a member mentioned in the chat and the one the task is for"
     );
     assert_eq!(opened.members[1].1, AccountId::new(1007).unwrap());
+}
+
+#[tokio::test]
+async fn an_addressed_note_says_when_the_bot_has_replied_since_the_message() {
+    let open = |lines: Vec<ChatLine>| async move {
+        let ctx = PromptContext::new(
+            Arc::new(FixedHistory(lines)),
+            Personas::single(persona("Bobo", "")),
+            Arc::new(Clock0),
+            PromptSettings {
+                window: HistoryWindow::default(),
+                timezone: "Asia/Shanghai".into(),
+            },
+        )
+        .unwrap();
+        ctx.open(
+            GroupId::new(900).unwrap(),
+            &Trigger::Addressed {
+                message: MessageId::new(6).unwrap(),
+                sender: AccountId::new(1).unwrap(),
+            },
+        )
+        .await
+        .unwrap()
+        .trigger_note
+        .unwrap()
+        .text
+    };
+    let at = 1_700_000_000_000;
+    let bot = |message: i64, text: &str| ChatLine {
+        message: MessageId::new(message).unwrap(),
+        speaker: Speaker::Bot,
+        at: UnixMillis::new(at),
+        text: text.into(),
+    };
+    // The bot answered before the message: nothing to say about it.
+    let note = open(vec![
+        line(5, 1, 3, at, "hi [at:bot]"),
+        bot(4, "hello"),
+        line(6, 1, 3, at, "which cut of pork?"),
+    ])
+    .await;
+    assert!(!note.contains("already replied"), "{note}");
+    // A run that answered after it (this member's earlier run, say): the note says so.
+    let note = open(vec![
+        line(5, 1, 3, at, "hi [at:bot]"),
+        line(6, 1, 3, at, "which cut of pork?"),
+        bot(7, "pork belly"),
+    ])
+    .await;
+    assert!(
+        note.contains("member:3 addressed you in [msg:6]") && note.contains("already replied"),
+        "{note}"
+    );
 }

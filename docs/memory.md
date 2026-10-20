@@ -42,38 +42,51 @@ counts as covered, so it does not hold back the group's later slices; its lines 
 so they stay verbatim wherever history shows them, and remain searchable. Network, account and
 provider-side failures are not permanent: the job fails and the slice is tried again.
 
-**What the extractor reads.** No tools, only context, so the slice can be read the way the
-reply model reads chat:
+**What the extractor reads.** No tools, only context, so everything a reader needs to understand
+the slice and to tell what lasts from what passes is put in front of it (method `slice-v4`):
 - Lines are `[msg:ID] MM-DD HH:MM member:N: text` in the bot's time zone: who said what,
-  when, and which line a `[reply:ID]` quotes.
+  when, and which line a `[reply:ID]` quotes. The target part's heading gives its first and last
+  moments in full, with the year and weekday (`2026-10-15 Thu 20:30`), so "tomorrow" or "on
+  Friday" can be turned into dates; the summary writes plans and deadlines as dates.
 - The target lines are numbered; one batch on either side is unnumbered context.
+- "Earlier in this chat" gives the title and summary of the group's episode just before the
+  slice, so a slice that begins mid-conversation is read in its context and not summarized as if
+  it began there.
+- "Quoted from earlier" shows older lines that the shown lines reply to (`[reply:ID]` beyond the
+  context batches: the newest line with that id before them), so a reply such as "agreed" can be
+  understood. Context only, like the neighbouring batches.
 - Ahead of the lines, "Who is who" (`SliceBackground`, implemented by the prompt layer from the
   same records replies use) lists every member the lines involve, whether as speaker or as
   `[at:N]`. For each it gives the current group display name, other names, accounts linked as
   one person in the group, a block, and facts learned before, all from the group's own records. These resolve names and references to member
-  numbers.
-- "About the group" gives the operator's group background and the learned topic and terms.
+  numbers, and the earlier facts are what a later statement can confirm or end.
+- "About the group" says what the bot is called (members address it by that name, which must
+  never become a member's), the operator's group background and the learned topic and terms.
 - Notes are left out: they are what members wrote about each other, not needed to read a
   conversation.
 
 The prompt says that names and earlier facts help interpretation but are no evidence: a finding
-still needs a quote from the target. The model's reasoning effort is
-`providers.text.extraction_reasoning`.
+still needs a quote from the target. It says what counts as lasting: a fact must still be true in
+a few weeks (where someone lives, works or studies, what they like or keep doing); a mood, what
+someone is doing right now, a one-off event or a plan for tonight belongs in the summary at most.
+The model's reasoning effort is `providers.text.extraction_reasoning`.
 
 The model answers with one tool call, `submit_episode`: a title and summary in the bot's writing
 language (from the locale), one to three evidence quotes, and findings: names, facts about members
-(by the predicates in `prompts/predicates.toml`) and group knowledge (terms and the topic), each
-tied to a target line and a verbatim quote. Code validates everything:
+(by the predicates in `prompts/predicates.toml`), facts that ended (`ended`: the same predicates,
+for what the target part says no longer holds: someone quit a game, moved away, stopped liking
+something) and group knowledge (terms and the topic), each tied to a target line and a verbatim
+quote. Code validates everything:
 
 - The episode needs a title, a summary and one to three quotes copied exactly from target lines.
   A rejected episode goes back to the model with every reason.
 - A finding needs a member's line (never the bot's, never a notice) whose text contains the quote,
   a subject who wrote the line or is mentioned in the quote, a known predicate, and for a name or a
-  term, the name in the quote or the term written in the target. Rejected findings go back once;
-  if the correction is not valid, the episode is kept with the findings that held.
+  term, the name in the quote or the term written in the target. An ended fact is held to the
+  same rules as a fact. Rejected findings go back once; if the correction is not valid, the
+  episode is kept with the findings that held.
 - An answer cut off at the provider's output limit, or whose arguments are not JSON, is lost
   rather than wrong: the same request is sent again. At most three model calls per slice.
-
 There is no staging state machine: a crash between the model response and the insert repeats one
 slice's model call, which is cheaper than the machinery to avoid it. The episode records the
 extraction method and model; a later change of extraction model does not invalidate existing
@@ -188,7 +201,9 @@ The design above would then still hold: the slicing function is the only part th
   keys on the normalized object; an opposite predicate (likes / dislikes) supersedes the other.
   One episode says one thing per slot (a subject's predicate and key, an opposite pair counting
   as one): its last statement. An episode supports a fact at most once, so applying it again
-  changes nothing.
+  changes nothing. After its observations an episode's ended facts are applied: each ends the
+  active fact of its slot with that value (superseded, as a replaced value is), and one that is
+  not recorded, or holds another value now, changes nothing.
 - **Confidence** is the Wilson lower bound of the supporting episodes times `0.5^(age /
   half-life)`, with the half-life chosen by the predicate's decay class
   (`memory.facts.half_life_days`); a fact whose confidence falls below 0.05 is expired by the
@@ -220,3 +235,8 @@ name the store each command acts on.
 
 Episodes, facts and evidence are small text and are kept; expired and superseded facts stay as
 history. Revisit if storage or privacy requires.
+
+A recalled message's line keeps its place in the archive but says only `[recalled]`
+([architecture.md](architecture.md) section 4), so a slice extracted after the recall learns
+nothing from it. An episode or fact made from it before the recall stays: episodes are never
+rewritten, and a message recalled within minutes is rarely in an extracted slice yet.

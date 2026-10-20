@@ -347,6 +347,7 @@ async fn tool_specs_come_from_the_argument_types() {
             "stay_silent",
             "search_history",
             "schedule_task",
+            "schedule_repeating_task",
             "list_tasks",
             "get_task",
             "update_task",

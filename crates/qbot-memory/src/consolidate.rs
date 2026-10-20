@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use crate::episode::Episode;
-use crate::facts::{FactStore, GROUP_TERM, GROUP_TOPIC, Observation, normalize_key};
+use crate::facts::{FactStore, GROUP_TERM, GROUP_TOPIC, Observation, Retraction, normalize_key};
 use crate::findings::KnowledgeFinding;
 use crate::identity::{EvidenceKind, EvidenceRecord, IdentityError};
 use crate::identity_store::IdentityStore;
@@ -133,6 +133,29 @@ impl Consolidator {
         }
         for observation in last_per_slot(observations) {
             self.facts.observe(&observation).await?;
+        }
+        // After what the episode affirms: within one stretch of chat, "I don't play it any more"
+        // comes after the playing it ends. Retracting what is not recorded changes nothing, so
+        // applying the episode again changes nothing either.
+        for fact in &source.findings.ended {
+            let Some(predicate) = self.predicates.get(&fact.predicate) else {
+                continue;
+            };
+            let key = match predicate.cardinality {
+                Cardinality::Single => String::new(),
+                Cardinality::Multi => normalize_key(&fact.object),
+            };
+            let retraction = Retraction {
+                group,
+                subject: Some(fact.account),
+                predicate: fact.predicate.clone(),
+                key,
+                object: fact.object.clone(),
+                at,
+            };
+            if self.facts.retract(&retraction).await? {
+                tracing::info!(group = group.get(), predicate = %fact.predicate, "a fact was said to hold no longer");
+            }
         }
         Ok(())
     }

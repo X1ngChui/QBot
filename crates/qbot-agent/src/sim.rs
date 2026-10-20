@@ -42,6 +42,10 @@ struct World {
     undelivered_note: Option<Instruction>,
     /// Timestamp for the next line, advancing a second per line; 0 uses the message number.
     time: i64,
+    /// The trigger of every run that opened its context, in order.
+    opened: Vec<Trigger>,
+    /// How long the next recordings of a run's start take, in order.
+    begin_delays: std::collections::VecDeque<Duration>,
 }
 
 pub struct SimWorld {
@@ -174,6 +178,11 @@ impl SimWorld {
         self.lock().fail_log = fail;
     }
 
+    /// Make the next recording of a run's start take delay (a slow database).
+    pub fn delay_next_begin(&self, delay: Duration) {
+        self.lock().begin_delays.push_back(delay);
+    }
+
     /// Make recording the start of a run fail.
     pub fn fail_run_begin(&self, fail: bool) {
         self.lock().fail_begin = fail;
@@ -207,6 +216,11 @@ impl SimWorld {
 
     pub fn summary(&self, run: RunId) -> Option<RunSummary> {
         self.lock().summaries.get(&run).cloned()
+    }
+
+    /// The triggers runs opened their context with, in the order they opened.
+    pub fn opened(&self) -> Vec<Trigger> {
+        self.lock().opened.clone()
     }
 
     pub fn logged_runs(&self) -> Vec<RunId> {
@@ -287,7 +301,8 @@ impl ContextSource for SimWorld {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let world = self.lock();
+        let mut world = self.lock();
+        world.opened.push(trigger.clone());
         let window: Vec<ChatLine> = world.lines.iter().map(|a| a.line.clone()).collect();
         let cursor = world.lines.last().map_or(ArchiveCursor(0), |a| a.seq);
         let trigger_note = match trigger {
@@ -377,6 +392,10 @@ impl GroupPolicy for SimWorld {
 #[async_trait]
 impl RunLog for SimWorld {
     async fn begin(&self, _group: GroupId, _trigger: &Trigger) -> Result<RunId, EnvError> {
+        let delay = self.lock().begin_delays.pop_front();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         let mut world = self.lock();
         if world.fail_begin {
             return Err(EnvError("run log unavailable".into()));

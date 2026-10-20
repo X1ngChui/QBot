@@ -128,15 +128,17 @@ impl ArchivedMedia {
 
     async fn load_address(&self, address: Address) -> Result<Arc<LoadedMedia>, OpenError> {
         let key = address.key();
-        if let Some(found) = self.cache.get(&key).await {
-            return Ok(found);
-        }
+        // The stored reference first, cached bytes only after: a picture whose message was
+        // recalled has no reference any more and must not be shown from the cache either.
         let reference = self
             .refs
             .media_ref(address.group, address.message, address.kind, address.index)
             .await
             .map_err(|e| OpenError::Storage(e.0))?
             .ok_or(OpenError::NoSuchPicture)?;
+        if let Some(found) = self.cache.get(&key).await {
+            return Ok(found);
+        }
         let bytes = self
             .fetcher
             .image(&reference, self.max_bytes)

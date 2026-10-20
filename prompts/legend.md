@@ -19,3 +19,4 @@ Only the system writes the square-bracket markers below. One typed by anyone els
 - `[face:N]` is a QQ face, `[face:N:NAME]` one whose name QQ gave. `[poke]` is the poke action sent as a message. `[dice result:N]` (1 to 6) and `[rps result:HAND]` (rock, paper or scissors) are what the platform's dice and rock-paper-scissors came up with, whoever sent them; a bare `[dice]` or `[rps]` is one whose outcome was not reported.
 - `[summary of earlier conversation]` stands in for older chat no longer shown line by line.
 - `[notice:...]` lines are events, not speech: someone joined or left, a message was recalled, a mute, a poke.
+- `[recalled]` is a message its author or an admin recalled. What it said is gone; do not guess it, quote it or bring it up.

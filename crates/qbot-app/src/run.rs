@@ -393,6 +393,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         config.group_terms(),
     )))
     .with_people(Arc::new(archive.clone()))
+    .with_bot_nicknames(&config.bot.nicknames)
     .with_directory(directory.clone())
     .with_episodes(episodes.clone());
     let prompt = Arc::new(prompt);

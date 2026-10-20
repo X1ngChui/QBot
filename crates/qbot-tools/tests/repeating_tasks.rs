@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-//! The task tools with repeating tasks: created only when a member asks, from structured
-//! arguments, and carried on by the scheduler without the model.
+//! The task tools with repeating tasks: one tool per job, a repeating task made only when a member
+//! asks, from one rule argument, and carried on by the scheduler without the model.
 
 mod common;
 
@@ -22,39 +22,44 @@ async fn one_call(r: &Rig, tool: &str, args: serde_json::Value) -> qbot_context:
 }
 
 #[tokio::test(start_paused = true)]
-async fn the_repeat_arguments_are_typed_and_described_in_the_schema() {
+async fn each_task_tool_does_one_thing_and_says_so_in_its_schema() {
     let r = rig(vec![]);
     let tools = qbot_agent::ToolSet::new()
         .with(qbot_tools::ScheduleTask(r.service.clone()))
         .unwrap()
+        .with(qbot_tools::ScheduleRepeatingTask(r.service.clone()))
+        .unwrap()
         .with(qbot_tools::UpdateScheduledTask(r.service.clone()))
         .unwrap();
-    for spec in tools.specs() {
-        let props = &spec.schema["properties"];
-        for field in ["repeat", "repeat_minutes", "repeat_time", "repeat_weekdays"] {
-            assert!(
-                props[field]["description"].is_string(),
-                "{}.{field}: {}",
-                spec.name,
-                spec.schema
-            );
-        }
-        let schema = spec.schema.to_string();
-        for word in [
-            "\"interval\"",
-            "\"daily\"",
-            "\"weekly\"",
-            "\"mon\"",
-            "\"sun\"",
-        ] {
-            assert!(schema.contains(word), "{}: {schema}", spec.name);
-        }
-        let required = spec.schema["required"].to_string();
-        assert!(
-            !required.contains("repeat"),
-            "repeat is optional: {required}"
-        );
-    }
+    let fields = |name: &str| -> Vec<String> {
+        let spec = tools.specs().into_iter().find(|s| s.name == name).unwrap();
+        let mut fields: Vec<String> = spec.schema["properties"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        fields.sort();
+        fields
+    };
+    assert_eq!(
+        fields("schedule_task"),
+        ["delay_seconds", "intent", "run_at"]
+    );
+    assert_eq!(
+        fields("schedule_repeating_task"),
+        ["intent", "rule", "start_at"]
+    );
+    assert_eq!(
+        fields("update_task"),
+        ["delay_seconds", "id", "intent", "run_at"]
+    );
+    let repeating = tools
+        .specs()
+        .into_iter()
+        .find(|s| s.name == "schedule_repeating_task")
+        .unwrap();
+    assert_eq!(repeating.schema["required"], json!(["intent", "rule"]));
 }
 
 #[tokio::test(start_paused = true)]
@@ -63,8 +68,8 @@ async fn a_member_asking_for_a_recurring_task_gets_one_repeating_task() {
     // 09:00 in Shanghai is 01:00Z; today's has passed (it is 16:00 there), so tomorrow's.
     let daily = one_call(
         &r,
-        "schedule_task",
-        json!({ "intent": "say good morning", "repeat": "daily", "repeat_time": "09:00" }),
+        "schedule_repeating_task",
+        json!({ "intent": "say good morning", "rule": "daily@09:00" }),
     )
     .await;
     assert_eq!(daily.outcome, Outcome::Ok, "{}", text_of(&daily));
@@ -84,8 +89,8 @@ async fn a_member_asking_for_a_recurring_task_gets_one_repeating_task() {
     // 2027-01-15 is a Friday; Monday 20:30 in Shanghai is 12:30Z on the 18th.
     let weekly = one_call(
         &r,
-        "schedule_task",
-        json!({ "intent": "weekly topic", "repeat": "weekly", "repeat_weekdays": ["thu", "mon"], "repeat_time": "20:30" }),
+        "schedule_repeating_task",
+        json!({ "intent": "weekly topic", "rule": "thu,mon@20:30" }),
     )
     .await;
     assert!(
@@ -96,10 +101,11 @@ async fn a_member_asking_for_a_recurring_task_gets_one_repeating_task() {
         text_of(&weekly)
     );
 
+    // An interval starts where it was asked to: 08:30Z is 16:30 in Shanghai, half an hour on.
     let interval = one_call(
         &r,
-        "schedule_task",
-        json!({ "intent": "drink water", "repeat": "interval", "repeat_minutes": 120, "delay_seconds": 1800 }),
+        "schedule_repeating_task",
+        json!({ "intent": "drink water", "rule": " 2h ", "start_at": "2027-01-15T08:30:00Z" }),
     )
     .await;
     assert!(
@@ -122,7 +128,7 @@ async fn an_ordinary_task_never_becomes_a_repeating_one() {
     assert_eq!(once.outcome, Outcome::Ok);
     assert!(!text_of(&once).contains("repeats"), "{}", text_of(&once));
     assert_eq!(r.timer(1).await.wake().unwrap().repeat, None);
-    // Changing its time or intent keeps it a one-time task.
+    // Changing its time or intent keeps it a one-time task, and update_task takes no rule.
     let updated = one_call(
         &r,
         "update_task",
@@ -130,39 +136,77 @@ async fn an_ordinary_task_never_becomes_a_repeating_one() {
     )
     .await;
     assert_eq!(updated.outcome, Outcome::Ok);
+    let ruled = one_call(&r, "update_task", json!({ "id": 1, "rule": "daily@09:00" })).await;
+    assert_eq!(ruled.outcome, Outcome::Error(ErrorKind::InvalidArguments));
     assert_eq!(r.timer(1).await.wake().unwrap().repeat, None);
 }
 
 #[tokio::test(start_paused = true)]
-async fn bad_repeat_arguments_are_explained_and_create_nothing() {
+async fn bad_arguments_are_explained_and_create_nothing() {
     let r = rig(vec![]);
-    for args in [
-        json!({ "intent": "x", "delay_seconds": 600, "repeat_time": "09:00" }),
-        json!({ "intent": "x", "repeat": "interval" }),
-        json!({ "intent": "x", "repeat": "interval", "repeat_minutes": 0 }),
-        json!({ "intent": "x", "repeat": "interval", "repeat_minutes": 30 }),
-        json!({ "intent": "x", "repeat": "interval", "repeat_minutes": 60, "repeat_time": "09:00" }),
-        json!({ "intent": "x", "repeat": "daily" }),
-        json!({ "intent": "x", "repeat": "daily", "repeat_time": "9am" }),
-        json!({ "intent": "x", "repeat": "daily", "repeat_time": "24:00" }),
-        json!({ "intent": "x", "repeat": "daily", "repeat_time": "09:00", "repeat_weekdays": ["mon"] }),
-        json!({ "intent": "x", "repeat": "weekly", "repeat_time": "09:00" }),
-        json!({ "intent": "x", "repeat": "weekly", "repeat_time": "09:00", "repeat_weekdays": [] }),
-        json!({ "intent": "x", "repeat": "weekly", "repeat_time": "09:00", "repeat_weekdays": ["funday"] }),
-        json!({ "intent": "x", "repeat": "monthly", "repeat_time": "09:00" }),
-        json!({ "intent": "x", "repeat": "daily", "repeat_time": "09:00", "delay_seconds": 60 }),
+    for (tool, args) in [
+        // A rule given to the one-shot tool is a mistake, not ignored.
+        (
+            "schedule_task",
+            json!({ "intent": "x", "delay_seconds": 600, "rule": "daily@09:00" }),
+        ),
+        ("schedule_task", json!({ "intent": "x" })),
+        ("schedule_repeating_task", json!({ "intent": "x" })),
+        (
+            "schedule_repeating_task",
+            json!({ "intent": "x", "rule": "0m" }),
+        ),
+        (
+            "schedule_repeating_task",
+            json!({ "intent": "x", "rule": "30m" }),
+        ),
+        (
+            "schedule_repeating_task",
+            json!({ "intent": "x", "rule": "daily" }),
+        ),
+        (
+            "schedule_repeating_task",
+            json!({ "intent": "x", "rule": "daily@9am" }),
+        ),
+        (
+            "schedule_repeating_task",
+            json!({ "intent": "x", "rule": "daily@24:00" }),
+        ),
+        (
+            "schedule_repeating_task",
+            json!({ "intent": "x", "rule": "@09:00" }),
+        ),
+        (
+            "schedule_repeating_task",
+            json!({ "intent": "x", "rule": "funday@09:00" }),
+        ),
+        (
+            "schedule_repeating_task",
+            json!({ "intent": "x", "rule": "monthly" }),
+        ),
+        (
+            "schedule_repeating_task",
+            json!({ "intent": "x", "rule": "1d", "start_at": "tomorrow" }),
+        ),
+        (
+            "schedule_repeating_task",
+            json!({ "intent": "x", "rule": "1d", "delay_seconds": 60 }),
+        ),
+        (
+            "schedule_repeating_task",
+            json!({ "intent": " ", "rule": "1d" }),
+        ),
     ] {
-        let result = one_call(&r, "schedule_task", args.clone()).await;
+        let result = one_call(&r, tool, args.clone()).await;
         assert_eq!(
             result.outcome,
             Outcome::Error(ErrorKind::InvalidArguments),
-            "{args}: {}",
+            "{tool} {args}: {}",
             text_of(&result)
         );
     }
     assert!(r.store.all().is_empty(), "nothing was created");
 }
-
 #[tokio::test(start_paused = true)]
 async fn only_a_members_request_starts_a_repeating_task() {
     let r = rig(vec![]);
@@ -177,26 +221,15 @@ async fn only_a_members_request_starts_a_repeating_task() {
         )
         .await
         .unwrap();
-    let other = r
-        .service
-        .create(
-            group(),
-            "later",
-            When::After(Duration::from_secs(7200)),
-            None,
-            Origin::Owner,
-        )
-        .await
-        .unwrap();
-    // The task's own run tries to start a repeating task, and to make another one repeat.
+    // The task's own run tries to start repeating tasks.
     r.fake.push(reply(
         call(
-            "schedule_task",
-            json!({ "intent": "check in daily", "repeat": "daily", "repeat_time": "10:00" }),
+            "schedule_repeating_task",
+            json!({ "intent": "check in daily", "rule": "daily@10:00" }),
         )
         .call(
-            "update_task",
-            json!({ "id": other.id.get(), "repeat": "daily", "repeat_time": "10:00" }),
+            "schedule_repeating_task",
+            json!({ "intent": "later, daily", "rule": "1d" }),
         ),
     ));
     r.fake.push(done());
@@ -232,8 +265,8 @@ async fn a_repeating_task_wakes_the_model_each_time_without_being_scheduled_agai
     let r = rig(vec![]);
     let created = one_call(
         &r,
-        "schedule_task",
-        json!({ "intent": "post the hourly status", "repeat": "interval", "repeat_minutes": 60 }),
+        "schedule_repeating_task",
+        json!({ "intent": "post the hourly status", "rule": "60m" }),
     )
     .await;
     assert_eq!(created.outcome, Outcome::Ok, "{}", text_of(&created));
@@ -282,50 +315,6 @@ async fn a_repeating_task_wakes_the_model_each_time_without_being_scheduled_agai
     assert_eq!(r.world.sent().len(), 3, "no run after cancelling");
     r.shutdown.cancel();
     handle.await.unwrap();
-}
-
-#[tokio::test(start_paused = true)]
-async fn a_member_can_change_a_tasks_repeat_rule_in_this_group_only() {
-    let r = rig(vec![]);
-    one_call(
-        &r,
-        "schedule_task",
-        json!({ "intent": "stretch", "delay_seconds": 600 }),
-    )
-    .await;
-    let made = one_call(
-        &r,
-        "update_task",
-        json!({ "id": 1, "repeat": "weekly", "repeat_weekdays": ["fri"], "repeat_time": "18:00" }),
-    )
-    .await;
-    assert_eq!(made.outcome, Outcome::Ok, "{}", text_of(&made));
-    // Friday 18:00 in Shanghai is 10:00Z today.
-    assert!(
-        text_of(&made)
-            .contains("repeats every fri at 18:00 Asia/Shanghai) next due 2027-01-15T10:00:00Z"),
-        "{}",
-        text_of(&made)
-    );
-    let theirs = r
-        .service
-        .create(
-            other_group(),
-            "theirs",
-            When::After(Duration::from_secs(600)),
-            None,
-            Origin::Owner,
-        )
-        .await
-        .unwrap();
-    let foreign = one_call(
-        &r,
-        "update_task",
-        json!({ "id": theirs.id.get(), "repeat": "daily", "repeat_time": "08:00" }),
-    )
-    .await;
-    assert_eq!(foreign.outcome, Outcome::Error(ErrorKind::InvalidArguments));
-    assert_eq!(r.timer(theirs.id.get()).await.wake().unwrap().repeat, None);
 }
 
 #[tokio::test(start_paused = true)]

@@ -102,6 +102,7 @@ async fn the_background_comes_before_the_lines_and_times_are_local() {
     let background = Background {
         text: "## Who is who\n- member:2: shown as \"Kit\"".into(),
         zone: jiff::tz::TimeZone::get("Asia/Shanghai").unwrap(),
+        ..Default::default()
     };
     ex.extract(
         &SliceContext {
@@ -1086,7 +1087,7 @@ async fn an_episodes_findings_become_names_facts_and_group_knowledge_once() {
         (2, 2, 2)
     );
     assert!(store.unconsolidated(group()).await.unwrap().is_empty());
-    assert_eq!(stored[0].episode.method, "slice-v3");
+    assert_eq!(stored[0].episode.method, "slice-v4");
 }
 
 #[tokio::test]
@@ -1350,4 +1351,178 @@ async fn one_episode_says_one_thing_per_slot_and_applying_it_again_changes_nothi
     );
     consolidator.apply(&episode).await.unwrap();
     assert_eq!(current().await, applied, "the same rows, unchanged");
+}
+
+#[tokio::test]
+async fn a_slice_is_shown_the_chat_it_continues_its_dates_and_lines_it_quotes_from_further_back() {
+    let (fake, store, job) = jobs(answers(4), 10, 1);
+    let mut all = lines(1..=40);
+    // Line 35 answers line 2, far before anything shown with that slice.
+    all[34].text = "[reply:1002] agreed, line 35".into();
+    store.add_lines(group(), all);
+    assert_eq!(job.extract_group(group()).await.unwrap(), 4);
+
+    let first = prompt(&fake, 0);
+    assert!(
+        !first.contains("## Earlier in this chat")
+            && !first.contains("Quoted from earlier in the chat (")
+    );
+    // The target names its dates in full: 1_800_000_000_000 ms is 2027-01-15, a Friday.
+    assert!(
+        first.contains("Target part (summarize this), from 2027-01-15 Fri 08:00"),
+        "{first}"
+    );
+
+    let last = prompt(&fake, 3);
+    assert!(
+        last.contains("## Earlier in this chat")
+            && last.contains("Deploy pipeline: They discussed"),
+        "the previous episode's summary: {last}"
+    );
+    let quoted = last
+        .split("Quoted from earlier in the chat (")
+        .nth(1)
+        .and_then(|rest| rest.split("Context before").next())
+        .unwrap_or_default();
+    assert!(
+        quoted.contains("[msg:1002]") && quoted.contains("line 2 about"),
+        "the quoted line is shown: {last}"
+    );
+    assert!(
+        !quoted.contains("line 21 about"),
+        "a line already shown is not repeated"
+    );
+}
+
+#[tokio::test]
+async fn a_fact_said_to_hold_no_longer_is_ended_and_only_that_value() {
+    use qbot_memory::consolidate::Consolidator;
+    use qbot_memory::facts::{FactStore, MemoryFactStore};
+    use qbot_memory::identity::IdentityPolicy;
+    use qbot_memory::predicates::Predicates;
+    use qbot_memory::{IdentityStore, MemoryIdentityStore};
+
+    let plays = json!({
+        "title": "Games", "summary": "member:2 plays two games.",
+        "evidence": [{ "line": 1, "quote": "I play Genshin" }],
+        "facts": [
+            { "member": 2, "predicate": "plays", "object": "Genshin", "line": 1, "quote": "I play Genshin" },
+            { "member": 2, "predicate": "plays", "object": "Chess", "line": 2, "quote": "and Chess" }
+        ]
+    });
+    let quits = json!({
+        "title": "Quitting", "summary": "member:2 quit Genshin.",
+        "evidence": [{ "line": 1, "quote": "quit Genshin" }],
+        "ended": [
+            { "member": 2, "predicate": "plays", "object": "genshin", "line": 1, "quote": "quit Genshin" },
+            { "member": 2, "predicate": "plays", "object": "Tetris", "line": 1, "quote": "quit Genshin" },
+            { "member": 1, "predicate": "plays", "object": "Chess", "line": 2, "quote": "no more" }
+        ]
+    });
+    let (_, _, b) = builder(vec![answer(plays), answer(quits.clone()), answer(quits)]);
+    let store = Arc::new(MemoryEpisodeStore::new());
+    store.add_lines(
+        group(),
+        [
+            said(1, 11, 2, "I play Genshin every night"),
+            said(2, 11, 2, "and Chess on weekends"),
+            said(3, 12, 3, "nice"),
+            said(4, 11, 2, "I quit Genshin last week"),
+            said(5, 12, 3, "no more for me either"),
+            said(6, 12, 3, "ok"),
+        ],
+    );
+    let facts = Arc::new(MemoryFactStore::new());
+    let identity = Arc::new(MemoryIdentityStore::new(IdentityPolicy::default()));
+    for account in [11, 12] {
+        identity
+            .seen(AccountId::new(account).unwrap(), UnixMillis::new(0))
+            .await
+            .unwrap();
+    }
+    let consolidator = Arc::new(Consolidator::new(
+        facts.clone(),
+        identity,
+        Arc::new(Predicates::builtin()),
+    ));
+    let job =
+        EpisodeJobs::new(store.clone(), b, slice_grid(3, 1, 0, 0)).with_consolidator(consolidator);
+    assert_eq!(job.extract_group(group()).await.unwrap(), 2);
+
+    let games: Vec<String> = facts
+        .current(group(), AccountId::new(11).ok())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|f| f.object)
+        .collect();
+    assert_eq!(games, ["Chess"], "Genshin ended, Chess untouched");
+    let stored = store.within(group(), 4, 6).await.unwrap();
+    assert_eq!(
+        stored[0].episode.findings.ended.len(),
+        2,
+        "a member who neither wrote the line nor is mentioned ends nothing"
+    );
+}
+
+#[test]
+fn the_later_of_a_fact_and_its_end_wins_and_the_bots_names_are_no_ones() {
+    use qbot_memory::findings::{FactArg, NameArg, validate_findings};
+    use qbot_memory::predicates::Predicates;
+
+    let target = [
+        said(1, 11, 2, "I quit Genshin"),
+        said(2, 11, 2, "Bobo, call me Kit"),
+        said(3, 11, 2, "ok I'm back on Genshin again"),
+        said(4, 12, 3, "I love tea"),
+        said(5, 12, 3, "no, I stopped drinking tea"),
+    ];
+    let background = Background {
+        bot_names: vec!["Bobo".into()],
+        ..Default::default()
+    };
+    let ctx = SliceContext {
+        group: group(),
+        previous: &[],
+        target: &target,
+        next: &[],
+        background: &background,
+    };
+    let fact = |member: u32, predicate: &str, object: &str, line: u32, quote: &str| FactArg {
+        member,
+        predicate: predicate.into(),
+        object: object.into(),
+        line,
+        quote: quote.into(),
+    };
+    let name = |name: &str| NameArg {
+        member: 2,
+        name: name.into(),
+        line: 2,
+        quote: "Bobo, call me Kit".into(),
+    };
+    let (findings, dropped) = validate_findings(
+        &[name("Bobo"), name("Kit")],
+        &[
+            fact(2, "plays", "Genshin", 3, "back on Genshin"),
+            fact(3, "likes", "tea", 4, "I love tea"),
+        ],
+        &[],
+        &[
+            fact(2, "plays", "genshin", 1, "I quit Genshin"),
+            fact(3, "likes", "tea", 5, "I stopped drinking tea"),
+        ],
+        &ctx,
+        &Predicates::builtin(),
+    );
+    let said: Vec<&str> = findings.facts.iter().map(|f| f.object.as_str()).collect();
+    let ended: Vec<&str> = findings.ended.iter().map(|f| f.object.as_str()).collect();
+    assert_eq!(said, ["Genshin"], "back on it after quitting: it holds");
+    assert_eq!(ended, ["tea"], "stopped after saying it: it ended");
+    let names: Vec<&str> = findings.names.iter().map(|n| n.name.as_str()).collect();
+    assert_eq!(names, ["Kit"]);
+    assert!(
+        dropped.iter().any(|d| d.contains("a name of the bot")),
+        "{dropped:?}"
+    );
 }

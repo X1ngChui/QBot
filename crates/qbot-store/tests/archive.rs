@@ -662,3 +662,66 @@ async fn media_references_are_stored_with_the_line_and_found_by_position() {
         .unwrap();
     assert_eq!(again, Appended::Duplicate);
 }
+
+#[tokio::test]
+async fn a_recall_removes_what_the_line_said_and_its_media_but_keeps_its_place() {
+    use qbot_store::MediaRefRow;
+    let db = db!();
+    let archive = PgArchive::new(db.pool().clone());
+    let g = group(620);
+    let picture = MediaRefRow {
+        kind: MediaKind::Image,
+        index: 0,
+        key: Some("k".into()),
+        file: None,
+        url: None,
+        size: None,
+    };
+    archive
+        .append_line(
+            member(g, 1, 501, "my address is 1 Example Road [image]"),
+            &[],
+            &[picture],
+        )
+        .await
+        .unwrap();
+    archive.append(member(g, 2, 502, "noted")).await.unwrap();
+    let id = MessageId::new(1).unwrap();
+    let (author, other) = (AccountId::new(501).unwrap(), AccountId::new(502).unwrap());
+
+    // Only the line its author wrote under that id is recalled; another group's never.
+    assert!(!archive.recall(g, id, Some(other)).await.unwrap());
+    assert!(!archive.recall(group(621), id, Some(author)).await.unwrap());
+    assert!(
+        !archive.recall(g, id, None).await.unwrap(),
+        "not the bot's line"
+    );
+    assert!(archive.recall(g, id, Some(author)).await.unwrap());
+    assert!(
+        !archive.recall(g, id, Some(author)).await.unwrap(),
+        "a second recall changes nothing"
+    );
+
+    let (lines, _) = archive.recent(g, 10).await.unwrap();
+    let texts: Vec<_> = lines.iter().map(|l| l.text.as_str()).collect();
+    assert_eq!(texts, ["[recalled]", "noted"]);
+    assert_eq!(number_of(&lines[0]), 1, "its author and number stay");
+    assert_eq!(archive.last_ordinal(g).await.unwrap(), 2);
+    assert!(
+        archive
+            .media_ref(g, id, MediaKind::Image, 0)
+            .await
+            .unwrap()
+            .is_none(),
+        "the picture can no longer be opened"
+    );
+    assert!(
+        archive
+            .search(g, &q("Example"), 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "nor is it found by search"
+    );
+    db.drop_db().await;
+}

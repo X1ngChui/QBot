@@ -184,3 +184,44 @@ async fn pictures_open_by_message_and_position_and_are_fetched_once() {
         Err(ToolError::InvalidArguments(_))
     ));
 }
+
+/// References that can be taken away, as a recall does.
+#[derive(Default)]
+struct Removable(Mutex<HashMap<(i64, &'static str, u32), MediaRef>>);
+
+#[async_trait]
+impl MediaRefs for Removable {
+    async fn media_ref(
+        &self,
+        _: GroupId,
+        message: MessageId,
+        kind: MediaKind,
+        index: u32,
+    ) -> Result<Option<MediaRef>, RefsError> {
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .get(&(message.get(), kind.marker(), index))
+            .cloned())
+    }
+}
+
+#[tokio::test]
+async fn a_picture_whose_message_was_recalled_is_not_shown_from_the_cache() {
+    let refs = Arc::new(Removable::default());
+    refs.0
+        .lock()
+        .unwrap()
+        .insert((10, "image", 0), reference("a"));
+    let store = ArchivedMedia::new(refs.clone(), Arc::new(Fetch::default()), 1000);
+    assert!(
+        store.load("9/10/image/0").await.is_ok(),
+        "opened and cached"
+    );
+    refs.0.lock().unwrap().clear();
+    assert!(
+        store.load("9/10/image/0").await.is_err(),
+        "gone with its reference, though its bytes are cached"
+    );
+}
