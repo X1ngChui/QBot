@@ -43,7 +43,7 @@ so they stay verbatim wherever history shows them, and remain searchable. Networ
 provider-side failures are not permanent: the job fails and the slice is tried again.
 
 **What the extractor reads.** No tools, only context, so everything a reader needs to understand
-the slice and to tell what lasts from what passes is put in front of it (method `slice-v4`):
+the slice and to tell what lasts from what passes is put in front of it (method `slice-v5`):
 - Lines are `[msg:ID] MM-DD HH:MM member:N: text` in the bot's time zone: who said what,
   when, and which line a `[reply:ID]` quotes. The target part's heading gives its first and last
   moments in full, with the year and weekday (`2026-10-15 Thu 20:30`), so "tomorrow" or "on
@@ -59,7 +59,9 @@ the slice and to tell what lasts from what passes is put in front of it (method 
   same records replies use) lists every member the lines involve, whether as speaker or as
   `[at:N]`. For each it gives the current group display name, other names, accounts linked as
   one person in the group, a block, and facts learned before, all from the group's own records. These resolve names and references to member
-  numbers, and the earlier facts are what a later statement can confirm or end.
+  numbers, and the earlier facts (every one, the most confident first, with its confidence) are
+  what a later statement can confirm or end; a value said again is given exactly as listed, so it
+  supports the record instead of standing beside it as a rewording.
 - "About the group" says what the bot is called (members address it by that name, which must
   never become a member's), the operator's group background and the learned topic and terms.
 - Notes are left out: they are what members wrote about each other, not needed to read a
@@ -143,9 +145,13 @@ else the account nickname. These docs say "group nickname" and "group display na
   name is available. A number appears in a message only when someone asks about the numbers.
 - *Stored names* are the other names people use for someone: per group, pointing at an account.
   A name given with `--linked` is given to each of the person's accounts in the group, and a name
-  confirmed for one of a person's accounts does not stop their other accounts from having it. Evidence is fused in one Rust function: manual 1.0, extracted evidence 0.25 per
-  distinct episode capped at 0.7, combined as independent evidence. A name resolves only when
-  confirmed (at 0.75), so extraction alone never confirms: only a person does. Two confirmed targets for a name is *ambiguous*, never a guess.
+  confirmed for one of a person's accounts does not stop their other accounts from having it.
+  A name is a belief (section 7): set by a person (`/name`) it is *confirmed*, confidence 1,
+  and stands until removed; learned from chat it is a *lead*, with the credibility of its
+  distinct supporting episodes ageing with the stable half-life. Confirmed is provenance, not a
+  threshold: only a person vouches, however often chat repeats a name. A lead stays a lead,
+  shown with its confidence, and is never expired. A name resolves only to confirmed targets; two
+  confirmed targets for a name is *ambiguous*, never a guess.
 - *Invitations* to link accounts: ten minutes, one pending per
   account per group, only the target confirms (once: the archive runs each message once, and a
   confirmed invitation is no longer pending; message ids are hashes and are never compared), an
@@ -192,28 +198,95 @@ needed for this use case, so episodes are fixed, batch-aligned slices; an LLM bo
 a segmentation state machine is only worth building if fixed slicing proves clearly insufficient.
 The design above would then still hold: the slicing function is the only part that changes.
 
-## 7. Facts and group knowledge
+## 7. Beliefs: confidence and forgetting
 
-- **Consolidation** applies each episode's findings in chat order, right after it is stored and,
-  for any left over by a crash, at the start of the group's next extraction. Names become
-  extracted identity evidence; facts and knowledge become observations in `fact` /
-  `fact_evidence`. A single-valued predicate supersedes its previous value; a multi-valued one
-  keys on the normalized object; an opposite predicate (likes / dislikes) supersedes the other.
-  One episode says one thing per slot (a subject's predicate and key, an opposite pair counting
-  as one): its last statement. An episode supports a fact at most once, so applying it again
-  changes nothing. After its observations an episode's ended facts are applied: each ends the
-  active fact of its slot with that value (superseded, as a replaced value is), and one that is
-  not recorded, or holds another value now, changes nothing.
-- **Confidence** is the Wilson lower bound of the supporting episodes times `0.5^(age /
-  half-life)`, with the half-life chosen by the predicate's decay class
-  (`memory.facts.half_life_days`); a fact whose confidence falls below 0.05 is expired by the
-  nightly run. It is computed on read, so it is deterministic for a given time.
-- **Where facts reach the model.** Every run's people block lists each person's facts with
-  their other names, notes and linked accounts. Facts come by predicate, the most recently
-  confirmed first, each with its episode count and last confirmation date, across the person's
-  accounts linked in the group. Dates are absolute, so the block stays in the cached prefix until a record
-  changes. Group knowledge is an instruction: the topic and the `memory.group_terms` (40) most
-  recently confirmed terms ([architecture.md](architecture.md) section 7). Members see their own facts with `/who` and remove them with `/forget`.
+Memory holds two kinds of thing. *Records* say what happened: archive lines, episodes, notes
+members wrote. They are true of the past by construction and carry no confidence; recall ranks
+episodes by relevance and age (section 3). *Beliefs* are claims about how things are now, inferred
+from records: a fact about a person (`lives_in`, `likes`), the meaning of a group term, the
+group's topic, a name a person goes by. Every belief has one **confidence**, with one meaning
+everywhere: *the estimated probability that the claim holds now*. It is computed on read from the
+belief's evidence, in one place (`qbot_memory::belief`), so a fact, a term and a name with the same
+evidence have the same confidence.
+
+**The model.** A belief can be wrong for three independent reasons, and confidence is the product
+of the three chances that it is not:
+
+1. *The statements were wrong* (a joke, sarcasm, a misread line, the wrong subject).
+   `credibility(n) = (n + 1) / (n + 2)` for `n` distinct episodes that supported it: the posterior
+   mean of a uniform Beta prior after `n` agreeing observations (Laplace's rule of succession).
+   One episode gives 0.67, two 0.75, four 0.83, eight 0.9; it never reaches 1, since repeating a
+   claim is not proof of it. A name set by a person (`/name`) is an assignment, not an inference:
+   credibility 1.
+2. *It stopped holding since it was last said* (people move, quit games, change tastes).
+   `persistence = 0.5^(age / half-life)`, age counted from the last support, the half-life being
+   how long a claim of its decay class typically keeps holding unsaid
+   (`memory.facts.half_life_days`: stable 730 days for where someone lives or works, a pet, a
+   name; default 180 for tastes; fast 45 for what someone currently plays, watches or wants).
+   A vouched name does not age: it stands until removed.
+3. *Something said later contradicts it.* The latest statement screens off earlier ones: a
+   statement made after the belief's last support that is incompatible with it multiplies its
+   confidence by `1 - credibility` of that statement. Incompatible are another value of a
+   single-valued predicate ("lives in Shanghai" against "lives in Beijing"), the opposite
+   predicate for the same thing ("dislikes cats" against "likes cats"), another meaning of the
+   same term, and a statement that it no longer holds (an `ended` finding, credibility of one
+   statement). Support given after the contradiction restores it: the contradiction is then
+   older than the belief's last support and no longer counts.
+
+So "moved to Shanghai" after three mentions of Beijing leaves Shanghai at 0.67 and Beijing at
+about a quarter (0.8 credibility, a little persistence lost, times 1/3); both stay, and the model sees
+both with their confidence. A rewording ("Beijing" then "Beijing city") costs the older wording
+two thirds of its confidence instead of deleting it, and either wording is restored by being
+said again. Confidence is a number the model reads, not a gate: nothing is hidden or deleted
+for having low confidence.
+
+**Forgetting is ranking under a budget, not deletion.** What reaches the model is chosen by
+confidence where space is limited:
+- the people block shows each person's `memory.person_facts` (16) most confident facts, each with
+  its confidence (rounded to tens of percent) and last support date, competing values side by
+  side, and their names with leads marked by confidence;
+- group knowledge shows the most confident topic and, per term, its most confident meaning, the
+  `memory.group_terms` (40) most confident terms;
+- the extractor sees every fact of the members a slice involves, most confident first, so a
+  statement can confirm, reword or end any of them.
+
+Confidence is computed as of the start of the current UTC day, so the people block and the group
+knowledge change at most once a day by ageing and stay in the cached prompt prefix in between.
+A belief that falls out of a budget is still kept, still shown by `/who` and to the extractor,
+and comes back when it is said again. Nothing expires: a belief nobody repeats tends to zero
+confidence and drops in rank; it is not discarded. Hard deletion is only by a person: `/forget`
+(facts), `/name remove` (names), a recalled message (which teaches nothing afterwards). Storage
+grows with distinct claims, which are short text; there is no automatic purge.
+
+**Storage.** `fact` holds one row per claim: subject, predicate, *slot* and value. Claims of one
+subject compete when they share a slot and differ in predicate or value: a single-valued
+predicate's slot is the predicate (`lives_in`); a multi-valued predicate with an opposite shares
+one slot with it per normalized value (`dislikes/likes:cats`); a multi-valued predicate without
+one has a slot per value, so its values stand side by side; a term's slot is the term, the topic
+has one. Each row keeps its distinct supporting episodes (`fact_evidence`, with the quote), its
+first and last support and the latest time it was said to have ended; confidence is derived.
+Statuses are `active` and `forgotten` (struck out by a person, never shown, never a competitor).
+
+**Consolidation** applies each episode's findings in chat order, right after it is stored and, for
+any left over by a crash, at the start of the group's next extraction. Names become extracted
+identity evidence; facts and knowledge become observations: support for the slot's row with the
+same predicate and normalized value, or a new row beside its competitors. One episode says one
+thing per slot: its last statement. An episode supports a claim at most once, so applying it
+again changes nothing. After its observations an episode's ended facts are applied: each records
+the time on the claim with that value, and one that is not recorded changes nothing.
+
+**Alternatives considered.**
+
+| Approach | What it gets right | Why not here |
+| --- | --- | --- |
+| Wilson lower bound times decay, expire below 0.05 (the earlier design) | conservative with little evidence | not a probability (one mention 0.27, so most memory looked unreliable); a once-said fact was deleted after about ten weeks; no negative evidence, so a new value had to delete the old |
+| Beta reputation / subjective logic opinion (Jøsang and Ismail 2002), positive and negative counts with a forgetting factor | evidence-based, one scale, explicit uncertainty | treats statements as exchangeable trials of a fixed proportion: three old mentions outvote one fresh "I moved", though the fresh one is about the present. Its rule of succession is kept for credibility |
+| Ebbinghaus strength growing with recall (MemoryBank, Zhong et al. 2023) and ACT-R base-level activation (power-law decay of uses) | memories used often persist | model how a *mind* forgets, not whether a claim about the world still holds; being shown in a prompt is not evidence that it is true, and would make every shown fact immortal |
+| Recency + importance + relevance, min-max normalized (Generative Agents, Park et al. 2023) | good for ranking records | a ranking score, not a probability; importance asked of a model is unstable across calls. Recall of episodes keeps a similarity-times-recency score in this spirit |
+| Model-chosen ADD / UPDATE / DELETE (Mem0, 2025) | resolves rewording semantically | a contradiction deletes on one model call; Mem0's graph variant and Zep / Graphiti instead mark facts invalid and keep them for temporal reasoning, which is what competing claims with confidence do here without another model call |
+
+Members see their own facts and confidence with `/who` and remove them with `/forget`; group
+knowledge is removed with `/forget group`.
 
 ## 8. Manual notes are not memory
 
@@ -224,7 +297,7 @@ Two kinds of information about people and the group are kept apart (architecture
 | Written by | a person, with `/note` | extraction, from chat lines |
 | Store | `note` | `fact` / `fact_evidence` (and aliases from evidence) |
 | Removed by | `/note remove` / `/note clear` | `/forget N` (facts), `/forget group N` (group knowledge) |
-| Confidence | none: it is what someone wrote | Wilson bound of evidence, decaying |
+| Confidence | none: it is a record of what someone wrote | the probability the claim holds now (section 7) |
 | Model sees it as | a note written by a member | learned from chat, with confidence and age |
 
 Neither path writes into the other: extraction reads chat lines, never notes, and consolidation
@@ -233,8 +306,8 @@ name the store each command acts on.
 
 ## 9. Retention
 
-Episodes, facts and evidence are small text and are kept; expired and superseded facts stay as
-history. Revisit if storage or privacy requires.
+Episodes, facts and evidence are small text and are kept; a belief nobody repeats loses
+confidence and rank but is not deleted (section 7). Revisit if storage or privacy requires.
 
 A recalled message's line keeps its place in the archive but says only `[recalled]`
 ([architecture.md](architecture.md) section 4), so a slice extracted after the recall learns

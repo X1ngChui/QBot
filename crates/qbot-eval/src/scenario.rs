@@ -94,6 +94,9 @@ pub struct FactSpec {
     /// How many episodes support it (more is more confident).
     #[serde(default = "one")]
     pub episodes: u32,
+    /// How long ago they did (an older fact is less likely to hold).
+    #[serde(default)]
+    pub days_ago: u32,
 }
 
 fn one() -> u32 {

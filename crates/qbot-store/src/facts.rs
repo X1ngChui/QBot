@@ -1,5 +1,5 @@
 //! Facts on Postgres. The rules are those of `qbot_memory::facts::MemoryFactStore`; one
-//! transaction per observation, serialized per group so concurrent observations of one slot
+//! transaction per observation, serialized per group so concurrent observations of one claim
 //! cannot both insert.
 
 use async_trait::async_trait;
@@ -16,10 +16,10 @@ fn backend(error: impl std::fmt::Display) -> MemoryError {
     MemoryError::Backend(error.to_string())
 }
 
-const COLS: &str = "fact_id, group_id, subject_account, predicate, key, object, label, status, supports, decay, \
-    first_seen_ms, last_confirmed_ms, ended_ms";
+pub(crate) const COLS: &str = "fact_id, group_id, subject_account, predicate, slot, key, object, label, status, \
+    supports, decay, first_seen_ms, last_confirmed_ms, ended_ms";
 
-fn to_fact(row: &PgRow) -> Result<Fact, MemoryError> {
+pub(crate) fn to_fact(row: &PgRow) -> Result<Fact, MemoryError> {
     let status: String = row.get("status");
     let decay: String = row.get("decay");
     Ok(Fact {
@@ -31,6 +31,7 @@ fn to_fact(row: &PgRow) -> Result<Fact, MemoryError> {
             .transpose()
             .map_err(backend)?,
         predicate: row.get("predicate"),
+        slot: row.get("slot"),
         key: row.get("key"),
         object: row.get("object"),
         label: row.get("label"),
@@ -56,48 +57,66 @@ impl PgFactStore {
     }
 }
 
-/// The active row of one slot, locked for the rest of the transaction.
-async fn active_slot(
+async fn lock_group(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    obs: &Observation,
+    group: GroupId,
+) -> Result<(), MemoryError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('fact:' || $1::text, 0))")
+        .bind(group.get())
+        .execute(&mut **tx)
+        .await
+        .map_err(backend)?;
+    Ok(())
+}
+
+/// The subject's active claim of `predicate` in `slot` whose value is `object` once normalized,
+/// locked for the rest of the transaction. Values are compared in Rust, the one definition of
+/// the comparison form.
+async fn active_claim(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    group: GroupId,
+    subject: Option<AccountId>,
     predicate: &str,
+    slot: &str,
+    object: &str,
 ) -> Result<Option<Fact>, MemoryError> {
-    let row = sqlx::query(&format!(
+    let rows = sqlx::query(&format!(
         "SELECT {COLS} FROM fact WHERE group_id = $1 AND subject_account IS NOT DISTINCT FROM $2 \
-         AND predicate = $3 AND key = $4 AND status = 'active' FOR UPDATE"
+         AND predicate = $3 AND slot = $4 AND status = 'active' ORDER BY fact_id FOR UPDATE"
     ))
-    .bind(obs.group.get())
-    .bind(obs.subject.map(AccountId::get))
+    .bind(group.get())
+    .bind(subject.map(AccountId::get))
     .bind(predicate)
-    .bind(&obs.key)
-    .fetch_optional(&mut **tx)
+    .bind(slot)
+    .fetch_all(&mut **tx)
     .await
     .map_err(backend)?;
-    row.as_ref().map(to_fact).transpose()
+    let wanted = normalize_key(object);
+    for row in &rows {
+        let fact = to_fact(row)?;
+        if normalize_key(&fact.object) == wanted {
+            return Ok(Some(fact));
+        }
+    }
+    Ok(None)
 }
 
 #[async_trait]
 impl FactStore for PgFactStore {
     async fn observe(&self, obs: &Observation) -> Result<FactId, MemoryError> {
         let mut tx = self.pool.begin().await.map_err(backend)?;
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('fact:' || $1::text, 0))")
-            .bind(obs.group.get())
-            .execute(&mut *tx)
-            .await
-            .map_err(backend)?;
-        if let Some(opposite) = &obs.opposite
-            && let Some(retired) = active_slot(&mut tx, obs, opposite).await?
-        {
-            sqlx::query("UPDATE fact SET status = 'superseded', ended_ms = $2 WHERE fact_id = $1")
-                .bind(retired.id.0)
-                .bind(obs.at.get())
-                .execute(&mut *tx)
-                .await
-                .map_err(backend)?;
-        }
-        let current = active_slot(&mut tx, obs, &obs.predicate).await?;
-        let id = match current {
-            Some(fact) if normalize_key(&fact.object) == normalize_key(&obs.object) => {
+        lock_group(&mut tx, obs.group).await?;
+        let same = active_claim(
+            &mut tx,
+            obs.group,
+            obs.subject,
+            &obs.predicate,
+            &obs.slot,
+            &obs.object,
+        )
+        .await?;
+        let id = match same {
+            Some(fact) => {
                 let added = sqlx::query(
                     "INSERT INTO fact_evidence (fact_id, episode_id, message_id, quote) VALUES ($1, $2, $3, $4) \
                      ON CONFLICT DO NOTHING",
@@ -122,26 +141,17 @@ impl FactStore for PgFactStore {
                 }
                 fact.id
             }
-            other => {
-                if let Some(old) = other {
-                    sqlx::query(
-                        "UPDATE fact SET status = 'superseded', ended_ms = $2 WHERE fact_id = $1",
-                    )
-                    .bind(old.id.0)
-                    .bind(obs.at.get())
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(backend)?;
-                }
+            None => {
                 let id: i64 = sqlx::query(
-                    "INSERT INTO fact (group_id, subject_account, predicate, key, object, label, status, supports, decay, \
-                     first_seen_ms, last_confirmed_ms) VALUES ($1, $2, $3, $4, $5, $6, 'active', 1, $7, $8, $8) \
-                     RETURNING fact_id",
+                    "INSERT INTO fact (group_id, subject_account, predicate, slot, key, object, label, status, \
+                     supports, decay, first_seen_ms, last_confirmed_ms) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', 1, $8, $9, $9) RETURNING fact_id",
                 )
                 .bind(obs.group.get())
                 .bind(obs.subject.map(AccountId::get))
                 .bind(&obs.predicate)
-                .bind(&obs.key)
+                .bind(&obs.slot)
+                .bind(normalize_key(&obs.object))
                 .bind(&obs.object)
                 .bind(&obs.label)
                 .bind(obs.decay.as_str())
@@ -184,29 +194,20 @@ impl FactStore for PgFactStore {
 
     async fn retract(&self, r: &Retraction) -> Result<bool, MemoryError> {
         let mut tx = self.pool.begin().await.map_err(backend)?;
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('fact:' || $1::text, 0))")
-            .bind(r.group.get())
-            .execute(&mut *tx)
-            .await
-            .map_err(backend)?;
-        let row = sqlx::query(&format!(
-            "SELECT {COLS} FROM fact WHERE group_id = $1 AND subject_account IS NOT DISTINCT FROM $2 \
-             AND predicate = $3 AND key = $4 AND status = 'active' FOR UPDATE"
-        ))
-        .bind(r.group.get())
-        .bind(r.subject.map(AccountId::get))
-        .bind(&r.predicate)
-        .bind(&r.key)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(backend)?;
-        let Some(fact) = row.as_ref().map(to_fact).transpose()? else {
+        lock_group(&mut tx, r.group).await?;
+        let Some(fact) = active_claim(
+            &mut tx,
+            r.group,
+            r.subject,
+            &r.predicate,
+            &r.slot,
+            &r.object,
+        )
+        .await?
+        else {
             return Ok(false);
         };
-        if normalize_key(&fact.object) != normalize_key(&r.object) {
-            return Ok(false);
-        }
-        sqlx::query("UPDATE fact SET status = 'superseded', ended_ms = $2 WHERE fact_id = $1")
+        sqlx::query("UPDATE fact SET ended_ms = greatest(ended_ms, $2) WHERE fact_id = $1")
             .bind(fact.id.0)
             .bind(r.at.get())
             .execute(&mut *tx)
@@ -224,26 +225,5 @@ impl FactStore for PgFactStore {
             .await
             .map_err(backend)?;
         Ok(result.rows_affected() > 0)
-    }
-
-    async fn all_active(&self) -> Result<Vec<Fact>, MemoryError> {
-        let rows = sqlx::query(&format!(
-            "SELECT {COLS} FROM fact WHERE status = 'active' ORDER BY fact_id"
-        ))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(backend)?;
-        rows.iter().map(to_fact).collect()
-    }
-
-    async fn expire(&self, ids: &[FactId], at: UnixMillis) -> Result<usize, MemoryError> {
-        let ids: Vec<i64> = ids.iter().map(|id| id.0).collect();
-        let result = sqlx::query("UPDATE fact SET status = 'expired', ended_ms = $2 WHERE fact_id = ANY($1) AND status = 'active'")
-            .bind(&ids)
-            .bind(at.get())
-            .execute(&self.pool)
-            .await
-            .map_err(backend)?;
-        Ok(usize::try_from(result.rows_affected()).unwrap_or(usize::MAX))
     }
 }

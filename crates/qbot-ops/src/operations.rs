@@ -6,8 +6,6 @@ use jiff::tz::TimeZone;
 use jiff::{Span, Timestamp};
 use qbot_core::{AccountId, Clock, GroupId, UnixMillis};
 use qbot_i18n::Locales;
-use qbot_memory::IdentityStore;
-use qbot_memory::facts::{DecayPolicy, FactStore, decay as decay_facts};
 use qbot_sched::{JobError, JobKind, JobRunner};
 
 use crate::backup::{BackupConfig, create_verified_backup, newest_backup_age, rotate_backups};
@@ -18,8 +16,6 @@ use crate::report::render_report;
 pub struct OpsConfig {
     /// `None`: backups are switched off.
     pub backup: Option<BackupConfig>,
-    /// A name nobody has vouched for and no evidence has supported for this long is dropped.
-    pub alias_unused: Duration,
     /// Picture descriptions older than this are forgotten (and so redone when next needed).
     pub description_ttl: Duration,
     /// Finished runs and finished scheduled tasks older than this are deleted. `None` keeps
@@ -27,32 +23,27 @@ pub struct OpsConfig {
     pub records_keep: Option<Duration>,
     pub owners: Vec<AccountId>,
     pub zone: TimeZone,
-    /// How facts fade when nothing confirms them.
-    pub fact_decay: DecayPolicy,
 }
 
 impl OpsConfig {
     /// The nightly upkeep around the deployment's choices (backups, how long records are kept,
-    /// who gets the report, the time zone, how facts fade). A name candidate nothing has supported
-    /// for one default fact half-life is dropped: a lead from chat fades like a fact. A cached
-    /// picture description is dropped after 15 days (it serves reposts, which come within days,
+    /// who gets the report, the time zone). Beliefs are not expired: what nobody repeats loses
+    /// confidence, computed on read, and stays (`qbot_memory::belief`). A cached picture
+    /// description is dropped after 15 days (it serves reposts, which come within days,
     /// and must not grow with the archive; what was archived keeps its words).
     pub fn new(
         backup: Option<BackupConfig>,
         records_keep: Option<Duration>,
         owners: Vec<AccountId>,
         zone: TimeZone,
-        fact_decay: DecayPolicy,
     ) -> Self {
         const DAY: Duration = Duration::from_secs(86_400);
         Self {
             backup,
-            alias_unused: fact_decay.default,
             description_ttl: DAY * 15,
             records_keep,
             owners,
             zone,
-            fact_decay,
         }
     }
 }
@@ -62,8 +53,6 @@ pub struct Operations {
     clock: Arc<dyn Clock>,
     extractor: Arc<dyn Extractor>,
     housekeeping: Arc<dyn Housekeeping>,
-    identity: Arc<dyn IdentityStore>,
-    facts: Arc<dyn FactStore>,
     report: Arc<dyn ReportSource>,
     sink: Arc<dyn ReportSink>,
     locales: Locales,
@@ -83,8 +72,6 @@ pub struct Parts {
     pub clock: Arc<dyn Clock>,
     pub extractor: Arc<dyn Extractor>,
     pub housekeeping: Arc<dyn Housekeeping>,
-    pub identity: Arc<dyn IdentityStore>,
-    pub facts: Arc<dyn FactStore>,
     pub report: Arc<dyn ReportSource>,
     pub sink: Arc<dyn ReportSink>,
     pub locales: Locales,
@@ -103,8 +90,6 @@ impl Operations {
             clock: parts.clock,
             extractor: parts.extractor,
             housekeeping: parts.housekeeping,
-            identity: parts.identity,
-            facts: parts.facts,
             report: parts.report,
             sink: parts.sink,
             locales: parts.locales,
@@ -144,23 +129,14 @@ impl Operations {
         }
     }
 
-    /// Drop stale name candidates, facts nothing confirms any more, and stale picture
-    /// descriptions.
+    /// Drop stale picture descriptions (a cache, not memory).
     pub async fn decay(&self) -> Result<(), JobError> {
-        let expired = self
-            .identity
-            .expire_candidates(self.before(self.cfg.alias_unused))
-            .await
-            .map_err(failed)?;
         let forgotten = self
             .housekeeping
             .expire_descriptions(self.before(self.cfg.description_ttl))
             .await
             .map_err(failed)?;
-        let faded = decay_facts(&*self.facts, &self.cfg.fact_decay, self.clock.now())
-            .await
-            .map_err(failed)?;
-        tracing::info!(expired, forgotten, faded, "decay finished");
+        tracing::info!(forgotten, "decay finished");
         Ok(())
     }
 

@@ -607,6 +607,7 @@ summary_batches = 0
 [memory]
 slice_batches = 4
 group_terms = 12
+person_facts = 7
 [memory.recall]
 half_life_days = 30
 [media]
@@ -636,7 +637,7 @@ extraction_reasoning = "medium"
         (4, 1, 1)
     );
     assert_eq!(grid.retained_raw_batches, 4, "the verbatim tier");
-    assert_eq!(c.group_terms(), 12);
+    assert_eq!((c.group_terms(), c.person_facts()), (12, 7));
     assert_eq!(c.media_wait(), Duration::from_secs(10));
     assert_eq!(c.extraction_reasoning(), qbot_llm::ReasoningEffort::Medium);
     assert_eq!(

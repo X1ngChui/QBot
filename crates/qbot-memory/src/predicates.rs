@@ -17,13 +17,13 @@ pub enum FactKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Cardinality {
-    /// One value at a time: a new value replaces the old one.
+    /// One value at a time: a later value contradicts an earlier one.
     Single,
     /// Values stand side by side.
     Multi,
 }
 
-/// How quickly an unconfirmed fact is forgotten. The half-lives are configuration.
+/// How long a fact of the class typically keeps holding unsaid. The half-lives are configuration.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, serde::Serialize,
 )]

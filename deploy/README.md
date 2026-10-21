@@ -161,7 +161,7 @@ The bot runs its own maintenance; nothing outside the container is needed.
   that has never run starts from now.
 - **Nightly run**, in order: memory extraction for every group (after embedding any episode the
   configured embedding model has no vector for, so a new embedding model needs no other step),
-  decay (stale name candidates, cached picture descriptions older than 15 days, faded facts), a verified
+  decay (cached picture descriptions older than 15 days; learned memory is not expired), a verified
   `pg_dump`, then cleanup (finished timers and runs after `maintenance.records_keep_days`, NapCat's file cache). Every
   stage runs even if an earlier one failed. A failed decay, backup or cleanup fails the job, which
   is retried with backoff; a failed extraction is logged (`extraction failed`) and tried again with

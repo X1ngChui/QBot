@@ -1,6 +1,8 @@
 use qbot_core::AccountId;
 use qbot_i18n::Msg;
+use qbot_memory::belief::{as_of_day, percent};
 use qbot_memory::facts::{Fact, GROUP_TERM, GROUP_TOPIC};
+use qbot_memory::predicates::DecayClass;
 use qbot_memory::{Alias, AliasStatus, IdentityError};
 
 use super::Reply;
@@ -78,7 +80,7 @@ async fn scope_accounts(
 fn entry(cx: &Cx<'_>, alias: &Alias) -> String {
     cx.t(&Msg::NameEntry {
         text: alias.text.clone(),
-        confidence: format!("{:.2}", alias.confidence),
+        confidence: name_confidence(cx, alias),
     })
 }
 
@@ -164,16 +166,20 @@ pub(crate) async fn who(cx: &Cx<'_>) -> Reply {
     if facts.is_empty() {
         lines.push(cx.t(&Msg::WhoNoFacts {}));
     } else {
-        let now = cx.deps.clock.now();
+        let confidences = cx
+            .deps
+            .settings
+            .fact_decay
+            .confidences(&facts, cx.deps.clock.now());
         lines.push(cx.t(&Msg::WhoFacts {
             count: facts.len() as u64,
         }));
-        for (index, fact) in (1u64..).zip(&facts) {
+        for ((index, fact), confidence) in (1u64..).zip(&facts).zip(confidences) {
             lines.push(cx.t(&Msg::WhoFactLine {
                 index,
                 predicate: fact.predicate.clone(),
                 object: fact.object.clone(),
-                confidence: format!("{:.2}", cx.deps.settings.fact_decay.confidence(fact, now)),
+                confidence: shown(confidence),
             }));
         }
     }
@@ -181,6 +187,19 @@ pub(crate) async fn who(cx: &Cx<'_>) -> Reply {
         lines.push(cx.t(&Msg::WhoHint {}));
     }
     Ok(cx.fit(&lines.join("\n")))
+}
+
+/// A confidence as members see it: whole tens of percent.
+fn shown(confidence: f64) -> String {
+    format!("{}%", percent(confidence))
+}
+
+/// A name's confidence now: a lead's credibility ages like a stable fact.
+fn name_confidence(cx: &Cx<'_>, alias: &Alias) -> String {
+    shown(alias.confidence_at(
+        cx.deps.settings.fact_decay.half_life(DecayClass::Stable),
+        cx.deps.clock.now(),
+    ))
 }
 
 /// The learned facts about these accounts, in the order /who numbers them.
@@ -199,26 +218,33 @@ async fn learned(cx: &Cx<'_>, accounts: &[qbot_core::AccountId]) -> Result<Vec<F
     Ok(facts)
 }
 
-/// What the bot learned about the group itself, in the order /group numbers it: the topic,
-/// then terms by key.
-async fn group_knowledge(cx: &Cx<'_>) -> Result<Vec<Fact>, Fail> {
+/// What the bot learned about the group itself with its confidence, in the order /group numbers
+/// it: topics, then terms by term, the most confident first. Confidence is as of the start of the
+/// day, so /group and a /forget group after it number alike.
+async fn group_knowledge(cx: &Cx<'_>) -> Result<Vec<(Fact, f64)>, Fail> {
     let facts = cx
         .deps
         .facts
         .current(cx.group(), None)
         .await
         .map_err(|e| Fail::Storage(e.to_string()))?;
-    let mut ordered: Vec<Fact> = facts
-        .iter()
-        .filter(|f| f.predicate == GROUP_TOPIC)
-        .cloned()
-        .collect();
-    let mut terms: Vec<Fact> = facts
+    let confidences = cx
+        .deps
+        .settings
+        .fact_decay
+        .confidences(&facts, as_of_day(cx.deps.clock.now()));
+    let mut ordered: Vec<(Fact, f64)> = facts
         .into_iter()
-        .filter(|f| f.predicate == GROUP_TERM)
+        .zip(confidences)
+        .filter(|(f, _)| f.predicate == GROUP_TOPIC || f.predicate == GROUP_TERM)
         .collect();
-    terms.sort_by(|a, b| a.key.cmp(&b.key));
-    ordered.extend(terms);
+    ordered.sort_by(|(a, p), (b, q)| {
+        (a.predicate != GROUP_TOPIC)
+            .cmp(&(b.predicate != GROUP_TOPIC))
+            .then_with(|| a.slot.cmp(&b.slot))
+            .then(q.total_cmp(p))
+            .then(a.id.cmp(&b.id))
+    });
     Ok(ordered)
 }
 
@@ -238,17 +264,20 @@ pub(crate) async fn group(cx: &Cx<'_>) -> Reply {
         return Ok(cx.t(&Msg::GroupEmpty {}));
     }
     let mut lines = vec![cx.t(&Msg::GroupHeader {})];
-    for (index, fact) in (1u64..).zip(&knowledge) {
+    for (index, (fact, confidence)) in (1u64..).zip(&knowledge) {
+        let confidence = shown(*confidence);
         lines.push(cx.t(&if fact.predicate == GROUP_TERM {
             Msg::GroupTermLine {
                 index,
                 term: fact.label.clone().unwrap_or_else(|| fact.key.clone()),
                 text: fact.object.clone(),
+                confidence,
             }
         } else {
             Msg::GroupTopicLine {
                 index,
                 text: fact.object.clone(),
+                confidence,
             }
         }));
     }
@@ -272,7 +301,7 @@ async fn forget_group(cx: &Cx<'_>, rest: &[&str]) -> Reply {
     let no_such = || Msg::ForgetGroupNoSuch {
         index: u64::from(index),
     };
-    let fact = knowledge.get(index as usize - 1).ok_or_else(no_such)?;
+    let (fact, _) = knowledge.get(index as usize - 1).ok_or_else(no_such)?;
     let gone = cx
         .deps
         .facts
@@ -357,7 +386,7 @@ pub(crate) async fn name(cx: &Cx<'_>) -> Reply {
         let mut lines = vec![cx.t(&Msg::NameHeader { display })];
         for status in [AliasStatus::Confirmed, AliasStatus::Candidate] {
             for alias in names.iter().filter(|a| a.status == status) {
-                let (text, confidence) = (alias.text.clone(), format!("{:.2}", alias.confidence));
+                let (text, confidence) = (alias.text.clone(), name_confidence(cx, alias));
                 lines.push(cx.t(&if status == AliasStatus::Confirmed {
                     Msg::NameConfirmedLine { text, confidence }
                 } else {

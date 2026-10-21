@@ -1,14 +1,12 @@
-//! Facts: what is known about a person or the group, with time attached.
+//! Facts: what is believed about a person or the group, with time attached.
 //!
-//! A fact is `(subject, predicate, value)` plus how often independent episodes supported it and
-//! when it was last confirmed. Nothing is deleted when the world changes: a new value for a
-//! single-valued predicate *supersedes* the old row (somebody moving is itself information), an
-//! opposite predicate supersedes its counterpart, a fact nobody confirms for long enough
-//! *expires*, and an owner can *forget* one. Only active facts are shown.
-//!
-//! Confidence is earned, not asserted: the Wilson lower bound on the supporting evidence (one
-//! mention scores about 0.27, three about 0.53, eight about 0.75), multiplied by an exponential
-//! decay since the last confirmation with the predicate's half-life.
+//! A fact is a claim `(subject, predicate, value)` plus the distinct episodes that supported it,
+//! when it was first and last supported, and when it was last said to hold no longer. Claims of
+//! one subject *compete* when they share a slot and differ in predicate or value: another value
+//! of a single-valued predicate, the opposite predicate for the same thing, another meaning of the
+//! same term. Competing claims stand side by side; which one is believed is their confidence
+//! ([`crate::belief`]), computed on read, never a deletion. Only an owner removes a fact
+//! (*forget*).
 
 use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
@@ -19,8 +17,9 @@ use qbot_core::{AccountId, GroupId, MessageId, UnixMillis};
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
+use crate::belief::{contradicted, credibility, persistence};
 use crate::episode::EpisodeId;
-use crate::predicates::DecayClass;
+use crate::predicates::{Cardinality, DecayClass, Predicate};
 use crate::store::MemoryError;
 
 /// Group-level predicates (not in the person table).
@@ -34,11 +33,7 @@ pub struct FactId(pub i64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FactStatus {
     Active,
-    /// Replaced by a newer value or by its opposite, or said to hold no longer.
-    Superseded,
-    /// Nothing confirmed it for long enough.
-    Expired,
-    /// An owner struck it out.
+    /// An owner struck it out: never shown and no competitor of anything.
     Forgotten,
 }
 
@@ -46,8 +41,6 @@ impl FactStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             FactStatus::Active => "active",
-            FactStatus::Superseded => "superseded",
-            FactStatus::Expired => "expired",
             FactStatus::Forgotten => "forgotten",
         }
     }
@@ -55,8 +48,6 @@ impl FactStatus {
     pub fn parse(text: &str) -> Option<Self> {
         Some(match text {
             "active" => FactStatus::Active,
-            "superseded" => FactStatus::Superseded,
-            "expired" => FactStatus::Expired,
             "forgotten" => FactStatus::Forgotten,
             _ => return None,
         })
@@ -70,7 +61,9 @@ pub struct Fact {
     /// `None`: a fact about the group itself.
     pub subject: Option<AccountId>,
     pub predicate: String,
-    /// What distinguishes values of the predicate: empty for single-valued ones.
+    /// What the claim is about: claims of a subject sharing a slot compete ([`slot`]).
+    pub slot: String,
+    /// The value in comparison form ([`normalize_key`]).
     pub key: String,
     pub object: String,
     /// For a group term: the term as written.
@@ -80,8 +73,20 @@ pub struct Fact {
     pub supports: u32,
     pub first_seen: UnixMillis,
     pub last_confirmed: UnixMillis,
+    /// The latest time it was said to hold no longer.
     pub ended: Option<UnixMillis>,
     pub decay: DecayClass,
+}
+
+impl Fact {
+    /// Whether the two are different claims about the same thing.
+    pub fn competes_with(&self, other: &Fact) -> bool {
+        self.id != other.id
+            && self.group == other.group
+            && self.subject == other.subject
+            && self.slot == other.slot
+            && (self.predicate != other.predicate || self.key != other.key)
+    }
 }
 
 /// One supported observation, from one episode.
@@ -90,11 +95,9 @@ pub struct Observation {
     pub group: GroupId,
     pub subject: Option<AccountId>,
     pub predicate: String,
-    pub key: String,
+    pub slot: String,
     pub object: String,
     pub label: Option<String>,
-    /// The predicate this one retires for the same key.
-    pub opposite: Option<String>,
     pub decay: DecayClass,
     pub episode: EpisodeId,
     pub message: MessageId,
@@ -103,13 +106,13 @@ pub struct Observation {
 }
 
 /// A statement that a fact no longer holds ("I quit that game", "I don't live there any more"):
-/// it ends the active fact of the slot whose value it names, and nothing else.
+/// it counts against the claim of the slot with the value it names, and nothing else.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Retraction {
     pub group: GroupId,
     pub subject: Option<AccountId>,
     pub predicate: String,
-    pub key: String,
+    pub slot: String,
     pub object: String,
     pub at: UnixMillis,
 }
@@ -120,37 +123,44 @@ pub fn normalize_key(text: &str) -> String {
     folded.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// The one-sided 95% Wilson lower bound on a proportion of `supports` out of `supports` trials.
-pub fn wilson(supports: u32) -> f64 {
-    if supports == 0 {
-        return 0.0;
+/// The slot of a person fact. A single-valued predicate has one (its values compete); a
+/// multi-valued one has one per value, shared with its opposite (liking and disliking the same
+/// thing compete; liking two things does not).
+pub fn slot(predicate: &Predicate, object: &str) -> String {
+    let family = match &predicate.opposite {
+        Some(opposite) if *opposite < predicate.name => format!("{opposite}/{}", predicate.name),
+        Some(opposite) => format!("{}/{opposite}", predicate.name),
+        None => predicate.name.clone(),
+    };
+    match predicate.cardinality {
+        Cardinality::Single => family,
+        Cardinality::Multi => format!("{family}:{}", normalize_key(object)),
     }
-    let n = f64::from(supports);
-    let z = 1.6449_f64;
-    let z2 = z * z;
-    let centre = 1.0 + z2 / (2.0 * n);
-    let margin = z * (z2 / (4.0 * n * n)).sqrt();
-    ((centre - margin) / (1.0 + z2 / n)).max(0.0)
 }
 
-/// How facts age. The half-lives and the floor are deployment policy.
+/// The slot of a group term: one per term, its meanings compete.
+pub fn term_slot(term: &str) -> String {
+    format!("{GROUP_TERM}:{}", normalize_key(term))
+}
+
+/// The slot of the group's topic: one, the topics compete.
+pub const TOPIC_SLOT: &str = GROUP_TOPIC;
+
+/// How long claims typically keep holding unsaid, by decay class. Deployment policy.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DecayPolicy {
     pub stable: Duration,
     pub default: Duration,
     pub fast: Duration,
-    /// A fact whose current confidence falls below this is expired.
-    pub forget_below: f64,
 }
 
 impl Default for DecayPolicy {
     fn default() -> Self {
         let days = |n: u64| Duration::from_secs(n * 86_400);
         Self {
-            stable: days(90),
-            default: days(30),
-            fast: days(14),
-            forget_below: 0.05,
+            stable: days(730),
+            default: days(180),
+            fast: days(45),
         }
     }
 }
@@ -164,20 +174,47 @@ impl DecayPolicy {
         }
     }
 
-    /// The fact's confidence now: earned confidence, halved every half-life since it was last
-    /// confirmed.
-    pub fn confidence(&self, fact: &Fact, now: UnixMillis) -> f64 {
-        let age = now.since(fact.last_confirmed).as_secs_f64();
-        let half = self.half_life(fact.decay).as_secs_f64().max(1.0);
-        wilson(fact.supports) * 0.5_f64.powf(age / half)
+    /// The probability that `fact` holds at `now`, given the other claims of its subject
+    /// (`others` may include the fact itself and claims that do not compete with it): its
+    /// credibility, the chance it has persisted since its last support, and for every later
+    /// incompatible statement (a competing claim supported after it, or a statement that it
+    /// ended), the chance that statement was wrong.
+    pub fn confidence<'a>(
+        &self,
+        fact: &Fact,
+        others: impl IntoIterator<Item = &'a Fact>,
+        now: UnixMillis,
+    ) -> f64 {
+        let mut p = credibility(fact.supports)
+            * persistence(self.half_life(fact.decay), fact.last_confirmed, now);
+        for rival in others {
+            if rival.status == FactStatus::Active
+                && fact.competes_with(rival)
+                && rival.last_confirmed > fact.last_confirmed
+            {
+                p = contradicted(p, credibility(rival.supports));
+            }
+        }
+        if fact.ended.is_some_and(|ended| ended > fact.last_confirmed) {
+            p = contradicted(p, credibility(1));
+        }
+        p
+    }
+
+    /// The confidence of each of `facts` at `now`, in order, each weighed against the others.
+    pub fn confidences(&self, facts: &[Fact], now: UnixMillis) -> Vec<f64> {
+        facts
+            .iter()
+            .map(|fact| self.confidence(fact, facts, now))
+            .collect()
     }
 }
 
 #[async_trait]
 pub trait FactStore: Send + Sync {
-    /// Apply one observation: support the matching active fact, or record a new one (superseding
-    /// a different active value of the same predicate and key, and the opposite predicate's fact
-    /// for the same key). The same episode never supports a fact twice.
+    /// Apply one observation: support the subject's active claim with the same slot, predicate
+    /// and value (compared normalized), or record a new claim beside its competitors. The same
+    /// episode never supports a claim twice.
     async fn observe(&self, observation: &Observation) -> Result<FactId, MemoryError>;
 
     /// Active facts about a subject (`None`: about the group), by predicate, and within a
@@ -188,39 +225,13 @@ pub trait FactStore: Send + Sync {
         subject: Option<AccountId>,
     ) -> Result<Vec<Fact>, MemoryError>;
 
-    /// End the active fact the retraction names (same group, subject, predicate and key, the same
-    /// value once normalized): it is superseded as of the retraction. Returns whether one was;
-    /// a fact that was never recorded, or has another value now, is left alone.
+    /// Record that the active claim the retraction names (same group, subject, predicate and
+    /// slot, the same value once normalized) was said to hold no longer at its time. Returns
+    /// whether there was one; a claim that was never recorded is left alone.
     async fn retract(&self, retraction: &Retraction) -> Result<bool, MemoryError>;
 
     /// Strike out an active fact of the group. Returns whether one was.
     async fn forget(&self, group: GroupId, id: FactId) -> Result<bool, MemoryError>;
-
-    /// Every active fact, of every group (for decay).
-    async fn all_active(&self) -> Result<Vec<Fact>, MemoryError>;
-
-    /// Mark active facts expired as of `at`. Returns how many.
-    async fn expire(&self, ids: &[FactId], at: UnixMillis) -> Result<usize, MemoryError>;
-}
-
-/// Expire every active fact whose confidence has fallen below the policy's floor.
-pub async fn decay(
-    store: &dyn FactStore,
-    policy: &DecayPolicy,
-    now: UnixMillis,
-) -> Result<usize, MemoryError> {
-    let stale: Vec<FactId> = store
-        .all_active()
-        .await?
-        .into_iter()
-        .filter(|fact| policy.confidence(fact, now) < policy.forget_below)
-        .map(|fact| fact.id)
-        .collect();
-    if stale.is_empty() {
-        Ok(0)
-    } else {
-        store.expire(&stale, now).await
-    }
 }
 
 #[derive(Default)]
@@ -253,26 +264,17 @@ impl MemoryFactStore {
 impl FactStore for MemoryFactStore {
     async fn observe(&self, obs: &Observation) -> Result<FactId, MemoryError> {
         let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        let same_slot = |f: &Fact, predicate: &str| {
+        let key = normalize_key(&obs.object);
+        let same = inner.facts.iter().position(|f| {
             f.status == FactStatus::Active
                 && f.group == obs.group
                 && f.subject == obs.subject
-                && f.predicate == predicate
-                && f.key == obs.key
-        };
-        if let Some(opposite) = &obs.opposite {
-            for fact in inner.facts.iter_mut().filter(|f| same_slot(f, opposite)) {
-                fact.status = FactStatus::Superseded;
-                fact.ended = Some(obs.at);
-            }
-        }
-        let wanted = normalize_key(&obs.object);
-        let current = inner
-            .facts
-            .iter()
-            .position(|f| same_slot(f, &obs.predicate));
-        let id = match current {
-            Some(index) if normalize_key(&inner.facts[index].object) == wanted => {
+                && f.slot == obs.slot
+                && f.predicate == obs.predicate
+                && normalize_key(&f.object) == key
+        });
+        let id = match same {
+            Some(index) => {
                 let id = inner.facts[index].id;
                 if !inner
                     .evidence
@@ -288,11 +290,7 @@ impl FactStore for MemoryFactStore {
                 }
                 id
             }
-            other => {
-                if let Some(index) = other {
-                    inner.facts[index].status = FactStatus::Superseded;
-                    inner.facts[index].ended = Some(obs.at);
-                }
+            None => {
                 inner.next_id += 1;
                 let id = FactId(inner.next_id);
                 inner.facts.push(Fact {
@@ -300,7 +298,8 @@ impl FactStore for MemoryFactStore {
                     group: obs.group,
                     subject: obs.subject,
                     predicate: obs.predicate.clone(),
-                    key: obs.key.clone(),
+                    slot: obs.slot.clone(),
+                    key,
                     object: obs.object.clone(),
                     label: obs.label.clone(),
                     status: FactStatus::Active,
@@ -348,12 +347,11 @@ impl FactStore for MemoryFactStore {
                 && f.group == r.group
                 && f.subject == r.subject
                 && f.predicate == r.predicate
-                && f.key == r.key
+                && f.slot == r.slot
                 && normalize_key(&f.object) == wanted
         }) {
             Some(fact) => {
-                fact.status = FactStatus::Superseded;
-                fact.ended = Some(r.at);
+                fact.ended = Some(fact.ended.map_or(r.at, |ended| ended.max(r.at)));
                 Ok(true)
             }
             None => Ok(false),
@@ -373,31 +371,6 @@ impl FactStore for MemoryFactStore {
             }
             None => Ok(false),
         }
-    }
-
-    async fn all_active(&self) -> Result<Vec<Fact>, MemoryError> {
-        let inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        Ok(inner
-            .facts
-            .iter()
-            .filter(|f| f.status == FactStatus::Active)
-            .cloned()
-            .collect())
-    }
-
-    async fn expire(&self, ids: &[FactId], at: UnixMillis) -> Result<usize, MemoryError> {
-        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut count = 0;
-        for fact in inner
-            .facts
-            .iter_mut()
-            .filter(|f| f.status == FactStatus::Active && ids.contains(&f.id))
-        {
-            fact.status = FactStatus::Expired;
-            fact.ended = Some(at);
-            count += 1;
-        }
-        Ok(count)
     }
 }
 

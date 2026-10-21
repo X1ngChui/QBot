@@ -76,9 +76,13 @@ summary_batches = 9
 # Batches summarized into one episode, at most history.raw_batches (the episode must exist
 # before its chat leaves the verbatim tier).
 slice_batches = 3
-# Group terms every reply is shown (the most recently confirmed). The block is part of every
-# reply's cached prefix.
+# Group terms every reply is shown (for each term its most confident meaning, the most confident
+# terms). The block is part of every reply's cached prefix.
 group_terms = 40
+# Learned facts every reply is shown per person, the most confident first; the rest stay
+# recorded and reach /who and the extractor. The people block is part of every reply's cached
+# prefix.
+person_facts = 16
 
 [memory.recall]
 # Cosine distance beyond which an episode is not a candidate at all (below 1). Tuned to the
@@ -89,9 +93,11 @@ max_distance = 0.45
 half_life_days = 180
 
 [memory.facts]
-# A learned fact's confidence halves every half-life since it was last confirmed, by its
-# predicate's decay class; facts that fade away are expired by the nightly run.
-half_life_days = { stable = 90, default = 30, fast = 14 }
+# How long a learned claim of each decay class typically keeps holding when nobody says it again:
+# its confidence (the probability that it holds now) halves every half-life since its last
+# support. Nothing is expired for it; an unrepeated claim ranks lower. Names learned from chat age
+# like stable facts.
+half_life_days = { stable = 730, default = 180, fast = 45 }
 
 [media]
 # Transcribe voice clips in the process (SenseVoice on the CPU; the model is fetched once with

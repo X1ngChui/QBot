@@ -6,6 +6,7 @@
 //! long-term recall and, because a summary never changes and covers whole batches, also the
 //! natural stand-in for older chat when context has to shrink.
 
+pub mod belief;
 pub mod build;
 pub mod conformance;
 pub mod consolidate;

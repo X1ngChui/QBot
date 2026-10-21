@@ -20,7 +20,8 @@ fn e(kind: EvidenceKind, support: Option<i64>) -> EvidenceRecord {
 }
 
 #[test]
-fn fusion_combines_channels_as_independent_evidence() {
+fn a_name_is_as_credible_as_its_distinct_episodes_and_confirmed_only_by_a_person() {
+    use qbot_memory::identity::status_for;
     assert_eq!(confidence(&[]), 0.0);
     assert!((confidence(&[e(EvidenceKind::Manual, None)]) - 1.0).abs() < 1e-6);
     let extracted_twice = confidence(&[
@@ -36,35 +37,13 @@ fn fusion_combines_channels_as_independent_evidence() {
             .map(|i| e(EvidenceKind::Extracted, Some(i)))
             .collect::<Vec<_>>()
     };
+    assert!((confidence(&extracted(1)) - 2.0 / 3.0).abs() < 1e-6);
     assert!(confidence(&extracted(1)) < confidence(&extracted(2)));
-    assert!(
-        (confidence(&extracted(50)) - 0.7).abs() < 1e-6,
-        "extraction is capped"
-    );
-    assert!(
-        confidence(&extracted(50)) < 0.75,
-        "and the cap is below the default confirmation line"
-    );
-}
-
-#[test]
-fn the_confirmation_threshold_is_policy_not_a_constant() {
-    let strict = IdentityPolicy {
-        confirm_at: 0.9,
-        ..IdentityPolicy::default()
-    };
-    let lenient = IdentityPolicy {
-        confirm_at: 0.5,
-        ..IdentityPolicy::default()
-    };
-    assert_eq!(
-        qbot_memory::identity::status_for(0.8, &strict),
-        AliasStatus::Candidate
-    );
-    assert_eq!(
-        qbot_memory::identity::status_for(0.8, &lenient),
-        AliasStatus::Confirmed
-    );
+    assert!(confidence(&extracted(50)) < 1.0, "repetition is not proof");
+    assert_eq!(status_for(&extracted(50)), AliasStatus::Candidate);
+    let mut vouched = extracted(1);
+    vouched.push(e(EvidenceKind::Manual, None));
+    assert_eq!(status_for(&vouched), AliasStatus::Confirmed);
 }
 
 #[tokio::test]
@@ -72,7 +51,6 @@ async fn the_invitation_lifetime_is_policy_too() {
     use qbot_core::{AccountId, GroupId, MessageId};
     let policy = IdentityPolicy {
         invitation_ttl: Duration::from_secs(30),
-        ..IdentityPolicy::default()
     };
     let store = MemoryIdentityStore::new(policy);
     let (a, b, g) = (

@@ -24,7 +24,8 @@ R4. Reply through tools: the model decides whether to speak, whom to mention and
 R5. Tools: send, stay silent, archive search, episode recall and reading, web search and page
 reading, opening pictures, and the group's scheduled tasks.
 R6. Group-scoped memory learned from chat: episodes with embeddings, names, facts about members
-and group knowledge, each grounded in verbatim quotes, with confidence that fades. Notes written
+and group knowledge, each grounded in verbatim quotes, with one confidence (the probability that
+it holds now) that ranks rather than deletes ([memory.md](memory.md) section 7). Notes written
 by hand are a separate store with their own commands.
 R7. Identity: accounts are linked in a group, with a confirmation that lapses if either side's
 links there changed; stable member numbers per group.
@@ -326,7 +327,8 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
   1. the reply rules, the legend, and the persona with its group background (fixed per
      deployment);
   2. the people block and learned knowledge, which change only when a command or an extraction
-     changes a record;
+     changes a record, or a shown confidence (as of the start of the day, in tens of percent)
+     moves;
   3. the chat, which grows by whole batches;
   4. last the trigger note (the time, the trigger, a task's intent, and the current group
      display names of the members in the chat and in the people block, read live through
@@ -335,12 +337,13 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
   one entry per person, in member order. An entry has:
   - the person's numbered accounts here (two or more are linked accounts), and which are
     blocked now;
-  - the names they go by, confirmed ones and leads from chat;
+  - the names they go by, confirmed ones and leads from chat with their confidence;
   - notes members wrote (each with its date);
-  - facts learned from chat (each with its episode count and last confirmation date).
+  - the `memory.person_facts` (16) most confident facts learned from chat, each with its
+    confidence, episode count and last confirmation date (competing values side by side).
 
-  Dates are absolute and nothing depends on the current hour, so the block is byte-identical
-  until a record changes. Member-written text is escaped like chat and kept on its own line.
+  Dates are absolute and confidence is computed as of the start of the UTC day, so the block is
+  byte-identical until a record changes or a day turns. Member-written text is escaped like chat and kept on its own line.
   Live display names are not part of it: they change apart from every record and sit in the
   trigger note. The model reads who someone is here, with no tool call; there is no lookup tool.
 - **Personas** are TOML files: `default.toml`, or `group_<id>.toml` replacing it for one group.
@@ -350,9 +353,9 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
   is reached through `search_history` and `recall_episodes`. The tiers move a batch at a time.
   A summary names its episode (`episode 12, ...`), so `read_episode` can open its messages; before
   it did, 12 of 20 `read_episode` calls in a month were refused ids the model had guessed.
-- **Group knowledge** enters as an instruction: the group's topic, and at most
-  `memory.group_terms` (40) terms, the most recently confirmed, listed in key order so that
-  confirming a term again does not change the prompt.
+- **Group knowledge** enters as an instruction: the most confident topic, and for at most
+  `memory.group_terms` (40) terms, the most confident, the most confident meaning, each with its
+  confidence, listed in term order so that confirming a term again does not reorder the prompt.
 - **Wording** (`qbot-wording`): every short model-facing text (tool and parameter descriptions,
   results, error explanations, outcome notes, extraction headers and corrections) is a `Text`
   variant with fixed slots, rendered from `wording.toml`; tests keep the file and the enum in
@@ -638,7 +641,7 @@ The schema holds only what a deployment may choose:
 | `database` | host, port, name, user, ssl mode, password secret |
 | `replies` | concurrency, deadline, messages per reply, the chance of a spontaneous run |
 | `history` | batch lines, raw and summary batches |
-| `memory` | slice batches, group terms shown; recall's max distance and half-life; fact half-lives per decay class |
+| `memory` | slice batches, group terms and facts per person shown; recall's max distance and half-life; how long claims of each decay class keep holding (half-lives) |
 | `media` | voice transcription on or off; pictures and clips per minute per group; how long a reply waits for them |
 | `network` | an outbound proxy and the services that use it |
 | `providers.*` | text (kind, endpoint, model, reasoning of replies and of extraction), vision, embedding (model, width, batch), search (depths) |
@@ -656,8 +659,8 @@ Derived rather than configured:
 - the extraction's context: one batch on either side of a slice, within the verbatim tier;
 - extraction cadence: every filled batch queues its group's extraction, which extracts each
   completed slice, and the nightly run catches up;
-- how long an unused name lead lives: one default fact half-life
-  (`memory.facts.half_life_days.default`), since a lead from chat fades like a fact;
+- how a name learned from chat ages: like a stable fact
+  (`memory.facts.half_life_days.stable`), since a name lasts like where someone lives;
 - record retention: one `maintenance.records_keep_days` for finished runs and finished
   scheduled tasks, the two operational records;
 - the provider's state mode (from its kind), the writing language (from the locale), and the
@@ -688,6 +691,7 @@ error is left to that error. The local limits and why they exist:
 | `read_url` page | 8,000 characters | a web page is the one tool input with no size of its own |
 | Search results, passages | 5, 3 | enough to answer from, little enough to read |
 | Group terms in the prompt | configured (40) | the block enters every reply's instructions |
+| Learned facts per person in the prompt | configured (16) | the people block enters every reply's instructions; the rest stay recorded |
 | Notes per account | 20 | bounds what one member's notes add to every reply's people block |
 | Name length | 64 characters | a name is a name, not a paragraph |
 | Per-call deadlines | 10 min text, 2 min picture, 30 s embedding, 20 s search | a hung connection must not stall the nightly run |
@@ -720,8 +724,8 @@ spend.
 ## 16. Operations (`qbot-ops`)
 
 - **Nightly**: extraction (each group's episodes, after embedding any the current index lacks),
-  decay (name candidates nothing supported for one default fact half-life, cached picture descriptions older than 15 days,
-  faded facts), a verified backup, cleanup (finished tasks and finished runs after
+  decay (cached picture descriptions older than 15 days; beliefs are not expired, their
+  confidence is computed on read), a verified backup, cleanup (finished tasks and finished runs after
   `maintenance.records_keep_days`, NapCat's file cache through its `clean_cache` action). Every stage
   runs. The job fails, and is retried, if decay, the backup or cleanup failed; a failed extraction
   is logged and left to the group's next filled batch or the next night, since a retry of the
@@ -787,7 +791,8 @@ through it.
 - Runs of different members overlap (decision 1), and nothing tells a run what another is
   answering until that one has replied: two members asking the same thing within the same
   seconds can both be answered (13 such pairs in 30 days before the turn-taking rule).
-- Memory already extracted from a recalled message stays until it fades or is forgotten.
+- Memory already extracted from a recalled message stays, losing confidence unless repeated,
+  until it is forgotten.
 - `/forget` removes one learned fact; a later episode can learn it again.
 - Every run sees every recorded member's names, notes and facts of its group; only the
   commands limit what a member may look up.
@@ -795,4 +800,5 @@ through it.
   every filled batch and every night, and holds back that group's later slices.
 - Messages shown by `search_history` and `read_episode` cannot be quoted, opened or used to
   address their authors: the run's view knows only what its context showed.
-- The people block has no size bound (about 15 KB in the largest group today).
+- The people block's size grows with the people on record: facts are bounded per person, names
+  and notes are not (about 15 KB in the largest group today).

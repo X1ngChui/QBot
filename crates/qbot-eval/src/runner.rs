@@ -19,9 +19,10 @@ use qbot_llm::embedding::FakeEmbedder;
 use qbot_llm::search::{FakeSearch, PageRead, SearchHit, SearchResults};
 use qbot_llm::{Provider, ReasoningEffort, Usage};
 use qbot_memory::facts::{
-    FactStore, GROUP_TERM, GROUP_TOPIC, MemoryFactStore, Observation, normalize_key,
+    DecayPolicy, FactStore, GROUP_TERM, GROUP_TOPIC, MemoryFactStore, Observation, TOPIC_SLOT,
+    slot, term_slot,
 };
-use qbot_memory::predicates::{Cardinality, DecayClass, Predicates};
+use qbot_memory::predicates::{DecayClass, Predicates};
 use qbot_memory::{EpisodeId, MemoryEpisodeStore, Recall, RecallParams};
 use qbot_prompt::{
     FactKnowledge, GroupPeople, HistorySource, PeopleSource, Personas, PromptContext,
@@ -275,16 +276,19 @@ async fn scenario_people(
                             updated: now,
                         }),
                 );
-            for fact in facts
+            let about = facts
                 .current(group, Some(*account))
                 .await
-                .map_err(|e| e.to_string())?
-            {
+                .map_err(|e| e.to_string())?;
+            // The deployment's default decay, as the store would weigh them.
+            let confidences = DecayPolicy::default().confidences(&about, now);
+            for (fact, confidence) in about.into_iter().zip(confidences) {
                 person.facts.push(KnownFact {
                     predicate: fact.predicate,
                     value: fact.label.unwrap_or(fact.object),
                     supports: fact.supports,
                     last_confirmed: fact.last_confirmed,
+                    confidence,
                 });
             }
         }
@@ -360,18 +364,14 @@ impl Runner {
                         group,
                         subject: Some(account_of(f.member)?),
                         predicate: f.predicate.clone(),
-                        key: match predicate.cardinality {
-                            Cardinality::Single => String::new(),
-                            Cardinality::Multi => normalize_key(&f.object),
-                        },
+                        slot: slot(predicate, &f.object),
                         object: f.object.clone(),
                         label: None,
-                        opposite: predicate.opposite.clone(),
                         decay: predicate.decay,
                         episode: EpisodeId::new(episode),
                         message: MessageId::new(episode).map_err(|e| e.to_string())?,
                         quote: f.object.clone(),
-                        at: now.now(),
+                        at: UnixMillis::new(now.now().get() - i64::from(f.days_ago) * 86_400_000),
                     })
                     .await
                     .map_err(|e| e.to_string())?;
@@ -379,19 +379,18 @@ impl Runner {
         }
         for k in &scenario.knowledge {
             episode += 1;
-            let (predicate, key, label) = match &k.term {
-                Some(term) => (GROUP_TERM, normalize_key(term), Some(term.clone())),
-                None => (GROUP_TOPIC, String::new(), None),
+            let (predicate, slot, label) = match &k.term {
+                Some(term) => (GROUP_TERM, term_slot(term), Some(term.clone())),
+                None => (GROUP_TOPIC, TOPIC_SLOT.to_owned(), None),
             };
             facts
                 .observe(&Observation {
                     group,
                     subject: None,
                     predicate: predicate.to_owned(),
-                    key,
+                    slot,
                     object: k.text.clone(),
                     label,
-                    opposite: None,
                     decay: DecayClass::Stable,
                     episode: EpisodeId::new(episode),
                     message: MessageId::new(episode).map_err(|e| e.to_string())?,
@@ -481,8 +480,10 @@ impl Runner {
             facts.clone(),
             // memory.group_terms by default
             40,
+            DecayPolicy::default(),
         )))
-        .with_people(Arc::new(ScenarioPeople(people)))
+        // memory.person_facts by default
+        .with_people(Arc::new(ScenarioPeople(people)), 16)
         .with_directory(names.clone());
         let trigger = match (&scenario.trigger.line, &scenario.trigger.wake) {
             (Some(n), _) => {

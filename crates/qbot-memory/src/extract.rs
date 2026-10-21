@@ -25,7 +25,7 @@ use crate::slice::{Background, SliceLine};
 
 pub const TOOL_NAME: &str = "submit_episode";
 /// Version of the prompt and validation rules, recorded on every episode.
-pub const METHOD: &str = "slice-v4";
+pub const METHOD: &str = "slice-v5";
 
 /// The extraction instructions; `{language}` and `{predicates}` are filled per call.
 const SYSTEM: &str = include_str!("../../../prompts/extract.md");

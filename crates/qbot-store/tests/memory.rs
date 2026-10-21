@@ -790,9 +790,10 @@ async fn people_shows_each_person_with_blocks_links_names_notes_and_facts_of_its
             .collect::<Vec<_>>()
     };
 
+    let decay = qbot_memory::facts::DecayPolicy::default();
     let now = UnixMillis::new(T0);
     assert_eq!(
-        archive.people(g, now).await.unwrap(),
+        archive.people(g, now, &decay).await.unwrap(),
         Default::default(),
         "no records, nobody listed"
     );
@@ -817,7 +818,7 @@ async fn people_shows_each_person_with_blocks_links_names_notes_and_facts_of_its
         .link(group(61), account(701), account(702), now)
         .await
         .unwrap();
-    let people = archive.people(g, now).await.unwrap();
+    let people = archive.people(g, now, &decay).await.unwrap();
     assert_eq!(
         shape(&people),
         [(vec![2], vec![2]), (vec![3, 5], vec![]), (vec![4], vec![4])],
@@ -831,7 +832,7 @@ async fn people_shows_each_person_with_blocks_links_names_notes_and_facts_of_its
         .await
         .unwrap();
     assert_eq!(
-        shape(&archive.people(g, later).await.unwrap()),
+        shape(&archive.people(g, later, &decay).await.unwrap()),
         [
             (vec![1, 2], vec![]),
             (vec![3, 5], vec![]),
@@ -841,7 +842,7 @@ async fn people_shows_each_person_with_blocks_links_names_notes_and_facts_of_its
     );
     identity.unlink(g, account(703)).await.unwrap();
     assert_eq!(
-        shape(&archive.people(g, later).await.unwrap()),
+        shape(&archive.people(g, later, &decay).await.unwrap()),
         [(vec![1, 2], vec![]), (vec![4], vec![4])],
         "unlinking ends the set"
     );
@@ -881,10 +882,9 @@ async fn people_shows_each_person_with_blocks_links_names_notes_and_facts_of_its
         group,
         subject: Some(account(704)),
         predicate: "lives_in".into(),
-        key: String::new(),
+        slot: "lives_in".into(),
         object: object.into(),
         label: None,
-        opposite: None,
         decay: DecayClass::Stable,
         episode: qbot_memory::EpisodeId::new(9),
         message: qbot_core::MessageId::new(1).unwrap(),
@@ -893,7 +893,12 @@ async fn people_shows_each_person_with_blocks_links_names_notes_and_facts_of_its
     };
     facts.observe(&fact(g, "Hangzhou")).await.unwrap();
     facts.observe(&fact(group(61), "Suzhou")).await.unwrap();
-    let people = archive.people(g, later).await.unwrap();
+    // A later, different value: both are kept, the later one believed.
+    let mut moved = fact(g, "Ningbo");
+    moved.episode = qbot_memory::EpisodeId::new(10);
+    moved.at = UnixMillis::new(later.get() + 1);
+    facts.observe(&moved).await.unwrap();
+    let people = archive.people(g, later, &decay).await.unwrap();
     let merged = &people.people[1];
     assert_eq!(
         merged
@@ -908,11 +913,13 @@ async fn people_shows_each_person_with_blocks_links_names_notes_and_facts_of_its
         [
             KnownName {
                 text: "kit".into(),
-                confirmed: true
+                confirmed: true,
+                confidence: 1.0,
             },
             KnownName {
                 text: "kitty".into(),
-                confirmed: true
+                confirmed: true,
+                confidence: 1.0,
             }
         ]
     );
@@ -925,15 +932,26 @@ async fn people_shows_each_person_with_blocks_links_names_notes_and_facts_of_its
     );
     assert_eq!(
         merged.facts,
-        [KnownFact {
-            predicate: "lives_in".into(),
-            value: "Hangzhou".into(),
-            supports: 1,
-            last_confirmed: later
-        }]
+        [
+            KnownFact {
+                predicate: "lives_in".into(),
+                value: "Ningbo".into(),
+                supports: 1,
+                last_confirmed: UnixMillis::new(later.get() + 1),
+                confidence: 2.0 / 3.0,
+            },
+            KnownFact {
+                predicate: "lives_in".into(),
+                value: "Hangzhou".into(),
+                supports: 1,
+                last_confirmed: later,
+                confidence: 2.0 / 3.0 * (1.0 - 2.0 / 3.0),
+            }
+        ],
+        "the most confident first, the contradicted value kept"
     );
     assert_eq!(
-        archive.people(g, later).await.unwrap(),
+        archive.people(g, later, &decay).await.unwrap(),
         people,
         "the same records give the same block"
     );

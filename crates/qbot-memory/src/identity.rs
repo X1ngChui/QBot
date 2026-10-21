@@ -13,17 +13,19 @@ use qbot_core::{AccountId, GroupId, MessageId, UnixMillis};
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
+use crate::belief::{credibility, persistence};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct AliasId(pub i64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AliasStatus {
-    /// Some evidence, not enough to resolve the name.
+    /// A lead: learned from chat, nobody vouched for it. It does not resolve the name.
     Candidate,
-    /// Strong enough to resolve the name.
+    /// A person vouched for it (`/name`): it resolves the name.
     Confirmed,
-    /// Removed by a person, or expired unused.
+    /// Removed by a person.
     Inactive,
 }
 
@@ -35,7 +37,7 @@ pub enum AliasStatus {
 /// names learned from chat.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvidenceKind {
-    /// A person set it. Decisive.
+    /// A person set it: an assignment, not an inference.
     Manual,
     /// A model proposed it from chat, supported by a validated quote in an episode.
     Extracted,
@@ -49,12 +51,9 @@ pub struct EvidenceRecord {
     pub support: Option<i64>,
 }
 
-/// Deployment policy for identity. These are choices an operator can reasonably make; the
-/// evidence weights below are tuning internal to the fusion rule and stay constants.
+/// Deployment policy for identity.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct IdentityPolicy {
-    /// A name is confirmed from this confidence up.
-    pub confirm_at: f32,
     /// How long an invitation to link accounts stays open.
     pub invitation_ttl: Duration,
 }
@@ -62,41 +61,33 @@ pub struct IdentityPolicy {
 impl Default for IdentityPolicy {
     fn default() -> Self {
         Self {
-            confirm_at: 0.75,
             invitation_ttl: Duration::from_secs(600),
         }
     }
 }
 
-const MANUAL: f32 = 1.0;
-const EXTRACTED_EACH: f32 = 0.25;
-const EXTRACTED_CAP: f32 = 0.7;
-
-/// Fuse evidence into one confidence in `0.0..=1.0`.
-///
-/// Each kind is a channel with its own strength, and channels combine as independent evidence
-/// (`1 - prod(1 - c)`). Within `Extracted`, each distinct supporting episode counts once and
-/// they accumulate toward a cap below the confirmation line, so extraction alone never confirms
-/// a name: only a person does.
+/// The credibility of a name from its evidence (`crate::belief::credibility`): 1 for a name a
+/// person set, otherwise that of its distinct supporting episodes; 0 without evidence. How long
+/// ago it was supported is left to [`Alias::confidence_at`].
 pub fn confidence(evidence: &[EvidenceRecord]) -> f32 {
-    let manual = evidence.iter().any(|e| e.kind == EvidenceKind::Manual);
-    let extracted: BTreeSet<Option<i64>> = evidence
+    if evidence.iter().any(|e| e.kind == EvidenceKind::Manual) {
+        return 1.0;
+    }
+    let episodes: BTreeSet<Option<i64>> = evidence
         .iter()
         .filter(|e| e.kind == EvidenceKind::Extracted)
         .map(|e| e.support)
         .collect();
-    let extracted_c = if extracted.is_empty() {
-        0.0
-    } else {
-        (1.0 - (1.0 - EXTRACTED_EACH).powi(i32::try_from(extracted.len()).unwrap_or(i32::MAX)))
-            .min(EXTRACTED_CAP)
-    };
-    let none = (1.0 - if manual { MANUAL } else { 0.0 }) * (1.0 - extracted_c);
-    1.0 - none
+    if episodes.is_empty() {
+        return 0.0;
+    }
+    // In 0.5..1, so the narrowing is harmless.
+    credibility(u32::try_from(episodes.len()).unwrap_or(u32::MAX)) as f32
 }
 
-pub fn status_for(confidence: f32, policy: &IdentityPolicy) -> AliasStatus {
-    if confidence >= policy.confirm_at {
+/// Confirmed is provenance, not a threshold: a name is confirmed when a person vouched for it.
+pub fn status_for(evidence: &[EvidenceRecord]) -> AliasStatus {
+    if evidence.iter().any(|e| e.kind == EvidenceKind::Manual) {
         AliasStatus::Confirmed
     } else {
         AliasStatus::Candidate
@@ -136,8 +127,22 @@ pub struct Alias {
     pub text: String,
     pub account: AccountId,
     pub status: AliasStatus,
+    /// Credibility from the evidence ([`confidence`]).
     pub confidence: f32,
     pub last_evidence: UnixMillis,
+}
+
+impl Alias {
+    /// The probability that the name is theirs at `now`: a confirmed name stands until removed;
+    /// a lead's credibility ages with `half_life` (that of stable facts) since its last support.
+    pub fn confidence_at(&self, half_life: Duration, now: UnixMillis) -> f64 {
+        let credibility = f64::from(self.confidence);
+        match self.status {
+            AliasStatus::Confirmed => credibility,
+            AliasStatus::Candidate => credibility * persistence(half_life, self.last_evidence, now),
+            AliasStatus::Inactive => 0.0,
+        }
+    }
 }
 
 /// What a name refers to in a group, among confirmed aliases only.

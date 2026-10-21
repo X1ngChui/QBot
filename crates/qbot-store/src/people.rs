@@ -2,24 +2,28 @@
 //! member numbers are one person, the names they go by, the notes members wrote about them and
 //! the facts learned from chat. Every record is the group's own: links made in other groups and
 //! anything stored there play no part. Every run shows it, so it is read whole and ordered
-//! deterministically: it changes only when the stored records do.
+//! deterministically: it changes only when the stored records do, or when the confidence of a
+//! belief, computed as of the start of the day, moves.
 
 use std::collections::{BTreeMap, HashMap};
 
 use qbot_core::{AccountId, GroupId, MemberNo, UnixMillis};
+use qbot_memory::belief::{as_of_day, persistence};
+use qbot_memory::facts::{DecayPolicy, Fact};
+use qbot_memory::predicates::DecayClass;
 use sqlx::Row;
 
 use crate::archive::PgArchive;
 use crate::error::StoreError;
 
 /// The people of a group the bot keeps anything about, by their lowest member number.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct GroupPeople {
     pub people: Vec<Person>,
 }
 
 /// One person: one or more numbered accounts of the group (two or more are linked accounts).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Person {
     /// Their numbered accounts here, by number. The account is for asking the platform about
     /// them; it is never shown.
@@ -30,15 +34,17 @@ pub struct Person {
     pub names: Vec<KnownName>,
     /// Notes members wrote about them, oldest first.
     pub notes: Vec<KnownNote>,
-    /// Facts learned from chat, by predicate, then the most recently confirmed first.
+    /// Facts learned from chat, the most confident first.
     pub facts: Vec<KnownFact>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct KnownName {
     pub text: String,
     /// Vouched for (by the person or an owner); otherwise a lead from chat.
     pub confirmed: bool,
+    /// The probability that it is their name (`qbot_memory::belief`): 1 when confirmed.
+    pub confidence: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,13 +53,16 @@ pub struct KnownNote {
     pub updated: UnixMillis,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct KnownFact {
     pub predicate: String,
     pub value: String,
     /// Distinct episodes that supported it.
     pub supports: u32,
     pub last_confirmed: UnixMillis,
+    /// The probability that it holds (`qbot_memory::belief`), weighed against the competing
+    /// claims about the same account.
+    pub confidence: f64,
 }
 
 impl Person {
@@ -76,8 +85,15 @@ fn member_no(n: i32) -> Result<MemberNo, StoreError> {
 
 impl PgArchive {
     /// Everyone in `group` the bot keeps a record about, as of `now` (a block that has run out
-    /// is not in force). Records about an account with no member number here are not shown.
-    pub async fn people(&self, group: GroupId, now: UnixMillis) -> Result<GroupPeople, StoreError> {
+    /// is not in force), with the confidence of beliefs as of the start of `now`'s day under
+    /// `decay`. Records about an account with no member number here are not shown.
+    pub async fn people(
+        &self,
+        group: GroupId,
+        now: UnixMillis,
+        decay: &DecayPolicy,
+    ) -> Result<GroupPeople, StoreError> {
+        let as_of = as_of_day(now);
         let (pool, g) = (self.pool(), group.get());
         let mut numbers: HashMap<i64, MemberNo> = HashMap::new();
         for row in sqlx::query("SELECT number, account_id FROM member_number WHERE group_id = $1")
@@ -140,8 +156,8 @@ impl PgArchive {
 
         // Names in force.
         let names = sqlx::query(
-            "SELECT text, status = 'confirmed' AS confirmed, account_id FROM alias \
-             WHERE group_id = $1 AND NOT removed AND status IN ('candidate', 'confirmed')",
+            "SELECT text, status = 'confirmed' AS confirmed, confidence, last_evidence_ms, account_id \
+             FROM alias WHERE group_id = $1 AND NOT removed AND status IN ('candidate', 'confirmed')",
         )
         .bind(g)
         .fetch_all(pool)
@@ -152,9 +168,27 @@ impl PgArchive {
                 continue;
             };
             let (text, confirmed): (String, bool) = (row.get("text"), row.get("confirmed"));
+            let credibility = f64::from(row.get::<f32, _>("confidence"));
+            let confidence = if confirmed {
+                credibility
+            } else {
+                credibility
+                    * persistence(
+                        decay.half_life(DecayClass::Stable),
+                        UnixMillis::new(row.get("last_evidence_ms")),
+                        as_of,
+                    )
+            };
             match person.names.iter_mut().find(|n| n.text == text) {
-                Some(known) => known.confirmed |= confirmed,
-                None => person.names.push(KnownName { text, confirmed }),
+                Some(known) => {
+                    known.confirmed |= confirmed;
+                    known.confidence = known.confidence.max(confidence);
+                }
+                None => person.names.push(KnownName {
+                    text,
+                    confirmed,
+                    confidence,
+                }),
             }
         }
 
@@ -174,24 +208,34 @@ impl PgArchive {
             }
         }
 
-        for row in sqlx::query(
-            "SELECT subject_account, predicate, coalesce(label, object) AS value, supports, \
-                    last_confirmed_ms \
-             FROM fact WHERE group_id = $1 AND status = 'active' AND subject_account IS NOT NULL \
-             ORDER BY predicate COLLATE \"C\", last_confirmed_ms DESC, fact_id DESC",
-        )
+        // Facts weigh against the competing claims about the same account.
+        let mut about: BTreeMap<i64, Vec<Fact>> = BTreeMap::new();
+        for row in sqlx::query(&format!(
+            "SELECT {} FROM fact WHERE group_id = $1 AND status = 'active' \
+             AND subject_account IS NOT NULL ORDER BY fact_id",
+            crate::facts::COLS
+        ))
         .bind(g)
         .fetch_all(pool)
         .await?
         {
-            if let Some(person) =
-                person_of(row.get("subject_account")).and_then(|h| people.get_mut(&h))
-            {
+            let fact = crate::facts::to_fact(&row).map_err(corrupt)?;
+            if let Some(subject) = fact.subject {
+                about.entry(subject.get()).or_default().push(fact);
+            }
+        }
+        for (account, facts) in about {
+            let Some(person) = person_of(account).and_then(|h| people.get_mut(&h)) else {
+                continue;
+            };
+            let confidences = decay.confidences(&facts, as_of);
+            for (fact, confidence) in facts.into_iter().zip(confidences) {
                 person.facts.push(KnownFact {
-                    predicate: row.get("predicate"),
-                    value: row.get("value"),
-                    supports: u32::try_from(row.get::<i32, _>("supports")).map_err(corrupt)?,
-                    last_confirmed: UnixMillis::new(row.get("last_confirmed_ms")),
+                    predicate: fact.predicate,
+                    value: fact.label.unwrap_or(fact.object),
+                    supports: fact.supports,
+                    last_confirmed: fact.last_confirmed,
+                    confidence,
                 });
             }
         }
@@ -203,6 +247,13 @@ impl PgArchive {
                 p.members.sort();
                 p.blocked.sort();
                 p.names.sort_by(|a, b| a.text.cmp(&b.text));
+                p.facts.sort_by(|a, b| {
+                    b.confidence
+                        .total_cmp(&a.confidence)
+                        .then_with(|| a.predicate.cmp(&b.predicate))
+                        .then(b.last_confirmed.cmp(&a.last_confirmed))
+                        .then_with(|| a.value.cmp(&b.value))
+                });
                 p
             })
             .collect();

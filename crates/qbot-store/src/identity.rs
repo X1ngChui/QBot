@@ -232,7 +232,7 @@ impl PgIdentityStore {
             .max()
             .unwrap_or(at.get());
         let conf = confidence(&records);
-        let status = match status_for(conf, &self.policy) {
+        let status = match status_for(&records) {
             AliasStatus::Confirmed => "confirmed",
             _ => "candidate",
         };
@@ -443,18 +443,6 @@ impl IdentityStore for PgIdentityStore {
                 .then(a.text.cmp(&b.text))
         });
         Ok(names)
-    }
-
-    async fn expire_candidates(&self, before: UnixMillis) -> Result<usize, IdentityError> {
-        let result = sqlx::query(
-            "UPDATE alias SET removed = true, status = 'inactive' WHERE NOT removed AND status = 'candidate' AND last_evidence_ms < $1 \
-             AND NOT EXISTS (SELECT 1 FROM alias_evidence e WHERE e.alias_id = alias.alias_id AND e.kind = 'manual')",
-        )
-        .bind(before.get())
-        .execute(&self.pool)
-        .await
-        .map_err(backend)?;
-        Ok(usize::try_from(result.rows_affected()).unwrap_or(usize::MAX))
     }
 
     async fn invite(

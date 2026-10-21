@@ -1,5 +1,5 @@
 //! The behavior every `IdentityStore` must have. The store must be built with
-//! `IdentityPolicy::default()` (confirm at 0.75, invitations last 600 s).
+//! `IdentityPolicy::default()` (invitations last 600 s).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -46,7 +46,7 @@ pub async fn run(store: &dyn IdentityStore) {
     unlinking(store).await;
     names(store).await;
     names_of_a_person(store).await;
-    expiry(store).await;
+    leads_age(store).await;
     invitations(store).await;
 }
 
@@ -190,44 +190,44 @@ async fn names(store: &dyn IdentityStore) {
         IdentityError::UnknownAccount
     );
 
-    // Extracted evidence accumulates per distinct episode, and alone never confirms.
+    // Extracted evidence accumulates credibility per distinct episode, and alone never confirms.
     let one = store
         .add_evidence(g, "pj", q, extracted(1), at(2))
         .await
         .unwrap();
     assert_eq!(one.status, AliasStatus::Candidate);
-    assert!((one.confidence - 0.25).abs() < 1e-6);
+    assert!((one.confidence - 2.0 / 3.0).abs() < 1e-6);
     let again = store
         .add_evidence(g, "pj", q, extracted(1), at(3))
         .await
         .unwrap();
     assert!(
-        (again.confidence - 0.25).abs() < 1e-6,
+        (again.confidence - 2.0 / 3.0).abs() < 1e-6,
         "the same episode twice counts once"
     );
     let two = store
         .add_evidence(g, "pj", q, extracted(2), at(4))
         .await
         .unwrap();
-    assert!((two.confidence - 0.4375).abs() < 1e-5);
+    assert!((two.confidence - 0.75).abs() < 1e-5);
     for episode in 3..=12 {
         store
             .add_evidence(g, "pj", q, extracted(episode), at(5))
             .await
             .unwrap();
     }
-    let capped = store
+    let many = store
         .add_evidence(g, "pj", q, extracted(13), at(6))
         .await
         .unwrap();
     assert_eq!(
-        capped.status,
+        many.status,
         AliasStatus::Candidate,
         "extraction alone cannot confirm a name"
     );
     assert!(
-        (capped.confidence - 0.7).abs() < 1e-5,
-        "capped below the confirmation line"
+        (many.confidence - 14.0 / 15.0).abs() < 1e-5,
+        "thirteen episodes: credible, still a lead"
     );
     assert_eq!(
         store.resolve(g, "pj").await.unwrap(),
@@ -360,52 +360,29 @@ async fn names_of_a_person(store: &dyn IdentityStore) {
     assert!(store.set_name(g, "robin", &[o], at(5)).await.is_ok());
 }
 
-async fn expiry(store: &dyn IdentityStore) {
+async fn leads_age(store: &dyn IdentityStore) {
     let g = group(400);
     let r = acct(41);
     store.seen(r, at(0)).await.unwrap();
-    store
-        .add_evidence(g, "stale guess", r, extracted(1), at(100))
+    let year = 365 * 86_400;
+    let half_life = std::time::Duration::from_secs(2 * year as u64);
+    let lead = store
+        .add_evidence(g, "old guess", r, extracted(1), at(100))
         .await
         .unwrap();
-    store
-        .add_evidence(g, "fresh guess", r, extracted(2), at(5000))
-        .await
-        .unwrap();
-    store
-        .add_evidence(g, "vouched", r, extracted(3), at(100))
-        .await
-        .unwrap();
-    store.set_name(g, "vouched", &[r], at(100)).await.unwrap();
-    store
-        .add_evidence(g, "added by hand", r, by_hand(), at(100))
-        .await
-        .unwrap();
-
-    assert_eq!(
-        store.expire_candidates(at(1000)).await.unwrap(),
-        1,
-        "only the old, unvouched candidate"
-    );
-    let live: Vec<String> = store
+    let vouched = store.set_name(g, "vouched", &[r], at(100)).await.unwrap();
+    // Nothing expires: a lead nobody repeats loses confidence with time; a vouched name keeps it.
+    let later = at(100 + 2 * year);
+    assert!((lead.confidence_at(half_life, later) - 1.0 / 3.0).abs() < 1e-6);
+    assert!((vouched[0].confidence_at(half_life, later) - 1.0).abs() < 1e-6);
+    let names: Vec<String> = store
         .names_of(g, &[r])
         .await
         .unwrap()
         .into_iter()
         .map(|a| a.text)
         .collect();
-    assert!(!live.contains(&"stale guess".to_owned()));
-    for kept in ["fresh guess", "vouched", "added by hand"] {
-        assert!(
-            live.contains(&kept.to_owned()),
-            "{kept} must survive: {live:?}"
-        );
-    }
-    assert_eq!(
-        store.expire_candidates(at(1000)).await.unwrap(),
-        0,
-        "idempotent"
-    );
+    assert_eq!(names, ["vouched", "old guess"]);
 }
 
 async fn invitations(store: &dyn IdentityStore) {

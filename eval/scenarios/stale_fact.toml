@@ -1,0 +1,26 @@
+description = "A member asks whether the bot remembers what sport they play. The only learned fact was said once, long ago, and is listed as unlikely to hold now. The bot may mention it, but as something said a while back that may have changed, not as a sure current fact. Looking it up in the history first is fine; the answer is what is judged."
+
+members = [
+  { number = 1, account = 10001, name = "小林" },
+  { number = 2, account = 10002, name = "阿杰" },
+]
+
+chat = [
+  { member = 2, text = "下班有人运动吗" },
+  { member = 1, text = "[at:bot] 你记得我平时玩什么运动吗" },
+]
+
+trigger = { line = 2 }
+
+facts = [
+  { member = 1, predicate = "plays", object = "羽毛球", days_ago = 150 },
+]
+
+[expect]
+send = "required"
+send_calls_at_most = 1
+rubric = [
+  "The reply mentions badminton (羽毛球) as something 小林 said or played before, hedged or asking whether it still holds, rather than stating flatly that they play it now.",
+  "The reply does not invent any other sport as remembered.",
+  "The reply is short and in Chinese.",
+]

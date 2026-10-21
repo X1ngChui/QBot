@@ -81,10 +81,6 @@ pub trait IdentityStore: Send + Sync {
         accounts: &[AccountId],
     ) -> Result<Vec<Alias>, IdentityError>;
 
-    /// Mark candidate aliases with no evidence since `before` inactive, unless a person vouched
-    /// for them. Returns how many.
-    async fn expire_candidates(&self, before: UnixMillis) -> Result<usize, IdentityError>;
-
     async fn invite(
         &self,
         group: GroupId,
@@ -215,7 +211,7 @@ impl Inner {
         LinkOutcome::Linked
     }
 
-    fn recompute(row: &mut AliasRow, policy: &IdentityPolicy) {
+    fn recompute(row: &mut AliasRow) {
         let records: Vec<EvidenceRecord> = row.evidence.iter().map(|(e, _)| *e).collect();
         row.alias.confidence = confidence(&records);
         row.alias.last_evidence = row
@@ -227,13 +223,12 @@ impl Inner {
         row.alias.status = if row.removed {
             AliasStatus::Inactive
         } else {
-            status_for(row.alias.confidence, policy)
+            status_for(&records)
         };
     }
 
     fn add_evidence(
         &mut self,
-        policy: &IdentityPolicy,
         group: GroupId,
         text: &str,
         account: AccountId,
@@ -271,7 +266,7 @@ impl Inner {
             None => row.evidence.push((evidence, at)),
         }
         row.removed = false;
-        Inner::recompute(row, policy);
+        Inner::recompute(row);
         Ok(row.alias.clone())
     }
 }
@@ -333,9 +328,8 @@ impl IdentityStore for MemoryIdentityStore {
         at: UnixMillis,
     ) -> Result<Alias, IdentityError> {
         let text = normalize_alias(text)?;
-        let policy = self.policy;
         self.lock()
-            .add_evidence(&policy, group, &text, account, evidence, at)
+            .add_evidence(group, &text, account, evidence, at)
     }
 
     async fn set_name(
@@ -346,7 +340,6 @@ impl IdentityStore for MemoryIdentityStore {
         at: UnixMillis,
     ) -> Result<Vec<Alias>, IdentityError> {
         let normalized = normalize_alias(text)?;
-        let policy = self.policy;
         let mut inner = self.lock();
         for account in accounts {
             inner.known(*account)?;
@@ -366,7 +359,7 @@ impl IdentityStore for MemoryIdentityStore {
         };
         accounts
             .iter()
-            .map(|account| inner.add_evidence(&policy, group, &normalized, *account, manual, at))
+            .map(|account| inner.add_evidence(group, &normalized, *account, manual, at))
             .collect()
     }
 
@@ -376,7 +369,6 @@ impl IdentityStore for MemoryIdentityStore {
         text: &str,
         accounts: &[AccountId],
     ) -> Result<bool, IdentityError> {
-        let policy = self.policy;
         let normalized = normalize_alias(text)?;
         let mut inner = self.lock();
         let mut removed = false;
@@ -387,7 +379,7 @@ impl IdentityStore for MemoryIdentityStore {
                 && !r.removed
         }) {
             row.removed = true;
-            Inner::recompute(row, &policy);
+            Inner::recompute(row);
             removed = true;
         }
         Ok(removed)
@@ -428,28 +420,6 @@ impl IdentityStore for MemoryIdentityStore {
                 .map(|r| r.alias.clone())
                 .collect(),
         ))
-    }
-
-    async fn expire_candidates(&self, before: UnixMillis) -> Result<usize, IdentityError> {
-        let policy = self.policy;
-        let mut inner = self.lock();
-        let mut expired = 0;
-        for row in &mut inner.aliases {
-            let vouched = row
-                .evidence
-                .iter()
-                .any(|(e, _)| e.kind == EvidenceKind::Manual);
-            if !row.removed
-                && row.alias.status == AliasStatus::Candidate
-                && !vouched
-                && row.alias.last_evidence < before
-            {
-                row.removed = true;
-                Inner::recompute(row, &policy);
-                expired += 1;
-            }
-        }
-        Ok(expired)
     }
 
     async fn invite(

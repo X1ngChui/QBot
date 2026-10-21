@@ -572,13 +572,13 @@ async fn aliases_can_be_added_listed_and_removed_with_evidence_semantics() {
     let list = rig.say(ALICE, "/name", &[]).await;
     assert!(
         list.contains("Names of Alice:")
-            && list.contains("- al the great (confirmed, confidence 1.00)"),
+            && list.contains("- al the great (confirmed, confidence 100%)"),
         "{list}"
     );
     assert!(
         rig.say(ALICE, "/who", &[])
             .await
-            .contains("Confirmed names: al the great (confidence 1.00)")
+            .contains("Confirmed names: al the great (confidence 100%)")
     );
     assert_eq!(
         rig.say(BOB, "/name add Al the Great", &[]).await,
@@ -1099,10 +1099,14 @@ fn observation(
         group: GroupId::new(900).unwrap(),
         subject: Some(acct(subject)),
         predicate: predicate.into(),
-        key: object.to_lowercase(),
+        slot: qbot_memory::facts::slot(
+            qbot_memory::predicates::Predicates::builtin()
+                .get(predicate)
+                .expect("a person predicate"),
+            object,
+        ),
         object: object.into(),
         label: None,
-        opposite: None,
         decay: qbot_memory::predicates::DecayClass::Default,
         episode: qbot_memory::episode::EpisodeId::new(episode),
         message: MessageId::new(episode).unwrap(),
@@ -1134,7 +1138,7 @@ async fn who_shows_learned_facts_and_forget_removes_one_by_its_number() {
         .unwrap();
     let who = rig.say(ALICE, "/who", &[]).await;
     assert!(
-        who.contains("Learned from chat (2):\n1. likes: cats (confidence 0.27)\n2. lives_in: Hangzhou (confidence 0.27)\nRemove a note with /note remove N, a learned fact with /forget N (same scope)."),
+        who.contains("Learned from chat (2):\n1. likes: cats (confidence 70%)\n2. lives_in: Hangzhou (confidence 70%)\nRemove a note with /note remove N, a learned fact with /forget N (same scope)."),
         "{who}"
     );
     assert_eq!(
@@ -1292,9 +1296,13 @@ fn group_fact(
     qbot_memory::facts::Observation {
         subject: None,
         predicate: predicate.into(),
-        key: key.into(),
+        slot: if predicate == qbot_memory::facts::GROUP_TERM {
+            qbot_memory::facts::term_slot(key)
+        } else {
+            qbot_memory::facts::TOPIC_SLOT.into()
+        },
         label: label.map(str::to_owned),
-        ..observation(ALICE, predicate, object, episode)
+        ..observation(ALICE, "likes", object, episode)
     }
 }
 
@@ -1322,7 +1330,7 @@ async fn group_shows_learned_knowledge_and_only_owners_forget_it() {
         .unwrap();
     let group = rig.say(ALICE, "/group", &[]).await;
     assert!(
-        group.contains("1. What the group is about: 3D printing\n2. \"printer room\" means: the room with the 3D printer"),
+        group.contains("1. What the group is about: 3D printing (confidence 70%)\n2. \"printer room\" means: the room with the 3D printer (confidence 70%)"),
         "the topic first, then terms: {group}"
     );
     assert_eq!(

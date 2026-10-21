@@ -126,8 +126,10 @@ pub struct History {
 #[serde(deny_unknown_fields)]
 pub struct Memory {
     pub slice_batches: u32,
-    /// Group terms every reply is shown, the most recently confirmed.
+    /// Group terms every reply is shown, the most confident.
     pub group_terms: u32,
+    /// Learned facts every reply is shown per person, the most confident.
+    pub person_facts: u32,
     pub recall: Recall,
     pub facts: Facts,
 }

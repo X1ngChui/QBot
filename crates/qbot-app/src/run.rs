@@ -391,8 +391,15 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     .with_knowledge(Arc::new(qbot_prompt::FactKnowledge::new(
         facts.clone(),
         config.group_terms(),
+        config.decay_policy(),
     )))
-    .with_people(Arc::new(archive.clone()))
+    .with_people(
+        Arc::new(qbot_prompt::ArchivePeople::new(
+            archive.clone(),
+            config.decay_policy(),
+        )),
+        config.person_facts(),
+    )
     .with_bot_nicknames(&config.bot.nicknames)
     .with_directory(directory.clone())
     .with_episodes(episodes.clone());
@@ -444,8 +451,6 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
             admin.clone(),
             PgMediaCache::new(pool.clone(), clock.clone()),
         )),
-        identity: identity.clone(),
-        facts: facts.clone(),
         report: Arc::new(PgReportSource(admin.clone())),
         sink: Arc::new(OneBotReportSink::new(bridge.clone(), timeouts.action)),
         locales: locales.clone(),

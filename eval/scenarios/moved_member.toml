@@ -1,0 +1,27 @@
+description = "A member asked about where someone lives. The People in this group block lists two competing values: one said three times long ago, one said once recently that contradicts it (the older one is shown as much less likely). The bot should go by the likelier, recent value and not present the old one as current. Looking the question up in the history first is fine; the answer is what is judged."
+
+members = [
+  { number = 1, account = 10001, name = "小林" },
+  { number = 2, account = 10002, name = "阿杰" },
+]
+
+chat = [
+  { member = 2, text = "周末想约小林吃饭" },
+  { member = 2, text = "[at:bot] 小林现在住哪个城市来着" },
+]
+
+trigger = { line = 2 }
+
+facts = [
+  { member = 1, predicate = "lives_in", object = "杭州", episodes = 3, days_ago = 200 },
+  { member = 1, predicate = "lives_in", object = "上海", days_ago = 10 },
+]
+
+[expect]
+send = "required"
+send_calls_at_most = 1
+rubric = [
+  "The reply says 小林 lives in Shanghai (上海), possibly with a light hedge or a note that they lived in Hangzhou before.",
+  "The reply does not say that 小林 lives in Hangzhou (杭州) now.",
+  "The reply is short and in Chinese.",
+]

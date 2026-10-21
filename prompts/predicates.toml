@@ -4,11 +4,12 @@
 #
 #   kind         attribute (stable properties), preference (what they think of things),
 #                relation (who or what they belong to)
-#   cardinality  single: one value at a time; a new value replaces the old one ("moved to X").
+#   cardinality  single: one value at a time; a later value contradicts an earlier one ("moved
+#                to X"), and both are kept with their confidence.
 #                multi: values stand side by side, each confirmed or forgotten on its own.
-#   decay        stable | default | fast: how quickly it is forgotten when nothing confirms it
-#                again (the half-lives are configuration: memory.facts.half_life_days).
-#   opposite     recording this retires the named predicate for the same object, and back.
+#   decay        stable | default | fast: how long such a fact typically keeps holding unsaid
+#                (the half-lives are configuration: memory.facts.half_life_days).
+#   opposite     the named predicate for the same object contradicts this one, and back.
 #   rule         what the extraction model reads: the meaning, then the boundary against the
 #                predicate it would otherwise leak into.
 #

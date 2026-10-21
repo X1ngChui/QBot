@@ -895,40 +895,61 @@ async fn the_in_memory_fact_store_defines_the_contract() {
 }
 
 #[test]
-fn earned_confidence_grows_with_independent_support_and_fades_without_it() {
-    use qbot_memory::facts::{DecayPolicy, Fact, FactId, FactStatus, wilson};
+fn confidence_is_the_chance_a_claim_holds_now() {
+    use qbot_memory::belief::{as_of_day, credibility, percent};
+    use qbot_memory::facts::{DecayPolicy, Fact, FactId, FactStatus};
+    use qbot_memory::predicates::DecayClass;
     assert!(
-        (wilson(1) - 0.27).abs() < 0.01
-            && (wilson(3) - 0.53).abs() < 0.01
-            && (wilson(8) - 0.75).abs() < 0.02
+        (credibility(1) - 2.0 / 3.0).abs() < 1e-9
+            && (credibility(2) - 0.75).abs() < 1e-9
+            && (credibility(8) - 0.9).abs() < 1e-9
     );
     let policy = DecayPolicy::default();
-    let fact = |supports, decay| Fact {
-        id: FactId(1),
+    let day = 86_400_000;
+    let now = |days: i64| qbot_core::UnixMillis::new(days * day);
+    let fact = |id, predicate: &str, object: &str, supports, last: i64| Fact {
+        id: FactId(id),
         group: qbot_core::GroupId::new(1).unwrap(),
-        subject: None,
-        predicate: "likes".into(),
-        key: "x".into(),
-        object: "x".into(),
+        subject: AccountId::new(5).ok(),
+        predicate: predicate.into(),
+        slot: "lives_in".into(),
+        key: object.into(),
+        object: object.into(),
         label: None,
         status: FactStatus::Active,
         supports,
-        first_seen: qbot_core::UnixMillis::new(0),
-        last_confirmed: qbot_core::UnixMillis::new(0),
+        first_seen: now(0),
+        last_confirmed: now(last),
         ended: None,
-        decay,
+        decay: DecayClass::Default,
     };
-    let day = 86_400_000;
-    let now = |days: i64| qbot_core::UnixMillis::new(days * day);
-    let once = fact(1, qbot_memory::predicates::DecayClass::Default);
-    assert!(
-        (policy.confidence(&once, now(30)) - wilson(1) / 2.0).abs() < 1e-9,
-        "one half-life halves it"
+    // Unrepeated, a claim halves every half-life and is never cut off.
+    let once = fact(1, "lives_in", "x", 1, 0);
+    assert!((policy.confidence(&once, [], now(180)) - 1.0 / 3.0).abs() < 1e-9);
+    assert!(policy.confidence(&once, [], now(3650)) > 0.0);
+    // Three old mentions against one fresh change: the fresh one is believed, the old one kept.
+    let both = [
+        fact(1, "lives_in", "beijing", 3, 0),
+        fact(2, "lives_in", "shanghai", 1, 60),
+    ];
+    let [p_old, p_new] = policy.confidences(&both, now(60))[..] else {
+        unreachable!()
+    };
+    assert!((p_new - 2.0 / 3.0).abs() < 1e-9);
+    assert!(p_old > 0.2 && p_old < 0.3, "{p_old}");
+    // Said to have ended: only a later support brings it back.
+    let mut ended = once.clone();
+    ended.ended = Some(now(10));
+    let ratio = policy.confidence(&ended, [], now(10)) / policy.confidence(&once, [], now(10));
+    assert!((ratio - 1.0 / 3.0).abs() < 1e-9);
+    ended.last_confirmed = now(11);
+    assert!(policy.confidence(&ended, [], now(11)) > 0.6);
+    // Shown at whole tens of percent, as of the start of the day.
+    assert_eq!(
+        (percent(2.0 / 3.0), percent(0.04), percent(1.0)),
+        (70, 0, 100)
     );
-    // Forgotten below 0.05: a single mention lasts about 2.4 half-lives, eight mentions about 3.9.
-    assert!(policy.confidence(&once, now(70)) > 0.05 && policy.confidence(&once, now(80)) < 0.05);
-    let often = fact(8, qbot_memory::predicates::DecayClass::Default);
-    assert!(policy.confidence(&often, now(110)) > 0.05);
+    assert_eq!(as_of_day(qbot_core::UnixMillis::new(3 * day + 5)), now(3));
 }
 
 fn said(ordinal: u64, account: i64, member: u32, text: &str) -> SliceLine {
@@ -1064,7 +1085,7 @@ async fn an_episodes_findings_become_names_facts_and_group_knowledge_once() {
         ("kit", AliasStatus::Candidate)
     );
     assert!(
-        (names[0].confidence - 0.25).abs() < 1e-6,
+        (names[0].confidence - 2.0 / 3.0).abs() < 1e-6,
         "{}",
         names[0].confidence
     );
@@ -1087,7 +1108,7 @@ async fn an_episodes_findings_become_names_facts_and_group_knowledge_once() {
         (2, 2, 2)
     );
     assert!(store.unconsolidated(group()).await.unwrap().is_empty());
-    assert_eq!(stored[0].episode.method, "slice-v4");
+    assert_eq!(stored[0].episode.method, "slice-v5");
 }
 
 #[tokio::test]
@@ -1449,14 +1470,18 @@ async fn a_fact_said_to_hold_no_longer_is_ended_and_only_that_value() {
         EpisodeJobs::new(store.clone(), b, slice_grid(3, 1, 0, 0)).with_consolidator(consolidator);
     assert_eq!(job.extract_group(group()).await.unwrap(), 2);
 
-    let games: Vec<String> = facts
+    let games: Vec<(String, bool)> = facts
         .current(group(), AccountId::new(11).ok())
         .await
         .unwrap()
         .into_iter()
-        .map(|f| f.object)
+        .map(|f| (f.object, f.ended.is_some()))
         .collect();
-    assert_eq!(games, ["Chess"], "Genshin ended, Chess untouched");
+    assert_eq!(
+        games,
+        [("Chess".to_owned(), false), ("Genshin".to_owned(), true)],
+        "Genshin is said to have ended and kept as such, Chess untouched"
+    );
     let stored = store.within(group(), 4, 6).await.unwrap();
     assert_eq!(
         stored[0].episode.findings.ended.len(),

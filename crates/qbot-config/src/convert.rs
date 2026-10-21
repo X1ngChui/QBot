@@ -155,6 +155,11 @@ impl Config {
         usize::try_from(self.memory.group_terms).unwrap_or(usize::MAX)
     }
 
+    /// Learned facts every reply is shown per person.
+    pub fn person_facts(&self) -> usize {
+        usize::try_from(self.memory.person_facts).unwrap_or(usize::MAX)
+    }
+
     pub fn tool_settings(&self) -> ToolSettings {
         ToolSettings {
             max_sends_per_run: self.replies.max_messages,
@@ -188,7 +193,6 @@ impl Config {
             stable: days(h.stable),
             default: days(h.default),
             fast: days(h.fast),
-            ..DecayPolicy::default()
         }
     }
 
@@ -300,7 +304,6 @@ impl Config {
             (keep > 0).then(|| days(keep)),
             self.owners().into_iter().collect(),
             zone,
-            self.decay_policy(),
         )
     }
 }

@@ -14,8 +14,8 @@ pub use persona::{Persona, PersonaError, Personas};
 pub use qbot_store::{GroupPeople, KnownFact, KnownName, KnownNote, Person};
 pub use render::PromptRenderer;
 pub use source::{
-    FactKnowledge, HistorySource, Knowledge, KnowledgeSource, PeopleSource, PromptContext,
-    PromptSettings, UnknownZone,
+    ArchivePeople, FactKnowledge, HistorySource, Knowledge, KnowledgeSource, PeopleSource,
+    PromptContext, PromptSettings, UnknownZone,
 };
 pub use templates::{PromptError, Template, render_template};
 

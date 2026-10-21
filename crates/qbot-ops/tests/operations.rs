@@ -8,7 +8,6 @@ use async_trait::async_trait;
 use qbot_core::{AccountId, Clock, GroupId, UnixMillis};
 use qbot_i18n::Locales;
 use qbot_llm::{CallKind, Purpose};
-use qbot_memory::{IdentityPolicy, MemoryIdentityStore};
 use qbot_ops::{
     Extractor, Housekeeping, Operations, OpsConfig, OpsError, Parts, ReportSink, ReportSource,
     render_report,
@@ -241,18 +240,14 @@ fn rig(owners: Vec<AccountId>) -> Rig {
     let ops = Operations::new(Parts {
         cfg: OpsConfig {
             backup: None,
-            alias_unused: Duration::from_secs(30 * 86_400),
             description_ttl: Duration::from_secs(15 * 86_400),
             records_keep: Some(Duration::from_secs(90 * 86_400)),
             owners,
             zone: jiff::tz::TimeZone::get("Asia/Shanghai").unwrap(),
-            fact_decay: qbot_memory::facts::DecayPolicy::default(),
         },
         clock: Arc::new(Fixed(AtomicI64::new(NOON))),
         extractor: extract.clone(),
         housekeeping: house.clone(),
-        identity: Arc::new(MemoryIdentityStore::new(IdentityPolicy::default())),
-        facts: Arc::new(qbot_memory::facts::MemoryFactStore::new()),
         report: source.clone(),
         sink: sink.clone(),
         locales: Locales::english(),

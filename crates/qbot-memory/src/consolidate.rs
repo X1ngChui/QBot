@@ -7,11 +7,13 @@
 use std::sync::Arc;
 
 use crate::episode::Episode;
-use crate::facts::{FactStore, GROUP_TERM, GROUP_TOPIC, Observation, Retraction, normalize_key};
+use crate::facts::{
+    FactStore, GROUP_TERM, GROUP_TOPIC, Observation, Retraction, TOPIC_SLOT, slot, term_slot,
+};
 use crate::findings::KnowledgeFinding;
 use crate::identity::{EvidenceKind, EvidenceRecord, IdentityError};
 use crate::identity_store::IdentityStore;
-use crate::predicates::{Cardinality, DecayClass, Predicates};
+use crate::predicates::{DecayClass, Predicates};
 use crate::store::MemoryError;
 
 pub struct Consolidator {
@@ -68,18 +70,13 @@ impl Consolidator {
                 tracing::info!(predicate = %fact.predicate, "a fact for an unknown predicate was skipped");
                 continue;
             };
-            let key = match predicate.cardinality {
-                Cardinality::Single => String::new(),
-                Cardinality::Multi => normalize_key(&fact.object),
-            };
             observations.push(Observation {
                 group,
                 subject: Some(fact.account),
                 predicate: fact.predicate.clone(),
-                key,
+                slot: slot(predicate, &fact.object),
                 object: fact.object.clone(),
                 label: None,
-                opposite: predicate.opposite.clone(),
                 decay: predicate.decay,
                 episode: episode.id,
                 message: fact.message,
@@ -89,7 +86,7 @@ impl Consolidator {
         }
         for item in &source.findings.knowledge {
             let observation = match item {
-                // A term keeps one meaning at a time; a new meaning replaces the old one.
+                // A term's meanings compete.
                 KnowledgeFinding::Term {
                     term,
                     meaning,
@@ -99,17 +96,16 @@ impl Consolidator {
                     group,
                     subject: None,
                     predicate: GROUP_TERM.into(),
-                    key: normalize_key(term),
+                    slot: term_slot(term),
                     object: meaning.clone(),
                     label: Some(term.clone()),
-                    opposite: None,
                     decay: DecayClass::Default,
                     episode: episode.id,
                     message: *message,
                     quote: quote.clone(),
                     at,
                 },
-                // A group has one topic at a time.
+                // The group's topics compete.
                 KnowledgeFinding::Topic {
                     topic,
                     message,
@@ -118,10 +114,9 @@ impl Consolidator {
                     group,
                     subject: None,
                     predicate: GROUP_TOPIC.into(),
-                    key: String::new(),
+                    slot: TOPIC_SLOT.into(),
                     object: topic.clone(),
                     label: None,
-                    opposite: None,
                     decay: DecayClass::Stable,
                     episode: episode.id,
                     message: *message,
@@ -141,15 +136,11 @@ impl Consolidator {
             let Some(predicate) = self.predicates.get(&fact.predicate) else {
                 continue;
             };
-            let key = match predicate.cardinality {
-                Cardinality::Single => String::new(),
-                Cardinality::Multi => normalize_key(&fact.object),
-            };
             let retraction = Retraction {
                 group,
                 subject: Some(fact.account),
                 predicate: fact.predicate.clone(),
-                key,
+                slot: slot(predicate, &fact.object),
                 object: fact.object.clone(),
                 at,
             };
@@ -161,18 +152,11 @@ impl Consolidator {
     }
 }
 
-/// One observation per slot, the last one made, in the order they were made. A slot is a
-/// subject's predicate and key, with a predicate and its opposite sharing one: within one slice,
-/// a later statement replaces an earlier one about the same thing, and applying both would leave
-/// a superseded row that never held and make a second application differ from the first.
+/// One observation per slot of a subject, the last one made, in the order they were made: within
+/// one slice, a later statement replaces an earlier one about the same thing, and applying both
+/// would leave a claim the slice itself took back standing beside its replacement, as recent as it.
 fn last_per_slot(observations: Vec<Observation>) -> Vec<Observation> {
-    let slot = |o: &Observation| {
-        let pair = match &o.opposite {
-            Some(opposite) if *opposite < o.predicate => opposite.clone(),
-            _ => o.predicate.clone(),
-        };
-        (o.subject, pair, o.key.clone())
-    };
+    let slot = |o: &Observation| (o.subject, o.slot.clone());
     let mut kept: Vec<Observation> = Vec::new();
     for observation in observations {
         kept.retain(|earlier| slot(earlier) != slot(&observation));

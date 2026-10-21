@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -9,7 +10,8 @@ use qbot_agent::{
 use qbot_context::{ChatLine, Instruction, InstructionRole, Speaker};
 use qbot_core::marker::{RECALLED, escape_markers};
 use qbot_core::{Clock, GroupId, HistoryWindow, MemberNo, UnixMillis};
-use qbot_memory::facts::{FactStore, GROUP_TERM, GROUP_TOPIC};
+use qbot_memory::belief::{as_of_day, percent};
+use qbot_memory::facts::{DecayPolicy, Fact, FactStore, GROUP_TERM, GROUP_TOPIC};
 use qbot_memory::{Background, EpisodeStore, HistoryPart, MemoryError, SliceBackground, compose};
 use qbot_store::{GroupPeople, PgArchive};
 use qbot_wording::{Text, say};
@@ -19,18 +21,19 @@ use crate::render::clock_label;
 use crate::templates::{PromptError, Template, render_template};
 
 /// One piece of learned group knowledge: a term and its meaning, or (no term) what the group
-/// is about.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// is about, with the probability that it holds (`qbot_memory::belief`).
+#[derive(Debug, Clone, PartialEq)]
 pub struct Knowledge {
     pub term: Option<String>,
     pub text: String,
+    pub confidence: f64,
 }
 
 /// Where learned group knowledge comes from.
 #[async_trait]
 pub trait KnowledgeSource: Send + Sync {
-    /// The group's current knowledge, in a stable order.
-    async fn knowledge(&self, group: GroupId) -> Result<Vec<Knowledge>, EnvError>;
+    /// The group's current knowledge as of `now`, in a stable order.
+    async fn knowledge(&self, group: GroupId, now: UnixMillis) -> Result<Vec<Knowledge>, EnvError>;
 }
 
 /// Group knowledge held as group facts.
@@ -39,11 +42,16 @@ pub struct FactKnowledge {
     /// Terms shown at most: the block enters every reply's instructions, and a long-lived group
     /// accumulates far more terms than a prompt should carry.
     max_terms: usize,
+    decay: DecayPolicy,
 }
 
 impl FactKnowledge {
-    pub fn new(facts: Arc<dyn FactStore>, max_terms: usize) -> Self {
-        Self { facts, max_terms }
+    pub fn new(facts: Arc<dyn FactStore>, max_terms: usize, decay: DecayPolicy) -> Self {
+        Self {
+            facts,
+            max_terms,
+            decay,
+        }
     }
 }
 
@@ -57,34 +65,52 @@ impl std::fmt::Debug for FactKnowledge {
 
 #[async_trait]
 impl KnowledgeSource for FactKnowledge {
-    /// The topic, then the most recently confirmed terms (up to `max_terms`), listed in key
-    /// order: which terms are shown follows recency, but confirming a shown term again does not
-    /// reorder the block, so the cached prompt prefix survives it.
-    async fn knowledge(&self, group: GroupId) -> Result<Vec<Knowledge>, EnvError> {
+    /// The most confident topic, then for each term its most confident meaning, the most
+    /// confident terms (up to `max_terms`) listed in term order. Confidence is as of the start of
+    /// the day and confirming a shown term does not reorder the block, so the cached prompt prefix
+    /// changes only when a shown meaning or its rounded confidence does.
+    async fn knowledge(&self, group: GroupId, now: UnixMillis) -> Result<Vec<Knowledge>, EnvError> {
         let facts = self
             .facts
             .current(group, None)
             .await
             .map_err(|e| EnvError(e.to_string()))?;
-        // Within a predicate the store lists the most recently confirmed first.
-        let mut out: Vec<Knowledge> = facts
+        let confidences = self.decay.confidences(&facts, as_of_day(now));
+        // The more confident, then the more recently supported, then the newer claim.
+        let rank = |a: &(&Fact, f64), b: &(&Fact, f64)| {
+            a.1.total_cmp(&b.1)
+                .then(a.0.last_confirmed.cmp(&b.0.last_confirmed))
+                .then(a.0.id.cmp(&b.0.id))
+        };
+        let scored: Vec<(&Fact, f64)> = facts.iter().zip(confidences).collect();
+        let mut out: Vec<Knowledge> = scored
             .iter()
-            .find(|f| f.predicate == GROUP_TOPIC)
-            .map(|f| Knowledge {
+            .filter(|(f, _)| f.predicate == GROUP_TOPIC)
+            .max_by(|a, b| rank(a, b))
+            .map(|(f, confidence)| Knowledge {
                 term: None,
                 text: f.object.clone(),
+                confidence: *confidence,
             })
             .into_iter()
             .collect();
-        let mut terms: Vec<_> = facts
-            .iter()
-            .filter(|f| f.predicate == GROUP_TERM)
-            .take(self.max_terms)
-            .collect();
-        terms.sort_by(|a, b| a.key.cmp(&b.key).then(a.id.cmp(&b.id)));
-        out.extend(terms.into_iter().map(|f| Knowledge {
+        let mut meanings: BTreeMap<&str, (&Fact, f64)> = BTreeMap::new();
+        for item in scored.iter().filter(|(f, _)| f.predicate == GROUP_TERM) {
+            match meanings.get(item.0.slot.as_str()) {
+                Some(kept) if rank(kept, item).is_ge() => {}
+                _ => {
+                    meanings.insert(&item.0.slot, *item);
+                }
+            }
+        }
+        let mut terms: Vec<(&Fact, f64)> = meanings.into_values().collect();
+        terms.sort_by(|a, b| rank(b, a));
+        terms.truncate(self.max_terms);
+        terms.sort_by(|a, b| a.0.slot.cmp(&b.0.slot).then(a.0.id.cmp(&b.0.id)));
+        out.extend(terms.into_iter().map(|(f, confidence)| Knowledge {
             term: Some(f.label.clone().unwrap_or_else(|| f.key.clone())),
             text: f.object.clone(),
+            confidence,
         }));
         Ok(out)
     }
@@ -147,10 +173,25 @@ pub trait PeopleSource: Send + Sync {
     async fn people(&self, group: GroupId, now: UnixMillis) -> Result<GroupPeople, EnvError>;
 }
 
+/// The people of a group from the store of record, with the confidence of what is believed
+/// about them under the deployment's decay policy.
+#[derive(Debug, Clone)]
+pub struct ArchivePeople {
+    archive: PgArchive,
+    decay: DecayPolicy,
+}
+
+impl ArchivePeople {
+    pub fn new(archive: PgArchive, decay: DecayPolicy) -> Self {
+        Self { archive, decay }
+    }
+}
+
 #[async_trait]
-impl PeopleSource for PgArchive {
+impl PeopleSource for ArchivePeople {
     async fn people(&self, group: GroupId, now: UnixMillis) -> Result<GroupPeople, EnvError> {
-        PgArchive::people(self, group, now)
+        self.archive
+            .people(group, now, &self.decay)
             .await
             .map_err(|e| EnvError(e.to_string()))
     }
@@ -173,6 +214,9 @@ pub struct PromptSettings {
 pub struct PromptContext {
     knowledge: Option<Arc<dyn KnowledgeSource>>,
     people: Option<Arc<dyn PeopleSource>>,
+    /// Facts shown per person at most, the most confident: the block enters every reply's
+    /// instructions.
+    person_facts: usize,
     directory: Option<Arc<dyn Directory>>,
     episodes: Option<Arc<dyn EpisodeStore>>,
     history: Arc<dyn HistorySource>,
@@ -209,6 +253,7 @@ impl PromptContext {
         Ok(Self {
             knowledge: None,
             people: None,
+            person_facts: 0,
             directory: None,
             episodes: None,
             history,
@@ -239,9 +284,10 @@ impl PromptContext {
     }
 
     /// Show every run what the bot keeps about the group's people: blocks, linked accounts,
-    /// names, notes and learned facts.
-    pub fn with_people(mut self, source: Arc<dyn PeopleSource>) -> Self {
+    /// names, notes and each person's `person_facts` most confident learned facts.
+    pub fn with_people(mut self, source: Arc<dyn PeopleSource>, person_facts: usize) -> Self {
         self.people = Some(source);
+        self.person_facts = person_facts;
         self
     }
 
@@ -357,8 +403,8 @@ impl PromptContext {
     }
 
     /// The people block: everyone the bot keeps a record about, one entry per person, in member
-    /// order. It changes only when a record does (a command, an extraction), so it sits in the
-    /// cached prefix. What members wrote or said is escaped like chat and kept on its line.
+    /// order. It changes only when a record does (a command, an extraction) or a shown
+    /// confidence, rounded and as of the start of the day, moves, so it sits in the cached prefix. What members wrote or said is escaped like chat and kept on its line.
     fn people_instruction(&self, people: &GroupPeople) -> Result<Option<Instruction>, EnvError> {
         if people.people.is_empty() {
             return Ok(None);
@@ -402,7 +448,10 @@ impl PromptContext {
                         if n.confirmed {
                             name
                         } else {
-                            say(Text::PromptPersonNameLead { name })
+                            say(Text::PromptPersonNameLead {
+                                name,
+                                percent: percent(n.confidence).to_string(),
+                            })
                         }
                     })
                     .collect::<Vec<_>>()
@@ -424,13 +473,16 @@ impl PromptContext {
                 entries.push(say(Text::PromptPersonNotes { notes }));
             }
             if !person.facts.is_empty() {
+                // The source lists them the most confident first.
                 let facts = person
                     .facts
                     .iter()
+                    .take(self.person_facts)
                     .map(|f| {
                         say(Text::PromptPersonFact {
                             predicate: f.predicate.clone(),
                             value: line(&f.value),
+                            percent: percent(f.confidence).to_string(),
                             count: f.supports.to_string(),
                             date: date(f.last_confirmed),
                         })
@@ -456,7 +508,7 @@ impl PromptContext {
         let Some(source) = &self.knowledge else {
             return Ok(None);
         };
-        let items = source.knowledge(group).await?;
+        let items = source.knowledge(group, self.clock.now()).await?;
         if items.is_empty() {
             return Ok(None);
         }
@@ -466,9 +518,11 @@ impl PromptContext {
                 Some(term) => say(Text::PromptGroupTerm {
                     term: escape_markers(term),
                     text: escape_markers(&k.text),
+                    percent: percent(k.confidence).to_string(),
                 }),
                 None => say(Text::PromptGroupTopic {
                     text: escape_markers(&k.text),
+                    percent: percent(k.confidence).to_string(),
                 }),
             })
             .collect();
@@ -828,11 +882,19 @@ impl SliceBackground for PromptContext {
                     details.push(say(Text::ExtractBackgroundBlocked {}));
                 }
                 if !person.facts.is_empty() {
+                    // Every fact, the most confident first: any of them can be confirmed, reworded
+                    // or ended.
                     details.push(say(Text::ExtractBackgroundFacts {
                         facts: person
                             .facts
                             .iter()
-                            .map(|f| format!("{}: {}", f.predicate, line(&f.value)))
+                            .map(|f| {
+                                say(Text::ExtractBackgroundFact {
+                                    predicate: f.predicate.clone(),
+                                    value: line(&f.value),
+                                    percent: percent(f.confidence).to_string(),
+                                })
+                            })
                             .collect::<Vec<_>>()
                             .join(", "),
                     }));
@@ -873,7 +935,7 @@ impl SliceBackground for PromptContext {
         if let Some(source) = &self.knowledge {
             about.extend(
                 source
-                    .knowledge(group)
+                    .knowledge(group, self.clock.now())
                     .await
                     .map_err(backend)?
                     .iter()
@@ -881,9 +943,11 @@ impl SliceBackground for PromptContext {
                         Some(term) => say(Text::PromptGroupTerm {
                             term: escape_markers(term),
                             text: escape_markers(&k.text),
+                            percent: percent(k.confidence).to_string(),
                         }),
                         None => say(Text::PromptGroupTopic {
                             text: escape_markers(&k.text),
+                            percent: percent(k.confidence).to_string(),
                         }),
                     }),
             );

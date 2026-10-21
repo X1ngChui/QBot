@@ -93,7 +93,7 @@ async fn a_real_model_writes_a_valid_episode_with_findings() {
     let background = qbot_memory::Background {
         text: "## Who is who\n\nThe members these lines involve, as the group knows them now.\n\n\
                - member:1: shown as \"\u{5c0f}\u{6797}\"\n\
-               - member:2: shown as \"\u{963f}\u{6770}\"; known before: lives_in: \u{676d}\u{5dde}\n\
+               - member:2: shown as \"\u{963f}\u{6770}\"; known before: lives_in: \u{676d}\u{5dde} (about 70% likely)\n\
                - member:3: shown as \"Mia\"\n\n\
                ## About the group\n\nFriends from the same university who chat about food and trips."
             .into(),
@@ -204,8 +204,8 @@ async fn a_real_model_ends_what_stopped_dates_plans_and_skips_what_passes() {
     // As the prompt layer and the extraction job write it.
     let background = qbot_memory::Background {
         text: "## Who is who\n\nThe members these lines involve, as the group knows them now.\n\n\
-               - member:1: shown as \"\u{5c0f}\u{6797}\"; known before: plays: \u{539f}\u{795e}\n\
-               - member:2: shown as \"\u{963f}\u{6770}\"; known before: lives_in: \u{676d}\u{5dde}\n\
+               - member:1: shown as \"\u{5c0f}\u{6797}\"; known before: plays: \u{539f}\u{795e} (about 70% likely)\n\
+               - member:2: shown as \"\u{963f}\u{6770}\"; known before: lives_in: \u{676d}\u{5dde}\u{5e02} (about 60% likely)\n\
                - member:3: shown as \"Mia\"\n\n\
                ## About the group\n\nThe group's bot (its lines are `bot:`) is called Bobo. These are the bot's \
                names, never names of members.\n\
@@ -263,6 +263,16 @@ async fn a_real_model_ends_what_stopped_dates_plans_and_skips_what_passes() {
             .any(|f| f.account == two && f.message == target[2].message),
         "a passing mood is no fact"
     );
+    // "Hangzhou" said again of what is recorded as "Hangzhou city" supports the record.
+    let city = "\u{676d}\u{5dde}\u{5e02}";
+    let homes: Vec<&str> = out
+        .findings
+        .facts
+        .iter()
+        .filter(|f| f.account == two && f.predicate == "lives_in")
+        .map(|f| f.object.as_str())
+        .collect();
+    assert_eq!(homes, [city], "a value said again is given as recorded");
     assert!(
         !out.findings
             .names
