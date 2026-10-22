@@ -5,6 +5,7 @@ use std::sync::{Mutex, PoisonError};
 use async_trait::async_trait;
 use qbot_core::{GroupId, MessageId, UnixMillis};
 
+use crate::belief::Activity;
 use crate::episode::{Episode, EpisodeId, Hit, NewEpisode};
 use crate::slice::SliceLine;
 
@@ -75,6 +76,9 @@ pub trait EpisodeStore: Send + Sync {
 
     /// Record that an episode's findings have been applied.
     async fn mark_consolidated(&self, id: EpisodeId) -> Result<(), MemoryError>;
+
+    /// The group's conversation as a clock for salience: every episode's end and participants.
+    async fn activity(&self, group: GroupId) -> Result<Activity, MemoryError>;
 
     /// Episodes of the group lying wholly inside the ordinal range, in order.
     async fn within(
@@ -352,6 +356,17 @@ impl EpisodeStore for MemoryEpisodeStore {
     async fn mark_consolidated(&self, id: EpisodeId) -> Result<(), MemoryError> {
         self.lock().consolidated.insert(id);
         Ok(())
+    }
+
+    async fn activity(&self, group: GroupId) -> Result<Activity, MemoryError> {
+        Ok(Activity::new(
+            self.lock()
+                .episodes
+                .iter()
+                .filter(|(e, _, _)| e.episode.group == group)
+                .map(|(e, _, _)| (e.episode.ended, e.episode.participants.clone()))
+                .collect(),
+        ))
     }
 
     async fn get(&self, group: GroupId, id: EpisodeId) -> Result<Option<Episode>, MemoryError> {

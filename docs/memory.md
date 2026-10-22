@@ -238,33 +238,57 @@ So "moved to Shanghai" after three mentions of Beijing leaves Shanghai at 0.67 a
 about a quarter (0.8 credibility, a little persistence lost, times 1/3); both stay, and the model sees
 both with their confidence. A rewording ("Beijing" then "Beijing city") costs the older wording
 two thirds of its confidence instead of deleting it, and either wording is restored by being
-said again. Confidence is a number the model reads, not a gate: nothing is hidden or deleted
-for having low confidence.
+said again. Confidence is a number the model reads, not a gate: nothing is hidden for having
+low confidence.
 
-**Forgetting is ranking under a budget, not deletion.** What reaches the model is chosen by
-confidence where space is limited:
-- the people block shows each person's `memory.person_facts` (16) most confident facts, each with
-  its confidence (rounded to tens of percent) and last support date, competing values side by
-  side, and their names with leads marked by confidence;
-- group knowledge shows the most confident topic and, per term, its most confident meaning, the
-  `memory.group_terms` (40) most confident terms;
-- the extractor sees every fact of the members a slice involves, most confident first, so a
-  statement can confirm, reword or end any of them.
+**Salience: how current a claim is, on the group's own clock.** Confidence answers whether a
+claim holds; it does not say whether it still matters. A claim also loses *salience* every time
+the conversation goes by without it: `0.5^(n / h)`, where `n` counts the episodes ended since its
+last support that its subject took part in (for the group's terms and topics, every episode of
+the group) and `h` is the class's `memory.facts.activity_half_life_episodes` (stable 200, default
+40, fast 10). The clock is the group's conversation, not the calendar: a busy group's clock runs
+fast, so what it stopped talking about loses salience within days; a quiet group's clock barely
+moves, so what it knows stays current for as long as it is quiet; and a member who says nothing
+has not passed anything over. Salience is computed on read from the episodes' ends and
+participants, so no message and no schedule writes anything. A claim's *worth* where room is
+limited is its confidence times its salience; worth is never shown, confidence is.
 
-Confidence is computed as of the start of the current UTC day, so the people block and the group
-knowledge change at most once a day by ageing and stay in the cached prompt prefix in between.
-A belief that falls out of a budget is still kept, still shown by `/who` and to the extractor,
-and comes back when it is said again. Nothing expires: a belief nobody repeats tends to zero
-confidence and drops in rank; it is not discarded. Hard deletion is only by a person: `/forget`
-(facts), `/name remove` (names), a recalled message (which teaches nothing afterwards). Storage
-grows with distinct claims, which are short text; there is no automatic purge.
+**Forgetting: ranking under budgets, eviction under capacity.** Two limits, two mechanisms:
+- *Budgets* choose what reaches the model, by worth: the people block shows each person's
+  `memory.person_facts` (16) facts most worth showing, each with its confidence (rounded to tens
+  of percent) and last support date, competing values side by side, and their names with leads
+  marked by confidence; group knowledge shows the topic most worth showing and, for the
+  `memory.group_terms` (40) terms most worth showing, the meaning most worth showing; the
+  extractor sees every stored fact of the members a slice involves, most worth first, so a
+  statement can confirm, reword or end any of them. What falls out of a budget is still kept,
+  shown by `/who`, and comes back when it is said again.
+- *Capacity* bounds what a group keeps (`memory.capacity`: 40 claims per member, 120 term
+  claims, 8 topics). It is enforced as each episode is applied: in every scope the episode
+  touched that is over its room, the claims worth least, weighed as of the episode's end, are
+  deleted with their evidence; what the episode itself supported is never among them, so new
+  information always finds room (a scope may stay over its room by what one episode said). The
+  provenance stays: the episode keeps its findings and quotes, the archive its lines, and a claim
+  said again is learned again. Scopes nobody adds to are never touched, so a quiet group keeps
+  everything however old.
+
+The order in which claims give way follows from worth, not from a rule per case: a contradicted
+value first (its confidence is cut by the statement after it); then a temporary activity its
+subject has talked past many times; then a taste; a stable attribute (where someone lives, their
+name) only after hundreds of episodes of its subject without it, and a claim said in many
+episodes after one said once. Confidence and salience are computed as of the start of the
+current UTC day in what replies are shown, so the people block and the group knowledge change
+at most once a day by ageing and stay in the cached prompt prefix in between. Hard deletion is
+otherwise only by a person: `/forget` (facts), `/name remove` (names), a recalled message (which
+teaches nothing afterwards). Names are not under capacity: a person goes by a few, and all are
+shown.
 
 **Storage.** `fact` holds one row per claim: subject, predicate, *slot* and value. Claims of one
 subject compete when they share a slot and differ in predicate or value: a single-valued
 predicate's slot is the predicate (`lives_in`); a multi-valued predicate with an opposite shares
 one slot with it per normalized value (`dislikes/likes:cats`); a multi-valued predicate without
-one has a slot per value, so its values stand side by side; a term's slot is the term, the topic
-has one. Each row keeps its distinct supporting episodes (`fact_evidence`, with the quote), its
+one has a slot per value, so its values stand side by side; a term's slot is the term (its
+meanings compete), and each topic has its own (a group talking about exams has not stopped being
+about games; topics compete only for room). Each row keeps its distinct supporting episodes (`fact_evidence`, with the quote), its
 first and last support and the latest time it was said to have ended; confidence is derived.
 Statuses are `active` and `forgotten` (struck out by a person, never shown, never a competitor).
 
@@ -274,7 +298,21 @@ identity evidence; facts and knowledge become observations: support for the slot
 same predicate and normalized value, or a new row beside its competitors. One episode says one
 thing per slot: its last statement. An episode supports a claim at most once, so applying it
 again changes nothing. After its observations an episode's ended facts are applied: each records
-the time on the claim with that value, and one that is not recorded changes nothing.
+the time on the claim with that value, and one that is not recorded changes nothing. Last,
+capacity is enforced in the scopes the episode touched, weighed as of the episode's end, so
+applying it again evicts nothing more.
+
+**Cases** (`qbot-memory/tests/capacity.rs`):
+- *A quiet group, or a quiet member*, keeps everything, however old: nothing adds to its scopes
+  and its clock does not move.
+- *A busy group with changing topics* keeps the topic it keeps returning to (credible, current)
+  and the latest passing one; older passing topics make way.
+- *The same fact said again* is support for one claim, once per episode: it gains credibility
+  and salience, and outlasts what was said once.
+- *A genuine contradiction* ("moved to Shanghai") keeps both values while there is room, the
+  later one believed; under pressure the contradicted value is the first to go.
+- *A member full of facts says something new*: it is recorded, and the claim worth least makes
+  way (a game they have talked past twenty times, not where they live).
 
 **Alternatives considered.**
 
@@ -284,6 +322,9 @@ the time on the claim with that value, and one that is not recorded changes noth
 | Beta reputation / subjective logic opinion (Jøsang and Ismail 2002), positive and negative counts with a forgetting factor | evidence-based, one scale, explicit uncertainty | treats statements as exchangeable trials of a fixed proportion: three old mentions outvote one fresh "I moved", though the fresh one is about the present. Its rule of succession is kept for credibility |
 | Ebbinghaus strength growing with recall (MemoryBank, Zhong et al. 2023) and ACT-R base-level activation (power-law decay of uses) | memories used often persist | model how a *mind* forgets, not whether a claim about the world still holds; being shown in a prompt is not evidence that it is true, and would make every shown fact immortal |
 | Recency + importance + relevance, min-max normalized (Generative Agents, Park et al. 2023) | good for ranking records | a ranking score, not a probability; importance asked of a model is unstable across calls. Recall of episodes keeps a similarity-times-recency score in this spirit |
+| Time-to-live, or eviction by age alone | simple, bounded | deletes a long-standing fact as readily as last week's game; in a quiet group it forgets what nobody contradicted |
+| Decay on the calendar only (the previous design, and a nightly decay pass) | one clock for everything | a busy group fills its budgets with what it said a month ago while a quiet group loses what it still means; a nightly pass writes for nothing |
+| LRU / LFU by retrieval (being shown counts as use) | cheap capacity management | being shown in a prompt is not evidence; every shown claim would keep itself |
 | Model-chosen ADD / UPDATE / DELETE (Mem0, 2025) | resolves rewording semantically | a contradiction deletes on one model call; Mem0's graph variant and Zep / Graphiti instead mark facts invalid and keep them for temporal reasoning, which is what competing claims with confidence do here without another model call |
 
 Members see their own facts and confidence with `/who` and remove them with `/forget`; group

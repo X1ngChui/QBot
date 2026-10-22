@@ -132,6 +132,15 @@ pub struct Memory {
     pub person_facts: u32,
     pub recall: Recall,
     pub facts: Facts,
+    pub capacity: MemoryCapacity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryCapacity {
+    pub person_facts: u32,
+    pub group_terms: u32,
+    pub group_topics: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -145,6 +154,7 @@ pub struct Recall {
 #[serde(deny_unknown_fields)]
 pub struct Facts {
     pub half_life_days: HalfLives,
+    pub activity_half_life_episodes: HalfLives,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

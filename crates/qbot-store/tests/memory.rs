@@ -939,6 +939,7 @@ async fn people_shows_each_person_with_blocks_links_names_notes_and_facts_of_its
                 supports: 1,
                 last_confirmed: UnixMillis::new(later.get() + 1),
                 confidence: 2.0 / 3.0,
+                worth: 2.0 / 3.0,
             },
             KnownFact {
                 predicate: "lives_in".into(),
@@ -946,6 +947,7 @@ async fn people_shows_each_person_with_blocks_links_names_notes_and_facts_of_its
                 supports: 1,
                 last_confirmed: later,
                 confidence: 2.0 / 3.0 * (1.0 - 2.0 / 3.0),
+                worth: 2.0 / 3.0 * (1.0 - 2.0 / 3.0),
             }
         ],
         "the most confident first, the contradicted value kept"

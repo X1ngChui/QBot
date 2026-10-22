@@ -154,6 +154,18 @@ impl Config {
             "memory.facts.half_life_days",
             "every half-life must be at least 1 day",
         );
+        let act = &m.facts.activity_half_life_episodes;
+        c.that(
+            act.stable >= 1 && act.default >= 1 && act.fast >= 1,
+            "memory.facts.activity_half_life_episodes",
+            "every half-life must be at least 1 episode",
+        );
+        let cap = &m.capacity;
+        c.that(
+            cap.person_facts >= m.person_facts && cap.group_terms >= m.group_terms && cap.group_topics >= 1,
+            "memory.capacity",
+            "must hold at least what replies are shown (memory.person_facts, memory.group_terms) and one topic",
+        );
 
         let md = &self.media;
         c.that(

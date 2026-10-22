@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use qbot_core::{AccountId, Clock, GroupId, MessageId, UnixMillis};
+use qbot_memory::belief::Activity;
 use qbot_memory::{
     Episode, EpisodeId, EpisodeStore, Evidence, Hit, MemoryError, NewEpisode, SliceLine,
 };
@@ -387,6 +388,27 @@ impl EpisodeStore for PgEpisodeStore {
             .await
             .map_err(backend)?;
         Ok(())
+    }
+
+    async fn activity(&self, group: GroupId) -> Result<Activity, MemoryError> {
+        let rows = sqlx::query(
+            "SELECT ended_ms, participants FROM episode WHERE group_id = $1 ORDER BY ended_ms, episode_id",
+        )
+        .bind(group.get())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        let mut episodes = Vec::with_capacity(rows.len());
+        for row in rows {
+            let people = row
+                .get::<Vec<i64>, _>("participants")
+                .into_iter()
+                .map(AccountId::new)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(backend)?;
+            episodes.push((UnixMillis::new(row.get("ended_ms")), people));
+        }
+        Ok(Activity::new(episodes))
     }
 
     async fn get(&self, group: GroupId, id: EpisodeId) -> Result<Option<Episode>, MemoryError> {

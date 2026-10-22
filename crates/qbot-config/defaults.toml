@@ -95,9 +95,23 @@ half_life_days = 180
 [memory.facts]
 # How long a learned claim of each decay class typically keeps holding when nobody says it again:
 # its confidence (the probability that it holds now) halves every half-life since its last
-# support. Nothing is expired for it; an unrepeated claim ranks lower. Names learned from chat age
+# support. Nothing expires for it (room is memory.capacity). Names learned from chat age
 # like stable facts.
 half_life_days = { stable = 730, default = 180, fast = 45 }
+# How current a learned claim stays in the conversation, by decay class: halved for every this
+# many episodes its subject takes part in (for the group's terms and topics, every episode of
+# the group) without saying it again. Ranks what replies are shown and what makes way when a
+# scope is full; a quiet group's clock barely moves. Confidence is not affected.
+activity_half_life_episodes = { stable = 200, default = 40, fast = 10 }
+
+[memory.capacity]
+# Learned claims a group keeps: per member, terms (each meaning counts) and topics. When an
+# episode leaves a scope over its room, the claims there worth least (confidence times how
+# current they are) are deleted, never what that episode said; the episodes keep what was said.
+# Bounds what accumulates in a busy group and what the extractor reads about each member.
+person_facts = 40
+group_terms = 120
+group_topics = 8
 
 [media]
 # Transcribe voice clips in the process (SenseVoice on the CPU; the model is fetched once with

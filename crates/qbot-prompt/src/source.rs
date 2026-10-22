@@ -10,7 +10,7 @@ use qbot_agent::{
 use qbot_context::{ChatLine, Instruction, InstructionRole, Speaker};
 use qbot_core::marker::{RECALLED, escape_markers};
 use qbot_core::{Clock, GroupId, HistoryWindow, MemberNo, UnixMillis};
-use qbot_memory::belief::{as_of_day, percent};
+use qbot_memory::belief::{Activity, as_of_day, percent};
 use qbot_memory::facts::{DecayPolicy, Fact, FactStore, GROUP_TERM, GROUP_TOPIC};
 use qbot_memory::{Background, EpisodeStore, HistoryPart, MemoryError, SliceBackground, compose};
 use qbot_store::{GroupPeople, PgArchive};
@@ -43,6 +43,9 @@ pub struct FactKnowledge {
     /// accumulates far more terms than a prompt should carry.
     max_terms: usize,
     decay: DecayPolicy,
+    /// The group's episodes, the clock of how current knowledge is; without them, knowledge is
+    /// weighed by confidence alone.
+    episodes: Option<Arc<dyn EpisodeStore>>,
 }
 
 impl FactKnowledge {
@@ -51,7 +54,14 @@ impl FactKnowledge {
             facts,
             max_terms,
             decay,
+            episodes: None,
         }
+    }
+
+    /// Weigh knowledge by how current it is in the group's conversation as well.
+    pub fn with_activity(mut self, episodes: Arc<dyn EpisodeStore>) -> Self {
+        self.episodes = Some(episodes);
+        self
     }
 }
 
@@ -65,37 +75,49 @@ impl std::fmt::Debug for FactKnowledge {
 
 #[async_trait]
 impl KnowledgeSource for FactKnowledge {
-    /// The most confident topic, then for each term its most confident meaning, the most
-    /// confident terms (up to `max_terms`) listed in term order. Confidence is as of the start of
-    /// the day and confirming a shown term does not reorder the block, so the cached prompt prefix
-    /// changes only when a shown meaning or its rounded confidence does.
+    /// The topic most worth showing, then for each term its meaning most worth showing, the terms
+    /// most worth showing (up to `max_terms`) listed in term order, each with its confidence.
+    /// Worth is confidence times how current the claim is (`DecayPolicy::value`). Both are as of
+    /// the start of the day and confirming a shown term does not reorder the block, so the cached
+    /// prompt prefix changes only when what is shown or its rounded confidence does.
     async fn knowledge(&self, group: GroupId, now: UnixMillis) -> Result<Vec<Knowledge>, EnvError> {
         let facts = self
             .facts
             .current(group, None)
             .await
             .map_err(|e| EnvError(e.to_string()))?;
-        let confidences = self.decay.confidences(&facts, as_of_day(now));
-        // The more confident, then the more recently supported, then the newer claim.
-        let rank = |a: &(&Fact, f64), b: &(&Fact, f64)| {
-            a.1.total_cmp(&b.1)
+        let activity = match &self.episodes {
+            Some(episodes) => episodes
+                .activity(group)
+                .await
+                .map_err(|e| EnvError(e.to_string()))?,
+            None => Activity::default(),
+        };
+        let assessed = self.decay.assess(&facts, &activity, as_of_day(now));
+        // The more worth, then the more recently supported, then the newer claim.
+        let rank = |a: &(&Fact, f64, f64), b: &(&Fact, f64, f64)| {
+            a.2.total_cmp(&b.2)
                 .then(a.0.last_confirmed.cmp(&b.0.last_confirmed))
                 .then(a.0.id.cmp(&b.0.id))
         };
-        let scored: Vec<(&Fact, f64)> = facts.iter().zip(confidences).collect();
+        let scored: Vec<(&Fact, f64, f64)> = facts
+            .iter()
+            .zip(assessed)
+            .map(|(f, (confidence, worth))| (f, confidence, worth))
+            .collect();
         let mut out: Vec<Knowledge> = scored
             .iter()
-            .filter(|(f, _)| f.predicate == GROUP_TOPIC)
+            .filter(|(f, _, _)| f.predicate == GROUP_TOPIC)
             .max_by(|a, b| rank(a, b))
-            .map(|(f, confidence)| Knowledge {
+            .map(|(f, confidence, _)| Knowledge {
                 term: None,
                 text: f.object.clone(),
                 confidence: *confidence,
             })
             .into_iter()
             .collect();
-        let mut meanings: BTreeMap<&str, (&Fact, f64)> = BTreeMap::new();
-        for item in scored.iter().filter(|(f, _)| f.predicate == GROUP_TERM) {
+        let mut meanings: BTreeMap<&str, (&Fact, f64, f64)> = BTreeMap::new();
+        for item in scored.iter().filter(|(f, _, _)| f.predicate == GROUP_TERM) {
             match meanings.get(item.0.slot.as_str()) {
                 Some(kept) if rank(kept, item).is_ge() => {}
                 _ => {
@@ -103,11 +125,11 @@ impl KnowledgeSource for FactKnowledge {
                 }
             }
         }
-        let mut terms: Vec<(&Fact, f64)> = meanings.into_values().collect();
+        let mut terms: Vec<(&Fact, f64, f64)> = meanings.into_values().collect();
         terms.sort_by(|a, b| rank(b, a));
         terms.truncate(self.max_terms);
         terms.sort_by(|a, b| a.0.slot.cmp(&b.0.slot).then(a.0.id.cmp(&b.0.id)));
-        out.extend(terms.into_iter().map(|(f, confidence)| Knowledge {
+        out.extend(terms.into_iter().map(|(f, confidence, _)| Knowledge {
             term: Some(f.label.clone().unwrap_or_else(|| f.key.clone())),
             text: f.object.clone(),
             confidence,

@@ -3,23 +3,41 @@
 //! and one episode says one thing per slot (its last statement), so applying the same episode
 //! again changes nothing, and a crash between storing an episode and applying it loses nothing
 //! (the episode stays unconsolidated until applied).
+//!
+//! Room follows the conversation: after an episode is applied, each scope it touched (a member's
+//! facts, the group's terms, its topics) that is over its capacity lets its claims of least value
+//! go, weighed as of the episode's end. Nothing else ages memory; nothing runs on a schedule.
+//! Weighing as of the episode makes it deterministic, so applying the same episode again evicts
+//! nothing more, and what the episode itself supported is never evicted by it.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
+
+use qbot_core::AccountId;
 
 use crate::episode::Episode;
 use crate::facts::{
-    FactStore, GROUP_TERM, GROUP_TOPIC, Observation, Retraction, TOPIC_SLOT, slot, term_slot,
+    Capacity, DecayPolicy, FactStore, GROUP_TERM, GROUP_TOPIC, Observation, Retraction, slot,
+    term_slot, topic_slot,
 };
 use crate::findings::KnowledgeFinding;
 use crate::identity::{EvidenceKind, EvidenceRecord, IdentityError};
 use crate::identity_store::IdentityStore;
 use crate::predicates::{DecayClass, Predicates};
-use crate::store::MemoryError;
+use crate::store::{EpisodeStore, MemoryError};
 
 pub struct Consolidator {
     facts: Arc<dyn FactStore>,
     identity: Arc<dyn IdentityStore>,
     predicates: Arc<Predicates>,
+    room: Option<Room>,
+}
+
+/// What capacity management needs: the group's activity, how claims age, and the room.
+struct Room {
+    episodes: Arc<dyn EpisodeStore>,
+    decay: DecayPolicy,
+    capacity: Capacity,
 }
 
 impl std::fmt::Debug for Consolidator {
@@ -38,7 +56,24 @@ impl Consolidator {
             facts,
             identity,
             predicates,
+            room: None,
         }
+    }
+
+    /// Keep each scope within `capacity` as episodes are applied, weighing claims by `decay` on
+    /// the activity of `episodes`. Without it, claims accumulate.
+    pub fn with_capacity(
+        mut self,
+        episodes: Arc<dyn EpisodeStore>,
+        decay: DecayPolicy,
+        capacity: Capacity,
+    ) -> Self {
+        self.room = Some(Room {
+            episodes,
+            decay,
+            capacity,
+        });
+        self
     }
 
     pub async fn apply(&self, episode: &Episode) -> Result<(), MemoryError> {
@@ -105,7 +140,7 @@ impl Consolidator {
                     quote: quote.clone(),
                     at,
                 },
-                // The group's topics compete.
+                // A topic stands beside the others; they compete only for room.
                 KnowledgeFinding::Topic {
                     topic,
                     message,
@@ -114,7 +149,7 @@ impl Consolidator {
                     group,
                     subject: None,
                     predicate: GROUP_TOPIC.into(),
-                    slot: TOPIC_SLOT.into(),
+                    slot: topic_slot(topic),
                     object: topic.clone(),
                     label: None,
                     decay: DecayClass::Stable,
@@ -126,8 +161,12 @@ impl Consolidator {
             };
             observations.push(observation);
         }
+        // The scopes the episode touched, and the claims it supported there.
+        let mut touched: BTreeSet<Option<AccountId>> = BTreeSet::new();
+        let mut said = Vec::new();
         for observation in last_per_slot(observations) {
-            self.facts.observe(&observation).await?;
+            touched.insert(observation.subject);
+            said.push(self.facts.observe(&observation).await?);
         }
         // After what the episode affirms: within one stretch of chat, "I don't play it any more"
         // comes after the playing it ends. Retracting what is not recorded changes nothing, so
@@ -146,6 +185,27 @@ impl Consolidator {
             };
             if self.facts.retract(&retraction).await? {
                 tracing::info!(group = group.get(), predicate = %fact.predicate, "a fact was said to hold no longer");
+            }
+        }
+        if let Some(room) = &self.room {
+            let activity = room.episodes.activity(group).await?;
+            for subject in touched {
+                let claims = self.facts.current(group, subject).await?;
+                let values: Vec<f64> = room
+                    .decay
+                    .assess(&claims, &activity, at)
+                    .into_iter()
+                    .map(|(_, value)| value)
+                    .collect();
+                let evict = room.capacity.evictions(&claims, &values, &said);
+                if !evict.is_empty() {
+                    let evicted = self.facts.evict(group, &evict).await?;
+                    tracing::info!(
+                        group = group.get(),
+                        evicted,
+                        "claims of least value made room"
+                    );
+                }
             }
         }
         Ok(())

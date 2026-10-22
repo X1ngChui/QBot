@@ -388,11 +388,10 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
             timezone: config.bot.timezone.clone(),
         },
     )?
-    .with_knowledge(Arc::new(qbot_prompt::FactKnowledge::new(
-        facts.clone(),
-        config.group_terms(),
-        config.decay_policy(),
-    )))
+    .with_knowledge(Arc::new(
+        qbot_prompt::FactKnowledge::new(facts.clone(), config.group_terms(), config.decay_policy())
+            .with_activity(episodes.clone()),
+    ))
     .with_people(
         Arc::new(qbot_prompt::ArchivePeople::new(
             archive.clone(),
@@ -439,11 +438,14 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         clock: clock.clone(),
         extractor: Arc::new(
             EpisodeJobs::new(episodes.clone(), builder, config.slice_grid())
-                .with_consolidator(Arc::new(Consolidator::new(
-                    facts.clone(),
-                    identity.clone(),
-                    predicates.clone(),
-                )))
+                .with_consolidator(Arc::new(
+                    Consolidator::new(facts.clone(), identity.clone(), predicates.clone())
+                        .with_capacity(
+                            episodes.clone(),
+                            config.decay_policy(),
+                            config.memory_capacity(),
+                        ),
+                ))
                 // Extraction reads the group as replies do: the same people and knowledge.
                 .with_background(prompt.clone()),
         ),

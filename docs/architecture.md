@@ -642,7 +642,7 @@ The schema holds only what a deployment may choose:
 | `database` | host, port, name, user, ssl mode, password secret |
 | `replies` | concurrency, deadline, messages per reply, the chance of a spontaneous run |
 | `history` | batch lines, raw and summary batches |
-| `memory` | slice batches, group terms and facts per person shown; recall's max distance and half-life; how long claims of each decay class keep holding (half-lives) |
+| `memory` | slice batches, group terms and facts per person shown; recall's max distance and half-life; how long claims of each decay class keep holding (days) and stay current (episodes); how many claims a group keeps per member, of terms and of topics |
 | `media` | voice transcription on or off; pictures and clips per minute per group; how long a reply waits for them |
 | `network` | an outbound proxy and the services that use it |
 | `providers.*` | text (kind, endpoint, model, reasoning of replies and of extraction), vision, embedding (model, width, batch), search (depths) |
@@ -694,6 +694,7 @@ error is left to that error. The local limits and why they exist:
 | Search results, passages | 5, 3 | enough to answer from, little enough to read |
 | Group terms in the prompt | configured (40) | the block enters every reply's instructions |
 | Learned facts per person in the prompt | configured (16) | the people block enters every reply's instructions; the rest stay recorded |
+| Learned claims a group keeps | configured (40 per member, 120 term claims, 8 topics) | what a busy group accumulates, and what the extractor reads about each member; the claims worth least make way, never what the episode applied just said |
 | Notes per account | 20 | bounds what one member's notes add to every reply's people block |
 | Name length | 64 characters | a name is a name, not a paragraph |
 | Per-call deadlines | 10 min text, 2 min picture, 30 s embedding, 20 s search | a hung connection must not stall the nightly run |

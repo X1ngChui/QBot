@@ -226,4 +226,21 @@ impl FactStore for PgFactStore {
             .map_err(backend)?;
         Ok(result.rows_affected() > 0)
     }
+
+    async fn evict(&self, group: GroupId, ids: &[FactId]) -> Result<usize, MemoryError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let ids: Vec<i64> = ids.iter().map(|id| id.0).collect();
+        // Evidence goes with its fact (ON DELETE CASCADE).
+        let result = sqlx::query(
+            "DELETE FROM fact WHERE group_id = $1 AND fact_id = ANY($2) AND status = 'active'",
+        )
+        .bind(group.get())
+        .bind(&ids)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(usize::try_from(result.rows_affected()).unwrap_or(usize::MAX))
+    }
 }

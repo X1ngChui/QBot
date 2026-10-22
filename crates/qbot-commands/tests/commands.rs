@@ -1299,7 +1299,7 @@ fn group_fact(
         slot: if predicate == qbot_memory::facts::GROUP_TERM {
             qbot_memory::facts::term_slot(key)
         } else {
-            qbot_memory::facts::TOPIC_SLOT.into()
+            qbot_memory::facts::topic_slot(object)
         },
         label: label.map(str::to_owned),
         ..observation(ALICE, "likes", object, episode)

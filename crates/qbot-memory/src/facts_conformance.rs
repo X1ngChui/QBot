@@ -254,4 +254,31 @@ pub async fn run(store: &dyn FactStore, accounts: &[i64]) {
     let current = store.current(g, subject(a)).await.unwrap();
     let shanghai = current.iter().find(|f| f.id == new_home).unwrap();
     assert!(policy.confidence(shanghai, &current, at(130)) > before * 3.0);
+
+    // Eviction deletes active claims of the group with their evidence, nothing else; the same
+    // value said again afterwards is a new claim.
+    let cats = current.iter().find(|f| f.key == "cats").unwrap().id;
+    assert_eq!(
+        store.evict(other, &[cats]).await.unwrap(),
+        0,
+        "not this group's"
+    );
+    assert_eq!(store.evict(g, &[cats, new_home]).await.unwrap(), 2);
+    assert_eq!(store.evict(g, &[cats]).await.unwrap(), 0, "already gone");
+    assert_eq!(store.evict(g, &[]).await.unwrap(), 0);
+    let left = store.current(g, subject(a)).await.unwrap();
+    assert!(left.iter().all(|f| f.id != cats && f.id != new_home));
+    assert!(left.iter().any(|f| f.key == "dogs"), "other claims stay");
+    let again = store
+        .observe(&obs(g, Some(a), "likes", "cats", 2, 140))
+        .await
+        .unwrap();
+    assert_ne!(again, cats);
+    let renewed = store.current(g, subject(a)).await.unwrap();
+    let renewed = renewed.iter().find(|f| f.id == again).unwrap();
+    assert_eq!(
+        (renewed.supports, renewed.first_seen),
+        (1, at(140)),
+        "its old evidence went with it, so an episode that supported it before counts afresh"
+    );
 }

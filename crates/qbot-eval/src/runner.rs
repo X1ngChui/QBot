@@ -18,9 +18,10 @@ use qbot_core::{AccountId, ChainId, Clock, GroupId, MessageId, RunId, TimerId, U
 use qbot_llm::embedding::FakeEmbedder;
 use qbot_llm::search::{FakeSearch, PageRead, SearchHit, SearchResults};
 use qbot_llm::{Provider, ReasoningEffort, Usage};
+use qbot_memory::belief::Activity;
 use qbot_memory::facts::{
-    DecayPolicy, FactStore, GROUP_TERM, GROUP_TOPIC, MemoryFactStore, Observation, TOPIC_SLOT,
-    slot, term_slot,
+    DecayPolicy, FactStore, GROUP_TERM, GROUP_TOPIC, MemoryFactStore, Observation, slot, term_slot,
+    topic_slot,
 };
 use qbot_memory::predicates::{DecayClass, Predicates};
 use qbot_memory::{EpisodeId, MemoryEpisodeStore, Recall, RecallParams};
@@ -280,18 +281,21 @@ async fn scenario_people(
                 .current(group, Some(*account))
                 .await
                 .map_err(|e| e.to_string())?;
-            // The deployment's default decay, as the store would weigh them.
-            let confidences = DecayPolicy::default().confidences(&about, now);
-            for (fact, confidence) in about.into_iter().zip(confidences) {
+            // The deployment's default decay, as the store would weigh them (a scenario has no
+            // earlier episodes, so everything is current).
+            let assessed = DecayPolicy::default().assess(&about, &Activity::default(), now);
+            for (fact, (confidence, worth)) in about.into_iter().zip(assessed) {
                 person.facts.push(KnownFact {
                     predicate: fact.predicate,
                     value: fact.label.unwrap_or(fact.object),
                     supports: fact.supports,
                     last_confirmed: fact.last_confirmed,
                     confidence,
+                    worth,
                 });
             }
         }
+        person.facts.sort_by(|a, b| b.worth.total_cmp(&a.worth));
         let has_records = person.members.len() > 1
             || !person.blocked.is_empty()
             || !person.notes.is_empty()
@@ -381,7 +385,7 @@ impl Runner {
             episode += 1;
             let (predicate, slot, label) = match &k.term {
                 Some(term) => (GROUP_TERM, term_slot(term), Some(term.clone())),
-                None => (GROUP_TOPIC, TOPIC_SLOT.to_owned(), None),
+                None => (GROUP_TOPIC, topic_slot(&k.text), None),
             };
             facts
                 .observe(&Observation {

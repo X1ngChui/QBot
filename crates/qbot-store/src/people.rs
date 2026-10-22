@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use qbot_core::{AccountId, GroupId, MemberNo, UnixMillis};
-use qbot_memory::belief::{as_of_day, persistence};
+use qbot_memory::belief::{Activity, as_of_day, persistence};
 use qbot_memory::facts::{DecayPolicy, Fact};
 use qbot_memory::predicates::DecayClass;
 use sqlx::Row;
@@ -34,7 +34,7 @@ pub struct Person {
     pub names: Vec<KnownName>,
     /// Notes members wrote about them, oldest first.
     pub notes: Vec<KnownNote>,
-    /// Facts learned from chat, the most confident first.
+    /// Facts learned from chat, the most worth showing first.
     pub facts: Vec<KnownFact>,
 }
 
@@ -63,6 +63,9 @@ pub struct KnownFact {
     /// The probability that it holds (`qbot_memory::belief`), weighed against the competing
     /// claims about the same account.
     pub confidence: f64,
+    /// What it is worth where room is limited: confidence times how current it still is in the
+    /// group's conversation (`DecayPolicy::value`). Orders the facts; not shown.
+    pub worth: f64,
 }
 
 impl Person {
@@ -208,7 +211,25 @@ impl PgArchive {
             }
         }
 
-        // Facts weigh against the competing claims about the same account.
+        // Facts weigh against the competing claims about the same account; how current they are
+        // follows the group's own episodes.
+        let mut episodes = Vec::new();
+        for row in sqlx::query(
+            "SELECT ended_ms, participants FROM episode WHERE group_id = $1 ORDER BY ended_ms",
+        )
+        .bind(g)
+        .fetch_all(pool)
+        .await?
+        {
+            let people = row
+                .get::<Vec<i64>, _>("participants")
+                .into_iter()
+                .map(AccountId::new)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(corrupt)?;
+            episodes.push((UnixMillis::new(row.get("ended_ms")), people));
+        }
+        let activity = Activity::new(episodes);
         let mut about: BTreeMap<i64, Vec<Fact>> = BTreeMap::new();
         for row in sqlx::query(&format!(
             "SELECT {} FROM fact WHERE group_id = $1 AND status = 'active' \
@@ -228,14 +249,15 @@ impl PgArchive {
             let Some(person) = person_of(account).and_then(|h| people.get_mut(&h)) else {
                 continue;
             };
-            let confidences = decay.confidences(&facts, as_of);
-            for (fact, confidence) in facts.into_iter().zip(confidences) {
+            let assessed = decay.assess(&facts, &activity, as_of);
+            for (fact, (confidence, worth)) in facts.into_iter().zip(assessed) {
                 person.facts.push(KnownFact {
                     predicate: fact.predicate,
                     value: fact.label.unwrap_or(fact.object),
                     supports: fact.supports,
                     last_confirmed: fact.last_confirmed,
                     confidence,
+                    worth,
                 });
             }
         }
@@ -248,8 +270,8 @@ impl PgArchive {
                 p.blocked.sort();
                 p.names.sort_by(|a, b| a.text.cmp(&b.text));
                 p.facts.sort_by(|a, b| {
-                    b.confidence
-                        .total_cmp(&a.confidence)
+                    b.worth
+                        .total_cmp(&a.worth)
                         .then_with(|| a.predicate.cmp(&b.predicate))
                         .then(b.last_confirmed.cmp(&a.last_confirmed))
                         .then_with(|| a.value.cmp(&b.value))

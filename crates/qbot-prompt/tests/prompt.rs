@@ -343,8 +343,8 @@ fn persona_loading_reports_every_problem() {
 async fn learned_group_knowledge_joins_the_stable_instructions() {
     use qbot_memory::episode::EpisodeId;
     use qbot_memory::facts::{
-        DecayPolicy, FactStore, GROUP_TERM, GROUP_TOPIC, MemoryFactStore, Observation, TOPIC_SLOT,
-        term_slot,
+        DecayPolicy, FactStore, GROUP_TERM, GROUP_TOPIC, MemoryFactStore, Observation, term_slot,
+        topic_slot,
     };
     use qbot_memory::predicates::DecayClass;
     let g = GroupId::new(900).unwrap();
@@ -357,7 +357,7 @@ async fn learned_group_knowledge_joins_the_stable_instructions() {
             slot: if predicate == GROUP_TERM {
                 term_slot(key)
             } else {
-                TOPIC_SLOT.into()
+                topic_slot(text)
             },
             object: text.into(),
             label: label.map(Into::into),
@@ -480,6 +480,7 @@ async fn every_person_with_a_record_is_shown_whole_in_the_cached_prefix() {
                         supports: 3,
                         last_confirmed: at,
                         confidence: 0.8,
+                        worth: 0.8,
                     },
                     KnownFact {
                         predicate: "lives_in".into(),
@@ -487,6 +488,7 @@ async fn every_person_with_a_record_is_shown_whole_in_the_cached_prefix() {
                         supports: 1,
                         last_confirmed: at,
                         confidence: 0.09,
+                        worth: 0.09,
                     },
                 ],
             },
@@ -537,8 +539,8 @@ async fn every_person_with_a_record_is_shown_whole_in_the_cached_prefix() {
 async fn only_the_most_confident_meanings_and_terms_are_shown_in_a_stable_order() {
     use qbot_memory::episode::EpisodeId;
     use qbot_memory::facts::{
-        DecayPolicy, FactStore, GROUP_TERM, GROUP_TOPIC, MemoryFactStore, Observation, TOPIC_SLOT,
-        term_slot,
+        DecayPolicy, FactStore, GROUP_TERM, GROUP_TOPIC, MemoryFactStore, Observation, term_slot,
+        topic_slot,
     };
     use qbot_memory::predicates::DecayClass;
     use qbot_prompt::KnowledgeSource;
@@ -551,7 +553,7 @@ async fn only_the_most_confident_meanings_and_terms_are_shown_in_a_stable_order(
         slot: if predicate == GROUP_TERM {
             term_slot(key)
         } else {
-            TOPIC_SLOT.into()
+            topic_slot(text)
         },
         object: text.into(),
         label: None,
@@ -610,6 +612,59 @@ async fn only_the_most_confident_meanings_and_terms_are_shown_in_a_stable_order(
         .map(|k| k.text)
         .collect();
     assert_eq!(texts, ["a chess club", "aa", "middle"]);
+}
+
+#[tokio::test]
+async fn in_a_busy_group_a_fresh_term_takes_the_place_of_one_nobody_uses_any_more() {
+    use qbot_memory::episode::EpisodeId;
+    use qbot_memory::facts::{DecayPolicy, FactStore, GROUP_TERM, MemoryFactStore, Observation};
+    use qbot_memory::predicates::DecayClass;
+    use qbot_memory::{EpisodeStore, MemoryEpisodeStore, conformance::episode};
+    use qbot_prompt::KnowledgeSource;
+    let g = GroupId::new(902).unwrap();
+    let day = 86_400_000;
+    let facts = Arc::new(MemoryFactStore::new());
+    let say = |term: &str, episode: i64, at: i64| Observation {
+        group: g,
+        subject: None,
+        predicate: GROUP_TERM.into(),
+        slot: qbot_memory::facts::term_slot(term),
+        object: format!("meaning of {term}"),
+        label: Some(term.into()),
+        decay: DecayClass::Default,
+        episode: EpisodeId::new(episode),
+        message: MessageId::new(episode).unwrap(),
+        quote: "q".into(),
+        at: UnixMillis::new(at),
+    };
+    // "old" was used in three episodes; then the group talked through sixty more without it.
+    for n in 1..=3 {
+        facts.observe(&say("old", n, n * day)).await.unwrap();
+    }
+    let episodes = Arc::new(MemoryEpisodeStore::new());
+    for n in 0..60u64 {
+        let mut e = episode(g, n * 10 + 1, n * 10 + 10, "chat");
+        e.ended = UnixMillis::new(4 * day + n as i64 * 60_000);
+        episodes.insert(&e, &[1.0, 0.0], "m").await.unwrap();
+    }
+    facts.observe(&say("new", 99, 5 * day)).await.unwrap();
+    let now = UnixMillis::new(6 * day);
+    let terms = |items: Vec<qbot_prompt::Knowledge>| -> Vec<String> {
+        items.into_iter().filter_map(|k| k.term).collect()
+    };
+    let by_confidence = qbot_prompt::FactKnowledge::new(facts.clone(), 1, DecayPolicy::default());
+    assert_eq!(
+        terms(by_confidence.knowledge(g, now).await.unwrap()),
+        ["old"],
+        "by confidence alone, three mentions outweigh one"
+    );
+    let by_worth =
+        qbot_prompt::FactKnowledge::new(facts, 1, DecayPolicy::default()).with_activity(episodes);
+    assert_eq!(
+        terms(by_worth.knowledge(g, now).await.unwrap()),
+        ["new"],
+        "on the group's own clock, sixty episodes without it make room for the fresh one"
+    );
 }
 
 /// A context over `n` lines (ordinal = message id), batches of two: the newest two batches
@@ -934,6 +989,7 @@ async fn the_extractor_is_told_who_the_people_in_a_slice_are_and_what_the_group_
                 supports: 2,
                 last_confirmed: at,
                 confidence: 0.75,
+                worth: 0.75,
             }],
         }],
     };

@@ -261,4 +261,22 @@ pub async fn run(store: &dyn EpisodeStore) {
             .await,
         Err(MemoryError::NotFound)
     ));
+
+    // The group's activity: every episode of the group, with who took part.
+    let (dawn, end) = (UnixMillis::new(0), UnixMillis::new(i64::MAX));
+    let activity = store.activity(g).await.unwrap();
+    assert_eq!(activity.since(None, dawn, end) as usize, every.len());
+    assert_eq!(
+        activity.since(Some(AccountId::new(5).unwrap()), dawn, end) as usize,
+        every.len()
+    );
+    assert_eq!(
+        activity.since(Some(AccountId::new(77).unwrap()), dawn, end),
+        0
+    );
+    assert_eq!(
+        store.activity(h).await.unwrap().since(None, dawn, end),
+        1,
+        "scoped by group"
+    );
 }

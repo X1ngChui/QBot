@@ -316,6 +316,9 @@ slice_batches = 0
 max_distance = 1.0
 [memory.facts]
 half_life_days = { stable = 0, default = 30, fast = 14 }
+activity_half_life_episodes = { stable = 200, default = 0, fast = 10 }
+[memory.capacity]
+person_facts = 3
 [maintenance]
 nightly_cron = "every night"
 "#,
@@ -340,6 +343,8 @@ nightly_cron = "every night"
         "memory.slice_batches",
         "memory.recall.max_distance",
         "memory.facts.half_life_days",
+        "memory.facts.activity_half_life_episodes",
+        "memory.capacity",
         "maintenance.nightly_cron",
     ] {
         assert!(
@@ -347,7 +352,7 @@ nightly_cron = "every night"
             "{expected} missing from {keys:?}"
         );
     }
-    assert_eq!(keys.len(), 9);
+    assert_eq!(keys.len(), 11);
     assert!(
         !found.iter().any(|e| e.to_string().contains("pass@")),
         "an embedded credential is not echoed"
@@ -569,6 +574,7 @@ fn the_configuration_defaults_equal_the_defaults_of_the_crates_that_consume_them
     let c = load(&scratch(), &MapEnv::default()).unwrap().config;
     assert_eq!(c.recall_params(), qbot_memory::RecallParams::default());
     assert_eq!(c.decay_policy(), qbot_memory::facts::DecayPolicy::default());
+    assert_eq!(c.memory_capacity(), qbot_memory::facts::Capacity::default());
     assert_eq!(c.history_window(), qbot_core::HistoryWindow::default());
     assert_eq!(c.media_config(), qbot_media::MediaConfig::default());
     assert_eq!(c.tool_settings().max_sends_per_run, 4);

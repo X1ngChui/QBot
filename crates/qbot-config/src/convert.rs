@@ -16,7 +16,7 @@ use qbot_llm::responses::{ResponsesConfig, RetryPolicy, StateMode};
 use qbot_llm::search::TavilyConfig;
 use qbot_media::MediaConfig;
 use qbot_memory::RecallParams;
-use qbot_memory::facts::DecayPolicy;
+use qbot_memory::facts::{Capacity, DecayPolicy, EpisodeHalfLives};
 use qbot_ops::{BackupConfig, OpsConfig, PgTarget};
 use qbot_tools::ToolSettings;
 
@@ -188,11 +188,30 @@ impl Config {
     }
 
     pub fn decay_policy(&self) -> DecayPolicy {
-        let h = &self.memory.facts.half_life_days;
+        let (h, a) = (
+            &self.memory.facts.half_life_days,
+            &self.memory.facts.activity_half_life_episodes,
+        );
         DecayPolicy {
             stable: days(h.stable),
             default: days(h.default),
             fast: days(h.fast),
+            activity: EpisodeHalfLives {
+                stable: f64::from(a.stable),
+                default: f64::from(a.default),
+                fast: f64::from(a.fast),
+            },
+        }
+    }
+
+    /// How many learned claims each scope of a group keeps.
+    pub fn memory_capacity(&self) -> Capacity {
+        let c = &self.memory.capacity;
+        let n = |v: u32| usize::try_from(v).unwrap_or(usize::MAX);
+        Capacity {
+            person_facts: n(c.person_facts),
+            group_terms: n(c.group_terms),
+            group_topics: n(c.group_topics),
         }
     }
 

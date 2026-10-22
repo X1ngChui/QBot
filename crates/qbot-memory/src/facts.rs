@@ -5,10 +5,11 @@
 //! one subject *compete* when they share a slot and differ in predicate or value: another value
 //! of a single-valued predicate, the opposite predicate for the same thing, another meaning of the
 //! same term. Competing claims stand side by side; which one is believed is their confidence
-//! ([`crate::belief`]), computed on read, never a deletion. Only an owner removes a fact
-//! (*forget*).
+//! ([`crate::belief`]), computed on read, never a deletion. An owner removes a fact (*forget*);
+//! otherwise a claim is deleted only to make room, when an episode leaves its scope over its
+//! [`Capacity`] and it is worth least there ([`DecayPolicy::value`]).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
@@ -17,7 +18,7 @@ use qbot_core::{AccountId, GroupId, MessageId, UnixMillis};
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
-use crate::belief::{contradicted, credibility, persistence};
+use crate::belief::{Activity, contradicted, credibility, persistence, salience};
 use crate::episode::EpisodeId;
 use crate::predicates::{Cardinality, DecayClass, Predicate};
 use crate::store::MemoryError;
@@ -143,15 +144,29 @@ pub fn term_slot(term: &str) -> String {
     format!("{GROUP_TERM}:{}", normalize_key(term))
 }
 
-/// The slot of the group's topic: one, the topics compete.
-pub const TOPIC_SLOT: &str = GROUP_TOPIC;
+/// The slot of one of the group's topics: one per topic, so topics stand side by side (a group
+/// talking about exams has not stopped being about games) and compete only for room.
+pub fn topic_slot(topic: &str) -> String {
+    format!("{GROUP_TOPIC}:{}", normalize_key(topic))
+}
 
-/// How long claims typically keep holding unsaid, by decay class. Deployment policy.
+/// How claims age, by decay class: how long they typically keep holding unsaid (wall-clock
+/// half-lives, for confidence) and how many episodes their subject can take part in without
+/// restating them before they are half as current (for salience). Deployment policy.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DecayPolicy {
     pub stable: Duration,
     pub default: Duration,
     pub fast: Duration,
+    pub activity: EpisodeHalfLives,
+}
+
+/// Half-lives counted in episodes, by decay class.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EpisodeHalfLives {
+    pub stable: f64,
+    pub default: f64,
+    pub fast: f64,
 }
 
 impl Default for DecayPolicy {
@@ -161,6 +176,11 @@ impl Default for DecayPolicy {
             stable: days(730),
             default: days(180),
             fast: days(45),
+            activity: EpisodeHalfLives {
+                stable: 200.0,
+                default: 40.0,
+                fast: 10.0,
+            },
         }
     }
 }
@@ -208,6 +228,107 @@ impl DecayPolicy {
             .map(|fact| self.confidence(fact, facts, now))
             .collect()
     }
+
+    pub fn activity_half_life(&self, class: DecayClass) -> f64 {
+        match class {
+            DecayClass::Stable => self.activity.stable,
+            DecayClass::Default => self.activity.default,
+            DecayClass::Fast => self.activity.fast,
+        }
+    }
+
+    /// What a claim is worth where room is limited (a prompt budget, a capacity): the chance it
+    /// holds, times how current it still is in the conversation. Not shown as confidence.
+    pub fn value(&self, fact: &Fact, confidence: f64, activity: &Activity, now: UnixMillis) -> f64 {
+        let passed = activity.since(fact.subject, fact.last_confirmed, now);
+        confidence * salience(self.activity_half_life(fact.decay), passed)
+    }
+
+    /// The confidence and value of each of `facts` at `now`, in order.
+    pub fn assess(&self, facts: &[Fact], activity: &Activity, now: UnixMillis) -> Vec<(f64, f64)> {
+        facts
+            .iter()
+            .map(|fact| {
+                let confidence = self.confidence(fact, facts, now);
+                (confidence, self.value(fact, confidence, activity, now))
+            })
+            .collect()
+    }
+}
+
+/// The room a group gives learned claims: how many active claims each scope keeps. Past it, the
+/// claims of least value make way (`Capacity::evictions`). Deployment policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Capacity {
+    /// Per member of a group.
+    pub person_facts: usize,
+    pub group_terms: usize,
+    pub group_topics: usize,
+}
+
+impl Default for Capacity {
+    fn default() -> Self {
+        Self {
+            person_facts: 40,
+            group_terms: 120,
+            group_topics: 8,
+        }
+    }
+}
+
+/// The room a claim takes: its subject's, or the group's terms or topics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Scope {
+    Person(AccountId),
+    Terms,
+    Topics,
+}
+
+impl Capacity {
+    fn room(&self, scope: Scope) -> usize {
+        match scope {
+            Scope::Person(_) => self.person_facts,
+            Scope::Terms => self.group_terms,
+            Scope::Topics => self.group_topics,
+        }
+    }
+
+    /// The claims to evict so that every scope among `facts` (active claims of one group, with
+    /// their values in order) fits its room: in each scope over it, those of least value (then
+    /// the longer unsupported, then the older), never one of `keep` (what was just said, so new
+    /// information always finds room).
+    pub fn evictions(&self, facts: &[Fact], values: &[f64], keep: &[FactId]) -> Vec<FactId> {
+        let mut scopes: BTreeMap<Scope, Vec<(&Fact, f64)>> = BTreeMap::new();
+        for (fact, value) in facts.iter().zip(values) {
+            let scope = match (fact.subject, fact.predicate.as_str()) {
+                (Some(account), _) => Scope::Person(account),
+                (None, GROUP_TERM) => Scope::Terms,
+                (None, GROUP_TOPIC) => Scope::Topics,
+                (None, _) => continue,
+            };
+            if fact.status == FactStatus::Active {
+                scopes.entry(scope).or_default().push((fact, *value));
+            }
+        }
+        let mut out = Vec::new();
+        for (scope, mut claims) in scopes {
+            let over = claims.len().saturating_sub(self.room(scope));
+            claims.sort_by(|(a, p), (b, q)| {
+                p.total_cmp(q)
+                    .then(a.last_confirmed.cmp(&b.last_confirmed))
+                    .then(a.id.cmp(&b.id))
+            });
+            out.extend(
+                claims
+                    .iter()
+                    .filter(|(f, _)| !keep.contains(&f.id))
+                    .take(over)
+                    .map(|(f, _)| f.id),
+            );
+        }
+        out.sort();
+        out
+    }
 }
 
 #[async_trait]
@@ -232,6 +353,10 @@ pub trait FactStore: Send + Sync {
 
     /// Strike out an active fact of the group. Returns whether one was.
     async fn forget(&self, group: GroupId, id: FactId) -> Result<bool, MemoryError>;
+
+    /// Delete active claims of the group to make room, with their evidence (the episodes that
+    /// supported them keep what was said). Returns how many.
+    async fn evict(&self, group: GroupId, ids: &[FactId]) -> Result<usize, MemoryError>;
 }
 
 #[derive(Default)]
@@ -371,6 +496,18 @@ impl FactStore for MemoryFactStore {
             }
             None => Ok(false),
         }
+    }
+
+    async fn evict(&self, group: GroupId, ids: &[FactId]) -> Result<usize, MemoryError> {
+        let mut inner = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let before = inner.facts.len();
+        inner.facts.retain(|f| {
+            !(f.group == group && f.status == FactStatus::Active && ids.contains(&f.id))
+        });
+        let gone = before - inner.facts.len();
+        let alive: std::collections::HashSet<FactId> = inner.facts.iter().map(|f| f.id).collect();
+        inner.evidence.retain(|(f, _, _, _)| alive.contains(f));
+        Ok(gone)
     }
 }
 
