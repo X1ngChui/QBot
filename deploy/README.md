@@ -159,14 +159,16 @@ The bot runs its own maintenance; nothing outside the container is needed.
   midnight) are cron expressions in `bot.timezone`. A run missed while the bot was down happens once
   when it comes back; each occurrence runs exactly once however often the bot restarts. A schedule
   that has never run starts from now.
-- **Nightly run**, in order: memory extraction for every group (after embedding any episode the
-  configured embedding model has no vector for, so a new embedding model needs no other step),
-  decay (cached picture descriptions older than 15 days; learned memory is not expired), a verified
+- **Memory extraction** is not part of it: each filled batch queues its group's extraction,
+  which first embeds any of the group's episodes the configured embedding model has no vector
+  for (a new embedding model needs no other step; a group re-embeds when it next fills a batch).
+  A failed extraction is logged and tried again with backoff and with the group's next filled
+  batch. A slice the provider refuses for good is skipped (`slice skipped` in the log) and its
+  lines simply have no episode.
+- **Nightly run**, in order: decay (cached picture descriptions older than 15 days; learned memory is not expired), a verified
   `pg_dump`, then cleanup (finished timers and runs after `maintenance.records_keep_days`, NapCat's file cache). Every
   stage runs even if an earlier one failed. A failed decay, backup or cleanup fails the job, which
-  is retried with backoff; a failed extraction is logged (`extraction failed`) and tried again with
-  the group's next filled batch or the next night. A slice the provider refuses for good is
-  skipped (`slice skipped` in the log) and its lines simply have no episode.
+  is retried with backoff.
 - **Backups** go to `data/qbot/backups` as `qbot-YYYYMMDD-HHMMSS.dump`. A dump is written under a
   temporary name, listed with `pg_restore` (it must parse and contain the chat archive) and only
   then renamed into place; the newest `maintenance.backups` are kept (0 makes none). The image

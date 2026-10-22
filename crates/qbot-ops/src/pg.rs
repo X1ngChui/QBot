@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use qbot_core::{GroupId, UnixMillis};
+use qbot_core::UnixMillis;
 use qbot_store::{PgAdmin, PgMediaCache, ReportData};
 
 use crate::ports::{Housekeeping, OpsError, ReportSource};
@@ -23,10 +23,6 @@ impl PgHousekeeping {
 
 #[async_trait]
 impl Housekeeping for PgHousekeeping {
-    async fn groups(&self) -> Result<Vec<GroupId>, OpsError> {
-        self.admin.groups().await.map_err(ops)
-    }
-
     async fn expire_descriptions(&self, before: UnixMillis) -> Result<u64, OpsError> {
         self.media.expire(before).await.map_err(ops)
     }

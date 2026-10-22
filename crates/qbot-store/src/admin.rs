@@ -351,18 +351,6 @@ impl PgAdmin {
             .collect()
     }
 
-    /// Every group the bot has seen.
-    pub async fn groups(&self) -> Result<Vec<GroupId>, StoreError> {
-        let rows = sqlx::query("SELECT group_id FROM group_state ORDER BY group_id")
-            .fetch_all(&self.pool)
-            .await?;
-        rows.iter()
-            .map(|r| {
-                GroupId::new(r.get("group_id")).map_err(|e| StoreError::corrupt(e.to_string()))
-            })
-            .collect()
-    }
-
     /// Delete timers that are over (done, cancelled or interrupted) and were created before
     /// `before`. Returns how many.
     pub async fn delete_finished_timers(&self, before: UnixMillis) -> Result<u64, StoreError> {

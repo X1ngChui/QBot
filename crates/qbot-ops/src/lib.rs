@@ -1,7 +1,8 @@
 //! Operations: the work the bot does for itself rather than for a group.
 //!
-//! - the **nightly pipeline** (memory extraction, decay, backup, cleanup including the chat
-//!   platform's file cache, in that order, each stage independent of the others' success);
+//! - the **nightly pipeline** (decay, backup, cleanup including the chat platform's file cache,
+//!   in that order, each stage independent of the others' success);
+//! - a group's **extraction** job, queued by each filled batch;
 //! - **verified backups** of the database with rotation;
 //! - the **daily report** to the owners.
 //!

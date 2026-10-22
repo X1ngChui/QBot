@@ -35,8 +35,8 @@ R9. Commands without model calls for members and owners (section 12).
 R10. Group tasks: durable timers owned by the group, bounded, waking the agent with fresh
 context; one-shot, or repeating by a rule the scheduler keeps (never by the model), each
 occurrence run at most once.
-R11. Operations: nightly extraction, embedding, fact decay, verified backups, cleanup, a daily
-report to the owners, and single-instance exclusivity.
+R11. Operations: extraction as chat fills batches, nightly upkeep (cache decay, verified
+backups, cleanup), a daily report to the owners, and single-instance exclusivity.
 R12. Observability: every provider call (model turns of replies, extraction and picture
 description, embeddings, web searches and page reads) is counted with its requests, tokens, cache
 hits, credits and latency, by the work it served; a run that fails logs why (`/logs`). Nothing
@@ -404,7 +404,8 @@ Described in [memory.md](memory.md). In short: the archive is the source of trut
 summarizes one fixed slice of whole batches and is never rewritten; extraction returns the
 episode and its findings in one validated tool call; consolidation turns findings into names,
 facts and group knowledge; recall ranks episodes by similarity decaying with age; embeddings are
-a derived index the nightly run keeps complete for the configured embedding model.
+a derived index each group's extraction completes for the configured embedding model before
+it extracts.
 
 **Groups are separate.** Except the owners' `/stats global` (totals of runs, provider calls and
 tokens over all groups), nothing learned or stored in one group becomes visible in, or changes
@@ -658,7 +659,8 @@ Derived rather than configured:
 - the reply queue: ten waiting runs per model slot of `replies.concurrency`;
 - the extraction's context: one batch on either side of a slice, within the verbatim tier;
 - extraction cadence: every filled batch queues its group's extraction, which extracts each
-  completed slice, and the nightly run catches up;
+  completed slice; nothing else extracts, so a slice missed by a failed job is extracted by
+  the group's next one;
 - how a name learned from chat ages: like a stable fact
   (`memory.facts.half_life_days.stable`), since a name lasts like where someone lives;
 - record retention: one `maintenance.records_keep_days` for finished runs and finished
@@ -723,13 +725,12 @@ spend.
 
 ## 16. Operations (`qbot-ops`)
 
-- **Nightly**: extraction (each group's episodes, after embedding any the current index lacks),
-  decay (cached picture descriptions older than 15 days; beliefs are not expired, their
-  confidence is computed on read), a verified backup, cleanup (finished tasks and finished runs after
-  `maintenance.records_keep_days`, NapCat's file cache through its `clean_cache` action). Every stage
-  runs. The job fails, and is retried, if decay, the backup or cleanup failed; a failed extraction
-  is logged and left to the group's next filled batch or the next night, since a retry of the
-  whole job would also take another backup and rotate an older one out.
+- **Extraction** is a group's own job, queued by each filled batch (memory.md section 2); the
+  nightly run does not extract.
+- **Nightly**: decay (cached picture descriptions older than 15 days; beliefs are not expired,
+  their confidence is computed on read), a verified backup, cleanup (finished tasks and finished
+  runs after `maintenance.records_keep_days`, NapCat's file cache through its `clean_cache`
+  action). Every stage runs; the job fails, and is retried, if any failed.
 - **Backups** shell out to `pg_dump`/`pg_restore`: password through the environment, a partial file
   verified by listing before an atomic rename, rotation after success, the tools checked at
   startup. A partial file left by a backup stopped with the process is removed by the next one.
@@ -775,7 +776,8 @@ through it.
 5. Evaluation is written in English; test conversations may be in Chinese.
 6. Speech recognition runs in the process.
 7. The archive is the source of truth. Derived memory survives a change of extraction model; only
-   an incompatible embedding model or width calls for re-embedding, which the nightly run does.
+   an incompatible embedding model or width calls for re-embedding, which each group's next
+   extraction does.
 
 ## 19. Known gaps
 
@@ -797,7 +799,11 @@ through it.
 - Every run sees every recorded member's names, notes and facts of its group; only the
   commands limit what a member may look up.
 - A slice the provider refuses with an error that is not classed as permanent is tried again on
-  every filled batch and every night, and holds back that group's later slices.
+  every filled batch, and holds back that group's later slices.
+- What is said in a group is learned only when its slice is complete: a group that stops
+  talking keeps its last, incomplete slice unextracted (still verbatim in the history and
+  searchable), and after an embedding change a group that fills no batch keeps its old
+  episodes unembedded until it does.
 - Messages shown by `search_history` and `read_episode` cannot be quoted, opened or used to
   address their authors: the run's view knows only what its context showed.
 - The people block's size grows with the people on record: facts are bounded per person, names

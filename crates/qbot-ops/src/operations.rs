@@ -105,30 +105,6 @@ impl Operations {
         )
     }
 
-    /// Extract every group's complete slices. A group that fails does not stop the others; the
-    /// errors are reported together.
-    pub async fn extract_all(&self) -> Result<usize, JobError> {
-        let groups = self.housekeeping.groups().await.map_err(failed)?;
-        let (mut episodes, mut failed_groups) = (0, 0);
-        for group in groups {
-            match self.extractor.extract_group(group).await {
-                Ok(n) => episodes += n,
-                // Logged under its group: what went wrong may quote the group's chat.
-                Err(error) => {
-                    failed_groups += 1;
-                    tracing::error!(group = group.get(), %error, "extraction failed for the group");
-                }
-            }
-        }
-        if failed_groups == 0 {
-            Ok(episodes)
-        } else {
-            Err(JobError(format!(
-                "extraction failed in {failed_groups} group(s)"
-            )))
-        }
-    }
-
     /// Drop stale picture descriptions (a cache, not memory).
     pub async fn decay(&self) -> Result<(), JobError> {
         let forgotten = self
@@ -156,7 +132,7 @@ impl Operations {
             None => (0, 0),
         };
         // Best effort: the platform may be disconnected at night. Failing would retry the whole
-        // pipeline (another extraction pass, another backup) for a cache the next night cleans.
+        // pipeline (another backup) for a cache the next night cleans.
         if let Some(cache) = &self.platform_cache
             && let Err(error) = cache.clean().await
         {
@@ -178,19 +154,12 @@ impl Operations {
         Ok(())
     }
 
-    /// The whole pipeline in order. Every stage runs even if an earlier one failed (a failed
-    /// extraction must not cost a night's backup). The job fails, and is retried, if decay, the
-    /// backup or cleanup did; a failed extraction is logged and left to the group's next filled
-    /// batch or the next night, because a retry of the pipeline would also take another backup
-    /// and rotate an older one out.
+    /// The whole pipeline in order: decay, backup, cleanup. Every stage runs even if an earlier
+    /// one failed (a failed decay must not cost a night's backup); the job fails, and is retried,
+    /// if any did. Memory extraction is not part of it: each group's filled batches queue their
+    /// own extraction.
     pub async fn nightly(&self) -> Result<(), JobError> {
         let mut failures = Vec::new();
-        match self.extract_all().await {
-            Ok(episodes) => tracing::info!(episodes, "extraction finished"),
-            Err(error) => {
-                tracing::error!(error = %error.0, "extraction failed; retried with the next batch or night")
-            }
-        }
         if let Err(error) = self.decay().await {
             failures.push(format!("decay: {error}"));
         }

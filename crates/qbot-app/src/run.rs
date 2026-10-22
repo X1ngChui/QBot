@@ -133,7 +133,7 @@ impl BatchFilled for ExtractOnBatch {
             .await
         {
             Ok(_) => self.wake.notify_one(),
-            // The nightly run extracts whatever this missed.
+            // The group's next filled batch queues another.
             Err(error) => {
                 tracing::warn!(%error, group = group.get(), "an extraction job could not be queued")
             }

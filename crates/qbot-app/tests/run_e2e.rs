@@ -1020,7 +1020,7 @@ async fn a_filled_batch_turns_archived_chat_into_a_stored_episode() {
     ]));
     let (llm, embedded) = mock_llm_counting(sim.clone()).await;
     // One-line batches and three-batch slices: the third line completes a slice, and the batch
-    // it fills queues the extraction at once, without waiting for the nightly run.
+    // it fills queues the extraction at once.
     deployment_with(
         &db,
         llm,

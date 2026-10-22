@@ -25,8 +25,6 @@ impl Extractor for EpisodeJobs {
 /// The deletions and listings maintenance needs from storage.
 #[async_trait]
 pub trait Housekeeping: Send + Sync {
-    /// Every group the bot has seen.
-    async fn groups(&self) -> Result<Vec<GroupId>, OpsError>;
     /// Forget picture descriptions older than `before`.
     async fn expire_descriptions(&self, before: UnixMillis) -> Result<u64, OpsError>;
     /// Delete finished timers created before `before`.

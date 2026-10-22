@@ -30,8 +30,8 @@ archive of chat lines is the source of truth; everything here is derived from it
 
 ## 2. Extraction
 
-Every filled batch queues its group's extraction job, and the nightly run extracts whatever was
-missed. `EpisodeJobs::extract_group` runs one group at a time: it first embeds any episode the
+Every filled batch queues its group's extraction job; nothing else extracts. A job that fails
+is retried with backoff, and whatever a job leaves undone the group's next one does. `EpisodeJobs::extract_group` runs one group at a time: it first embeds any episode the
 current embedding index lacks, then loops: find the next complete slice after the group's newest
 episode, read the previous, target and next lines, call the model, validate, embed
 `title + summary`, store the episode and its vector in one transaction, and apply its findings. It
@@ -107,8 +107,9 @@ episodes or what was learned from them.
   days ago beats 0.8 from a year ago).
 - `read_episode(id)` returns the raw lines of that episode's range, bounded by the slice size.
 - **Embeddings are a derived index.** An episode has one vector, from the configured embedding
-  model and width. When either changes, recall finds an episode again once the nightly run has
-  embedded it anew from its stored title and summary; nothing is extracted again.
+  model and width. When either changes, recall finds an episode again once its group's next extraction
+  (queued by its next filled batch) has embedded it anew from its stored title and summary;
+  nothing is extracted again.
 
 ## 4. Identity
 

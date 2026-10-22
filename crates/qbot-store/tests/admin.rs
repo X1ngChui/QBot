@@ -146,10 +146,8 @@ async fn the_daily_report_and_housekeeping_read_what_happened() {
     let log = PgRunLog::new(db.pool().clone(), clock.clone());
     let (g1, g2) = (group(21), group(22));
 
-    assert_eq!(admin.groups().await.unwrap(), Vec::<GroupId>::new());
     say(&archive, g1, 1, 501).await;
     say(&archive, g2, 2, 502).await;
-    assert_eq!(admin.groups().await.unwrap(), [g1, g2]);
 
     let finish = |end: RunEnd, error: Option<&'static str>| RunSummary {
         end,

@@ -33,16 +33,12 @@ fn owner(n: i64) -> AccountId {
 
 #[derive(Default)]
 struct Extract {
-    failing: Mutex<Vec<GroupId>>,
     done: Mutex<Vec<GroupId>>,
 }
 
 #[async_trait]
 impl Extractor for Extract {
     async fn extract_group(&self, g: GroupId) -> Result<usize, JobError> {
-        if self.failing.lock().unwrap().contains(&g) {
-            return Err(JobError("the model is down".into()));
-        }
         self.done.lock().unwrap().push(g);
         Ok(2)
     }
@@ -57,9 +53,6 @@ struct House {
 
 #[async_trait]
 impl Housekeeping for House {
-    async fn groups(&self) -> Result<Vec<GroupId>, OpsError> {
-        Ok(vec![group(1), group(2), group(3)])
-    }
     async fn expire_descriptions(&self, before: UnixMillis) -> Result<u64, OpsError> {
         self.calls
             .lock()
@@ -266,17 +259,12 @@ fn rig(owners: Vec<AccountId>) -> Rig {
 #[tokio::test]
 async fn the_nightly_pipeline_runs_every_stage_even_after_a_failure() {
     let r = rig(vec![owner(1)]);
-    r.extract.failing.lock().unwrap().push(group(2));
-    r.ops
-        .run(JobKind::Nightly, None)
-        .await
-        .expect("a failed extraction waits for the next batch or night, not a retry of the night");
-    assert_eq!(
-        *r.extract.done.lock().unwrap(),
-        [group(1), group(3)],
-        "the other groups were still extracted"
+    r.ops.run(JobKind::Nightly, None).await.unwrap();
+    assert!(
+        r.extract.done.lock().unwrap().is_empty(),
+        "the night extracts nothing: filled batches queue their own extraction"
     );
-    // Decay and cleanup ran after the failed extraction, with cutoffs counted back from now.
+    // Decay and cleanup ran, with cutoffs counted back from now.
     let day = 86_400_000;
     assert_eq!(
         *r.house.calls.lock().unwrap(),
@@ -297,7 +285,6 @@ async fn the_nightly_pipeline_runs_every_stage_even_after_a_failure() {
 async fn a_clean_night_succeeds_and_skips_backup_when_it_is_switched_off() {
     let r = rig(vec![owner(1)]);
     r.ops.run(JobKind::Nightly, None).await.unwrap();
-    assert_eq!(r.extract.done.lock().unwrap().len(), 3);
     // Running the backup job itself while backups are off is an error, not a silent no-op.
     let error = r.ops.run(JobKind::Backup, None).await.unwrap_err();
     assert!(error.0.contains("switched off"), "{error}");

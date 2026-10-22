@@ -36,7 +36,7 @@ pub struct LastRun {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum JobKind {
-    /// The whole nightly pipeline, in order: extraction, decay, backup, cleanup.
+    /// The whole nightly pipeline, in order: decay, backup, cleanup.
     Nightly,
     /// Extract every complete slice of one group.
     Extract,

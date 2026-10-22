@@ -134,8 +134,9 @@ api_key_secret = "VISION_API_KEY"
 # An OpenAI-compatible embeddings endpoint.
 endpoint = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 model = "text-embedding-v4"
-# Vector width. After changing the model or the width, the nightly run re-embeds the existing
-# episodes; until then recall finds only those already embedded.
+# Vector width. After changing the model or the width, a group's next extraction (queued by its
+# next filled batch) re-embeds its existing episodes; until then recall finds only those already
+# embedded.
 dims = 2048
 # Inputs per request the endpoint accepts.
 max_batch = 10
@@ -152,8 +153,8 @@ depth = "basic"
 extract_depth = "basic"
 
 [maintenance]
-# Five-field cron expressions in bot.timezone: the nightly run (memory extraction, embedding,
-# fact decay, backup, cleanup) and the daily report to the owners. A run missed while the bot
+# Five-field cron expressions in bot.timezone: the nightly run (picture-description decay,
+# backup, cleanup) and the daily report to the owners. A run missed while the bot
 # was down happens once when it comes back.
 nightly_cron = "30 2 * * *"
 report_cron = "0 0 * * *"
