@@ -6,8 +6,11 @@
 //! - parentheses group;
 //! - `"two words"` is one phrase, spaces included.
 //!
-//! `OR`, `AND` and `NOT` are operators only in capitals, so ordinary words are never mistaken
-//! for them. Every term matches as a case-insensitive substring.
+//! Precedence, tightest first: `-` and `NOT` (on the word, phrase or group right after them), then
+//! `AND`, then `OR`; so `a b OR -c d` is `(a AND b) OR ((NOT c) AND d)`, and parentheses say
+//! anything else. `OR`, `AND` and `NOT` are operators only in capitals, so ordinary words are
+//! never mistaken for them. Every term matches as a case-insensitive substring of the line's
+//! text, literally: no character in a term is a wildcard or a pattern.
 
 use qbot_agent::TextQuery;
 use qbot_wording::{Text, say};
@@ -155,7 +158,17 @@ fn flatten(mut parts: Vec<TextQuery>, join: fn(Vec<TextQuery>) -> TextQuery) -> 
 }
 
 /// Parse a query, or say what is wrong with it and where (in characters, from 1).
+/// How deeply parentheses may nest. The parser and every walk of the tree recurse once per level,
+/// so a query of thousands of `(` (pasted by a member, copied by the model) would overflow the
+/// stack and abort the process; no real search needs more than a few levels.
+pub const MAX_NESTING: usize = 16;
+
 pub fn parse_query(text: &str) -> Result<TextQuery, String> {
+    if nesting(text) > MAX_NESTING {
+        return Err(say(Text::SearchHistoryQueryTooDeep {
+            max: MAX_NESTING.to_string(),
+        }));
+    }
     let parsed = delimited(
         multispace0,
         cut_err(any_of).context(expected("operand")),
@@ -183,6 +196,23 @@ pub fn parse_query(text: &str) -> Result<TextQuery, String> {
         return Err(say(Text::SearchHistoryQueryOnlyExcludes {}));
     }
     Ok(query)
+}
+
+/// The deepest parenthesis nesting outside quoted phrases.
+fn nesting(text: &str) -> usize {
+    let (mut depth, mut deepest, mut quoted) = (0usize, 0usize, false);
+    for c in text.chars() {
+        match c {
+            '"' => quoted = !quoted,
+            '(' if !quoted => {
+                depth += 1;
+                deepest = deepest.max(depth);
+            }
+            ')' if !quoted => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    deepest
 }
 
 #[cfg(test)]
@@ -213,6 +243,22 @@ mod tests {
             parse_query("a b OR c").unwrap(),
             TextQuery::Any(vec![TextQuery::All(vec![has("a"), has("b")]), has("c")]),
             "AND binds tighter than OR"
+        );
+        assert_eq!(
+            parse_query("x NOT a OR -b c").unwrap(),
+            TextQuery::Any(vec![
+                TextQuery::All(vec![has("x"), not(has("a"))]),
+                TextQuery::All(vec![not(has("b")), has("c")]),
+            ]),
+            "NOT binds tightest, to the word after it"
+        );
+        assert_eq!(
+            parse_query("-(a OR b) c").unwrap(),
+            TextQuery::All(vec![
+                not(TextQuery::Any(vec![has("a"), has("b")])),
+                has("c")
+            ]),
+            "NOT applies to a whole group"
         );
         assert_eq!(
             parse_query("(\u{6253}\u{5370}\u{673a} OR \u{6253}\u{5370}) -\u{590d}\u{5370}")
@@ -288,6 +334,19 @@ mod tests {
                 .contains("only excludes")
         );
         assert!(parse_query("a -b").is_ok());
+        // Deep nesting is refused before any recursion, however long the query.
+        let deep = format!("{}a{}", "(".repeat(10_000), ")".repeat(10_000));
+        assert!(
+            parse_query(&deep)
+                .unwrap_err()
+                .contains("parentheses more than 16 deep")
+        );
+        let fine = format!("{}a{}", "(".repeat(MAX_NESTING), ")".repeat(MAX_NESTING));
+        assert!(parse_query(&fine).is_ok());
+        assert!(
+            parse_query("\"(((((((((((((((((((\" a").is_ok(),
+            "quoted text is not nesting"
+        );
     }
 
     #[test]
@@ -297,5 +356,9 @@ mod tests {
         assert!(q.matches("\u{6253}\u{5370}\u{673a}\u{574f}\u{4e86}"));
         assert!(!q.matches("\u{6253}\u{5370}\u{548c}\u{590d}\u{5370}"));
         assert!(!q.matches("scanner"));
+        // Terms are literal text: what a pattern language would read as wildcards is matched as is.
+        let literal = parse_query("a.c* [x]").unwrap();
+        assert!(literal.matches("say a.c* and [x]"));
+        assert!(!literal.matches("abcc and x"));
     }
 }

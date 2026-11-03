@@ -42,6 +42,8 @@ pub trait IdentityStore: Send + Sync {
 
     /// Record evidence that `text` refers to `account` in `group`, creating the alias if needed
     /// and recomputing its confidence and status. The same evidence recorded twice counts once.
+    /// A name a person removed comes back only on a person's evidence (`Manual`); extracted
+    /// evidence is recorded but leaves it removed.
     async fn add_evidence(
         &self,
         group: GroupId,
@@ -265,7 +267,10 @@ impl Inner {
             Some(slot) => slot.1 = at,
             None => row.evidence.push((evidence, at)),
         }
-        row.removed = false;
+        // Only a person brings back a name a person removed; what chat says is still recorded.
+        if evidence.kind == EvidenceKind::Manual {
+            row.removed = false;
+        }
         Inner::recompute(row);
         Ok(row.alias.clone())
     }

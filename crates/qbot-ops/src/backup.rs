@@ -17,7 +17,7 @@ const MARKER_TABLE: &str = " public chat_line ";
 /// How much of a tool's complaint is kept in the error.
 const STDERR_KEPT: usize = 500;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PgTarget {
     pub host: String,
     pub port: u16,
@@ -25,6 +25,19 @@ pub struct PgTarget {
     pub database: String,
     /// Passed to the tool through its environment, never on the command line.
     pub password: String,
+}
+
+/// Everything but the password, which must not reach a log through a `?config`.
+impl std::fmt::Debug for PgTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PgTarget")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("database", &self.database)
+            .field("password", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]

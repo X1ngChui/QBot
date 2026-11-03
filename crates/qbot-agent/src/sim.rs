@@ -46,6 +46,8 @@ struct World {
     opened: Vec<Trigger>,
     /// How long the next recordings of a run's start take, in order.
     begin_delays: std::collections::VecDeque<Duration>,
+    /// Archived lines older than any run's window: only the archive's tools reach them.
+    out_of_view: std::collections::HashSet<MessageId>,
 }
 
 pub struct SimWorld {
@@ -116,6 +118,14 @@ impl SimWorld {
             },
             text.to_owned(),
         )
+    }
+
+    /// A member said something long ago: it is in the archive, so a search finds it, but in no
+    /// run's window.
+    pub fn said_long_ago(&self, account: i64, number: u32, text: &str) -> ChatLine {
+        let line = self.say(account, number, text);
+        self.lock().out_of_view.insert(line.message);
+        line
     }
 
     /// One of the bot's own earlier lines, as an echo would have archived it.
@@ -303,7 +313,12 @@ impl ContextSource for SimWorld {
         }
         let mut world = self.lock();
         world.opened.push(trigger.clone());
-        let window: Vec<ChatLine> = world.lines.iter().map(|a| a.line.clone()).collect();
+        let window: Vec<ChatLine> = world
+            .lines
+            .iter()
+            .filter(|a| !world.out_of_view.contains(&a.line.message))
+            .map(|a| a.line.clone())
+            .collect();
         let cursor = world.lines.last().map_or(ArchiveCursor(0), |a| a.seq);
         let trigger_note = match trigger {
             Trigger::Wake {

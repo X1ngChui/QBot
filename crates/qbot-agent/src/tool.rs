@@ -110,6 +110,14 @@ pub struct RunState {
     /// Messages sent, or perhaps sent: a send counts unless it certainly failed.
     sends: AtomicU32,
     observed: Mutex<HashSet<MessageId>>,
+    shown: Mutex<Shown>,
+}
+
+/// Lines of the group's history a tool showed the model in this run.
+#[derive(Debug, Default)]
+struct Shown {
+    messages: HashSet<MessageId>,
+    authors: BTreeMap<MemberNo, AccountId>,
 }
 
 impl RunState {
@@ -148,6 +156,35 @@ impl RunState {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .contains(&id)
+    }
+
+    /// Record a line a tool showed the model from the group's own history (a search hit, an
+    /// episode's message): like a line of the visible chat, it can then be quoted and its author
+    /// mentioned. What nothing in the run showed stays out of reach.
+    pub fn note_shown(&self, message: MessageId, author: Option<(MemberNo, AccountId)>) {
+        let mut shown = self.shown.lock().unwrap_or_else(PoisonError::into_inner);
+        shown.messages.insert(message);
+        if let Some((number, account)) = author {
+            shown.authors.insert(number, account);
+        }
+    }
+
+    pub fn was_shown(&self, message: MessageId) -> bool {
+        self.shown
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .messages
+            .contains(&message)
+    }
+
+    /// The account of a member who wrote a line a tool showed in this run.
+    pub fn shown_author(&self, number: MemberNo) -> Option<AccountId> {
+        self.shown
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .authors
+            .get(&number)
+            .copied()
     }
 }
 

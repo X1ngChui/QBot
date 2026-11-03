@@ -47,7 +47,32 @@ pub async fn run(store: &dyn IdentityStore) {
     names(store).await;
     names_of_a_person(store).await;
     leads_age(store).await;
+    a_removed_name_stays_removed_until_a_person_gives_it(store).await;
     invitations(store).await;
+}
+
+async fn a_removed_name_stays_removed_until_a_person_gives_it(store: &dyn IdentityStore) {
+    let g = group(450);
+    let r = acct(45);
+    store.seen(r, at(0)).await.unwrap();
+    let texts = |aliases: Vec<crate::identity::Alias>| -> Vec<String> {
+        aliases.into_iter().map(|a| a.text).collect()
+    };
+    store
+        .add_evidence(g, "boss", r, extracted(1), at(10))
+        .await
+        .unwrap();
+    assert!(store.remove_name(g, "boss", &[r]).await.unwrap());
+    // Chat goes on calling them that: the evidence is kept, the name stays removed.
+    let again = store
+        .add_evidence(g, "boss", r, extracted(2), at(20))
+        .await
+        .unwrap();
+    assert_eq!(again.status, AliasStatus::Inactive);
+    assert!(store.names_of(g, &[r]).await.unwrap().is_empty());
+    // A person giving it back is what brings it back.
+    store.set_name(g, "boss", &[r], at(30)).await.unwrap();
+    assert_eq!(texts(store.names_of(g, &[r]).await.unwrap()), ["boss"]);
 }
 
 async fn links_belong_to_their_group(store: &dyn IdentityStore) {
@@ -307,7 +332,7 @@ async fn names(store: &dyn IdentityStore) {
             .iter()
             .any(|a| a.text == "johnny")
     );
-    // New evidence brings a removed name back.
+    // A person giving it again brings a removed name back.
     let back = store
         .add_evidence(g, "johnny", p, by_hand(), at(11))
         .await

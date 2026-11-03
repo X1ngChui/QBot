@@ -107,8 +107,19 @@ scheduler and memory depend on no database or platform. Its Postgres adapter liv
   `ActionResponse`); anything unusable is `Frame::Ignored` with a reason.
 - **Rendering** (`render`): a message becomes archive text with ASCII markers, one per segment
   (the table below). What members typed is kept as typed; only a marker-shaped token in it is
-  escaped, so a marker cannot be forged (section 7, Trust). Forwarded records show at most `FORWARD_MAX_LINES` (30) of their messages: a
-  record can hold hundreds, and every prompt showing the line would carry them all.
+  escaped, so a marker cannot be forged (section 7, Trust). Forwarded records show at most `FORWARD_MAX_LINES` (40) messages in all: a
+  record can hold hundreds, and every prompt showing the line would carry them all. A record
+  inside a forwarded message (20% of the forwards received carry one, holding 1 to 40
+  messages) is shown too, breadth first (`render::Forwards`): numbered where it appears
+  (`[forward:N #K]`) and shown after every record of the level above under
+  `[forward:#K depth D]`, so the order of messages and where each record came from stay
+  readable. Depth is at most 3 and at most 8 records inside records are shown, all within the
+  one budget of lines, so the walk ends however a record is built; a record repeated under the
+  same platform id is shown once and named again; a record whose content did not come, or came
+  malformed, stays `[forward]`. The media walk follows the same plan, so marker positions
+  match, and fetches at most 8 forwarded pictures per message (each must be downloaded just to
+  learn whether it was described before). What a message says after a record starts on a line
+  of its own.
 - **Segments, received and sent.** Receiving aims to understand everything NapCat (v4.18)
   reports in a group message; sending is a separate, deliberately small set. A marker the model
   can read is not therefore one it can write: a receive-only marker in `send_messages` text is
@@ -127,7 +138,7 @@ scheduler and memory depend on no database or platform. Its Postgres adapter liv
   | `video` | `[video]` | marker only | unsupported |
   | `file`, `onlinefile` | `[file:NAME (SIZE)]`, `[folder:NAME]` | marker and metadata | unsupported |
   | `flashtransfer` | `[file transfer]` | marker only | unsupported |
-  | `forward` (inline content) | `[forward:N]` and indented lines | understood (30 lines) | unsupported |
+  | `forward` (inline content) | `[forward:N]` and indented lines; a record inside one as `[forward:N #K]`, shown under `[forward:#K depth D]` | understood (40 lines in all, depth 3, 8 inner records) | unsupported |
   | `dice`, `rps` | `[dice result:N]`, `[rps result:HAND]` | understood | `[dice]`, `[rps]`, no value |
   | `poke` (the poke face) | `[poke]` | marker only | unsupported |
   | `contact` (as the bot's own card echoes) | `[contact card]`, `[group card]` | marker only | `[contact:N]`, members seen speaking here |
@@ -284,8 +295,10 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
   `stay_silent` makes silence explicit. `[at:N]` and `[contact:N]` may name only a member the
   run's context names (`OpenedContext::members`): someone who speaks in the visible chat, is
   mentioned in it, is named in a task's intent as `member:N`, or has an entry in the people
-  block. So a reminder reaches someone who has been quiet, while the model cannot address a
-  number nothing showed it.
+  block, or wrote a line `search_history` or `read_episode` showed in this run (`RunState`); a
+  quote (`[reply:ID]`) likewise names a message of the visible chat or of such a result. So a
+  reminder reaches someone who has been quiet and an answer can quote the old message it found,
+  while the model cannot address a number or a message nothing showed it.
 - **Tool choice per turn.** Every turn of a run must call a tool (a turn without one ends the
   run), but a turn asks for `ToolChoice::Auto`, not a forced choice: the reply keeps its
   reasoning, and DeepSeek's Responses API refuses any forced `tool_choice` (`required` or a
@@ -315,6 +328,18 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
   path. The tool set is fixed for the whole run, so the cached prefix does not change. Tools show
   chat lines exactly as the chat does and times in the bot's zone with their offset, through the
   run's renderer (`ToolCx::renderer`), so the model never converts zones.
+- **History search** (`search_history(query, speaker?, limit?)`): literal keywords with Boolean
+  operators, parsed and validated in Rust (`qbot_tools::query`) and matched by Postgres. Words
+  side by side (or `AND`) must all occur, `OR` means either, `-word` or `NOT word` excludes,
+  parentheses group and `"two words"` is one phrase; `NOT` binds tightest, then `AND`, then
+  `OR`, and operators are capital words only. Each term is a case-insensitive substring of a
+  line's text as archived (markers included), matched with `position(lower($n) in
+  lower(l.text))`, each term a bind parameter: nothing in a term is a wildcard or a pattern, and
+  Chinese is found by its characters. A query that only excludes would match nearly every line
+  and is refused; a malformed one is explained with the position where it goes wrong. The
+  database filters by group (and member, with `speaker`) and returns the newest matches up to
+  the limit (8 by default); a limit above the most one search returns (50) is capped and the
+  result says so, rather than failing the turn.
 
 ## 7. The prompt (`qbot-prompt`, `qbot-wording`, `qbot-i18n`)
 
@@ -512,15 +537,19 @@ the `media_ref` row the platform reference came in.
   task ends the series at once; the running occurrence is not cut off and its outcome is still
   recorded. Only a run started by a member's message (or an owner's `/tasks`) may create, change or
   cancel a repeating task: a task's own run or a spontaneous one can neither start an endless
-  series nor rewrite or end one a member asked for. A repeating task counts against the pending
+  series nor rewrite or end one a member asked for. A spontaneous run writes no task at all: it
+  answers no one, so it makes no commitments for the group (its tools refuse and say why); a
+  task's own run may still schedule a one-shot follow-up within the chain bounds. A repeating task counts against the pending
   bound like any other, also while its occurrence runs.
 - **The task tools do one thing each**: `schedule_task` makes a one-shot task (`intent`, `run_at`
   or `delay_seconds`); `schedule_repeating_task` makes a repeating one (`intent`, `rule`,
   optional `start_at`), the rule written in the grammar `/tasks --every` uses (`6h`, `90m`,
   `daily@08:00`, `mon,thu@08:00`) and parsed by the same `Rule::from_str`; `update_task`
   changes a pending task's intent or time, never its rule (a new schedule is cancel and
-  schedule again; the owner's `/tasks edit --every` can still replace one); `list_tasks`,
-  `get_task` and `cancel_task` as named. Each refuses an argument that belongs to another (a
+  schedule again; the owner's `/tasks edit --every` can still replace one); `list_tasks`
+  (each task with its number, state, time, intent and, for a repeating task, its rule and last
+  run) and `cancel_task` as named. There is no separate task lookup: it would show the line
+  `list_tasks` shows (owners see finished tasks with `/tasks`). Each refuses an argument that belongs to another (a
   `rule` given to `schedule_task`), so a mistaken call is explained rather than half done.
 - **Recurring schedules** (`maintenance.nightly_cron`, `report_cron`, croner with the bot's time
   zone) turn each occurrence into a job through one atomic store step, so an occurrence fires once
@@ -688,7 +717,7 @@ error is left to that error. The local limits and why they exist:
 | Media per minute per group | configured | resource isolation between groups |
 | Media workers, queue, picture size, clip length | 4, 32, 8 MiB, 300 s | CPU and memory isolation; pictures and clips are untrusted input of any size |
 | Opened-picture cache | 64 MiB | memory bound for bytes fetched on demand |
-| Forwarded lines shown | 30 | an unbounded external input enters every later prompt |
+| Forwarded lines shown; depth; records inside records; forwarded pictures fetched | 40 in all; 3; 8; 8 per message | an unbounded external input enters every later prompt; each forwarded picture is downloaded just to learn whether it was described, on the shared download permits |
 | Card field, file or face name; card link | 120 characters; 400 or left out | external text that enters every later prompt; a cut link leads nowhere |
 | `read_url` page | 8,000 characters | a web page is the one tool input with no size of its own |
 | Search results, passages | 5, 3 | enough to answer from, little enough to read |
@@ -716,8 +745,8 @@ spend.
 - Member numbers are assigned densely under a per-group advisory lock and are immutable: a
   trigger rejects any update, delete or truncate of `member_number`. A group's slices cannot
   overlap, whether episodes or skipped (`slice_skip`): range exclusion constraints, and a check
-  across the two tables under the group's slice lock. One active fact per subject, predicate and key (a partial
-  unique index).
+  across the two tables under the group's slice lock. One active claim per subject, slot,
+  predicate and value (a partial unique index).
 - **Single instance**: the process takes a Postgres advisory-lock session lease before it migrates
   or recovers anything, checks it every ten seconds, and shuts down if it loses it. A check that does not answer within the interval
   counts as lost: on a hung connection only an answer proves the lock is still held.
@@ -789,7 +818,10 @@ through it.
   each upload is used only for one description or one run's turns; the Files API's shortest
   lifetime would do, once it is checked against the live API.
 - `open_images` cannot open pictures inside forwarded records whose content was not delivered.
-- History search scans the group's lines; a `pg_trgm` index is the step if archives grow large.
+- History search scans the group's lines in the database: a term found nowhere costs about
+  25 ms in the largest group (35,000 lines) and under 1 ms in a group of 700, the planner using
+  the `(group_id, seq)` index where it helps. A `pg_trgm` index with `ILIKE` terms is the step
+  if an archive grows by orders of magnitude.
 - OpenAI-style providers are covered by the simulated server, not by a live test.
 - Runs of different members overlap (decision 1), and nothing tells a run what another is
   answering until that one has replied: two members asking the same thing within the same
@@ -805,7 +837,22 @@ through it.
   talking keeps its last, incomplete slice unextracted (still verbatim in the history and
   searchable), and after an embedding change a group that fills no batch keeps its old
   episodes unembedded until it does.
-- Messages shown by `search_history` and `read_episode` cannot be quoted, opened or used to
-  address their authors: the run's view knows only what its context showed.
+- A picture in a line `search_history` or `read_episode` showed cannot be opened with
+  `open_images`, which reaches only the run's visible chat.
+- A quote of an old message a search found names it by NapCat's message id, a 31-bit hash
+  (section 4): in a long archive another message may share it, and the platform decides which
+  one the quote shows. Quotes of the visible chat were exposed to this only within its window.
 - The people block's size grows with the people on record: facts are bounded per person, names
   and notes are not (about 15 KB in the largest group today).
+- Salience reads a group's whole episode list (end and participants) for every reply's people
+  block and every applied episode: a few hundred rows today; a bound (episodes since the oldest
+  active claim's support) is the step if a group's history grows by orders of magnitude.
+- A command's reply comes back as the bot's own echo and is archived as the bot's line, so text
+  it repeats (a listed note, a name) reads in later chat as something the bot said. The trust
+  rule covers it as material, but archiving command replies under their own marker would say
+  what they are.
+- A retried daily report goes to every owner again, and works out "yesterday" anew; a retried
+  nightly run takes another backup, so rotation keeps one older dump fewer.
+- A job's completion is not tied to the claim that ran it: a job whose lease ran out while it
+  still worked (renewal stalled) can be claimed again, and the first runner's finish then closes
+  the second's claim. Jobs are idempotent, so the cost is at most a repeated backup or report.

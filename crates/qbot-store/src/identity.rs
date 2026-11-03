@@ -236,13 +236,18 @@ impl PgIdentityStore {
             AliasStatus::Confirmed => "confirmed",
             _ => "candidate",
         };
+        // Only a person brings back a name a person removed; what chat says is still recorded.
+        let manual = evidence.kind == EvidenceKind::Manual;
         let row = sqlx::query(&format!(
-            "UPDATE alias SET confidence = $2, status = $3, removed = false, last_evidence_ms = $4 WHERE alias_id = $1 RETURNING {ALIAS_COLS}"
+            "UPDATE alias SET confidence = $2, removed = removed AND NOT $5, \
+             status = CASE WHEN removed AND NOT $5 THEN 'inactive' ELSE $3 END, \
+             last_evidence_ms = $4 WHERE alias_id = $1 RETURNING {ALIAS_COLS}"
         ))
         .bind(alias_id)
         .bind(conf)
         .bind(status)
         .bind(last)
+        .bind(manual)
         .fetch_one(&mut **tx)
         .await
         .map_err(backend)?;

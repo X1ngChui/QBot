@@ -157,6 +157,14 @@ impl Tool for ReadEpisode {
             .lines(cx.group, e.first_ordinal, e.last_ordinal)
             .await
             .map_err(unavailable)?;
+        // What the episode showed can be quoted and its authors mentioned.
+        for line in &lines {
+            let author = line
+                .speaker
+                .zip(line.member_no)
+                .map(|(account, n)| (MemberNo::new(n), account));
+            cx.state.note_shown(line.message, author);
+        }
         let mut out = vec![describe(cx, &episode)];
         out.extend(lines.iter().map(|line| render(cx, line)));
         Ok(ToolOutput::text(out.join("\n")))

@@ -159,12 +159,17 @@ fn blank(piece: &Piece) -> bool {
 fn lower(cx: &ToolCx<'_>, text: &str) -> Result<Vec<OutSegment>, ToolError> {
     let invalid = ToolError::InvalidArguments;
     let pieces = parse(text).map_err(invalid)?;
+    // Whom the run's context names, or a line a tool showed in this run was written by.
     let member = |n: u32| {
-        cx.view.account_of(MemberNo::new(n)).ok_or_else(|| {
-            refused(say(Text::SendMessagesNoMember {
-                member: n.to_string(),
-            }))
-        })
+        let number = MemberNo::new(n);
+        cx.view
+            .account_of(number)
+            .or_else(|| cx.state.shown_author(number))
+            .ok_or_else(|| {
+                refused(say(Text::SendMessagesNoMember {
+                    member: n.to_string(),
+                }))
+            })
     };
     let meaningful = pieces.iter().filter(|p| !blank(p)).count();
     if meaningful == 0 {
@@ -194,7 +199,7 @@ fn lower(cx: &ToolCx<'_>, text: &str) -> Result<Vec<OutSegment>, ToolError> {
                 let message = MessageId::new(*id).map_err(|_| {
                     invalid(say(Text::SendMessagesNotMessageId { id: id.to_string() }))
                 })?;
-                if !cx.view.has_message(message) {
+                if !cx.view.has_message(message) && !cx.state.was_shown(message) {
                     return Err(refused(say(Text::SendMessagesNoMessage {
                         id: id.to_string(),
                     })));

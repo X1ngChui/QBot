@@ -81,7 +81,7 @@ async fn bad_scheduling_arguments_are_explained_to_the_model() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn listing_getting_updating_and_cancelling_are_scoped_to_the_group() {
+async fn listing_updating_and_cancelling_are_scoped_to_the_group() {
     let r = rig(vec![]);
     let mine = r
         .service
@@ -109,7 +109,12 @@ async fn listing_getting_updating_and_cancelling_are_scoped_to_the_group() {
     let listing = one_call(&r, "list_tasks", json!({})).await;
     assert!(text_of(&listing).contains("mine") && !text_of(&listing).contains("theirs"));
 
-    let foreign = one_call(&r, "get_task", json!({ "id": theirs.id.get() })).await;
+    let foreign = one_call(
+        &r,
+        "update_task",
+        json!({ "id": theirs.id.get(), "intent": "hijacked" }),
+    )
+    .await;
     assert_eq!(foreign.outcome, Outcome::Error(ErrorKind::InvalidArguments));
     let foreign = one_call(&r, "cancel_task", json!({ "id": theirs.id.get() })).await;
     assert_eq!(foreign.outcome, Outcome::Error(ErrorKind::InvalidArguments));
@@ -289,11 +294,7 @@ async fn history_search_returns_newest_first_with_ids_and_bounds_its_own_output(
         ),
         "no matches"
     );
-    for args in [
-        json!({ "query": " " }),
-        json!({ "query": "x", "limit": 0 }),
-        json!({ "query": "x", "limit": 51 }),
-    ] {
+    for args in [json!({ "query": " " }), json!({ "query": "x", "limit": 0 })] {
         assert_eq!(
             one_call(&r, "search_history", args).await.outcome,
             Outcome::Error(ErrorKind::InvalidArguments)
@@ -349,9 +350,109 @@ async fn tool_specs_come_from_the_argument_types() {
             "schedule_task",
             "schedule_repeating_task",
             "list_tasks",
-            "get_task",
             "update_task",
             "cancel_task"
         ]
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_line_a_search_showed_can_be_quoted_and_its_author_mentioned() {
+    let r = rig(vec![]);
+    let old = r.world.said_long_ago(9, 9, "the printer code is 4421");
+    let quote = send(&format!("[reply:{}] [at:9] that one", old.message.get()));
+    // Outside the visible chat, nothing showed it: the reference is refused, not guessed.
+    let before = one_call(&r, "send_messages", quote.clone()).await;
+    assert_eq!(
+        before.outcome,
+        Outcome::Refused(RefusalReason::NotAllowed),
+        "{}",
+        text_of(&before)
+    );
+    // Once a search in the run has shown it, the line and its author are part of what the run saw.
+    r.fake.push(reply(call(
+        "search_history",
+        json!({ "query": "printer code" }),
+    )));
+    r.fake.push(reply(call("send_messages", quote)));
+    r.fake.push(done());
+    r.ask(1, 1, "what was the printer code again?").await;
+    let results = r.last_run_results();
+    assert!(text_of(&results[0]).contains("4421"));
+    assert_eq!(results[1].outcome, Outcome::Ok, "{}", text_of(&results[1]));
+    assert!(
+        r.world
+            .sent()
+            .iter()
+            .any(|m| m.contains(&qbot_agent::OutSegment::Reply(old.message)))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_look_at_the_chat_on_the_bots_own_makes_no_task() {
+    let r = rig(vec![]);
+    r.fake.push(reply(call(
+        "schedule_task",
+        json!({ "intent": "remind everyone", "delay_seconds": 3600 }),
+    )));
+    r.fake.push(done());
+    r.world.say(2, 2, "anyone up for lunch?");
+    r.supervisor
+        .submit_spontaneous(group(), qbot_core::AccountId::new(2).unwrap())
+        .await
+        .unwrap()
+        .finished()
+        .await
+        .unwrap();
+    let results = r.last_run_results();
+    assert_eq!(
+        results[0].outcome,
+        Outcome::Refused(RefusalReason::NotAllowed),
+        "{}",
+        text_of(&results[0])
+    );
+    assert!(text_of(&results[0]).contains("nobody asking"));
+    assert!(r.service.list(group(), 0, 10).await.unwrap().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn asking_for_more_matches_than_a_search_returns_is_capped_and_said_not_failed() {
+    let r = rig(vec![]);
+    for n in 0..3 {
+        r.world.say(2, 2, &format!("deploy {n}"));
+    }
+    let few = one_call(
+        &r,
+        "search_history",
+        json!({ "query": "deploy", "limit": 500 }),
+    )
+    .await;
+    assert_eq!(few.outcome, Outcome::Ok);
+    let text = text_of(&few);
+    assert_eq!(
+        text.lines().filter(|l| l.contains("deploy")).count(),
+        3,
+        "{text}"
+    );
+    assert!(
+        !text.contains("at most"),
+        "all matches fit, so no note: {text}"
+    );
+    for n in 3..60 {
+        r.world.say(2, 2, &format!("deploy {n}"));
+    }
+    let many = one_call(
+        &r,
+        "search_history",
+        json!({ "query": "deploy", "limit": 500 }),
+    )
+    .await;
+    assert_eq!(many.outcome, Outcome::Ok);
+    let text = text_of(&many);
+    assert_eq!(
+        text.lines().filter(|l| l.starts_with("[msg:")).count(),
+        50,
+        "{text}"
+    );
+    assert!(text.contains("at most 50 matches"), "{text}");
 }

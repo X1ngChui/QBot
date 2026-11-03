@@ -54,12 +54,21 @@ where
             Ok(response) => http_error(response.status, &response.body, response.retry_after),
             Err(error) => error,
         };
-        if error.is_transient() && attempt < max_attempts {
+        if error.is_transient() && attempt < max_attempts && !waits_too_long(&error) {
             tokio::time::sleep(backoff(policy, attempt, &error)).await;
             continue;
         }
         return Err(error);
     }
+}
+
+/// The longest a provider's Retry-After is waited out. A provider asking for longer is, for this
+/// call, unavailable: waiting would hold a job's lease or a media permit for as long as it asks
+/// (a day, say) on a call that has no deadline of its own, so it fails as rate-limited instead.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+
+fn waits_too_long(error: &LlmError) -> bool {
+    matches!(error, LlmError::RateLimited { retry_after: Some(after) } if *after > MAX_RETRY_AFTER)
 }
 
 fn backoff(policy: &RetryPolicy, attempt: u32, error: &LlmError) -> Duration {
@@ -80,4 +89,22 @@ fn backoff(policy: &RetryPolicy, attempt: u32, error: &LlmError) -> Duration {
         delay += delay.mul_f64(fraction);
     }
     delay
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_retry_after_beyond_the_cap_is_not_waited_out() {
+        let asks = |secs| LlmError::RateLimited {
+            retry_after: Some(Duration::from_secs(secs)),
+        };
+        assert!(!waits_too_long(&asks(30)));
+        assert!(!waits_too_long(&asks(60)));
+        assert!(waits_too_long(&asks(86_400)));
+        assert!(!waits_too_long(&LlmError::RateLimited {
+            retry_after: None
+        }));
+    }
 }

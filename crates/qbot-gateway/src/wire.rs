@@ -57,9 +57,12 @@ pub enum Segment {
     /// A platform dice; the result is present only on echoes of sent messages.
     Dice(Option<String>),
     Rps(Option<String>),
-    /// A forwarded chat record. The platform delivers its messages inline; `nodes` is `None`
-    /// when it did not (the content is then unavailable).
+    /// A forwarded chat record. The platform delivers its messages inline, a record inside a
+    /// record included; `nodes` is `None` when it did not (the content is then unavailable).
+    /// `id` is the platform's id of the record, when it gives one: the same record forwarded
+    /// twice in one message has the same id.
     Forward {
+        id: Option<String>,
         nodes: Option<Vec<ForwardNode>>,
     },
     /// A rich card: a shared contact, group, location, song, link or mini-app. Context for the
@@ -302,6 +305,12 @@ fn segment(raw: &Value) -> Segment {
                 .filter(|s| !s.is_empty()),
         ),
         "forward" | "node" => Segment::Forward {
+            // A record's own id; a `node` names a message by its id, a hash two messages can
+            // share, so it says nothing about which record this is.
+            id: (kind == "forward")
+                .then(|| field("id").map(|v| text_of(Some(v))))
+                .flatten()
+                .filter(|id| !id.trim().is_empty()),
             nodes: field("content")
                 .and_then(Value::as_array)
                 .map(|nodes| nodes.iter().map(forward_node).collect()),

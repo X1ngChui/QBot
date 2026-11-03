@@ -1,4 +1,4 @@
-//! The six group-task tools. They are thin: every rule lives in `qbot_sched::TaskService`,
+//! The five group-task tools. They are thin: every rule lives in `qbot_sched::TaskService`,
 //! which the owner's `/tasks` command uses too.
 
 use std::time::Duration;
@@ -37,6 +37,19 @@ fn when(run_at: Option<&str>, delay_seconds: Option<u64>) -> Result<Option<When>
     }
 }
 
+/// Tasks are written only by a run something asked for: a member's message, or a task coming due
+/// (which may continue its chain). A look at the chat on the bot's own answers no one, so it makes
+/// no commitments for the group: it neither creates nor changes nor cancels a task.
+fn check_asked(cx: &ToolCx<'_>) -> Result<(), ToolError> {
+    match cx.trigger {
+        Trigger::Addressed { .. } | Trigger::Wake { .. } => Ok(()),
+        Trigger::Spontaneous => Err(ToolError::refused(
+            RefusalReason::NotAllowed,
+            say(Text::TasksNotAsked {}),
+        )),
+    }
+}
+
 /// A repeating task is made only on a member's request: in a run a member's message started.
 /// A task's own run, or a look at the chat on the bot's own, cannot start an endless series.
 fn check_requested(cx: &ToolCx<'_>) -> Result<(), ToolError> {
@@ -53,6 +66,7 @@ fn check_requested(cx: &ToolCx<'_>) -> Result<(), ToolError> {
 /// task's own run or a spontaneous one must not rewrite or end a series a member asked for. A
 /// one-shot task is left to the model as before.
 async fn check_target(tasks: &TaskService, cx: &ToolCx<'_>, id: TimerId) -> Result<(), ToolError> {
+    check_asked(cx)?;
     if matches!(cx.trigger, Trigger::Addressed { .. }) {
         return Ok(());
     }
@@ -198,6 +212,7 @@ impl Tool for ScheduleTask {
         Effect::Write
     }
     async fn call(&self, cx: &ToolCx<'_>, args: ScheduleArgs) -> Result<ToolOutput, ToolError> {
+        check_asked(cx)?;
         let when = when(args.run_at.as_deref(), args.delay_seconds)?
             .ok_or_else(|| ToolError::InvalidArguments(say(Text::TasksNoTime {})))?;
         // A task created while handling a task continues that task's chain.
@@ -283,6 +298,7 @@ impl Tool for ScheduleRepeatingTask {
     }
 }
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ListArgs {
     pub page: Option<u32>,
 }
@@ -329,34 +345,9 @@ impl Tool for ListScheduledTasks {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TaskRef {
     pub id: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct GetScheduledTask(pub TaskService);
-
-#[async_trait]
-impl Tool for GetScheduledTask {
-    type Args = TaskRef;
-    const NAME: &'static str = "get_task";
-    fn description(&self) -> String {
-        say(Text::GetTaskDescription {})
-    }
-    fn parameters(&self) -> Vec<(&'static str, String)> {
-        vec![("id", say(Text::GetTaskParamId {}))]
-    }
-    fn effect(&self) -> Effect {
-        Effect::Read
-    }
-    async fn call(&self, cx: &ToolCx<'_>, args: TaskRef) -> Result<ToolOutput, ToolError> {
-        let timer = self
-            .0
-            .get(cx.group, TimerId::new(args.id))
-            .await
-            .map_err(|e| map_error(cx, e))?;
-        Ok(ToolOutput::text(describe(cx, &timer)))
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -426,8 +417,8 @@ impl Tool for UpdateScheduledTask {
         Effect::Write
     }
     async fn call(&self, cx: &ToolCx<'_>, args: UpdateArgs) -> Result<ToolOutput, ToolError> {
-        let when = when(args.run_at.as_deref(), args.delay_seconds)?;
         check_target(&self.0, cx, TimerId::new(args.id)).await?;
+        let when = when(args.run_at.as_deref(), args.delay_seconds)?;
         let timer = self
             .0
             .update(

@@ -13,28 +13,35 @@ use qbot_media::{FetchError, Fetcher, MediaItem, MediaRef};
 use serde_json::{Value, json};
 
 use crate::bridge::Bridge;
-use crate::render::RenderContext;
+use crate::render::{Forwards, RenderContext};
 use crate::wire::{GroupMessage, Segment};
 
 /// The pictures, stickers and clips of a message, each with its position among the markers of
 /// its kind in the rendered line. The walk mirrors [`render`](crate::render::render) exactly,
-/// including the messages of a forwarded record that are shown, so positions always match.
+/// including the messages of forwarded records, and of records inside them, that are shown
+/// (the same [`Forwards`] plan), so positions always match.
 pub fn items_for(message: &GroupMessage, ctx: &RenderContext) -> Vec<MediaItem> {
-    let mut walk = Walk::default();
-    walk.collect(&message.segments, ctx, false);
+    let mut walk = Walk {
+        images: 0,
+        stickers: 0,
+        clips: 0,
+        items: Vec::new(),
+        forwards: Forwards::new(ctx.forward_max_lines),
+    };
+    walk.collect(&message.segments, false);
     walk.items
 }
 
-#[derive(Default)]
 struct Walk {
     images: usize,
     stickers: usize,
     clips: usize,
     items: Vec<MediaItem>,
+    forwards: Forwards,
 }
 
 impl Walk {
-    fn collect(&mut self, segments: &[Segment], ctx: &RenderContext, nested: bool) {
+    fn collect(&mut self, segments: &[Segment], nested: bool) {
         for segment in segments {
             match segment {
                 Segment::Image { file, url, size } => {
@@ -83,9 +90,13 @@ impl Walk {
                     }
                     self.clips += 1;
                 }
-                Segment::Forward { nodes: Some(nodes) } if !nested => {
-                    for node in nodes.iter().take(ctx.forward_max_lines) {
-                        self.collect(&node.segments, ctx, true);
+                Segment::Forward {
+                    nodes: Some(nodes), ..
+                } if !nested => {
+                    for record in self.forwards.plan(nodes) {
+                        for node in record.nodes {
+                            self.collect(&node.segments, true);
+                        }
                     }
                 }
                 _ => {}
@@ -177,6 +188,10 @@ impl OneBotFetcher {
 
     /// `Ok(None)`: this route did not answer, try the next. `Err`: the verdict is final.
     async fn download(&self, url: &str, max_bytes: u64) -> Result<Option<Vec<u8>>, FetchError> {
+        // A link from a message is outside input: only the web's own schemes are fetched.
+        if !(url.starts_with("https://") || url.starts_with("http://")) {
+            return Ok(None);
+        }
         let response = match self.http.get(url).send().await {
             Ok(r) => r,
             Err(_) => return Ok(None),

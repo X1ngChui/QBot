@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use qbot_agent::{Archive, Effect, HistoryQuery, Tool, ToolCx, ToolError, ToolOutput};
-use qbot_context::ChatBatch;
+use qbot_context::{ChatBatch, Speaker};
 use qbot_wording::{Text, say};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -75,14 +75,14 @@ impl Tool for SearchHistory {
             text: crate::query::parse_query(&args.query).map_err(ToolError::InvalidArguments)?,
             speaker: args.speaker.map(qbot_core::MemberNo::new),
         };
-        let limit = args.limit.unwrap_or(self.settings.default_limit);
-        if !(1..=self.settings.max_limit).contains(&limit) {
+        let wanted = args.limit.unwrap_or(self.settings.default_limit);
+        if wanted == 0 {
             return Err(ToolError::InvalidArguments(say(
-                Text::SearchHistoryLimitRange {
-                    max: self.settings.max_limit.to_string(),
-                },
+                Text::SearchHistoryLimitRange {},
             )));
         }
+        // More than a search returns is the most it returns, said so: not a failed turn.
+        let limit = wanted.min(self.settings.max_limit);
         let lines = self
             .archive
             .search(cx.group, &query, limit as usize)
@@ -91,7 +91,24 @@ impl Tool for SearchHistory {
         if lines.is_empty() {
             return Ok(ToolOutput::text(say(Text::SearchHistoryNoMatches {})));
         }
+        let shown = lines.len();
+        // What the search showed can be quoted and its authors mentioned.
+        for line in &lines {
+            let author = match line.speaker {
+                Speaker::Member { number, account } => Some((number, account)),
+                Speaker::Bot => None,
+            };
+            cx.state.note_shown(line.message, author);
+        }
         // Newest first, each line as the chat shows it.
-        Ok(ToolOutput::text(cx.renderer.chat(&ChatBatch::new(lines))))
+        let mut text = cx.renderer.chat(&ChatBatch::new(lines));
+        // Only a full result can have left older matches out.
+        if wanted > limit && shown == limit as usize {
+            text.push('\n');
+            text.push_str(&say(Text::SearchHistoryCapped {
+                max: limit.to_string(),
+            }));
+        }
+        Ok(ToolOutput::text(text))
     }
 }

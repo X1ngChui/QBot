@@ -23,8 +23,8 @@ pub struct EpisodeJobs {
     slices: SliceGrid,
     consolidator: Option<Arc<Consolidator>>,
     background: Option<Arc<dyn SliceBackground>>,
-    /// One extraction at a time: a filled batch and the nightly run may both ask for a group,
-    /// and the second must find the first's episodes rather than write them again.
+    /// One extraction at a time: several filled batches may queue jobs for one group, and a
+    /// later job must find the earlier one's episodes rather than write them again.
     running: tokio::sync::Mutex<()>,
 }
 

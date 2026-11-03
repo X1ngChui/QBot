@@ -150,7 +150,9 @@ else the account nickname. These docs say "group nickname" and "group display na
   A name is a belief (section 7): set by a person (`/name`) it is *confirmed*, confidence 1,
   and stands until removed; learned from chat it is a *lead*, with the credibility of its
   distinct supporting episodes ageing with the stable half-life. Confirmed is provenance, not a
-  threshold: only a person vouches, however often chat repeats a name. A lead stays a lead,
+  threshold: only a person vouches, however often chat repeats a name. A name a person removed
+  (`/name remove`) stays removed: chat using it again is recorded as evidence but does not bring
+  it back; a person giving it again does. A lead stays a lead,
   shown with its confidence, and is never expired. A name resolves only to confirmed targets; two
   confirmed targets for a name is *ambiguous*, never a guess.
 - *Invitations* to link accounts: ten minutes, one pending per

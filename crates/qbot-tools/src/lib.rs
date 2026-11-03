@@ -18,9 +18,8 @@ pub use query::parse_query;
 pub use search::{SearchArgs, SearchHistory, SearchSettings};
 pub use send::{SendArgs, SendMessages, StaySilent, StaySilentArgs};
 pub use tasks::{
-    CancelScheduledTask, GetScheduledTask, ListArgs, ListScheduledTasks, ScheduleArgs,
-    ScheduleRepeatingArgs, ScheduleRepeatingTask, ScheduleTask, TaskRef, UpdateArgs,
-    UpdateScheduledTask,
+    CancelScheduledTask, ListArgs, ListScheduledTasks, ScheduleArgs, ScheduleRepeatingArgs,
+    ScheduleRepeatingTask, ScheduleTask, TaskRef, UpdateArgs, UpdateScheduledTask,
 };
 pub use web::{READ_URL_MAX_CHARS, ReadUrl, ReadUrlArgs, WebSearchArgs, WebSearchTool};
 
@@ -46,7 +45,6 @@ pub fn standard_tools(
         .with(ScheduleTask(tasks.clone()))?
         .with(ScheduleRepeatingTask(tasks.clone()))?
         .with(ListScheduledTasks(tasks.clone()))?
-        .with(GetScheduledTask(tasks.clone()))?
         .with(UpdateScheduledTask(tasks.clone()))?
         .with(CancelScheduledTask(tasks))
 }

@@ -433,6 +433,7 @@ impl MediaService {
         // out, so they come after and hold no reply up.
         let (forwarded, posted): (Vec<MediaItem>, Vec<MediaItem>) =
             items.into_iter().partition(|item| item.nested);
+        let forwarded: Vec<MediaItem> = forwarded.into_iter().take(FORWARDED_FETCH_MAX).collect();
         let key = (job.group, job.ordinal);
         let done = (!posted.is_empty()).then(|| {
             let (done_tx, done_rx) = watch::channel(false);
@@ -521,3 +522,9 @@ impl MediaService {
         self.tasks.wait().await;
     }
 }
+
+/// Pictures inside forwarded records fetched for one message. Each must be downloaded just to
+/// learn whether it was described before, on the few download permits every group shares, so a
+/// record full of pictures must not hold them, and other groups' pictures, for long. The rest
+/// keep their bare marker; they stay on record, so `open_images` still reaches them.
+pub const FORWARDED_FETCH_MAX: usize = 8;
