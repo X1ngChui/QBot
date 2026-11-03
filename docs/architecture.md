@@ -848,9 +848,12 @@ through it.
   block and every applied episode: a few hundred rows today; a bound (episodes since the oldest
   active claim's support) is the step if a group's history grows by orders of magnitude.
 - A command's reply comes back as the bot's own echo and is archived as the bot's line, so text
-  it repeats (a listed note, a name) reads in later chat as something the bot said. The trust
-  rule covers it as material, but archiving command replies under their own marker would say
-  what they are.
+  it repeats (a listed note, a name) could read in later chat as something the bot said. A
+  command's reply always quotes the command, and the reading guide (`prompts/legend.md`) says
+  a line of the bot's that quotes a `/command` is that command's automatic reply, its listed
+  text having only the standing of what members wrote. Archiving command replies under their
+  own marker would say it in the record itself, but needs echoes matched to their sender's kind
+  before they are archived (the send's answer and its echo arrive in either order).
 - A retried daily report goes to every owner again, and works out "yesterday" anew; a retried
   nightly run takes another backup, so rotation keeps one older dump fewer.
 - A job's completion is not tied to the claim that ran it: a job whose lease ran out while it
