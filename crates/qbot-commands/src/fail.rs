@@ -1,7 +1,7 @@
 //! How a command ends other than by succeeding.
 
 use qbot_i18n::Msg;
-use qbot_memory::{AliasTextError, IdentityError, LinkError, MAX_ALIAS_CHARS};
+use qbot_memory::{IdentityError, LinkError};
 use qbot_sched::TaskError;
 
 use crate::ports::AdminError;
@@ -41,13 +41,6 @@ pub fn link_msg(error: &LinkError) -> Msg {
 impl From<IdentityError> for Fail {
     fn from(error: IdentityError) -> Self {
         match error {
-            IdentityError::Name(AliasTextError::Empty) => Fail::Say(Msg::NameEmptyName {}),
-            IdentityError::Name(AliasTextError::TooLong) => Fail::Say(Msg::NameTooLong {
-                max: u32::try_from(MAX_ALIAS_CHARS).unwrap_or(u32::MAX),
-            }),
-            IdentityError::NameTaken => Fail::Say(Msg::NameTaken {
-                name: String::new(),
-            }),
             IdentityError::NotLinked => Fail::Say(Msg::NotLinked {}),
             IdentityError::UnknownAccount => Fail::Say(Msg::UnknownAccount {}),
             IdentityError::Link(link) => Fail::Say(link_msg(&link)),

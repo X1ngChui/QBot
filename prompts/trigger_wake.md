@@ -10,5 +10,8 @@ This task repeats by itself: its next run is already scheduled, so do only what 
 Names in this chat now:
 {{names}}
 {% endif %}
+{% if people %}
+{{people}}
+{% endif %}
 
 Act through your tools: do what the task needs with `send_messages`, or call `stay_silent`; text you write outside a tool call reaches no one.

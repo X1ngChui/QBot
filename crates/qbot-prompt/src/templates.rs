@@ -59,12 +59,12 @@ impl Template {
             Template::KnowledgeBlock => &["knowledge"],
             Template::PeopleBlock => &["entries"],
             Template::TriggerAddressed => &[
-                "now", "timezone", "sender", "message", "replied", "recalled", "names",
+                "now", "timezone", "sender", "message", "replied", "recalled", "names", "people",
             ],
             Template::TriggerWake => &[
-                "now", "timezone", "task", "depth", "intent", "repeats", "names",
+                "now", "timezone", "task", "depth", "intent", "repeats", "names", "people",
             ],
-            Template::TriggerSpontaneous => &["now", "timezone", "names"],
+            Template::TriggerSpontaneous => &["now", "timezone", "names", "people"],
             Template::DescribeImage => &["language"],
             Template::LearnedKnowledge => &["entries"],
             Template::UndeliveredNote => &[],

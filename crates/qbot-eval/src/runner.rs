@@ -18,16 +18,14 @@ use qbot_core::{AccountId, ChainId, Clock, GroupId, MessageId, RunId, TimerId, U
 use qbot_llm::embedding::FakeEmbedder;
 use qbot_llm::search::{FakeSearch, PageRead, SearchHit, SearchResults};
 use qbot_llm::{Provider, ReasoningEffort, Usage};
-use qbot_memory::belief::Activity;
-use qbot_memory::facts::{
-    DecayPolicy, FactStore, GROUP_TERM, GROUP_TOPIC, MemoryFactStore, Observation, slot, term_slot,
-    topic_slot,
+use qbot_memory::{
+    Change, Durability, EpisodeId, InMemoryMemoryStore, MemoryEpisodeStore, MemoryId,
+    MemoryNameStore, MemoryNoteStore, MemoryStore, NameBasis, NameStore, NameUse, NoteStore,
+    Recall, RecallParams, Statement, Support, UseSource,
 };
-use qbot_memory::predicates::{DecayClass, Predicates};
-use qbot_memory::{EpisodeId, MemoryEpisodeStore, Recall, RecallParams};
 use qbot_prompt::{
-    FactKnowledge, GroupPeople, HistorySource, PeopleSource, Personas, PromptContext,
-    PromptRenderer, PromptSettings,
+    GroupPeople, HistorySource, MemoryView, PeopleSource, Person, Personas, PromptContext,
+    PromptRenderer, PromptSettings, ShownName,
 };
 use qbot_sched::{MemoryTimerStore, TaskLimits, TaskService};
 use qbot_tools::{
@@ -101,12 +99,17 @@ impl HistorySource for WorldHistory {
     }
 }
 
-/// The scenario's blocked members, as the store would report them.
+/// The scenario's roster, as the store would report it.
 struct ScenarioPeople(GroupPeople);
 
 #[async_trait]
 impl PeopleSource for ScenarioPeople {
-    async fn people(&self, _: GroupId, _: UnixMillis) -> Result<GroupPeople, EnvError> {
+    async fn people(
+        &self,
+        _: GroupId,
+        _: UnixMillis,
+        _: &[AccountId],
+    ) -> Result<GroupPeople, EnvError> {
         Ok(self.0.clone())
     }
 }
@@ -236,17 +239,24 @@ fn render(segments: &[OutSegment], scenario: &Scenario, accounts: &[(u32, Accoun
         .collect()
 }
 
-/// The people block as the store would give it: one entry per person (a same-person set or a
-/// single member) that has a block, a link, notes or learned facts.
+/// The roster as the store would give it: every member (a scenario's members all spoke
+/// recently), one entry per person, with what they are and were shown as and the names people
+/// use for them.
 async fn scenario_people(
     scenario: &Scenario,
     accounts: &[(u32, AccountId)],
-    facts: &dyn FactStore,
+    names: &dyn NameStore,
     group: GroupId,
     now: UnixMillis,
 ) -> Result<GroupPeople, String> {
     use qbot_core::MemberNo;
-    use qbot_prompt::{KnownFact, KnownNote, Person};
+    let all = names.names(group, None).await.map_err(|e| e.to_string())?;
+    let number_of = |account: AccountId| {
+        accounts
+            .iter()
+            .find(|(_, a)| *a == account)
+            .map(|(n, _)| *n)
+    };
     let mut sets: Vec<Vec<u32>> = scenario.same_person.clone();
     for (n, _) in accounts {
         if !sets.iter().any(|set| set.contains(n)) {
@@ -256,56 +266,46 @@ async fn scenario_people(
     let mut people = Vec::new();
     for mut set in sets {
         set.sort();
-        let mut person = Person::default();
+        let mut person = Person {
+            active: Some(now),
+            ..Person::default()
+        };
         for n in &set {
             let Some((_, account)) = accounts.iter().find(|(x, _)| x == n) else {
                 continue;
             };
-            person.members.push((MemberNo::new(*n), *account));
-            if scenario.members.iter().any(|m| m.number == *n && m.blocked) {
-                person.blocked.push(MemberNo::new(*n));
+            let member = MemberNo::new(*n);
+            person.members.push((member, *account));
+            let Some(spec) = scenario.member(*n) else {
+                continue;
+            };
+            if spec.blocked {
+                person.blocked.push(member);
             }
-            person
-                .notes
-                .extend(
-                    scenario
-                        .notes
-                        .iter()
-                        .filter(|note| note.member == *n)
-                        .map(|note| KnownNote {
-                            text: note.text.clone(),
-                            updated: now,
-                        }),
-                );
-            let about = facts
-                .current(group, Some(*account))
-                .await
-                .map_err(|e| e.to_string())?;
-            // The deployment's default decay, as the store would weigh them (a scenario has no
-            // earlier episodes, so everything is current).
-            let assessed = DecayPolicy::default().assess(&about, &Activity::default(), now);
-            for (fact, (confidence, worth)) in about.into_iter().zip(assessed) {
-                person.facts.push(KnownFact {
-                    predicate: fact.predicate,
-                    value: fact.label.unwrap_or(fact.object),
-                    supports: fact.supports,
-                    last_confirmed: fact.last_confirmed,
-                    confidence,
-                    worth,
+            // Earlier display names were last used a day apart, before the current one.
+            let shown = std::iter::once(&spec.name).chain(&spec.earlier_names);
+            for (days, text) in (0i64..).zip(shown) {
+                person.shown.push(ShownName {
+                    member,
+                    text: text.clone(),
+                    last: UnixMillis::new(now.get() - days * 86_400_000),
                 });
             }
+            person
+                .names
+                .extend(all.iter().filter(|k| k.account == *account).cloned());
         }
-        person.facts.sort_by(|a, b| b.worth.total_cmp(&a.worth));
-        let has_records = person.members.len() > 1
-            || !person.blocked.is_empty()
-            || !person.notes.is_empty()
-            || !person.facts.is_empty();
-        if has_records {
-            people.push(person);
-        }
+        person
+            .names
+            .sort_by(|a, b| b.set.cmp(&a.set).then(b.uses().cmp(&a.uses())));
+        people.push(person);
     }
     people.sort_by_key(|p| p.members.first().map(|(n, _)| *n));
-    Ok(GroupPeople { people })
+    let names = all
+        .into_iter()
+        .filter_map(|k| number_of(k.account).map(|n| (MemberNo::new(n), k)))
+        .collect();
+    Ok(GroupPeople { people, names })
 }
 
 pub struct Runner {
@@ -354,57 +354,97 @@ impl Runner {
         world.set_time(now.now());
 
         // What the bot keeps about the group and its people.
-        let facts = Arc::new(MemoryFactStore::new());
-        let predicates = Predicates::builtin();
+        let memories = Arc::new(InMemoryMemoryStore::default());
         let mut episode = 0;
-        for f in &scenario.facts {
-            let predicate = predicates
-                .get(&f.predicate)
-                .ok_or_else(|| format!("unknown predicate {}", f.predicate))?;
-            for _ in 0..f.episodes.max(1) {
+        let mut ids: Vec<MemoryId> = Vec::new();
+        for (i, m) in scenario.memories.iter().enumerate() {
+            let subject = m.member.map(account_of).transpose()?;
+            let author = match (m.by, m.member) {
+                (Some(by), _) | (None, Some(by)) => account_of(by)?,
+                (None, None) => accounts.first().map(|(_, a)| *a).ok_or("no members")?,
+            };
+            let durability = m
+                .durability
+                .as_deref()
+                .and_then(Durability::parse)
+                .unwrap_or(Durability::Ongoing);
+            let last = UnixMillis::new(now.now().get() - i64::from(m.days_ago) * 86_400_000);
+            let mut id = None;
+            // Each supporting conversation a week before the next, the last one `days_ago`.
+            for k in (0..m.episodes.max(1)).rev() {
                 episode += 1;
-                facts
-                    .observe(&Observation {
-                        group,
-                        subject: Some(account_of(f.member)?),
-                        predicate: f.predicate.clone(),
-                        slot: slot(predicate, &f.object),
-                        object: f.object.clone(),
-                        label: None,
-                        decay: predicate.decay,
+                let statement = Statement {
+                    subject,
+                    term: m.term.clone(),
+                    text: m.text.clone(),
+                    durability,
+                    support: Support {
                         episode: EpisodeId::new(episode),
                         message: MessageId::new(episode).map_err(|e| e.to_string())?,
-                        quote: f.object.clone(),
-                        at: UnixMillis::new(now.now().get() - i64::from(f.days_ago) * 86_400_000),
-                    })
+                        author: Some(author),
+                        quote: m.text.clone(),
+                        at: UnixMillis::new(last.get() - i64::from(k) * 7 * 86_400_000),
+                    },
+                };
+                let change = match (m.replaces, id) {
+                    (Some(r), None) => Change::Replace {
+                        id: ids[r - 1],
+                        with: statement,
+                    },
+                    _ => Change::New(statement),
+                };
+                id = memories
+                    .apply(group, &[change])
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| e.to_string())?
+                    .first()
+                    .copied();
             }
+            ids.push(id.ok_or_else(|| format!("memory {} was not stored", i + 1))?);
         }
-        for k in &scenario.knowledge {
-            episode += 1;
-            let (predicate, slot, label) = match &k.term {
-                Some(term) => (GROUP_TERM, term_slot(term), Some(term.clone())),
-                None => (GROUP_TOPIC, topic_slot(&k.text), None),
-            };
-            facts
-                .observe(&Observation {
-                    group,
-                    subject: None,
-                    predicate: predicate.to_owned(),
-                    slot,
-                    object: k.text.clone(),
-                    label,
-                    decay: DecayClass::Stable,
-                    episode: EpisodeId::new(episode),
-                    message: MessageId::new(episode).map_err(|e| e.to_string())?,
-                    quote: k.text.clone(),
-                    at: now.now(),
-                })
+        let notes = Arc::new(MemoryNoteStore::default());
+        for note in &scenario.notes {
+            let about = account_of(note.member)?;
+            notes
+                .add(group, about, &note.text, about, now.now())
                 .await
                 .map_err(|e| e.to_string())?;
         }
-        let people = scenario_people(scenario, &accounts, facts.as_ref(), group, now.now()).await?;
+        let name_store = MemoryNameStore::default();
+        for n in &scenario.names {
+            let about = account_of(n.member)?;
+            match n.basis.as_deref().and_then(NameBasis::parse) {
+                Some(NameBasis::Set) => name_store
+                    .set(group, &n.name, &[about], now.now())
+                    .await
+                    .map_err(|e| e.to_string())?,
+                basis => {
+                    let uses: Vec<NameUse> = (0..n.episodes.max(1))
+                        .map(|k| {
+                            episode += 1;
+                            Ok(NameUse {
+                                account: about,
+                                text: n.name.clone(),
+                                basis: basis.unwrap_or(NameBasis::Addressed),
+                                source: Some(UseSource {
+                                    episode: EpisodeId::new(episode),
+                                    message: MessageId::new(episode).map_err(|e| e.to_string())?,
+                                    quote: n.name.clone(),
+                                }),
+                                at: UnixMillis::new(
+                                    now.now().get() - i64::from(k) * 3 * 86_400_000,
+                                ),
+                            })
+                        })
+                        .collect::<Result<_, String>>()?;
+                    name_store
+                        .record(group, &uses)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        let people = scenario_people(scenario, &accounts, &name_store, group, now.now()).await?;
         let names = Arc::new(Names(
             scenario
                 .members
@@ -452,6 +492,31 @@ impl Runner {
                 ..RecallParams::default()
             },
         ));
+        // The production prompt layer.
+        let prompt = Arc::new(
+            PromptContext::new(
+                Arc::new(WorldHistory(world.clone(), accounts.clone())),
+                self.personas.clone(),
+                clock.clone(),
+                PromptSettings {
+                    window: qbot_core::HistoryWindow::default(),
+                    timezone: TIMEZONE.to_owned(),
+                },
+            )
+            .map_err(|e| e.to_string())?
+            .with_people(Arc::new(ScenarioPeople(people)))
+            // memory.group_memories and memory.person_memories by default
+            .with_memories(
+                memories.clone(),
+                notes.clone(),
+                MemoryView {
+                    group_memories: 40,
+                    person_memories: 8,
+                    half_lives: Default::default(),
+                },
+            )
+            .with_directory(names.clone()),
+        );
         let tools = standard_tools(
             world.clone() as Arc<dyn Delivery>,
             world.clone() as Arc<dyn Archive>,
@@ -464,31 +529,18 @@ impl Runner {
                 },
             },
         )
-        .and_then(|set| add_memory_tools(set, recall, episodes))
+        .and_then(|set| {
+            add_memory_tools(
+                set,
+                recall,
+                episodes,
+                Some(prompt.clone() as Arc<dyn qbot_tools::MemberRecords>),
+            )
+        })
         .and_then(|set| set.with(WebSearchTool::new(search.clone())))
         .and_then(|set| set.with(ReadUrl::new(search, 8000)))
         .map_err(|e| e.to_string())?;
 
-        // The production prompt layer.
-        let prompt = PromptContext::new(
-            Arc::new(WorldHistory(world.clone(), accounts.clone())),
-            self.personas.clone(),
-            clock.clone(),
-            PromptSettings {
-                window: qbot_core::HistoryWindow::default(),
-                timezone: TIMEZONE.to_owned(),
-            },
-        )
-        .map_err(|e| e.to_string())?
-        .with_knowledge(Arc::new(FactKnowledge::new(
-            facts.clone(),
-            // memory.group_terms by default
-            40,
-            DecayPolicy::default(),
-        )))
-        // memory.person_facts by default
-        .with_people(Arc::new(ScenarioPeople(people)), 16)
-        .with_directory(names.clone());
         let trigger = match (&scenario.trigger.line, &scenario.trigger.wake) {
             (Some(n), _) => {
                 let line = &lines[n - 1];

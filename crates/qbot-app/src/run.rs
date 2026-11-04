@@ -34,11 +34,9 @@ use qbot_media::{
     Transcriber,
 };
 use qbot_memory::consolidate::Consolidator;
-use qbot_memory::facts::FactStore;
-use qbot_memory::predicates::Predicates;
 use qbot_memory::{
     BuilderConfig, EpisodeBuilder, EpisodeExtractor, EpisodeJobs, EpisodeStore, IdentityStore,
-    Recall,
+    MemoryStore, NameStore, Recall,
 };
 use qbot_ops::{BackupError, Operations, Parts, PgHousekeeping, PgReportSource, check_tools};
 use qbot_prompt::{
@@ -47,9 +45,9 @@ use qbot_prompt::{
 };
 use qbot_sched::{JobKind, Recurring, Scheduler, TaskService, TimerStore};
 use qbot_store::{
-    DEFAULT_KEY, LeaseError, PgAdmin, PgArchive, PgEpisodeStore, PgFactStore, PgGroupPolicy,
-    PgIdentityStore, PgMediaCache, PgRunLog, PgTimerStore, PgUsageSink, RuntimeLease, Store,
-    StoreError,
+    DEFAULT_KEY, LeaseError, PgAdmin, PgArchive, PgEpisodeStore, PgGroupPolicy, PgIdentityStore,
+    PgMediaCache, PgMemoryStore, PgNameStore, PgRunLog, PgTimerStore, PgUsageSink, RuntimeLease,
+    Store, StoreError,
 };
 use std::net::SocketAddr;
 
@@ -253,10 +251,10 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         Arc::new(PgIdentityStore::new(pool.clone(), Default::default()));
     let episodes: Arc<dyn EpisodeStore> =
         Arc::new(PgEpisodeStore::new(pool.clone(), clock.clone()));
-    let facts: Arc<dyn FactStore> = Arc::new(PgFactStore::new(pool.clone()));
+    let names: Arc<dyn NameStore> = Arc::new(PgNameStore::new(pool.clone()));
+    let memories: Arc<dyn MemoryStore> = Arc::new(PgMemoryStore::new(pool.clone()));
     let notes: Arc<dyn qbot_memory::NoteStore> =
         Arc::new(qbot_store::PgNoteStore::new(pool.clone()));
-    let predicates = Arc::new(Predicates::builtin());
     let recorder = PgUsageSink::start(pool.clone(), clock.clone());
 
     // A run that was open when the previous process died has no end; close it before serving.
@@ -320,6 +318,37 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         )
         .map_err(|e| RunError::Media(e.to_string()))?,
     );
+    // What every run reads: the chat, who is who, what is remembered.
+    let prompt = Arc::new(
+        PromptContext::new(
+            Arc::new(archive.clone()),
+            personas,
+            clock.clone(),
+            PromptSettings {
+                window: config.history_window(),
+                timezone: config.bot.timezone.clone(),
+            },
+        )?
+        .with_people(Arc::new(qbot_prompt::ArchivePeople::new(
+            archive.clone(),
+            qbot_prompt::RosterSettings {
+                recent_ms: config.roster_recent_ms(),
+                max_people: config.roster_people(),
+            },
+        )))
+        .with_memories(
+            memories.clone(),
+            notes.clone(),
+            qbot_prompt::MemoryView {
+                group_memories: config.group_memories(),
+                person_memories: config.person_memories(),
+                half_lives: config.half_lives(),
+            },
+        )
+        .with_bot_nicknames(&config.bot.nicknames)
+        .with_directory(directory.clone())
+        .with_episodes(episodes.clone()),
+    );
     let archive_port: Arc<dyn Archive> = Arc::new(archive.clone());
     let tools = qbot_tools::standard_tools(
         delivery.clone(),
@@ -334,7 +363,12 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
             clock.clone(),
             config.recall_params(),
         ));
-        qbot_tools::add_memory_tools(set, recall, episodes.clone())
+        qbot_tools::add_memory_tools(
+            set,
+            recall,
+            episodes.clone(),
+            Some(prompt.clone() as Arc<dyn qbot_tools::MemberRecords>),
+        )
     })
     .map_err(|e| RunError::Tools(e.to_string()))?;
     // The model may look at pictures itself only if it accepts images at all.
@@ -379,30 +413,6 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         tools
     };
 
-    let prompt = PromptContext::new(
-        Arc::new(archive.clone()),
-        personas,
-        clock.clone(),
-        PromptSettings {
-            window: config.history_window(),
-            timezone: config.bot.timezone.clone(),
-        },
-    )?
-    .with_knowledge(Arc::new(
-        qbot_prompt::FactKnowledge::new(facts.clone(), config.group_terms(), config.decay_policy())
-            .with_activity(episodes.clone()),
-    ))
-    .with_people(
-        Arc::new(qbot_prompt::ArchivePeople::new(
-            archive.clone(),
-            config.decay_policy(),
-        )),
-        config.person_facts(),
-    )
-    .with_bot_nicknames(&config.bot.nicknames)
-    .with_directory(directory.clone())
-    .with_episodes(episodes.clone());
-    let prompt = Arc::new(prompt);
     let renderer = Arc::new(PromptRenderer::new(prompt.zone().clone()));
     let deps = Arc::new(RunDeps {
         provider: provider.clone(),
@@ -439,12 +449,11 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         extractor: Arc::new(
             EpisodeJobs::new(episodes.clone(), builder, config.slice_grid())
                 .with_consolidator(Arc::new(
-                    Consolidator::new(facts.clone(), identity.clone(), predicates.clone())
-                        .with_capacity(
-                            episodes.clone(),
-                            config.decay_policy(),
-                            config.memory_capacity(),
-                        ),
+                    Consolidator::new(names.clone(), memories.clone()).with_capacity(
+                        episodes.clone(),
+                        config.half_lives(),
+                        config.memory_capacity(),
+                    ),
                 ))
                 // Extraction reads the group as replies do: the same people and knowledge.
                 .with_background(prompt.clone()),
@@ -528,7 +537,8 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     // Commands and the pipeline.
     let commands = Arc::new(CommandRouter::new(Deps {
         identity: identity.clone(),
-        facts: facts.clone(),
+        names: names.clone(),
+        memories: memories.clone(),
         notes: notes.clone(),
         admin: Arc::new(PgGroupAdmin::new(admin, policy)),
         runs: Arc::new(run_log.clone()),
@@ -538,7 +548,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         delivery: delivery.clone(),
         locales,
         clock: clock.clone(),
-        settings: CommandSettings::new(bot, config.owners(), zone, config.decay_policy()),
+        settings: CommandSettings::new(bot, config.owners(), zone),
     }));
     let pipeline = Arc::new(
         Pipeline::new(

@@ -15,7 +15,11 @@ use qbot_core::{AccountId, Clock, GroupId, MessageId, UnixMillis};
 use qbot_gateway::pipeline::{CommandRequest, Commands};
 use qbot_i18n::Locales;
 use qbot_llm::{CallKind, Purpose};
-use qbot_memory::{IdentityPolicy, IdentityStore, MemoryIdentityStore};
+use qbot_memory::{
+    Change, Durability, EpisodeId, IdentityPolicy, IdentityStore, InMemoryMemoryStore, MemoryId,
+    MemoryIdentityStore, MemoryNameStore, MemoryStore, NameBasis, NameStore, NameUse, Statement,
+    Support, UseSource,
+};
 use qbot_sched::{MemoryTimerStore, TaskLimits, TaskService};
 use qbot_store::{BlockRule, BlockedBy, RosterRow, TopRow, UsageLine, UsageSummary};
 use tokio::sync::Notify;
@@ -334,7 +338,8 @@ fn run_items() -> Vec<qbot_context::Item> {
 struct Rig {
     router: CommandRouter,
     identity: Arc<MemoryIdentityStore>,
-    facts: Arc<qbot_memory::facts::MemoryFactStore>,
+    names: Arc<MemoryNameStore>,
+    memories: Arc<InMemoryMemoryStore>,
     notes: Arc<qbot_memory::MemoryNoteStore>,
     sent: Arc<Sent>,
     next_message: AtomicI64,
@@ -354,11 +359,13 @@ async fn rig() -> Rig {
         qbot_sched::Zone::get("Asia/Shanghai").unwrap(),
     );
     let sent = Arc::new(Sent::default());
-    let facts = Arc::new(qbot_memory::facts::MemoryFactStore::new());
+    let names = Arc::new(MemoryNameStore::default());
+    let memories = Arc::new(InMemoryMemoryStore::default());
     let notes = Arc::new(qbot_memory::MemoryNoteStore::default());
     let router = CommandRouter::new(Deps {
         identity: identity.clone(),
-        facts: facts.clone(),
+        names: names.clone(),
+        memories: memories.clone(),
         notes: notes.clone(),
         admin: Arc::new(FakeAdmin::default()),
         runs: Arc::new(FakeRuns(vec![
@@ -398,7 +405,6 @@ async fn rig() -> Rig {
             members_max_rows: 60,
             top_max_rows: 20,
             link_ttl: Duration::from_secs(600),
-            fact_decay: qbot_memory::facts::DecayPolicy::default(),
             notes_per_account: 3,
             runs_max_rows: 10,
         },
@@ -406,7 +412,8 @@ async fn rig() -> Rig {
     Rig {
         router,
         identity,
-        facts,
+        names,
+        memories,
         notes,
         sent,
         next_message: AtomicI64::new(1000),
@@ -414,6 +421,37 @@ async fn rig() -> Rig {
 }
 
 impl Rig {
+    /// Remember `text` about `subject` (`None`: the group), as said by them (or Alice) in
+    /// `episode`; its id.
+    async fn remember(
+        &self,
+        subject: Option<i64>,
+        term: Option<&str>,
+        text: &str,
+        episode: i64,
+    ) -> MemoryId {
+        let author = acct(subject.unwrap_or(ALICE));
+        self.memories
+            .apply(
+                GroupId::new(900).unwrap(),
+                &[Change::New(Statement {
+                    subject: subject.map(acct),
+                    term: term.map(Into::into),
+                    text: text.into(),
+                    durability: Durability::Ongoing,
+                    support: Support {
+                        episode: EpisodeId::new(episode),
+                        message: MessageId::new(episode).unwrap(),
+                        author: Some(author),
+                        quote: "q".into(),
+                        at: UnixMillis::new(T0),
+                    },
+                })],
+            )
+            .await
+            .unwrap()[0]
+    }
+
     fn request(&self, sender: i64, text: &str, mentions: &[i64]) -> CommandRequest {
         self.request_in(900, sender, text, mentions)
     }
@@ -559,7 +597,7 @@ async fn who_shows_a_record_and_enforces_scope_rules() {
 }
 
 #[tokio::test]
-async fn aliases_can_be_added_listed_and_removed_with_evidence_semantics() {
+async fn names_are_set_listed_and_removed_with_how_each_was_used() {
     let rig = rig().await;
     assert_eq!(
         rig.say(ALICE, "/name", &[]).await,
@@ -569,16 +607,34 @@ async fn aliases_can_be_added_listed_and_removed_with_evidence_semantics() {
         rig.say(ALICE, "/name add Al the  Great", &[]).await,
         "Recorded: Alice is also called \"Al the Great\"."
     );
+    // A name chat used for Alice twice and for Bob once.
+    let used = |account: i64, episode: i64| NameUse {
+        account: acct(account),
+        text: "Boss".into(),
+        basis: NameBasis::Addressed,
+        source: Some(UseSource {
+            episode: EpisodeId::new(episode),
+            message: MessageId::new(episode).unwrap(),
+            quote: "Boss".into(),
+        }),
+        at: UnixMillis::new(T0),
+    };
+    rig.names
+        .record(
+            GroupId::new(900).unwrap(),
+            &[used(ALICE, 1), used(ALICE, 2), used(BOB, 3)],
+        )
+        .await
+        .unwrap();
     let list = rig.say(ALICE, "/name", &[]).await;
-    assert!(
-        list.contains("Names of Alice:")
-            && list.contains("- al the great (confirmed, confidence 100%)"),
-        "{list}"
+    assert_eq!(
+        list,
+        "Names of Alice:\n- Al the Great (set with /name)\n- Boss (others call them so in 2 conversation(s), last 2027-01-15; also used for Bob)",
     );
     assert!(
         rig.say(ALICE, "/who", &[])
             .await
-            .contains("Confirmed names: al the great (confidence 100%)")
+            .contains("Names (2):\n- Al the Great (set with /name)\n- Boss"),
     );
     assert_eq!(
         rig.say(BOB, "/name add Al the Great", &[]).await,
@@ -599,6 +655,19 @@ async fn aliases_can_be_added_listed_and_removed_with_evidence_semantics() {
     assert_eq!(
         rig.say(ALICE, "/name remove Al the Great", &[]).await,
         "Alice has no active name \"Al the Great\" in this scope."
+    );
+    // A removed name chat uses again is not learned again.
+    assert_eq!(
+        rig.say(ALICE, "/name remove boss", &[]).await,
+        "Removed the name \"boss\" from Alice."
+    );
+    rig.names
+        .record(GroupId::new(900).unwrap(), &[used(ALICE, 4)])
+        .await
+        .unwrap();
+    assert_eq!(
+        rig.say(ALICE, "/name", &[]).await,
+        "Alice has no names on record."
     );
     let long = format!("/name add {}", "x".repeat(65));
     assert_eq!(
@@ -1089,90 +1158,72 @@ async fn replies_quote_and_mention_the_sender_and_long_ones_are_split() {
     let _ = HashMap::<i32, i32>::new();
 }
 
-fn observation(
-    subject: i64,
-    predicate: &str,
-    object: &str,
-    episode: i64,
-) -> qbot_memory::facts::Observation {
-    qbot_memory::facts::Observation {
-        group: GroupId::new(900).unwrap(),
-        subject: Some(acct(subject)),
-        predicate: predicate.into(),
-        slot: qbot_memory::facts::slot(
-            qbot_memory::predicates::Predicates::builtin()
-                .get(predicate)
-                .expect("a person predicate"),
-            object,
-        ),
-        object: object.into(),
-        label: None,
-        decay: qbot_memory::predicates::DecayClass::Default,
-        episode: qbot_memory::episode::EpisodeId::new(episode),
-        message: MessageId::new(episode).unwrap(),
-        quote: "q".into(),
-        at: UnixMillis::new(T0),
-    }
-}
-
 #[tokio::test]
-async fn who_shows_learned_facts_and_forget_removes_one_by_its_number() {
-    use qbot_memory::facts::FactStore;
+async fn who_shows_memories_with_their_source_and_forget_removes_one_by_its_id() {
     let rig = rig().await;
     assert!(
         rig.say(ALICE, "/who", &[])
             .await
-            .contains("Learned from chat: nothing yet")
+            .contains("Remembered from chat: nothing")
     );
-    rig.facts
-        .observe(&observation(ALICE, "likes", "cats", 1))
-        .await
-        .unwrap();
-    rig.facts
-        .observe(&observation(ALICE, "lives_in", "Hangzhou", 2))
-        .await
-        .unwrap();
-    rig.facts
-        .observe(&observation(BOB, "likes", "tea", 3))
-        .await
-        .unwrap();
+    let cats = rig.remember(Some(ALICE), None, "likes cats", 1).await;
+    let home = rig
+        .remember(Some(ALICE), None, "lives in Hangzhou", 2)
+        .await;
+    let tea = rig.remember(Some(BOB), None, "likes tea", 3).await;
     let who = rig.say(ALICE, "/who", &[]).await;
     assert!(
-        who.contains("Learned from chat (2):\n1. likes: cats (confidence 70%)\n2. lives_in: Hangzhou (confidence 70%)\nRemove a note with /note remove N, a learned fact with /forget N (same scope)."),
+        who.contains(&format!(
+            "Remembered from chat (2):\n{} likes cats (they said so; 1 conversation(s), last 2027-01-15)\n{} lives in Hangzhou (they said so; 1 conversation(s), last 2027-01-15)\nRemove a note with /note remove N, a memory with /forget ID (for example /forget m12), everything remembered about them with /forget all.",
+            cats.label(),
+            home.label()
+        )),
         "{who}"
     );
     assert_eq!(
-        rig.say(ALICE, "/forget 3", &[]).await,
-        "There is no learned fact 3 in that scope. Send /who to see the list."
+        rig.say(ALICE, &format!("/forget {}", tea.label()), &[])
+            .await,
+        format!(
+            "There is no memory {} in that scope. Send /who to see the list.",
+            tea.label()
+        )
     );
     assert_eq!(
         rig.say(ALICE, "/forget", &[]).await,
-        "Usage: /forget [--linked] [@account] N, or /forget group N"
+        "Usage: /forget [--linked] [@account] ID, /forget all [--linked] [@account], or /forget group ID"
     );
     assert_eq!(
-        rig.say(ALICE, "/forget 1", &[BOB]).await,
+        rig.say(ALICE, &format!("/forget {}", cats.label()), &[BOB])
+            .await,
         "You can only act on your own account or on accounts you have confirmed as linked."
     );
     assert_eq!(
-        rig.say(ALICE, "/forget 1", &[]).await,
-        "Forgot 1. likes: cats."
+        rig.say(ALICE, &format!("/forget {}", cats.label()), &[])
+            .await,
+        format!("Forgot {}: likes cats", cats.label())
     );
-    assert!(
-        rig.say(ALICE, "/who", &[])
-            .await
-            .contains("1. lives_in: Hangzhou"),
-        "the numbering follows what is left"
+    assert_eq!(
+        rig.say(ALICE, &format!("/forget {}", home.get()), &[])
+            .await,
+        format!("Forgot {}: lives in Hangzhou", home.label()),
+        "the id with or without its m"
     );
     // Owners may forget anyone's, and --linked covers linked accounts.
     rig.say(OWNER, "/link", &[ALICE, BOB]).await;
     assert!(
         rig.say(ALICE, "/who --linked", &[])
             .await
-            .contains("Learned from chat (2):")
+            .contains("Remembered from chat (1):")
     );
+    rig.remember(Some(BOB), None, "plays go", 4).await;
     assert_eq!(
-        rig.say(OWNER, "/forget 1", &[BOB]).await,
-        "Forgot 1. likes: tea."
+        rig.say(OWNER, "/forget all", &[BOB]).await,
+        "Forgot everything remembered about Bob (2)."
+    );
+    assert!(
+        rig.say(OWNER, "/who", &[BOB])
+            .await
+            .contains("Remembered from chat: nothing")
     );
 }
 
@@ -1249,13 +1300,9 @@ async fn notes_are_written_listed_edited_and_removed_by_hand() {
 }
 
 #[tokio::test]
-async fn notes_and_learned_facts_are_separate_and_each_command_touches_only_its_own() {
-    use qbot_memory::facts::FactStore;
+async fn notes_and_memories_are_separate_and_each_command_touches_only_its_own() {
     let rig = rig().await;
-    rig.facts
-        .observe(&observation(ALICE, "likes", "cats", 1))
-        .await
-        .unwrap();
+    let cats = rig.remember(Some(ALICE), None, "likes cats", 1).await;
     rig.say(ALICE, "/note add likes cats too, says so herself", &[])
         .await;
     let who = rig.say(ALICE, "/who", &[]).await;
@@ -1263,87 +1310,76 @@ async fn notes_and_learned_facts_are_separate_and_each_command_touches_only_its_
         who.contains("Notes written by people (1):\n1. likes cats too, says so herself"),
         "{who}"
     );
-    assert!(
-        who.contains("Learned from chat (1):\n1. likes: cats"),
-        "{who}"
-    );
-    // Forgetting learned fact 1 leaves note 1 alone ...
-    assert_eq!(
-        rig.say(ALICE, "/forget 1", &[]).await,
-        "Forgot 1. likes: cats."
-    );
+    assert!(who.contains("Remembered from chat (1):"), "{who}");
+    // Forgetting the memory leaves note 1 alone ...
+    rig.say(ALICE, &format!("/forget {}", cats.label()), &[])
+        .await;
     let who = rig.say(ALICE, "/who", &[]).await;
     assert!(who.contains("Notes written by people (1):"), "{who}");
-    assert!(who.contains("Learned from chat: nothing yet"), "{who}");
-    // ... and removing note 1 leaves learned facts alone.
-    rig.facts
-        .observe(&observation(ALICE, "lives_in", "Hangzhou", 2))
-        .await
-        .unwrap();
+    assert!(who.contains("Remembered from chat: nothing"), "{who}");
+    // ... and removing note 1 leaves memories alone, as does forgetting all of them notes.
+    rig.remember(Some(ALICE), None, "lives in Hangzhou", 2)
+        .await;
     rig.say(ALICE, "/note remove 1", &[]).await;
     let who = rig.say(ALICE, "/who", &[]).await;
     assert!(who.contains("Notes written by people: none"), "{who}");
-    assert!(who.contains("Learned from chat (1):"), "{who}");
-}
-
-fn group_fact(
-    predicate: &str,
-    key: &str,
-    label: Option<&str>,
-    object: &str,
-    episode: i64,
-) -> qbot_memory::facts::Observation {
-    qbot_memory::facts::Observation {
-        subject: None,
-        predicate: predicate.into(),
-        slot: if predicate == qbot_memory::facts::GROUP_TERM {
-            qbot_memory::facts::term_slot(key)
-        } else {
-            qbot_memory::facts::topic_slot(object)
-        },
-        label: label.map(str::to_owned),
-        ..observation(ALICE, "likes", object, episode)
-    }
+    assert!(who.contains("Remembered from chat (1):"), "{who}");
+    rig.say(ALICE, "/note add a second note", &[]).await;
+    rig.say(ALICE, "/forget all", &[]).await;
+    assert!(
+        rig.say(ALICE, "/who", &[])
+            .await
+            .contains("Notes written by people (1):")
+    );
 }
 
 #[tokio::test]
-async fn group_shows_learned_knowledge_and_only_owners_forget_it() {
-    use qbot_memory::facts::{FactStore, GROUP_TERM, GROUP_TOPIC};
+async fn group_shows_what_is_remembered_about_it_and_only_owners_forget_it() {
     let rig = rig().await;
     assert_eq!(
         rig.say(ALICE, "/group", &[]).await,
-        "Nothing has been learned about this group yet."
+        "Nothing is remembered about this group yet."
     );
-    rig.facts
-        .observe(&group_fact(
-            GROUP_TERM,
-            "printer room",
+    let room = rig
+        .remember(
+            None,
             Some("printer room"),
             "the room with the 3D printer",
             1,
-        ))
-        .await
-        .unwrap();
-    rig.facts
-        .observe(&group_fact(GROUP_TOPIC, "", None, "3D printing", 2))
-        .await
-        .unwrap();
+        )
+        .await;
+    let about = rig.remember(None, None, "3D printing", 2).await;
+    let mine = rig.remember(Some(ALICE), None, "likes cats", 3).await;
     let group = rig.say(ALICE, "/group", &[]).await;
     assert!(
-        group.contains("1. What the group is about: 3D printing (confidence 70%)\n2. \"printer room\" means: the room with the 3D printer (confidence 70%)"),
-        "the topic first, then terms: {group}"
+        group.contains(&format!(
+            "Remembered about this group:\n{} 3D printing (members said so; 1 conversation(s), last 2027-01-15)\n{} printer room: the room with the 3D printer (members said so; 1 conversation(s), last 2027-01-15)",
+            about.label(),
+            room.label()
+        )),
+        "what it is, then terms: {group}"
     );
     assert_eq!(
-        rig.say(ALICE, "/forget group 1", &[]).await,
+        rig.say(ALICE, &format!("/forget group {}", room.label()), &[])
+            .await,
         "This action needs bot-owner permission."
     );
     assert_eq!(
-        rig.say(OWNER, "/forget group 9", &[]).await,
-        "There is no group knowledge 9. Send /group to see the list."
+        rig.say(OWNER, &format!("/forget group {}", mine.label()), &[])
+            .await,
+        format!(
+            "There is no group memory {}. Send /group to see the list.",
+            mine.label()
+        ),
+        "a member's memory is not the group's"
     );
     assert_eq!(
-        rig.say(OWNER, "/forget group 2", &[]).await,
-        "Forgot group knowledge 2: printer room: the room with the 3D printer"
+        rig.say(OWNER, &format!("/forget group {}", room.label()), &[])
+            .await,
+        format!(
+            "Forgot {}: printer room: the room with the 3D printer",
+            room.label()
+        )
     );
     assert!(!rig.say(ALICE, "/group", &[]).await.contains("printer room"));
 }
@@ -1705,12 +1741,8 @@ const OWN_ONLY: &str =
 
 #[tokio::test]
 async fn members_act_on_themselves_and_nobody_else() {
-    use qbot_memory::facts::FactStore;
     let rig = rig().await;
-    rig.facts
-        .observe(&observation(ALICE, "likes", "cats", 1))
-        .await
-        .unwrap();
+    rig.remember(Some(ALICE), None, "likes cats", 1).await;
     assert_eq!(
         rig.say(ALICE, "/note add likes cats", &[]).await,
         "Added note 1 about Alice."
@@ -1726,14 +1758,15 @@ async fn members_act_on_themselves_and_nobody_else() {
             .contains("Account record | Alice")
     );
     assert_eq!(
-        rig.say(ALICE, "/forget 1", &[]).await,
-        "Forgot 1. likes: cats."
+        rig.say(ALICE, "/forget m1", &[]).await,
+        "Forgot m1: likes cats"
     );
     for text in [
         "/who",
         "/note add hi",
         "/name add Bobby",
-        "/forget 1",
+        "/forget m1",
+        "/forget all",
         "/note",
     ] {
         assert_eq!(rig.say(ALICE, text, &[BOB]).await, OWN_ONLY, "{text}");
@@ -1742,13 +1775,9 @@ async fn members_act_on_themselves_and_nobody_else() {
 
 #[tokio::test]
 async fn a_delegated_admin_manages_ordinary_members_of_its_group() {
-    use qbot_memory::facts::FactStore;
     let rig = rig().await;
     rig.say(OWNER, "/admin add", &[ADAM]).await;
-    rig.facts
-        .observe(&observation(BOB, "likes", "tea", 1))
-        .await
-        .unwrap();
+    rig.remember(Some(BOB), None, "likes tea", 1).await;
     assert!(
         rig.say(ADAM, "/who", &[BOB])
             .await
@@ -1778,8 +1807,8 @@ async fn a_delegated_admin_manages_ordinary_members_of_its_group() {
         "Removed the name \"Bobby\" from Bob."
     );
     assert_eq!(
-        rig.say(ADAM, "/forget 1", &[BOB]).await,
-        "Forgot 1. likes: tea."
+        rig.say(ADAM, "/forget m1", &[BOB]).await,
+        "Forgot m1: likes tea"
     );
     assert!(
         rig.say(ADAM, "/members", &[])

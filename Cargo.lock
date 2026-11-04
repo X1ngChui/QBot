@@ -2433,6 +2433,7 @@ dependencies = [
  "qbot-llm",
  "qbot-memory",
  "qbot-store",
+ "qbot-tools",
  "qbot-wording",
  "serde",
  "sha2",

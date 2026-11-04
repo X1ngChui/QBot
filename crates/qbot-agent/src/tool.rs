@@ -169,6 +169,16 @@ impl RunState {
         }
     }
 
+    /// Record a member a tool told the model about: like the author of a shown line, they can
+    /// then be mentioned.
+    pub fn note_member(&self, number: MemberNo, account: AccountId) {
+        self.shown
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .authors
+            .insert(number, account);
+    }
+
     pub fn was_shown(&self, message: MessageId) -> bool {
         self.shown
             .lock()

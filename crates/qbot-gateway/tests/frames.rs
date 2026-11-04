@@ -209,6 +209,27 @@ fn an_at_outranks_a_nickname() {
     assert_eq!(decide(false, "hi", &names), None);
 }
 
+#[test]
+fn a_message_carries_the_name_the_group_showed_for_its_sender() {
+    let shown = |extra: &str| {
+        let Frame::Message(m) = parse_frame(&message(extra, "[]")) else {
+            panic!()
+        };
+        m.sender_name
+    };
+    assert_eq!(
+        shown(r#","sender":{"card":"Kit in this group","nickname":"Kit"}"#).as_deref(),
+        Some("Kit in this group"),
+        "the group nickname, as QQ shows it"
+    );
+    assert_eq!(
+        shown(r#","sender":{"card":"  ","nickname":"Kit"}"#).as_deref(),
+        Some("Kit"),
+        "else the account nickname"
+    );
+    assert_eq!(shown(""), None);
+}
+
 fn parsed(segments: &str) -> qbot_gateway::wire::GroupMessage {
     let Frame::Message(m) = parse_frame(&message("", segments)) else {
         panic!()

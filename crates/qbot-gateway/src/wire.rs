@@ -93,6 +93,9 @@ pub struct GroupMessage {
     /// the event does not carry it.
     pub platform_seq: Option<u64>,
     pub sender: AccountId,
+    /// The name the group showed next to the message: the sender's group nickname (`card`),
+    /// else their account nickname. Member-typed text.
+    pub sender_name: Option<String>,
     pub at: UnixMillis,
     /// The bot's own message reported back (`message_sent`, or a sender equal to the bot).
     pub from_bot: bool,
@@ -410,6 +413,13 @@ pub fn parse_frame(raw: &str) -> Frame {
                     .and_then(|seq| u64::try_from(seq).ok())
                     .filter(|seq| *seq > 0),
                 sender,
+                sender_name: [
+                    frame.get("sender").and_then(|s| s.get("card")),
+                    frame.get("sender").and_then(|s| s.get("nickname")),
+                ]
+                .into_iter()
+                .map(text_of)
+                .find(|n| !n.trim().is_empty()),
                 at: millis(&frame),
                 from_bot: post == "message_sent" || sender == self_id,
                 segments: segments(&frame),

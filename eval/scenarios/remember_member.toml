@@ -1,4 +1,4 @@
-description = "A member asks whether the bot remembers something about them. What the bot learned from earlier chat is in its People in this group block; it should answer from that, without a tool call, honestly reflecting how sure it is."
+description = "A member asks whether the bot remembers something about them. What the bot remembers about them from earlier chat is in the note that opens the run, with who said it and when; it should answer from that, without a tool call, honestly reflecting how sure it is."
 
 members = [
   { number = 1, account = 10001, name = "小林" },
@@ -12,9 +12,9 @@ chat = [
 
 trigger = { line = 2 }
 
-facts = [
-  { member = 1, predicate = "likes", object = "猫", episodes = 3 },
-  { member = 1, predicate = "dislikes", object = "蛇" },
+memories = [
+  { member = 1, text = "喜欢猫", episodes = 3 },
+  { member = 1, text = "不喜欢蛇" },
 ]
 
 [expect]
@@ -23,6 +23,6 @@ send_calls_at_most = 1
 tools_forbidden = ["search_history", "recall_episodes"]
 rubric = [
   "The reply says that 小林 likes cats.",
-  "The reply does not present anything beyond the learned facts (likes cats, dislikes snakes) as remembered fact.",
+  "The reply does not present anything beyond what was remembered (likes cats, dislikes snakes) as remembered fact.",
   "The reply is short and in Chinese.",
 ]

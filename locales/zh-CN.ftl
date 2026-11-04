@@ -15,7 +15,6 @@ command-own_accounts_only = 只能操作当前账号或已确认关联账号的�
 command-duration_invalid = 时长格式无效，请使用 30m、12h 或 3d。
 command-truncated = （已截断）
 command-list_separator = 、
-command-name_entry = { $text }（置信度 { $confidence }）
 command-display_fallback = 账号 { $account }
 command-display_member = 成员 { $number }
 command-scope_exact = 精确账号
@@ -68,15 +67,7 @@ help-detail =
 
     { $detail }
 what-who = 查看成员的资料
-detail-who =
-    /who [--linked] [@账号]
-    显示称呼、人工备注和从聊天中自动归纳的内容，各自分别编号。默认查看当前精确账号；--linked 包括关联账号。成员查看自己的记录；授权管理员还可查看本群普通成员的；owner 可查看任何人的。
 what-name = 管理成员的称呼
-detail-name =
-    /name [--linked] [@账号]
-    /name add [--linked] [@账号] 称呼
-    /name remove [--linked] [@账号] 称呼
-    称呼由证据支撑；手动添加的称呼视为已确认。--linked 作用于所有关联账号背后的同一个人。成员管理自己的称呼；授权管理员还可管理本群普通成员的；owner 可管理任何人的。
 what-note = 管理人工备注
 detail-note =
     /note [--linked] [@账号]
@@ -143,9 +134,6 @@ detail-block =
 what-mute = 管理本群静音
 detail-mute = /mute [status|on|off]
 what-group = 查看 bot 对本群学到的内容
-detail-group =
-    /group
-    从聊天中学到的本群主题和常用说法。owner 可用 /forget group 编号 删除。
 what-runs = 查看最近的 bot 运行
 detail-runs =
     /runs
@@ -161,12 +149,7 @@ who-no_record = 本群暂无该账号资料。
 who-title = 账号资料｜{ $display }｜{ $scope }
 who-messages = 本群发言：{ $count } 条
 who-linked = 关联账号：{ $count } 个
-who-names = 已确认称呼：{ $names }
-who-leads = 未确认线索（不可用于指认）：{ $names }
 name-none = { $display } 暂无记录在案的称呼。
-name-header = { $display } 的称呼：
-name-confirmed_line = · { $text }（已确认，置信度 { $confidence }）
-name-candidate_line = · { $text }（未确认，置信度 { $confidence }）
 name-removed = 已撤销 { $display } 的称呼「{ $name }」。
 name-remove_none = { $display } 在此范围没有可撤销的称呼「{ $name }」。
 name-taken = 「{ $name }」已经指向本群的其他人。
@@ -293,44 +276,9 @@ tasks-too_many = 本群待执行任务数量已达上限（{ $limit }）。
 tasks-chain_deep = 本群任务续链深度已达上限（{ $limit }）。
 tasks-nothing_to_change = 修改任务至少需要内容、新的预约时间或新的规则。
 tasks-empty_intent = 任务内容不能为空。
-who-facts = 自动归纳：{ $count } 条
-who-no_facts = 自动归纳：暂无
-who-fact_line = { $index }. { $predicate ->
-        [lives_in] 住在
-        [lived_in] 曾住
-        [from_place] 来自
-        [works_as] 职业
-        [works_at] 就职于
-        [studies_at] 就读于
-        [graduated_from] 毕业于
-        [majors_in] 主修
-        [birthday] 生日
-        [likes] 喜欢
-        [dislikes] 不喜欢
-        [avoids] 回避
-        [wants] 想要
-        [fears] 害怕
-        [plays] 在玩
-        [watches] 在追
-        [listens_to] 在听
-        [reads] 在读
-        [uses] 在用
-        [owns] 有
-        [collects] 收集
-        [has_pet] 养着
-        [visited] 去过
-        [handle_on] 账号
-        [preferred_name] 希望被叫
-        [good_at] 擅长
-        [speaks] 会说
-        [member_of] 属于
-        [allergic_to] 过敏
-       *[other] { $predicate }
-    }：{ $object }（置信度 { $confidence }）
 who-notes = 人工备注（{ $count } 条）：
 who-no_notes = 人工备注：暂无
 who-note_line = { $index }. { $text }
-who-hint = 删除备注：/note remove 编号；删除自动归纳：/forget 编号（同一范围）。
 note-none = 此范围内暂无关于 { $display } 的备注。
 note-header = 关于 { $display } 的备注｜{ $scope }：
 note-line = { $index }. { $text }（{ $author }，{ $time }）
@@ -341,13 +289,6 @@ note-cleared = 已删除关于 { $display } 的 { $count } 条备注。
 note-no_such = 该范围没有第 { $index } 条备注。发送 /note 查看列表。
 note-empty = 备注内容不能为空。
 note-too_many = 每个账号最多 { $max } 条备注，请先删除一条。
-group-empty = 还没有学到关于本群的内容。
-group-header = 对本群学到的内容：
-group-topic_line = { $index }. 本群主要聊：{ $text }（置信度 { $confidence }）
-group-term_line = { $index }. 「{ $term }」的意思：{ $text }（置信度 { $confidence }）
-group-hint = owner 可用 /forget group 编号 删除某一条。
-forget-group_done = 已删除第 { $index } 条群知识：{ $text }
-forget-group_no_such = 没有第 { $index } 条群知识。发送 /group 查看列表。
 runs-empty = 本群还没有运行记录。
 runs-header = 本群最近的运行（{ $count } 次）：
 runs-row = #{ $id } { $time } { $trigger }｜{ $end }｜{ $turns } 轮，{ $tools } 次工具调用，发出 { $sends } 条｜{ $tokens } 词元
@@ -366,45 +307,6 @@ runs-open = 仍在运行
 logs-empty = 启动以来没有警告或错误。
 logs-header = 最近的警告和错误（{ $count } 条）：
 logs-line = { $time } { $level } { $text }
-usage-forget = 用法：/forget [--linked] [@账号] 编号，或 /forget group 编号
-forget-done = 已删除第 { $index } 条：{ $predicate ->
-        [lives_in] 住在
-        [lived_in] 曾住
-        [from_place] 来自
-        [works_as] 职业
-        [works_at] 就职于
-        [studies_at] 就读于
-        [graduated_from] 毕业于
-        [majors_in] 主修
-        [birthday] 生日
-        [likes] 喜欢
-        [dislikes] 不喜欢
-        [avoids] 回避
-        [wants] 想要
-        [fears] 害怕
-        [plays] 在玩
-        [watches] 在追
-        [listens_to] 在听
-        [reads] 在读
-        [uses] 在用
-        [owns] 有
-        [collects] 收集
-        [has_pet] 养着
-        [visited] 去过
-        [handle_on] 账号
-        [preferred_name] 希望被叫
-        [good_at] 擅长
-        [speaks] 会说
-        [member_of] 属于
-        [allergic_to] 过敏
-       *[other] { $predicate }
-    }：{ $object }。
-forget-no_such = 该范围没有第 { $index } 条自动归纳。发送 /who 查看列表。
-what-forget = 删除 bot 从聊天中自动学到的内容
-detail-forget =
-    /forget [--linked] [@账号] 编号
-    /forget group 编号（仅 owner）
-    删除 bot 自己学到的内容：/who 中同一范围的第 N 条自动归纳，或 /group 中的第 N 条群知识。不影响人工备注；备注请用 /note 管理。成员删除关于自己的内容；授权管理员还可删除本群普通成员的；owner 可删除任何人的。
 report-title = 每日报告｜{ $date }
 report-runs = 回复：{ $runs } 次（被叫 { $addressed }，定时 { $wake }，主动 { $spontaneous }）
 report-ends = 结束方式：{ $ends }
@@ -434,3 +336,46 @@ report-memory = 记忆：新增 { $episodes } 条经历
 report-jobs = 后台任务：待执行 { $pending }，失败 { $failed }；被中断的定时任务 { $interrupted }
 report-backup_age = 最近备份：{ $hours } 小时前
 report-backup_none = 最近备份：未找到
+
+who-names = 称呼（{ $count } 个）：
+who-shown = 群名片：{ $names }
+name-header = { $display } 的称呼：
+name-line = · { $text }（{ $how }）
+name-how_set = 用 /name 设定
+name-how_own = 本人在 { $count } 段对话中这样自称
+name-how_others = 别人在 { $count } 段对话中这样叫，最近 { $date }
+name-how_shared = 也用来叫 { $members }
+who-memories = 从聊天中记住的（{ $count } 条）：
+who-no_memories = 从聊天中记住的：暂无
+memory-line = { $id } { $text }（{ $source }；{ $count } 段对话，最近 { $date }）
+memory-source_own = 本人说的
+memory-source_others = 别人说的
+memory-source_both = 本人和别人都说过
+memory-source_members = 群友说的
+who-hint = 删除备注：/note remove 编号；删除一条记忆：/forget 编号（例如 /forget m12）；删除关于此人的全部记忆：/forget all。
+group-empty = 还没有记住关于本群的内容。
+group-header = 关于本群记住的内容：
+group-hint = owner 可用 /forget group 编号 删除某一条。
+forget-done = 已删除 { $id }：{ $text }
+forget-no_such = 该范围没有记忆 { $id }。发送 /who 查看列表。
+forget-group_done = 已删除 { $id }：{ $text }
+forget-group_no_such = 没有群记忆 { $id }。发送 /group 查看列表。
+forget-all_done = 已删除关于 { $display } 的全部记忆（{ $count } 条）。
+usage-forget = 用法：/forget [--linked] [@账号] 编号，/forget all [--linked] [@账号]，或 /forget group 编号
+what-forget = 删除 bot 从聊天中记住的内容
+detail-forget =
+    /forget [--linked] [@账号] 编号
+    /forget all [--linked] [@账号]
+    /forget group 编号（仅 owner）
+    删除 bot 自己从聊天中记住的内容及其来源：/who 中同一范围内该编号的记忆、关于该成员的全部记忆，或 /group 中该编号的群记忆。不影响人工备注（用 /note 管理）和称呼（用 /name remove）。成员删除关于自己的内容；授权管理员还可删除本群普通成员的；owner 可删除任何人的。
+detail-who =
+    /who [--linked] [@账号]
+    显示群名片、大家对此人的称呼、人工备注，以及 bot 从聊天中记住的内容（谁说的、何时说的）。默认查看当前精确账号；--linked 包括关联账号。成员查看自己的记录；授权管理员还可查看本群普通成员的；owner 可查看任何人的。
+detail-name =
+    /name [--linked] [@账号]
+    /name add [--linked] [@账号] 称呼
+    /name remove [--linked] [@账号] 称呼
+    大家对成员的称呼，以及每个称呼的来源：手动设定、本人自称，或别人在对话中这样叫。手动撤销的称呼不会再被自动学回，除非有人重新添加。--linked 作用于所有关联账号背后的同一个人。成员管理自己的称呼；授权管理员还可管理本群普通成员的；owner 可管理任何人的。
+detail-group =
+    /group
+    bot 记住的关于本群的内容：常用说法及其含义、本群的情况，以及说过几次、最近何时说的。owner 可用 /forget group 编号 删除。

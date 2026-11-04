@@ -1,8 +1,10 @@
-# Memory: identity, episodes, recall
+# Memory: identity, episodes, memories, recall
 
-How QBot remembers: `qbot-memory` (domain, pipeline, ports), `qbot-store` (Postgres) and the
-`recall_episodes` and `read_episode` tools, plus the people block every run starts with. The
-archive of chat lines is the source of truth; everything here is derived from it.
+How QBot remembers: `qbot-memory` (domain, pipeline, ports), `qbot-store` (Postgres), the
+`recall_episodes`, `read_episode` and `about_member` tools, and what every run is shown about the
+people in its group. The archive of chat lines is the source of truth; everything here is derived
+from it. Why active memory is built this way, and what was rejected, is in
+[memory-design.md](memory-design.md).
 
 ## 1. Model
 
@@ -43,52 +45,55 @@ so they stay verbatim wherever history shows them, and remain searchable. Networ
 provider-side failures are not permanent: the job fails and the slice is tried again.
 
 **What the extractor reads.** No tools, only context, so everything a reader needs to understand
-the slice and to tell what lasts from what passes is put in front of it (method `slice-v5`):
+the slice and to tell what lasts from what passes is put in front of it (method `slice-v6`):
 - Lines are `[msg:ID] MM-DD HH:MM member:N: text` in the bot's time zone: who said what,
   when, and which line a `[reply:ID]` quotes. The target part's heading gives its first and last
   moments in full, with the year and weekday (`2026-10-15 Thu 20:30`), so "tomorrow" or "on
   Friday" can be turned into dates; the summary writes plans and deadlines as dates.
 - The target lines are numbered; one batch on either side is unnumbered context.
 - "Earlier in this chat" gives the title and summary of the group's episode just before the
-  slice, so a slice that begins mid-conversation is read in its context and not summarized as if
-  it began there.
-- "Quoted from earlier" shows older lines that the shown lines reply to (`[reply:ID]` beyond the
-  context batches: the newest line with that id before them), so a reply such as "agreed" can be
-  understood. Context only, like the neighbouring batches.
+  slice, so a slice that begins mid-conversation is read in its context.
+- "Quoted from earlier" shows older lines that the shown lines reply to. Context only.
 - Ahead of the lines, "Who is who" (`SliceBackground`, implemented by the prompt layer from the
-  same records replies use) lists every member the lines involve, whether as speaker or as
-  `[at:N]`. For each it gives the current group display name, other names, accounts linked as
-  one person in the group, a block, and facts learned before, all from the group's own records. These resolve names and references to member
-  numbers, and the earlier facts (every one, the most confident first, with its confidence) are
-  what a later statement can confirm or end; a value said again is given exactly as listed, so it
-  supports the record instead of standing beside it as a rewording.
-- "About the group" says what the bot is called (members address it by that name, which must
-  never become a member's), the operator's group background and the learned topic and terms.
-- Notes are left out: they are what members wrote about each other, not needed to read a
-  conversation.
+  same records replies use) lists every member the lines involve, as speaker or as `[at:N]`: the
+  display names their lines in the slice were sent under (from the archive, so a name the member
+  has since changed is shown as it was then), the names people use for them with how they were
+  used and whom else each is used for, linked accounts, a block, and every current memory about
+  them with its id (`m12`), the most worth first. A member only mentioned is resolved to their
+  account here, so a line addressed to them can be about them.
+- "About the group" says what the bot is called (never a member's name), the operator's group
+  background, and every current group memory with its id.
+- Notes are left out: they are what members wrote about each other.
 
-The prompt says that names and earlier facts help interpretation but are no evidence: a finding
-still needs a quote from the target. It says what counts as lasting: a fact must still be true in
-a few weeks (where someone lives, works or studies, what they like or keep doing); a mood, what
-someone is doing right now, a one-off event or a plan for tonight belongs in the summary at most.
-The model's reasoning effort is `providers.text.extraction_reasoning`.
+The prompt says that names and memories listed help interpretation but are no evidence: a finding
+needs a line of the target and a quote from it. It says what counts as lasting: a memory must
+still be true and useful in a few weeks; a mood, a one-off event, a plan for tonight or a wish
+voiced once belongs in the summary at most. The model's reasoning effort is
+`providers.text.extraction_reasoning`.
 
 The model answers with one tool call, `submit_episode`: a title and summary in the bot's writing
-language (from the locale), one to three evidence quotes, and findings: names, facts about members
-(by the predicates in `prompts/predicates.toml`), facts that ended (`ended`: the same predicates,
-for what the target part says no longer holds: someone quit a game, moved away, stopped liking
-something) and group knowledge (terms and the topic), each tied to a target line and a verbatim
-quote. Code validates everything:
+language, one to three evidence quotes, and two lists, each item tied to a target line and a
+verbatim quote. Code validates everything against the line's structure:
 
 - The episode needs a title, a summary and one to three quotes copied exactly from target lines.
   A rejected episode goes back to the model with every reason.
-- A finding needs a member's line (never the bot's, never a notice) whose text contains the quote,
-  a subject who wrote the line or is mentioned in the quote, a known predicate, and for a name or a
-  term, the name in the quote or the term written in the target. An ended fact is held to the
-  same rules as a fact. Rejected findings go back once; if the correction is not valid, the
-  episode is kept with the findings that held.
-- An answer cut off at the provider's output limit, or whose arguments are not JSON, is lost
-  rather than wrong: the same request is sent again. At most three model calls per slice.
+- **Names** (`names`): a name a line uses for a member, with its *basis*. `own`: the member wrote
+  the line. `addressed`: someone else wrote it and it mentions the member as `[at:N]` or replies
+  to one of their messages. `about`: someone else wrote it. A basis the line does not bear out is
+  rejected, as is a name not in its quote, one of the bot's names, a name some other member's
+  lines are sent under, and a name given to two members in one answer.
+- **Memories** (`memories`): about `member:N` or `group`, with an action. `new` (text and
+  durability), `same` as memory `id` (it gains support), `changed` (memory `id` is replaced by
+  the new text, which is kept with its durability) or `ended` (memory `id` holds no longer). A
+  memory about a member needs a line they wrote or one directed at them (`[at:N]`, or a reply to
+  their message): talk about someone absent is no evidence about any account. An `id` must be
+  one the background listed for that same subject. A term is the group's and must be written in
+  the target. A text is one sentence of at most 200 characters. One stretch of chat says one thing
+  about each memory: its last line ("I quit it" then "back on it again" leaves it current).
+- Rejected findings go back once; if the correction is not valid, the episode is kept with the
+  findings that held. An answer cut off at the provider's output limit, or whose arguments are
+  not JSON, is lost rather than wrong: the same request is sent again. At most three model calls
+  per slice.
 There is no staging state machine: a crash between the model response and the insert repeats one
 slice's model call, which is cheaper than the machinery to avoid it. The episode records the
 extraction method and model; a later change of extraction model does not invalidate existing
@@ -113,53 +118,43 @@ episodes or what was learned from them.
 
 ## 4. Identity
 
-Terms. A member's *group nickname* is the name they set for one group (OneBot `card`). Their *account nickname* is the account's global QQ
-name (OneBot `nickname`). Their *group display name* is what the group shows: the group nickname,
-else the account nickname. These docs say "group nickname" and "group display name" only.
+Terms. A member's *group nickname* is the name they set for one group (OneBot `card`). Their
+*account nickname* is the account's global QQ name (OneBot `nickname`). Their *group display name*
+is what the group shows: the group nickname, else the account nickname.
 
 - *Account* (a platform login, the QQ number) is recorded in the same transaction as its first
-  line. It is the one global identity record and is never shown; everything about an account
-  is kept per group ([architecture.md](architecture.md) section 8, "Groups are separate").
+  line. It is the one global identity record and is never shown; everything about an account is
+  kept per group ([architecture.md](architecture.md) section 8, "Groups are separate").
 - *Member number*: an account's number in one group (`member:N` to the model), assigned densely
-  the first time the account appears there (speaks or is mentioned) and never changed, reused or
-  removed: a trigger on `member_number` rejects every update, delete and truncate. Linking,
-  splitting, blocks, names and other groups do not touch it. Account ids are global and never
-  reach the model; member numbers are group-local, and two accounts of one person keep two
-  numbers. The model learns which numbers are one person, and who is blocked, from the "People in
-  this group" instruction, read from the group's block list and links on every run.
+  the first time the account appears there and never changed, reused or removed (a trigger on
+  `member_number` rejects every update, delete and truncate). Account ids never reach the model;
+  two accounts of one person keep two numbers.
 - *Linking* records a link between two accounts in the group where it was made
-  (`account_link`). A *person* in a group is the accounts linked to each other there, directly or
-  through others; a link made in another group plays no part, so it never joins numbers, names,
-  notes, facts, blocks or command authority here. *Unlinking* removes an account's links in the
-  group; the accounts it connected stay linked only where they have links of their own.
-- *The current group display name* is the authoritative name of a member in a group: their
-  group nickname (OneBot `card`, the name they set for this group) or, where they set none, their
-  account nickname (OneBot `nickname`), exactly as QQ shows it in the group. It is the platform's own answer, not
-  inferred and not added by anyone, so it is read live from NapCat when needed
-  (`qbot_agent::Directory`, `get_group_member_info`) and never stored: no cache can go stale. It
-  takes precedence over stored names for display and addressing: command replies use it, and
-  every run's trigger note lists it for each member who speaks in the visible chat or has an
-  entry in the people block (asked of the platform when the run opens).
-- *Member number versus name*: `member:N` is the model's internal handle (tool arguments,
-  `[at:N]`, the people block, telling accounts apart); in what the bot writes, people are called
-  by their current group display name, addressed with `[at:N]`, or described naturally when no
-  name is available. A number appears in a message only when someone asks about the numbers.
-- *Stored names* are the other names people use for someone: per group, pointing at an account.
-  A name given with `--linked` is given to each of the person's accounts in the group, and a name
-  confirmed for one of a person's accounts does not stop their other accounts from having it.
-  A name is a belief (section 7): set by a person (`/name`) it is *confirmed*, confidence 1,
-  and stands until removed; learned from chat it is a *lead*, with the credibility of its
-  distinct supporting episodes ageing with the stable half-life. Confirmed is provenance, not a
-  threshold: only a person vouches, however often chat repeats a name. A name a person removed
-  (`/name remove`) stays removed: chat using it again is recorded as evidence but does not bring
-  it back; a person giving it again does. A lead stays a lead,
-  shown with its confidence, and is never expired. A name resolves only to confirmed targets; two
-  confirmed targets for a name is *ambiguous*, never a guess.
-- *Invitations* to link accounts: ten minutes, one pending per
-  account per group, only the target confirms (once: the archive runs each message once, and a
-  confirmed invitation is no longer pending; message ids are hashes and are never compared), an
-  expired or stale (either side's links in the group changed) invitation is closed, replaying the
-  confirming message is a no-op.
+  (`account_link`). A *person* in a group is the accounts linked there, directly or through
+  others; a link made in another group plays no part. *Invitations* to link: ten minutes, one
+  pending per account per group, only the target confirms, an expired or stale one is closed.
+- *Display names are recorded.* Every member line keeps the display name it was sent under
+  (`chat_line.sender_name`, from the event's `sender.card`, else `sender.nickname`). From the
+  archive the bot knows what each member is shown as now and was shown as before: members keep
+  calling each other by old and shortened display names. The current name is also read live from
+  NapCat for the members of a run's conversation (`qbot_agent::Directory`), for the trigger note
+  and command replies, because a name changes apart from any line.
+- *Names people use are uses, not beliefs* (`qbot_memory::names`, `name_use`). Each use records
+  that, in one episode, a line used a name for a member, with its basis: `own`, `addressed`,
+  `about`, or `set` for a name a person gave with `/name` (vouched for, not inferred). One
+  episode counts once per member and name, with its strongest basis. Whom a name refers to is
+  read from all its uses together (`KnownName`: per member and name, how many episodes used it
+  each way and when last), so a name used for one member in eight conversations and for another
+  once reads exactly so, and a name used for several members (or that is another member's display
+  name) is marked as shared. Nothing resolves a name automatically: the model reads the uses and
+  the conversation, and asks when they do not tell.
+- A name a person removed (`/name remove`) loses its uses and is suppressed for that member
+  (`name_removed`): chat using it again is not recorded until a person sets it again. A set name
+  is not set for a member outside those given while it is set for another (`NameTaken`); learned
+  names may be shared.
+- *Member number versus name*: in what the bot writes, people are called by their current group
+  display name, addressed with `[at:N]`, or described; a number appears only when someone asks
+  about the numbers.
 
 ## 5. Compaction alignment
 
@@ -201,159 +196,109 @@ needed for this use case, so episodes are fixed, batch-aligned slices; an LLM bo
 a segmentation state machine is only worth building if fixed slicing proves clearly insufficient.
 The design above would then still hold: the slicing function is the only part that changes.
 
-## 7. Beliefs: confidence and forgetting
+## 7. Memories: provenance, history, rank and room
 
 Memory holds two kinds of thing. *Records* say what happened: archive lines, episodes, notes
-members wrote. They are true of the past by construction and carry no confidence; recall ranks
-episodes by relevance and age (section 3). *Beliefs* are claims about how things are now, inferred
-from records: a fact about a person (`lives_in`, `likes`), the meaning of a group term, the
-group's topic, a name a person goes by. Every belief has one **confidence**, with one meaning
-everywhere: *the estimated probability that the claim holds now*. It is computed on read from the
-belief's evidence, in one place (`qbot_memory::belief`), so a fact, a term and a name with the same
-evidence have the same confidence.
+members wrote. *Memories* (`qbot_memory::memories`, `memory` and `memory_evidence`) are what the
+bot keeps knowing about a member or the group: one short statement in the bot's words ("lives in
+Hangzhou", a group term and what it means here, what the group is for), each with every line
+that supported it (episode, message, author, quote, time).
 
-**The model.** A belief can be wrong for three independent reasons, and confidence is the product
-of the three chances that it is not:
+**Provenance, not probability.** What a reader sees of a memory is who said it (the member
+themselves, others to them, or both; for the group, its members), in how many conversations, and
+when last. No confidence number is computed or shown: almost everything is said once, and a
+probability that is the same everywhere carries no information. The reply prompt says how to
+weigh what it sees: said by the member, recently or more than once, is a good guide; said once,
+long ago, or only by others is what was said then.
 
-1. *The statements were wrong* (a joke, sarcasm, a misread line, the wrong subject).
-   `credibility(n) = (n + 1) / (n + 2)` for `n` distinct episodes that supported it: the posterior
-   mean of a uniform Beta prior after `n` agreeing observations (Laplace's rule of succession).
-   One episode gives 0.67, two 0.75, four 0.83, eight 0.9; it never reaches 1, since repeating a
-   claim is not proof of it. A name set by a person (`/name`) is an assignment, not an inference:
-   credibility 1.
-2. *It stopped holding since it was last said* (people move, quit games, change tastes).
-   `persistence = 0.5^(age / half-life)`, age counted from the last support, the half-life being
-   how long a claim of its decay class typically keeps holding unsaid
-   (`memory.facts.half_life_days`: stable 730 days for where someone lives or works, a pet, a
-   name; default 180 for tastes; fast 45 for what someone currently plays, watches or wants).
-   A vouched name does not age: it stands until removed.
-3. *Something said later contradicts it.* The latest statement screens off earlier ones: a
-   statement made after the belief's last support that is incompatible with it multiplies its
-   confidence by `1 - credibility` of that statement. Incompatible are another value of a
-   single-valued predicate ("lives in Shanghai" against "lives in Beijing"), the opposite
-   predicate for the same thing ("dislikes cats" against "likes cats"), another meaning of the
-   same term, and a statement that it no longer holds (an `ended` finding, credibility of one
-   statement). Support given after the contradiction restores it: the contradiction is then
-   older than the belief's last support and no longer counts.
+**History, not overwriting.** A later statement either supports a memory (`same`, or a `new`
+statement equal to a current memory by `memory_key`: the term and text compatibility-normalized
+and lower-cased), replaces it (`changed`: a new memory, the old one kept as `replaced` with the
+time and its replacement), or ends it (`ended`, with the time). A replaced or ended memory is no
+longer shown in replies; `about_member` shows it as what no longer holds. Said again after it
+ended, a statement is remembered anew. The model makes the semantic call (it sees the current
+memories with their ids); code checks that every id names a current memory of that subject in
+that group, so a statement can never touch another member's memories.
 
-So "moved to Shanghai" after three mentions of Beijing leaves Shanghai at 0.67 and Beijing at
-about a quarter (0.8 credibility, a little persistence lost, times 1/3); both stay, and the model sees
-both with their confidence. A rewording ("Beijing" then "Beijing city") costs the older wording
-two thirds of its confidence instead of deleting it, and either wording is restored by being
-said again. Confidence is a number the model reads, not a gate: nothing is hidden for having
-low confidence.
+**Durability and rank.** A memory is `lasting` (where someone lives, comes from, works or studies,
+family, a lasting trait or boundary), `ongoing` (tastes, hobbies, what they keep doing) or
+`current` (what they are playing or working towards these weeks). Durability sets how fast it
+loses rank, never whether it is true. Rank (`qbot_memory::worth`, never shown) is
+`n / (n + 1) * 0.5^(k / h)`: `n` distinct supporting episodes, `k` the episodes its subject took
+part in since the last support (for the group, every episode of the group), `h` the durability's
+`memory.rank.half_life_episodes` (lasting 200, ongoing 40, current 10). The clock is the
+conversation, not the calendar: a quiet member's or group's memories keep their place, and a
+member who says nothing has not passed anything over. Rank is computed as of the start of the
+UTC day in what replies are shown, so the cached prefix changes by ageing at most once a day.
 
-**Salience: how current a claim is, on the group's own clock.** Confidence answers whether a
-claim holds; it does not say whether it still matters. A claim also loses *salience* every time
-the conversation goes by without it: `0.5^(n / h)`, where `n` counts the episodes ended since its
-last support that its subject took part in (for the group's terms and topics, every episode of
-the group) and `h` is the class's `memory.facts.activity_half_life_episodes` (stable 200, default
-40, fast 10). The clock is the group's conversation, not the calendar: a busy group's clock runs
-fast, so what it stopped talking about loses salience within days; a quiet group's clock barely
-moves, so what it knows stays current for as long as it is quiet; and a member who says nothing
-has not passed anything over. Salience is computed on read from the episodes' ends and
-participants, so no message and no schedule writes anything. A claim's *worth* where room is
-limited is its confidence times its salience; worth is never shown, confidence is.
+**What each run is shown** (`qbot-prompt`):
+- In the cached prefix, **People in this group**: the roster (`PgArchive::people`). A person is
+  listed when one of their accounts spoke within `memory.roster_days` (30), is linked or blocked,
+  or has a name set with `/name`; at most `memory.roster_people` (80), the most recently active
+  first. For each: what they are shown as and were shown as before (up to four display names per
+  account), the names people use for them with how each was used and whom else it is used for,
+  linked accounts, blocks. Activity and display names count lines up to the start of the UTC day.
+- In the cached prefix, **Learned about this group**: the `memory.group_memories` (40) group
+  memories of most rank, listed by term and text.
+- In the run's opening note, for the people of the run's conversation (who wrote the newest 50
+  lines of the window, whom those lines mention, whom a due task's intent names): notes members
+  wrote and the `memory.person_memories` (8) memories of most rank for each. Memories of people
+  not in the conversation are not in the prompt at all: relevance, and less to pass on unasked.
+- On demand, **`about_member(member)`**: everything kept about one member, with what no longer
+  holds. It also makes them mentionable in the run.
 
-**Forgetting: ranking under budgets, eviction under capacity.** Two limits, two mechanisms:
-- *Budgets* choose what reaches the model, by worth: the people block shows each person's
-  `memory.person_facts` (16) facts most worth showing, each with its confidence (rounded to tens
-  of percent) and last support date, competing values side by side, and their names with leads
-  marked by confidence; group knowledge shows the topic most worth showing and, for the
-  `memory.group_terms` (40) terms most worth showing, the meaning most worth showing; the
-  extractor sees every stored fact of the members a slice involves, most worth first, so a
-  statement can confirm, reword or end any of them. What falls out of a budget is still kept,
-  shown by `/who`, and comes back when it is said again.
-- *Capacity* bounds what a group keeps (`memory.capacity`: 40 claims per member, 120 term
-  claims, 8 topics). It is enforced as each episode is applied: in every scope the episode
-  touched that is over its room, the claims worth least, weighed as of the episode's end, are
-  deleted with their evidence; what the episode itself supported is never among them, so new
-  information always finds room (a scope may stay over its room by what one episode said). The
-  provenance stays: the episode keeps its findings and quotes, the archive its lines, and a claim
-  said again is learned again. Scopes nobody adds to are never touched, so a quiet group keeps
-  everything however old.
+**Room.** Each member keeps at most `memory.capacity.per_member` (30) memories in every state and
+the group `memory.capacity.group` (120). Applying an episode, a subject it touched that is over
+its room gives up replaced and ended memories first (the longest closed first), then current ones
+of least rank, weighed as of the episode's end; never one the episode itself touched, so new
+information always finds room and applying an episode again evicts nothing more. Episodes keep
+their findings and the archive its lines: something said again is learned again.
 
-The order in which claims give way follows from worth, not from a rule per case: a contradicted
-value first (its confidence is cut by the statement after it); then a temporary activity its
-subject has talked past many times; then a taste; a stable attribute (where someone lives, their
-name) only after hundreds of episodes of its subject without it, and a claim said in many
-episodes after one said once. Confidence and salience are computed as of the start of the
-current UTC day in what replies are shown, so the people block and the group knowledge change
-at most once a day by ageing and stay in the cached prompt prefix in between. Hard deletion is
-otherwise only by a person: `/forget` (facts), `/name remove` (names), a recalled message (which
-teaches nothing afterwards). Names are not under capacity: a person goes by a few, and all are
-shown.
+**Consolidation** applies each episode's findings right after it is stored and, for any left over
+by a crash, at the start of the group's next extraction: name uses to the name index, statements
+as changes in chat order, then room. Every step is idempotent: an episode records a use and
+supports a memory at most once.
 
-**Storage.** `fact` holds one row per claim: subject, predicate, *slot* and value. Claims of one
-subject compete when they share a slot and differ in predicate or value: a single-valued
-predicate's slot is the predicate (`lives_in`); a multi-valued predicate with an opposite shares
-one slot with it per normalized value (`dislikes/likes:cats`); a multi-valued predicate without
-one has a slot per value, so its values stand side by side; a term's slot is the term (its
-meanings compete), and each topic has its own (a group talking about exams has not stopped being
-about games; topics compete only for room). Each row keeps its distinct supporting episodes (`fact_evidence`, with the quote), its
-first and last support and the latest time it was said to have ended; confidence is derived.
-Statuses are `active` and `forgotten` (struck out by a person, never shown, never a competitor).
+**Erasure.** `/forget ID` deletes one memory and its evidence, `/forget all` every memory about a
+member, `/forget group ID` (owners) a group memory; `/name remove` a name. Deletion is real: the
+row and its evidence go. An episode already applied is never applied again, so a forgotten memory
+comes back only if someone says it again. The episode's own findings and the archive's lines are
+records of what was said and stay (section 9).
 
-**Consolidation** applies each episode's findings in chat order, right after it is stored and, for
-any left over by a crash, at the start of the group's next extraction. Names become extracted
-identity evidence; facts and knowledge become observations: support for the slot's row with the
-same predicate and normalized value, or a new row beside its competitors. One episode says one
-thing per slot: its last statement. An episode supports a claim at most once, so applying it
-again changes nothing. After its observations an episode's ended facts are applied: each records
-the time on the claim with that value, and one that is not recorded changes nothing. Last,
-capacity is enforced in the scopes the episode touched, weighed as of the episode's end, so
-applying it again evicts nothing more.
-
-**Cases** (`qbot-memory/tests/capacity.rs`):
-- *A quiet group, or a quiet member*, keeps everything, however old: nothing adds to its scopes
-  and its clock does not move.
-- *A busy group with changing topics* keeps the topic it keeps returning to (credible, current)
-  and the latest passing one; older passing topics make way.
-- *The same fact said again* is support for one claim, once per episode: it gains credibility
-  and salience, and outlasts what was said once.
-- *A genuine contradiction* ("moved to Shanghai") keeps both values while there is room, the
-  later one believed; under pressure the contradicted value is the first to go.
-- *A member full of facts says something new*: it is recorded, and the claim worth least makes
-  way (a game they have talked past twenty times, not where they live).
-
-**Alternatives considered.**
-
-| Approach | What it gets right | Why not here |
-| --- | --- | --- |
-| Wilson lower bound times decay, expire below 0.05 (the earlier design) | conservative with little evidence | not a probability (one mention 0.27, so most memory looked unreliable); a once-said fact was deleted after about ten weeks; no negative evidence, so a new value had to delete the old |
-| Beta reputation / subjective logic opinion (Jøsang and Ismail 2002), positive and negative counts with a forgetting factor | evidence-based, one scale, explicit uncertainty | treats statements as exchangeable trials of a fixed proportion: three old mentions outvote one fresh "I moved", though the fresh one is about the present. Its rule of succession is kept for credibility |
-| Ebbinghaus strength growing with recall (MemoryBank, Zhong et al. 2023) and ACT-R base-level activation (power-law decay of uses) | memories used often persist | model how a *mind* forgets, not whether a claim about the world still holds; being shown in a prompt is not evidence that it is true, and would make every shown fact immortal |
-| Recency + importance + relevance, min-max normalized (Generative Agents, Park et al. 2023) | good for ranking records | a ranking score, not a probability; importance asked of a model is unstable across calls. Recall of episodes keeps a similarity-times-recency score in this spirit |
-| Time-to-live, or eviction by age alone | simple, bounded | deletes a long-standing fact as readily as last week's game; in a quiet group it forgets what nobody contradicted |
-| Decay on the calendar only (the previous design, and a nightly decay pass) | one clock for everything | a busy group fills its budgets with what it said a month ago while a quiet group loses what it still means; a nightly pass writes for nothing |
-| LRU / LFU by retrieval (being shown counts as use) | cheap capacity management | being shown in a prompt is not evidence; every shown claim would keep itself |
-| Model-chosen ADD / UPDATE / DELETE (Mem0, 2025) | resolves rewording semantically | a contradiction deletes on one model call; Mem0's graph variant and Zep / Graphiti instead mark facts invalid and keep them for temporal reasoning, which is what competing claims with confidence do here without another model call |
-
-Members see their own facts and confidence with `/who` and remove them with `/forget`; group
-knowledge is removed with `/forget group`.
+**Cases** (`qbot-memory/tests/pipeline.rs`, `qbot-prompt/tests/prompt.rs`, `eval/scenarios`):
+- *A shared name*: "Boss" used for one member in eight conversations and for another once is
+  listed for both, each with its count, and marked as also used for the other; the reply model
+  goes by the conversation or asks (`shared_name`).
+- *An old display name*: a member asked about by the name they were shown as before is found by
+  the roster's earlier display names (`former_display_name`).
+- *Moved*: "lives in Hangzhou" replaced by "lives in Ningbo"; replies see Ningbo, `about_member`
+  shows Hangzhou as no longer holding (`moved_member`, `absent_member`).
+- *Quit*: an ended memory leaves replies and takes room first.
+- *Someone absent*: what one member says about another who is neither writing nor addressed is
+  not recorded about anyone.
 
 ## 8. Manual notes are not memory
 
 Two kinds of information about people and the group are kept apart (architecture.md section 18):
 
-| | Manual notes | Extracted memory |
+| | Manual notes | Memories |
 | --- | --- | --- |
 | Written by | a person, with `/note` | extraction, from chat lines |
-| Store | `note` | `fact` / `fact_evidence` (and aliases from evidence) |
-| Removed by | `/note remove` / `/note clear` | `/forget N` (facts), `/forget group N` (group knowledge) |
-| Confidence | none: it is a record of what someone wrote | the probability the claim holds now (section 7) |
-| Model sees it as | a note written by a member | learned from chat, with confidence and age |
+| Store | `note` | `memory` / `memory_evidence` (names: `name_use`) |
+| Removed by | `/note remove` / `/note clear` | `/forget ID`, `/forget all`, `/forget group ID` |
+| Standing | a record of what someone wrote | who said it, how often, when last |
+| Model sees it as | a note written by a member | a memory with its provenance |
 
-Neither path writes into the other: extraction reads chat lines, never notes, and consolidation
-never creates notes; `/forget` never touches notes and `/note` never touches facts. Help texts
-name the store each command acts on.
+Neither path writes into the other: extraction reads chat lines, never notes; `/forget` never
+touches notes and `/note` never touches memories. Help texts name the store each command acts on.
 
 ## 9. Retention
 
-Episodes, facts and evidence are small text and are kept; a belief nobody repeats loses
-confidence and rank but is not deleted (section 7). Revisit if storage or privacy requires.
+Episodes, memories and their evidence are small text. Memories are bounded per subject (section
+7); episodes and the archive are kept.
 
 A recalled message's line keeps its place in the archive but says only `[recalled]`
 ([architecture.md](architecture.md) section 4), so a slice extracted after the recall learns
-nothing from it. An episode or fact made from it before the recall stays: episodes are never
-rewritten, and a message recalled within minutes is rarely in an extracted slice yet.
+nothing from it. An episode or memory made from it before the recall stays: episodes are never
+rewritten, and a message recalled within minutes is rarely in an extracted slice yet. A member
+removes what was remembered from it with `/forget`.

@@ -24,6 +24,7 @@ fn line(ordinal: u64, text: &str) -> SliceLine {
         member_no: Some((ordinal % 3) as u32 + 1),
         at: UnixMillis::new(1_800_000_000_000 + ordinal as i64 * 1000),
         text: text.into(),
+        shown: None,
     }
 }
 
@@ -890,66 +891,21 @@ mod compose {
 fn unused(_: &dyn Provider) {}
 
 #[tokio::test]
-async fn the_in_memory_fact_store_defines_the_contract() {
-    qbot_memory::facts_conformance::run(&qbot_memory::facts::MemoryFactStore::new(), &[5, 9]).await;
+async fn the_in_memory_name_and_memory_stores_define_their_contracts() {
+    qbot_memory::names_conformance::run(&qbot_memory::MemoryNameStore::default()).await;
+    qbot_memory::memories_conformance::run(&qbot_memory::InMemoryMemoryStore::default()).await;
 }
 
 #[test]
-fn confidence_is_the_chance_a_claim_holds_now() {
-    use qbot_memory::belief::{as_of_day, credibility, percent};
-    use qbot_memory::facts::{DecayPolicy, Fact, FactId, FactStatus};
-    use qbot_memory::predicates::DecayClass;
-    assert!(
-        (credibility(1) - 2.0 / 3.0).abs() < 1e-9
-            && (credibility(2) - 0.75).abs() < 1e-9
-            && (credibility(8) - 0.9).abs() < 1e-9
-    );
-    let policy = DecayPolicy::default();
-    let day = 86_400_000;
-    let now = |days: i64| qbot_core::UnixMillis::new(days * day);
-    let fact = |id, predicate: &str, object: &str, supports, last: i64| Fact {
-        id: FactId(id),
-        group: qbot_core::GroupId::new(1).unwrap(),
-        subject: AccountId::new(5).ok(),
-        predicate: predicate.into(),
-        slot: "lives_in".into(),
-        key: object.into(),
-        object: object.into(),
-        label: None,
-        status: FactStatus::Active,
-        supports,
-        first_seen: now(0),
-        last_confirmed: now(last),
-        ended: None,
-        decay: DecayClass::Default,
-    };
-    // Unrepeated, a claim halves every half-life and is never cut off.
-    let once = fact(1, "lives_in", "x", 1, 0);
-    assert!((policy.confidence(&once, [], now(180)) - 1.0 / 3.0).abs() < 1e-9);
-    assert!(policy.confidence(&once, [], now(3650)) > 0.0);
-    // Three old mentions against one fresh change: the fresh one is believed, the old one kept.
-    let both = [
-        fact(1, "lives_in", "beijing", 3, 0),
-        fact(2, "lives_in", "shanghai", 1, 60),
-    ];
-    let [p_old, p_new] = policy.confidences(&both, now(60))[..] else {
-        unreachable!()
-    };
-    assert!((p_new - 2.0 / 3.0).abs() < 1e-9);
-    assert!(p_old > 0.2 && p_old < 0.3, "{p_old}");
-    // Said to have ended: only a later support brings it back.
-    let mut ended = once.clone();
-    ended.ended = Some(now(10));
-    let ratio = policy.confidence(&ended, [], now(10)) / policy.confidence(&once, [], now(10));
-    assert!((ratio - 1.0 / 3.0).abs() < 1e-9);
-    ended.last_confirmed = now(11);
-    assert!(policy.confidence(&ended, [], now(11)) > 0.6);
-    // Shown at whole tens of percent, as of the start of the day.
+fn names_are_normalized_compatibly_and_bounded() {
+    use qbot_memory::name_key;
     assert_eq!(
-        (percent(2.0 / 3.0), percent(0.04), percent(1.0)),
-        (70, 0, 100)
+        name_key("  \u{ff21}\u{ff4c}\u{ff45}\u{ff58} \t Kim ").unwrap(),
+        "alex kim"
     );
-    assert_eq!(as_of_day(qbot_core::UnixMillis::new(3 * day + 5)), now(3));
+    assert!(name_key("").is_err() && name_key(" \n ").is_err());
+    assert!(name_key(&"a".repeat(65)).is_err());
+    assert!(name_key(&"a".repeat(64)).is_ok());
 }
 
 fn said(ordinal: u64, account: i64, member: u32, text: &str) -> SliceLine {
@@ -960,6 +916,33 @@ fn said(ordinal: u64, account: i64, member: u32, text: &str) -> SliceLine {
         member_no: Some(member),
         at: UnixMillis::new(1_800_000_000_000 + ordinal as i64 * 1000),
         text: text.into(),
+        shown: None,
+    }
+}
+
+/// The background replies' prompt layer would give: every current memory with its id.
+struct Remembered(Arc<qbot_memory::InMemoryMemoryStore>);
+
+#[async_trait::async_trait]
+impl qbot_memory::SliceBackground for Remembered {
+    async fn background(
+        &self,
+        group: GroupId,
+        members: &[qbot_memory::SliceMember],
+    ) -> Result<Background, qbot_memory::MemoryError> {
+        use qbot_memory::MemoryStore;
+        let mut subjects: Vec<Option<AccountId>> = members.iter().map(|m| m.account).collect();
+        subjects.push(None);
+        let current = self.0.current(group, &subjects).await?;
+        Ok(Background {
+            text: current
+                .iter()
+                .map(|m| format!("{} {}", m.id.label(), m.display()))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            known: current.iter().map(|m| (m.id, m.subject)).collect(),
+            ..Background::default()
+        })
     }
 }
 
@@ -969,32 +952,25 @@ fn answer_with_findings() -> serde_json::Value {
         "summary": "Kit moved to Hangzhou; the group explained GG.",
         "evidence": [{ "line": 1, "quote": "I moved to Hangzhou" }],
         "names": [
-            { "member": 2, "name": "Kit", "line": 1, "quote": "call me Kit" },
-            { "member": 2, "name": "Kit", "line": 2, "quote": "[at:2] Kit likes" },
-            { "member": 3, "name": "Boss", "line": 1, "quote": "call me Kit" }
+            { "member": 2, "name": "Kit", "basis": "own", "line": 1, "quote": "call me Kit" },
+            { "member": 2, "name": "Kit", "basis": "addressed", "line": 2, "quote": "[at:2] Kit likes" },
+            { "member": 3, "name": "Boss", "basis": "own", "line": 1, "quote": "call me Kit" }
         ],
-        "facts": [
-            { "member": 2, "predicate": "lives_in", "object": "Hangzhou", "line": 1, "quote": "I moved to Hangzhou" },
-            { "member": 2, "predicate": "likes", "object": "cats", "line": 2, "quote": "[at:2] Kit likes cats" },
-            { "member": 1, "predicate": "likes", "object": "dogs", "line": 2, "quote": "Kit likes cats" },
-            { "member": 2, "predicate": "astrology", "object": "leo", "line": 1, "quote": "I moved" },
-            { "member": 3, "predicate": "likes", "object": "tea", "line": 4, "quote": "tea" }
-        ],
-        "knowledge": [
-            { "kind": "term", "term": "GG", "text": "good game", "line": 3, "quote": "GG means good game" },
-            { "kind": "topic", "text": "travel and pets", "line": 1, "quote": "I moved" },
-            { "kind": "term", "term": "AFK", "text": "away", "line": 3, "quote": "GG means" }
+        "memories": [
+            { "about": "member:2", "action": "new", "text": "lives in Hangzhou", "durability": "lasting", "line": 1, "quote": "I moved to Hangzhou" },
+            { "about": "member:2", "action": "new", "text": "likes cats", "durability": "ongoing", "line": 2, "quote": "[at:2] Kit likes cats" },
+            { "about": "member:1", "action": "new", "text": "likes dogs", "durability": "ongoing", "line": 2, "quote": "Kit likes cats" },
+            { "about": "member:2", "action": "same", "id": "m99", "line": 1, "quote": "I moved" },
+            { "about": "group", "action": "new", "term": "GG", "text": "good game", "durability": "ongoing", "line": 3, "quote": "GG means good game" },
+            { "about": "group", "action": "new", "term": "AFK", "text": "away", "durability": "ongoing", "line": 3, "quote": "GG means" }
         ]
     })
 }
 
 #[tokio::test]
-async fn an_episodes_findings_become_names_facts_and_group_knowledge_once() {
+async fn an_episodes_findings_become_name_uses_and_memories_once() {
     use qbot_memory::consolidate::Consolidator;
-    use qbot_memory::facts::{FactStore, MemoryFactStore};
-    use qbot_memory::identity::{AliasStatus, IdentityPolicy};
-    use qbot_memory::predicates::Predicates;
-    use qbot_memory::{IdentityStore, MemoryIdentityStore};
+    use qbot_memory::{InMemoryMemoryStore, MemoryNameStore, MemoryStore, NameStore};
 
     // The rejected findings go back once; the same answer again is kept as it stands.
     let (fake, _, b) = builder(vec![
@@ -1010,91 +986,60 @@ async fn an_episodes_findings_become_names_facts_and_group_knowledge_once() {
             said(3, 10, 1, "here GG means good game"),
         ],
     );
-    let facts = Arc::new(MemoryFactStore::new());
-    let identity = Arc::new(MemoryIdentityStore::new(IdentityPolicy::default()));
-    for account in [10, 11, 12] {
-        identity
-            .seen(AccountId::new(account).unwrap(), UnixMillis::new(0))
-            .await
-            .unwrap();
-    }
-    let consolidator = Arc::new(Consolidator::new(
-        facts.clone(),
-        identity.clone(),
-        Arc::new(Predicates::builtin()),
-    ));
+    let names = Arc::new(MemoryNameStore::default());
+    let memories = Arc::new(InMemoryMemoryStore::default());
+    let consolidator = Arc::new(Consolidator::new(names.clone(), memories.clone()));
     let job =
         EpisodeJobs::new(store.clone(), b, slice_grid(3, 1, 1, 1)).with_consolidator(consolidator);
     assert_eq!(job.extract_group(group()).await.unwrap(), 1);
 
-    // The model was told about the predicates.
     let p = prompt(&fake, 0);
+    assert!(p.contains("## Names") && p.contains("`addressed`"), "{p}");
+    let sent_back = format!("{:?}", fake.recorded()[1].conversation.items().last());
     assert!(
-        p.contains("- lives_in (one value): The city or region where they live now"),
-        "{p}"
+        sent_back.contains("names item 3: basis own: member:3 did not write that line")
+            && sent_back.contains("memories item 3: member:1 neither wrote that line")
+            && sent_back.contains("memories item 4: \\\"m99\\\" is not a current memory")
+            && sent_back.contains("memories item 6: the term \\\"AFK\\\" is not written"),
+        "{sent_back}"
     );
 
     let kit = AccountId::new(11).unwrap();
-    let about_kit: Vec<(String, String)> = facts
-        .current(group(), Some(kit))
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|f| (f.predicate, f.object))
+    let about_kit = memories.current(group(), &[Some(kit)]).await.unwrap();
+    let texts: Vec<(&str, u32)> = about_kit
+        .iter()
+        .map(|m| (m.text.as_str(), m.own_word()))
         .collect();
     assert_eq!(
-        about_kit,
-        [
-            ("likes".to_owned(), "cats".to_owned()),
-            ("lives_in".to_owned(), "Hangzhou".to_owned())
-        ]
+        texts,
+        [("lives in Hangzhou", 1), ("likes cats", 0)],
+        "what they said themselves, and what someone said to them"
     );
     assert!(
-        facts
-            .current(group(), AccountId::new(10).ok())
+        memories
+            .current(group(), &[AccountId::new(10).ok()])
             .await
             .unwrap()
             .is_empty(),
-        "a fact from someone else's line about an unmentioned member is dropped"
+        "a statement about a member the line is not directed at is dropped"
     );
-    let group_facts: Vec<(String, Option<String>, String)> = facts
-        .current(group(), None)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|f| (f.predicate, f.label, f.object))
-        .collect();
+    let ours = memories.current(group(), &[None]).await.unwrap();
     assert_eq!(
-        group_facts,
-        [
-            (
-                "group_term".to_owned(),
-                Some("GG".to_owned()),
-                "good game".to_owned()
-            ),
-            ("group_topic".to_owned(), None, "travel and pets".to_owned())
-        ]
+        ours.iter().map(|m| m.display()).collect::<Vec<_>>(),
+        ["GG: good game"]
     );
 
-    // The name is extracted evidence: a lead, never confirmed by extraction alone, counted once
-    // per episode however often it is cited.
-    let names = identity.names_of(group(), &[kit]).await.unwrap();
-    assert_eq!(names.len(), 1);
+    // A name is a use: one per member, name and episode, the strongest way the episode used it.
+    let known = names.names(group(), None).await.unwrap();
+    assert_eq!(known.len(), 1);
     assert_eq!(
-        (names[0].text.as_str(), names[0].status),
-        ("kit", AliasStatus::Candidate)
-    );
-    assert!(
-        (names[0].confidence - 2.0 / 3.0).abs() < 1e-6,
-        "{}",
-        names[0].confidence
-    );
-    assert!(
-        identity
-            .names_of(group(), &[AccountId::new(12).unwrap()])
-            .await
-            .unwrap()
-            .is_empty()
+        (
+            known[0].key.as_str(),
+            known[0].own,
+            known[0].addressed,
+            known[0].set
+        ),
+        ("kit", 1, 0, false)
     );
 
     // The episode keeps exactly what was kept, and is marked applied.
@@ -1102,22 +1047,18 @@ async fn an_episodes_findings_become_names_facts_and_group_knowledge_once() {
     assert_eq!(
         (
             stored[0].episode.findings.names.len(),
-            stored[0].episode.findings.facts.len(),
-            stored[0].episode.findings.knowledge.len()
+            stored[0].episode.findings.memories.len()
         ),
-        (2, 2, 2)
+        (2, 3)
     );
     assert!(store.unconsolidated(group()).await.unwrap().is_empty());
-    assert_eq!(stored[0].episode.method, "slice-v5");
+    assert_eq!(stored[0].episode.method, METHOD);
 }
 
 #[tokio::test]
 async fn an_episode_stored_but_not_yet_applied_is_applied_by_the_next_run() {
     use qbot_memory::consolidate::Consolidator;
-    use qbot_memory::facts::{FactStore, MemoryFactStore};
-    use qbot_memory::identity::IdentityPolicy;
-    use qbot_memory::predicates::Predicates;
-    use qbot_memory::{IdentityStore, MemoryIdentityStore};
+    use qbot_memory::{InMemoryMemoryStore, MemoryNameStore, MemoryStore};
 
     let lines = [
         said(1, 11, 2, "I moved to Hangzhou last year, call me Kit"),
@@ -1134,46 +1075,31 @@ async fn an_episode_stored_but_not_yet_applied_is_applied_by_the_next_run() {
         .unwrap();
     assert_eq!(store.unconsolidated(group()).await.unwrap().len(), 1);
 
-    let facts = Arc::new(MemoryFactStore::new());
-    let identity = Arc::new(MemoryIdentityStore::new(IdentityPolicy::default()));
-    for account in [10, 11, 12] {
-        identity
-            .seen(AccountId::new(account).unwrap(), UnixMillis::new(0))
-            .await
-            .unwrap();
-    }
+    let memories = Arc::new(InMemoryMemoryStore::default());
     let consolidator = Arc::new(Consolidator::new(
-        facts.clone(),
-        identity,
-        Arc::new(Predicates::builtin()),
+        Arc::new(MemoryNameStore::default()),
+        memories.clone(),
     ));
     let (_, _, b) = builder(vec![]);
     let job =
         EpisodeJobs::new(store.clone(), b, slice_grid(3, 1, 1, 1)).with_consolidator(consolidator);
+    assert_eq!(job.extract_group(group()).await.unwrap(), 0);
+    let kit = [AccountId::new(11).ok()];
     assert_eq!(
-        job.extract_group(group()).await.unwrap(),
-        0,
-        "nothing new to extract"
-    );
-    assert_eq!(
-        facts
-            .current(group(), AccountId::new(11).ok())
-            .await
-            .unwrap()
-            .len(),
+        memories.current(group(), &kit).await.unwrap().len(),
         2,
         "but the stored findings were applied"
     );
     assert!(store.unconsolidated(group()).await.unwrap().is_empty());
-    // Running again changes nothing: an episode supports a fact once.
+    // Running again changes nothing: an episode supports a memory once.
     job.extract_group(group()).await.unwrap();
     assert!(
-        facts
-            .current(group(), AccountId::new(11).ok())
+        memories
+            .current(group(), &kit)
             .await
             .unwrap()
             .iter()
-            .all(|f| f.supports == 1)
+            .all(|m| m.episodes() == 1)
     );
 }
 
@@ -1183,25 +1109,26 @@ async fn the_in_memory_note_store_meets_the_note_contract() {
     qbot_memory::notes_conformance::run(&qbot_memory::MemoryNoteStore::default(), accounts).await;
 }
 
+fn term_answer(quote: &str) -> serde_json::Value {
+    json!({
+        "title": "The cafe",
+        "summary": "member:2 said the group calls the cafe the Den.",
+        "evidence": [{ "line": 1, "quote": "call that cafe the Den" }],
+        "memories": [
+            { "about": "group", "action": "new", "term": "the Den", "text": "the cat cafe by the lake", "durability": "ongoing", "line": 2, "quote": quote }
+        ]
+    })
+}
+
 #[tokio::test]
 async fn rejected_findings_go_back_once_and_the_corrected_answer_is_kept() {
     let target = vec![
         said(1, 11, 2, "we all call that cafe the Den"),
         said(2, 12, 3, "the Den is the cat cafe by the lake"),
     ];
-    let summary = |quote: &str| {
-        json!({
-            "title": "The cafe",
-            "summary": "member:2 said the group calls the cafe the Den.",
-            "evidence": [{ "line": 1, "quote": "call that cafe the Den" }],
-            "knowledge": [
-                { "kind": "term", "term": "the Den", "text": "the cat cafe by the lake", "line": 2, "quote": quote }
-            ]
-        })
-    };
     let (fake, ex) = extractor(vec![
-        answer(summary("the cafe by the lake")),
-        answer(summary("the cat cafe by the lake")),
+        answer(term_answer("the cafe by the lake")),
+        answer(term_answer("the cat cafe by the lake")),
     ]);
     let out = ex
         .extract(
@@ -1218,14 +1145,11 @@ async fn rejected_findings_go_back_once_and_the_corrected_answer_is_kept() {
         .unwrap();
     assert_eq!(out.attempts, 2);
     assert!(out.dropped.is_empty(), "{:?}", out.dropped);
-    assert!(matches!(
-        &out.findings.knowledge[..],
-        [qbot_memory::findings::KnowledgeFinding::Term { term, .. }] if term == "the Den"
-    ));
+    assert_eq!(out.findings.memories[0].term.as_deref(), Some("the Den"));
     let sent_back = format!("{:?}", fake.recorded()[1].conversation.items().last());
     assert!(
         sent_back.contains("The episode is fine, but some items were not accepted")
-            && sent_back.contains("knowledge item 1: the quote for line #2"),
+            && sent_back.contains("memories item 1: the quote for line #2"),
         "{sent_back}"
     );
 }
@@ -1240,9 +1164,10 @@ async fn a_term_may_be_explained_by_a_line_that_does_not_repeat_it() {
         "title": "The cafe",
         "summary": "member:2 said the group calls a place the Den.",
         "evidence": [{ "line": 1, "quote": "call that place the Den" }],
-        "knowledge": [
-            { "kind": "term", "term": "the Den", "text": "the cat cafe by the lake", "line": 2, "quote": "the cat cafe by the lake" },
-            { "kind": "term", "term": "the Burrow", "text": "invented", "line": 2, "quote": "the cat cafe" }
+        "memories": [
+            { "about": "group", "action": "new", "term": "the Den", "text": "the cat cafe by the lake", "durability": "ongoing", "line": 2, "quote": "the cat cafe by the lake" },
+            { "about": "group", "action": "new", "term": "the Burrow", "text": "invented", "durability": "ongoing", "line": 2, "quote": "the cat cafe" },
+            { "about": "member:2", "action": "new", "term": "Den", "text": "a term about a member", "durability": "ongoing", "line": 1, "quote": "the Den" }
         ]
     }))]);
     let ctx = SliceContext {
@@ -1253,10 +1178,13 @@ async fn a_term_may_be_explained_by_a_line_that_does_not_repeat_it() {
         next: &[],
     };
     let out = ex.extract(&ctx, "English").await.unwrap();
-    assert_eq!(out.findings.knowledge.len(), 1, "{:?}", out.dropped);
+    assert_eq!(out.findings.memories.len(), 1, "{:?}", out.dropped);
     assert_eq!(
         out.dropped,
-        ["knowledge item 2: the term \"the Burrow\" is not written in the target part"]
+        [
+            "memories item 2: the term \"the Burrow\" is not written in the target part",
+            "memories item 3: a term belongs to the group: give it with about group"
+        ]
     );
 }
 
@@ -1312,69 +1240,6 @@ async fn an_answer_cut_off_on_every_attempt_is_an_error() {
 }
 
 #[tokio::test]
-async fn one_episode_says_one_thing_per_slot_and_applying_it_again_changes_nothing() {
-    use qbot_memory::consolidate::Consolidator;
-    use qbot_memory::facts::{FactStore, MemoryFactStore};
-    use qbot_memory::findings::{FactFinding, Findings};
-    use qbot_memory::identity::IdentityPolicy;
-    use qbot_memory::predicates::Predicates;
-    use qbot_memory::{Episode, EpisodeId, MemoryIdentityStore};
-
-    let kit = AccountId::new(11).unwrap();
-    let fact = |predicate: &str, object: &str| FactFinding {
-        account: kit,
-        predicate: predicate.into(),
-        object: object.into(),
-        message: MessageId::new(1).unwrap(),
-        quote: "q".into(),
-    };
-    let mut new = qbot_memory::conformance::episode(group(), 1, 30, "moves");
-    new.findings = Findings {
-        facts: vec![
-            fact("lives_in", "Hangzhou"),
-            fact("likes", "tea"),
-            fact("lives_in", "Ningbo"),
-            fact("dislikes", "tea"),
-        ],
-        ..Findings::default()
-    };
-    let episode = Episode {
-        id: EpisodeId::new(7),
-        created: UnixMillis::new(0),
-        episode: new,
-    };
-    let facts = Arc::new(MemoryFactStore::new());
-    let consolidator = Consolidator::new(
-        facts.clone(),
-        Arc::new(MemoryIdentityStore::new(IdentityPolicy::default())),
-        Arc::new(Predicates::builtin()),
-    );
-    let current = || async {
-        facts
-            .current(group(), Some(kit))
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|f| (f.id, f.predicate, f.object, f.supports))
-            .collect::<Vec<_>>()
-    };
-
-    consolidator.apply(&episode).await.unwrap();
-    let applied = current().await;
-    let held: Vec<_> = applied
-        .iter()
-        .map(|(_, p, o, s)| (p.as_str(), o.as_str(), *s))
-        .collect();
-    assert_eq!(
-        held,
-        [("dislikes", "tea", 1), ("lives_in", "Ningbo", 1)],
-        "the slice's last word on each slot, an opposite pair being one slot"
-    );
-    consolidator.apply(&episode).await.unwrap();
-    assert_eq!(current().await, applied, "the same rows, unchanged");
-}
-
-#[tokio::test]
 async fn a_slice_is_shown_the_chat_it_continues_its_dates_and_lines_it_quotes_from_further_back() {
     let (fake, store, job) = jobs(answers(4), 10, 1);
     let mut all = lines(1..=40);
@@ -1416,138 +1281,432 @@ async fn a_slice_is_shown_the_chat_it_continues_its_dates_and_lines_it_quotes_fr
 }
 
 #[tokio::test]
-async fn a_fact_said_to_hold_no_longer_is_ended_and_only_that_value() {
+async fn later_statements_confirm_replace_and_end_memories_and_history_is_kept() {
     use qbot_memory::consolidate::Consolidator;
-    use qbot_memory::facts::{FactStore, MemoryFactStore};
-    use qbot_memory::identity::IdentityPolicy;
-    use qbot_memory::predicates::Predicates;
-    use qbot_memory::{IdentityStore, MemoryIdentityStore};
+    use qbot_memory::{InMemoryMemoryStore, MemoryNameStore, MemoryState, MemoryStore};
 
-    let plays = json!({
-        "title": "Games", "summary": "member:2 plays two games.",
+    let first = json!({
+        "title": "Games", "summary": "member:2 plays two games and lives in Hangzhou.",
         "evidence": [{ "line": 1, "quote": "I play Genshin" }],
-        "facts": [
-            { "member": 2, "predicate": "plays", "object": "Genshin", "line": 1, "quote": "I play Genshin" },
-            { "member": 2, "predicate": "plays", "object": "Chess", "line": 2, "quote": "and Chess" }
+        "memories": [
+            { "about": "member:2", "action": "new", "text": "plays Genshin", "durability": "current", "line": 1, "quote": "I play Genshin" },
+            { "about": "member:2", "action": "new", "text": "plays chess on weekends", "durability": "ongoing", "line": 2, "quote": "and Chess" },
+            { "about": "member:2", "action": "new", "text": "lives in Hangzhou", "durability": "lasting", "line": 3, "quote": "in Hangzhou" }
         ]
     });
-    let quits = json!({
-        "title": "Quitting", "summary": "member:2 quit Genshin.",
+    // The ids are those the background listed: m1 Genshin, m2 chess, m3 Hangzhou.
+    let second = json!({
+        "title": "Changes", "summary": "member:2 quit Genshin and moved to Ningbo.",
         "evidence": [{ "line": 1, "quote": "quit Genshin" }],
-        "ended": [
-            { "member": 2, "predicate": "plays", "object": "genshin", "line": 1, "quote": "quit Genshin" },
-            { "member": 2, "predicate": "plays", "object": "Tetris", "line": 1, "quote": "quit Genshin" },
-            { "member": 1, "predicate": "plays", "object": "Chess", "line": 2, "quote": "no more" }
+        "memories": [
+            { "about": "member:2", "action": "ended", "id": "m1", "line": 1, "quote": "quit Genshin" },
+            { "about": "member:2", "action": "ended", "id": "m42", "line": 1, "quote": "quit Genshin" },
+            { "about": "member:3", "action": "ended", "id": "m2", "line": 2, "quote": "no more" },
+            { "about": "member:2", "action": "changed", "id": "m3", "text": "lives in Ningbo", "durability": "lasting", "line": 3, "quote": "moved to Ningbo" },
+            { "about": "member:2", "action": "same", "id": "m2", "line": 4, "quote": "still play chess" }
         ]
     });
-    let (_, _, b) = builder(vec![answer(plays), answer(quits.clone()), answer(quits)]);
+    let (fake, _, b) = builder(vec![answer(first), answer(second.clone()), answer(second)]);
     let store = Arc::new(MemoryEpisodeStore::new());
     store.add_lines(
         group(),
         [
             said(1, 11, 2, "I play Genshin every night"),
             said(2, 11, 2, "and Chess on weekends"),
-            said(3, 12, 3, "nice"),
-            said(4, 11, 2, "I quit Genshin last week"),
-            said(5, 12, 3, "no more for me either"),
-            said(6, 12, 3, "ok"),
+            said(3, 11, 2, "I live in Hangzhou"),
+            said(4, 12, 3, "nice"),
+            said(5, 11, 2, "I quit Genshin last week"),
+            said(6, 12, 3, "no more for me either"),
+            said(7, 11, 2, "and I moved to Ningbo"),
+            said(8, 11, 2, "I still play chess though"),
         ],
     );
-    let facts = Arc::new(MemoryFactStore::new());
-    let identity = Arc::new(MemoryIdentityStore::new(IdentityPolicy::default()));
-    for account in [11, 12] {
-        identity
-            .seen(AccountId::new(account).unwrap(), UnixMillis::new(0))
-            .await
-            .unwrap();
-    }
+    let memories = Arc::new(InMemoryMemoryStore::default());
     let consolidator = Arc::new(Consolidator::new(
-        facts.clone(),
-        identity,
-        Arc::new(Predicates::builtin()),
+        Arc::new(MemoryNameStore::default()),
+        memories.clone(),
     ));
-    let job =
-        EpisodeJobs::new(store.clone(), b, slice_grid(3, 1, 0, 0)).with_consolidator(consolidator);
+    let job = EpisodeJobs::new(store.clone(), b, slice_grid(4, 1, 0, 0))
+        .with_consolidator(consolidator)
+        .with_background(Arc::new(Remembered(memories.clone())));
     assert_eq!(job.extract_group(group()).await.unwrap(), 2);
+    assert!(
+        prompt(&fake, 1).contains("m3 lives in Hangzhou"),
+        "the extractor saw the memories with their ids"
+    );
 
-    let games: Vec<(String, bool)> = facts
-        .current(group(), AccountId::new(11).ok())
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|f| (f.object, f.ended.is_some()))
+    let kit = AccountId::new(11).ok();
+    let all = memories.about(group(), kit).await.unwrap();
+    let states: Vec<(&str, &str)> = all
+        .iter()
+        .map(|m| {
+            let state = match m.state {
+                MemoryState::Current => "current",
+                MemoryState::Replaced { .. } => "replaced",
+                MemoryState::Ended { .. } => "ended",
+            };
+            (m.text.as_str(), state)
+        })
         .collect();
     assert_eq!(
-        games,
-        [("Chess".to_owned(), false), ("Genshin".to_owned(), true)],
-        "Genshin is said to have ended and kept as such, Chess untouched"
+        states,
+        [
+            ("plays Genshin", "ended"),
+            ("plays chess on weekends", "current"),
+            ("lives in Hangzhou", "replaced"),
+            ("lives in Ningbo", "current"),
+        ],
+        "an ended or replaced memory is kept as history"
     );
-    let stored = store.within(group(), 4, 6).await.unwrap();
+    assert_eq!(all[1].episodes(), 2, "said again in the second episode");
+    assert!(matches!(all[2].state, MemoryState::Replaced { by: Some(id), .. } if id == all[3].id));
+    let stored = store.within(group(), 5, 8).await.unwrap();
     assert_eq!(
-        stored[0].episode.findings.ended.len(),
-        2,
-        "a member who neither wrote the line nor is mentioned ends nothing"
+        stored[0].episode.findings.memories.len(),
+        3,
+        "an unknown id and someone else's memory end nothing"
     );
 }
 
 #[test]
-fn the_later_of_a_fact_and_its_end_wins_and_the_bots_names_are_no_ones() {
-    use qbot_memory::findings::{FactArg, NameArg, validate_findings};
-    use qbot_memory::predicates::Predicates;
+fn one_episode_says_one_thing_about_each_memory_its_last() {
+    use qbot_memory::MemoryId;
+    use qbot_memory::findings::{FindingContext, MemoryAction, MemoryArg, validate_findings};
 
     let target = [
         said(1, 11, 2, "I quit Genshin"),
-        said(2, 11, 2, "Bobo, call me Kit"),
-        said(3, 11, 2, "ok I'm back on Genshin again"),
-        said(4, 12, 3, "I love tea"),
-        said(5, 12, 3, "no, I stopped drinking tea"),
+        said(2, 11, 2, "ok I'm back on Genshin again"),
+        said(3, 12, 3, "I love tea"),
+        said(4, 12, 3, "no, I stopped drinking tea"),
+        said(5, 12, 3, "I love tea"),
     ];
-    let background = Background {
-        bot_names: vec!["Bobo".into()],
-        ..Default::default()
-    };
-    let ctx = SliceContext {
-        group: group(),
-        previous: &[],
-        target: &target,
-        next: &[],
-        background: &background,
-    };
-    let fact = |member: u32, predicate: &str, object: &str, line: u32, quote: &str| FactArg {
+    let (kit, other) = (AccountId::new(11).ok(), AccountId::new(12).ok());
+    let known = [(MemoryId::new(1), kit), (MemoryId::new(2), other)];
+    let item =
+        |about: &str, action, id: Option<&str>, text: Option<&str>, line: u32, quote: &str| {
+            MemoryArg {
+                about: about.into(),
+                action,
+                id: id.map(Into::into),
+                term: None,
+                text: text.map(Into::into),
+                durability: text.map(|_| qbot_memory::Durability::Ongoing),
+                line,
+                quote: quote.into(),
+            }
+        };
+    let (findings, dropped) = validate_findings(
+        &[],
+        &[
+            item(
+                "member:2",
+                MemoryAction::Ended,
+                Some("m1"),
+                None,
+                1,
+                "I quit Genshin",
+            ),
+            item(
+                "member:2",
+                MemoryAction::Same,
+                Some("m1"),
+                None,
+                2,
+                "back on Genshin",
+            ),
+            item(
+                "member:3",
+                MemoryAction::New,
+                None,
+                Some("loves tea"),
+                3,
+                "I love tea",
+            ),
+            item(
+                "member:3",
+                MemoryAction::Ended,
+                Some("2"),
+                None,
+                4,
+                "I stopped drinking tea",
+            ),
+            item(
+                "member:3",
+                MemoryAction::New,
+                None,
+                Some("Loves  tea"),
+                5,
+                "I love tea",
+            ),
+        ],
+        &FindingContext {
+            parts: [&[], &target, &[]],
+            quoted: &[],
+            accounts: &[],
+            known: &known,
+            bot_names: &[],
+        },
+    );
+    assert!(dropped.is_empty(), "{dropped:?}");
+    let kept: Vec<(MemoryAction, Option<i64>)> = findings
+        .memories
+        .iter()
+        .map(|f| (f.action, f.id.map(MemoryId::get)))
+        .collect();
+    assert_eq!(
+        kept,
+        [
+            (MemoryAction::Same, Some(1)),
+            (MemoryAction::Ended, Some(2)),
+            (MemoryAction::New, None),
+        ],
+        "back on it after quitting holds; one new statement said twice is said once"
+    );
+}
+
+#[test]
+fn how_a_line_uses_a_name_is_checked_against_the_line() {
+    use qbot_memory::NameBasis;
+    use qbot_memory::findings::{FindingContext, NameArg, UseArg, validate_findings};
+
+    let mut shown = said(6, 13, 4, "hi all");
+    shown.shown = Some("Wren".into());
+    let target = [
+        said(1, 11, 2, "Bobo, call me Kit"),
+        said(2, 12, 3, "[at:2] Kit, are you coming?"),
+        said(3, 12, 3, "[reply:1001] sure, Kitty"),
+        said(4, 12, 3, "Kit is late again"),
+        said(5, 12, 3, "Wren said so"),
+        shown,
+    ];
+    let name = |member: u32, name: &str, basis: UseArg, line: u32, quote: &str| NameArg {
         member,
-        predicate: predicate.into(),
-        object: object.into(),
+        name: name.into(),
+        basis,
         line,
         quote: quote.into(),
     };
-    let name = |name: &str| NameArg {
-        member: 2,
-        name: name.into(),
-        line: 2,
-        quote: "Bobo, call me Kit".into(),
-    };
     let (findings, dropped) = validate_findings(
-        &[name("Bobo"), name("Kit")],
         &[
-            fact(2, "plays", "Genshin", 3, "back on Genshin"),
-            fact(3, "likes", "tea", 4, "I love tea"),
+            name(2, "Bobo", UseArg::Own, 1, "Bobo, call me Kit"),
+            name(2, "Kit", UseArg::Own, 1, "call me Kit"),
+            name(2, "Kit", UseArg::Addressed, 2, "[at:2] Kit"),
+            name(2, "Kitty", UseArg::Addressed, 3, "sure, Kitty"),
+            name(2, "Kit", UseArg::Addressed, 4, "Kit is late"),
+            name(2, "Kit", UseArg::Own, 4, "Kit is late"),
+            name(3, "Kit", UseArg::About, 4, "Kit is late"),
+            name(2, "Wren", UseArg::About, 5, "Wren said"),
         ],
         &[],
-        &[
-            fact(2, "plays", "genshin", 1, "I quit Genshin"),
-            fact(3, "likes", "tea", 5, "I stopped drinking tea"),
+        &FindingContext {
+            parts: [&[], &target, &[]],
+            quoted: &[],
+            accounts: &[],
+            known: &[],
+            bot_names: &["bobo".to_owned()],
+        },
+    );
+    let kept: Vec<(&str, NameBasis)> = findings
+        .names
+        .iter()
+        .map(|n| (n.name.as_str(), n.basis))
+        .collect();
+    assert_eq!(
+        kept,
+        [
+            ("Kit", NameBasis::Own),
+            ("Kit", NameBasis::Addressed),
+            ("Kitty", NameBasis::Addressed),
         ],
-        &ctx,
-        &Predicates::builtin(),
+        "a reply to their message addresses them"
     );
-    let said: Vec<&str> = findings.facts.iter().map(|f| f.object.as_str()).collect();
-    let ended: Vec<&str> = findings.ended.iter().map(|f| f.object.as_str()).collect();
-    assert_eq!(said, ["Genshin"], "back on it after quitting: it holds");
-    assert_eq!(ended, ["tea"], "stopped after saying it: it ended");
-    let names: Vec<&str> = findings.names.iter().map(|n| n.name.as_str()).collect();
-    assert_eq!(names, ["Kit"]);
+    let reasons = dropped.join("\n");
+    for expected in [
+        "names item 1: \"Bobo\" is a name of the bot",
+        "names item 5: basis addressed: the line neither mentions [at:2] nor replies to a message of member:2",
+        "names item 6: basis own: member:2 did not write that line",
+        "names item 7: member:3 wrote that line; a name they give themselves has basis own",
+        "names item 8: \"Wren\" is how member:4 is shown in these lines",
+    ] {
+        assert!(reasons.contains(expected), "{expected}\n{reasons}");
+    }
+}
+
+#[tokio::test]
+async fn a_full_member_gives_up_history_first_then_what_is_worth_least_never_what_was_just_said() {
+    use qbot_memory::consolidate::Consolidator;
+    use qbot_memory::findings::{Findings, MemoryAction, MemoryFinding};
+    use qbot_memory::{
+        Capacity, Durability, Episode, EpisodeId, HalfLives, InMemoryMemoryStore, MemoryNameStore,
+        MemoryStore,
+    };
+
+    let kit = AccountId::new(11).unwrap();
+    let episodes = Arc::new(MemoryEpisodeStore::new());
+    let memories = Arc::new(InMemoryMemoryStore::default());
+    let consolidator = Consolidator::new(Arc::new(MemoryNameStore::default()), memories.clone())
+        .with_capacity(
+            episodes.clone(),
+            HalfLives::default(),
+            Capacity {
+                per_member: 2,
+                group: 10,
+            },
+        );
+    let finding = |action, id: Option<i64>, text: &str, durability| MemoryFinding {
+        subject: Some(kit),
+        action,
+        id: id.map(qbot_memory::MemoryId::new),
+        term: None,
+        text: (!text.is_empty()).then(|| text.to_owned()),
+        durability: Some(durability),
+        message: MessageId::new(1).unwrap(),
+        author: kit,
+        quote: "q".into(),
+    };
+    let apply = |n: i64, findings: Vec<MemoryFinding>| {
+        let mut new =
+            qbot_memory::conformance::episode(group(), 1 + 30 * (n as u64 - 1), 30 * n as u64, "e");
+        new.findings = Findings {
+            memories: findings,
+            ..Findings::default()
+        };
+        new.participants = vec![kit];
+        Episode {
+            id: EpisodeId::new(n),
+            created: UnixMillis::new(0),
+            episode: new,
+        }
+    };
+    let texts = || async {
+        memories
+            .about(group(), Some(kit))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| {
+                let current = m.is_current();
+                (m.text, current)
+            })
+            .collect::<Vec<_>>()
+    };
+    let one = apply(
+        1,
+        vec![
+            finding(
+                MemoryAction::New,
+                None,
+                "lives in Hangzhou",
+                Durability::Lasting,
+            ),
+            finding(
+                MemoryAction::New,
+                None,
+                "plays Genshin",
+                Durability::Current,
+            ),
+        ],
+    );
+    consolidator.apply(&one).await.unwrap();
+    // Moving replaces Hangzhou: three memories in a room of two, the replaced one goes.
+    let two = apply(
+        2,
+        vec![finding(
+            MemoryAction::Changed,
+            Some(1),
+            "lives in Ningbo",
+            Durability::Lasting,
+        )],
+    );
+    consolidator.apply(&two).await.unwrap();
+    assert_eq!(
+        texts().await,
+        [
+            ("plays Genshin".to_owned(), true),
+            ("lives in Ningbo".to_owned(), true)
+        ]
+    );
+    // Something new: the memory worth least goes, never what the episode said.
+    let three = apply(
+        3,
+        vec![finding(
+            MemoryAction::New,
+            None,
+            "studies law",
+            Durability::Lasting,
+        )],
+    );
+    consolidator.apply(&three).await.unwrap();
+    let left = texts().await;
+    assert_eq!(left.len(), 2);
+    assert!(left.iter().any(|(t, _)| t == "studies law"));
+    // Applying an episode again evicts nothing more.
+    consolidator.apply(&three).await.unwrap();
+    assert_eq!(texts().await, left);
+}
+
+#[test]
+fn rank_follows_support_and_the_subjects_own_conversation() {
+    use qbot_memory::{Activity, Durability, HalfLives, Memory, MemoryId, MemoryState, Support};
+    let kit = AccountId::new(11).unwrap();
+    let other = AccountId::new(12).unwrap();
+    let at = |n: i64| UnixMillis::new(n * 1000);
+    let memory = |id: i64, durability, episodes: i64, last: i64| Memory {
+        id: MemoryId::new(id),
+        group: group(),
+        subject: Some(kit),
+        term: None,
+        text: format!("m{id}"),
+        durability,
+        state: MemoryState::Current,
+        first: at(0),
+        last: at(last),
+        support: (0..episodes)
+            .map(|e| Support {
+                episode: qbot_memory::EpisodeId::new(e),
+                message: MessageId::new(1).unwrap(),
+                author: Some(kit),
+                quote: String::new(),
+                at: at(last),
+            })
+            .collect(),
+    };
+    let h = HalfLives::default();
+    // Ten episodes of the group: five with kit, five without.
+    let activity = Activity::new(
+        (1..=10)
+            .map(|n| {
+                (
+                    at(100 + n),
+                    if n % 2 == 0 { vec![kit] } else { vec![other] },
+                )
+            })
+            .collect(),
+    );
+    let fresh = memory(1, Durability::Current, 1, 200);
+    let passed = memory(2, Durability::Current, 1, 0);
+    let lasting = memory(3, Durability::Lasting, 1, 0);
+    let repeated = memory(4, Durability::Current, 4, 0);
+    let until = at(1000);
+    let w = |m: &Memory| h.worth(m, &activity, until);
+    assert!((w(&fresh) - 0.5).abs() < 1e-9, "said once, nothing since");
+    // Five of kit's episodes went by: a current memory loses half its rank to 10 such.
+    assert!((w(&passed) - 0.5 * 0.5_f64.powf(0.5)).abs() < 1e-9);
+    assert!(w(&lasting) > w(&passed), "a lasting memory keeps its place");
+    assert!(w(&repeated) > w(&passed), "said in more conversations");
+    let quiet = Activity::new((1..=10).map(|n| (at(100 + n), vec![other])).collect());
     assert!(
-        dropped.iter().any(|d| d.contains("a name of the bot")),
-        "{dropped:?}"
+        (h.worth(&passed, &quiet, until) - 0.5).abs() < 1e-9,
+        "a member who said nothing since has not passed it over"
     );
+    let mut ended = fresh.clone();
+    ended.state = MemoryState::Ended { at: at(300) };
+    assert_eq!(w(&ended), 0.0);
+    let all = [passed.clone(), fresh.clone(), lasting.clone()];
+    let order: Vec<i64> = h
+        .ranked(&all, &activity, until)
+        .iter()
+        .map(|m| m.id.get())
+        .collect();
+    assert_eq!(order, [1, 3, 2]);
 }

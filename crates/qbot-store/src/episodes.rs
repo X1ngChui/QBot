@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use qbot_core::{AccountId, Clock, GroupId, MessageId, UnixMillis};
-use qbot_memory::belief::Activity;
+use qbot_memory::worth::Activity;
 use qbot_memory::{
     Episode, EpisodeId, EpisodeStore, Evidence, Hit, MemoryError, NewEpisode, SliceLine,
 };
@@ -90,6 +90,7 @@ fn slice_line(row: &PgRow) -> Result<SliceLine, MemoryError> {
             .and_then(|n| u32::try_from(n).ok()),
         at: UnixMillis::new(row.get("at_ms")),
         text: row.get("text"),
+        shown: row.get("sender_name"),
     })
 }
 
@@ -154,7 +155,7 @@ impl EpisodeStore for PgEpisodeStore {
         last_ordinal: u64,
     ) -> Result<Vec<SliceLine>, MemoryError> {
         let rows = sqlx::query(
-            "SELECT l.ordinal, l.message_id, l.account_id, l.at_ms, l.text, m.number \
+            "SELECT l.ordinal, l.message_id, l.account_id, l.at_ms, l.text, l.sender_name, m.number \
              FROM chat_line l LEFT JOIN member_number m ON m.group_id = l.group_id AND m.account_id = l.account_id \
              WHERE l.group_id = $1 AND l.ordinal BETWEEN $2 AND $3 ORDER BY l.ordinal",
         )
@@ -178,7 +179,7 @@ impl EpisodeStore for PgEpisodeStore {
         }
         let ids: Vec<i64> = messages.iter().map(|m| m.get()).collect();
         let rows = sqlx::query(
-            "SELECT DISTINCT ON (l.message_id) l.ordinal, l.message_id, l.account_id, l.at_ms, l.text, m.number \
+            "SELECT DISTINCT ON (l.message_id) l.ordinal, l.message_id, l.account_id, l.at_ms, l.text, l.sender_name, m.number \
              FROM chat_line l LEFT JOIN member_number m ON m.group_id = l.group_id AND m.account_id = l.account_id \
              WHERE l.group_id = $1 AND l.message_id = ANY($2) AND l.ordinal < $3 \
              ORDER BY l.message_id, l.ordinal DESC",

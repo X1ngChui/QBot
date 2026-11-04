@@ -148,23 +148,22 @@ impl Config {
             "memory.recall.max_distance",
             "must be in (0, 1): a candidate must be similar, not unrelated or opposite",
         );
-        let half = &m.facts.half_life_days;
+        let half = &m.rank.half_life_episodes;
         c.that(
-            half.stable >= 1 && half.default >= 1 && half.fast >= 1,
-            "memory.facts.half_life_days",
-            "every half-life must be at least 1 day",
-        );
-        let act = &m.facts.activity_half_life_episodes;
-        c.that(
-            act.stable >= 1 && act.default >= 1 && act.fast >= 1,
-            "memory.facts.activity_half_life_episodes",
+            half.lasting >= 1 && half.ongoing >= 1 && half.current >= 1,
+            "memory.rank.half_life_episodes",
             "every half-life must be at least 1 episode",
         );
         let cap = &m.capacity;
         c.that(
-            cap.person_facts >= m.person_facts && cap.group_terms >= m.group_terms && cap.group_topics >= 1,
+            cap.per_member >= m.person_memories && cap.group >= m.group_memories,
             "memory.capacity",
-            "must hold at least what replies are shown (memory.person_facts, memory.group_terms) and one topic",
+            "must hold at least what replies are shown (memory.person_memories, memory.group_memories)",
+        );
+        c.that(
+            m.roster_days >= 1 && m.roster_people >= 1,
+            "memory.roster_days",
+            "the roster must cover at least one day and one person",
         );
 
         let md = &self.media;

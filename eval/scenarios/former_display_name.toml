@@ -1,0 +1,26 @@
+description = "A member asks about 小鱼. Nobody in the chat is shown as 小鱼 now, but the roster says member 1, shown as Fish_2026, was earlier shown as 小鱼; what the bot remembers about member 1 is in the run's opening note, since they are in the chat. The bot should recognize 小鱼 as member 1 and answer from that memory (studies law), not say it does not know who 小鱼 is."
+
+members = [
+  { number = 1, account = 60001, name = "Fish_2026", earlier_names = ["小鱼"] },
+  { number = 2, account = 60002, name = "阿杰" },
+]
+
+chat = [
+  { member = 1, text = "今天图书馆人好多" },
+  { member = 2, text = "[at:bot] 小鱼现在还在学法律吗" },
+]
+
+trigger = { line = 2 }
+
+memories = [
+  { member = 1, text = "在华东政法读法学", durability = "lasting", episodes = 2, days_ago = 30 },
+]
+
+[expect]
+send = "required"
+send_calls_at_most = 1
+rubric = [
+  "The reply treats 小鱼 as the member now shown as Fish_2026 and says they study law (法学 / 华东政法), possibly hedged by how long ago it was said.",
+  "The reply does not say it does not know who 小鱼 is.",
+  "The reply is short and in Chinese.",
+]

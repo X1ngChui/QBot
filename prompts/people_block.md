@@ -1,5 +1,5 @@
 ## People in this group
 
-What you keep about members besides their display names (those are in the trigger note). Blocks and linked accounts are records; names marked as leads, notes and learned facts are what people said. A lead or a learned fact says how likely it is to hold now, from how often and how recently it was said and whether something said later contradicts it, and how often and when it was said. Two values of one thing may both be listed when they disagree, the likelier first.
+Who is who: what each member is shown as in QQ (from their own messages, now and before) and the names people use for them, with how often. Members often call each other by a shortened, altered or older display name. A name used for more than one member says so, and then only the conversation can tell whom it means: ask rather than guess when it matters. Linked accounts and blocks are records. What you remember about the people in the chat is in the note that opens the run; `about_member` tells you about anyone else.
 
 {{entries}}

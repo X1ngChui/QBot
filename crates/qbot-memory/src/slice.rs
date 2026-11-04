@@ -3,6 +3,7 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use qbot_core::{AccountId, GroupId, MessageId, UnixMillis};
 
+use crate::memories::MemoryId;
 use crate::store::MemoryError;
 
 /// An archived line as the memory pipeline sees it. `ordinal` is the dense per-group number the
@@ -17,6 +18,9 @@ pub struct SliceLine {
     pub member_no: Option<u32>,
     pub at: UnixMillis,
     pub text: String,
+    /// The display name the line was sent under (a member's group nickname, else account
+    /// nickname), when the archive has it.
+    pub shown: Option<String>,
 }
 
 impl SliceLine {
@@ -50,6 +54,10 @@ pub struct Background {
     pub quoted: Vec<SliceLine>,
     /// What members call the bot (its persona's name, its nicknames): never a member's name.
     pub bot_names: Vec<String>,
+    /// Accounts of members the lines mention without writing any of them.
+    pub accounts: Vec<(u32, AccountId)>,
+    /// The current memories `text` lists, with their subjects: the ones a statement may name.
+    pub known: Vec<(MemoryId, Option<AccountId>)>,
 }
 
 impl Default for Background {
@@ -60,18 +68,30 @@ impl Default for Background {
             earlier: None,
             quoted: Vec::new(),
             bot_names: Vec::new(),
+            accounts: Vec::new(),
+            known: Vec::new(),
         }
     }
+}
+
+/// A member the lines of a slice involve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SliceMember {
+    pub number: u32,
+    /// Known when the member wrote one of the lines.
+    pub account: Option<AccountId>,
+    /// The display names their lines were sent under, in order of first appearance.
+    pub shown: Vec<String>,
 }
 
 /// Where a slice's background comes from: the records about its members and the group.
 #[async_trait]
 pub trait SliceBackground: Send + Sync {
-    /// The background for a slice of `group` whose lines (context included) involve `members`:
-    /// each member number, with its account when the lines show it.
+    /// The background for a slice of `group` whose lines (context included) involve `members`,
+    /// by member number.
     async fn background(
         &self,
         group: GroupId,
-        members: &[(u32, Option<AccountId>)],
+        members: &[SliceMember],
     ) -> Result<Background, MemoryError>;
 }

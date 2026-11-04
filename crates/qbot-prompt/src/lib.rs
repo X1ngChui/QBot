@@ -1,21 +1,23 @@
 //! Everything the model reads that is not a tool result: instruction templates, personas, the
-//! rendering of chat lines, and the assembly of a run's opening context.
+//! rendering of chat lines and of what is kept about people, and the assembly of a run's opening
+//! context.
 //!
 //! Wording lives in `prompts/*.md` (English) and in the deployment's persona files; code
 //! only fills named slots. The set of slots of each template is a closed contract that is
 //! checked at render time and by tests.
 
+mod people;
 mod persona;
 mod render;
 mod source;
 mod templates;
 
+pub use people::MemoryView;
 pub use persona::{Persona, PersonaError, Personas};
-pub use qbot_store::{GroupPeople, KnownFact, KnownName, KnownNote, Person};
+pub use qbot_store::{GroupPeople, Person, RosterSettings, ShownName};
 pub use render::PromptRenderer;
 pub use source::{
-    ArchivePeople, FactKnowledge, HistorySource, Knowledge, KnowledgeSource, PeopleSource,
-    PromptContext, PromptSettings, UnknownZone,
+    ArchivePeople, HistorySource, PeopleSource, PromptContext, PromptSettings, UnknownZone,
 };
 pub use templates::{PromptError, Template, render_template};
 

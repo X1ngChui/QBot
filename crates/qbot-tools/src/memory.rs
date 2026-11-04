@@ -171,11 +171,87 @@ impl Tool for ReadEpisode {
     }
 }
 
-/// Add the memory tools to a tool set.
+/// What is kept about one member of a group, as the model reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberRecord {
+    pub account: qbot_core::AccountId,
+    pub text: String,
+}
+
+/// Where `about_member` reads from: the names, notes and memories kept about a member.
+#[async_trait]
+pub trait MemberRecords: Send + Sync {
+    /// Everything kept about member `member` of `group`, rendered; `None` when the group has no
+    /// such member.
+    async fn describe(
+        &self,
+        group: qbot_core::GroupId,
+        member: MemberNo,
+    ) -> Result<Option<MemberRecord>, String>;
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AboutMemberArgs {
+    pub member: u32,
+}
+
+#[derive(Clone)]
+pub struct AboutMember(pub Arc<dyn MemberRecords>);
+
+impl std::fmt::Debug for AboutMember {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AboutMember").finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl Tool for AboutMember {
+    type Args = AboutMemberArgs;
+    const NAME: &'static str = "about_member";
+
+    fn description(&self) -> String {
+        say(Text::AboutMemberDescription {})
+    }
+
+    fn parameters(&self) -> Vec<(&'static str, String)> {
+        vec![("member", say(Text::AboutMemberParamMember {}))]
+    }
+
+    fn effect(&self) -> Effect {
+        Effect::Read
+    }
+
+    async fn call(&self, cx: &ToolCx<'_>, args: AboutMemberArgs) -> Result<ToolOutput, ToolError> {
+        let number = MemberNo::new(args.member);
+        let record = self
+            .0
+            .describe(cx.group, number)
+            .await
+            .map_err(ToolError::Unavailable)?
+            .ok_or_else(|| {
+                ToolError::refused(
+                    RefusalReason::NotAllowed,
+                    say(Text::AboutMemberNoSuch {
+                        member: args.member.to_string(),
+                    }),
+                )
+            })?;
+        // The model was told about them, so it may mention them.
+        cx.state.note_member(number, record.account);
+        Ok(ToolOutput::text(record.text))
+    }
+}
+
+/// Add the memory tools to a tool set; `about_member` when there are member records to read.
 pub fn add_memory_tools(
     set: ToolSet,
     recall: Arc<Recall>,
     store: Arc<dyn EpisodeStore>,
+    members: Option<Arc<dyn MemberRecords>>,
 ) -> Result<ToolSet, ToolSetError> {
-    set.with(RecallEpisodes(recall))?.with(ReadEpisode(store))
+    let set = set.with(RecallEpisodes(recall))?.with(ReadEpisode(store))?;
+    match members {
+        Some(records) => set.with(AboutMember(records)),
+        None => Ok(set),
+    }
 }

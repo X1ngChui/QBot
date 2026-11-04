@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use qbot_core::{AccountId, MessageId, UnixMillis};
 use qbot_llm::responses::{KeySource, ReqwestTransport, ResponsesConfig, ResponsesProvider};
-use qbot_memory::findings::KnowledgeFinding;
-use qbot_memory::{EpisodeExtractor, SliceContext, SliceLine};
+use qbot_memory::findings::MemoryAction;
+use qbot_memory::{EpisodeExtractor, MemoryId, NameBasis, SliceContext, SliceLine};
 
 fn secret(file: &str) -> String {
     let dir = std::env::var_os("QBOT_LIVE_SECRETS_DIR").map_or_else(
@@ -32,12 +32,11 @@ fn line(ordinal: u64, account: i64, member: u32, text: &str) -> SliceLine {
         member_no: Some(member),
         at: UnixMillis::new(1_800_000_000_000 + ordinal as i64 * 60_000),
         text: text.into(),
+        shown: None,
     }
 }
 
-#[tokio::test]
-#[ignore = "calls paid provider APIs"]
-async fn a_real_model_writes_a_valid_episode_with_findings() {
+fn live_extractor() -> EpisodeExtractor {
     let endpoint = std::env::var("QBOT_LIVE_TEXT_ENDPOINT")
         .unwrap_or_else(|_| "https://api.deepseek.com".into());
     let model = std::env::var("QBOT_LIVE_TEXT_MODEL").unwrap_or_else(|_| "deepseek-flash".into());
@@ -50,7 +49,24 @@ async fn a_real_model_writes_a_valid_episode_with_findings() {
     let mut cfg = ResponsesConfig::deepseek(model);
     cfg.timeout = Some(Duration::from_secs(180));
     let provider = Arc::new(ResponsesProvider::new(cfg, Arc::new(transport)).unwrap());
-    let extractor = EpisodeExtractor::new(provider);
+    EpisodeExtractor::new(provider)
+}
+
+fn report(out: &qbot_memory::Extracted) {
+    eprintln!(
+        "[extract] model={} attempts={} usage={:?}",
+        out.model, out.attempts, out.usage
+    );
+    eprintln!("[extract] title={:?}", out.title);
+    eprintln!("[extract] summary={:?}", out.summary);
+    eprintln!("[extract] findings={:#?}", out.findings);
+    eprintln!("[extract] dropped={:?}", out.dropped);
+}
+
+#[tokio::test]
+#[ignore = "calls paid provider APIs"]
+async fn a_real_model_writes_a_valid_episode_with_findings() {
+    let extractor = live_extractor();
     let target = vec![
         line(
             1,
@@ -91,13 +107,15 @@ async fn a_real_model_writes_a_valid_episode_with_findings() {
     ];
     // As the prompt layer writes it: the members as the group knows them, and the group.
     let background = qbot_memory::Background {
-        text: "## Who is who\n\nThe members these lines involve, as the group knows them now.\n\n\
-               - member:1: shown as \"\u{5c0f}\u{6797}\"\n\
-               - member:2: shown as \"\u{963f}\u{6770}\"; known before: lives_in: \u{676d}\u{5dde} (about 70% likely)\n\
-               - member:3: shown as \"Mia\"\n\n\
+        text: "## Who is who\n\nThe members these lines involve, as the group knows them.\n\n\
+               - member:1: lines sent as \"\u{5c0f}\u{6797}\"\n\
+               - member:2: lines sent as \"\u{963f}\u{6770}\"\n  remembered:\n  \
+               - m7 (lasting) \u{4f4f}\u{5728}\u{676d}\u{5dde}: they said so, 2 conversation(s), last 2026-12-01\n\
+               - member:3: lines sent as \"Mia\"\n\n\
                ## About the group\n\nFriends from the same university who chat about food and trips."
             .into(),
         zone: jiff::tz::TimeZone::get("Asia/Shanghai").unwrap(),
+        known: vec![(MemoryId::new(7), AccountId::new(1002).ok())],
         ..Default::default()
     };
     let ctx = SliceContext {
@@ -108,15 +126,7 @@ async fn a_real_model_writes_a_valid_episode_with_findings() {
         background: &background,
     };
     let out = extractor.extract(&ctx, "English").await.unwrap();
-    eprintln!(
-        "[extract] model={} attempts={} usage={:?}",
-        out.model, out.attempts, out.usage
-    );
-    eprintln!("[extract] title={:?}", out.title);
-    eprintln!("[extract] summary={:?}", out.summary);
-    eprintln!("[extract] evidence={:?}", out.evidence);
-    eprintln!("[extract] findings={:#?}", out.findings);
-    eprintln!("[extract] dropped={:?}", out.dropped);
+    report(&out);
 
     assert!(!out.title.trim().is_empty() && !out.summary.trim().is_empty());
     assert!(!out.evidence.is_empty());
@@ -127,41 +137,39 @@ async fn a_real_model_writes_a_valid_episode_with_findings() {
             .expect("evidence names a target line");
         assert!(source.text.contains(&e.quote), "{e:?}");
     }
-    let member_one = AccountId::new(1001).unwrap();
+    let member_one = AccountId::new(1001).ok();
     assert!(
-        out.findings.facts.iter().any(|f| f.account == member_one
-            && f.predicate == "likes"
-            && f.object.contains("\u{732b}")),
+        out.findings.memories.iter().any(|m| {
+            let text = m.text.as_deref().unwrap_or_default().to_lowercase();
+            m.subject == member_one
+                && m.action == MemoryAction::New
+                && (text.contains("cat") || text.contains("\u{732b}"))
+        }),
         "member 1 said they like cats"
     );
     assert!(
-        out.findings.knowledge.iter().any(
-            |k| matches!(k, KnowledgeFinding::Term { term, .. } if term.contains("\u{55b5}\u{7ad9}"))
-        ),
-        "the group's name for the cafe is group knowledge"
+        out.findings.memories.iter().any(|m| m.subject.is_none()
+            && m.term
+                .as_deref()
+                .is_some_and(|t| t.contains("\u{55b5}\u{7ad9}"))),
+        "the group's name for the cafe is a group term"
+    );
+    assert!(
+        !out.findings
+            .memories
+            .iter()
+            .any(|m| m.subject == member_one && m.message == target[0].message),
+        "a business trip next week is a plan, not a memory"
     );
 }
 
-/// The context an extractor needs and the judgement it is asked for: a fact that ends, a plan
-/// said relative to the slice's day, a reply to a line from further back, a passing mood, and a
-/// member addressing the bot by its name.
+/// The judgement the extractor is asked for: something that ended, something said again in other
+/// words, a plan said relative to the slice's day, a reply to a line from further back, a passing
+/// mood, and a member addressing the bot by its name.
 #[tokio::test]
 #[ignore = "calls paid provider APIs"]
-async fn a_real_model_ends_what_stopped_dates_plans_and_skips_what_passes() {
-    let endpoint = std::env::var("QBOT_LIVE_TEXT_ENDPOINT")
-        .unwrap_or_else(|_| "https://api.deepseek.com".into());
-    let model = std::env::var("QBOT_LIVE_TEXT_MODEL").unwrap_or_else(|_| "deepseek-flash".into());
-    let transport = ReqwestTransport::new(
-        endpoint,
-        KeySource::Static(secret("text_api_key")),
-        &qbot_llm::net::Route::Direct,
-    )
-    .unwrap();
-    let mut cfg = ResponsesConfig::deepseek(model);
-    cfg.timeout = Some(Duration::from_secs(180));
-    let provider = Arc::new(ResponsesProvider::new(cfg, Arc::new(transport)).unwrap());
-    let extractor = EpisodeExtractor::new(provider);
-    let game = "\u{539f}\u{795e}";
+async fn a_real_model_ends_confirms_dates_plans_and_skips_what_passes() {
+    let extractor = live_extractor();
     let target = vec![
         // "Bobo, I don't play Genshin any more, sold the account last week."
         line(
@@ -203,10 +211,12 @@ async fn a_real_model_ends_what_stopped_dates_plans_and_skips_what_passes() {
     ];
     // As the prompt layer and the extraction job write it.
     let background = qbot_memory::Background {
-        text: "## Who is who\n\nThe members these lines involve, as the group knows them now.\n\n\
-               - member:1: shown as \"\u{5c0f}\u{6797}\"; known before: plays: \u{539f}\u{795e} (about 70% likely)\n\
-               - member:2: shown as \"\u{963f}\u{6770}\"; known before: lives_in: \u{676d}\u{5dde}\u{5e02} (about 60% likely)\n\
-               - member:3: shown as \"Mia\"\n\n\
+        text: "## Who is who\n\nThe members these lines involve, as the group knows them.\n\n\
+               - member:1: lines sent as \"\u{5c0f}\u{6797}\"\n  remembered:\n  \
+               - m3 (current) \u{5728}\u{73a9}\u{539f}\u{795e}: they said so, 3 conversation(s), last 2026-12-20\n\
+               - member:2: lines sent as \"\u{963f}\u{6770}\"\n  remembered:\n  \
+               - m5 (lasting) \u{4f4f}\u{5728}\u{676d}\u{5dde}\u{5e02}: they said so, 1 conversation(s), last 2026-09-01\n\
+               - member:3: lines sent as \"Mia\"\n\n\
                ## About the group\n\nThe group's bot (its lines are `bot:`) is called Bobo. These are the bot's \
                names, never names of members.\n\
                Friends from the same university who chat about games and trips."
@@ -227,6 +237,11 @@ async fn a_real_model_ends_what_stopped_dates_plans_and_skips_what_passes() {
             )
         }],
         bot_names: vec!["Bobo".into()],
+        known: vec![
+            (MemoryId::new(3), AccountId::new(1001).ok()),
+            (MemoryId::new(5), AccountId::new(1002).ok()),
+        ],
+        ..Default::default()
     };
     let ctx = SliceContext {
         group: qbot_core::GroupId::new(900).unwrap(),
@@ -236,43 +251,30 @@ async fn a_real_model_ends_what_stopped_dates_plans_and_skips_what_passes() {
         background: &background,
     };
     let out = extractor.extract(&ctx, "English").await.unwrap();
-    eprintln!("[extract] title={:?}", out.title);
-    eprintln!("[extract] summary={:?}", out.summary);
-    eprintln!("[extract] findings={:#?}", out.findings);
-    eprintln!("[extract] dropped={:?}", out.dropped);
+    report(&out);
 
-    let (one, two) = (AccountId::new(1001).unwrap(), AccountId::new(1002).unwrap());
-    assert!(
+    let (one, two) = (AccountId::new(1001).ok(), AccountId::new(1002).ok());
+    let about = |who, id: i64| {
         out.findings
-            .ended
+            .memories
             .iter()
-            .any(|f| f.account == one && f.predicate == "plays" && f.object.contains(game)),
+            .filter(move |m| m.subject == who && m.id == Some(MemoryId::new(id)))
+    };
+    assert!(
+        about(one, 3).any(|m| m.action == MemoryAction::Ended),
         "member 1 stopped playing the game"
     );
     assert!(
-        !out.findings
-            .facts
-            .iter()
-            .any(|f| f.predicate == "plays" && f.object.contains(game)),
-        "the game is not recorded again as played"
+        about(two, 5).any(|m| m.action == MemoryAction::Same),
+        "living in Hangzhou, said again in other words, supports the memory"
     );
     assert!(
         !out.findings
-            .facts
+            .memories
             .iter()
-            .any(|f| f.account == two && f.message == target[2].message),
-        "a passing mood is no fact"
+            .any(|m| m.subject == two && m.action == MemoryAction::New),
+        "neither the mood nor the city is a new memory"
     );
-    // "Hangzhou" said again of what is recorded as "Hangzhou city" supports the record.
-    let city = "\u{676d}\u{5dde}\u{5e02}";
-    let homes: Vec<&str> = out
-        .findings
-        .facts
-        .iter()
-        .filter(|f| f.account == two && f.predicate == "lives_in")
-        .map(|f| f.object.as_str())
-        .collect();
-    assert_eq!(homes, [city], "a value said again is given as recorded");
     assert!(
         !out.findings
             .names
@@ -285,5 +287,71 @@ async fn a_real_model_ends_what_stopped_dates_plans_and_skips_what_passes() {
         out.summary.contains("16") && !out.summary.to_lowercase().contains("tomorrow"),
         "the plan has its date: {}",
         out.summary
+    );
+}
+
+/// Names: a member gives their own name, someone addresses another by a nickname with an
+/// @-mention, and a third name is used for someone the line does not identify.
+#[tokio::test]
+#[ignore = "calls paid provider APIs"]
+async fn a_real_model_records_names_with_how_they_were_used() {
+    let extractor = live_extractor();
+    let target = vec![
+        // member 3: "[at:1] Xiaochuan, are you coming to the dinner on Saturday?"
+        line(
+            1,
+            1003,
+            3,
+            "[at:1] \u{5c0f}\u{5ddd}\u{5468}\u{516d}\u{805a}\u{9910}\u{4f60}\u{6765}\u{4e0d}\u{6765}",
+        ),
+        // member 1: "Coming. And don't call me Xiaochuan, call me Brother Chuan."
+        line(
+            2,
+            1001,
+            1,
+            "\u{6765}\u{3002}\u{522b}\u{53eb}\u{6211}\u{5c0f}\u{5ddd}\u{4e86}\u{ff0c}\u{53eb}\u{6211}\u{5ddd}\u{54e5}",
+        ),
+        // member 2: "Old Wang is late again today."
+        line(
+            3,
+            1002,
+            2,
+            "\u{8001}\u{738b}\u{4eca}\u{5929}\u{53c8}\u{8fdf}\u{5230}\u{4e86}",
+        ),
+        // member 3: "haha"
+        line(4, 1003, 3, "\u{54c8}\u{54c8}"),
+    ];
+    let background = qbot_memory::Background {
+        text: "## Who is who\n\nThe members these lines involve, as the group knows them.\n\n\
+               - member:1: lines sent as \"\u{738b}\u{5c0f}\u{5ddd}\"\n\
+               - member:2: lines sent as \"Echo\"\n\
+               - member:3: lines sent as \"\u{5927}\u{5218}\"\n\n\
+               ## About the group\n\nColleagues who chat about work and food."
+            .into(),
+        zone: jiff::tz::TimeZone::get("Asia/Shanghai").unwrap(),
+        ..Default::default()
+    };
+    let ctx = SliceContext {
+        group: qbot_core::GroupId::new(900).unwrap(),
+        previous: &[],
+        target: &target,
+        next: &[],
+        background: &background,
+    };
+    let out = extractor.extract(&ctx, "English").await.unwrap();
+    report(&out);
+    let one = AccountId::new(1001).unwrap();
+    assert!(
+        out.findings.names.iter().any(|n| n.account == one
+            && n.basis == NameBasis::Own
+            && n.name.contains("\u{5ddd}\u{54e5}")),
+        "member 1 gave their own name"
+    );
+    assert!(
+        !out.findings
+            .names
+            .iter()
+            .any(|n| n.name.contains("\u{8001}\u{738b}")),
+        "nothing in the lines says whom Old Wang means"
     );
 }

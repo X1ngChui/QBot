@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use qbot_core::AccountId;
 use qbot_i18n::Msg;
-use qbot_memory::AliasStatus;
 use qbot_store::BlockedBy;
 
 use super::{Rank, Reply, period_start};
@@ -286,16 +285,18 @@ pub(crate) async fn members(cx: &Cx<'_>) -> Reply {
         total: total.to_string(),
     })];
     for row in rows {
-        let names = cx
+        // The names people use most for them, set ones first.
+        let mut names = cx
             .deps
-            .identity
-            .names_of(cx.group(), &[row.account])
-            .await?;
+            .names
+            .names(cx.group(), Some(&[row.account]))
+            .await
+            .map_err(|e| Fail::Storage(e.to_string()))?;
+        names.sort_by(|a, b| b.set.cmp(&a.set).then(b.uses().cmp(&a.uses())));
         let names: Vec<String> = names
             .into_iter()
-            .filter(|a| a.status == AliasStatus::Confirmed)
             .take(3)
-            .map(|a| a.text)
+            .map(|n| n.text.trim().to_owned())
             .collect();
         let (display, messages) = (cx.name_of(row.account).await, row.messages);
         lines.push(cx.t(&if names.is_empty() {

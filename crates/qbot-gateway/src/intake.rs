@@ -16,6 +16,8 @@ pub struct Incoming {
     pub author: Option<AccountId>,
     pub at: UnixMillis,
     pub text: String,
+    /// The display name a member's message was sent under.
+    pub sender_name: Option<String>,
     /// Accounts whose `[at:ACCOUNT]` markers appear in `text`.
     pub mentions: Vec<AccountId>,
     /// References to the line's pictures, stickers and clips, stored with it.
@@ -66,6 +68,7 @@ impl Intake for PgArchive {
                 speaker,
                 at: line.at,
                 text: line.text,
+                sender_name: line.sender_name,
             },
             &line.mentions,
             &line.media,

@@ -21,12 +21,13 @@ own. A muted group gets nothing, commands included except a bot owner's and its 
 admins' `/mute` and `/block`; a blocked member cannot start a reply or get a command answered,
 but stays in context.
 R4. Reply through tools: the model decides whether to speak, whom to mention and what to quote.
-R5. Tools: send, stay silent, archive search, episode recall and reading, web search and page
-reading, opening pictures, and the group's scheduled tasks.
-R6. Group-scoped memory learned from chat: episodes with embeddings, names, facts about members
-and group knowledge, each grounded in verbatim quotes, with one confidence (the probability that
-it holds now) that ranks rather than deletes ([memory.md](memory.md) section 7). Notes written
-by hand are a separate store with their own commands.
+R5. Tools: send, stay silent, archive search, episode recall and reading, what is kept about a
+member, web search and page reading, opening pictures, and the group's scheduled tasks.
+R6. Group-scoped memory learned from chat: episodes with embeddings; the display names members'
+lines were sent under and the names people use for whom, each use with how it was used; and
+memories about members and the group, each with its supporting lines (who said it, the quote),
+replaced or ended by later statements but kept as history ([memory.md](memory.md) sections 4
+and 7). Notes written by hand are a separate store with their own commands.
 R7. Identity: accounts are linked in a group, with a confirmation that lapses if either side's
 links there changed; stable member numbers per group.
 R8. Media: pictures described once by content and archived as text, originals opened on demand;
@@ -83,7 +84,7 @@ qbot-asr       in-process speech recognition (sherpa-onnx, SenseVoice)
 qbot-prompt    instructions, personas, history tiers, chat rendering
 qbot-sched     timers, group tasks, recurring schedules, the scheduler loop
 qbot-agent     supervisor, run loop, tool trait and executor, ports, a simulated group
-qbot-memory    identity, episodes, extraction, consolidation, facts, recall, notes
+qbot-memory    identity, names, episodes, extraction, consolidation, memories, recall, notes
 qbot-store     Postgres adapters for every port, the schema, the lease
 qbot-llm       provider contract, Responses/DeepSeek adapter, embeddings, web search, fakes
 qbot-config    typed, layered configuration and secrets
@@ -160,7 +161,7 @@ scheduler and memory depend on no database or platform. Its Postgres adapter liv
   later extraction and `open_images` then see nothing of it. Runs already under way keep what
   they were shown, run transcripts are not rewritten (they are the operational record, kept
   `maintenance.records_keep_days`), and memory already extracted from the line stays (`/forget`
-  removes a fact). A picture description that finishes after the recall finds no marker to fill.
+  removes a memory). A picture description that finishes after the recall finds no marker to fill.
 - **A received card is context, never a capability.** No account or group id a card carries is
   shown, numbered or stored: only mentions get member numbers, and `send_messages` addresses only
   members the run's context names (below). A card for another
@@ -294,8 +295,9 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
   counts messages, not calls, and a successful call ends the run unless `end_turn` is false.
   `stay_silent` makes silence explicit. `[at:N]` and `[contact:N]` may name only a member the
   run's context names (`OpenedContext::members`): someone who speaks in the visible chat, is
-  mentioned in it, is named in a task's intent as `member:N`, or has an entry in the people
-  block, or wrote a line `search_history` or `read_episode` showed in this run (`RunState`); a
+  mentioned in it, is named in a task's intent as `member:N`, or is listed on the roster, or
+  wrote a line `search_history` or `read_episode` showed in this run, or was described by
+  `about_member` in it (`RunState`); a
   quote (`[reply:ID]`) likewise names a message of the visible chat or of such a result. So a
   reminder reaches someone who has been quiet and an answer can quote the old message it found,
   while the model cannot address a number or a message nothing showed it.
@@ -328,6 +330,11 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
   path. The tool set is fixed for the whole run, so the cached prefix does not change. Tools show
   chat lines exactly as the chat does and times in the bot's zone with their offset, through the
   run's renderer (`ToolCx::renderer`), so the model never converts zones.
+- **Member records** (`about_member(member)`): everything kept about one member of the group,
+  read through the prompt layer (`qbot_tools::MemberRecords`), so it says what replies say the
+  same way: what they are and were shown as, the names people use for them, linked accounts, a
+  block, notes members wrote, current memories with their provenance, and what no longer holds.
+  For someone talked about who is not in the run's conversation.
 - **History search** (`search_history(query, speaker?, limit?)`): literal keywords with Boolean
   operators, parsed and validated in Rust (`qbot_tools::query`) and matched by Postgres. Words
   side by side (or `AND`) must all occur, `OR` means either, `-word` or `NOT word` excludes,
@@ -345,32 +352,31 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
 
 - **Instructions** are minijinja templates in `prompts/*.md` with a closed set of slots per
   template (a test holds them equal): the reply rules, the guide to reading chat markers, the
-  persona block, the people block, the learned group knowledge, the three trigger notes, picture
-  description, extraction.
+  persona block, the roster (people block), the learned group knowledge, the three trigger notes,
+  picture description, extraction.
 - **Order is stable to volatile**, so runs of a group share the longest prefix the provider can
   cache:
   1. the reply rules, the legend, and the persona with its group background (fixed per
      deployment);
-  2. the people block and learned knowledge, which change only when a command or an extraction
-     changes a record, or a shown confidence (as of the start of the day, in tens of percent)
-     moves;
+  2. the roster and learned knowledge, which change only when a command or an extraction
+     changes a record, or with the day (activity and rank are counted as of the start of the
+     UTC day);
   3. the chat, which grows by whole batches;
-  4. last the trigger note (the time, the trigger, a task's intent, and the current group
-     display names of the members in the chat and in the people block, read live through
-     `with_directory`), which is different for every run.
-- **People block** (`PgArchive::people`, one read model): everyone the bot keeps a record about,
-  one entry per person, in member order. An entry has:
-  - the person's numbered accounts here (two or more are linked accounts), and which are
-    blocked now;
-  - the names they go by, confirmed ones and leads from chat with their confidence;
-  - notes members wrote (each with its date);
-  - the `memory.person_facts` (16) most confident facts learned from chat, each with its
-    confidence, episode count and last confirmation date (competing values side by side).
-
-  Dates are absolute and confidence is computed as of the start of the UTC day, so the block is
-  byte-identical until a record changes or a day turns. Member-written text is escaped like chat and kept on its own line.
-  Live display names are not part of it: they change apart from every record and sit in the
-  trigger note. The model reads who someone is here, with no tool call; there is no lookup tool.
+  4. last the trigger note (the time, the trigger, a task's intent, the current group display
+     names of the members in the visible chat and the run's conversation, read live through
+     `with_directory`, and what
+     is remembered about them and what members wrote about them), which is different for every
+     run.
+- **Roster** (`PgArchive::people`, one read model; memory.md section 7): who is who, one entry
+  per listed person (spoke within `memory.roster_days`, linked, blocked, or named with `/name`;
+  at most `memory.roster_people`), in member order: their numbered accounts here and which are
+  blocked, what they are shown as now and were shown as before (from the archive), and the names
+  people use for them with how each was used and whom else it is used for. Member-written text
+  is escaped like chat and kept on its own line.
+- **Memories of the people in the run** sit in the trigger note, not the prefix: for those who
+  wrote the newest 50 lines, whom those lines mention and whom a task names, the notes members
+  wrote and the `memory.person_memories` (8) memories of most rank, each with who said it, in how
+  many conversations and when last. Anyone else is reached with `about_member`.
 - **Personas** are TOML files: `default.toml`, or `group_<id>.toml` replacing it for one group.
 - **History tiers.** A run sees whole batches counted back from the batch being filled: the newest
   `history.raw_batches` verbatim, the `history.summary_batches` before them as the summaries of
@@ -378,9 +384,10 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
   is reached through `search_history` and `recall_episodes`. The tiers move a batch at a time.
   A summary names its episode (`episode 12, ...`), so `read_episode` can open its messages; before
   it did, 12 of 20 `read_episode` calls in a month were refused ids the model had guessed.
-- **Group knowledge** enters as an instruction: the most confident topic, and for at most
-  `memory.group_terms` (40) terms, the most confident, the most confident meaning, each with its
-  confidence, listed in term order so that confirming a term again does not reorder the prompt.
+- **Group knowledge** enters as an instruction: the `memory.group_memories` (40) group memories
+  of most rank (terms and what is known about the group), each with how many conversations said
+  it and when last, listed by term and text so that confirming one again does not reorder the
+  prompt.
 - **Wording** (`qbot-wording`): every short model-facing text (tool and parameter descriptions,
   results, error explanations, outcome notes, extraction headers and corrections) is a `Text`
   variant with fixed slots, rendered from `wording.toml`; tests keep the file and the enum in
@@ -396,11 +403,11 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
   warnings:
   - The rules, reading guide, persona and operator group background are system messages. Notes
     for the model (the undelivered-text note) are developer messages.
-  - Chat lines, episode summaries, the trigger note (names, a task's intent), the people block
-    and learned group knowledge are user content (`InstructionRole::Trigger`,
-    `InstructionRole::Reference`). The people block and knowledge are assembled by the system,
-    but their names, notes and facts are what members wrote or said, so they get the chat's
-    standing, never a system message's.
+  - Chat lines, episode summaries, the trigger note (names, memories, notes, a task's intent),
+    the roster and learned group knowledge are user content (`InstructionRole::Trigger`,
+    `InstructionRole::Reference`). They are assembled by the system, but their names, notes and
+    memories are what members wrote or said, so they get the chat's standing, never a system
+    message's.
   - Web pages, search results and history come back as tool results under a one-line header
     naming their source; their text is passed on unchanged.
 - **Escaping is narrow and tied to the protocol** (`qbot_core::marker`). `MARKERS` is the closed
@@ -427,8 +434,8 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
 
 Described in [memory.md](memory.md). In short: the archive is the source of truth; an episode
 summarizes one fixed slice of whole batches and is never rewritten; extraction returns the
-episode and its findings in one validated tool call; consolidation turns findings into names,
-facts and group knowledge; recall ranks episodes by similarity decaying with age; embeddings are
+episode and its findings in one validated tool call; consolidation turns findings into name uses
+and changes to memories (new, the same, replaced, ended); recall ranks episodes by similarity decaying with age; embeddings are
 a derived index each group's extraction completes for the configured embedding model before
 it extracts.
 
@@ -443,14 +450,15 @@ record is one of these:
 | Global, by content | picture descriptions and voice transcripts (`media_cache`) | keyed by a digest of the bytes and made from the bytes alone (the describer and recognizer see nothing else), so a hit gives a group only what it could get from the same picture or clip it received itself; nothing learned from any group's conversation enters them. A forwarded picture is described only on a hit, which says only that identical bytes were seen before |
 | Global, owners | `usage_event`, `run` totals for `/stats global` and the daily report | counts and tokens, no text; the report goes to the owners privately |
 | Process, owners | warnings and errors for `/logs` | a line about a group (its `group` field) is shown only in that group; a line about no group is shown everywhere, so it keeps only its fixed message and numeric fields, never free text such as an error or a model's answer (the full line stays in the process log) |
-| Group | archive and `media_ref`, member numbers, blocks, mute, delegated admins (`group_admin`), links (`account_link`), names, notes, facts and group knowledge, episodes and their embeddings, tasks and recurring schedules, runs and their transcripts, invitations | read only with the group's id |
+| Group | archive and `media_ref`, member numbers, blocks, mute, delegated admins (`group_admin`), links (`account_link`), display names on lines, names (`name_use`, `name_removed`), notes, memories and their evidence, episodes and their embeddings, tasks and recurring schedules, runs and their transcripts, invitations | read only with the group's id |
 
-Nothing else crosses: no name, fact, note, relationship (link), chat text, memory, task context
+Nothing else crosses: no name, memory, note, relationship (link), chat text, memory, task context
 or anything else derived from a group's conversation is shown or used in another group.
 Linking is per group: a person in a group is the accounts linked to each other there
 (`IdentityStore::linked`), and a link made elsewhere does not join their numbers, names, notes,
-facts, blocks, `/top` rows or command authority. Names, notes and facts about an account are
-kept per group and read only from the group's own rows.
+memories, blocks, `/top` rows or command authority. Names, notes and memories about an account
+are kept per group and read only from the group's own rows; a memory change names a memory id
+that must belong to the same group and subject.
 
 ## 9. Media (`qbot-media`, `qbot-asr`)
 
@@ -620,11 +628,11 @@ accounts linked here is a bot owner's or a delegated admin's.
 
 | Command | Member | Delegated admin (its group only) | Bot owner |
 | --- | --- | --- | --- |
-| `/who [--linked] [@m]`: names, notes, learned facts on record | self | self, ordinary members | anyone |
+| `/who [--linked] [@m]`: names, notes, memories on record | self | self, ordinary members | anyone |
 | `/note` `add` `edit N` `remove N` `clear` | self | self, ordinary members, except notes a bot owner wrote | anyone |
 | `/name` `add` `remove` | self | self, ordinary members | anyone |
-| `/forget [--linked] [@m] N`: a learned fact | self | self, ordinary members | anyone |
-| `/forget group N`: group knowledge | no | no | yes |
+| `/forget [--linked] [@m] ID`, `/forget all`: one memory, or all about the member | self | self, ordinary members | anyone |
+| `/forget group ID`: a group memory | no | no | yes |
 | `/group`, `/stats`, `/top`, `/help` | yes | yes | yes |
 | `/stats global` | no | no | yes |
 | `/link @m`, `/link confirm`, `/link cancel`, `/unlink` | self | self | self |
@@ -671,7 +679,7 @@ The schema holds only what a deployment may choose:
 | `database` | host, port, name, user, ssl mode, password secret |
 | `replies` | concurrency, deadline, messages per reply, the chance of a spontaneous run |
 | `history` | batch lines, raw and summary batches |
-| `memory` | slice batches, group terms and facts per person shown; recall's max distance and half-life; how long claims of each decay class keep holding (days) and stay current (episodes); how many claims a group keeps per member, of terms and of topics |
+| `memory` | slice batches; group memories and memories per person shown; who the roster lists (days, people); recall's max distance and half-life; how fast memories of each durability lose rank (episodes); how many memories a group keeps per member and about itself |
 | `media` | voice transcription on or off; pictures and clips per minute per group; how long a reply waits for them |
 | `network` | an outbound proxy and the services that use it |
 | `providers.*` | text (kind, endpoint, model, reasoning of replies and of extraction), vision, embedding (model, width, batch), search (depths) |
@@ -690,8 +698,6 @@ Derived rather than configured:
 - extraction cadence: every filled batch queues its group's extraction, which extracts each
   completed slice; nothing else extracts, so a slice missed by a failed job is extracted by
   the group's next one;
-- how a name learned from chat ages: like a stable fact
-  (`memory.facts.half_life_days.stable`), since a name lasts like where someone lives;
 - record retention: one `maintenance.records_keep_days` for finished runs and finished
   scheduled tasks, the two operational records;
 - the provider's state mode (from its kind), the writing language (from the locale), and the
@@ -721,10 +727,15 @@ error is left to that error. The local limits and why they exist:
 | Card field, file or face name; card link | 120 characters; 400 or left out | external text that enters every later prompt; a cut link leads nowhere |
 | `read_url` page | 8,000 characters | a web page is the one tool input with no size of its own |
 | Search results, passages | 5, 3 | enough to answer from, little enough to read |
-| Group terms in the prompt | configured (40) | the block enters every reply's instructions |
-| Learned facts per person in the prompt | configured (16) | the people block enters every reply's instructions; the rest stay recorded |
-| Learned claims a group keeps | configured (40 per member, 120 term claims, 8 topics) | what a busy group accumulates, and what the extractor reads about each member; the claims worth least make way, never what the episode applied just said |
-| Notes per account | 20 | bounds what one member's notes add to every reply's people block |
+| Group memories in the prompt | configured (40) | the block enters every reply's instructions |
+| Memories per person in a run | configured (8) | the opening note carries them for everyone in the conversation; the rest reach `about_member` and `/who` |
+| Memories a group keeps | configured (30 per member, 120 about the group) | what a busy group accumulates, and what the extractor reads about each member; replaced and ended ones make way first, never what the episode applied just said |
+| People on the roster | configured (30 days, 80 people) | the roster enters every reply's cached prefix; a group can have thousands of members |
+| Lines whose people a run is shown memories of | the newest 50 | the conversation a run answers is at the end of its window |
+| Display names per account on the roster | 4 | old names help recognise someone; a long history of renames does not |
+| Memory text; group term | 200; 64 characters | one sentence about one thing, shown in every prompt about its subject |
+| Display name stored with a line | 128 characters | QQ's are far shorter; absurd input stays out |
+| Notes per account | 20 | bounds what one member's notes add to every run they are part of |
 | Name length | 64 characters | a name is a name, not a paragraph |
 | Per-call deadlines | 10 min text, 2 min picture, 30 s embedding, 20 s search | a hung connection must not stall the nightly run |
 | Connect timeout | 10 s | a hung connect is invisible to the provider |
@@ -757,8 +768,8 @@ spend.
 
 - **Extraction** is a group's own job, queued by each filled batch (memory.md section 2); the
   nightly run does not extract.
-- **Nightly**: decay (cached picture descriptions older than 15 days; beliefs are not expired,
-  their confidence is computed on read), a verified backup, cleanup (finished tasks and finished
+- **Nightly**: decay (cached picture descriptions older than 15 days; memories are not aged by
+  the calendar: their rank follows the conversation and is computed on read), a verified backup, cleanup (finished tasks and finished
   runs after `maintenance.records_keep_days`, NapCat's file cache through its `clean_cache`
   action). Every stage runs; the job fails, and is retried, if any failed.
 - **Backups** shell out to `pg_dump`/`pg_restore`: password through the environment, a partial file
@@ -787,7 +798,8 @@ spend.
 ## 17. Evaluation (`qbot-eval`)
 
 Scenarios in `eval/scenarios/*.toml` (an English description and rubric, chat in any
-language, a trigger, optional notes, facts, group knowledge and canned web results) run through
+language, a trigger, optional notes, memories, names, earlier display names and canned web
+results) run through
 the production prompt layer, tools and run loop against the real text model over a simulated
 group. Deterministic checks (sent or silent, how many messages and send calls, tools required or
 forbidden, members not to mention, a normal ending) are followed by an English LLM judge per rubric item; `--repeat N` because model
@@ -826,11 +838,12 @@ through it.
 - Runs of different members overlap (decision 1), and nothing tells a run what another is
   answering until that one has replied: two members asking the same thing within the same
   seconds can both be answered (13 such pairs in 30 days before the turn-taking rule).
-- Memory already extracted from a recalled message stays, losing confidence unless repeated,
-  until it is forgotten.
-- `/forget` removes one learned fact; a later episode can learn it again.
-- Every run sees every recorded member's names, notes and facts of its group; only the
-  commands limit what a member may look up.
+- Memory already extracted from a recalled message stays until it is forgotten.
+- `/forget` deletes a memory; a later episode in which someone says it again learns it again.
+- A run sees the names of everyone on the roster and can look up anyone with `about_member`;
+  only the commands limit what a member may look up, and the reply rules what the bot passes on.
+- Names in lines archived before display names were recorded have none: what a member was shown
+  as before that is unknown.
 - A slice the provider refuses with an error that is not classed as permanent is tried again on
   every filled batch, and holds back that group's later slices.
 - What is said in a group is learned only when its slice is complete: a group that stops
@@ -842,11 +855,11 @@ through it.
 - A quote of an old message a search found names it by NapCat's message id, a 31-bit hash
   (section 4): in a long archive another message may share it, and the platform decides which
   one the quote shows. Quotes of the visible chat were exposed to this only within its window.
-- The people block's size grows with the people on record: facts are bounded per person, names
-  and notes are not (about 15 KB in the largest group today).
-- Salience reads a group's whole episode list (end and participants) for every reply's people
-  block and every applied episode: a few hundred rows today; a bound (episodes since the oldest
-  active claim's support) is the step if a group's history grows by orders of magnitude.
+- The roster's size grows with the people listed: bounded in number, while names and display
+  names per person are few in practice.
+- Rank reads a group's whole episode list (end and participants) for every run with memories to
+  show and every applied episode: a few hundred rows today; a bound (episodes since the oldest
+  memory's support) is the step if a group's history grows by orders of magnitude.
 - A command's reply comes back as the bot's own echo and is archived as the bot's line, so text
   it repeats (a listed note, a name) could read in later chat as something the bot said. A
   command's reply always quotes the command, and the reading guide (`prompts/legend.md`) says

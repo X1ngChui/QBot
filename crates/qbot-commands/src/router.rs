@@ -9,9 +9,7 @@ use qbot_agent::{Delivery, OutSegment};
 use qbot_core::{AccountId, Clock, GroupId};
 use qbot_gateway::pipeline::{CommandRequest, Commands};
 use qbot_i18n::{Locales, Msg};
-use qbot_memory::IdentityStore;
-use qbot_memory::NoteStore;
-use qbot_memory::facts::{DecayPolicy, FactStore};
+use qbot_memory::{IdentityStore, MemoryStore, NameStore, NoteStore};
 use qbot_sched::TaskService;
 
 use crate::catalog::Command;
@@ -32,8 +30,6 @@ pub struct CommandSettings {
     pub top_max_rows: usize,
     /// How long a link invitation stays open (shown in the reply that issues it).
     pub link_ttl: Duration,
-    /// How confident a learned fact still is, for /who.
-    pub fact_decay: DecayPolicy,
     /// Most notes one account may have in a group: notes are in every run's people block.
     pub notes_per_account: usize,
     /// Rows `/runs` lists.
@@ -44,12 +40,7 @@ impl CommandSettings {
     /// The settings for `bot`. QQ shows at most 2000 characters in one message; the list sizes
     /// keep a reply to one or two screens; 20 notes per account bound what one member's notes add
     /// to every run's people block.
-    pub fn new(
-        bot: AccountId,
-        owners: BTreeSet<AccountId>,
-        zone: TimeZone,
-        fact_decay: DecayPolicy,
-    ) -> Self {
+    pub fn new(bot: AccountId, owners: BTreeSet<AccountId>, zone: TimeZone) -> Self {
         Self {
             bot,
             owners,
@@ -58,7 +49,6 @@ impl CommandSettings {
             members_max_rows: 60,
             top_max_rows: 20,
             link_ttl: qbot_memory::identity::IdentityPolicy::default().invitation_ttl,
-            fact_decay,
             notes_per_account: 20,
             runs_max_rows: 10,
         }
@@ -67,7 +57,8 @@ impl CommandSettings {
 
 pub struct Deps {
     pub identity: Arc<dyn IdentityStore>,
-    pub facts: Arc<dyn FactStore>,
+    pub names: Arc<dyn NameStore>,
+    pub memories: Arc<dyn MemoryStore>,
     pub notes: Arc<dyn NoteStore>,
     pub admin: Arc<dyn GroupAdmin>,
     pub runs: Arc<dyn RunHistory>,

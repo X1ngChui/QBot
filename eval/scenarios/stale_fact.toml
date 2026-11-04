@@ -1,4 +1,4 @@
-description = "A member asks whether the bot remembers what sport they play. The only learned fact was said once, long ago, and is listed as unlikely to hold now. The bot may mention it, but as something said a while back that may have changed, not as a sure current fact. Looking it up in the history first is fine; the answer is what is judged."
+description = "A member asks whether the bot remembers what sport they play. The only memory was said once, about five months ago, and is listed with that date; it is about what they were doing then and may well have changed. The bot may mention it, but as something said a while back that may have changed, not as a sure current fact. Looking it up in the history first is fine; the answer is what is judged."
 
 members = [
   { number = 1, account = 10001, name = "小林" },
@@ -12,8 +12,8 @@ chat = [
 
 trigger = { line = 2 }
 
-facts = [
-  { member = 1, predicate = "plays", object = "羽毛球", days_ago = 150 },
+memories = [
+  { member = 1, text = "在打羽毛球", durability = "current", days_ago = 150 },
 ]
 
 [expect]

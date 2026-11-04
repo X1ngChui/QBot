@@ -2,54 +2,12 @@
 //!
 //! An *account* is a platform login. Accounts are *linked* in a group: a link is a record of that
 //! group, and a person in a group is the accounts linked to each other there, directly or through
-//! others. Nothing about a link reaches another group. Names (*aliases*) are scoped to a group and
-//! point at an account, each backed by evidence whose strength is fused here, in one place,
-//! rather than in SQL.
+//! others. Nothing about a link reaches another group. Names are not identity records: they are
+//! uses, kept by [`crate::names`].
 
-use std::collections::BTreeSet;
 use std::time::Duration;
 
 use qbot_core::{AccountId, GroupId, MessageId, UnixMillis};
-use serde::{Deserialize, Serialize};
-use unicode_normalization::UnicodeNormalization;
-
-use crate::belief::{credibility, persistence};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct AliasId(pub i64);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AliasStatus {
-    /// A lead: learned from chat, nobody vouched for it. It does not resolve the name.
-    Candidate,
-    /// A person vouched for it (`/name`): it resolves the name.
-    Confirmed,
-    /// Removed by a person.
-    Inactive,
-}
-
-/// Why we believe a stored name refers to a target.
-///
-/// The member's current group display name is not stored evidence: it is the platform's own
-/// answer, read live when needed (`qbot_agent::Directory`) and taking precedence over every
-/// stored name. Stored names are what people call someone besides that: names set by hand and
-/// names learned from chat.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EvidenceKind {
-    /// A person set it: an assignment, not an inference.
-    Manual,
-    /// A model proposed it from chat, supported by a validated quote in an episode.
-    Extracted,
-}
-
-/// One piece of evidence. `support` distinguishes independent observations of the same kind: for
-/// `Extracted`, the episode that supports the name, so repeating one episode adds nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EvidenceRecord {
-    pub kind: EvidenceKind,
-    pub support: Option<i64>,
-}
 
 /// Deployment policy for identity.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -62,106 +20,6 @@ impl Default for IdentityPolicy {
     fn default() -> Self {
         Self {
             invitation_ttl: Duration::from_secs(600),
-        }
-    }
-}
-
-/// The credibility of a name from its evidence (`crate::belief::credibility`): 1 for a name a
-/// person set, otherwise that of its distinct supporting episodes; 0 without evidence. How long
-/// ago it was supported is left to [`Alias::confidence_at`].
-pub fn confidence(evidence: &[EvidenceRecord]) -> f32 {
-    if evidence.iter().any(|e| e.kind == EvidenceKind::Manual) {
-        return 1.0;
-    }
-    let episodes: BTreeSet<Option<i64>> = evidence
-        .iter()
-        .filter(|e| e.kind == EvidenceKind::Extracted)
-        .map(|e| e.support)
-        .collect();
-    if episodes.is_empty() {
-        return 0.0;
-    }
-    // In 0.5..1, so the narrowing is harmless.
-    credibility(u32::try_from(episodes.len()).unwrap_or(u32::MAX)) as f32
-}
-
-/// Confirmed is provenance, not a threshold: a name is confirmed when a person vouched for it.
-pub fn status_for(evidence: &[EvidenceRecord]) -> AliasStatus {
-    if evidence.iter().any(|e| e.kind == EvidenceKind::Manual) {
-        AliasStatus::Confirmed
-    } else {
-        AliasStatus::Candidate
-    }
-}
-
-/// The longest name stored. A name is a few words; this keeps absurd input out of the index.
-pub const MAX_ALIAS_CHARS: usize = 64;
-
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum AliasTextError {
-    #[error("a name must not be empty")]
-    Empty,
-    #[error("a name is at most {MAX_ALIAS_CHARS} characters")]
-    TooLong,
-}
-
-/// Canonical form used for matching: compatibility-normalized (full-width and half-width forms
-/// agree), whitespace collapsed, lower-cased.
-pub fn normalize_alias(text: &str) -> Result<String, AliasTextError> {
-    let folded: String = text.nfkc().collect::<String>().to_lowercase();
-    let collapsed = folded.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.is_empty() {
-        return Err(AliasTextError::Empty);
-    }
-    if collapsed.chars().count() > MAX_ALIAS_CHARS {
-        return Err(AliasTextError::TooLong);
-    }
-    Ok(collapsed)
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Alias {
-    pub id: AliasId,
-    pub group: GroupId,
-    /// Normalized text.
-    pub text: String,
-    pub account: AccountId,
-    pub status: AliasStatus,
-    /// Credibility from the evidence ([`confidence`]).
-    pub confidence: f32,
-    pub last_evidence: UnixMillis,
-}
-
-impl Alias {
-    /// The probability that the name is theirs at `now`: a confirmed name stands until removed;
-    /// a lead's credibility ages with `half_life` (that of stable facts) since its last support.
-    pub fn confidence_at(&self, half_life: Duration, now: UnixMillis) -> f64 {
-        let credibility = f64::from(self.confidence);
-        match self.status {
-            AliasStatus::Confirmed => credibility,
-            AliasStatus::Candidate => credibility * persistence(half_life, self.last_evidence, now),
-            AliasStatus::Inactive => 0.0,
-        }
-    }
-}
-
-/// What a name refers to in a group, among confirmed aliases only.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Resolution {
-    Unknown,
-    One(AccountId),
-    /// More than one confirmed account; the caller must not guess.
-    Ambiguous(Vec<AccountId>),
-}
-
-impl Resolution {
-    pub fn from_targets(mut targets: Vec<AccountId>) -> Self {
-        targets.sort();
-        targets.dedup();
-        match targets.len() {
-            0 => Resolution::Unknown,
-            1 => Resolution::One(targets[0]),
-            _ => Resolution::Ambiguous(targets),
         }
     }
 }
@@ -250,11 +108,6 @@ impl Invitation {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum IdentityError {
-    #[error(transparent)]
-    Name(#[from] AliasTextError),
-    /// A person tried to give a name that already refers to someone else in the group.
-    #[error("that name already refers to someone else in this group")]
-    NameTaken,
     #[error("the account is not linked to another account in this group")]
     NotLinked,
     #[error("unknown account")]

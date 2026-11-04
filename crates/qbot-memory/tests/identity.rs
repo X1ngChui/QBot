@@ -3,47 +3,13 @@
 use std::time::Duration;
 
 use qbot_core::UnixMillis;
-use qbot_memory::identity::{
-    EvidenceKind, EvidenceRecord, IdentityPolicy, Invitation, InvitationState, LinkError,
-    confidence, normalize_alias,
-};
-use qbot_memory::{AliasStatus, IdentityStore, MemoryIdentityStore};
+use qbot_memory::identity::{IdentityPolicy, Invitation, InvitationState, LinkError};
+use qbot_memory::{IdentityStore, MemoryIdentityStore};
 
 #[tokio::test]
 async fn the_in_memory_store_satisfies_the_identity_contract() {
     qbot_memory::identity_conformance::run(&MemoryIdentityStore::new(IdentityPolicy::default()))
         .await;
-}
-
-fn e(kind: EvidenceKind, support: Option<i64>) -> EvidenceRecord {
-    EvidenceRecord { kind, support }
-}
-
-#[test]
-fn a_name_is_as_credible_as_its_distinct_episodes_and_confirmed_only_by_a_person() {
-    use qbot_memory::identity::status_for;
-    assert_eq!(confidence(&[]), 0.0);
-    assert!((confidence(&[e(EvidenceKind::Manual, None)]) - 1.0).abs() < 1e-6);
-    let extracted_twice = confidence(&[
-        e(EvidenceKind::Extracted, Some(1)),
-        e(EvidenceKind::Extracted, Some(1)),
-    ]);
-    assert!(
-        (extracted_twice - confidence(&[e(EvidenceKind::Extracted, Some(1))])).abs() < 1e-6,
-        "one episode counts once"
-    );
-    let extracted = |n: i64| {
-        (1..=n)
-            .map(|i| e(EvidenceKind::Extracted, Some(i)))
-            .collect::<Vec<_>>()
-    };
-    assert!((confidence(&extracted(1)) - 2.0 / 3.0).abs() < 1e-6);
-    assert!(confidence(&extracted(1)) < confidence(&extracted(2)));
-    assert!(confidence(&extracted(50)) < 1.0, "repetition is not proof");
-    assert_eq!(status_for(&extracted(50)), AliasStatus::Candidate);
-    let mut vouched = extracted(1);
-    vouched.push(e(EvidenceKind::Manual, None));
-    assert_eq!(status_for(&vouched), AliasStatus::Confirmed);
 }
 
 #[tokio::test]
@@ -108,17 +74,4 @@ fn the_pure_confirmation_rules_do_not_need_a_store() {
     assert_eq!(confirm(2, 600, &[1], &[2]), Err(LinkError::Expired));
     assert_eq!(confirm(2, 5, &[1, 3], &[2]), Err(LinkError::Stale));
     assert_eq!(confirm(2, 5, &[1], &[2, 3]), Err(LinkError::Stale));
-}
-
-#[test]
-fn names_are_normalized_compatibly_and_bounded() {
-    assert_eq!(normalize_alias("  Ａｌｅｘ \t Kim ").unwrap(), "alex kim");
-    assert_eq!(
-        normalize_alias("ＡＢＣ１２３").unwrap(),
-        "abc123",
-        "full-width letters and digits fold to ASCII"
-    );
-    assert!(normalize_alias("").is_err() && normalize_alias(" \n ").is_err());
-    assert!(normalize_alias(&"a".repeat(65)).is_err());
-    assert!(normalize_alias(&"a".repeat(64)).is_ok());
 }

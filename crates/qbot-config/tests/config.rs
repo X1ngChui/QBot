@@ -312,13 +312,13 @@ dims = 0
 images_per_minute = 0
 [memory]
 slice_batches = 0
+roster_people = 0
 [memory.recall]
 max_distance = 1.0
-[memory.facts]
-half_life_days = { stable = 0, default = 30, fast = 14 }
-activity_half_life_episodes = { stable = 200, default = 0, fast = 10 }
+[memory.rank]
+half_life_episodes = { lasting = 200, ongoing = 0, current = 10 }
 [memory.capacity]
-person_facts = 3
+per_member = 3
 [maintenance]
 nightly_cron = "every night"
 "#,
@@ -342,9 +342,9 @@ nightly_cron = "every night"
         "media.images_per_minute",
         "memory.slice_batches",
         "memory.recall.max_distance",
-        "memory.facts.half_life_days",
-        "memory.facts.activity_half_life_episodes",
+        "memory.rank.half_life_episodes",
         "memory.capacity",
+        "memory.roster_days",
         "maintenance.nightly_cron",
     ] {
         assert!(
@@ -573,8 +573,8 @@ fn the_configuration_defaults_equal_the_defaults_of_the_crates_that_consume_them
     // One source of truth: if a crate's `Default` and `defaults.toml` ever drift, this fails.
     let c = load(&scratch(), &MapEnv::default()).unwrap().config;
     assert_eq!(c.recall_params(), qbot_memory::RecallParams::default());
-    assert_eq!(c.decay_policy(), qbot_memory::facts::DecayPolicy::default());
-    assert_eq!(c.memory_capacity(), qbot_memory::facts::Capacity::default());
+    assert_eq!(c.half_lives(), qbot_memory::HalfLives::default());
+    assert_eq!(c.memory_capacity(), qbot_memory::Capacity::default());
     assert_eq!(c.history_window(), qbot_core::HistoryWindow::default());
     assert_eq!(c.media_config(), qbot_media::MediaConfig::default());
     assert_eq!(c.tool_settings().max_sends_per_run, 4);
@@ -612,8 +612,10 @@ raw_batches = 4
 summary_batches = 0
 [memory]
 slice_batches = 4
-group_terms = 12
-person_facts = 7
+group_memories = 12
+person_memories = 7
+roster_days = 10
+roster_people = 5
 [memory.recall]
 half_life_days = 30
 [media]
@@ -643,7 +645,11 @@ extraction_reasoning = "medium"
         (4, 1, 1)
     );
     assert_eq!(grid.retained_raw_batches, 4, "the verbatim tier");
-    assert_eq!((c.group_terms(), c.person_facts()), (12, 7));
+    assert_eq!((c.group_memories(), c.person_memories()), (12, 7));
+    assert_eq!(
+        (c.roster_recent_ms(), c.roster_people()),
+        (10 * 86_400_000, 5)
+    );
     assert_eq!(c.media_wait(), Duration::from_secs(10));
     assert_eq!(c.extraction_reasoning(), qbot_llm::ReasoningEffort::Medium);
     assert_eq!(

@@ -1,55 +1,61 @@
-//! What an episode's extraction found besides the summary: names people go by, facts about them,
-//! and knowledge about the group. Each is grounded in a verbatim quote from one line of the target
-//! part, checked here; the model may propose, code decides what is kept.
+//! What an episode's extraction found besides the summary: names people use for one another and
+//! memories about members and the group. Each is grounded in a verbatim quote from one line of
+//! the target part and checked here against the line's structure; the model proposes, code
+//! decides what is kept.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use qbot_core::{AccountId, MessageId};
 use qbot_wording::{Text, say};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::facts::normalize_key;
-use crate::identity::{AliasTextError, normalize_alias};
-use crate::predicates::Predicates;
+use crate::memories::{Durability, MAX_MEMORY_CHARS, MAX_TERM_CHARS, MemoryId, memory_key};
+use crate::names::{NameBasis, NameTextError, name_key};
 use crate::slice::SliceLine;
 
-/// A name someone goes by, as used in the chat.
+/// A name used for a member.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NameFinding {
     pub account: AccountId,
     pub name: String,
+    /// Never [`NameBasis::Set`]: only a person sets a name.
+    pub basis: NameBasis,
     pub message: MessageId,
     pub quote: String,
 }
 
-/// A fact about one person, by a predicate of the table.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FactFinding {
-    pub account: AccountId,
-    pub predicate: String,
-    pub object: String,
-    pub message: MessageId,
-    pub quote: String,
+/// What a statement does to what is remembered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryAction {
+    /// Not remembered yet.
+    New,
+    /// Says again what memory `id` says.
+    Same,
+    /// Memory `id` holds no longer; this replaces it.
+    Changed,
+    /// Memory `id` holds no longer, and nothing replaces it.
+    Ended,
 }
 
-/// Something true of the group rather than of anyone in it.
+/// A statement about a member or the group.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum KnowledgeFinding {
-    /// A word or phrase the group uses, and what it means here.
-    Term {
-        term: String,
-        meaning: String,
-        message: MessageId,
-        quote: String,
-    },
-    /// What the group is about.
-    Topic {
-        topic: String,
-        message: MessageId,
-        quote: String,
-    },
+pub struct MemoryFinding {
+    /// `None`: the group.
+    pub subject: Option<AccountId>,
+    pub action: MemoryAction,
+    /// The memory a `same`, `changed` or `ended` statement is about.
+    pub id: Option<MemoryId>,
+    /// For a group term.
+    pub term: Option<String>,
+    /// For `new` and `changed`.
+    pub text: Option<String>,
+    pub durability: Option<Durability>,
+    pub message: MessageId,
+    /// Who wrote the line.
+    pub author: AccountId,
+    pub quote: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -57,74 +63,134 @@ pub struct Findings {
     #[serde(default)]
     pub names: Vec<NameFinding>,
     #[serde(default)]
-    pub facts: Vec<FactFinding>,
-    #[serde(default)]
-    pub knowledge: Vec<KnowledgeFinding>,
-    /// Facts the target part says no longer hold (I quit that game), each ending the fact
-    /// recorded with that value, if there is one.
-    #[serde(default)]
-    pub ended: Vec<FactFinding>,
+    pub memories: Vec<MemoryFinding>,
 }
 
 impl Findings {
     pub fn is_empty(&self) -> bool {
-        self.names.is_empty()
-            && self.facts.is_empty()
-            && self.knowledge.is_empty()
-            && self.ended.is_empty()
+        self.names.is_empty() && self.memories.is_empty()
     }
+}
+
+/// How a line used a name, as the model may say it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UseArg {
+    Own,
+    Addressed,
+    About,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct NameArg {
     pub member: u32,
     pub name: String,
+    pub basis: UseArg,
     pub line: u32,
     pub quote: String,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct FactArg {
-    pub member: u32,
-    pub predicate: String,
-    pub object: String,
-    pub line: u32,
-    pub quote: String,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum KnowledgeKind {
-    Term,
-    Topic,
-}
-
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct KnowledgeArg {
-    pub kind: KnowledgeKind,
+pub struct MemoryArg {
+    pub about: String,
+    pub action: MemoryAction,
+    #[serde(default)]
+    pub id: Option<String>,
     #[serde(default)]
     pub term: Option<String>,
-    pub text: String,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub durability: Option<Durability>,
     pub line: u32,
     pub quote: String,
 }
 
-/// Who appears in the slice and its context, by member number.
-fn members(lines: &[&[SliceLine]]) -> HashMap<u32, AccountId> {
-    lines
-        .iter()
-        .flat_map(|part| part.iter())
-        .filter_map(|l| Some((l.member_no?, l.speaker?)))
+/// What validation reads besides the arguments.
+#[derive(Debug, Clone, Copy)]
+pub struct FindingContext<'a> {
+    /// The context before, the target and the context after.
+    pub parts: [&'a [SliceLine]; 3],
+    /// Older lines the shown ones quote.
+    pub quoted: &'a [SliceLine],
+    /// Accounts of members the lines mention without writing any of them.
+    pub accounts: &'a [(u32, AccountId)],
+    /// The current memories the extractor was shown, with their subjects.
+    pub known: &'a [(MemoryId, Option<AccountId>)],
+    /// Normalized names of the bot.
+    pub bot_names: &'a [String],
+}
+
+impl FindingContext<'_> {
+    fn target(&self) -> &[SliceLine] {
+        self.parts[1]
+    }
+
+    /// Member numbers of the lines and their accounts.
+    fn members(&self) -> HashMap<u32, AccountId> {
+        let mut out: HashMap<u32, AccountId> = self.accounts.iter().copied().collect();
+        for line in self.parts.iter().flat_map(|p| p.iter()) {
+            if let (Some(n), Some(a)) = (line.member_no, line.speaker) {
+                out.insert(n, a);
+            }
+        }
+        out
+    }
+
+    /// Who wrote the message `id`, among the lines shown and quoted.
+    fn author_of(&self, id: MessageId) -> Option<AccountId> {
+        self.parts
+            .iter()
+            .flat_map(|p| p.iter())
+            .chain(self.quoted)
+            .rfind(|l| l.message == id)
+            .and_then(|l| l.speaker)
+    }
+
+    /// The names each member is shown under in the lines, normalized.
+    fn shown(&self) -> HashMap<String, AccountId> {
+        let mut out = HashMap::new();
+        for line in self.parts.iter().flat_map(|p| p.iter()) {
+            if let (Some(account), Some(name)) = (line.speaker, &line.shown)
+                && let Ok(key) = name_key(name)
+            {
+                out.insert(key, account);
+            }
+        }
+        out
+    }
+}
+
+/// `[at:N]` member numbers in a text.
+fn mentioned(text: &str) -> HashSet<u32> {
+    numbers_after(text, "[at:")
+        .filter_map(|n| u32::try_from(n).ok())
         .collect()
 }
 
-struct Source<'a> {
-    line: &'a SliceLine,
-    quote: String,
+/// Message ids a text quotes (`[reply:ID]`).
+fn replies(text: &str) -> Vec<MessageId> {
+    numbers_after(text, "[reply:")
+        .filter_map(|n| MessageId::new(n).ok())
+        .collect()
+}
+
+fn numbers_after<'a>(text: &'a str, prefix: &'a str) -> impl Iterator<Item = i64> + 'a {
+    text.match_indices(prefix).filter_map(move |(at, _)| {
+        let digits: String = text[at + prefix.len()..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().ok()
+    })
 }
 
 /// The target line a finding cites, if it is a member's message that contains the quote.
-fn source<'a>(target: &'a [SliceLine], line: u32, quote: &str) -> Result<Source<'a>, String> {
+fn source<'a>(
+    target: &'a [SliceLine],
+    line: u32,
+    quote: &str,
+) -> Result<(&'a SliceLine, String), String> {
     let Some(found) = target.get((line as usize).wrapping_sub(1)) else {
         return Err(say(Text::ExtractFindingLine {
             line: line.to_string(),
@@ -146,31 +212,16 @@ fn source<'a>(target: &'a [SliceLine], line: u32, quote: &str) -> Result<Source<
             line: line.to_string(),
         }));
     }
-    Ok(Source {
-        line: found,
-        quote: quote.to_owned(),
-    })
+    Ok((found, quote.to_owned()))
 }
 
-/// The account a finding is about. It must be the person who wrote the line, or someone the
-/// quote itself mentions: what one person says is never filed under somebody else's name.
-fn subject(
-    members: &HashMap<u32, AccountId>,
-    member: u32,
-    source: &Source<'_>,
-) -> Result<AccountId, String> {
-    let account = *members.get(&member).ok_or_else(|| {
-        say(Text::ExtractFindingNoMember {
-            member: member.to_string(),
-        })
-    })?;
-    if source.line.speaker == Some(account) || source.quote.contains(&format!("[at:{member}]")) {
-        Ok(account)
-    } else {
-        Err(say(Text::ExtractFindingNotSubject {
-            member: member.to_string(),
-        }))
-    }
+/// Whether the line is directed at `account`: it mentions them as `[at:N]` or replies to one of
+/// their messages.
+fn directed_at(cx: &FindingContext<'_>, line: &SliceLine, number: u32, account: AccountId) -> bool {
+    mentioned(&line.text).contains(&number)
+        || replies(&line.text)
+            .into_iter()
+            .any(|id| cx.author_of(id) == Some(account))
 }
 
 /// A reason a finding was not kept, naming the list and the item (counted from 1).
@@ -182,54 +233,188 @@ fn problem(list: &str, index: usize, reason: String) -> String {
     })
 }
 
+fn account_of(members: &HashMap<u32, AccountId>, member: u32) -> Result<AccountId, String> {
+    members.get(&member).copied().ok_or_else(|| {
+        say(Text::ExtractFindingNoMember {
+            member: member.to_string(),
+        })
+    })
+}
+
+fn name(
+    cx: &FindingContext<'_>,
+    members: &HashMap<u32, AccountId>,
+    shown: &HashMap<String, AccountId>,
+    arg: &NameArg,
+) -> Result<NameFinding, String> {
+    let (line, quote) = source(cx.target(), arg.line, &arg.quote)?;
+    let account = account_of(members, arg.member)?;
+    let member = arg.member.to_string();
+    let author = line.speaker;
+    let basis = match arg.basis {
+        UseArg::Own if author == Some(account) => NameBasis::Own,
+        UseArg::Own => return Err(say(Text::ExtractFindingNameOwnNotAuthor { member })),
+        _ if author == Some(account) => {
+            return Err(say(Text::ExtractFindingNameByThemselves { member }));
+        }
+        UseArg::Addressed if directed_at(cx, line, arg.member, account) => NameBasis::Addressed,
+        UseArg::Addressed => return Err(say(Text::ExtractFindingNameNotAddressed { member })),
+        UseArg::About => NameBasis::About,
+    };
+    let text = arg.name.trim();
+    if text.is_empty() || !quote.contains(text) {
+        return Err(say(Text::ExtractFindingNameNotQuoted {
+            name: text.to_owned(),
+        }));
+    }
+    let key = name_key(text).map_err(|e| match e {
+        NameTextError::Empty => say(Text::ExtractFindingNameEmpty {}),
+        NameTextError::TooLong => say(Text::ExtractFindingNameTooLong {}),
+    })?;
+    // Members call the bot by its names; those never become a member's.
+    if cx.bot_names.contains(&key) {
+        return Err(say(Text::ExtractFindingNameBot {
+            name: text.to_owned(),
+        }));
+    }
+    if let Some(other) = shown.get(&key).filter(|other| **other != account) {
+        let other = members
+            .iter()
+            .find(|(_, a)| *a == other)
+            .map_or_else(String::new, |(n, _)| n.to_string());
+        return Err(say(Text::ExtractFindingNameShownAs {
+            name: text.to_owned(),
+            other,
+        }));
+    }
+    Ok(NameFinding {
+        account,
+        name: text.to_owned(),
+        basis,
+        message: line.message,
+        quote,
+    })
+}
+
+fn memory(
+    cx: &FindingContext<'_>,
+    members: &HashMap<u32, AccountId>,
+    arg: &MemoryArg,
+) -> Result<MemoryFinding, String> {
+    let (line, quote) = source(cx.target(), arg.line, &arg.quote)?;
+    let Some(author) = line.speaker else {
+        return Err(say(Text::ExtractFindingBotLine {
+            line: arg.line.to_string(),
+        }));
+    };
+    let about = arg.about.trim();
+    let subject = if about == "group" {
+        None
+    } else {
+        let number = about
+            .strip_prefix("member:")
+            .and_then(|n| n.trim().parse::<u32>().ok())
+            .ok_or_else(|| {
+                say(Text::ExtractFindingAbout {
+                    about: about.to_owned(),
+                })
+            })?;
+        let account = account_of(members, number)?;
+        // What one person says is filed under someone else only when the line is directed at
+        // them; talk about an absent member by name is no evidence about any account.
+        if author != account && !directed_at(cx, line, number, account) {
+            return Err(say(Text::ExtractFindingNotSubject {
+                member: number.to_string(),
+            }));
+        }
+        Some(account)
+    };
+    let id = match (arg.action, arg.id.as_deref().map(str::trim)) {
+        (MemoryAction::New, _) => None,
+        (action, None | Some("")) => {
+            return Err(say(Text::ExtractFindingNoId {
+                action: format!("{action:?}").to_lowercase(),
+            }));
+        }
+        (_, Some(raw)) => {
+            let id = MemoryId::parse(raw)
+                .filter(|id| cx.known.contains(&(*id, subject)))
+                .ok_or_else(|| {
+                    say(Text::ExtractFindingUnknownId {
+                        id: raw.to_owned(),
+                        about: about.to_owned(),
+                    })
+                })?;
+            Some(id)
+        }
+    };
+    let term = match arg.term.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        None => None,
+        Some(_) if subject.is_some() => return Err(say(Text::ExtractFindingTermForMember {})),
+        Some(term) if term.chars().count() > MAX_TERM_CHARS => {
+            return Err(say(Text::ExtractFindingTermTooLong {}));
+        }
+        Some(term) => {
+            // The quote shows what the term means; the term itself only has to be written
+            // somewhere in the target, by a member.
+            let written = cx
+                .target()
+                .iter()
+                .any(|l| l.speaker.is_some() && l.text.contains(term));
+            if !written {
+                return Err(say(Text::ExtractFindingTermNotWritten {
+                    term: term.to_owned(),
+                }));
+            }
+            Some(term.to_owned())
+        }
+    };
+    let (text, durability) = match arg.action {
+        MemoryAction::New | MemoryAction::Changed => {
+            let text = arg.text.as_deref().map(str::trim).unwrap_or_default();
+            if text.is_empty() {
+                return Err(say(Text::ExtractFindingEmptyText {}));
+            }
+            if text.chars().count() > MAX_MEMORY_CHARS {
+                return Err(say(Text::ExtractFindingTextTooLong {
+                    max: MAX_MEMORY_CHARS.to_string(),
+                }));
+            }
+            let Some(durability) = arg.durability else {
+                return Err(say(Text::ExtractFindingNoDurability {}));
+            };
+            (Some(text.to_owned()), Some(durability))
+        }
+        MemoryAction::Same | MemoryAction::Ended => (None, None),
+    };
+    Ok(MemoryFinding {
+        subject,
+        action: arg.action,
+        id,
+        term,
+        text,
+        durability,
+        message: line.message,
+        author,
+        quote,
+    })
+}
+
 /// Keep the findings that hold up; return the reasons for the rest. Findings never fail an
-/// episode: a summary is worth keeping even when a fact proposed beside it is not.
+/// episode: a summary is worth keeping even when an item proposed beside it is not.
 pub fn validate_findings(
     names: &[NameArg],
-    facts: &[FactArg],
-    knowledge: &[KnowledgeArg],
-    ended: &[FactArg],
-    ctx: &crate::extract::SliceContext<'_>,
-    predicates: &Predicates,
+    memories: &[MemoryArg],
+    cx: &FindingContext<'_>,
 ) -> (Findings, Vec<String>) {
-    let members = members(&[ctx.previous, ctx.target, ctx.next]);
-    let bot_names: Vec<String> = ctx
-        .background
-        .bot_names
-        .iter()
-        .filter_map(|n| normalize_alias(n).ok())
-        .collect();
+    let members = cx.members();
+    let shown = cx.shown();
     let mut kept = Findings::default();
     let mut dropped = Vec::new();
 
     let mut name_items = Vec::new();
     for (index, arg) in names.iter().enumerate() {
-        let result = source(ctx.target, arg.line, &arg.quote).and_then(|src| {
-            let account = subject(&members, arg.member, &src)?;
-            let name = arg.name.trim();
-            if name.is_empty() || !src.quote.contains(name) {
-                return Err(say(Text::ExtractFindingNameNotQuoted {
-                    name: name.to_owned(),
-                }));
-            }
-            let key = normalize_alias(name).map_err(|e| match e {
-                AliasTextError::Empty => say(Text::ExtractFindingNameEmpty {}),
-                AliasTextError::TooLong => say(Text::ExtractFindingNameTooLong {}),
-            })?;
-            // Members call the bot by its names; those never become a member's.
-            if bot_names.contains(&key) {
-                return Err(say(Text::ExtractFindingNameBot {
-                    name: name.to_owned(),
-                }));
-            }
-            Ok(NameFinding {
-                account,
-                name: name.to_owned(),
-                message: src.line.message,
-                quote: src.quote,
-            })
-        });
-        match result {
+        match name(cx, &members, &shown, arg) {
             Ok(finding) => {
                 name_items.push(index);
                 kept.names.push(finding);
@@ -237,143 +422,61 @@ pub fn validate_findings(
             Err(reason) => dropped.push(problem("names", index, reason)),
         }
     }
-    // One name for two people in one answer is a guess, not a finding: drop every such name.
-    let mut owners: HashMap<String, Vec<AccountId>> = HashMap::new();
+    // One name for two people in one stretch of chat is a guess, not a finding: drop every such
+    // name.
+    let mut owners: HashMap<String, HashSet<AccountId>> = HashMap::new();
     for finding in &kept.names {
-        if let Ok(key) = normalize_alias(&finding.name) {
-            owners.entry(key).or_default().push(finding.account);
+        if let Ok(key) = name_key(&finding.name) {
+            owners.entry(key).or_default().insert(finding.account);
         }
     }
     let mut items = name_items.into_iter();
     kept.names.retain(|finding| {
         let index = items.next().unwrap_or_default();
-        let ambiguous = normalize_alias(&finding.name)
+        let shared = name_key(&finding.name)
             .ok()
             .and_then(|key| owners.get(&key))
-            .is_some_and(|accounts| accounts.iter().any(|a| *a != finding.account));
-        if ambiguous {
+            .is_some_and(|accounts| accounts.len() > 1);
+        if shared {
             let reason = say(Text::ExtractFindingNameShared {
                 name: finding.name.clone(),
             });
             dropped.push(problem("names", index, reason));
         }
-        !ambiguous
+        !shared
     });
 
-    // A fact and the end of one are held to the same rules: a member's line, its subject, a
-    // known predicate and a value.
-    let fact = |arg: &FactArg| {
-        source(ctx.target, arg.line, &arg.quote).and_then(|src| {
-            let account = subject(&members, arg.member, &src)?;
-            if predicates.get(&arg.predicate).is_none() {
-                return Err(say(Text::ExtractFindingPredicate {
-                    predicate: arg.predicate.clone(),
-                }));
+    let mut lines = Vec::new();
+    for (index, arg) in memories.iter().enumerate() {
+        match memory(cx, &members, arg) {
+            Ok(finding) => {
+                lines.push(arg.line);
+                kept.memories.push(finding);
             }
-            let object = arg.object.trim();
-            if object.is_empty() {
-                return Err(say(Text::ExtractFindingEmptyObject {}));
-            }
-            Ok(FactFinding {
-                account,
-                predicate: arg.predicate.clone(),
-                object: object.to_owned(),
-                message: src.line.message,
-                quote: src.quote,
-            })
-        })
+            Err(reason) => dropped.push(problem("memories", index, reason)),
+        }
+    }
+    // One stretch of chat says one thing about each memory and each new statement: its last
+    // line ("I quit it" ... "back on it again"), so applying the episode never both supports and
+    // ends one memory.
+    let what = |f: &MemoryFinding| match (f.id, &f.text) {
+        (Some(id), _) => (f.subject, format!("#{}", id.get())),
+        (None, text) => (
+            f.subject,
+            memory_key(f.term.as_deref(), text.as_deref().unwrap_or_default()),
+        ),
     };
-    let mut fact_lines = Vec::new();
-    for (index, arg) in facts.iter().enumerate() {
-        match fact(arg) {
-            Ok(finding) => {
-                fact_lines.push(arg.line);
-                kept.facts.push(finding);
-            }
-            Err(reason) => dropped.push(problem("facts", index, reason)),
-        }
+    let mut last: HashMap<(Option<AccountId>, String), u32> = HashMap::new();
+    for (finding, line) in kept.memories.iter().zip(&lines) {
+        let entry = last.entry(what(finding)).or_insert(*line);
+        *entry = (*entry).max(*line);
     }
-    let mut ended_lines = Vec::new();
-    for (index, arg) in ended.iter().enumerate() {
-        match fact(arg) {
-            Ok(finding) => {
-                ended_lines.push(arg.line);
-                kept.ended.push(finding);
-            }
-            Err(reason) => dropped.push(problem("ended", index, reason)),
-        }
-    }
-    // A value said to hold and said to have ended in one stretch of chat: the later line is what
-    // holds now ("I quit it" ... "back on it again"), so only that item is kept, and applying the
-    // episode never both records and ends one fact.
-    let slot = |f: &FactFinding| (f.account, f.predicate.clone(), normalize_key(&f.object));
-    let latest_end: HashMap<_, u32> =
-        kept.ended
-            .iter()
-            .zip(&ended_lines)
-            .fold(HashMap::new(), |mut latest, (f, line)| {
-                let entry = latest.entry(slot(f)).or_insert(*line);
-                *entry = (*entry).max(*line);
-                latest
-            });
-    let latest_fact: HashMap<_, u32> =
-        kept.facts
-            .iter()
-            .zip(&fact_lines)
-            .fold(HashMap::new(), |mut latest, (f, line)| {
-                let entry = latest.entry(slot(f)).or_insert(*line);
-                *entry = (*entry).max(*line);
-                latest
-            });
-    let mut lines = fact_lines.into_iter();
-    kept.facts.retain(|f| {
-        let line = lines.next().unwrap_or_default();
-        latest_end.get(&slot(f)).is_none_or(|end| line > *end)
+    let mut seen = HashSet::new();
+    let mut at = lines.into_iter();
+    kept.memories.retain(|finding| {
+        let line = at.next().unwrap_or_default();
+        let key = what(finding);
+        last.get(&key) == Some(&line) && seen.insert(key)
     });
-    let mut lines = ended_lines.into_iter();
-    kept.ended.retain(|f| {
-        let line = lines.next().unwrap_or_default();
-        latest_fact.get(&slot(f)).is_none_or(|said| line >= *said)
-    });
-
-    for (index, arg) in knowledge.iter().enumerate() {
-        let result = source(ctx.target, arg.line, &arg.quote).and_then(|src| {
-            let text = arg.text.trim();
-            if text.is_empty() {
-                return Err(say(Text::ExtractFindingEmptyText {}));
-            }
-            match arg.kind {
-                KnowledgeKind::Term => {
-                    let term = arg.term.as_deref().map(str::trim).unwrap_or_default();
-                    // The quote shows what the term means; the term itself only has to be
-                    // written somewhere in the target, by a member.
-                    let written = ctx
-                        .target
-                        .iter()
-                        .any(|l| l.speaker.is_some() && l.text.contains(term));
-                    if term.is_empty() || !written {
-                        return Err(say(Text::ExtractFindingTermNotWritten {
-                            term: term.to_owned(),
-                        }));
-                    }
-                    Ok(KnowledgeFinding::Term {
-                        term: term.to_owned(),
-                        meaning: text.to_owned(),
-                        message: src.line.message,
-                        quote: src.quote,
-                    })
-                }
-                KnowledgeKind::Topic => Ok(KnowledgeFinding::Topic {
-                    topic: text.to_owned(),
-                    message: src.line.message,
-                    quote: src.quote,
-                }),
-            }
-        });
-        match result {
-            Ok(finding) => kept.knowledge.push(finding),
-            Err(reason) => dropped.push(problem("knowledge", index, reason)),
-        }
-    }
     (kept, dropped)
 }

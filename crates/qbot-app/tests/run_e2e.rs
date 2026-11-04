@@ -364,7 +364,8 @@ async fn connect(
 fn group_message(id: i64, user: i64, segments: Value) -> Message {
     Message::text(
         json!({"post_type": "message", "message_type": "group", "time": 1_800_000_000, "self_id": 100,
-               "user_id": user, "group_id": 900, "message_id": id, "message": segments})
+               "user_id": user, "group_id": 900, "message_id": id, "message": segments,
+               "sender": {"user_id": user, "card": format!("Tester {user}"), "nickname": "x"}})
         .to_string(),
     )
 }
@@ -1003,12 +1004,16 @@ async fn a_filled_batch_turns_archived_chat_into_a_stored_episode() {
     let Some(db) = database().await else { return };
     let root = scratch();
     // The extractor's model answers with a valid episode: a title, a summary, and a quote copied
-    // exactly from the first line.
+    // exactly from the first line; the member who wrote it gives a name and is remembered for
+    // something.
     let sim = Arc::new(SimServer::new([
         SimStep::Reply(FakeReply::new().call(
             "submit_episode",
             json!({"title": "Planning a trip", "summary": "Members discussed planning a trip together.",
-                   "evidence": [{"line": 1, "quote": "plan the trip"}]}),
+                   "evidence": [{"line": 1, "quote": "plan the trip"}],
+                   "names": [{"member": 1, "name": "Tess", "basis": "own", "line": 1, "quote": "call me Tess"}],
+                   "memories": [{"about": "member:1", "action": "new", "text": "likes planning trips",
+                                 "durability": "ongoing", "line": 1, "quote": "plan the trip"}]}),
         )),
         SimStep::Reply(FakeReply::new().call(
             "submit_episode",
@@ -1032,7 +1037,7 @@ async fn a_filled_batch_turns_archived_chat_into_a_stored_episode() {
     let pool = db.pool().await;
     let mut napcat = connect(bot.addr, "sesame").await.unwrap();
     for (id, text) in [
-        (1, "we should plan the trip together"),
+        (1, "call me Tess, we should plan the trip together"),
         (2, "good idea, where to?"),
         (3, "somewhere warm"),
     ] {
@@ -1072,6 +1077,31 @@ async fn a_filled_batch_turns_archived_chat_into_a_stored_episode() {
         .await
         .unwrap();
     assert_eq!(vectors, 1, "the episode is searchable");
+    // The line keeps the name it was sent under; the findings became a name use and a memory with
+    // its evidence, all of the group and the account that wrote the line.
+    let shown: Option<String> =
+        sqlx::query_scalar("SELECT sender_name FROM chat_line WHERE message_id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(shown.as_deref(), Some("Tester 3"));
+    let name: (i64, i64, String, String) =
+        sqlx::query_as("SELECT group_id, account_id, key, basis FROM name_use")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(name, (900, 3, "tess".to_owned(), "own".to_owned()));
+    let memory: (i64, i64, String, String, Option<i64>) = sqlx::query_as(
+        "SELECT m.memory_id, m.subject_account, m.text, m.state, e.author_account \
+         FROM memory m JOIN memory_evidence e USING (memory_id) WHERE m.group_id = 900",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (memory.1, memory.2.as_str(), memory.3.as_str(), memory.4),
+        (3, "likes planning trips", "current", Some(3))
+    );
     // Every filled batch queued a job (three lines, three batches); the first two had no
     // complete slice yet and found nothing to do.
     answering_names(
@@ -1142,6 +1172,19 @@ async fn a_filled_batch_turns_archived_chat_into_a_stored_episode() {
     assert!(
         asked.contains("we should plan the trip together") && asked.contains("submit_episode"),
         "{asked}"
+    );
+    // The next slice's extractor saw the member as their lines were sent and what is remembered
+    // about them, with the id a later statement can name.
+    let next = sim.requests()[1].to_string();
+    assert!(
+        next.contains("lines sent as \\\"Tester 3\\\"")
+            && next.contains(&format!("m{} (ongoing) likes planning trips", memory.0)),
+        "{next}"
+    );
+    // The reply's opening note carries what is remembered about the people in its chat.
+    assert!(
+        seen.contains("likes planning trips (they said so; 1 conversation(s)"),
+        "{seen}"
     );
     // Extraction (its model calls and the episodes' embeddings) is accounted for beside the
     // reply, request for request.

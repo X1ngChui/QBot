@@ -1,0 +1,30 @@
+description = "A member asks where 老周 works now. 老周 (member 3) has said nothing in the visible chat, so nothing about them is in the run's opening note; the roster shows member 3 is shown as 老周. The bot should look them up with about_member and answer from what it remembers (works at a bookshop since replacing an older job), not guess or claim to know nothing without looking."
+
+members = [
+  { number = 1, account = 70001, name = "阿明" },
+  { number = 2, account = 70002, name = "小雨" },
+  { number = 3, account = 70003, name = "老周" },
+]
+
+chat = [
+  { member = 1, text = "老周好久没冒泡了" },
+  { member = 2, text = "[at:bot] 老周现在在哪上班来着" },
+]
+
+trigger = { line = 2 }
+
+memories = [
+  { member = 3, text = "在面包店上班", durability = "lasting", episodes = 2, days_ago = 120 },
+  { member = 3, text = "换工作了，现在在书店上班", durability = "lasting", days_ago = 14, replaces = 1 },
+  { member = 3, text = "喜欢跑步", days_ago = 60 },
+]
+
+[expect]
+send = "required"
+send_calls_at_most = 1
+tools_required = ["about_member"]
+rubric = [
+  "The reply says 老周 works at a bookshop (书店) now; it may mention the bakery as an earlier job.",
+  "The reply does not say 老周 works at the bakery now.",
+  "The reply is short and in Chinese.",
+]

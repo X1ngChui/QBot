@@ -25,11 +25,11 @@ fn rendering_substitutes_arguments_and_picks_plural_forms() {
         "Usage: /top [--linked] [count]"
     );
     assert_eq!(
-        en.render(&Msg::NameEntry {
-            text: "Bobo".into(),
-            confidence: "0.80".into()
+        en.render(&Msg::ForgetDone {
+            id: "m12".into(),
+            text: "likes cats".into()
         }),
-        "Bobo (confidence 0.80)"
+        "Forgot m12: likes cats"
     );
     assert_eq!(
         en.render(&Msg::MentionsExact { count: 1 }),
@@ -147,23 +147,16 @@ fn a_translation_may_omit_a_variable_but_not_invent_one() {
             .join("\n")
     };
     // Dropping a variable the code supplies is allowed (some languages do not need it).
-    Locale::parse(
-        "en",
-        &with("command-name_entry", "command-name_entry = { $text }"),
-    )
-    .unwrap();
+    Locale::parse("en", &with("forget-done", "forget-done = { $text }")).unwrap();
     // Inventing one is an error.
     let errors = Locale::parse(
         "en",
-        &with(
-            "command-name_entry",
-            "command-name_entry = { $text } { $nope }",
-        ),
+        &with("forget-done", "forget-done = { $text } { $nope }"),
     )
     .unwrap_err()
     .0;
     assert!(
-        matches!(&errors[0], LocaleError::Unrenderable { id, .. } if id == "command-name_entry"),
+        matches!(&errors[0], LocaleError::Unrenderable { id, .. } if id == "forget-done"),
         "{errors:?}"
     );
 }

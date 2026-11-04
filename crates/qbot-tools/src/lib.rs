@@ -13,7 +13,10 @@ use std::sync::Arc;
 use qbot_agent::{Archive, Delivery, ToolSet, ToolSetError};
 use qbot_sched::TaskService;
 
-pub use memory::{ReadEpisode, ReadEpisodeArgs, RecallArgs, RecallEpisodes, add_memory_tools};
+pub use memory::{
+    AboutMember, AboutMemberArgs, MemberRecord, MemberRecords, ReadEpisode, ReadEpisodeArgs,
+    RecallArgs, RecallEpisodes, add_memory_tools,
+};
 pub use query::parse_query;
 pub use search::{SearchArgs, SearchHistory, SearchSettings};
 pub use send::{SendArgs, SendMessages, StaySilent, StaySilentArgs};

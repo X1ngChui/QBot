@@ -24,6 +24,7 @@ fn member(group: GroupId, message: i64, account: i64, text: &str) -> NewLine {
         speaker: NewSpeaker::Member(AccountId::new(account).unwrap()),
         at: UnixMillis::new(T0 + message),
         text: text.into(),
+        sender_name: None,
     }
 }
 
@@ -274,6 +275,7 @@ async fn since_and_recent_follow_the_cursor_and_isolate_groups() {
             speaker: NewSpeaker::Bot,
             at: UnixMillis::new(T0),
             text: "bot reply".into(),
+            sender_name: None,
         })
         .await
         .unwrap();

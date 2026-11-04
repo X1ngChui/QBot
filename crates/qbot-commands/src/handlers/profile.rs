@@ -1,9 +1,7 @@
-use qbot_core::AccountId;
+use qbot_core::{AccountId, UnixMillis};
 use qbot_i18n::Msg;
-use qbot_memory::belief::{as_of_day, percent};
-use qbot_memory::facts::{Fact, GROUP_TERM, GROUP_TOPIC};
-use qbot_memory::predicates::DecayClass;
-use qbot_memory::{Alias, AliasStatus, IdentityError};
+use qbot_memory::memories::{Memory, MemoryId};
+use qbot_memory::names::{KnownName, MAX_NAME_CHARS, NameError, NameTextError};
 
 use super::Reply;
 use crate::args;
@@ -77,11 +75,120 @@ async fn scope_accounts(
     }
 }
 
-fn entry(cx: &Cx<'_>, alias: &Alias) -> String {
-    cx.t(&Msg::NameEntry {
-        text: alias.text.clone(),
-        confidence: name_confidence(cx, alias),
+fn storage(error: impl std::fmt::Display) -> Fail {
+    Fail::Storage(error.to_string())
+}
+
+fn date(cx: &Cx<'_>, at: UnixMillis) -> String {
+    jiff::Timestamp::from_millisecond(at.get())
+        .map(|t| {
+            t.to_zoned(cx.deps.settings.zone.clone())
+                .strftime("%Y-%m-%d")
+                .to_string()
+        })
+        .unwrap_or_default()
+}
+
+/// How a name is used, as members read it: set by hand, given by the member, used by others,
+/// and whom else it is used for.
+async fn name_line(
+    cx: &Cx<'_>,
+    name: &KnownName,
+    all: &[KnownName],
+    own: &[AccountId],
+) -> Result<String, Fail> {
+    let mut how = Vec::new();
+    if name.set {
+        how.push(cx.t(&Msg::NameHowSet {}));
+    }
+    if name.own > 0 {
+        how.push(cx.t(&Msg::NameHowOwn {
+            count: u64::from(name.own),
+        }));
+    }
+    let others = name.addressed + name.about;
+    if others > 0 {
+        how.push(cx.t(&Msg::NameHowOthers {
+            count: u64::from(others),
+            date: date(cx, name.last),
+        }));
+    }
+    let mut shared = Vec::new();
+    for other in all
+        .iter()
+        .filter(|n| n.key == name.key && !own.contains(&n.account))
+    {
+        shared.push(cx.name_of(other.account).await);
+    }
+    if !shared.is_empty() {
+        how.push(cx.t(&Msg::NameHowShared {
+            members: cx.join_names(&shared),
+        }));
+    }
+    Ok(cx.t(&Msg::NameLine {
+        text: name.text.trim().to_owned(),
+        how: how.join("; "),
+    }))
+}
+
+/// The names of these accounts, one line each, set names first, then the most used.
+async fn name_lines(cx: &Cx<'_>, accounts: &[AccountId]) -> Result<Vec<String>, Fail> {
+    let all = cx
+        .deps
+        .names
+        .names(cx.group(), None)
+        .await
+        .map_err(storage)?;
+    let mut mine: Vec<&KnownName> = all
+        .iter()
+        .filter(|n| accounts.contains(&n.account))
+        .collect();
+    mine.sort_by(|a, b| {
+        b.set
+            .cmp(&a.set)
+            .then(b.uses().cmp(&a.uses()))
+            .then_with(|| a.key.cmp(&b.key))
+    });
+    let mut lines = Vec::new();
+    for name in mine {
+        lines.push(name_line(cx, name, &all, accounts).await?);
+    }
+    Ok(lines)
+}
+
+/// Who said a memory, as members read it.
+fn source(cx: &Cx<'_>, memory: &Memory) -> String {
+    if memory.subject.is_none() {
+        return cx.t(&Msg::MemorySourceMembers {});
+    }
+    let own = memory.own_word();
+    cx.t(&if own == 0 {
+        Msg::MemorySourceOthers {}
+    } else if own == memory.episodes() {
+        Msg::MemorySourceOwn {}
+    } else {
+        Msg::MemorySourceBoth {}
     })
+}
+
+fn memory_line(cx: &Cx<'_>, memory: &Memory) -> String {
+    cx.t(&Msg::MemoryLine {
+        id: memory.id.label(),
+        text: memory.display(),
+        source: source(cx, memory),
+        count: u64::from(memory.episodes()),
+        date: date(cx, memory.last),
+    })
+}
+
+/// The current memories about these accounts, by id: the order /who lists them.
+async fn remembered(cx: &Cx<'_>, accounts: &[AccountId]) -> Result<Vec<Memory>, Fail> {
+    let subjects: Vec<Option<AccountId>> = accounts.iter().copied().map(Some).collect();
+    cx.deps
+        .memories
+        .current(cx.group(), &subjects)
+        .await
+        .map_err(storage)
 }
 
 pub(crate) async fn who(cx: &Cx<'_>) -> Reply {
@@ -102,17 +209,6 @@ pub(crate) async fn who(cx: &Cx<'_>) -> Reply {
     }
     let linked = cx.linked_accounts(account).await?;
     let accounts = if all { linked.clone() } else { vec![account] };
-    let names = cx.deps.identity.names_of(cx.group(), &accounts).await?;
-    let confirmed: Vec<String> = names
-        .iter()
-        .filter(|a| a.status == AliasStatus::Confirmed)
-        .map(|a| entry(cx, a))
-        .collect();
-    let leads: Vec<String> = names
-        .iter()
-        .filter(|a| a.status == AliasStatus::Candidate)
-        .map(|a| entry(cx, a))
-        .collect();
 
     let mut lines = vec![
         cx.t(&Msg::WhoTitle {
@@ -133,22 +229,19 @@ pub(crate) async fn who(cx: &Cx<'_>) -> Reply {
             count: linked.len().to_string(),
         }));
     }
-    if !confirmed.is_empty() {
+    let names = name_lines(cx, &accounts).await?;
+    if !names.is_empty() {
         lines.push(cx.t(&Msg::WhoNames {
-            names: cx.join_names(&confirmed),
+            count: names.len() as u64,
         }));
-    }
-    if !leads.is_empty() {
-        lines.push(cx.t(&Msg::WhoLeads {
-            names: cx.join_names(&leads),
-        }));
+        lines.extend(names);
     }
     let notes = cx
         .deps
         .notes
         .notes(cx.group(), &accounts)
         .await
-        .map_err(|e| Fail::Storage(e.to_string()))?;
+        .map_err(storage)?;
     if notes.is_empty() {
         lines.push(cx.t(&Msg::WhoNoNotes {}));
     } else {
@@ -162,132 +255,44 @@ pub(crate) async fn who(cx: &Cx<'_>) -> Reply {
             }));
         }
     }
-    let facts = learned(cx, &accounts).await?;
-    if facts.is_empty() {
-        lines.push(cx.t(&Msg::WhoNoFacts {}));
+    let memories = remembered(cx, &accounts).await?;
+    if memories.is_empty() {
+        lines.push(cx.t(&Msg::WhoNoMemories {}));
     } else {
-        let confidences = cx
-            .deps
-            .settings
-            .fact_decay
-            .confidences(&facts, cx.deps.clock.now());
-        lines.push(cx.t(&Msg::WhoFacts {
-            count: facts.len() as u64,
+        lines.push(cx.t(&Msg::WhoMemories {
+            count: memories.len() as u64,
         }));
-        for ((index, fact), confidence) in (1u64..).zip(&facts).zip(confidences) {
-            lines.push(cx.t(&Msg::WhoFactLine {
-                index,
-                predicate: fact.predicate.clone(),
-                object: fact.object.clone(),
-                confidence: shown(confidence),
-            }));
-        }
+        lines.extend(memories.iter().map(|m| memory_line(cx, m)));
     }
-    if !notes.is_empty() || !facts.is_empty() {
+    if !notes.is_empty() || !memories.is_empty() {
         lines.push(cx.t(&Msg::WhoHint {}));
     }
     Ok(cx.fit(&lines.join("\n")))
-}
-
-/// A confidence as members see it: whole tens of percent.
-fn shown(confidence: f64) -> String {
-    format!("{}%", percent(confidence))
-}
-
-/// A name's confidence now: a lead's credibility ages like a stable fact.
-fn name_confidence(cx: &Cx<'_>, alias: &Alias) -> String {
-    shown(alias.confidence_at(
-        cx.deps.settings.fact_decay.half_life(DecayClass::Stable),
-        cx.deps.clock.now(),
-    ))
-}
-
-/// The learned facts about these accounts, in the order /who numbers them.
-async fn learned(cx: &Cx<'_>, accounts: &[qbot_core::AccountId]) -> Result<Vec<Fact>, Fail> {
-    let mut facts = Vec::new();
-    for account in accounts {
-        facts.extend(
-            cx.deps
-                .facts
-                .current(cx.group(), Some(*account))
-                .await
-                .map_err(|e| Fail::Storage(e.to_string()))?,
-        );
-    }
-    facts.sort_by(|a, b| (&a.predicate, &a.key, a.subject).cmp(&(&b.predicate, &b.key, b.subject)));
-    Ok(facts)
-}
-
-/// What the bot learned about the group itself with its confidence, in the order /group numbers
-/// it: topics, then terms by term, the most confident first. Confidence is as of the start of the
-/// day, so /group and a /forget group after it number alike.
-async fn group_knowledge(cx: &Cx<'_>) -> Result<Vec<(Fact, f64)>, Fail> {
-    let facts = cx
-        .deps
-        .facts
-        .current(cx.group(), None)
-        .await
-        .map_err(|e| Fail::Storage(e.to_string()))?;
-    let confidences = cx
-        .deps
-        .settings
-        .fact_decay
-        .confidences(&facts, as_of_day(cx.deps.clock.now()));
-    let mut ordered: Vec<(Fact, f64)> = facts
-        .into_iter()
-        .zip(confidences)
-        .filter(|(f, _)| f.predicate == GROUP_TOPIC || f.predicate == GROUP_TERM)
-        .collect();
-    ordered.sort_by(|(a, p), (b, q)| {
-        (a.predicate != GROUP_TOPIC)
-            .cmp(&(b.predicate != GROUP_TOPIC))
-            .then_with(|| a.slot.cmp(&b.slot))
-            .then(q.total_cmp(p))
-            .then(a.id.cmp(&b.id))
-    });
-    Ok(ordered)
-}
-
-fn knowledge_text(fact: &Fact) -> String {
-    match &fact.label {
-        Some(term) if fact.predicate == GROUP_TERM => format!("{term}: {}", fact.object),
-        _ => fact.object.clone(),
-    }
 }
 
 pub(crate) async fn group(cx: &Cx<'_>) -> Reply {
     if !cx.tokens().is_empty() || !cx.req.mentions.is_empty() {
         return Err(Msg::UsageGroup {}.into());
     }
-    let knowledge = group_knowledge(cx).await?;
-    if knowledge.is_empty() {
+    let mut memories = cx
+        .deps
+        .memories
+        .current(cx.group(), &[None])
+        .await
+        .map_err(storage)?;
+    if memories.is_empty() {
         return Ok(cx.t(&Msg::GroupEmpty {}));
     }
+    memories.sort_by(|a, b| (&a.term, &a.text, a.id).cmp(&(&b.term, &b.text, b.id)));
     let mut lines = vec![cx.t(&Msg::GroupHeader {})];
-    for (index, (fact, confidence)) in (1u64..).zip(&knowledge) {
-        let confidence = shown(*confidence);
-        lines.push(cx.t(&if fact.predicate == GROUP_TERM {
-            Msg::GroupTermLine {
-                index,
-                term: fact.label.clone().unwrap_or_else(|| fact.key.clone()),
-                text: fact.object.clone(),
-                confidence,
-            }
-        } else {
-            Msg::GroupTopicLine {
-                index,
-                text: fact.object.clone(),
-                confidence,
-            }
-        }));
-    }
+    lines.extend(memories.iter().map(|m| memory_line(cx, m)));
     lines.push(cx.t(&Msg::GroupHint {}));
     Ok(cx.fit(&lines.join("\n")))
 }
 
-/// `/forget group N`: remove learned group knowledge. Owners only.
+/// `/forget group ID`: remove a group memory. Owners only.
 async fn forget_group(cx: &Cx<'_>, rest: &[&str]) -> Reply {
-    let [number] = rest else {
+    let [raw] = rest else {
         return Err(Msg::UsageForget {}.into());
     };
     if !cx.owner {
@@ -296,24 +301,30 @@ async fn forget_group(cx: &Cx<'_>, rest: &[&str]) -> Reply {
     if !cx.req.mentions.is_empty() {
         return Err(Msg::UsageForget {}.into());
     }
-    let index = args::positive(number)?;
-    let knowledge = group_knowledge(cx).await?;
     let no_such = || Msg::ForgetGroupNoSuch {
-        index: u64::from(index),
+        id: (*raw).to_owned(),
     };
-    let (fact, _) = knowledge.get(index as usize - 1).ok_or_else(no_such)?;
-    let gone = cx
+    let id = MemoryId::parse(raw).ok_or_else(no_such)?;
+    let memory = cx
         .deps
-        .facts
-        .forget(cx.group(), fact.id)
+        .memories
+        .get(cx.group(), id)
         .await
-        .map_err(|e| Fail::Storage(e.to_string()))?;
-    if !gone {
+        .map_err(storage)?
+        .filter(|m| m.subject.is_none())
+        .ok_or_else(no_such)?;
+    if !cx
+        .deps
+        .memories
+        .delete(cx.group(), id)
+        .await
+        .map_err(storage)?
+    {
         return Err(no_such().into());
     }
     Ok(cx.t(&Msg::ForgetGroupDone {
-        index: u64::from(index),
-        text: knowledge_text(fact),
+        id: id.label(),
+        text: memory.display(),
     }))
 }
 
@@ -323,36 +334,54 @@ pub(crate) async fn forget(cx: &Cx<'_>) -> Reply {
         return forget_group(cx, rest).await;
     }
     let (all, rest) = args::scope(&tokens)?;
-    let [number] = rest.as_slice() else {
-        return Err(Msg::UsageForget {}.into());
-    };
-    let index = args::positive(number)?;
     let account = cx.target().await?;
     let accounts = scope_accounts(cx, account, all).await?;
-    let facts = learned(cx, &accounts).await?;
-    let Some(fact) = facts.get(index as usize - 1) else {
-        return Err(Msg::ForgetNoSuch {
-            index: u64::from(index),
+    match rest.as_slice() {
+        ["all"] => {
+            let mut gone = 0;
+            for one in &accounts {
+                gone += cx
+                    .deps
+                    .memories
+                    .delete_about(cx.group(), *one)
+                    .await
+                    .map_err(storage)?;
+            }
+            Ok(cx.t(&Msg::ForgetAllDone {
+                display: cx.name_of(account).await,
+                count: gone,
+            }))
         }
-        .into());
-    };
-    let gone = cx
-        .deps
-        .facts
-        .forget(cx.group(), fact.id)
-        .await
-        .map_err(|e| Fail::Storage(e.to_string()))?;
-    if !gone {
-        return Err(Msg::ForgetNoSuch {
-            index: u64::from(index),
+        [raw] => {
+            let no_such = || Msg::ForgetNoSuch {
+                id: (*raw).to_owned(),
+            };
+            let id = MemoryId::parse(raw).ok_or_else(no_such)?;
+            // Only a memory about the accounts in scope, in any state.
+            let memory = cx
+                .deps
+                .memories
+                .get(cx.group(), id)
+                .await
+                .map_err(storage)?
+                .filter(|m| m.subject.is_some_and(|s| accounts.contains(&s)))
+                .ok_or_else(no_such)?;
+            if !cx
+                .deps
+                .memories
+                .delete(cx.group(), id)
+                .await
+                .map_err(storage)?
+            {
+                return Err(no_such().into());
+            }
+            Ok(cx.t(&Msg::ForgetDone {
+                id: id.label(),
+                text: memory.display(),
+            }))
         }
-        .into());
+        _ => Err(Msg::UsageForget {}.into()),
     }
-    Ok(cx.t(&Msg::ForgetDone {
-        index: u64::from(index),
-        predicate: fact.predicate.clone(),
-        object: fact.object.clone(),
-    }))
 }
 
 pub(crate) async fn name(cx: &Cx<'_>) -> Reply {
@@ -379,21 +408,12 @@ pub(crate) async fn name(cx: &Cx<'_>) -> Reply {
         if !rest.is_empty() {
             return Err(Msg::UsageNameList {}.into());
         }
-        let names = cx.deps.identity.names_of(cx.group(), &accounts).await?;
+        let names = name_lines(cx, &accounts).await?;
         if names.is_empty() {
             return Ok(cx.t(&Msg::NameNone { display }));
         }
         let mut lines = vec![cx.t(&Msg::NameHeader { display })];
-        for status in [AliasStatus::Confirmed, AliasStatus::Candidate] {
-            for alias in names.iter().filter(|a| a.status == status) {
-                let (text, confidence) = (alias.text.clone(), name_confidence(cx, alias));
-                lines.push(cx.t(&if status == AliasStatus::Confirmed {
-                    Msg::NameConfirmedLine { text, confidence }
-                } else {
-                    Msg::NameCandidateLine { text, confidence }
-                }));
-            }
-        }
+        lines.extend(names);
         return Ok(cx.fit(&lines.join("\n")));
     };
 
@@ -404,26 +424,45 @@ pub(crate) async fn name(cx: &Cx<'_>) -> Reply {
         }
         .into());
     }
-    if action == "remove" {
-        let removed = cx
-            .deps
-            .identity
-            .remove_name(cx.group(), &name, &accounts)
-            .await?;
-        return Ok(cx.t(&if removed {
-            Msg::NameRemoved { display, name }
-        } else {
-            Msg::NameRemoveNone { display, name }
-        }));
-    }
-    match cx
-        .deps
-        .identity
-        .set_name(cx.group(), &name, &accounts, cx.deps.clock.now())
-        .await
-    {
-        Ok(_) => Ok(cx.t(&Msg::NameAdded { display, name })),
-        Err(IdentityError::NameTaken) => Err(Msg::NameTaken { name }.into()),
-        Err(other) => Err(other.into()),
+    let now = cx.deps.clock.now();
+    let result = if action == "remove" {
+        cx.deps
+            .names
+            .remove(cx.group(), &name, &accounts, now)
+            .await
+            .map(|removed| {
+                cx.t(&if removed {
+                    Msg::NameRemoved {
+                        display,
+                        name: name.clone(),
+                    }
+                } else {
+                    Msg::NameRemoveNone {
+                        display,
+                        name: name.clone(),
+                    }
+                })
+            })
+    } else {
+        cx.deps
+            .names
+            .set(cx.group(), &name, &accounts, now)
+            .await
+            .map(|()| {
+                cx.t(&Msg::NameAdded {
+                    display,
+                    name: name.clone(),
+                })
+            })
+    };
+    match result {
+        Ok(reply) => Ok(reply),
+        Err(NameError::Taken) => Err(Msg::NameTaken { name }.into()),
+        Err(NameError::Text(NameTextError::Empty)) => Err(Msg::NameEmptyName {}.into()),
+        Err(NameError::Text(NameTextError::TooLong)) => Err(Msg::NameTooLong {
+            max: MAX_NAME_CHARS as u32,
+        }
+        .into()),
+        Err(NameError::Backend(error)) => Err(storage(error)),
     }
 }

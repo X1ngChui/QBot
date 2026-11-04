@@ -20,10 +20,12 @@ pub struct Scenario {
     pub trigger: TriggerSpec,
     #[serde(default)]
     pub notes: Vec<NoteSpec>,
+    /// What the bot remembers about members and the group, in the order it was learned.
     #[serde(default)]
-    pub facts: Vec<FactSpec>,
+    pub memories: Vec<MemorySpec>,
+    /// Names people use for members, besides their display names.
     #[serde(default)]
-    pub knowledge: Vec<KnowledgeSpec>,
+    pub names: Vec<NameSpec>,
     /// What every `web_search` returns.
     #[serde(default)]
     pub web: Vec<WebHit>,
@@ -45,6 +47,9 @@ pub struct Member {
     pub account: i64,
     /// The member's current group display name.
     pub name: String,
+    /// Display names their earlier messages were sent under, the most recent first.
+    #[serde(default)]
+    pub earlier_names: Vec<String>,
     #[serde(default)]
     pub blocked: bool,
     /// The platform cannot say this member's name (the directory answers nothing).
@@ -87,29 +92,47 @@ pub struct NoteSpec {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct FactSpec {
-    pub member: u32,
-    pub predicate: String,
-    pub object: String,
-    /// How many episodes support it (more is more confident).
+pub struct MemorySpec {
+    /// The member it is about; absent for the group.
+    #[serde(default)]
+    pub member: Option<u32>,
+    /// For a group term.
+    #[serde(default)]
+    pub term: Option<String>,
+    pub text: String,
+    /// lasting, ongoing (default) or current.
+    #[serde(default)]
+    pub durability: Option<String>,
+    /// How many conversations said it.
     #[serde(default = "one")]
     pub episodes: u32,
-    /// How long ago they did (an older fact is less likely to hold).
+    /// How long ago it was last said.
     #[serde(default)]
     pub days_ago: u32,
-}
-
-fn one() -> u32 {
-    1
+    /// Who said it (a member number); by default the member it is about, or for the group,
+    /// the first member.
+    #[serde(default)]
+    pub by: Option<u32>,
+    /// The memory (1-based, in this list) this one replaced: that one is no longer current.
+    #[serde(default)]
+    pub replaces: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct KnowledgeSpec {
-    /// A term the group uses; absent for the group's topic.
+pub struct NameSpec {
+    pub member: u32,
+    pub name: String,
+    /// set, own, addressed (default) or about.
     #[serde(default)]
-    pub term: Option<String>,
-    pub text: String,
+    pub basis: Option<String>,
+    /// How many conversations used it.
+    #[serde(default = "one")]
+    pub episodes: u32,
+}
+
+fn one() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -205,11 +228,38 @@ impl Scenario {
             .notes
             .iter()
             .map(|n| n.member)
-            .chain(self.facts.iter().map(|f| f.member))
+            .chain(self.memories.iter().filter_map(|m| m.member))
+            .chain(self.memories.iter().filter_map(|m| m.by))
+            .chain(self.names.iter().map(|n| n.member))
             .chain(self.expect.mentions_forbidden.iter().copied())
         {
             if !known(n) {
                 return invalid(format!("unknown member {n}"));
+            }
+        }
+        for (i, m) in self.memories.iter().enumerate() {
+            if m.durability
+                .as_deref()
+                .is_some_and(|d| qbot_memory::Durability::parse(d).is_none())
+            {
+                return invalid(format!("memory {} has an unknown durability", i + 1));
+            }
+            if m.replaces.is_some_and(|r| r == 0 || r > i) {
+                return invalid(format!(
+                    "memory {} replaces one not listed before it",
+                    i + 1
+                ));
+            }
+            if m.member.is_some() && m.term.is_some() {
+                return invalid(format!("memory {} is a term about a member", i + 1));
+            }
+        }
+        for n in &self.names {
+            if n.basis
+                .as_deref()
+                .is_some_and(|b| qbot_memory::NameBasis::parse(b).is_none())
+            {
+                return invalid(format!("name {:?} has an unknown basis", n.name));
             }
         }
         if jiff::Timestamp::strptime("%Y-%m-%dT%H:%M:%S%:z", &self.start).is_err() {

@@ -76,13 +76,18 @@ summary_batches = 9
 # Batches summarized into one episode, at most history.raw_batches (the episode must exist
 # before its chat leaves the verbatim tier).
 slice_batches = 3
-# Group terms every reply is shown (for each term its most confident meaning, the most confident
-# terms). The block is part of every reply's cached prefix.
-group_terms = 40
-# Learned facts every reply is shown per person, the most confident first; the rest stay
-# recorded and reach /who and the extractor. The people block is part of every reply's cached
-# prefix.
-person_facts = 16
+# Memories about the group (its terms, what it is about) every reply is shown, the most worth
+# first. The block is part of every reply's cached prefix.
+group_memories = 40
+# Memories every run is shown per member of its conversation (who wrote or was mentioned in its
+# newest lines), the most worth first; the rest stay kept and reach /who, about_member and the
+# extractor.
+person_memories = 8
+# The roster every reply's cached prefix lists (what members are shown as, the names people use
+# for them): members who spoke within this many days, or are linked, blocked or have a name set
+# with /name; at most roster_people people, the most recently active first.
+roster_days = 30
+roster_people = 80
 
 [memory.recall]
 # Cosine distance beyond which an episode is not a candidate at all (below 1). Tuned to the
@@ -92,26 +97,22 @@ max_distance = 0.45
 # end: an older episode weighs less, never nothing. 0 ranks by similarity alone.
 half_life_days = 180
 
-[memory.facts]
-# How long a learned claim of each decay class typically keeps holding when nobody says it again:
-# its confidence (the probability that it holds now) halves every half-life since its last
-# support. Nothing expires for it (room is memory.capacity). Names learned from chat age
-# like stable facts.
-half_life_days = { stable = 730, default = 180, fast = 45 }
-# How current a learned claim stays in the conversation, by decay class: halved for every this
-# many episodes its subject takes part in (for the group's terms and topics, every episode of
-# the group) without saying it again. Ranks what replies are shown and what makes way when a
-# scope is full; a quiet group's clock barely moves. Confidence is not affected.
-activity_half_life_episodes = { stable = 200, default = 40, fast = 10 }
+[memory.rank]
+# How fast a memory loses rank in its subject's conversation, by durability: halved for every
+# this many episodes its subject takes part in (for the group's memories, every episode of the
+# group) without saying it again. Ranks what replies are shown and what makes way when a subject
+# is full; a quiet member's or group's clock does not move. Truth is not affected: what readers
+# see is who said a memory and when.
+half_life_episodes = { lasting = 200, ongoing = 40, current = 10 }
 
 [memory.capacity]
-# Learned claims a group keeps: per member, terms (each meaning counts) and topics. When an
-# episode leaves a scope over its room, the claims there worth least (confidence times how
-# current they are) are deleted, never what that episode said; the episodes keep what was said.
-# Bounds what accumulates in a busy group and what the extractor reads about each member.
-person_facts = 40
-group_terms = 120
-group_topics = 8
+# Memories a group keeps per member and about itself, in every state (a replaced or ended memory
+# counts until it makes way). When an episode leaves a subject over its room, the replaced and
+# ended memories go first, then the current ones worth least, never what that episode said; the
+# episodes keep what was said. Bounds what accumulates in a busy group and what the extractor
+# reads about each member.
+per_member = 30
+group = 120
 
 [media]
 # Transcribe voice clips in the process (SenseVoice on the CPU; the model is fetched once with

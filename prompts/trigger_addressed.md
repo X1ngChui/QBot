@@ -10,5 +10,8 @@ You have already replied since that message (your lines after it in the chat). I
 Names in this chat now:
 {{names}}
 {% endif %}
+{% if people %}
+{{people}}
+{% endif %}
 
 Reply through your tools: send what you have to say with `send_messages`, or call `stay_silent`; text you write outside a tool call reaches no one.

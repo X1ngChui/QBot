@@ -23,13 +23,9 @@ async fn migrations_are_idempotent_and_the_expected_tables_exist() {
         [
             "account",
             "account_link",
-            "alias",
-            "alias_evidence",
             "chat_line",
             "episode",
             "episode_embedding",
-            "fact",
-            "fact_evidence",
             "group_admin",
             "group_block",
             "group_state",
@@ -37,6 +33,10 @@ async fn migrations_are_idempotent_and_the_expected_tables_exist() {
             "media_cache",
             "media_ref",
             "member_number",
+            "memory",
+            "memory_evidence",
+            "name_removed",
+            "name_use",
             "note",
             "recurrence",
             "run",
@@ -151,22 +151,146 @@ async fn constraints_reject_invalid_rows() {
     assert!(rejected(&db, "INSERT INTO chat_line (group_id, ordinal, message_id, speaker, at_ms, text) VALUES (1, 1, 5, 'bot', 0, 'same ordinal')").await);
     assert!(rejected(&db, "INSERT INTO chat_line (group_id, ordinal, message_id, speaker, at_ms, text) VALUES (1, 0, 6, 'bot', 0, 'zero')").await);
 
-    // identity: an alias points at one account, evidence needs a support only when extracted.
+    // names: a use points at a known account; only a set name has no episode, and a learned one
+    // has its line; one use per member, name and episode.
     sqlx::query("INSERT INTO account (account_id, first_seen_ms) VALUES (7, 0)")
         .execute(db.pool())
         .await
         .unwrap();
-    assert!(rejected(&db, "INSERT INTO alias (group_id, text, status, confidence, last_evidence_ms) VALUES (1, 'x', 'candidate', 0, 0)").await, "no account");
-    assert!(rejected(&db, "INSERT INTO alias (group_id, text, account_id, status, confidence, last_evidence_ms) VALUES (1, 'x', 99, 'candidate', 0, 0)").await, "unknown account");
-    assert!(rejected(&db, "INSERT INTO alias (group_id, text, account_id, status, confidence, last_evidence_ms) VALUES (1, 'x', 7, 'candidate', 1.5, 0)").await, "confidence is a probability");
-    assert!(rejected(&db, "INSERT INTO alias (group_id, text, account_id, status, confidence, last_evidence_ms) VALUES (1, '', 7, 'candidate', 0, 0)").await, "empty name");
-    sqlx::query("INSERT INTO alias (group_id, text, account_id, status, confidence, last_evidence_ms) VALUES (1, 'x', 7, 'candidate', 0, 0)").execute(db.pool()).await.unwrap();
-    assert!(rejected(&db, "INSERT INTO alias (group_id, text, account_id, status, confidence, last_evidence_ms) VALUES (1, 'x', 7, 'candidate', 0, 0)").await, "one alias per name and account");
-    assert!(rejected(&db, "INSERT INTO alias_evidence (alias_id, kind, support, at_ms) VALUES ((SELECT min(alias_id) FROM alias), 'extracted', NULL, 0)").await);
-    assert!(rejected(&db, "INSERT INTO alias_evidence (alias_id, kind, support, at_ms) VALUES ((SELECT min(alias_id) FROM alias), 'manual', 5, 0)").await);
-    sqlx::query("INSERT INTO alias_evidence (alias_id, kind, support, at_ms) VALUES ((SELECT min(alias_id) FROM alias), 'manual', NULL, 0)").execute(db.pool()).await.unwrap();
-    assert!(rejected(&db, "INSERT INTO alias_evidence (alias_id, kind, support, at_ms) VALUES ((SELECT min(alias_id) FROM alias), 'manual', NULL, 9)").await, "the same evidence is stored once");
-    assert!(rejected(&db, "INSERT INTO alias_evidence (alias_id, kind, support, at_ms) VALUES ((SELECT min(alias_id) FROM alias), 'display', NULL, 0)").await, "the current group name is never stored as evidence");
+    let name_use = |rest: &str| {
+        format!(
+            "INSERT INTO name_use (group_id, account_id, key, text, basis, episode_id, message_id, quote, at_ms) VALUES {rest}"
+        )
+    };
+    assert!(
+        rejected(&db, &name_use("(1, 99, 'x', 'x', 'own', 1, 1, 'q', 0)")).await,
+        "unknown account"
+    );
+    assert!(
+        rejected(&db, &name_use("(1, 7, 'x', 'x', 'set', 1, 1, 'q', 0)")).await,
+        "a set name comes from no episode"
+    );
+    assert!(
+        rejected(
+            &db,
+            &name_use("(1, 7, 'x', 'x', 'own', NULL, NULL, NULL, 0)")
+        )
+        .await,
+        "a learned one does"
+    );
+    assert!(
+        rejected(&db, &name_use("(1, 7, 'x', 'x', 'nickname', 1, 1, 'q', 0)")).await,
+        "closed set of bases"
+    );
+    assert!(
+        rejected(&db, &name_use("(1, 7, '', '', 'own', 1, 1, 'q', 0)")).await,
+        "empty name"
+    );
+    sqlx::query(&name_use("(1, 7, 'x', 'X', 'own', 1, 1, 'q', 0)"))
+        .execute(db.pool())
+        .await
+        .unwrap();
+    sqlx::query(&name_use("(1, 7, 'x', 'x', 'set', NULL, NULL, NULL, 0)"))
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(
+        rejected(&db, &name_use("(1, 7, 'x', 'x', 'about', 1, 2, 'q', 0)")).await,
+        "once per episode"
+    );
+    assert!(
+        rejected(
+            &db,
+            &name_use("(1, 7, 'x', 'x', 'set', NULL, NULL, NULL, 1)")
+        )
+        .await,
+        "set once"
+    );
+
+    // memories: a member memory has no term; the state's time and replacement agree with it;
+    // two current memories of one subject never share a key; evidence once per episode.
+    let memory = |rest: &str| {
+        format!(
+            "INSERT INTO memory (group_id, subject_account, term, text, key, durability, state, replaced_by, closed_ms, first_ms, last_ms) VALUES {rest}"
+        )
+    };
+    assert!(
+        rejected(
+            &db,
+            &memory("(1, 7, 'GG', 't', 'k', 'lasting', 'current', NULL, NULL, 0, 0)")
+        )
+        .await,
+        "a term is the group's"
+    );
+    assert!(
+        rejected(
+            &db,
+            &memory("(1, 7, NULL, 't', 'k', 'forever', 'current', NULL, NULL, 0, 0)")
+        )
+        .await,
+        "closed set of durabilities"
+    );
+    assert!(
+        rejected(
+            &db,
+            &memory("(1, 7, NULL, 't', 'k', 'lasting', 'ended', NULL, NULL, 0, 0)")
+        )
+        .await,
+        "an end has its time"
+    );
+    assert!(
+        rejected(
+            &db,
+            &memory("(1, 7, NULL, 't', 'k', 'lasting', 'current', NULL, 5, 0, 0)")
+        )
+        .await,
+        "a current memory has none"
+    );
+    assert!(
+        rejected(
+            &db,
+            &memory("(1, 7, NULL, 't', 'k', 'lasting', 'current', NULL, NULL, 5, 0)")
+        )
+        .await,
+        "first before last"
+    );
+    assert!(
+        rejected(
+            &db,
+            &memory("(1, 7, NULL, '', 'k', 'lasting', 'current', NULL, NULL, 0, 0)")
+        )
+        .await,
+        "empty text"
+    );
+    sqlx::query(&memory(
+        "(1, 7, NULL, 't', 'k', 'lasting', 'current', NULL, NULL, 0, 0)",
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert!(
+        rejected(
+            &db,
+            &memory("(1, 7, NULL, 'T', 'k', 'lasting', 'current', NULL, NULL, 0, 0)")
+        )
+        .await,
+        "the same memory twice"
+    );
+    sqlx::query(&memory(
+        "(1, 7, NULL, 'T', 'k', 'lasting', 'ended', NULL, 3, 0, 0)",
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(&memory(
+        "(1, NULL, 'GG', 't', 'k', 'ongoing', 'current', NULL, NULL, 0, 0)",
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert!(rejected(&db, &memory("(1, 7, NULL, 'u', 'u', 'lasting', 'ended', (SELECT min(memory_id) FROM memory), 3, 0, 0)")).await, "only a replaced memory has a replacement");
+    sqlx::query("INSERT INTO memory_evidence (memory_id, episode_id, message_id, author_account, quote, at_ms) VALUES ((SELECT min(memory_id) FROM memory), 1, 1, 7, 'q', 0)").execute(db.pool()).await.unwrap();
+    assert!(rejected(&db, "INSERT INTO memory_evidence (memory_id, episode_id, message_id, author_account, quote, at_ms) VALUES ((SELECT min(memory_id) FROM memory), 1, 2, 7, 'q', 0)").await, "one support per episode");
 
     // episodes: ranges are valid and never overlap within a group; embeddings match their width.
     let episode = |first: i64, last: i64, group: i64| {
@@ -294,5 +418,155 @@ async fn only_content_keyed_picture_descriptions_are_kept() {
         [current],
         "platform-id and bare-hash keys can no longer be looked up"
     );
+    db.drop_db().await;
+}
+
+/// Applies the migrations before 0014, in order, to a bare database.
+async fn schema_before_0014(db: &common::TestDb) {
+    for sql in [
+        include_str!("../migrations/0001_schema.sql"),
+        include_str!("../migrations/0002_member_number_immutable.sql"),
+        include_str!("../migrations/0003_game_result_markers.sql"),
+        include_str!("../migrations/0004_slice_skip.sql"),
+        include_str!("../migrations/0005_media_cache_by_content.sql"),
+        include_str!("../migrations/0006_spontaneous_runs.sql"),
+        include_str!("../migrations/0007_provider_usage.sql"),
+        include_str!("../migrations/0008_archive_identity.sql"),
+        include_str!("../migrations/0009_group_links.sql"),
+        include_str!("../migrations/0010_group_admins.sql"),
+        include_str!("../migrations/0011_repeating_tasks.sql"),
+        include_str!("../migrations/0012_competing_claims.sql"),
+        include_str!("../migrations/0013_topics_side_by_side.sql"),
+    ] {
+        sqlx::raw_sql(sql).execute(db.pool()).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn the_active_memory_migration_keeps_set_names_removals_and_facts_with_their_history() {
+    let db = db!(bare);
+    schema_before_0014(&db).await;
+    let pool = db.pool().clone();
+    let run = |sql: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::raw_sql(sql).execute(&pool).await.unwrap();
+        }
+    };
+    run("INSERT INTO account (account_id, first_seen_ms) VALUES (7, 0), (8, 0);
+         INSERT INTO chat_line (group_id, ordinal, message_id, speaker, account_id, at_ms, text)
+         VALUES (1, 1, 501, 'member', 7, 100, 'I moved to Shanghai'),
+                (1, 2, 502, 'member', 8, 110, 'GG means good game');
+         INSERT INTO episode (group_id, first_batch, last_batch, first_ordinal, last_ordinal, batch_lines,
+             first_message, last_message, started_ms, ended_ms, line_count, participants, title, summary,
+             evidence, method, model, created_ms, findings)
+         VALUES (1, 0, 0, 1, 30, 30, 501, 502, 100, 120, 2, '{7,8}', 't', 's', '[]', 'slice-v5', 'm', 130,
+             '{\"names\": [{\"account\": 7, \"name\": \"Kit\", \"message\": 501, \"quote\": \"q\"}]}');
+         INSERT INTO alias (group_id, text, account_id, status, confidence, removed, last_evidence_ms)
+         VALUES (1, 'kit', 7, 'confirmed', 1, false, 50),
+                (1, 'boss', 8, 'inactive', 0.67, true, 60),
+                (1, 'lead', 8, 'candidate', 0.67, false, 70);
+         INSERT INTO alias_evidence (alias_id, kind, support, at_ms)
+         SELECT alias_id, 'manual', NULL, 40 FROM alias WHERE text = 'kit';
+         INSERT INTO alias_evidence (alias_id, kind, support, at_ms)
+         SELECT alias_id, 'extracted', 1, 70 FROM alias WHERE text = 'lead';
+         INSERT INTO fact (group_id, subject_account, predicate, key, object, label, status, supports,
+             decay, first_seen_ms, last_confirmed_ms, ended_ms, slot)
+         VALUES (1, 7, 'lives_in', 'beijing', 'Beijing', NULL, 'active', 3, 'stable', 10, 50, NULL, 'lives_in'),
+                (1, 7, 'lives_in', 'shanghai', 'Shanghai', NULL, 'active', 1, 'stable', 100, 100, NULL, 'lives_in'),
+                (1, 7, 'plays', 'genshin', 'Genshin', NULL, 'active', 1, 'fast', 20, 20, 90, 'plays:genshin'),
+                (1, 7, 'likes', 'cats', 'cats', NULL, 'forgotten', 1, 'default', 20, 20, NULL, 'dislikes/likes:cats'),
+                (1, NULL, 'group_term', 'good game', 'good game', 'GG', 'active', 1, 'default', 110, 110, NULL, 'group_term:gg'),
+                (1, NULL, 'group_topic', 'games', 'games', NULL, 'active', 2, 'stable', 5, 110, NULL, 'group_topic:games');
+         INSERT INTO fact_evidence (fact_id, episode_id, message_id, quote)
+         SELECT fact_id, (SELECT min(episode_id) FROM episode), 501, 'I moved to Shanghai'
+         FROM fact WHERE object = 'Shanghai';").await;
+    run(include_str!("../migrations/0014_active_memory.sql")).await;
+
+    let names: Vec<(i64, String, String)> =
+        sqlx::query_as("SELECT account_id, key, basis FROM name_use ORDER BY account_id, key")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        names,
+        [(7, "kit".to_owned(), "set".to_owned())],
+        "set names stay; names learned from chat are dropped"
+    );
+    let removed: Vec<(i64, String)> = sqlx::query_as("SELECT account_id, key FROM name_removed")
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        removed,
+        [(8, "boss".to_owned())],
+        "a removed name stays removed"
+    );
+
+    type Row = (Option<i64>, Option<String>, String, String, String);
+    let memories: Vec<Row> = sqlx::query_as(
+        "SELECT subject_account, term, text, durability, state FROM memory ORDER BY memory_id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    let row =
+        |subject: Option<i64>, term: Option<&str>, text: &str, durability: &str, state: &str| {
+            (
+                subject,
+                term.map(str::to_owned),
+                text.to_owned(),
+                durability.to_owned(),
+                state.to_owned(),
+            )
+        };
+    assert_eq!(
+        memories,
+        [
+            row(Some(7), None, "lives in: Beijing", "lasting", "replaced"),
+            row(Some(7), None, "lives in: Shanghai", "lasting", "current"),
+            row(Some(7), None, "plays: Genshin", "current", "ended"),
+            row(None, Some("GG"), "good game", "ongoing", "current"),
+            row(None, None, "games", "lasting", "current"),
+        ],
+        "the older of two competing values is replaced by the newer; a forgotten fact is gone"
+    );
+    let (replaced_by, author): (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT (SELECT replaced_by FROM memory WHERE text = 'lives in: Beijing'),
+                (SELECT e.author_account FROM memory_evidence e JOIN memory m USING (memory_id)
+                 WHERE m.text = 'lives in: Shanghai')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    let shanghai: i64 =
+        sqlx::query_scalar("SELECT memory_id FROM memory WHERE text = 'lives in: Shanghai'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(replaced_by, Some(shanghai));
+    assert_eq!(author, Some(7), "evidence keeps who wrote the line");
+
+    let (findings, legacy, applied): (serde_json::Value, Option<serde_json::Value>, Option<i64>) =
+        sqlx::query_as("SELECT findings, legacy_findings, consolidated_ms FROM episode")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(findings, serde_json::json!({}));
+    assert!(
+        legacy.is_some_and(|l| l["names"][0]["name"] == "Kit"),
+        "kept as a record"
+    );
+    assert_eq!(applied, Some(130), "and counted as applied");
+    for gone in ["alias", "alias_evidence", "fact", "fact_evidence"] {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = $1)",
+        )
+        .bind(gone)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(!exists, "{gone} is dropped");
+    }
     db.drop_db().await;
 }

@@ -3,14 +3,14 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use qbot_core::{AccountId, GroupId, MessageId, SliceGrid};
+use qbot_core::{GroupId, MessageId, SliceGrid};
 use qbot_llm::{Attribution, Purpose, attributed};
 use qbot_sched::{JobError, JobKind, JobRunner};
 
 use crate::build::EpisodeBuilder;
 use crate::consolidate::Consolidator;
 use crate::extract::SliceContext;
-use crate::slice::{Background, SliceBackground, SliceLine};
+use crate::slice::{Background, SliceBackground, SliceLine, SliceMember};
 use crate::store::EpisodeStore;
 
 /// Runs `JobKind::Extract` for a group: extracts every complete slice that has no episode yet,
@@ -273,13 +273,24 @@ fn quoted_unshown(parts: &[&[SliceLine]]) -> Vec<MessageId> {
     wanted
 }
 
-/// The members the lines involve, by number: who wrote them (with the account) and who they
-/// mention (`[at:N]`; the account is not in the line).
-fn members(parts: &[&[SliceLine]]) -> Vec<(u32, Option<AccountId>)> {
-    let mut found: std::collections::BTreeMap<u32, Option<AccountId>> = Default::default();
+/// The members the lines involve, by number: who wrote them (with the account and the display
+/// names their lines were sent under) and who they mention (`[at:N]`; the account is not in the
+/// line).
+fn members(parts: &[&[SliceLine]]) -> Vec<SliceMember> {
+    let mut found: std::collections::BTreeMap<u32, SliceMember> = Default::default();
     for line in parts.iter().flat_map(|part| part.iter()) {
         if let (Some(account), Some(number)) = (line.speaker, line.member_no) {
-            found.insert(number, Some(account));
+            let member = found.entry(number).or_insert_with(|| SliceMember {
+                number,
+                account: None,
+                shown: Vec::new(),
+            });
+            member.account = Some(account);
+            if let Some(name) = &line.shown
+                && !member.shown.contains(name)
+            {
+                member.shown.push(name.clone());
+            }
         }
         for (at, _) in line.text.match_indices("[at:") {
             let digits: String = line.text[at + 4..]
@@ -287,11 +298,15 @@ fn members(parts: &[&[SliceLine]]) -> Vec<(u32, Option<AccountId>)> {
                 .take_while(char::is_ascii_digit)
                 .collect();
             if let Ok(number) = digits.parse() {
-                found.entry(number).or_insert(None);
+                found.entry(number).or_insert_with(|| SliceMember {
+                    number,
+                    account: None,
+                    shown: Vec::new(),
+                });
             }
         }
     }
-    found.into_iter().collect()
+    found.into_values().collect()
 }
 
 #[async_trait]

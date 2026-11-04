@@ -68,6 +68,7 @@ impl Delivery for PgDelivery {
             speaker: NewSpeaker::Bot,
             at: SystemClock.now(),
             text,
+            sender_name: None,
         };
         match self
             .archive
@@ -239,6 +240,7 @@ impl Stack {
             speaker: NewSpeaker::Member(AccountId::new(account).unwrap()),
             at: SystemClock.now(),
             text: text.into(),
+            sender_name: None,
         };
         assert!(matches!(
             self.archive.append(line).await.unwrap(),

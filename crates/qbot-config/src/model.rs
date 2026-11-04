@@ -126,21 +126,24 @@ pub struct History {
 #[serde(deny_unknown_fields)]
 pub struct Memory {
     pub slice_batches: u32,
-    /// Group terms every reply is shown, the most confident.
-    pub group_terms: u32,
-    /// Learned facts every reply is shown per person, the most confident.
-    pub person_facts: u32,
+    /// Group memories every reply is shown, the most worth first.
+    pub group_memories: u32,
+    /// Memories a run is shown per member of its conversation, the most worth first.
+    pub person_memories: u32,
+    /// Who the roster lists: members active within this many days (and linked, blocked or named).
+    pub roster_days: u32,
+    /// People the roster lists at most.
+    pub roster_people: u32,
     pub recall: Recall,
-    pub facts: Facts,
+    pub rank: Rank,
     pub capacity: MemoryCapacity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemoryCapacity {
-    pub person_facts: u32,
-    pub group_terms: u32,
-    pub group_topics: u32,
+    pub per_member: u32,
+    pub group: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -152,17 +155,16 @@ pub struct Recall {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Facts {
-    pub half_life_days: HalfLives,
-    pub activity_half_life_episodes: HalfLives,
+pub struct Rank {
+    pub half_life_episodes: HalfLives,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HalfLives {
-    pub stable: u32,
-    pub default: u32,
-    pub fast: u32,
+    pub lasting: u32,
+    pub ongoing: u32,
+    pub current: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

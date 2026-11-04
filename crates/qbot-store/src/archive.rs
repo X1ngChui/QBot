@@ -26,6 +26,18 @@ pub struct NewLine {
     pub speaker: NewSpeaker,
     pub at: UnixMillis,
     pub text: String,
+    /// The display name a member's message was sent under; `None` for the bot, notices and
+    /// events that do not carry one.
+    pub sender_name: Option<String>,
+}
+
+/// The longest display name kept: QQ's are far shorter; this keeps absurd input out.
+const MAX_SENDER_NAME_CHARS: usize = 128;
+
+/// A display name as stored: trimmed, bounded, `None` when empty.
+fn sender_name(name: Option<&str>) -> Option<String> {
+    let name = name?.trim();
+    (!name.is_empty()).then(|| name.chars().take(MAX_SENDER_NAME_CHARS).collect())
 }
 
 /// A platform reference to one picture, sticker, clip or forwarded record of a line.
@@ -117,8 +129,8 @@ impl PgArchive {
             NewSpeaker::Member(account) => ("member", Some(account.get())),
         };
         let inserted = sqlx::query(
-            "INSERT INTO chat_line (group_id, ordinal, message_id, platform_seq, speaker, account_id, at_ms, text) \
-             SELECT $1, coalesce(max(ordinal), 0) + 1, $2, $7, $3, $4, $5, $6 FROM chat_line WHERE group_id = $1 \
+            "INSERT INTO chat_line (group_id, ordinal, message_id, platform_seq, speaker, account_id, at_ms, text, sender_name) \
+             SELECT $1, coalesce(max(ordinal), 0) + 1, $2, $7, $3, $4, $5, $6, $8 FROM chat_line WHERE group_id = $1 \
              ON CONFLICT DO NOTHING RETURNING seq, ordinal",
         )
         .bind(new.group.get())
@@ -132,6 +144,10 @@ impl PgArchive {
                 .map(|seq| i64::try_from(seq).map_err(|e| StoreError::corrupt(e.to_string())))
                 .transpose()?,
         )
+        .bind(match new.speaker {
+            NewSpeaker::Member(_) => sender_name(new.sender_name.as_deref()),
+            NewSpeaker::Bot => None,
+        })
         .fetch_optional(&mut *tx)
         .await?;
         let Some(row) = inserted else {

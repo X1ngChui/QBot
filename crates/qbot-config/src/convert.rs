@@ -15,8 +15,7 @@ use qbot_llm::net::Route;
 use qbot_llm::responses::{ResponsesConfig, RetryPolicy, StateMode};
 use qbot_llm::search::TavilyConfig;
 use qbot_media::MediaConfig;
-use qbot_memory::RecallParams;
-use qbot_memory::facts::{Capacity, DecayPolicy, EpisodeHalfLives};
+use qbot_memory::{Capacity, HalfLives, RecallParams};
 use qbot_ops::{BackupConfig, OpsConfig, PgTarget};
 use qbot_tools::ToolSettings;
 
@@ -150,16 +149,6 @@ impl Config {
         Duration::from_secs(self.media.reply_wait_secs)
     }
 
-    /// Group terms every reply is shown.
-    pub fn group_terms(&self) -> usize {
-        usize::try_from(self.memory.group_terms).unwrap_or(usize::MAX)
-    }
-
-    /// Learned facts every reply is shown per person.
-    pub fn person_facts(&self) -> usize {
-        usize::try_from(self.memory.person_facts).unwrap_or(usize::MAX)
-    }
-
     pub fn tool_settings(&self) -> ToolSettings {
         ToolSettings {
             max_sends_per_run: self.replies.max_messages,
@@ -187,32 +176,44 @@ impl Config {
         }
     }
 
-    pub fn decay_policy(&self) -> DecayPolicy {
-        let (h, a) = (
-            &self.memory.facts.half_life_days,
-            &self.memory.facts.activity_half_life_episodes,
-        );
-        DecayPolicy {
-            stable: days(h.stable),
-            default: days(h.default),
-            fast: days(h.fast),
-            activity: EpisodeHalfLives {
-                stable: f64::from(a.stable),
-                default: f64::from(a.default),
-                fast: f64::from(a.fast),
-            },
+    /// How fast memories lose rank, by durability.
+    pub fn half_lives(&self) -> HalfLives {
+        let h = &self.memory.rank.half_life_episodes;
+        HalfLives {
+            lasting: f64::from(h.lasting),
+            ongoing: f64::from(h.ongoing),
+            current: f64::from(h.current),
         }
     }
 
-    /// How many learned claims each scope of a group keeps.
+    /// How many memories a group keeps per member and about itself.
     pub fn memory_capacity(&self) -> Capacity {
         let c = &self.memory.capacity;
         let n = |v: u32| usize::try_from(v).unwrap_or(usize::MAX);
         Capacity {
-            person_facts: n(c.person_facts),
-            group_terms: n(c.group_terms),
-            group_topics: n(c.group_topics),
+            per_member: n(c.per_member),
+            group: n(c.group),
         }
+    }
+
+    /// Group memories every reply is shown.
+    pub fn group_memories(&self) -> usize {
+        usize::try_from(self.memory.group_memories).unwrap_or(usize::MAX)
+    }
+
+    /// Memories a run is shown per member of its conversation.
+    pub fn person_memories(&self) -> usize {
+        usize::try_from(self.memory.person_memories).unwrap_or(usize::MAX)
+    }
+
+    /// How recently a member must have spoken to be on the roster, in milliseconds.
+    pub fn roster_recent_ms(&self) -> i64 {
+        i64::from(self.memory.roster_days) * 86_400_000
+    }
+
+    /// People the roster lists at most.
+    pub fn roster_people(&self) -> usize {
+        usize::try_from(self.memory.roster_people).unwrap_or(usize::MAX)
     }
 
     pub fn media_config(&self) -> MediaConfig {

@@ -19,15 +19,15 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::episode::Evidence;
-use crate::findings::{FactArg, Findings, KnowledgeArg, NameArg, validate_findings};
-use crate::predicates::Predicates;
+use crate::findings::{FindingContext, Findings, MemoryArg, NameArg, validate_findings};
+use crate::names::name_key;
 use crate::slice::{Background, SliceLine};
 
 pub const TOOL_NAME: &str = "submit_episode";
 /// Version of the prompt and validation rules, recorded on every episode.
-pub const METHOD: &str = "slice-v5";
+pub const METHOD: &str = "slice-v6";
 
-/// The extraction instructions; `{language}` and `{predicates}` are filled per call.
+/// The extraction instructions; `{language}` is filled per call.
 const SYSTEM: &str = include_str!("../../../prompts/extract.md");
 
 /// Model calls for one slice: the first answer and up to two corrections or retries. Bounds a
@@ -42,11 +42,7 @@ pub struct SubmitArgs {
     #[serde(default)]
     pub names: Vec<NameArg>,
     #[serde(default)]
-    pub facts: Vec<FactArg>,
-    #[serde(default)]
-    pub knowledge: Vec<KnowledgeArg>,
-    #[serde(default)]
-    pub ended: Vec<FactArg>,
+    pub memories: Vec<MemoryArg>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -98,7 +94,6 @@ pub enum ExtractError {
 
 pub struct EpisodeExtractor {
     provider: Arc<dyn Provider>,
-    predicates: Arc<Predicates>,
     reasoning: ReasoningEffort,
 }
 
@@ -112,7 +107,6 @@ impl EpisodeExtractor {
     pub fn new(provider: Arc<dyn Provider>) -> Self {
         Self {
             provider,
-            predicates: Arc::new(Predicates::builtin()),
             reasoning: ReasoningEffort::Low,
         }
     }
@@ -123,27 +117,9 @@ impl EpisodeExtractor {
         self
     }
 
-    /// The instructions, with the predicate table spelled out.
+    /// The instructions, in the writing language.
     pub fn instructions(&self, language: &str) -> String {
-        let predicates: Vec<String> = self
-            .predicates
-            .iter()
-            .map(|p| {
-                say(Text::ExtractPredicate {
-                    name: p.name.to_string(),
-                    cardinality: say(if p.cardinality == crate::predicates::Cardinality::Single {
-                        Text::ExtractOneValue {}
-                    } else {
-                        Text::ExtractSeveralValues {}
-                    }),
-                    rule: p.rule.to_string(),
-                })
-            })
-            .collect();
-        SYSTEM
-            .trim_end()
-            .replace("{language}", language)
-            .replace("{predicates}", &predicates.join("\n"))
+        SYSTEM.trim_end().replace("{language}", language)
     }
 
     pub async fn extract(
@@ -253,13 +229,22 @@ impl EpisodeExtractor {
                         }
                         Ok(args) => match validate(&args, ctx.target) {
                             Ok(v) => {
+                                let bot_names: Vec<String> = ctx
+                                    .background
+                                    .bot_names
+                                    .iter()
+                                    .filter_map(|n| name_key(n).ok())
+                                    .collect();
                                 let (findings, dropped) = validate_findings(
                                     &args.names,
-                                    &args.facts,
-                                    &args.knowledge,
-                                    &args.ended,
-                                    ctx,
-                                    &self.predicates,
+                                    &args.memories,
+                                    &FindingContext {
+                                        parts: [ctx.previous, ctx.target, ctx.next],
+                                        quoted: &ctx.background.quoted,
+                                        accounts: &ctx.background.accounts,
+                                        known: &ctx.background.known,
+                                        bot_names: &bot_names,
+                                    },
                                 );
                                 let extracted = Extracted {
                                     title: v.0,
@@ -370,26 +355,21 @@ fn parameters() -> Vec<(&'static str, String)> {
         ("names", say(Text::ExtractParamNames {})),
         ("names.member", say(Text::ExtractParamNameMember {})),
         ("names.name", say(Text::ExtractParamNameName {})),
+        ("names.basis", say(Text::ExtractParamNameBasis {})),
         ("names.line", say(Text::ExtractParamLine {})),
         ("names.quote", say(Text::ExtractParamQuote {})),
-        ("facts", say(Text::ExtractParamFacts {})),
-        ("facts.member", say(Text::ExtractParamFactMember {})),
-        ("facts.predicate", say(Text::ExtractParamFactPredicate {})),
-        ("facts.object", say(Text::ExtractParamFactObject {})),
-        ("facts.line", say(Text::ExtractParamLine {})),
-        ("facts.quote", say(Text::ExtractParamQuote {})),
-        ("knowledge", say(Text::ExtractParamKnowledge {})),
-        ("knowledge.kind", say(Text::ExtractParamKnowledgeKind {})),
-        ("knowledge.term", say(Text::ExtractParamKnowledgeTerm {})),
-        ("knowledge.text", say(Text::ExtractParamKnowledgeText {})),
-        ("knowledge.line", say(Text::ExtractParamLine {})),
-        ("knowledge.quote", say(Text::ExtractParamQuote {})),
-        ("ended", say(Text::ExtractParamEnded {})),
-        ("ended.member", say(Text::ExtractParamFactMember {})),
-        ("ended.predicate", say(Text::ExtractParamFactPredicate {})),
-        ("ended.object", say(Text::ExtractParamEndedObject {})),
-        ("ended.line", say(Text::ExtractParamLine {})),
-        ("ended.quote", say(Text::ExtractParamQuote {})),
+        ("memories", say(Text::ExtractParamMemories {})),
+        ("memories.about", say(Text::ExtractParamMemoryAbout {})),
+        ("memories.action", say(Text::ExtractParamMemoryAction {})),
+        ("memories.id", say(Text::ExtractParamMemoryId {})),
+        ("memories.term", say(Text::ExtractParamMemoryTerm {})),
+        ("memories.text", say(Text::ExtractParamMemoryText {})),
+        (
+            "memories.durability",
+            say(Text::ExtractParamMemoryDurability {}),
+        ),
+        ("memories.line", say(Text::ExtractParamLine {})),
+        ("memories.quote", say(Text::ExtractParamQuote {})),
     ]
 }
 
@@ -529,18 +509,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_instructions_have_exactly_the_language_and_predicate_slots() {
+    fn the_instructions_have_exactly_the_language_slot() {
         let slots: Vec<&str> = SYSTEM
             .match_indices('{')
             .filter_map(|(at, _)| SYSTEM[at + 1..].split_once('}').map(|(slot, _)| slot))
             .collect();
-        assert_eq!(slots, ["language", "predicates"]);
+        assert_eq!(slots, ["language"]);
 
         let extractor = EpisodeExtractor::new(Arc::new(qbot_llm::fake::FakeProvider::new([])));
         let text = extractor.instructions("English");
         assert!(!text.contains('{'), "every slot is filled");
         assert!(text.contains("in this language: English."));
-        assert!(text.contains("- lives_in (one value): "));
     }
 }
 

@@ -469,6 +469,7 @@ impl Pipeline {
             author: Some(n.subject),
             at: n.at,
             text: notice::archive_text(&n),
+            sender_name: None,
             mentions: Vec::new(),
             media: Vec::new(),
         };
@@ -530,6 +531,7 @@ fn archive_form(m: &GroupMessage, ctx: &RenderContext) -> Option<(Incoming, Vec<
         author: (!m.from_bot).then_some(m.sender),
         at: m.at,
         text,
+        sender_name: m.sender_name.clone(),
         mentions: render::mentioned(&m.segments, ctx.bot),
         media: items
             .iter()

@@ -5,7 +5,7 @@ members = [
   { number = 3, account = 10003, name = "Mia" },
 ]
 
-knowledge = [
+memories = [
   { text = "Friends from the same university who chat about food, pets and weekend plans" },
   { term = "喵站", text = "the cat cafe by the lake that the group often goes to" },
 ]

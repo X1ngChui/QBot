@@ -25,7 +25,6 @@ command-own_accounts_only = You can only act on your own account or on accounts 
 command-duration_invalid = Invalid duration; use 30m, 12h or 3d.
 command-truncated = (truncated)
 command-list_separator = ,{ " " }
-command-name_entry = { $text } (confidence { $confidence })
 command-display_fallback = account { $account }
 command-display_member = member { $number }
 command-scope_exact = exact account
@@ -78,15 +77,7 @@ help-detail =
 
     { $detail }
 what-who = Show what is on record about a member
-detail-who =
-    /who [--linked] [@account]
-    Shows names, notes people wrote, and what the bot learned from chat, each numbered separately. Shows the exact account by default; --linked includes its linked accounts. Members see their own record; delegated admins also ordinary members' in this group; owners anyone's.
 what-name = Manage the names a member is called by
-detail-name =
-    /name [--linked] [@account]
-    /name add [--linked] [@account] name
-    /name remove [--linked] [@account] name
-    Names are backed by evidence; a name added by hand counts as confirmed. --linked applies to the person behind all linked accounts. Members manage their own names; delegated admins also ordinary members' in this group; owners anyone's.
 what-note = Manage notes people wrote about a member
 detail-note =
     /note [--linked] [@account]
@@ -153,9 +144,6 @@ detail-block =
 what-mute = Mute or unmute the bot here
 detail-mute = /mute [status|on|off]
 what-group = Show what the bot learned about this group
-detail-group =
-    /group
-    The group's topic and the terms it uses, as learned from chat. Owners remove an entry with /forget group N.
 what-runs = Show recent bot runs
 detail-runs =
     /runs
@@ -171,12 +159,7 @@ who-no_record = This account has no record in this group.
 who-title = Account record | { $display } | { $scope }
 who-messages = Messages in this group: { $count }
 who-linked = Linked accounts: { $count }
-who-names = Confirmed names: { $names }
-who-leads = Unconfirmed leads (not to be used to identify anyone): { $names }
 name-none = { $display } has no names on record.
-name-header = Names of { $display }:
-name-confirmed_line = - { $text } (confirmed, confidence { $confidence })
-name-candidate_line = - { $text } (unconfirmed, confidence { $confidence })
 name-removed = Removed the name "{ $name }" from { $display }.
 name-remove_none = { $display } has no active name "{ $name }" in this scope.
 name-taken = "{ $name }" already refers to someone else in this group.
@@ -316,13 +299,9 @@ tasks-too_many = This group already has { $limit } pending tasks.
 tasks-chain_deep = The follow-up chain is already { $limit } tasks deep.
 tasks-nothing_to_change = Editing a task needs new content, a new time or a new rule.
 tasks-empty_intent = The task content must not be empty.
-who-facts = Learned from chat ({ $count }):
-who-no_facts = Learned from chat: nothing yet
-who-fact_line = { $index }. { $predicate }: { $object } (confidence { $confidence })
 who-notes = Notes written by people ({ $count }):
 who-no_notes = Notes written by people: none
 who-note_line = { $index }. { $text }
-who-hint = Remove a note with /note remove N, a learned fact with /forget N (same scope).
 note-none = There are no notes about { $display } in this scope.
 note-header = Notes about { $display } | { $scope }:
 note-line = { $index }. { $text } (by { $author }, { $time })
@@ -337,13 +316,6 @@ note-cleared =
 note-no_such = There is no note { $index } in that scope. Send /note to see the list.
 note-empty = A note needs some text.
 note-too_many = An account can have at most { $max } notes; remove one first.
-group-empty = Nothing has been learned about this group yet.
-group-header = Learned about this group:
-group-topic_line = { $index }. What the group is about: { $text } (confidence { $confidence })
-group-term_line = { $index }. "{ $term }" means: { $text } (confidence { $confidence })
-group-hint = Owners remove an entry with /forget group N.
-forget-group_done = Forgot group knowledge { $index }: { $text }
-forget-group_no_such = There is no group knowledge { $index }. Send /group to see the list.
 runs-empty = This group has no runs yet.
 runs-header = Latest runs of this group ({ $count }):
 runs-row = #{ $id } { $time } { $trigger } | { $end } | { $turns } turns, { $tools } tool calls, { $sends } sent | { $tokens } tokens
@@ -366,14 +338,6 @@ runs-open = still running
 logs-empty = No warnings or errors since the bot started.
 logs-header = Latest warnings and errors ({ $count }):
 logs-line = { $time } { $level } { $text }
-usage-forget = Usage: /forget [--linked] [@account] N, or /forget group N
-forget-done = Forgot { $index }. { $predicate }: { $object }.
-forget-no_such = There is no learned fact { $index } in that scope. Send /who to see the list.
-what-forget = Remove something the bot learned from chat
-detail-forget =
-    /forget [--linked] [@account] N
-    /forget group N (owner only)
-    Removes what the bot learned on its own: the learned fact numbered N in /who (same scope), or the group knowledge numbered N in /group. Notes people wrote are not affected; use /note for those. Members forget what was learned about them; delegated admins also about ordinary members in this group; owners about anyone.
 report-title = Daily report | { $date }
 report-runs = Replies: { $runs } ({ $addressed } addressed, { $wake } scheduled, { $spontaneous } on its own)
 report-ends = How runs ended: { $ends }
@@ -446,3 +410,46 @@ report-backup_age = Last backup: { $hours } { $hours ->
        *[other] hours
     } ago
 report-backup_none = Last backup: none found
+
+who-names = Names ({ $count }):
+who-shown = Shown as: { $names }
+name-header = Names of { $display }:
+name-line = - { $text } ({ $how })
+name-how_set = set with /name
+name-how_own = they call themselves so in { $count } conversation(s)
+name-how_others = others call them so in { $count } conversation(s), last { $date }
+name-how_shared = also used for { $members }
+who-memories = Remembered from chat ({ $count }):
+who-no_memories = Remembered from chat: nothing
+memory-line = { $id } { $text } ({ $source }; { $count } conversation(s), last { $date })
+memory-source_own = they said so
+memory-source_others = others said so
+memory-source_both = they and others said so
+memory-source_members = members said so
+who-hint = Remove a note with /note remove N, a memory with /forget ID (for example /forget m12), everything remembered about them with /forget all.
+group-empty = Nothing is remembered about this group yet.
+group-header = Remembered about this group:
+group-hint = Owners remove an entry with /forget group ID.
+forget-done = Forgot { $id }: { $text }
+forget-no_such = There is no memory { $id } in that scope. Send /who to see the list.
+forget-group_done = Forgot { $id }: { $text }
+forget-group_no_such = There is no group memory { $id }. Send /group to see the list.
+forget-all_done = Forgot everything remembered about { $display } ({ $count }).
+usage-forget = Usage: /forget [--linked] [@account] ID, /forget all [--linked] [@account], or /forget group ID
+what-forget = Remove what the bot remembers from chat
+detail-forget =
+    /forget [--linked] [@account] ID
+    /forget all [--linked] [@account]
+    /forget group ID (owner only)
+    Deletes what the bot remembered on its own, with where it came from: the memory with that ID in /who (same scope), every memory about the member, or the group memory with that ID in /group. Notes people wrote are not affected; use /note for those, and /name remove for names. Members forget what is remembered about them; delegated admins also about ordinary members in this group; owners about anyone.
+detail-who =
+    /who [--linked] [@account]
+    Shows what the member is shown as, the names people use for them, notes people wrote, and what the bot remembers from chat with who said it and when. Shows the exact account by default; --linked includes its linked accounts. Members see their own record; delegated admins also ordinary members' in this group; owners anyone's.
+detail-name =
+    /name [--linked] [@account]
+    /name add [--linked] [@account] name
+    /name remove [--linked] [@account] name
+    Names people use for a member, with how they were used: set by hand, given by the member, or used by others in conversation. A name removed by hand is not learned again until someone adds it. --linked applies to the person behind all linked accounts. Members manage their own names; delegated admins also ordinary members' in this group; owners anyone's.
+detail-group =
+    /group
+    What the bot remembers about this group: terms it uses and what it is about, with how often and when they were said. Owners remove an entry with /forget group ID.

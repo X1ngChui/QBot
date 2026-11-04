@@ -34,6 +34,7 @@ fn member(group: GroupId, message: i64, account: i64, text: &str) -> NewLine {
         speaker: NewSpeaker::Member(AccountId::new(account).unwrap()),
         at: UnixMillis::new(T0 + message * 1000),
         text: text.into(),
+        sender_name: None,
     }
 }
 
@@ -355,6 +356,7 @@ async fn deleting_an_episode_removes_its_embedding_and_lines_carry_member_number
             speaker: NewSpeaker::Bot,
             at: UnixMillis::new(T0),
             text: "bot line".into(),
+            sender_name: None,
         })
         .await
         .unwrap();
@@ -523,7 +525,7 @@ async fn lines_become_episodes_which_recall_finds_and_read_episode_opens() {
     );
 
     // The tools, run the way the agent runtime runs them.
-    let set = qbot_tools::add_memory_tools(ToolSet::new(), recall, store.clone()).unwrap();
+    let set = qbot_tools::add_memory_tools(ToolSet::new(), recall, store.clone(), None).unwrap();
     let trigger = Trigger::Addressed {
         message: MessageId::new(1).unwrap(),
         sender: AccountId::new(10).unwrap(),
@@ -628,21 +630,19 @@ async fn lines_become_episodes_which_recall_finds_and_read_episode_opens() {
 }
 
 #[tokio::test]
-async fn the_postgres_fact_store_satisfies_the_fact_contract() {
+async fn the_postgres_name_and_memory_stores_satisfy_their_contracts() {
     use qbot_memory::IdentityStore;
     let db = db!();
     let identity = PgIdentityStore::new(db.pool().clone(), IdentityPolicy::default());
-    for account in [501, 502] {
+    for account in 1..=40 {
         identity
             .seen(AccountId::new(account).unwrap(), UnixMillis::new(T0))
             .await
             .unwrap();
     }
-    qbot_memory::facts_conformance::run(
-        &qbot_store::PgFactStore::new(db.pool().clone()),
-        &[501, 502],
-    )
-    .await;
+    qbot_memory::names_conformance::run(&qbot_store::PgNameStore::new(db.pool().clone())).await;
+    qbot_memory::memories_conformance::run(&qbot_store::PgMemoryStore::new(db.pool().clone()))
+        .await;
     db.drop_db().await;
 }
 
@@ -718,10 +718,13 @@ async fn a_member_number_survives_everything_that_happens_to_its_account() {
         .unwrap();
     policy.block(g, account(602), None).await.unwrap();
     policy.unblock(g, account(602)).await.unwrap();
-    identity
-        .set_name(g, "Tester", &[account(601)], UnixMillis::new(T0))
-        .await
-        .unwrap();
+    {
+        use qbot_memory::NameStore;
+        qbot_store::PgNameStore::new(db.pool().clone())
+            .set(g, "Tester", &[account(601)], UnixMillis::new(T0))
+            .await
+            .unwrap();
+    }
     for i in 0..5 {
         archive
             .append(member(g, 10 + i, 601, "more"))
@@ -747,36 +750,57 @@ async fn a_member_number_survives_everything_that_happens_to_its_account() {
 }
 
 #[tokio::test]
-async fn people_shows_each_person_with_blocks_links_names_notes_and_facts_of_its_group_only() {
-    use qbot_core::MemberNo;
-    use qbot_memory::facts::{FactStore, Observation};
-    use qbot_memory::predicates::DecayClass;
-    use qbot_memory::{IdentityStore, NoteStore};
-    use qbot_store::{KnownFact, KnownName, KnownNote, PgFactStore, PgNoteStore};
+async fn the_roster_lists_who_is_who_in_its_group_only() {
+    use qbot_memory::{EpisodeId, IdentityStore, NameBasis, NameStore, NameUse, UseSource};
+    use qbot_store::{PgNameStore, RosterSettings};
     let db = db!();
     let clock = ManualClock::new(T0);
     let archive = PgArchive::new(db.pool().clone());
     let identity = PgIdentityStore::new(db.pool().clone(), IdentityPolicy::default());
     let policy = qbot_store::PgGroupPolicy::new(db.pool().clone(), clock.clone());
-    let notes = PgNoteStore::new(db.pool().clone());
-    let facts = PgFactStore::new(db.pool().clone());
-    let g = group(60);
+    let names = PgNameStore::new(db.pool().clone());
+    let (g, other) = (group(60), group(61));
     let account = |n: i64| AccountId::new(n).unwrap();
-    let no = |n: u32| MemberNo::new(n);
-    for (i, a) in [701, 702, 703, 704, 705].into_iter().enumerate() {
+    const DAY: i64 = 86_400_000;
+    let named = |g: GroupId, message: i64, account: i64, at: i64, name: &str| NewLine {
+        sender_name: Some(name.into()),
+        at: UnixMillis::new(at),
+        ..member(g, message, account, "hi")
+    };
+    for (i, (a, name)) in [
+        (701, "Ann"),
+        (702, "Bo"),
+        (703, "Cy"),
+        (704, "Di"),
+        (705, "Ed"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let i = i as i64;
         archive
-            .append(member(g, i as i64 + 1, a, "hi"))
+            .append(named(g, i + 1, a, T0 + i, name))
             .await
             .unwrap();
     }
-    // 706 speaks only in another group: no number here. 701 and 702 are there too.
-    for (i, a) in [706, 701, 702].into_iter().enumerate() {
-        archive
-            .append(member(group(61), i as i64 + 1, a, "hi"))
-            .await
-            .unwrap();
-    }
-    // Who each person is and who of them is blocked, by member number.
+    // 705 is shown as something else from the next day; 706 speaks only in the other group, and
+    // 701 is shown differently there.
+    archive
+        .append(named(g, 6, 705, T0 + DAY, "Eddie"))
+        .await
+        .unwrap();
+    archive
+        .append(named(other, 1, 706, T0, "Fay"))
+        .await
+        .unwrap();
+    archive
+        .append(named(other, 2, 701, T0, "Ann elsewhere"))
+        .await
+        .unwrap();
+    let settings = RosterSettings {
+        recent_ms: 30 * DAY,
+        max_people: 10,
+    };
     let shape = |people: &qbot_store::GroupPeople| {
         people
             .people
@@ -784,178 +808,145 @@ async fn people_shows_each_person_with_blocks_links_names_notes_and_facts_of_its
             .map(|p| {
                 (
                     p.members.iter().map(|(n, _)| n.get()).collect::<Vec<_>>(),
-                    p.blocked.iter().map(|n| n.get()).collect::<Vec<_>>(),
+                    p.shown.iter().map(|s| s.text.clone()).collect::<Vec<_>>(),
                 )
             })
             .collect::<Vec<_>>()
     };
-
-    let decay = qbot_memory::facts::DecayPolicy::default();
-    let now = UnixMillis::new(T0);
-    assert_eq!(
-        archive.people(g, now, &decay).await.unwrap(),
-        Default::default(),
-        "no records, nobody listed"
-    );
-
-    policy.block(g, account(704), None).await.unwrap();
-    policy
-        .block(g, account(702), Some(UnixMillis::new(T0 + 60_000)))
+    let now = UnixMillis::new(T0 + 3 * DAY);
+    // A line sent today counts from tomorrow: the roster changes by activity once a day.
+    archive
+        .append(named(g, 7, 705, now.get() - 1, "Edward"))
         .await
         .unwrap();
-    policy.block(g, account(706), None).await.unwrap();
-    policy.block(group(61), account(701), None).await.unwrap();
-    identity
-        .link(g, account(705), account(703), now)
-        .await
-        .unwrap();
-    identity
-        .link(g, account(701), account(706), now)
-        .await
-        .unwrap();
-    // A link made in the other group is that group's record.
-    identity
-        .link(group(61), account(701), account(702), now)
-        .await
-        .unwrap();
-    let people = archive.people(g, now, &decay).await.unwrap();
+    let people = archive.people(g, now, settings, &[]).await.unwrap();
+    let s = |v: &[&str]| v.iter().map(|x| (*x).to_owned()).collect::<Vec<_>>();
     assert_eq!(
         shape(&people),
-        [(vec![2], vec![2]), (vec![3, 5], vec![]), (vec![4], vec![4])],
-        "a linked account without a number here is not shown; blocks and links are this group's"
-    );
-    assert_eq!(people.people[1].members[0], (no(3), account(703)));
-
-    let later = UnixMillis::new(T0 + 60_001);
-    identity
-        .link(g, account(701), account(702), later)
-        .await
-        .unwrap();
-    assert_eq!(
-        shape(&archive.people(g, later, &decay).await.unwrap()),
         [
-            (vec![1, 2], vec![]),
-            (vec![3, 5], vec![]),
-            (vec![4], vec![4])
+            (vec![1], s(&["Ann"])),
+            (vec![2], s(&["Bo"])),
+            (vec![3], s(&["Cy"])),
+            (vec![4], s(&["Di"])),
+            (vec![5], s(&["Eddie", "Ed"])),
         ],
-        "an expired block is gone; a new link joins two numbers into one person"
-    );
-    identity.unlink(g, account(703)).await.unwrap();
-    assert_eq!(
-        shape(&archive.people(g, later, &decay).await.unwrap()),
-        [(vec![1, 2], vec![]), (vec![4], vec![4])],
-        "unlinking ends the set"
+        "what each member is shown as, the latest first, from this group's lines only"
     );
 
-    // Names, notes and facts, all under the person they are about, and only this group's.
-    identity
-        .set_name(g, "Kit", &[account(705)], later)
+    // Names people use, each under its member, only this group's.
+    names.set(g, "Boss", &[account(702)], now).await.unwrap();
+    names
+        .set(other, "Elsewhere", &[account(701)], now)
         .await
         .unwrap();
-    identity
-        .link(g, account(704), account(705), later)
-        .await
-        .unwrap();
-    identity
-        .set_name(g, "Kitty", &[account(704), account(705)], later)
-        .await
-        .unwrap();
-    identity
-        .set_name(group(61), "Elsewhere", &[account(704)], later)
-        .await
-        .unwrap();
-    notes
-        .add(g, account(705), "allergic to peanuts", account(701), later)
-        .await
-        .unwrap();
-    notes
-        .add(
-            group(61),
-            account(704),
-            "said elsewhere",
-            account(701),
-            later,
-        )
-        .await
-        .unwrap();
-    let fact = |group: GroupId, object: &str| Observation {
-        group,
-        subject: Some(account(704)),
-        predicate: "lives_in".into(),
-        slot: "lives_in".into(),
-        object: object.into(),
-        label: None,
-        decay: DecayClass::Stable,
-        episode: qbot_memory::EpisodeId::new(9),
-        message: qbot_core::MessageId::new(1).unwrap(),
-        quote: "q".into(),
-        at: later,
+    let used = |episode: i64| NameUse {
+        account: account(701),
+        text: "Annie".into(),
+        basis: NameBasis::Addressed,
+        source: Some(UseSource {
+            episode: EpisodeId::new(episode),
+            message: MessageId::new(episode).unwrap(),
+            quote: "Annie".into(),
+        }),
+        at: now,
     };
-    facts.observe(&fact(g, "Hangzhou")).await.unwrap();
-    facts.observe(&fact(group(61), "Suzhou")).await.unwrap();
-    // A later, different value: both are kept, the later one believed.
-    let mut moved = fact(g, "Ningbo");
-    moved.episode = qbot_memory::EpisodeId::new(10);
-    moved.at = UnixMillis::new(later.get() + 1);
-    facts.observe(&moved).await.unwrap();
-    let people = archive.people(g, later, &decay).await.unwrap();
-    let merged = &people.people[1];
+    names.record(g, &[used(1), used(2)]).await.unwrap();
+    identity
+        .link(g, account(701), account(702), now)
+        .await
+        .unwrap();
+    let people = archive.people(g, now, settings, &[]).await.unwrap();
+    let pair = &people.people[0];
     assert_eq!(
-        merged
-            .members
+        pair.members
             .iter()
             .map(|(n, _)| n.get())
             .collect::<Vec<_>>(),
-        [4, 5]
+        [1, 2]
+    );
+    let keys: Vec<(&str, bool, u32)> = pair
+        .names
+        .iter()
+        .map(|n| (n.key.as_str(), n.set, n.uses()))
+        .collect();
+    assert_eq!(
+        keys,
+        [("boss", true, 0), ("annie", false, 2)],
+        "set names first"
     );
     assert_eq!(
-        merged.names,
-        [
-            KnownName {
-                text: "kit".into(),
-                confirmed: true,
-                confidence: 1.0,
-            },
-            KnownName {
-                text: "kitty".into(),
-                confirmed: true,
-                confidence: 1.0,
-            }
-        ]
+        people.names.len(),
+        2,
+        "every name of this group, with its member"
+    );
+
+    // Weeks later nobody spoke recently: only linked, blocked and named people are listed, and
+    // anyone asked for.
+    let later = UnixMillis::new(T0 + 40 * DAY);
+    policy.block(g, account(704), None).await.unwrap();
+    names.set(g, "Cee", &[account(703)], later).await.unwrap();
+    let members = |people: &qbot_store::GroupPeople| {
+        people
+            .people
+            .iter()
+            .map(|p| p.members.iter().map(|(n, _)| n.get()).collect::<Vec<_>>())
+            .collect::<Vec<_>>()
+    };
+    let quiet = archive.people(g, later, settings, &[]).await.unwrap();
+    assert_eq!(members(&quiet), [vec![1, 2], vec![3], vec![4]]);
+    assert_eq!(quiet.people[2].blocked, [qbot_core::MemberNo::new(4)]);
+    let asked = archive
+        .people(g, later, settings, &[account(705)])
+        .await
+        .unwrap();
+    assert_eq!(members(&asked), [vec![1, 2], vec![3], vec![4], vec![5]]);
+
+    // A bound: of those who only spoke, the most recently active are kept; those with a record
+    // and those asked for always are.
+    let one = RosterSettings {
+        max_people: 1,
+        ..settings
+    };
+    archive
+        .append(named(g, 8, 704, now.get() - 2 * DAY, "Di"))
+        .await
+        .unwrap();
+    let busy = archive.people(g, now, one, &[account(705)]).await.unwrap();
+    assert_eq!(
+        members(&busy),
+        [vec![1, 2], vec![3], vec![4], vec![5]],
+        "linked, named and blocked people stay; 705 was asked for"
+    );
+    archive
+        .append(named(other, 3, 707, now.get() - 2 * DAY, "Gil"))
+        .await
+        .unwrap();
+    for (i, a) in [708, 709].into_iter().enumerate() {
+        archive
+            .append(named(
+                g,
+                20 + i as i64,
+                a,
+                now.get() - 2 * DAY + i as i64,
+                "new",
+            ))
+            .await
+            .unwrap();
+    }
+    let bounded = archive.people(g, now, one, &[]).await.unwrap();
+    let only_active: Vec<Vec<u32>> = members(&bounded)
+        .into_iter()
+        .filter(|m| m.iter().all(|n| *n > 5))
+        .collect();
+    assert_eq!(
+        only_active.len(),
+        1,
+        "one of the people who only spoke: {only_active:?}"
     );
     assert_eq!(
-        merged.notes,
-        [KnownNote {
-            text: "allergic to peanuts".into(),
-            updated: later
-        }]
-    );
-    assert_eq!(
-        merged.facts,
-        [
-            KnownFact {
-                predicate: "lives_in".into(),
-                value: "Ningbo".into(),
-                supports: 1,
-                last_confirmed: UnixMillis::new(later.get() + 1),
-                confidence: 2.0 / 3.0,
-                worth: 2.0 / 3.0,
-            },
-            KnownFact {
-                predicate: "lives_in".into(),
-                value: "Hangzhou".into(),
-                supports: 1,
-                last_confirmed: later,
-                confidence: 2.0 / 3.0 * (1.0 - 2.0 / 3.0),
-                worth: 2.0 / 3.0 * (1.0 - 2.0 / 3.0),
-            }
-        ],
-        "the most confident first, the contradicted value kept"
-    );
-    assert_eq!(
-        archive.people(g, later, &decay).await.unwrap(),
-        people,
-        "the same records give the same block"
+        archive.people(g, now, settings, &[]).await.unwrap(),
+        archive.people(g, now, settings, &[]).await.unwrap(),
+        "the same records give the same roster"
     );
     db.drop_db().await;
 }

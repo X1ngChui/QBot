@@ -1,15 +1,13 @@
 //! The storage port for identity, plus a reference in-memory implementation.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::{Mutex, PoisonError};
 
 use async_trait::async_trait;
 use qbot_core::{AccountId, GroupId, MessageId, UnixMillis};
 
 use crate::identity::{
-    Alias, AliasId, AliasStatus, EvidenceKind, EvidenceRecord, IdentityError, IdentityPolicy,
-    Invitation, InvitationState, LinkError, LinkOutcome, Resolution, confidence, normalize_alias,
-    status_for,
+    IdentityError, IdentityPolicy, Invitation, InvitationState, LinkError, LinkOutcome,
 };
 
 #[async_trait]
@@ -40,49 +38,6 @@ pub trait IdentityStore: Send + Sync {
     /// where they have links of their own.
     async fn unlink(&self, group: GroupId, account: AccountId) -> Result<(), IdentityError>;
 
-    /// Record evidence that `text` refers to `account` in `group`, creating the alias if needed
-    /// and recomputing its confidence and status. The same evidence recorded twice counts once.
-    /// A name a person removed comes back only on a person's evidence (`Manual`); extracted
-    /// evidence is recorded but leaves it removed.
-    async fn add_evidence(
-        &self,
-        group: GroupId,
-        text: &str,
-        account: AccountId,
-        evidence: EvidenceRecord,
-        at: UnixMillis,
-    ) -> Result<Alias, IdentityError>;
-
-    /// A person gives a name to each of `accounts` (one account, or the accounts of one person
-    /// in the group): manual evidence. Refused if the name is already confirmed for an account
-    /// not among them.
-    async fn set_name(
-        &self,
-        group: GroupId,
-        text: &str,
-        accounts: &[AccountId],
-        at: UnixMillis,
-    ) -> Result<Vec<Alias>, IdentityError>;
-
-    /// A person removes a name from `accounts`. Returns whether one was active.
-    async fn remove_name(
-        &self,
-        group: GroupId,
-        text: &str,
-        accounts: &[AccountId],
-    ) -> Result<bool, IdentityError>;
-
-    /// What the name refers to in the group, from confirmed aliases only.
-    async fn resolve(&self, group: GroupId, text: &str) -> Result<Resolution, IdentityError>;
-
-    /// The group's names for any of `accounts`, one per text (the strongest), strongest first,
-    /// inactive ones excluded.
-    async fn names_of(
-        &self,
-        group: GroupId,
-        accounts: &[AccountId],
-    ) -> Result<Vec<Alias>, IdentityError>;
-
     async fn invite(
         &self,
         group: GroupId,
@@ -110,42 +65,12 @@ pub trait IdentityStore: Send + Sync {
     ) -> Result<bool, IdentityError>;
 }
 
-/// The strongest alias per text, strongest first, ties by text.
-fn strongest_per_text(aliases: Vec<Alias>) -> Vec<Alias> {
-    let mut best: BTreeMap<String, Alias> = BTreeMap::new();
-    for alias in aliases {
-        match best.get(&alias.text) {
-            Some(kept)
-                if (kept.confidence, std::cmp::Reverse(kept.id))
-                    >= (alias.confidence, std::cmp::Reverse(alias.id)) => {}
-            _ => {
-                best.insert(alias.text.clone(), alias);
-            }
-        }
-    }
-    let mut names: Vec<Alias> = best.into_values().collect();
-    names.sort_by(|a, b| {
-        b.confidence
-            .total_cmp(&a.confidence)
-            .then(a.text.cmp(&b.text))
-    });
-    names
-}
-
 #[derive(Default)]
 struct Inner {
-    next_alias: i64,
     accounts: BTreeSet<AccountId>,
     /// `(group, lower account, higher account)`.
     links: BTreeSet<(GroupId, AccountId, AccountId)>,
-    aliases: Vec<AliasRow>,
     invitations: Vec<InvitationRow>,
-}
-
-struct AliasRow {
-    alias: Alias,
-    evidence: Vec<(EvidenceRecord, UnixMillis)>,
-    removed: bool,
 }
 
 struct InvitationRow {
@@ -212,68 +137,6 @@ impl Inner {
         self.links.insert((group, a.min(b), a.max(b)));
         LinkOutcome::Linked
     }
-
-    fn recompute(row: &mut AliasRow) {
-        let records: Vec<EvidenceRecord> = row.evidence.iter().map(|(e, _)| *e).collect();
-        row.alias.confidence = confidence(&records);
-        row.alias.last_evidence = row
-            .evidence
-            .iter()
-            .map(|(_, at)| *at)
-            .max()
-            .unwrap_or(row.alias.last_evidence);
-        row.alias.status = if row.removed {
-            AliasStatus::Inactive
-        } else {
-            status_for(&records)
-        };
-    }
-
-    fn add_evidence(
-        &mut self,
-        group: GroupId,
-        text: &str,
-        account: AccountId,
-        evidence: EvidenceRecord,
-        at: UnixMillis,
-    ) -> Result<Alias, IdentityError> {
-        self.known(account)?;
-        let existing = self.aliases.iter().position(|r| {
-            r.alias.group == group && r.alias.text == text && r.alias.account == account
-        });
-        let index = match existing {
-            Some(i) => i,
-            None => {
-                self.next_alias += 1;
-                let alias = Alias {
-                    id: AliasId(self.next_alias),
-                    group,
-                    text: text.to_owned(),
-                    account,
-                    status: AliasStatus::Candidate,
-                    confidence: 0.0,
-                    last_evidence: at,
-                };
-                self.aliases.push(AliasRow {
-                    alias,
-                    evidence: Vec::new(),
-                    removed: false,
-                });
-                self.aliases.len() - 1
-            }
-        };
-        let row = &mut self.aliases[index];
-        match row.evidence.iter_mut().find(|(e, _)| *e == evidence) {
-            Some(slot) => slot.1 = at,
-            None => row.evidence.push((evidence, at)),
-        }
-        // Only a person brings back a name a person removed; what chat says is still recorded.
-        if evidence.kind == EvidenceKind::Manual {
-            row.removed = false;
-        }
-        Inner::recompute(row);
-        Ok(row.alias.clone())
-    }
 }
 
 #[async_trait]
@@ -322,109 +185,6 @@ impl IdentityStore for MemoryIdentityStore {
             return Err(IdentityError::NotLinked);
         }
         Ok(())
-    }
-
-    async fn add_evidence(
-        &self,
-        group: GroupId,
-        text: &str,
-        account: AccountId,
-        evidence: EvidenceRecord,
-        at: UnixMillis,
-    ) -> Result<Alias, IdentityError> {
-        let text = normalize_alias(text)?;
-        self.lock()
-            .add_evidence(group, &text, account, evidence, at)
-    }
-
-    async fn set_name(
-        &self,
-        group: GroupId,
-        text: &str,
-        accounts: &[AccountId],
-        at: UnixMillis,
-    ) -> Result<Vec<Alias>, IdentityError> {
-        let normalized = normalize_alias(text)?;
-        let mut inner = self.lock();
-        for account in accounts {
-            inner.known(*account)?;
-        }
-        let taken = inner.aliases.iter().any(|r| {
-            r.alias.group == group
-                && r.alias.text == normalized
-                && !accounts.contains(&r.alias.account)
-                && r.alias.status == AliasStatus::Confirmed
-        });
-        if taken {
-            return Err(IdentityError::NameTaken);
-        }
-        let manual = EvidenceRecord {
-            kind: EvidenceKind::Manual,
-            support: None,
-        };
-        accounts
-            .iter()
-            .map(|account| inner.add_evidence(group, &normalized, *account, manual, at))
-            .collect()
-    }
-
-    async fn remove_name(
-        &self,
-        group: GroupId,
-        text: &str,
-        accounts: &[AccountId],
-    ) -> Result<bool, IdentityError> {
-        let normalized = normalize_alias(text)?;
-        let mut inner = self.lock();
-        let mut removed = false;
-        for row in inner.aliases.iter_mut().filter(|r| {
-            r.alias.group == group
-                && r.alias.text == normalized
-                && accounts.contains(&r.alias.account)
-                && !r.removed
-        }) {
-            row.removed = true;
-            Inner::recompute(row);
-            removed = true;
-        }
-        Ok(removed)
-    }
-
-    async fn resolve(&self, group: GroupId, text: &str) -> Result<Resolution, IdentityError> {
-        let normalized = normalize_alias(text)?;
-        let inner = self.lock();
-        let targets = inner
-            .aliases
-            .iter()
-            .filter(|r| {
-                r.alias.group == group
-                    && r.alias.text == normalized
-                    && r.alias.status == AliasStatus::Confirmed
-            })
-            .map(|r| r.alias.account)
-            .collect();
-        Ok(Resolution::from_targets(targets))
-    }
-
-    async fn names_of(
-        &self,
-        group: GroupId,
-        accounts: &[AccountId],
-    ) -> Result<Vec<Alias>, IdentityError> {
-        let inner = self.lock();
-        Ok(strongest_per_text(
-            inner
-                .aliases
-                .iter()
-                .filter(|r| {
-                    r.alias.group == group
-                        && accounts.contains(&r.alias.account)
-                        && !r.removed
-                        && r.alias.status != AliasStatus::Inactive
-                })
-                .map(|r| r.alias.clone())
-                .collect(),
-        ))
     }
 
     async fn invite(

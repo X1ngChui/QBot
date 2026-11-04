@@ -28,6 +28,7 @@ async fn say(archive: &PgArchive, g: GroupId, message: i64, who: i64) {
             speaker: NewSpeaker::Member(account(who)),
             at: UnixMillis::new(T0),
             text: format!("m{message}"),
+            sender_name: None,
         })
         .await
         .unwrap();

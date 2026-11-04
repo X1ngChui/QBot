@@ -24,6 +24,16 @@ pub struct TestDb {
 
 impl TestDb {
     pub async fn try_new() -> Option<TestDb> {
+        Self::create(true).await
+    }
+
+    /// An empty database, no migration applied: for testing a migration on the data an older
+    /// schema held.
+    pub async fn try_bare() -> Option<TestDb> {
+        Self::create(false).await
+    }
+
+    async fn create(migrate: bool) -> Option<TestDb> {
         let base = match std::env::var("QBOT_TEST_DATABASE_URL") {
             Ok(url) => url,
             Err(_) if std::env::var("QBOT_SKIP_DB_TESTS").is_ok() => {
@@ -58,7 +68,9 @@ impl TestDb {
         let (prefix, _) = base.rsplit_once('/').expect("a URL with a database name");
         let url = format!("{prefix}/{name}");
         let store = Store::connect(&url).await.unwrap();
-        store.migrate().await.unwrap();
+        if migrate {
+            store.migrate().await.unwrap();
+        }
         Some(TestDb {
             store,
             url,
@@ -109,6 +121,12 @@ pub const T0: i64 = 1_800_000_000_000;
 macro_rules! db {
     () => {
         match $crate::common::TestDb::try_new().await {
+            Some(db) => db,
+            None => return,
+        }
+    };
+    (bare) => {
+        match $crate::common::TestDb::try_bare().await {
             Some(db) => db,
             None => return,
         }
