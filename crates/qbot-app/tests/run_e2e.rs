@@ -1053,13 +1053,19 @@ async fn a_filled_batch_turns_archived_chat_into_a_stored_episode() {
 
     answering_names(
         &mut napcat,
-        eventually("the filled batch to store the episode", || async {
-            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM episode")
+        // Stored and applied: its findings are consolidated right after the episode is stored.
+        eventually(
+            "the filled batch to store and apply the episode",
+            || async {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM episode WHERE consolidated_ms IS NOT NULL",
+                )
                 .fetch_one(&pool)
                 .await
                 .unwrap()
-                == 1
-        }),
+                    == 1
+            },
+        ),
     )
     .await;
     let (group, first, last, title, quote): (i64, i64, i64, String, String) = sqlx::query_as(
