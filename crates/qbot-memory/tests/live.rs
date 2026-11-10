@@ -11,7 +11,7 @@ use std::time::Duration;
 use qbot_core::{AccountId, MessageId, UnixMillis};
 use qbot_llm::responses::{KeySource, ReqwestTransport, ResponsesConfig, ResponsesProvider};
 use qbot_memory::findings::MemoryAction;
-use qbot_memory::{EpisodeExtractor, MemoryId, NameBasis, SliceContext, SliceLine};
+use qbot_memory::{EpisodeExtractor, MemoryId, NameBasis, Referent, SliceContext, SliceLine};
 
 fn secret(file: &str) -> String {
     let dir = std::env::var_os("QBOT_LIVE_SECRETS_DIR").map_or_else(
@@ -276,10 +276,9 @@ async fn a_real_model_ends_confirms_dates_plans_and_skips_what_passes() {
         "neither the mood nor the city is a new memory"
     );
     assert!(
-        !out.findings
-            .names
-            .iter()
-            .any(|n| n.name.eq_ignore_ascii_case("bobo")),
+        !out.findings.references.iter().any(|n| {
+            n.text.eq_ignore_ascii_case("bobo") && matches!(n.referent, Referent::Member(_))
+        }),
         "the bot's name is no member's name"
     );
     // The slice is on 2027-01-15 in Shanghai, so tomorrow is the 16th.
@@ -342,16 +341,18 @@ async fn a_real_model_records_names_with_how_they_were_used() {
     report(&out);
     let one = AccountId::new(1001).unwrap();
     assert!(
-        out.findings.names.iter().any(|n| n.account == one
-            && n.basis == NameBasis::Own
-            && n.name.contains("\u{5ddd}\u{54e5}")),
+        out.findings
+            .references
+            .iter()
+            .any(|n| n.referent == Referent::Member(one)
+                && n.basis == NameBasis::Own
+                && n.text.contains("\u{5ddd}\u{54e5}")),
         "member 1 gave their own name"
     );
     assert!(
-        !out.findings
-            .names
-            .iter()
-            .any(|n| n.name.contains("\u{8001}\u{738b}")),
+        !out.findings.references.iter().any(|n| {
+            n.text.contains("\u{8001}\u{738b}") && matches!(n.referent, Referent::Member(_))
+        }),
         "nothing in the lines says whom Old Wang means"
     );
 }

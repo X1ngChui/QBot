@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use qbot_core::{AccountId, Clock, GroupId, MessageId, UnixMillis};
+use qbot_memory::findings::Findings;
 use qbot_memory::worth::Activity;
 use qbot_memory::{
     Episode, EpisodeId, EpisodeStore, Evidence, Hit, MemoryError, NewEpisode, SliceLine,
@@ -388,6 +389,47 @@ impl EpisodeStore for PgEpisodeStore {
             .execute(&self.pool)
             .await
             .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn read_otherwise(
+        &self,
+        group: GroupId,
+        method: &str,
+        limit: usize,
+    ) -> Result<Vec<Episode>, MemoryError> {
+        let rows = sqlx::query(&format!(
+            "SELECT {EPISODE_COLS} FROM episode e WHERE e.group_id = $1 AND e.method <> $2 \
+             ORDER BY e.first_ordinal LIMIT $3"
+        ))
+        .bind(group.get())
+        .bind(method)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        rows.iter().map(to_episode).collect()
+    }
+
+    async fn reread(
+        &self,
+        id: EpisodeId,
+        method: &str,
+        findings: &Findings,
+    ) -> Result<(), MemoryError> {
+        let done = sqlx::query(
+            "UPDATE episode SET method = $2, findings = $3, consolidated_ms = NULL \
+             WHERE episode_id = $1",
+        )
+        .bind(id.get())
+        .bind(method)
+        .bind(serde_json::to_value(findings).map_err(backend)?)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        if done.rows_affected() == 0 {
+            return Err(MemoryError::NotFound);
+        }
         Ok(())
     }
 

@@ -13,8 +13,8 @@ use qbot_core::{AccountId, Clock, GroupId, HistoryWindow, MemberNo, UnixMillis};
 use qbot_memory::memories::{Memory, MemoryState, MemoryStore};
 use qbot_memory::worth::{Activity, as_of_day};
 use qbot_memory::{
-    Background, EpisodeStore, HistoryPart, MemoryError, NoteStore, SliceBackground, SliceMember,
-    compose,
+    Background, EpisodeStore, HistoryPart, MemoryError, NameStore, NoteStore, SliceBackground,
+    SliceMember, compose,
 };
 use qbot_store::{GroupPeople, PgArchive, RosterSettings};
 use qbot_tools::{MemberRecord, MemberRecords};
@@ -147,6 +147,7 @@ const PEOPLE_HERE_LINES: usize = 50;
 pub struct PromptContext {
     people: Option<Arc<dyn PeopleSource>>,
     records: Option<Records>,
+    names: Option<Arc<dyn NameStore>>,
     directory: Option<Arc<dyn Directory>>,
     episodes: Option<Arc<dyn EpisodeStore>>,
     history: Arc<dyn HistorySource>,
@@ -183,6 +184,7 @@ impl PromptContext {
         Ok(Self {
             people: None,
             records: None,
+            names: None,
             directory: None,
             episodes: None,
             history,
@@ -225,6 +227,13 @@ impl PromptContext {
             notes,
             view,
         });
+        self
+    }
+
+    /// Tell the extractor which names the group uses for someone nobody could place yet, so
+    /// every further use of them is recorded.
+    pub fn with_names(mut self, names: Arc<dyn NameStore>) -> Self {
+        self.names = Some(names);
         self
     }
 
@@ -789,6 +798,10 @@ impl ContextSource for PromptContext {
     }
 }
 
+/// Names nobody could place that the extractor is told about: the ones a ruling waits on, the
+/// most used first; more would crowd the people the lines involve.
+const OPEN_NAMES_SHOWN: usize = 12;
+
 /// What the extractor is told about a slice: the involved members as the group knows them (the
 /// display names their lines were sent under, the names people use for them, linked accounts, a
 /// block, what is remembered about them with ids) and what the group is (the bot's names, the
@@ -916,11 +929,72 @@ impl SliceBackground for PromptContext {
                 }
             }
         }
+        // The rest of the roster: a line may name a member who writes none of these lines, and
+        // only a listed member can be recorded as who is meant.
+        let involved_numbers: BTreeSet<u32> = involved.iter().map(|(n, _, _)| *n).collect();
+        let mut others = Vec::new();
+        let mut other_accounts = Vec::new();
+        for person in &people.people {
+            let own: Vec<MemberNo> = person.members.iter().map(|(n, _)| *n).collect();
+            for (number, account) in &person.members {
+                if involved_numbers.contains(&number.get()) {
+                    continue;
+                }
+                let mut details = Vec::new();
+                let shown: Vec<String> = person
+                    .shown
+                    .iter()
+                    .filter(|s| s.member == *number)
+                    .map(|s| format!("\"{}\"", line(&s.text)))
+                    .collect();
+                if !shown.is_empty() {
+                    details.push(say(Text::ExtractBackgroundShown {
+                        names: shown.join(", "),
+                    }));
+                }
+                let names: Vec<String> = person
+                    .names
+                    .iter()
+                    .filter(|n| n.account == *account && owners.shows(n))
+                    .map(|n| name_entry(&self.zone, n, &owners, &own))
+                    .collect();
+                if !names.is_empty() {
+                    details.push(say(Text::ExtractBackgroundCalled {
+                        names: names.join(", "),
+                    }));
+                }
+                if details.is_empty() {
+                    continue;
+                }
+                others.push(say(Text::ExtractBackgroundMember {
+                    member: number.get().to_string(),
+                    details: details.join("; "),
+                }));
+                other_accounts.push((number.get(), *account));
+            }
+        }
         let mut sections = Vec::new();
         if !entries.is_empty() {
             sections.push(say(Text::ExtractBackgroundPeople {
                 entries: entries.join("\n"),
             }));
+        }
+        if !others.is_empty() {
+            sections.push(say(Text::ExtractBackgroundOthers {
+                entries: others.join("\n"),
+            }));
+        }
+        if let Some(names) = &self.names {
+            let open = names.open(group, OPEN_NAMES_SHOWN).await?;
+            if !open.is_empty() {
+                sections.push(say(Text::ExtractBackgroundOpen {
+                    names: open
+                        .iter()
+                        .map(|o| format!("\"{}\"", line(&o.text)))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                }));
+            }
         }
         let persona = self.personas.for_group(group);
         // Members call the bot by its names; none may become one of their own.
@@ -961,6 +1035,7 @@ impl SliceBackground for PromptContext {
             accounts: involved
                 .iter()
                 .filter_map(|(n, a, _)| a.map(|a| (*n, a)))
+                .chain(other_accounts)
                 .collect(),
             known,
             ..Background::default()

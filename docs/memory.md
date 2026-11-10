@@ -45,7 +45,7 @@ so they stay verbatim wherever history shows them, and remain searchable. Networ
 provider-side failures are not permanent: the job fails and the slice is tried again.
 
 **What the extractor reads.** No tools, only context, so everything a reader needs to understand
-the slice and to tell what lasts from what passes is put in front of it (method `slice-v6`):
+the slice and to tell what lasts from what passes is put in front of it (method `slice-v7`):
 - Lines are `[msg:ID] MM-DD HH:MM member:N: text` in the bot's time zone: who said what,
   when, and which line a `[reply:ID]` quotes. The target part's heading gives its first and last
   moments in full, with the year and weekday (`2026-10-15 Thu 20:30`), so "tomorrow" or "on
@@ -60,7 +60,9 @@ the slice and to tell what lasts from what passes is put in front of it (method 
   has since changed is shown as it was then), the names people use for them with how they were
   used and whom else each is used for, linked accounts, a block, and every current memory about
   them with its id (`m12`), the most worth first. A member only mentioned is resolved to their
-  account here, so a line addressed to them can be about them.
+  account here, so a line addressed to them can be about them. Below them, the rest of the
+  roster with their display names and shown names (a line may name someone who is not speaking),
+  and up to twelve names the group uses for someone nobody could place yet.
 - "About the group" says what the bot is called (never a member's name), the operator's group
   background, and every current group memory with its id.
 - Notes are left out: they are what members wrote about each other.
@@ -77,16 +79,21 @@ verbatim quote. Code validates everything against the line's structure:
 
 - The episode needs a title, a summary and one to three quotes copied exactly from target lines.
   A rejected episode goes back to the model with every reason.
-- **Names** (`names`): a name a line uses for a member, with its *basis*. `own`: the member wrote
-  the line. `addressed`: someone else wrote it and it mentions the member as `[at:N]` or replies
-  to one of their messages. `about`: someone else wrote it. A basis the line does not bear out is
-  rejected, as is a name not in its quote, one of the bot's names, a name some other member's
-  lines are sent under, and a name given to two members in one answer.
-- **Memories** (`memories`): about `member:N` or `group`, with an action. `new` (text and
+- **References** (`references`): every place a member's words name a person: the expression,
+  whom it means (`member:N`, `bot`, `outside`, or `unknown` when the lines do not show it), how
+  the line uses it (`address`, `about`, `self`) and what shows who is meant (`marker`, `answer`
+  with the answering line, `content`, `self`, `listed`, `none`). Code keeps a reference only if
+  the expression is in what the member typed on that line (not in a marker or a forwarded record),
+  a `marker` is really a reply to or mention of that member, an `answer` points at a line that
+  member wrote, and the expression is not how another member is shown. One of the bot's names is
+  recorded as the bot. A line said to the member, or one they reply to, makes it *anchored*.
+  References left out are logged and do not by themselves cost a correction call.
+- **Memories** (`memories`): about `member:N`, `group` or `name:EXPRESSION` (a person recorded
+  as `unknown`: held until the name is a member's, `new` only), with an action. `new` (text and
   durability), `same` as memory `id` (it gains support), `changed` (memory `id` is replaced by
   the new text, which is kept with its durability) or `ended` (memory `id` holds no longer). A
-  memory about a member needs a line they wrote or one directed at them (`[at:N]`, or a reply to
-  their message): talk about someone absent is no evidence about any account. An `id` must be
+  memory about a member needs a line they wrote, one directed at them (`[at:N]`, or a reply to
+  their message), or a reference in the same answer that names them. An `id` must be
   one the background listed for that same subject. A term is the group's and must be written in
   the target. A text is one sentence of at most 200 characters. One stretch of chat says one thing
   about each memory: its last line ("I quit it" then "back on it again" leaves it current).
@@ -94,6 +101,14 @@ verbatim quote. Code validates everything against the line's structure:
   findings that held. An answer cut off at the provider's output limit, or whose arguments are
   not JSON, is lost rather than wrong: the same request is sent again. At most three model calls
   per slice.
+
+**After the new slices**, the same job does two bounded things. It reads again up to
+`memory.reread_per_run` (4) of the group's earlier episodes whose findings an older method read,
+the oldest first, with the current prompt: the summary stays, the findings are replaced and
+applied, and what they say of memories is taken as history (a `changed` is remembered as new, an
+`ended` is dropped), so older words never close what was learned since. Then it puts at most two
+open names to a ruling (section 4).
+
 There is no staging state machine: a crash between the model response and the insert repeats one
 slice's model call, which is cheaper than the machinery to avoid it. The episode records the
 extraction method and model; a later change of extraction model does not invalidate existing
@@ -139,30 +154,35 @@ is what the group shows: the group nickname, else the account nickname.
   calling each other by old and shortened display names. The current name is also read live from
   NapCat for the members of a run's conversation (`qbot_agent::Directory`), for the trigger note
   and command replies, because a name changes apart from any line.
-- *Names people use are uses, not beliefs* (`qbot_memory::names`, `name_use`). Each use records
-  that, in one episode, a line used a name for a member, with its basis: `own`, `addressed`,
-  `about`, or `set` for a name a person gave with `/name` (vouched for, not inferred). One
-  episode counts once per member and name, with its strongest basis. Whom a name refers to is
-  read from all its uses together (`KnownName`: per member and name, how many episodes used it
-  each way and when last), so a name used for one member in eight conversations and for another
-  once reads exactly so, and a name used for several members (or that is another member's display
-  name) is marked as shared. Nothing resolves a name automatically: the model reads the uses and
-  the conversation, and asks when they do not tell.
-- *A name others use needs an anchor before it is shown.* A use with basis `addressed` or
-  `about` is the extractor's reading of a line, and a line that mentions or answers someone can
-  still be naming a third person. So such a name is shown to a model (the roster, the
-  extractor's "Who is who", `about_member`) only when something ties it to the member: a person
-  set it; the member gave it themselves; the member answered the line that used it (a later line
-  of theirs in the slice replies to it, recorded as `name_use.anchored`); or it is at least two
-  characters long and part of a display name their lines were sent under. Without an anchor it
-  is kept, and shown once `CORROBORATED_USES` (2) conversations used it for that member and no
-  other person has a claim to it (an anchor of their own, as many conversations, or it being
-  their current display name); two people with unanchored claims to one name are both left
-  out. `/who` and `/name` list every recorded name, shown or not, so a member can remove one.
-  The rule is applied on read (`qbot_prompt::people::NameIndex`): nothing is deleted, and a name
-  appears as soon as it is corroborated.
-- A name a person removed (`/name remove`) loses its uses and is suppressed for that member
-  (`name_removed`): chat using it again is not recorded until a person sets it again. A set name
+- *Names are a ledger of references* (`qbot_memory::names`; `name_reference`, `name_set`,
+  `name_ruling`, `held_claim`). A reference records that, in one episode, one line used an
+  expression for a person (a member, the bot, someone outside, or `unknown`), how, and what
+  showed who was meant; one per episode, line and expression. A name a person gave with `/name`
+  is in `name_set` (vouched for, not inferred). Whom a name refers to is read from all its
+  references together (`KnownName`: per member and name, how many episodes used it each way, how
+  many were anchored or *grounded* (shown by a marker, an answer or the member's own word), and
+  when last), so a name used for one member in eight conversations and for another once reads
+  exactly so, and a name used for several members is marked as shared.
+- *A name others use needs an anchor before it is shown.* It is shown to a model (the roster,
+  the extractor's background, `about_member`) when a person set it, a ruling placed it, the member
+  used it themselves, a line said to them or answered by them used it, or it is at least two
+  characters long and part of a display name of theirs. Without an anchor it is kept, and shown
+  once two conversations used it for that member, at least one of them grounded in the chat
+  rather than in fitting what is remembered of them, and no other person has a claim to it.
+  `/who` and `/name` list every recorded name, shown or not. The rule is applied on read
+  (`qbot_prompt::people::NameIndex`).
+- *Rulings.* An expression with at least three `unknown` references from at least two episodes,
+  not set by a person and not ruled on, is *open*. Each extraction run puts the two most used
+  open names to a model (`NameRuler`, `prompts/rule_name.md`) with up to eight of its uses, one per
+  conversation, each with six lines before and four after, and "Who is who" for everyone in them.
+  It rules `member:N` (kept only for a member the lines involve, citing lines that were shown),
+  `outside`, `general` (a form of address or ordinary word: nobody's name) or `unknown` (asked
+  again after five more unplaced uses). A ruling for a member places every unplaced reference of
+  the expression, now and later, with them; `outside` and `general` make it no member's name
+  unless a person sets it. Statements held under that name are then remembered about the member.
+- A name a person removed (`/name remove`) loses its set name, its references to that member and
+  a ruling for them, and is suppressed for that member (`name_removed`): nothing read from chat
+  gives it back until a person sets it again. A set name
   is not set for a member outside those given while it is set for another (`NameTaken`); learned
   names may be shared.
 - *Member number versus name*: in what the bot writes, people are called by their current group
@@ -268,7 +288,8 @@ information always finds room and applying an episode again evicts nothing more.
 their findings and the archive its lines: something said again is learned again.
 
 **Consolidation** applies each episode's findings right after it is stored and, for any left over
-by a crash, at the start of the group's next extraction: name uses to the name index, statements
+by a crash, at the start of the group's next extraction: references to the ledger, statements
+about a name nobody placed to `held_claim`, statements
 as changes in the order the extractor listed them (one per memory: its last line), then room. Every step is idempotent: an episode records a use and
 supports a memory at most once.
 
@@ -291,7 +312,11 @@ records of what was said and stay (section 9).
   shows Hangzhou as no longer holding (`moved_member`, `absent_member`).
 - *Quit*: an ended memory leaves replies and takes room first.
 - *Someone absent*: what one member says about another who is neither writing nor addressed is
-  not recorded about anyone.
+  recorded about them when the reading places the name they are called by; otherwise it is held
+  under the name until a ruling places it.
+- *Direct address without reply or @*: "Old Ray keeps bees" in three conversations, each read as
+  `unknown`; the ruling sees member 2 answer each time and places it, and "keeps bees" is filed
+  under member 2.
 
 ## 8. Manual notes are not memory
 
@@ -300,7 +325,7 @@ Two kinds of information about people and the group are kept apart (architecture
 | | Manual notes | Memories |
 | --- | --- | --- |
 | Written by | a person, with `/note` | extraction, from chat lines |
-| Store | `note` | `memory` / `memory_evidence` (names: `name_use`) |
+| Store | `note` | `memory` / `memory_evidence` (names: `name_reference`, `name_set`, `name_ruling`) |
 | Removed by | `/note remove` / `/note clear` | `/forget ID`, `/forget all`, `/forget group ID` |
 | Standing | a record of what someone wrote | who said it, how often, when last |
 | Model sees it as | a note written by a member | a memory with its provenance |

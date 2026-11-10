@@ -540,6 +540,9 @@ fn unanchored(account: i64, text: &str, set: bool, others: u32) -> qbot_memory::
         text: text.into(),
         key: qbot_memory::name_key(text).unwrap(),
         set,
+        ruled: false,
+        // Each conversation showed who was meant by an answer, not by a marker.
+        grounded: others,
         own: 0,
         addressed: others,
         about: 0,

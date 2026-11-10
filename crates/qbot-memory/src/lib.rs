@@ -27,6 +27,7 @@ pub mod names_conformance;
 pub mod notes;
 pub mod notes_conformance;
 pub mod recall;
+pub mod rule;
 pub mod slice;
 pub mod store;
 pub mod worth;
@@ -45,11 +46,12 @@ pub use memories::{
     Support,
 };
 pub use names::{
-    CORROBORATED_USES, KnownName, MemoryNameStore, NameBasis, NameError, NameStore, NameTextError,
-    NameUse, UseSource, name_key,
+    CORROBORATED_USES, Grounds, HeldClaim, HeldId, KnownName, MemoryNameStore, NameBasis,
+    NameError, NameStore, NameTextError, OpenName, Reference, Referent, Ruling, Verdict, name_key,
 };
 pub use notes::{MemoryNoteStore, Note, NoteId, NoteStore};
 pub use recall::{Recall, RecallError, RecallParams, rank};
+pub use rule::NameRuler;
 pub use slice::{Background, SliceBackground, SliceLine, SliceMember};
 pub use store::{EpisodeStore, MemoryEpisodeStore, MemoryError};
 pub use worth::{Activity, Capacity, HalfLives};

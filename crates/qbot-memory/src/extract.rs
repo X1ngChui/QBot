@@ -19,13 +19,15 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::episode::Evidence;
-use crate::findings::{FindingContext, Findings, MemoryArg, NameArg, validate_findings};
+use crate::findings::{
+    Checked, FindingContext, Findings, MemoryArg, ReferenceArg, validate_findings,
+};
 use crate::names::name_key;
 use crate::slice::{Background, SliceLine};
 
 pub const TOOL_NAME: &str = "submit_episode";
 /// Version of the prompt and validation rules, recorded on every episode.
-pub const METHOD: &str = "slice-v6";
+pub const METHOD: &str = "slice-v7";
 
 /// The extraction instructions; `{language}` is filled per call.
 const SYSTEM: &str = include_str!("../../../prompts/extract.md");
@@ -40,7 +42,7 @@ pub struct SubmitArgs {
     pub summary: String,
     pub evidence: Vec<EvidenceArg>,
     #[serde(default)]
-    pub names: Vec<NameArg>,
+    pub references: Vec<ReferenceArg>,
     #[serde(default)]
     pub memories: Vec<MemoryArg>,
 }
@@ -72,8 +74,9 @@ pub struct Extracted {
     pub summary: String,
     pub evidence: Vec<Evidence>,
     pub findings: Findings,
-    /// Why proposed findings were not kept, for the log.
+    /// Why proposed statements were not kept, and why proposed references were not, for the log.
     pub dropped: Vec<String>,
+    pub unread: Vec<String>,
     pub usage: Usage,
     pub attempts: u32,
     pub model: String,
@@ -235,8 +238,12 @@ impl EpisodeExtractor {
                                     .iter()
                                     .filter_map(|n| name_key(n).ok())
                                     .collect();
-                                let (findings, dropped) = validate_findings(
-                                    &args.names,
+                                let Checked {
+                                    findings,
+                                    dropped,
+                                    unread,
+                                } = validate_findings(
+                                    &args.references,
                                     &args.memories,
                                     &FindingContext {
                                         parts: [ctx.previous, ctx.target, ctx.next],
@@ -252,11 +259,14 @@ impl EpisodeExtractor {
                                     evidence: v.2,
                                     findings,
                                     dropped,
+                                    unread,
                                     usage,
                                     attempts: attempt,
                                     model,
                                 };
-                                // One correction round for findings: they are optional, the episode is not.
+                                // One correction round for statements: they are optional, the
+                                // episode is not. A reference left out is one record among many
+                                // and is not worth another call by itself.
                                 if extracted.dropped.is_empty()
                                     || accepted.is_some()
                                     || attempt == MAX_ATTEMPTS
@@ -264,6 +274,7 @@ impl EpisodeExtractor {
                                     return Ok(extracted);
                                 }
                                 problems = extracted.dropped.clone();
+                                problems.extend(extracted.unread.iter().cloned());
                                 accepted = Some(extracted);
                                 only_findings = true;
                             }
@@ -352,12 +363,19 @@ fn parameters() -> Vec<(&'static str, String)> {
         ("evidence", say(Text::ExtractParamEvidence {})),
         ("evidence.line", say(Text::ExtractParamEvidenceLine {})),
         ("evidence.quote", say(Text::ExtractParamEvidenceQuote {})),
-        ("names", say(Text::ExtractParamNames {})),
-        ("names.member", say(Text::ExtractParamNameMember {})),
-        ("names.name", say(Text::ExtractParamNameName {})),
-        ("names.basis", say(Text::ExtractParamNameBasis {})),
-        ("names.line", say(Text::ExtractParamLine {})),
-        ("names.quote", say(Text::ExtractParamQuote {})),
+        ("references", say(Text::ExtractParamReferences {})),
+        ("references.line", say(Text::ExtractParamReferenceLine {})),
+        ("references.text", say(Text::ExtractParamReferenceText {})),
+        (
+            "references.refers",
+            say(Text::ExtractParamReferenceRefers {}),
+        ),
+        ("references.role", say(Text::ExtractParamReferenceRole {})),
+        ("references.basis", say(Text::ExtractParamReferenceBasis {})),
+        (
+            "references.shown_by",
+            say(Text::ExtractParamReferenceShownBy {}),
+        ),
         ("memories", say(Text::ExtractParamMemories {})),
         ("memories.about", say(Text::ExtractParamMemoryAbout {})),
         ("memories.action", say(Text::ExtractParamMemoryAction {})),

@@ -104,6 +104,41 @@ given by the member, answered to by the member, or part of their display name), 
 conversations used it for that member and nobody else has a claim to it. Unanchored uses are
 still recorded: dropping them would make a nickname unrelated to any display name unlearnable.
 
+### 4.1a Names and profiles are one reading: the reference ledger
+
+Measured on the production archive (counts only), of the lines in which another member writes a
+name the group already knows for someone, 11% reply to or @-mention that member, 19% are said
+to someone else, and 69% carry no reply or @ at all; 16 of the 40 members named that way are never
+named on a line that points at them. Learning names from reply/@ structure alone is precise but
+misses most real address, and "the named member speaks next" is barely above what they do after
+any line (27% against 13% when they had been silent). Deciding whether a later line answers an
+earlier one is itself a semantic judgement, so it is made by the model reading the conversation,
+not by a distance rule.
+
+Names and what is known about people draw on the same evidence (who speaks, who answers whom,
+what is said of a person, how they are addressed), so one reading records both: for every place a
+member's words name a person, a **reference** (the expression, who is meant or `unknown`, how
+the line uses it, and what showed it: a marker, an answer the model points at, content that fits
+one person, the speaker's own word, or a name already listed), and the statements about people
+beside it. Code checks what the lines can check: the expression is in the member's own words, a
+marker is really there, an answer is a line that person wrote.
+
+Semantics is allowed in reading a conversation and in judging across conversations, never in
+accepting a name from one line. A name is shown when something outside the reading ties it to the
+member (set, their own word, a marker or their reply, a display name), when separate
+conversations agree and at least one of them showed it in the chat rather than by what is already
+believed (a name resting only on fitting someone's profile would confirm itself), or when a
+**ruling** places it: an expression several conversations used for someone none of them could
+place is put to a model with its uses side by side and the roster with what is remembered; a
+ruling for a member must cite lines that were shown. A statement about a person known only by an
+unplaced name is **held** and filed under the member once the name is theirs.
+
+A knowledge graph was considered and rejected: its entity merging resolves aliases mainly by
+surface similarity, which a QQ nickname rarely has with an account name; it stores triples that
+lose the wording a reader needs; and it ties facts to episodes rather than lines. Here members
+are entities by account id, the only merge is "the person called X is member N", which is a
+reversible ruling that re-points references, and every name and claim cites lines.
+
 ### 4.2 Memories: items with provenance and history
 
 A memory is one short statement about one member (or the group) in the bot's own words, with its

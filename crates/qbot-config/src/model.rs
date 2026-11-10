@@ -126,6 +126,8 @@ pub struct History {
 #[serde(deny_unknown_fields)]
 pub struct Memory {
     pub slice_batches: u32,
+    /// Earlier episodes a run of extraction reads again with the current method.
+    pub reread_per_run: u32,
     /// Group memories every reply is shown, the most worth first.
     pub group_memories: u32,
     /// Memories a run is shown per member of its conversation, the most worth first.

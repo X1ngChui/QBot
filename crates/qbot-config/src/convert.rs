@@ -168,6 +168,11 @@ impl Config {
         SliceGrid::for_window(self.history_window(), self.memory.slice_batches)
     }
 
+    /// Earlier episodes a run of extraction reads again with the current method.
+    pub fn reread_per_run(&self) -> usize {
+        usize::try_from(self.memory.reread_per_run).unwrap_or(usize::MAX)
+    }
+
     pub fn recall_params(&self) -> RecallParams {
         RecallParams {
             max_distance: self.memory.recall.max_distance,

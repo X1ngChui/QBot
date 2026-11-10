@@ -54,7 +54,8 @@ pub struct Background {
     pub quoted: Vec<SliceLine>,
     /// What members call the bot (its persona's name, its nicknames): never a member's name.
     pub bot_names: Vec<String>,
-    /// Accounts of members the lines mention without writing any of them.
+    /// Accounts of the members `text` lists, by number: whom a line may be recorded as naming
+    /// besides those who wrote the lines.
     pub accounts: Vec<(u32, AccountId)>,
     /// The current memories `text` lists, with their subjects: the ones a statement may name.
     pub known: Vec<(MemoryId, Option<AccountId>)>,

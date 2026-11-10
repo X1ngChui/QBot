@@ -751,7 +751,7 @@ async fn a_member_number_survives_everything_that_happens_to_its_account() {
 
 #[tokio::test]
 async fn the_roster_lists_who_is_who_in_its_group_only() {
-    use qbot_memory::{EpisodeId, IdentityStore, NameBasis, NameStore, NameUse, UseSource};
+    use qbot_memory::{EpisodeId, IdentityStore, NameStore, Reference};
     use qbot_store::{PgNameStore, RosterSettings};
     let db = db!();
     let clock = ManualClock::new(T0);
@@ -839,17 +839,15 @@ async fn the_roster_lists_who_is_who_in_its_group_only() {
         .set(other, "Elsewhere", &[account(701)], now)
         .await
         .unwrap();
-    let used = |episode: i64| NameUse {
-        account: account(701),
-        text: "Annie".into(),
-        basis: NameBasis::Addressed,
-        source: Some(UseSource {
-            episode: EpisodeId::new(episode),
-            message: MessageId::new(episode).unwrap(),
-            quote: "Annie".into(),
-        }),
-        anchored: false,
-        at: now,
+    let used = |episode: i64| {
+        Reference::of(
+            account(701),
+            account(702),
+            "Annie",
+            EpisodeId::new(episode),
+            MessageId::new(episode).unwrap(),
+            now,
+        )
     };
     names.record(g, &[used(1), used(2)]).await.unwrap();
     identity

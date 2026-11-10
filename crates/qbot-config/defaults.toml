@@ -76,6 +76,10 @@ summary_batches = 9
 # Batches summarized into one episode, at most history.raw_batches (the episode must exist
 # before its chat leaves the verbatim tier).
 slice_batches = 3
+# Episodes whose names and memories an earlier version read are read again by the current one,
+# this many per run of a group's extraction (a run follows each filled batch), the oldest first,
+# until none is left. Each is one extraction call. 0 leaves earlier chat as it was read.
+reread_per_run = 4
 # Memories about the group (its terms, what it is about) every reply is shown, the most worth
 # first. The block is part of every reply's cached prefix.
 group_memories = 40

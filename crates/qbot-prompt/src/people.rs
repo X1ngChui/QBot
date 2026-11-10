@@ -9,7 +9,7 @@ use jiff::tz::TimeZone;
 use qbot_core::marker::escape_markers;
 use qbot_core::{AccountId, MemberNo, UnixMillis};
 use qbot_memory::memories::Memory;
-use qbot_memory::names::{CORROBORATED_USES, KnownName, name_key};
+use qbot_memory::names::{KnownName, name_key};
 use qbot_memory::worth::HalfLives;
 use qbot_store::{GroupPeople, Person};
 use qbot_wording::{Text, say};
@@ -45,11 +45,12 @@ fn numbers(members: impl IntoIterator<Item = MemberNo>) -> String {
 
 /// The group's names as prompts may show them.
 ///
-/// A name others use for a member is shown when something ties it to them: a person set it,
-/// the member gave it or answered to it, or it is part of a display name of theirs. Without
-/// such an anchor it is one model's reading of a line, so it is kept but not shown until
-/// [`CORROBORATED_USES`] conversations used it for that member and no other person has a claim to
-/// it (an anchor, as many conversations, or it being their display name).
+/// A name others use for a member is shown when something ties it to them: a person set it, a
+/// ruling over its uses placed it, the member used it for themselves, the chat's structure tied
+/// it to them, or it is part of a display name of theirs. Without such an anchor it is one
+/// reading of a conversation, so it is kept but not shown until separate conversations agree on
+/// it ([`KnownName::corroborated`]) and no other person has a claim to it (an anchor, as much
+/// agreement, or it being their display name).
 #[derive(Debug, Default)]
 pub(crate) struct NameIndex {
     /// The names shown, by account and key.
@@ -103,7 +104,7 @@ impl NameIndex {
                         .get(&name.account)
                         .is_some_and(|keys| keys.iter().any(|k| k.contains(&name.key))))
         };
-        let strong = |name: &KnownName| anchored(name) || name.uses() >= CORROBORATED_USES;
+        let strong = |name: &KnownName| anchored(name) || name.corroborated();
         let mut shown = BTreeSet::new();
         for (number, name) in &people.names {
             let me = person_of(name.account);
@@ -112,7 +113,7 @@ impl NameIndex {
             }) || current
                 .get(&name.key)
                 .is_some_and(|theirs| theirs.iter().any(|p| *p != me));
-            if anchored(name) || (name.uses() >= CORROBORATED_USES && !contested) {
+            if anchored(name) || (name.corroborated() && !contested) {
                 shown.insert((name.account, name.key.clone()));
                 owners.entry(name.key.clone()).or_default().insert(*number);
             }
@@ -137,6 +138,9 @@ pub(crate) fn name_entry(
     let mut how = Vec::new();
     if name.set {
         how.push(say(Text::PromptNameSet {}));
+    }
+    if name.ruled {
+        how.push(say(Text::PromptNameRuled {}));
     }
     if name.own > 0 {
         how.push(say(Text::PromptNameOwn {

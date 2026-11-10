@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use qbot_core::{GroupId, MessageId, UnixMillis};
 
 use crate::episode::{Episode, EpisodeId, Hit, NewEpisode};
+use crate::findings::Findings;
 use crate::slice::SliceLine;
 use crate::worth::Activity;
 
@@ -76,6 +77,24 @@ pub trait EpisodeStore: Send + Sync {
 
     /// Record that an episode's findings have been applied.
     async fn mark_consolidated(&self, id: EpisodeId) -> Result<(), MemoryError>;
+
+    /// Episodes of the group whose findings were read by another method than `method`, the
+    /// oldest first, at most `limit`: chat the current reading has not seen.
+    async fn read_otherwise(
+        &self,
+        group: GroupId,
+        method: &str,
+        limit: usize,
+    ) -> Result<Vec<Episode>, MemoryError>;
+
+    /// Give an episode the findings of a new reading by `method`. Its summary stays; the
+    /// findings count as not applied yet.
+    async fn reread(
+        &self,
+        id: EpisodeId,
+        method: &str,
+        findings: &Findings,
+    ) -> Result<(), MemoryError>;
 
     /// The group's conversation as a clock for salience: every episode's end and participants.
     async fn activity(&self, group: GroupId) -> Result<Activity, MemoryError>;
@@ -355,6 +374,43 @@ impl EpisodeStore for MemoryEpisodeStore {
 
     async fn mark_consolidated(&self, id: EpisodeId) -> Result<(), MemoryError> {
         self.lock().consolidated.insert(id);
+        Ok(())
+    }
+
+    async fn read_otherwise(
+        &self,
+        group: GroupId,
+        method: &str,
+        limit: usize,
+    ) -> Result<Vec<Episode>, MemoryError> {
+        let mut found: Vec<Episode> = self
+            .lock()
+            .episodes
+            .iter()
+            .map(|(e, _, _)| e)
+            .filter(|e| e.episode.group == group && e.episode.method != method)
+            .cloned()
+            .collect();
+        found.sort_by_key(|e| e.episode.first_ordinal);
+        found.truncate(limit);
+        Ok(found)
+    }
+
+    async fn reread(
+        &self,
+        id: EpisodeId,
+        method: &str,
+        findings: &Findings,
+    ) -> Result<(), MemoryError> {
+        let mut inner = self.lock();
+        let entry = inner
+            .episodes
+            .iter_mut()
+            .find(|(e, _, _)| e.id == id)
+            .ok_or(MemoryError::NotFound)?;
+        entry.0.episode.method = method.to_owned();
+        entry.0.episode.findings = findings.clone();
+        inner.consolidated.remove(&id);
         Ok(())
     }
 

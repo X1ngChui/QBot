@@ -17,8 +17,7 @@ use qbot_i18n::Locales;
 use qbot_llm::{CallKind, Purpose};
 use qbot_memory::{
     Change, Durability, EpisodeId, IdentityPolicy, IdentityStore, InMemoryMemoryStore, MemoryId,
-    MemoryIdentityStore, MemoryNameStore, MemoryStore, NameBasis, NameStore, NameUse, Statement,
-    Support, UseSource,
+    MemoryIdentityStore, MemoryNameStore, MemoryStore, NameStore, Reference, Statement, Support,
 };
 use qbot_sched::{MemoryTimerStore, TaskLimits, TaskService};
 use qbot_store::{BlockRule, BlockedBy, RosterRow, TopRow, UsageLine, UsageSummary};
@@ -608,17 +607,15 @@ async fn names_are_set_listed_and_removed_with_how_each_was_used() {
         "Recorded: Alice is also called \"Al the Great\"."
     );
     // A name chat used for Alice twice and for Bob once.
-    let used = |account: i64, episode: i64| NameUse {
-        account: acct(account),
-        text: "Boss".into(),
-        basis: NameBasis::Addressed,
-        source: Some(UseSource {
-            episode: EpisodeId::new(episode),
-            message: MessageId::new(episode).unwrap(),
-            quote: "Boss".into(),
-        }),
-        anchored: false,
-        at: UnixMillis::new(T0),
+    let used = |account: i64, episode: i64| {
+        Reference::of(
+            acct(account),
+            acct(if account == ALICE { BOB } else { ALICE }),
+            "Boss",
+            EpisodeId::new(episode),
+            MessageId::new(episode).unwrap(),
+            UnixMillis::new(T0),
+        )
     };
     rig.names
         .record(

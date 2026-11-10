@@ -19,9 +19,9 @@ use qbot_llm::embedding::FakeEmbedder;
 use qbot_llm::search::{FakeSearch, PageRead, SearchHit, SearchResults};
 use qbot_llm::{Provider, ReasoningEffort, Usage};
 use qbot_memory::{
-    Change, Durability, EpisodeId, InMemoryMemoryStore, MemoryEpisodeStore, MemoryId,
-    MemoryNameStore, MemoryNoteStore, MemoryStore, NameBasis, NameStore, NameUse, NoteStore,
-    Recall, RecallParams, Statement, Support, UseSource,
+    Change, Durability, EpisodeId, Grounds, InMemoryMemoryStore, MemoryEpisodeStore, MemoryId,
+    MemoryNameStore, MemoryNoteStore, MemoryStore, NameBasis, NameStore, NoteStore, Recall,
+    RecallParams, Reference, Referent, Statement, Support,
 };
 use qbot_prompt::{
     GroupPeople, HistorySource, MemoryView, PeopleSource, Person, Personas, PromptContext,
@@ -419,19 +419,26 @@ impl Runner {
                     .await
                     .map_err(|e| e.to_string())?,
                 basis => {
-                    let uses: Vec<NameUse> = (0..n.episodes.max(1))
+                    let basis = basis.unwrap_or(NameBasis::Addressed);
+                    let uses: Vec<Reference> = (0..n.episodes.max(1))
                         .map(|k| {
                             episode += 1;
-                            Ok(NameUse {
-                                account: about,
+                            Ok(Reference {
+                                episode: EpisodeId::new(episode),
+                                message: MessageId::new(episode).map_err(|e| e.to_string())?,
+                                ordinal: u64::try_from(episode).unwrap_or(0),
+                                // Who said it plays no part in what a scenario is shown.
+                                speaker: about,
                                 text: n.name.clone(),
-                                basis: basis.unwrap_or(NameBasis::Addressed),
-                                source: Some(UseSource {
-                                    episode: EpisodeId::new(episode),
-                                    message: MessageId::new(episode).map_err(|e| e.to_string())?,
-                                    quote: n.name.clone(),
-                                }),
+                                referent: Referent::Member(about),
+                                basis,
+                                grounds: match basis {
+                                    NameBasis::Own => Grounds::Own,
+                                    NameBasis::About => Grounds::Content,
+                                    _ => Grounds::Marker,
+                                },
                                 anchored: false,
+                                shown_by: Vec::new(),
                                 at: UnixMillis::new(
                                     now.now().get() - i64::from(k) * 3 * 86_400_000,
                                 ),

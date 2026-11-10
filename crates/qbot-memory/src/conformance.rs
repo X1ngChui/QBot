@@ -279,4 +279,55 @@ pub async fn run(store: &dyn EpisodeStore) {
         1,
         "scoped by group"
     );
+
+    // A new reading gives an episode other findings, to be applied again; its summary stays.
+    for episode in store.unconsolidated(g).await.unwrap() {
+        store.mark_consolidated(episode.id).await.unwrap();
+    }
+    let earlier = store.read_otherwise(g, "test-2", 2).await.unwrap();
+    assert_eq!(earlier.len(), 2, "at most as many as asked for");
+    assert!(
+        earlier[0].episode.first_ordinal < earlier[1].episode.first_ordinal,
+        "the oldest first"
+    );
+    let findings = crate::findings::Findings {
+        references: vec![crate::findings::ReferenceFinding {
+            message: earlier[0].episode.first_message,
+            ordinal: earlier[0].episode.first_ordinal,
+            speaker: AccountId::new(5).unwrap(),
+            text: "Kit".into(),
+            referent: crate::names::Referent::Unknown,
+            basis: crate::names::NameBasis::About,
+            grounds: crate::names::Grounds::None,
+            anchored: false,
+            shown_by: Vec::new(),
+        }],
+        memories: Vec::new(),
+    };
+    store
+        .reread(earlier[0].id, "test-2", &findings)
+        .await
+        .unwrap();
+    let again = store.get(g, earlier[0].id).await.unwrap().unwrap();
+    assert_eq!(again.episode.method, "test-2");
+    assert_eq!(again.episode.findings, findings);
+    assert_eq!(again.episode.summary, earlier[0].episode.summary);
+    let pending = store.unconsolidated(g).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, earlier[0].id);
+    assert!(
+        store
+            .read_otherwise(g, "test-2", 100)
+            .await
+            .unwrap()
+            .iter()
+            .all(|e| e.id != earlier[0].id),
+        "read the current way, it is not read again"
+    );
+    assert!(matches!(
+        store
+            .reread(EpisodeId::new(9_999_999), "test-2", &findings)
+            .await,
+        Err(MemoryError::NotFound)
+    ));
 }

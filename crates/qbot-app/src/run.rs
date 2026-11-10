@@ -36,7 +36,7 @@ use qbot_media::{
 use qbot_memory::consolidate::Consolidator;
 use qbot_memory::{
     BuilderConfig, EpisodeBuilder, EpisodeExtractor, EpisodeJobs, EpisodeStore, IdentityStore,
-    MemoryStore, NameStore, Recall,
+    MemoryStore, NameRuler, NameStore, Recall,
 };
 use qbot_ops::{BackupError, Operations, Parts, PgHousekeeping, PgReportSource, check_tools};
 use qbot_prompt::{
@@ -346,6 +346,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
             },
         )
         .with_bot_nicknames(&config.bot.nicknames)
+        .with_names(names.clone())
         .with_directory(directory.clone())
         .with_episodes(episodes.clone()),
     );
@@ -456,7 +457,12 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
                     ),
                 ))
                 // Extraction reads the group as replies do: the same people and knowledge.
-                .with_background(prompt.clone()),
+                .with_background(prompt.clone())
+                .with_rulings(
+                    names.clone(),
+                    NameRuler::new(provider.clone()).with_reasoning(config.extraction_reasoning()),
+                )
+                .with_reread(config.reread_per_run()),
         ),
         housekeeping: Arc::new(PgHousekeeping::new(
             admin.clone(),

@@ -7,6 +7,7 @@ use qbot_llm::{Embedder, LlmError, Usage};
 
 use crate::episode::{Episode, NewEpisode};
 use crate::extract::{EpisodeExtractor, ExtractError, METHOD, SliceContext};
+use crate::findings::{Findings, MemoryAction};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuilderConfig {
@@ -104,6 +105,29 @@ impl EpisodeBuilder {
         Ok(self.embedder.embed(&texts).await?.vectors)
     }
 
+    /// Read a slice that already has its episode again, for its findings alone: the episode's
+    /// summary stays as it is. What the reading says of memories is taken as history, since
+    /// later chat has been read already: a statement that something changed is remembered as
+    /// what was said then, and one that something ended is left out, so nothing learned since
+    /// is closed by older words.
+    pub async fn read(&self, ctx: &SliceContext<'_>) -> Result<Findings, BuildError> {
+        if ctx.target.is_empty() {
+            return Err(BuildError::EmptyTarget);
+        }
+        let extracted = self.extractor.extract(ctx, &self.cfg.language).await?;
+        let mut findings = extracted.findings;
+        findings
+            .memories
+            .retain(|f| f.action != MemoryAction::Ended);
+        for finding in &mut findings.memories {
+            if finding.action == MemoryAction::Changed {
+                finding.action = MemoryAction::New;
+                finding.id = None;
+            }
+        }
+        Ok(findings)
+    }
+
     /// Summarize the slice in `ctx.target`, which must be exactly the lines of `plan.target`.
     /// The episode owns that range and nothing else; context lines never enter it.
     pub async fn build(
@@ -119,6 +143,9 @@ impl EpisodeBuilder {
         let extracted = self.extractor.extract(ctx, &self.cfg.language).await?;
         for reason in &extracted.dropped {
             tracing::info!(group = group.get(), %reason, "a proposed finding was not kept");
+        }
+        for reason in &extracted.unread {
+            tracing::debug!(group = group.get(), %reason, "a proposed reference was not kept");
         }
         let mut participants: Vec<AccountId> =
             ctx.target.iter().filter_map(|l| l.speaker).collect();

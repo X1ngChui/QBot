@@ -1,8 +1,9 @@
-//! Applying what an episode found: name uses go to the name index, statements become changes to
-//! what is remembered. Idempotent: an episode records a name use and supports a memory at most
-//! once, and a new statement equal to a current memory supports it, so applying the same episode
-//! again changes nothing, and a crash between storing an episode and applying it loses nothing
-//! (the episode stays unapplied until applied).
+//! Applying what an episode found: references go to the name ledger, statements become changes
+//! to what is remembered, and a statement about a person known only by a name is held until the
+//! name is some member's. Idempotent: an episode records a reference and supports a memory at
+//! most once, and a new statement equal to a current memory supports it, so applying the same
+//! episode again changes nothing, and a crash between storing an episode and applying it loses
+//! nothing (the episode stays unapplied until applied).
 //!
 //! Room follows the conversation: after an episode is applied, each subject it touched that is
 //! over its capacity gives up its memories worth least, weighed as of the episode's end, never
@@ -11,12 +12,12 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use qbot_core::AccountId;
+use qbot_core::{AccountId, GroupId};
 
 use crate::episode::Episode;
 use crate::findings::{MemoryAction, MemoryFinding};
 use crate::memories::{Change, Durability, MemoryId, MemoryStore, Statement, Support};
-use crate::names::{NameStore, NameUse, UseSource, strongest_per_name};
+use crate::names::{HeldClaim, NameStore, Reference, name_key};
 use crate::store::{EpisodeStore, MemoryError};
 use crate::worth::{Capacity, HalfLives};
 
@@ -67,48 +68,62 @@ impl Consolidator {
     pub async fn apply(&self, episode: &Episode) -> Result<(), MemoryError> {
         let source = &episode.episode;
         let (group, at) = (source.group, source.ended);
-        let uses = strongest_per_name(
-            source
-                .findings
-                .names
-                .iter()
-                .map(|n| NameUse {
-                    account: n.account,
-                    text: n.name.clone(),
-                    basis: n.basis,
-                    source: Some(UseSource {
-                        episode: episode.id,
-                        message: n.message,
-                        quote: n.quote.clone(),
-                    }),
-                    anchored: n.anchored,
-                    at,
-                })
-                .collect(),
-        );
-        if !uses.is_empty() {
-            self.names.record(group, &uses).await?;
+        let references: Vec<Reference> = source
+            .findings
+            .references
+            .iter()
+            .map(|r| Reference {
+                episode: episode.id,
+                message: r.message,
+                ordinal: r.ordinal,
+                speaker: r.speaker,
+                text: r.text.clone(),
+                referent: r.referent,
+                basis: r.basis,
+                grounds: r.grounds,
+                anchored: r.anchored,
+                shown_by: r.shown_by.clone(),
+                at,
+            })
+            .collect();
+        if !references.is_empty() {
+            self.names.record(group, &references).await?;
         }
-        let changes: Vec<Change> = source
+        let held: Vec<HeldClaim> = source
             .findings
             .memories
             .iter()
-            .filter_map(|f| change(f, episode, at))
+            .filter_map(|f| {
+                Some(HeldClaim {
+                    name: f.name.clone()?,
+                    text: f.text.clone()?,
+                    durability: f.durability.unwrap_or(Durability::Ongoing),
+                    support: support(f, episode, at),
+                })
+            })
             .collect();
-        if changes.is_empty() {
-            return Ok(());
+        if !held.is_empty() {
+            self.names.hold(group, &held).await?;
         }
-        let touched: BTreeSet<MemoryId> = self
-            .memories
-            .apply(group, &changes)
-            .await?
-            .into_iter()
-            .collect();
+        let stated = || source.findings.memories.iter().filter(|f| f.name.is_none());
+        let changes: Vec<Change> = stated().filter_map(|f| change(f, episode, at)).collect();
+        let mut touched: BTreeSet<MemoryId> = BTreeSet::new();
+        let mut subjects: BTreeSet<Option<AccountId>> = BTreeSet::new();
+        if !changes.is_empty() {
+            touched.extend(self.memories.apply(group, &changes).await?);
+            subjects.extend(stated().map(|f| f.subject));
+        }
+        // A name these references settled frees what was held for it.
+        for (account, memory) in self.file_held(group).await? {
+            touched.insert(memory);
+            subjects.insert(Some(account));
+        }
         let Some(room) = &self.room else {
             return Ok(());
         };
-        let subjects: BTreeSet<Option<AccountId>> =
-            source.findings.memories.iter().map(|f| f.subject).collect();
+        if subjects.is_empty() {
+            return Ok(());
+        }
         let activity = room.episodes.activity(group).await?;
         for subject in subjects {
             let memories = self.memories.about(group, subject).await?;
@@ -126,17 +141,70 @@ impl Consolidator {
         }
         Ok(())
     }
+
+    /// Remember what was held about a name that is now one member's: the member it was set
+    /// for, ruled to be, or that separate conversations agree on. A name two members have a
+    /// claim to frees nothing. Returns the members and the memories this supported or created.
+    pub async fn file_held(
+        &self,
+        group: GroupId,
+    ) -> Result<Vec<(AccountId, MemoryId)>, MemoryError> {
+        let held = self.names.held(group).await?;
+        if held.is_empty() {
+            return Ok(Vec::new());
+        }
+        let names = self.names.names(group, None).await?;
+        let mut filed = Vec::new();
+        for (id, claim) in held {
+            let Ok(key) = name_key(&claim.name) else {
+                continue;
+            };
+            let owners: Vec<AccountId> = names
+                .iter()
+                .filter(|n| n.key == key && (n.vouched() || n.corroborated()))
+                .map(|n| n.account)
+                .collect();
+            let [account] = owners.as_slice() else {
+                continue;
+            };
+            let statement = Statement {
+                subject: Some(*account),
+                term: None,
+                text: claim.text.clone(),
+                durability: claim.durability,
+                support: claim.support.clone(),
+            };
+            let memories = self
+                .memories
+                .apply(group, &[Change::New(statement)])
+                .await?;
+            self.names.file(group, id, *account).await?;
+            filed.extend(memories.into_iter().map(|memory| (*account, memory)));
+        }
+        if !filed.is_empty() {
+            tracing::info!(
+                group = group.get(),
+                filed = filed.len(),
+                "statements held for a name are remembered about its member"
+            );
+        }
+        Ok(filed)
+    }
 }
 
-/// The change one validated statement makes, at the episode's end.
-fn change(f: &MemoryFinding, episode: &Episode, at: qbot_core::UnixMillis) -> Option<Change> {
-    let support = Support {
+fn support(f: &MemoryFinding, episode: &Episode, at: qbot_core::UnixMillis) -> Support {
+    Support {
         episode: episode.id,
         message: f.message,
         author: Some(f.author),
         quote: f.quote.clone(),
         at,
-    };
+    }
+}
+
+/// The change one validated statement makes, at the episode's end.
+fn change(f: &MemoryFinding, episode: &Episode, at: qbot_core::UnixMillis) -> Option<Change> {
+    let support = support(f, episode, at);
     let statement = || Statement {
         subject: f.subject,
         term: f.term.clone(),

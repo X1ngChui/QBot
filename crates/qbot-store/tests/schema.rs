@@ -29,14 +29,17 @@ async fn migrations_are_idempotent_and_the_expected_tables_exist() {
             "group_admin",
             "group_block",
             "group_state",
+            "held_claim",
             "link_invitation",
             "media_cache",
             "media_ref",
             "member_number",
             "memory",
             "memory_evidence",
+            "name_reference",
             "name_removed",
-            "name_use",
+            "name_ruling",
+            "name_set",
             "note",
             "recurrence",
             "run",
@@ -151,60 +154,118 @@ async fn constraints_reject_invalid_rows() {
     assert!(rejected(&db, "INSERT INTO chat_line (group_id, ordinal, message_id, speaker, at_ms, text) VALUES (1, 1, 5, 'bot', 0, 'same ordinal')").await);
     assert!(rejected(&db, "INSERT INTO chat_line (group_id, ordinal, message_id, speaker, at_ms, text) VALUES (1, 0, 6, 'bot', 0, 'zero')").await);
 
-    // names: a use points at a known account; only a set name has no episode, and a learned one
-    // has its line; one use per member, name and episode.
+    // names: a reference points at known accounts and names a member exactly when it says
+    // so; how a line uses a name and what shows whom it means are closed sets; one reading of
+    // an expression per episode and line. A name is set once per member, a ruling names a
+    // member exactly when it is for one.
     sqlx::query("INSERT INTO account (account_id, first_seen_ms) VALUES (7, 0)")
         .execute(db.pool())
         .await
         .unwrap();
-    let name_use = |rest: &str| {
+    let reference = |rest: &str| {
         format!(
-            "INSERT INTO name_use (group_id, account_id, key, text, basis, episode_id, message_id, quote, at_ms) VALUES {rest}"
+            "INSERT INTO name_reference (group_id, episode_id, message_id, ordinal, speaker_account, key, text, who, account_id, basis, grounds, at_ms) VALUES {rest}"
         )
     };
+    for (row, why) in [
+        (
+            "(1, 1, 1, 1, 99, 'x', 'x', 'unknown', NULL, 'about', 'none', 0)",
+            "unknown speaker",
+        ),
+        (
+            "(1, 1, 1, 1, 7, 'x', 'x', 'member', 99, 'about', 'content', 0)",
+            "unknown account",
+        ),
+        (
+            "(1, 1, 1, 1, 7, 'x', 'x', 'member', NULL, 'about', 'content', 0)",
+            "a member is named",
+        ),
+        (
+            "(1, 1, 1, 1, 7, 'x', 'x', 'unknown', 7, 'about', 'none', 0)",
+            "and nobody else is",
+        ),
+        (
+            "(1, 1, 1, 1, 7, 'x', 'x', 'unknown', NULL, 'set', 'none', 0)",
+            "closed set of uses",
+        ),
+        (
+            "(1, 1, 1, 1, 7, 'x', 'x', 'unknown', NULL, 'about', 'hunch', 0)",
+            "closed set of grounds",
+        ),
+        (
+            "(1, 1, 1, 1, 7, 'x', 'x', 'everyone', NULL, 'about', 'none', 0)",
+            "closed set of referents",
+        ),
+        (
+            "(1, 1, 1, 1, 7, '', '', 'unknown', NULL, 'about', 'none', 0)",
+            "empty expression",
+        ),
+    ] {
+        assert!(rejected(&db, &reference(row)).await, "{why}");
+    }
+    sqlx::query(&reference(
+        "(1, 1, 1, 1, 7, 'x', 'X', 'member', 7, 'own', 'self', 0)",
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
     assert!(
-        rejected(&db, &name_use("(1, 99, 'x', 'x', 'own', 1, 1, 'q', 0)")).await,
+        rejected(
+            &db,
+            &reference("(1, 1, 1, 1, 7, 'x', 'x', 'unknown', NULL, 'about', 'none', 0)")
+        )
+        .await,
+        "one reading per episode and line"
+    );
+    sqlx::query(&reference(
+        "(1, 1, 2, 2, 7, 'x', 'x', 'unknown', NULL, 'about', 'none', 0)",
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let set = "INSERT INTO name_set (group_id, account_id, key, text, at_ms) VALUES";
+    assert!(
+        rejected(&db, &format!("{set} (1, 99, 'x', 'x', 0)")).await,
         "unknown account"
     );
-    assert!(
-        rejected(&db, &name_use("(1, 7, 'x', 'x', 'set', 1, 1, 'q', 0)")).await,
-        "a set name comes from no episode"
-    );
-    assert!(
-        rejected(
-            &db,
-            &name_use("(1, 7, 'x', 'x', 'own', NULL, NULL, NULL, 0)")
-        )
-        .await,
-        "a learned one does"
-    );
-    assert!(
-        rejected(&db, &name_use("(1, 7, 'x', 'x', 'nickname', 1, 1, 'q', 0)")).await,
-        "closed set of bases"
-    );
-    assert!(
-        rejected(&db, &name_use("(1, 7, '', '', 'own', 1, 1, 'q', 0)")).await,
-        "empty name"
-    );
-    sqlx::query(&name_use("(1, 7, 'x', 'X', 'own', 1, 1, 'q', 0)"))
-        .execute(db.pool())
-        .await
-        .unwrap();
-    sqlx::query(&name_use("(1, 7, 'x', 'x', 'set', NULL, NULL, NULL, 0)"))
+    sqlx::query(&format!("{set} (1, 7, 'x', 'x', 0)"))
         .execute(db.pool())
         .await
         .unwrap();
     assert!(
-        rejected(&db, &name_use("(1, 7, 'x', 'x', 'about', 1, 2, 'q', 0)")).await,
-        "once per episode"
-    );
-    assert!(
-        rejected(
-            &db,
-            &name_use("(1, 7, 'x', 'x', 'set', NULL, NULL, NULL, 1)")
-        )
-        .await,
+        rejected(&db, &format!("{set} (1, 7, 'x', 'x', 1)")).await,
         "set once"
+    );
+    let ruling =
+        "INSERT INTO name_ruling (group_id, key, text, verdict, account_id, seen, at_ms) VALUES";
+    assert!(
+        rejected(
+            &db,
+            &format!("{ruling} (1, 'x', 'x', 'member', NULL, 3, 0)")
+        )
+        .await
+    );
+    assert!(rejected(&db, &format!("{ruling} (1, 'x', 'x', 'outside', 7, 3, 0)")).await);
+    assert!(rejected(&db, &format!("{ruling} (1, 'x', 'x', 'maybe', NULL, 3, 0)")).await);
+    sqlx::query(&format!("{ruling} (1, 'x', 'x', 'member', 7, 3, 0)"))
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(
+        rejected(
+            &db,
+            &format!("{ruling} (1, 'x', 'x', 'general', NULL, 3, 0)")
+        )
+        .await,
+        "one ruling per expression"
+    );
+    assert!(
+        rejected(
+            &db,
+            "INSERT INTO held_claim (group_id, key, name, text, durability, episode_id, message_id, quote, at_ms) VALUES (1, 'x', 'x', 'keeps bees', 'forever', 1, 1, 'q', 0)"
+        )
+        .await,
+        "closed set of durabilities"
     );
 
     // memories: a member memory has no term; the state's time and replacement agree with it;
@@ -568,5 +629,78 @@ async fn the_active_memory_migration_keeps_set_names_removals_and_facts_with_the
         .unwrap();
         assert!(!exists, "{gone} is dropped");
     }
+    db.drop_db().await;
+}
+
+#[tokio::test]
+async fn the_name_ledger_migration_carries_set_names_and_learned_uses_with_their_lines() {
+    let db = db!(bare);
+    schema_before_0014(&db).await;
+    for sql in [
+        include_str!("../migrations/0014_active_memory.sql"),
+        include_str!("../migrations/0015_name_anchor.sql"),
+        "INSERT INTO account (account_id, first_seen_ms) VALUES (7, 0), (8, 0);
+         INSERT INTO chat_line (group_id, ordinal, message_id, speaker, account_id, at_ms, text)
+         VALUES (1, 1, 501, 'member', 7, 10, 'call me Kit'),
+                (1, 2, 502, 'member', 8, 20, '[at:1] Kit hello'),
+                (1, 3, 503, 'member', 8, 30, 'Kit is late'),
+                (1, 4, 504, 'member', 8, 40, 'Kitty again'),
+                (1, 5, 505, 'member', 8, 50, 'I am Kit too');
+         INSERT INTO name_use (group_id, account_id, key, text, basis, episode_id, message_id,
+                               quote, at_ms, anchored)
+         VALUES (1, 7, 'boss', 'Boss', 'set', NULL, NULL, NULL, 5, false),
+                (1, 7, 'kit', 'Kit', 'own', 1, 501, 'call me Kit', 10, false),
+                (1, 7, 'kit', 'Kit', 'addressed', 2, 502, 'Kit hello', 20, false),
+                (1, 7, 'kit', 'Kit', 'about', 3, 503, 'Kit is late', 30, true),
+                (1, 7, 'kitty', 'Kitty', 'about', 4, 504, 'Kitty again', 40, false),
+                (1, 7, 'kit', 'Kit', 'own', 5, 505, 'I am Kit too', 50, false),
+                (1, 7, 'gone', 'Gone', 'about', 6, 999, 'no such line', 60, false);",
+        include_str!("../migrations/0016_name_ledger.sql"),
+    ] {
+        sqlx::raw_sql(sql).execute(db.pool()).await.unwrap();
+    }
+    let set: Vec<(i64, String, String)> =
+        sqlx::query_as("SELECT account_id, key, text FROM name_set")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(set, [(7, "boss".to_owned(), "Boss".to_owned())]);
+    type Row = (i64, i64, i64, String, String, i64, String, String, bool);
+    let carried: Vec<Row> = sqlx::query_as(
+        "SELECT message_id, ordinal, speaker_account, key, who, account_id, basis, grounds, \
+         anchored FROM name_reference ORDER BY message_id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    let row = |message, ordinal, speaker, key: &str, basis: &str, grounds: &str, anchored| {
+        (
+            message,
+            ordinal,
+            speaker,
+            key.to_owned(),
+            "member".to_owned(),
+            7,
+            basis.to_owned(),
+            grounds.to_owned(),
+            anchored,
+        )
+    };
+    assert_eq!(
+        carried,
+        [
+            row(501, 1, 7, "kit", "own", "self", false),
+            row(502, 2, 8, "kit", "addressed", "marker", false),
+            row(503, 3, 8, "kit", "about", "answer", true),
+            row(504, 4, 8, "kitty", "about", "content", false),
+        ],
+        "each use with its line and who wrote it; a use whose line is gone, or whose line the \
+         member did not write as the use says, is not carried"
+    );
+    let gone: Option<String> = sqlx::query_scalar("SELECT to_regclass('name_use')::text")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(gone, None);
     db.drop_db().await;
 }

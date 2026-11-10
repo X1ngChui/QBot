@@ -1011,7 +1011,8 @@ async fn a_filled_batch_turns_archived_chat_into_a_stored_episode() {
             "submit_episode",
             json!({"title": "Planning a trip", "summary": "Members discussed planning a trip together.",
                    "evidence": [{"line": 1, "quote": "plan the trip"}],
-                   "names": [{"member": 1, "name": "Tess", "basis": "own", "line": 1, "quote": "call me Tess"}],
+                   "references": [{"line": 1, "text": "Tess", "refers": "member:1", "role": "self",
+                                   "basis": "self", "shown_by": []}],
                    "memories": [{"about": "member:1", "action": "new", "text": "likes planning trips",
                                  "durability": "ongoing", "line": 1, "quote": "plan the trip"}]}),
         )),
@@ -1083,7 +1084,7 @@ async fn a_filled_batch_turns_archived_chat_into_a_stored_episode() {
         .await
         .unwrap();
     assert_eq!(vectors, 1, "the episode is searchable");
-    // The line keeps the name it was sent under; the findings became a name use and a memory with
+    // The line keeps the name it was sent under; the findings became a reference and a memory with
     // its evidence, all of the group and the account that wrote the line.
     let shown: Option<String> =
         sqlx::query_scalar("SELECT sender_name FROM chat_line WHERE message_id = 1")
@@ -1092,7 +1093,7 @@ async fn a_filled_batch_turns_archived_chat_into_a_stored_episode() {
             .unwrap();
     assert_eq!(shown.as_deref(), Some("Tester 3"));
     let name: (i64, i64, String, String) =
-        sqlx::query_as("SELECT group_id, account_id, key, basis FROM name_use")
+        sqlx::query_as("SELECT group_id, account_id, key, basis FROM name_reference")
             .fetch_one(&pool)
             .await
             .unwrap();
