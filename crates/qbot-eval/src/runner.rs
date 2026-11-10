@@ -431,6 +431,7 @@ impl Runner {
                                     message: MessageId::new(episode).map_err(|e| e.to_string())?,
                                     quote: n.name.clone(),
                                 }),
+                                anchored: false,
                                 at: UnixMillis::new(
                                     now.now().get() - i64::from(k) * 3 * 86_400_000,
                                 ),

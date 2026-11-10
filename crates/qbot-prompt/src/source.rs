@@ -21,7 +21,7 @@ use qbot_tools::{MemberRecord, MemberRecords};
 use qbot_wording::{Text, say};
 
 use crate::people::{
-    MemoryView, background_item, date, group_item, line, memory_item, name_entry, name_owners,
+    MemoryView, NameIndex, background_item, date, group_item, line, memory_item, name_entry,
     roster_entry,
 };
 use crate::persona::Personas;
@@ -359,7 +359,7 @@ impl PromptContext {
     /// record does or with the day, so it sits in the cached prefix. What members wrote or were
     /// called is escaped like chat and kept on its line.
     fn people_instruction(&self, people: &GroupPeople) -> Result<Option<Instruction>, EnvError> {
-        let owners = name_owners(people);
+        let owners = NameIndex::of(people);
         let entries: Vec<String> = people
             .people
             .iter()
@@ -600,24 +600,36 @@ impl PromptContext {
     }
 
     /// Members the run's context names besides its speakers, so tools can address them: the
-    /// people of the run's conversation and everyone the roster lists.
-    fn named_members(
+    /// people of the run's conversation, everyone the visible chat mentions (`[at:N]`, wherever
+    /// in the window) and everyone the roster lists.
+    async fn named_members(
+        &self,
+        group: GroupId,
         window: &[ChatLine],
         here: &BTreeMap<MemberNo, AccountId>,
         people: &GroupPeople,
-    ) -> Vec<(MemberNo, AccountId)> {
+    ) -> Result<Vec<(MemberNo, AccountId)>, EnvError> {
         let mut known: BTreeMap<MemberNo, AccountId> = people
             .people
             .iter()
             .flat_map(|p| p.members.iter().copied())
             .collect();
         known.extend(here.iter().map(|(n, a)| (*n, *a)));
+        let mut mentioned: BTreeSet<MemberNo> = window
+            .iter()
+            .flat_map(|line| numbers_after(&line.text, "[at:"))
+            .collect();
+        mentioned.retain(|n| !known.contains_key(n));
+        if !mentioned.is_empty() {
+            let mentioned: Vec<MemberNo> = mentioned.into_iter().collect();
+            known.extend(self.history.members(group, &mentioned).await?);
+        }
         for line in window {
             if let Speaker::Member { number, .. } = line.speaker {
                 known.remove(&number);
             }
         }
-        known.into_iter().collect()
+        Ok(known.into_iter().collect())
     }
 
     fn trigger_note(
@@ -749,7 +761,7 @@ impl ContextSource for PromptContext {
         instructions.extend(self.people_instruction(&people)?);
         instructions.extend(self.knowledge_instruction(group).await?);
         let here = self.people_here(group, &window, trigger).await?;
-        let members = Self::named_members(&window, &here, &people);
+        let members = self.named_members(group, &window, &here, &people).await?;
         // Every speaker of the visible chat is named, and everyone else the conversation involves.
         let mut named = here.clone();
         named.extend(window.iter().filter_map(|line| match line.speaker {
@@ -817,7 +829,7 @@ impl SliceBackground for PromptContext {
             .collect();
         let accounts: Vec<AccountId> = involved.iter().filter_map(|(_, a, _)| *a).collect();
         let people = self.roster(group, &accounts).await.map_err(backend)?;
-        let owners = name_owners(&people);
+        let owners = NameIndex::of(&people);
         let mut subjects: Vec<Option<AccountId>> = accounts.iter().copied().map(Some).collect();
         subjects.push(None);
         let memories = match &self.records {
@@ -856,7 +868,7 @@ impl SliceBackground for PromptContext {
                 let names: Vec<String> = person
                     .names
                     .iter()
-                    .filter(|n| Some(n.account) == *account)
+                    .filter(|n| Some(n.account) == *account && owners.shows(n))
                     .map(|n| name_entry(&self.zone, n, &owners, &own))
                     .collect();
                 if !names.is_empty() {
@@ -975,7 +987,7 @@ impl MemberRecords for PromptContext {
             return Ok(None);
         };
         let people = self.roster(group, &[account]).await.map_err(|e| e.0)?;
-        let owners = name_owners(&people);
+        let owners = NameIndex::of(&people);
         let mut out = vec![format!("member:{}", member.get())];
         if let Some(person) = people
             .people
@@ -997,7 +1009,7 @@ impl MemberRecords for PromptContext {
             let names: Vec<String> = person
                 .names
                 .iter()
-                .filter(|n| n.account == account)
+                .filter(|n| n.account == account && owners.shows(n))
                 .map(|n| name_entry(&self.zone, n, &owners, &own))
                 .collect();
             if !names.is_empty() {

@@ -10,10 +10,12 @@ stays out of the way.
   (`replies.spontaneous_chance`, off by default). The model decides whether to say anything, whom to mention
   and what to quote, and sends real QQ messages (mentions, quotes, faces, dice, contact cards).
 - **Memory grounded in the chat.** The archive of every message is the source of truth. Episodes
-  summarize fixed stretches of it; names, facts about members and the group's own terms are
-  extracted from verbatim quotes, checked by code, and fade unless confirmed again. Notes members
-  write by hand are kept separately. Members see what is known about them and remove notes, names
-and learned facts (a removed fact can be learned again from later chat).
+  summarize fixed stretches of it; the names people use for one another and memories about
+  members and the group are extracted from verbatim quotes, checked by code, and kept with who
+  said them and when; a later statement replaces or ends a memory, and what nobody repeats makes
+  way as the conversation moves on. Notes members write by hand are kept separately. Members see
+  what is kept about them and remove notes, names and memories (a removed memory can be learned
+  again from later chat).
 - **Identity, not nicknames.** Accounts belong to people; linking needs confirmation; every member
   has a stable number in the group, so people sharing a name are never confused.
 - **Pictures and voice.** Pictures are described once and archived as text, and the model can look
@@ -93,7 +95,7 @@ Postgres, a mock Responses server and a simulated NapCat.
 | `qbot-agent` | run loop, tool contract, supervisor |
 | `qbot-sched` | timers: group tasks, background jobs, recurring schedules |
 | `qbot-tools` | the model's tools |
-| `qbot-memory` | identity, episodes, extraction, facts, recall, notes |
+| `qbot-memory` | identity, names, episodes, extraction, memories, recall, notes |
 | `qbot-store` | Postgres adapters, the schema, the lease |
 | `qbot-config` | layered, typed configuration and secrets |
 | `qbot-i18n` | member-facing text: typed messages and validated catalogs (`locales/`) |

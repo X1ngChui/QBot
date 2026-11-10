@@ -89,7 +89,7 @@ impl ChatView {
     }
 
     /// Members the run's context names besides its speakers (mentioned in the chat, named in a
-    /// task's intent, in the people block): they can be addressed too.
+    /// task's intent, on the roster): they can be addressed too.
     pub fn know(&mut self, members: &[(MemberNo, AccountId)]) {
         self.roster.extend(members.iter().copied());
     }

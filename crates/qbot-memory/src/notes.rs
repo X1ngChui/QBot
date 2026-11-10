@@ -1,8 +1,8 @@
 //! Notes people write by hand about a member of a group.
 //!
-//! Notes are not memory: nothing here is inferred, scored or decayed, and extraction never reads
-//! or writes them. A note is exactly what someone typed, kept until someone removes it. Learned
-//! facts live in [`crate::facts`]; the two stores never touch each other.
+//! Notes are not memory: nothing here is inferred or ranked, and extraction never reads or
+//! writes them. A note is exactly what someone typed, kept until someone removes it. What is
+//! learned from chat lives in [`crate::memories`]; the two stores never touch each other.
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, PoisonError};

@@ -34,7 +34,8 @@ pub(crate) async fn known_names<'e>(
 ) -> Result<Vec<KnownName>, MemoryError> {
     let wanted: Option<Vec<i64>> = accounts.map(|a| a.iter().map(|x| x.get()).collect());
     let rows = sqlx::query(
-        "SELECT account_id, key, text, basis, episode_id, message_id, quote, at_ms FROM name_use \
+        "SELECT account_id, key, text, basis, episode_id, message_id, quote, anchored, at_ms \
+         FROM name_use \
          WHERE group_id = $1 AND ($2::bigint[] IS NULL OR account_id = ANY($2)) \
          ORDER BY account_id, key, at_ms, coalesce(episode_id, -1)",
     )
@@ -63,6 +64,7 @@ pub(crate) async fn known_names<'e>(
                 text: row.get("text"),
                 basis,
                 source,
+                anchored: row.get("anchored"),
                 at: UnixMillis::new(row.get("at_ms")),
             },
         ));
@@ -84,8 +86,8 @@ impl NameStore for PgNameStore {
             }
             let done = sqlx::query(
                 "INSERT INTO name_use (group_id, account_id, key, text, basis, episode_id, \
-                 message_id, quote, at_ms) \
-                 SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9 \
+                 message_id, quote, at_ms, anchored) \
+                 SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10 \
                  WHERE EXISTS (SELECT 1 FROM account WHERE account_id = $2) \
                    AND NOT EXISTS (SELECT 1 FROM name_removed \
                                    WHERE group_id = $1 AND account_id = $2 AND key = $3) \
@@ -100,6 +102,7 @@ impl NameStore for PgNameStore {
             .bind(source.message.get())
             .bind(&source.quote)
             .bind(one.at.get())
+            .bind(one.anchored)
             .execute(&mut *tx)
             .await
             .map_err(backend)?;

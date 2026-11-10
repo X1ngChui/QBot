@@ -45,8 +45,8 @@ pub use memories::{
     Support,
 };
 pub use names::{
-    KnownName, MemoryNameStore, NameBasis, NameError, NameStore, NameTextError, NameUse, UseSource,
-    name_key,
+    CORROBORATED_USES, KnownName, MemoryNameStore, NameBasis, NameError, NameStore, NameTextError,
+    NameUse, UseSource, name_key,
 };
 pub use notes::{MemoryNoteStore, Note, NoteId, NoteStore};
 pub use recall::{Recall, RecallError, RecallParams, rank};

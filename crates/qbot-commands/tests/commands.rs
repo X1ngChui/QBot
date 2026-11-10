@@ -617,6 +617,7 @@ async fn names_are_set_listed_and_removed_with_how_each_was_used() {
             message: MessageId::new(episode).unwrap(),
             quote: "Boss".into(),
         }),
+        anchored: false,
         at: UnixMillis::new(T0),
     };
     rig.names
@@ -1228,6 +1229,83 @@ async fn who_shows_memories_with_their_source_and_forget_removes_one_by_its_id()
 }
 
 #[tokio::test]
+async fn who_lists_memories_that_no_longer_hold_so_they_can_be_forgotten() {
+    let rig = rig().await;
+    let g = GroupId::new(900).unwrap();
+    let support = |episode: i64| Support {
+        episode: EpisodeId::new(episode),
+        message: MessageId::new(episode).unwrap(),
+        author: Some(acct(ALICE)),
+        quote: "q".into(),
+        at: UnixMillis::new(T0),
+    };
+    let old = rig
+        .remember(Some(ALICE), None, "lives in Hangzhou", 1)
+        .await;
+    let quit = rig.remember(Some(ALICE), None, "plays chess", 2).await;
+    let new = rig
+        .memories
+        .apply(
+            g,
+            &[
+                Change::Replace {
+                    id: old,
+                    with: Statement {
+                        subject: Some(acct(ALICE)),
+                        term: None,
+                        text: "lives in Ningbo".into(),
+                        durability: Durability::Lasting,
+                        support: support(3),
+                    },
+                },
+                Change::End {
+                    id: quit,
+                    subject: Some(acct(ALICE)),
+                    at: UnixMillis::new(T0),
+                },
+            ],
+        )
+        .await
+        .unwrap()[0];
+    let who = rig.say(ALICE, "/who", &[]).await;
+    assert!(
+        who.contains(&format!(
+            "Remembered from chat (1):\n{} lives in Ningbo (they said so; 1 conversation(s), last 2027-01-15)\nNo longer holds, still kept (2):\n{} lives in Hangzhou (replaced 2027-01-15)\n{} plays chess (said to have ended 2027-01-15)\nRemove a note",
+            new.label(),
+            old.label(),
+            quit.label()
+        )),
+        "{who}"
+    );
+    assert_eq!(
+        rig.say(ALICE, &format!("/forget {}", old.label()), &[])
+            .await,
+        format!("Forgot {}: lives in Hangzhou", old.label())
+    );
+    let who = rig.say(ALICE, "/who", &[]).await;
+    assert!(
+        who.contains("No longer holds, still kept (1):") && !who.contains("Hangzhou"),
+        "{who}"
+    );
+    // History alone is still listed, with the hint.
+    rig.say(ALICE, &format!("/forget {}", new.label()), &[])
+        .await;
+    let who = rig.say(ALICE, "/who", &[]).await;
+    assert!(
+        who.contains("Remembered from chat: nothing")
+            && who.contains("plays chess (said to have ended")
+            && who.contains("/forget ID"),
+        "{who}"
+    );
+    assert!(
+        !rig.say(OWNER, "/who", &[BOB])
+            .await
+            .contains("No longer holds"),
+        "nothing closed, no section"
+    );
+}
+
+#[tokio::test]
 async fn notes_are_written_listed_edited_and_removed_by_hand() {
     use qbot_memory::NoteStore;
     let rig = rig().await;
@@ -1434,7 +1512,7 @@ async fn logs_shows_the_latest_warnings_and_errors() {
 }
 
 /// Mute and block hold for commands as for runs: in a muted group only owners are answered, and
-/// a blocked member is not answered (nor can they write notes into every run's people block).
+/// a blocked member is not answered (nor can they write notes that runs are shown).
 #[tokio::test]
 async fn muted_groups_and_blocked_members_get_no_command_replies() {
     let rig = rig().await;

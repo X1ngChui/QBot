@@ -1,4 +1,4 @@
-description = "Two members are called 老王: people call member 1 that in many conversations, and once someone used it for member 3. A member asks what 老王 is busy with lately. The roster in the instructions lists the name for both, with how often, and marks it as shared. The bot should take it as the member the group mostly means (member 1, who is preparing for a driving test) or ask which 老王 is meant; it must not attribute member 3's night shifts to the 老王 asked about as if certain."
+description = "Two members are called 老王: people call member 1 that in many conversations, and once someone used it for member 3. A member asks what 老王 is busy with lately. The roster in the instructions lists the name for member 1 only: a name used once for someone, with nothing tying it to them, is kept but not shown. The bot should take it as the member the group means (member 1, who is preparing for a driving test) or ask which 老王 is meant; it must not attribute member 3's night shifts to the 老王 asked about as if certain."
 
 members = [
   { number = 1, account = 50001, name = "王小川" },

@@ -347,6 +347,9 @@ name-how_others = 别人在 { $count } 段对话中这样叫，最近 { $date }
 name-how_shared = 也用来叫 { $members }
 who-memories = 从聊天中记住的（{ $count } 条）：
 who-no_memories = 从聊天中记住的：暂无
+who-history = 已不成立但仍保留的（{ $count } 条）：
+memory-replaced_line = { $id } { $text }（{ $date } 被新说法取代）
+memory-ended_line = { $id } { $text }（{ $date } 说已不再如此）
 memory-line = { $id } { $text }（{ $source }；{ $count } 段对话，最近 { $date }）
 memory-source_own = 本人说的
 memory-source_others = 别人说的
@@ -370,7 +373,7 @@ detail-forget =
     删除 bot 自己从聊天中记住的内容及其来源：/who 中同一范围内该编号的记忆、关于该成员的全部记忆，或 /group 中该编号的群记忆。不影响人工备注（用 /note 管理）和称呼（用 /name remove）。成员删除关于自己的内容；授权管理员还可删除本群普通成员的；owner 可删除任何人的。
 detail-who =
     /who [--linked] [@账号]
-    显示群名片、大家对此人的称呼、人工备注，以及 bot 从聊天中记住的内容（谁说的、何时说的）。默认查看当前精确账号；--linked 包括关联账号。成员查看自己的记录；授权管理员还可查看本群普通成员的；owner 可查看任何人的。
+    显示大家对此人的称呼、人工备注，以及 bot 从聊天中记住的内容（谁说的、何时说的），包括已被新说法取代或说已不再如此、但仍保留的记忆（删除前一直保留）。默认查看当前精确账号；--linked 包括关联账号。成员查看自己的记录；授权管理员还可查看本群普通成员的；owner 可查看任何人的。
 detail-name =
     /name [--linked] [@账号]
     /name add [--linked] [@账号] 称呼

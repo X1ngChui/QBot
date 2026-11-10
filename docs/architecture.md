@@ -628,7 +628,7 @@ accounts linked here is a bot owner's or a delegated admin's.
 
 | Command | Member | Delegated admin (its group only) | Bot owner |
 | --- | --- | --- | --- |
-| `/who [--linked] [@m]`: names, notes, memories on record | self | self, ordinary members | anyone |
+| `/who [--linked] [@m]`: names, notes, memories on record (those that no longer hold too) | self | self, ordinary members | anyone |
 | `/note` `add` `edit N` `remove N` `clear` | self | self, ordinary members, except notes a bot owner wrote | anyone |
 | `/name` `add` `remove` | self | self, ordinary members | anyone |
 | `/forget [--linked] [@m] ID`, `/forget all`: one memory, or all about the member | self | self, ordinary members | anyone |
@@ -756,8 +756,8 @@ spend.
 - Member numbers are assigned densely under a per-group advisory lock and are immutable: a
   trigger rejects any update, delete or truncate of `member_number`. A group's slices cannot
   overlap, whether episodes or skipped (`slice_skip`): range exclusion constraints, and a check
-  across the two tables under the group's slice lock. One active claim per subject, slot,
-  predicate and value (a partial unique index).
+  across the two tables under the group's slice lock. One current memory per subject and key
+  (a partial unique index), and one name use per member, name and episode.
 - **Single instance**: the process takes a Postgres advisory-lock session lease before it migrates
   or recovers anything, checks it every ten seconds, and shuts down if it loses it. A check that does not answer within the interval
   counts as lost: on a hung connection only an answer proves the lock is still held.

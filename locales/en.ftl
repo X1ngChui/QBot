@@ -91,7 +91,7 @@ detail-admin =
     /admin
     /admin add @account
     /admin remove @account
-    In this group only, a delegated admin may use /mute, /block and /members, and manage the names, notes and learned facts of ordinary members (/who, /name, /note, /forget); never of a bot owner or another delegated admin, and never a bot owner's notes or blocks. Only a bot owner adds or removes delegated admins; the permission belongs to that account alone, not to accounts linked to it.
+    In this group only, a delegated admin may use /mute, /block and /members, and manage the names, notes and memories of ordinary members (/who, /name, /note, /forget); never of a bot owner or another delegated admin, and never a bot owner's notes or blocks. Only a bot owner adds or removes delegated admins; the permission belongs to that account alone, not to accounts linked to it.
 usage-admin = Usage: /admin, /admin add @account or /admin remove @account
 admin-list_empty = This group has no delegated admins.
 admin-list_header = Delegated admins of this group:
@@ -421,6 +421,9 @@ name-how_others = others call them so in { $count } conversation(s), last { $dat
 name-how_shared = also used for { $members }
 who-memories = Remembered from chat ({ $count }):
 who-no_memories = Remembered from chat: nothing
+who-history = No longer holds, still kept ({ $count }):
+memory-replaced_line = { $id } { $text } (replaced { $date })
+memory-ended_line = { $id } { $text } (said to have ended { $date })
 memory-line = { $id } { $text } ({ $source }; { $count } conversation(s), last { $date })
 memory-source_own = they said so
 memory-source_others = others said so
@@ -444,7 +447,7 @@ detail-forget =
     Deletes what the bot remembered on its own, with where it came from: the memory with that ID in /who (same scope), every memory about the member, or the group memory with that ID in /group. Notes people wrote are not affected; use /note for those, and /name remove for names. Members forget what is remembered about them; delegated admins also about ordinary members in this group; owners about anyone.
 detail-who =
     /who [--linked] [@account]
-    Shows what the member is shown as, the names people use for them, notes people wrote, and what the bot remembers from chat with who said it and when. Shows the exact account by default; --linked includes its linked accounts. Members see their own record; delegated admins also ordinary members' in this group; owners anyone's.
+    Shows the names people use for the member, notes people wrote, and what the bot remembers from chat with who said it and when, including memories a later statement replaced or ended (still kept until forgotten). Shows the exact account by default; --linked includes its linked accounts. Members see their own record; delegated admins also ordinary members' in this group; owners anyone's.
 detail-name =
     /name [--linked] [@account]
     /name add [--linked] [@account] name

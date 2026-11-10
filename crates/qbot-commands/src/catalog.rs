@@ -10,7 +10,7 @@ pub enum Command {
     Note,
     /// The names a member is called by.
     Name,
-    /// Removes what the bot learned from chat (member facts, group knowledge).
+    /// Removes what the bot remembers from chat (memories about a member or the group).
     Forget,
     Link,
     Unlink,

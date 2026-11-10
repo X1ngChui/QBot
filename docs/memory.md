@@ -148,6 +148,19 @@ is what the group shows: the group nickname, else the account nickname.
   once reads exactly so, and a name used for several members (or that is another member's display
   name) is marked as shared. Nothing resolves a name automatically: the model reads the uses and
   the conversation, and asks when they do not tell.
+- *A name others use needs an anchor before it is shown.* A use with basis `addressed` or
+  `about` is the extractor's reading of a line, and a line that mentions or answers someone can
+  still be naming a third person. So such a name is shown to a model (the roster, the
+  extractor's "Who is who", `about_member`) only when something ties it to the member: a person
+  set it; the member gave it themselves; the member answered the line that used it (a later line
+  of theirs in the slice replies to it, recorded as `name_use.anchored`); or it is at least two
+  characters long and part of a display name their lines were sent under. Without an anchor it
+  is kept, and shown once `CORROBORATED_USES` (2) conversations used it for that member and no
+  other person has a claim to it (an anchor of their own, as many conversations, or it being
+  their current display name); two people with unanchored claims to one name are both left
+  out. `/who` and `/name` list every recorded name, shown or not, so a member can remove one.
+  The rule is applied on read (`qbot_prompt::people::NameIndex`): nothing is deleted, and a name
+  appears as soon as it is corroborated.
 - A name a person removed (`/name remove`) loses its uses and is suppressed for that member
   (`name_removed`): chat using it again is not recorded until a person sets it again. A set name
   is not set for a member outside those given while it is set for another (`NameTaken`); learned
@@ -256,10 +269,12 @@ their findings and the archive its lines: something said again is learned again.
 
 **Consolidation** applies each episode's findings right after it is stored and, for any left over
 by a crash, at the start of the group's next extraction: name uses to the name index, statements
-as changes in chat order, then room. Every step is idempotent: an episode records a use and
+as changes in the order the extractor listed them (one per memory: its last line), then room. Every step is idempotent: an episode records a use and
 supports a memory at most once.
 
-**Erasure.** `/forget ID` deletes one memory and its evidence, `/forget all` every memory about a
+**Erasure.** `/who` lists a member's current memories and, apart, those a later statement
+replaced or ended (still kept), each with its id. `/forget ID` deletes one memory of either kind
+and its evidence, `/forget all` every memory about a
 member, `/forget group ID` (owners) a group memory; `/name remove` a name. Deletion is real: the
 row and its evidence go. An episode already applied is never applied again, so a forgotten memory
 comes back only if someone says it again. The episode's own findings and the archive's lines are
@@ -267,8 +282,9 @@ records of what was said and stay (section 9).
 
 **Cases** (`qbot-memory/tests/pipeline.rs`, `qbot-prompt/tests/prompt.rs`, `eval/scenarios`):
 - *A shared name*: "Boss" used for one member in eight conversations and for another once is
-  listed for both, each with its count, and marked as also used for the other; the reply model
-  goes by the conversation or asks (`shared_name`).
+  shown for the first only: one unanchored use is a guess (`shared_name`). Anchored for both
+  (each answered to it, or set it), it is listed for both and marked as also used for the other,
+  and the reply model goes by the conversation or asks.
 - *An old display name*: a member asked about by the name they were shown as before is found by
   the roster's earlier display names (`former_display_name`).
 - *Moved*: "lives in Hangzhou" replaced by "lives in Ningbo"; replies see Ningbo, `about_member`

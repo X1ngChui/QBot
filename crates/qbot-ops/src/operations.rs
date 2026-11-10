@@ -27,8 +27,8 @@ pub struct OpsConfig {
 
 impl OpsConfig {
     /// The nightly upkeep around the deployment's choices (backups, how long records are kept,
-    /// who gets the report, the time zone). Beliefs are not expired: what nobody repeats loses
-    /// confidence, computed on read, and stays (`qbot_memory::belief`). A cached picture
+    /// who gets the report, the time zone). Memories are not aged here: their rank follows the
+    /// conversation and is computed on read (`qbot_memory::worth`). A cached picture
     /// description is dropped after 15 days (it serves reposts, which come within days,
     /// and must not grow with the archive; what was archived keeps its words).
     pub fn new(

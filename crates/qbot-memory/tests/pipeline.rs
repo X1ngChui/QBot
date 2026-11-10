@@ -1032,6 +1032,7 @@ async fn an_episodes_findings_become_name_uses_and_memories_once() {
     // A name is a use: one per member, name and episode, the strongest way the episode used it.
     let known = names.names(group(), None).await.unwrap();
     assert_eq!(known.len(), 1);
+    assert!(known[0].vouched(), "the member gave it themselves");
     assert_eq!(
         (
             known[0].key.as_str(),
@@ -1478,6 +1479,8 @@ fn how_a_line_uses_a_name_is_checked_against_the_line() {
         said(4, 12, 3, "Kit is late again"),
         said(5, 12, 3, "Wren said so"),
         shown,
+        // The member answers the line that called them Kitty; nobody answers the others.
+        said(7, 11, 2, "[reply:1003] on my way"),
     ];
     let name = |member: u32, name: &str, basis: UseArg, line: u32, quote: &str| NameArg {
         member,
@@ -1519,6 +1522,15 @@ fn how_a_line_uses_a_name_is_checked_against_the_line() {
             ("Kitty", NameBasis::Addressed),
         ],
         "a reply to their message addresses them"
+    );
+    assert_eq!(
+        findings
+            .names
+            .iter()
+            .map(|n| n.anchored)
+            .collect::<Vec<_>>(),
+        [false, false, true],
+        "a name someone else used is anchored when the member answers that line"
     );
     let reasons = dropped.join("\n");
     for expected in [

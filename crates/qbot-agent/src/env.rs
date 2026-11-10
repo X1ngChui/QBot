@@ -87,8 +87,8 @@ pub struct HistoryQuery {
 /// This is the authoritative name of a member in a group, their group display name: the group
 /// nickname they set for this group (OneBot `card`), or their account nickname (`nickname`) where
 /// they set none, as QQ shows it. It is read live, never stored,
-/// so it is never stale; stored names (`qbot_memory` aliases) are what people call someone
-/// besides it. A name comes marker-safe (`qbot_core::marker::escape_markers`), so it can be shown
+/// so it is never stale; the archive keeps the name each line was sent under, and
+/// `qbot_memory::names` what people call someone besides it. A name comes marker-safe (`qbot_core::marker::escape_markers`), so it can be shown
 /// wherever chat text is.
 #[async_trait]
 pub trait Directory: Send + Sync {
@@ -130,7 +130,7 @@ pub struct OpenedContext {
     /// The chat window at trigger time.
     pub window: Vec<ChatLine>,
     /// Members the context names besides the window's speakers: mentioned in its lines, named in
-    /// a task's intent, or in the people block. Tools may address them like the speakers.
+    /// a task's intent, or listed on the roster. Tools may address them like the speakers.
     pub members: Vec<(MemberNo, AccountId)>,
     /// Lower-trust note about the trigger (for example a task intent), appended after the window.
     pub trigger_note: Option<Instruction>,

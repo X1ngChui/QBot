@@ -1,5 +1,9 @@
 # System review: requirements, agent design and target architecture
 
+> A record of October 2026. Active memory (names, facts, the people block) has been rebuilt
+> since: what this document says about them describes the design reviewed then, not the code.
+> See [memory-design.md](memory-design.md) and [memory.md](memory.md).
+
 A whole-system review of QBot (October 2026): what the product must do in a shared QQ group,
 how the implementation measures up against that and against current agent-design guidance, which
 design was chosen for the problems found, and why. [architecture.md](architecture.md) stays the

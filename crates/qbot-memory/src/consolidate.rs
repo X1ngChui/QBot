@@ -81,6 +81,7 @@ impl Consolidator {
                         message: n.message,
                         quote: n.quote.clone(),
                     }),
+                    anchored: n.anchored,
                     at,
                 })
                 .collect(),

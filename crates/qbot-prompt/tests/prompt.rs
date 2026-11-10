@@ -523,8 +523,19 @@ impl PeopleSource for FixedPeople {
     }
 }
 
+/// A name others used for the account in `others` conversations, in each of which the member
+/// answered to it.
 fn known(account: i64, text: &str, set: bool, others: u32) -> qbot_memory::KnownName {
     qbot_memory::KnownName {
+        anchored: others,
+        ..unanchored(account, text, set, others)
+    }
+}
+
+/// A name others used for the account in `others` conversations with nothing tying it to them.
+fn unanchored(account: i64, text: &str, set: bool, others: u32) -> qbot_memory::KnownName {
+    qbot_memory::KnownName {
+        anchored: 0,
         account: AccountId::new(account).unwrap(),
         text: text.into(),
         key: qbot_memory::name_key(text).unwrap(),
@@ -638,6 +649,97 @@ async fn the_roster_says_who_is_shown_as_what_and_whom_each_name_is_used_for() {
         ctx.open(g, &trigger).await.unwrap().instructions,
         opened.instructions,
         "the same records, the same prefix"
+    );
+}
+
+#[tokio::test]
+async fn a_name_nothing_ties_to_a_member_is_not_shown_until_a_second_conversation_agrees() {
+    use qbot_prompt::{Person, ShownName};
+    let g = GroupId::new(900).unwrap();
+    let no = MemberNo::new;
+    let acc = |n: i64| AccountId::new(n).unwrap();
+    let at = UnixMillis::new(1_700_000_000_000);
+    let person =
+        |number: u32, account: i64, shown: &str, names: Vec<qbot_memory::KnownName>| Person {
+            members: vec![(no(number), acc(account))],
+            shown: vec![ShownName {
+                member: no(number),
+                text: shown.into(),
+                last: at,
+            }],
+            names,
+            active: Some(at),
+            ..Person::default()
+        };
+    let own = qbot_memory::KnownName {
+        own: 1,
+        ..unanchored(30, "Trey", false, 0)
+    };
+    let names = vec![
+        // Used once for member 1, nothing ties it to them: kept, not shown.
+        (1, unanchored(10, "Guess", false, 1)),
+        // Used in two conversations for member 1, nobody else has it: shown.
+        (1, unanchored(10, "Ace", false, 2)),
+        // Part of member 2's display name: shown on a single use.
+        (2, unanchored(20, "Wang", false, 1)),
+        // Member 2 answered to it once: shown.
+        (2, known(20, "Deuce", false, 1)),
+        // Member 3 gave it themselves: shown.
+        (3, own),
+        // Two conversations each for members 1 and 3, neither anchored: whose it is is open.
+        (1, unanchored(10, "Boss", false, 2)),
+        (3, unanchored(30, "Boss", false, 3)),
+        // Two conversations for member 1, but it is how member 4 is shown: not shown.
+        (1, unanchored(10, "Quad", false, 2)),
+        // Used once for member 4 and anchored for member 2: only member 2's is shown.
+        (4, unanchored(40, "Deuce", false, 1)),
+    ];
+    let of = |account: i64| {
+        names
+            .iter()
+            .filter(|(_, n)| n.account == acc(account))
+            .map(|(_, n)| n.clone())
+            .collect::<Vec<_>>()
+    };
+    let people = GroupPeople {
+        people: vec![
+            person(1, 10, "Ann", of(10)),
+            person(2, 20, "Wang Lei", of(20)),
+            person(3, 30, "Cy", of(30)),
+            person(4, 40, "Quad", of(40)),
+        ],
+        names: names.iter().map(|(n, k)| (no(*n), k.clone())).collect(),
+    };
+    let ctx =
+        context(Personas::single(persona("Bobo", ""))).with_people(Arc::new(FixedPeople(people)));
+    let opened = ctx
+        .open(
+            g,
+            &Trigger::Addressed {
+                message: MessageId::new(5).unwrap(),
+                sender: acc(1),
+            },
+        )
+        .await
+        .unwrap();
+    let called: Vec<&str> = opened.instructions[3]
+        .text
+        .lines()
+        .filter(|l| l.starts_with("member:") || l.starts_with("  called:"))
+        .collect();
+    assert_eq!(
+        called,
+        [
+            "member:1",
+            "  called: \"Ace\" (others call them so in 2 conversation(s), last 2023-11-15)",
+            "member:2",
+            "  called: \"Wang\" (others call them so in 1 conversation(s), last 2023-11-15), \"Deuce\" (others call them so in 1 conversation(s), last 2023-11-15)",
+            "member:3",
+            "  called: \"Trey\" (they call themselves so in 1 conversation(s))",
+            "member:4",
+        ],
+        "a hidden name is not listed, and is not what makes another's name shared: {}",
+        opened.instructions[3].text
     );
 }
 
@@ -1315,6 +1417,35 @@ async fn members_the_context_names_can_be_addressed_though_they_did_not_speak() 
         "a member mentioned in the chat and the one the task is for"
     );
     assert_eq!(opened.members[1].1, AccountId::new(1007).unwrap());
+}
+
+#[tokio::test]
+async fn a_member_mentioned_anywhere_in_the_visible_chat_can_be_addressed() {
+    let g = GroupId::new(900).unwrap();
+    let at = 1_700_000_000_000;
+    // The mention is the oldest of 100 visible lines, far before the newest 50 whose people the
+    // run is shown memories of.
+    let mut lines = vec![line(1, 1, 3, at, "ask [at:4] about it")];
+    lines.extend((2..=100).map(|m| line(m, 1, 3, at, "chatter")));
+    let ctx = PromptContext::new(
+        Arc::new(FixedHistory(lines)),
+        Personas::single(persona("Bobo", "")),
+        Arc::new(Clock0),
+        PromptSettings {
+            window: HistoryWindow::default(),
+            timezone: "Asia/Shanghai".into(),
+        },
+    )
+    .unwrap();
+    let opened = ctx.open(g, &addressed(100)).await.unwrap();
+    assert!(
+        opened.window.iter().any(|l| l.text.contains("[at:4]")),
+        "the mention is in the visible chat"
+    );
+    assert_eq!(
+        opened.members,
+        [(MemberNo::new(4), AccountId::new(1004).unwrap())]
+    );
 }
 
 #[tokio::test]

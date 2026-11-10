@@ -52,9 +52,9 @@ pub struct NewEpisode {
     /// Which prompt and rules produced it.
     pub method: String,
     pub model: String,
-    /// Names, facts and group knowledge found in the slice, validated, waiting to be (or already)
-    /// applied to identity and facts. Stored with the episode so nothing found is lost between
-    /// the two.
+    /// Name uses and memory changes found in the slice, validated, waiting to be (or already)
+    /// applied to the name index and the memories. Stored with the episode so nothing found is
+    /// lost between the two.
     #[serde(default)]
     pub findings: Findings,
 }

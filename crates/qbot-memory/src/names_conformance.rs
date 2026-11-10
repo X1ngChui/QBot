@@ -29,6 +29,7 @@ fn used(account: AccountId, text: &str, basis: NameBasis, episode: i64) -> NameU
             message: MessageId::new(episode * 10).unwrap(),
             quote: format!("... {text} ..."),
         }),
+        anchored: false,
         at: at(episode),
     }
 }
@@ -62,6 +63,17 @@ async fn uses_add_up_per_member_and_name(store: &dyn NameStore) {
     let names = store.names(g, None).await.unwrap();
     let ming = find(&names, p, "ming").expect("one entry for every spelling");
     assert_eq!((ming.own, ming.addressed, ming.about), (1, 1, 1));
+    assert_eq!(ming.anchored, 0);
+    // The member answered to "Q" in one of two conversations.
+    let answered = NameUse {
+        anchored: true,
+        ..used(q, "q", NameBasis::About, 4)
+    };
+    store.record(g, &[answered]).await.unwrap();
+    let names = store.names(g, None).await.unwrap();
+    let called = find(&names, q, "q").unwrap();
+    assert_eq!((called.uses(), called.anchored), (2, 1));
+    assert!(called.vouched() && !find(&names, p, "ming").unwrap().set);
     assert_eq!(ming.uses(), 3);
     assert!(!ming.set);
     assert_eq!(ming.last, at(3));
@@ -70,6 +82,19 @@ async fn uses_add_up_per_member_and_name(store: &dyn NameStore) {
         "as most recently written, whitespace collapsed"
     );
     assert_eq!(store.names(g, Some(&[q])).await.unwrap().len(), 1);
+    let boss = [
+        used(q, "Boss", NameBasis::About, 5),
+        NameUse {
+            anchored: true,
+            ..used(q, "boss", NameBasis::Addressed, 5)
+        },
+    ];
+    let kept = crate::names::strongest_per_name(boss.to_vec());
+    assert_eq!(kept.len(), 1);
+    assert!(
+        kept[0].basis == NameBasis::Addressed && kept[0].anchored,
+        "one use per episode: its strongest basis, anchored if any was"
+    );
 }
 
 async fn a_shared_name_is_visible_as_shared(store: &dyn NameStore) {

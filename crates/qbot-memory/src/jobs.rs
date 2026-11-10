@@ -52,7 +52,7 @@ impl EpisodeJobs {
         }
     }
 
-    /// Apply each new episode's findings to identity and facts as it is stored.
+    /// Apply each new episode's findings to the name index and the memories as it is stored.
     pub fn with_consolidator(mut self, consolidator: Arc<Consolidator>) -> Self {
         self.consolidator = Some(consolidator);
         self

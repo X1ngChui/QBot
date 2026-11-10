@@ -7,9 +7,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use qbot_core::marker::escape_markers;
-use qbot_core::{MemberNo, UnixMillis};
+use qbot_core::{AccountId, MemberNo, UnixMillis};
 use qbot_memory::memories::Memory;
-use qbot_memory::names::{KnownName, name_key};
+use qbot_memory::names::{CORROBORATED_USES, KnownName, name_key};
 use qbot_memory::worth::HalfLives;
 use qbot_store::{GroupPeople, Person};
 use qbot_wording::{Text, say};
@@ -43,25 +43,87 @@ fn numbers(members: impl IntoIterator<Item = MemberNo>) -> String {
         .join(", ")
 }
 
-/// Which members each name (by key) stands for in the group: the names people use and what each
-/// listed member is shown as now.
-pub(crate) fn name_owners(people: &GroupPeople) -> BTreeMap<String, BTreeSet<MemberNo>> {
-    let mut owners: BTreeMap<String, BTreeSet<MemberNo>> = BTreeMap::new();
-    for (number, name) in &people.names {
-        owners.entry(name.key.clone()).or_default().insert(*number);
-    }
-    for person in &people.people {
-        let mut latest: BTreeSet<MemberNo> = BTreeSet::new();
-        for shown in &person.shown {
-            // Shown names are the most recent first: each member's first is the current one.
-            if latest.insert(shown.member)
-                && let Ok(key) = name_key(&shown.text)
-            {
-                owners.entry(key).or_default().insert(shown.member);
+/// The group's names as prompts may show them.
+///
+/// A name others use for a member is shown when something ties it to them: a person set it,
+/// the member gave it or answered to it, or it is part of a display name of theirs. Without
+/// such an anchor it is one model's reading of a line, so it is kept but not shown until
+/// [`CORROBORATED_USES`] conversations used it for that member and no other person has a claim to
+/// it (an anchor, as many conversations, or it being their display name).
+#[derive(Debug, Default)]
+pub(crate) struct NameIndex {
+    /// The names shown, by account and key.
+    shown: BTreeSet<(AccountId, String)>,
+    /// Which members each shown name (and each listed member's current display name) stands for.
+    owners: BTreeMap<String, BTreeSet<MemberNo>>,
+}
+
+impl NameIndex {
+    pub(crate) fn of(people: &GroupPeople) -> Self {
+        // The person each account belongs to (linked accounts are one), and the display names
+        // each account's lines were sent under.
+        let mut person: BTreeMap<AccountId, usize> = BTreeMap::new();
+        let mut displayed: BTreeMap<AccountId, Vec<String>> = BTreeMap::new();
+        let mut owners: BTreeMap<String, BTreeSet<MemberNo>> = BTreeMap::new();
+        // Display names that are someone's now, by key: a claim to the name like any other.
+        let mut current: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
+        for (index, p) in people.people.iter().enumerate() {
+            let mut latest: BTreeSet<MemberNo> = BTreeSet::new();
+            for (number, account) in &p.members {
+                person.insert(*account, index);
+                for shown in p.shown.iter().filter(|s| s.member == *number) {
+                    let Ok(key) = name_key(&shown.text) else {
+                        continue;
+                    };
+                    // Shown names are the most recent first: a member's first is the current one.
+                    if latest.insert(shown.member) {
+                        owners.entry(key.clone()).or_default().insert(*number);
+                        current.entry(key.clone()).or_default().insert(index);
+                    }
+                    displayed.entry(*account).or_default().push(key);
+                }
             }
         }
+        // Accounts the roster does not list are each their own person.
+        let unlisted = people.people.len();
+        let person_of = |account: AccountId| {
+            person.get(&account).copied().unwrap_or_else(|| {
+                unlisted
+                    + people
+                        .names
+                        .iter()
+                        .position(|(_, n)| n.account == account)
+                        .unwrap_or_default()
+            })
+        };
+        let anchored = |name: &KnownName| {
+            name.vouched()
+                || (name.key.chars().count() >= 2
+                    && displayed
+                        .get(&name.account)
+                        .is_some_and(|keys| keys.iter().any(|k| k.contains(&name.key))))
+        };
+        let strong = |name: &KnownName| anchored(name) || name.uses() >= CORROBORATED_USES;
+        let mut shown = BTreeSet::new();
+        for (number, name) in &people.names {
+            let me = person_of(name.account);
+            let contested = people.names.iter().any(|(_, other)| {
+                other.key == name.key && person_of(other.account) != me && strong(other)
+            }) || current
+                .get(&name.key)
+                .is_some_and(|theirs| theirs.iter().any(|p| *p != me));
+            if anchored(name) || (name.uses() >= CORROBORATED_USES && !contested) {
+                shown.insert((name.account, name.key.clone()));
+                owners.entry(name.key.clone()).or_default().insert(*number);
+            }
+        }
+        Self { shown, owners }
     }
-    owners
+
+    /// Whether prompts show this name for its member.
+    pub(crate) fn shows(&self, name: &KnownName) -> bool {
+        self.shown.contains(&(name.account, name.key.clone()))
+    }
 }
 
 /// How a name is used for a member: set by a person, given by them, used by others, and the
@@ -69,7 +131,7 @@ pub(crate) fn name_owners(people: &GroupPeople) -> BTreeMap<String, BTreeSet<Mem
 pub(crate) fn name_entry(
     zone: &TimeZone,
     name: &KnownName,
-    owners: &BTreeMap<String, BTreeSet<MemberNo>>,
+    index: &NameIndex,
     own_members: &[MemberNo],
 ) -> String {
     let mut how = Vec::new();
@@ -88,7 +150,8 @@ pub(crate) fn name_entry(
             date: date(zone, name.last),
         }));
     }
-    let shared: Vec<MemberNo> = owners
+    let shared: Vec<MemberNo> = index
+        .owners
         .get(&name.key)
         .into_iter()
         .flatten()
@@ -107,8 +170,8 @@ pub(crate) fn name_entry(
 }
 
 /// The names of a person worth listing beside what they are shown as: every set name, and
-/// learned ones that are not merely a display name of theirs.
-pub(crate) fn names_beyond_shown(person: &Person) -> Vec<&KnownName> {
+/// learned ones the index shows that are not merely a display name of theirs.
+pub(crate) fn names_beyond_shown<'a>(person: &'a Person, index: &NameIndex) -> Vec<&'a KnownName> {
     let shown: BTreeSet<String> = person
         .shown
         .iter()
@@ -117,16 +180,12 @@ pub(crate) fn names_beyond_shown(person: &Person) -> Vec<&KnownName> {
     person
         .names
         .iter()
-        .filter(|n| n.set || !shown.contains(&n.key))
+        .filter(|n| index.shows(n) && (n.set || !shown.contains(&n.key)))
         .collect()
 }
 
 /// One roster entry; `None` when nothing is known beyond the member number.
-pub(crate) fn roster_entry(
-    zone: &TimeZone,
-    person: &Person,
-    owners: &BTreeMap<String, BTreeSet<MemberNo>>,
-) -> Option<String> {
+pub(crate) fn roster_entry(zone: &TimeZone, person: &Person, index: &NameIndex) -> Option<String> {
     let members: Vec<MemberNo> = person.members.iter().map(|(n, _)| *n).collect();
     let mut out = vec![say(if members.len() > 1 {
         Text::PromptPersonLinked {
@@ -154,9 +213,9 @@ pub(crate) fn roster_entry(
         }
         known = true;
     }
-    let names: Vec<String> = names_beyond_shown(person)
+    let names: Vec<String> = names_beyond_shown(person, index)
         .into_iter()
-        .map(|n| name_entry(zone, n, owners, &members))
+        .map(|n| name_entry(zone, n, index, &members))
         .collect();
     if !names.is_empty() {
         out.push(say(Text::PromptPersonCalled {

@@ -183,5 +183,5 @@ The bot runs its own maintenance; nothing outside the container is needed.
   it is down the job retries. With no owners there is no report.
 - **Retention.** `maintenance.records_keep_days` (0 keeps them) bounds the operational record:
   finished runs (their transcripts, the one table that grows with every reply) and finished
-  scheduled tasks. Unused name leads fade with the default fact half-life; cached picture
-  descriptions are kept 15 days.
+  scheduled tasks. Memories are bounded per member and per group (`memory.capacity`), not
+  aged by the calendar; cached picture descriptions are kept 15 days.

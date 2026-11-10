@@ -21,6 +21,9 @@ pub struct NameFinding {
     pub name: String,
     /// Never [`NameBasis::Set`]: only a person sets a name.
     pub basis: NameBasis,
+    /// The member answered the line (a later line of theirs replies to it).
+    #[serde(default)]
+    pub anchored: bool,
     pub message: MessageId,
     pub quote: String,
 }
@@ -287,10 +290,18 @@ fn name(
             other,
         }));
     }
+    // A name someone else used is anchored when the member answers the line that used it.
+    let anchored = basis != NameBasis::Own
+        && cx.parts.iter().flat_map(|p| p.iter()).any(|later| {
+            later.ordinal > line.ordinal
+                && later.speaker == Some(account)
+                && replies(&later.text).contains(&line.message)
+        });
     Ok(NameFinding {
         account,
         name: text.to_owned(),
         basis,
+        anchored,
         message: line.message,
         quote,
     })

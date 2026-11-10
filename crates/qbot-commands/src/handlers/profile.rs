@@ -1,6 +1,6 @@
 use qbot_core::{AccountId, UnixMillis};
 use qbot_i18n::Msg;
-use qbot_memory::memories::{Memory, MemoryId};
+use qbot_memory::memories::{Memory, MemoryId, MemoryState};
 use qbot_memory::names::{KnownName, MAX_NAME_CHARS, NameError, NameTextError};
 
 use super::Reply;
@@ -181,14 +181,48 @@ fn memory_line(cx: &Cx<'_>, memory: &Memory) -> String {
     })
 }
 
-/// The current memories about these accounts, by id: the order /who lists them.
-async fn remembered(cx: &Cx<'_>, accounts: &[AccountId]) -> Result<Vec<Memory>, Fail> {
-    let subjects: Vec<Option<AccountId>> = accounts.iter().copied().map(Some).collect();
-    cx.deps
-        .memories
-        .current(cx.group(), &subjects)
-        .await
-        .map_err(storage)
+/// Every memory about these accounts: the current ones, then those a later statement replaced
+/// or ended, each by id (the order /who lists them).
+async fn remembered(
+    cx: &Cx<'_>,
+    accounts: &[AccountId],
+) -> Result<(Vec<Memory>, Vec<Memory>), Fail> {
+    let mut all = Vec::new();
+    for account in accounts {
+        all.extend(
+            cx.deps
+                .memories
+                .about(cx.group(), Some(*account))
+                .await
+                .map_err(storage)?,
+        );
+    }
+    all.sort_by_key(|m| m.id);
+    Ok(all.into_iter().partition(Memory::is_current))
+}
+
+/// A memory that no longer holds, as members read it: what it said, how it closed and when.
+fn closed_line(cx: &Cx<'_>, memory: &Memory) -> String {
+    let (id, text) = (memory.id.label(), memory.display());
+    cx.t(&match memory.state {
+        MemoryState::Replaced { at, .. } => Msg::MemoryReplacedLine {
+            id,
+            text,
+            date: date(cx, at),
+        },
+        MemoryState::Ended { at } => Msg::MemoryEndedLine {
+            id,
+            text,
+            date: date(cx, at),
+        },
+        MemoryState::Current => Msg::MemoryLine {
+            id,
+            text,
+            source: source(cx, memory),
+            count: u64::from(memory.episodes()),
+            date: date(cx, memory.last),
+        },
+    })
 }
 
 pub(crate) async fn who(cx: &Cx<'_>) -> Reply {
@@ -255,7 +289,7 @@ pub(crate) async fn who(cx: &Cx<'_>) -> Reply {
             }));
         }
     }
-    let memories = remembered(cx, &accounts).await?;
+    let (memories, closed) = remembered(cx, &accounts).await?;
     if memories.is_empty() {
         lines.push(cx.t(&Msg::WhoNoMemories {}));
     } else {
@@ -264,7 +298,14 @@ pub(crate) async fn who(cx: &Cx<'_>) -> Reply {
         }));
         lines.extend(memories.iter().map(|m| memory_line(cx, m)));
     }
-    if !notes.is_empty() || !memories.is_empty() {
+    // What a later statement replaced or ended is still kept, so it is shown and can be forgotten.
+    if !closed.is_empty() {
+        lines.push(cx.t(&Msg::WhoHistory {
+            count: closed.len() as u64,
+        }));
+        lines.extend(closed.iter().map(|m| closed_line(cx, m)));
+    }
+    if !notes.is_empty() || !memories.is_empty() || !closed.is_empty() {
         lines.push(cx.t(&Msg::WhoHint {}));
     }
     Ok(cx.fit(&lines.join("\n")))

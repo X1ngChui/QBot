@@ -30,7 +30,7 @@ pub struct CommandSettings {
     pub top_max_rows: usize,
     /// How long a link invitation stays open (shown in the reply that issues it).
     pub link_ttl: Duration,
-    /// Most notes one account may have in a group: notes are in every run's people block.
+    /// Most notes one account may have in a group: notes are in every run the member is part of.
     pub notes_per_account: usize,
     /// Rows `/runs` lists.
     pub runs_max_rows: usize,
@@ -39,7 +39,7 @@ pub struct CommandSettings {
 impl CommandSettings {
     /// The settings for `bot`. QQ shows at most 2000 characters in one message; the list sizes
     /// keep a reply to one or two screens; 20 notes per account bound what one member's notes add
-    /// to every run's people block.
+    /// to every run they are part of.
     pub fn new(bot: AccountId, owners: BTreeSet<AccountId>, zone: TimeZone) -> Self {
         Self {
             bot,

@@ -848,6 +848,7 @@ async fn the_roster_lists_who_is_who_in_its_group_only() {
             message: MessageId::new(episode).unwrap(),
             quote: "Annie".into(),
         }),
+        anchored: false,
         at: now,
     };
     names.record(g, &[used(1), used(2)]).await.unwrap();

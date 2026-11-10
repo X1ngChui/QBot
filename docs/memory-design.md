@@ -96,6 +96,14 @@ that @-mentions the member or replies to their message, *about* only on someone 
 person set (`/name`) is a use with basis *set*; a name a person removed is suppressed for that
 member until a person sets it again.
 
+A week of production showed where this still guessed: 16 of 23 learned uses were *about*, and 12
+of those came from lines that neither mention nor answer anyone, so only the extractor's reading
+tied the name to the member (and a line that mentions someone can as well be naming a third
+person). A name others use is therefore shown to a model only with an anchor (set by a person,
+given by the member, answered to by the member, or part of their display name), or once two
+conversations used it for that member and nobody else has a claim to it. Unanchored uses are
+still recorded: dropping them would make a nickname unrelated to any display name unlearnable.
+
 ### 4.2 Memories: items with provenance and history
 
 A memory is one short statement about one member (or the group) in the bot's own words, with its

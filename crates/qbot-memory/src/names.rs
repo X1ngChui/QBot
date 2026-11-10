@@ -113,6 +113,9 @@ pub struct NameUse {
     pub basis: NameBasis,
     /// `None` exactly for [`NameBasis::Set`].
     pub source: Option<UseSource>,
+    /// For a name someone else used ([`NameBasis::Addressed`], [`NameBasis::About`]): the member
+    /// answered the line, so the chat itself ties the name to them.
+    pub anchored: bool,
     pub at: UnixMillis,
 }
 
@@ -130,14 +133,27 @@ pub struct KnownName {
     pub own: u32,
     pub addressed: u32,
     pub about: u32,
+    /// Of the episodes in which others used it, those in which the member answered to it.
+    pub anchored: u32,
     /// The latest use.
     pub last: UnixMillis,
 }
+
+/// Conversations in which others must have used a name for a member before it counts without
+/// any anchor: one line a model read as naming someone is a guess, two conversations agree.
+pub const CORROBORATED_USES: u32 = 2;
 
 impl KnownName {
     /// Episodes in which the name was used for the member.
     pub fn uses(&self) -> u32 {
         self.own + self.addressed + self.about
+    }
+
+    /// Whether the records alone tie the name to the member: a person set it, the member gave
+    /// it, or the member answered to it. (A name contained in the member's display name is
+    /// anchored too; that is for whoever knows the display names to say.)
+    pub fn vouched(&self) -> bool {
+        self.set || self.own > 0 || self.anchored > 0
     }
 }
 
@@ -200,9 +216,16 @@ pub fn strongest_per_name(uses: Vec<NameUse>) -> Vec<NameUse> {
         let Ok(key) = name_key(&one.text) else {
             continue;
         };
-        match best.get(&(one.account, key.clone())) {
-            Some(kept) if kept.basis.strength() >= one.basis.strength() => {}
-            _ => {
+        // The strongest use stands for the episode; an anchor any of them has is kept.
+        match best.get_mut(&(one.account, key.clone())) {
+            Some(kept) if kept.basis.strength() >= one.basis.strength() => {
+                kept.anchored |= one.anchored;
+            }
+            Some(kept) => {
+                let anchored = kept.anchored || one.anchored;
+                *kept = NameUse { anchored, ..one };
+            }
+            None => {
                 best.insert((one.account, key), one);
             }
         }
@@ -224,8 +247,12 @@ pub fn summarize<'a>(uses: impl IntoIterator<Item = (&'a str, &'a NameUse)>) -> 
                 own: 0,
                 addressed: 0,
                 about: 0,
+                anchored: 0,
                 last: one.at,
             });
+        if one.anchored && matches!(one.basis, NameBasis::Addressed | NameBasis::About) {
+            entry.anchored += 1;
+        }
         match one.basis {
             NameBasis::Set => entry.set = true,
             NameBasis::Own => entry.own += 1,
@@ -315,6 +342,7 @@ impl NameStore for MemoryNameStore {
                     text: tidy_name(text),
                     basis: NameBasis::Set,
                     source: None,
+                    anchored: false,
                     at,
                 },
             );

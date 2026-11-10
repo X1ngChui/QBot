@@ -1,4 +1,4 @@
-//! Chat commands: `/who`, `/alias`, `/link`, `/tasks`, `/block`, `/mute` and the rest.
+//! Chat commands: `/who`, `/name`, `/link`, `/tasks`, `/block`, `/mute` and the rest.
 //!
 //! A command is recognised by the gateway (the first typed word, exactly), archived like any
 //! message, and then handled here without a model call. Every reply is a quote of the command

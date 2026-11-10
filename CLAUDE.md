@@ -5,7 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 QBot is an AI member for QQ group chats: a Rust service (`qbot run`) that NapCat (OneBot v11)
 connects to over a reverse WebSocket, backed by PostgreSQL 17 + pgvector. Read
 `docs/architecture.md` before larger changes; it is the authoritative design doc, with
-`docs/memory.md` for identity, episodes, extraction and recall. Develop on `dev`; `main` is the
+`docs/memory.md` for identity, names, episodes, extraction, memories and recall
+(`docs/memory-design.md` records why). Develop on `dev`; `main` is the
 released line. The earlier Python implementation is kept on the `py` branch for reference only.
 
 ## Commands
@@ -64,10 +65,14 @@ paid API. Build the image with `docker build -f deploy/Dockerfile .`; deployment
 - **Providers:** `qbot-llm` is the only place vendors are named: text and vision through the
   Responses API (DeepSeek and OpenAI-style dialects, typed capabilities), embeddings, Tavily search.
   No local output-token caps; reasoning items never leave the adapter.
-- **Memory:** `qbot-memory`. The archive is the source of truth. Episodes summarize fixed slices of
-  whole batches, extracted with validated findings (names, facts, group knowledge) that
-  consolidation applies; recall ranks by similarity decaying with age; embeddings are an index each
-  group's extraction completes for the configured model. Notes written by hand are a separate store.
+- **Memory:** `qbot-memory`. The archive is the source of truth (each member line keeps the display
+  name it was sent under). Episodes summarize fixed slices of whole batches, extracted with
+  validated findings that consolidation applies: name uses (who a line used a name for, and how)
+  and memory changes (new, the same, changed, ended; each memory keeps its supporting lines and
+  its history). The cached prefix shows who is who; a run's opening note shows the memories of the
+  people in its chat; `about_member` reaches the rest. Recall ranks episodes by similarity decaying
+  with age; embeddings are an index each group's extraction completes for the configured model.
+  Notes written by hand are a separate store.
 - **Durable work:** one `timer` table in `qbot-sched`: group tasks (at most once, interrupted on
   restart, never replayed) and jobs (leased, retried), plus cron schedules fired exactly once per
   occurrence. Extraction is a group job queued by each filled batch; `qbot-ops` runs the nightly decay,
