@@ -42,7 +42,7 @@ be quoted (`QBOT__DATABASE__NAME='"2024"'`), and a number is refused where text 
 
 An unknown key or a value of the wrong type is an error naming the key and the layer it came
 from (Figment reports the problems it finds in the merged result). After that, every semantic
-check (ranges, formats, cron expressions, time zones) runs and reports *all* its problems
+check (ranges, formats, schedules, time zones) runs and reports *all* its problems
 together. The process does not start on any of them. Secrets are not configuration and never
 travel through these layers (see "Secrets").
 `docker compose run --rm qbot check-config` lists every layer applied and checks everything
@@ -155,8 +155,8 @@ NapCat is untouched and reconnects by itself.
 
 The bot runs its own maintenance; nothing outside the container is needed.
 
-- **Schedule.** `maintenance.nightly_cron` (default 02:30) and `maintenance.report_cron` (default
-  midnight) are cron expressions in `bot.timezone`. A run missed while the bot was down happens once
+- **Schedule.** `maintenance.nightly` (default `daily@02:30`) and `maintenance.report` (default
+  `daily@00:00`) are repeat rules in `bot.timezone`, written as `/tasks --every` writes them. A run missed while the bot was down happens once
   when it comes back; each occurrence runs exactly once however often the bot restarts. A schedule
   that has never run starts from now.
 - **Memory extraction** is not part of it: each filled batch queues its group's extraction,

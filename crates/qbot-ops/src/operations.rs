@@ -1,15 +1,14 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use jiff::tz::TimeZone;
 use jiff::{Span, Timestamp};
-use qbot_core::{AccountId, Clock, GroupId, UnixMillis};
+use qbot_core::{AccountId, Clock, UnixMillis};
 use qbot_i18n::Locales;
-use qbot_sched::{JobError, JobKind, JobRunner};
+use qbot_sched::JobError;
 
 use crate::backup::{BackupConfig, create_verified_backup, newest_backup_age, rotate_backups};
-use crate::ports::{Extractor, Housekeeping, PlatformCache, ReportSink, ReportSource};
+use crate::ports::{Housekeeping, PlatformCache, ReportSink, ReportSource};
 use crate::report::render_report;
 
 #[derive(Debug, Clone)]
@@ -51,7 +50,6 @@ impl OpsConfig {
 pub struct Operations {
     cfg: OpsConfig,
     clock: Arc<dyn Clock>,
-    extractor: Arc<dyn Extractor>,
     housekeeping: Arc<dyn Housekeeping>,
     report: Arc<dyn ReportSource>,
     sink: Arc<dyn ReportSink>,
@@ -70,7 +68,6 @@ impl std::fmt::Debug for Operations {
 pub struct Parts {
     pub cfg: OpsConfig,
     pub clock: Arc<dyn Clock>,
-    pub extractor: Arc<dyn Extractor>,
     pub housekeeping: Arc<dyn Housekeeping>,
     pub report: Arc<dyn ReportSource>,
     pub sink: Arc<dyn ReportSink>,
@@ -88,7 +85,6 @@ impl Operations {
         Self {
             cfg: parts.cfg,
             clock: parts.clock,
-            extractor: parts.extractor,
             housekeeping: parts.housekeeping,
             report: parts.report,
             sink: parts.sink,
@@ -229,23 +225,6 @@ impl Operations {
                 "report not delivered to {}",
                 errors.join("; ")
             )))
-        }
-    }
-}
-
-#[async_trait]
-impl JobRunner for Operations {
-    async fn run(&self, kind: JobKind, group: Option<GroupId>) -> Result<(), JobError> {
-        match (kind, group) {
-            (JobKind::Nightly, _) => self.nightly().await,
-            (JobKind::Extract, Some(group)) => {
-                self.extractor.extract_group(group).await.map(|_| ())
-            }
-            (JobKind::Extract, None) => Err(JobError("an extract job needs a group".into())),
-            (JobKind::Decay, _) => self.decay().await,
-            (JobKind::Backup, _) => self.backup().await,
-            (JobKind::Cleanup, _) => self.cleanup().await,
-            (JobKind::Report, _) => self.daily_report().await,
         }
     }
 }

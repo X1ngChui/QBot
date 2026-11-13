@@ -43,7 +43,9 @@ use qbot_prompt::{
     PersonaError, Personas, PromptContext, PromptError, PromptRenderer, PromptSettings,
     UnknownZone, describe_image_instructions,
 };
-use qbot_sched::{JobKind, Recurring, Scheduler, TaskService, TimerStore};
+use qbot_sched::{
+    JobError, JobKind, JobRunner, Scheduler, SchedulerConfig, TaskService, TimerStore,
+};
 use qbot_store::{
     DEFAULT_KEY, LeaseError, PgAdmin, PgArchive, PgEpisodeStore, PgGroupPolicy, PgIdentityStore,
     PgMediaCache, PgMemoryStore, PgNameStore, PgRunLog, PgTimerStore, PgUsageSink, RuntimeLease,
@@ -83,8 +85,6 @@ pub enum RunError {
     Media(String),
     #[error("backups: {0}")]
     Backup(#[from] BackupError),
-    #[error("schedule: {0}")]
-    Schedule(#[from] qbot_sched::RecurrenceError),
     #[error("tool set: {0}")]
     Tools(String),
     #[error("cannot listen on {addr}: {source}")]
@@ -112,6 +112,24 @@ struct NoLogs;
 impl qbot_commands::RecentLogs for NoLogs {
     fn recent(&self, _: GroupId, _: usize) -> Vec<qbot_commands::LogLine> {
         Vec::new()
+    }
+}
+
+/// Which code runs each kind of job: the one place a job kind is given its work.
+struct Jobs {
+    operations: Operations,
+    episodes: EpisodeJobs,
+}
+
+#[async_trait::async_trait]
+impl JobRunner for Jobs {
+    async fn run(&self, kind: JobKind, group: Option<GroupId>) -> Result<(), JobError> {
+        match (kind, group) {
+            (JobKind::Nightly, _) => self.operations.nightly().await,
+            (JobKind::Report, _) => self.operations.daily_report().await,
+            (JobKind::Extract, Some(group)) => self.episodes.extract_group(group).await.map(|_| ()),
+            (JobKind::Extract, None) => Err(JobError("an extract job needs a group".into())),
+        }
     }
 }
 
@@ -301,13 +319,15 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
 
     // Tasks, tools, prompt, supervisor, scheduler.
     let wake = Arc::new(Notify::new());
+    // The zone repeat rules are read in: those of group tasks and of the maintenance schedules.
+    let rule_zone = qbot_sched::Zone::get(&config.bot.timezone)
+        .map_err(|_| UnknownZone(config.bot.timezone.clone()))?;
     let tasks = TaskService::new(
         timers.clone(),
         clock.clone(),
         Default::default(),
         wake.clone(),
-        qbot_sched::Zone::get(&config.bot.timezone)
-            .map_err(|_| UnknownZone(config.bot.timezone.clone()))?,
+        rule_zone.clone(),
     );
     // Pictures and clips are fetched through the platform connection.
     let fetcher: Arc<OneBotFetcher> = Arc::new(
@@ -444,26 +464,24 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
             language: writing_language.clone(),
         },
     );
-    let operations = Arc::new(Operations::new(Parts {
+    let episode_jobs = EpisodeJobs::new(episodes.clone(), builder, config.slice_grid())
+        .with_consolidator(Arc::new(
+            Consolidator::new(names.clone(), memories.clone()).with_capacity(
+                episodes.clone(),
+                config.half_lives(),
+                config.memory_capacity(),
+            ),
+        ))
+        // Extraction reads the group as replies do: the same people and knowledge.
+        .with_background(prompt.clone())
+        .with_rulings(
+            names.clone(),
+            NameRuler::new(provider.clone()).with_reasoning(config.extraction_reasoning()),
+        )
+        .with_reread(config.reread_per_run());
+    let operations = Operations::new(Parts {
         cfg: ops_config,
         clock: clock.clone(),
-        extractor: Arc::new(
-            EpisodeJobs::new(episodes.clone(), builder, config.slice_grid())
-                .with_consolidator(Arc::new(
-                    Consolidator::new(names.clone(), memories.clone()).with_capacity(
-                        episodes.clone(),
-                        config.half_lives(),
-                        config.memory_capacity(),
-                    ),
-                ))
-                // Extraction reads the group as replies do: the same people and knowledge.
-                .with_background(prompt.clone())
-                .with_rulings(
-                    names.clone(),
-                    NameRuler::new(provider.clone()).with_reasoning(config.extraction_reasoning()),
-                )
-                .with_reread(config.reread_per_run()),
-        ),
         housekeeping: Arc::new(PgHousekeeping::new(
             admin.clone(),
             PgMediaCache::new(pool.clone(), clock.clone()),
@@ -477,7 +495,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
                 timeouts.action,
             )) as Arc<dyn qbot_ops::PlatformCache>
         }),
-    }));
+    });
     // A filled batch asks for its episode now, so the summary exists before the chat leaves the
     // verbatim tier.
     let batch_jobs = Arc::new(ExtractOnBatch {
@@ -485,19 +503,18 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         clock: clock.clone(),
         wake: wake.clone(),
     });
-    let recurring = Arc::new(Recurring::new(
-        timers.clone(),
-        clock.clone(),
-        &config.bot.timezone,
-        config.recurrences(),
-        wake.clone(),
-    )?);
     let scheduler = Arc::new(Scheduler::new(
         timers,
         supervisor.clone(),
         clock.clone(),
-        operations,
-        Default::default(),
+        Arc::new(Jobs {
+            operations,
+            episodes: episode_jobs,
+        }),
+        SchedulerConfig {
+            schedules: config.schedules(&rule_zone),
+            ..SchedulerConfig::default()
+        },
         wake,
     ));
 
@@ -609,10 +626,6 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         let (scheduler, stop) = (scheduler.clone(), stop.clone());
         tokio::spawn(async move { scheduler.run(stop).await })
     };
-    let mut recurring_task = {
-        let (recurring, stop) = (recurring.clone(), stop.clone());
-        tokio::spawn(async move { recurring.run(stop).await })
-    };
     let watch_task = tokio::spawn(qbot_gateway::server::warn_while_disconnected(
         bridge_watch,
         qbot_gateway::server::DISCONNECTED_WARN_AFTER,
@@ -623,7 +636,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     // Each of these ends only when told to. One that ends by itself (a panic, say) leaves a
     // process that hears nothing or schedules nothing: it stops too, so the container restarts.
     let mut served = None;
-    let mut ended_early: Option<&'static str> = None;
+    let mut scheduler_ended = false;
     let reason = tokio::select! {
         () = shutdown.cancelled() => "shutdown requested",
         () = lease_lost.cancelled() => "the database lease was lost",
@@ -635,15 +648,8 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
             if let Err(error) = ended {
                 tracing::error!(%error, "the scheduler task panicked");
             }
-            ended_early = Some("the scheduler");
+            scheduler_ended = true;
             "the scheduler stopped"
-        }
-        ended = &mut recurring_task => {
-            if let Err(error) = ended {
-                tracing::error!(%error, "the recurring schedules task panicked");
-            }
-            ended_early = Some("the recurring schedules");
-            "the recurring schedules stopped"
         }
     };
     if shutdown.is_cancelled() {
@@ -664,15 +670,8 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     supervisor.shutdown().await;
     pipeline.finish().await;
     media.shutdown().await;
-    if ended_early != Some("the scheduler")
-        && let Err(error) = scheduler_task.await
-    {
+    if !scheduler_ended && let Err(error) = scheduler_task.await {
         tracing::error!(%error, "the scheduler task panicked");
-    }
-    if ended_early != Some("the recurring schedules")
-        && let Err(error) = recurring_task.await
-    {
-        tracing::error!(%error, "the recurring schedules task panicked");
     }
     if let Err(error) = watch_task.await {
         tracing::error!(%error, "the connection watch task panicked");
@@ -682,8 +681,8 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     if lease_lost.is_cancelled() {
         return Err(RunError::Lease(LeaseError::Lost));
     }
-    if let Some(what) = ended_early {
-        return Err(RunError::Stopped(what));
+    if scheduler_ended {
+        return Err(RunError::Stopped("the scheduler"));
     }
     match served {
         // Serving ends only when told to; ending before that is a failure.

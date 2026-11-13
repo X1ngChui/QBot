@@ -172,11 +172,12 @@ depth = "basic"
 extract_depth = "basic"
 
 [maintenance]
-# Five-field cron expressions in bot.timezone: the nightly run (picture-description decay,
-# backup, cleanup) and the daily report to the owners. A run missed while the bot
+# When the nightly run (picture-description decay, backup, cleanup) and the daily report to the
+# owners happen, as repeat rules in bot.timezone, written as /tasks --every writes them:
+# daily@HH:MM, days and a time (mon,thu@HH:MM), or an interval (6h). A run missed while the bot
 # was down happens once when it comes back.
-nightly_cron = "30 2 * * *"
-report_cron = "0 0 * * *"
+nightly = "daily@02:30"
+report = "daily@00:00"
 # Verified database backups kept under the data directory; 0 makes none.
 backups = 14
 # The directory holding pg_dump and pg_restore (of the server's major version); empty finds them

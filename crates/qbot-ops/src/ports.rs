@@ -1,26 +1,10 @@
 use async_trait::async_trait;
-use qbot_core::{AccountId, GroupId, UnixMillis};
-use qbot_memory::EpisodeJobs;
-use qbot_sched::JobError;
+use qbot_core::{AccountId, UnixMillis};
 use qbot_store::ReportData;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
 pub struct OpsError(pub String);
-
-/// Turns a group's archived chat into episodes.
-#[async_trait]
-pub trait Extractor: Send + Sync {
-    /// Extract every complete slice that has no episode yet; returns how many were made.
-    async fn extract_group(&self, group: GroupId) -> Result<usize, JobError>;
-}
-
-#[async_trait]
-impl Extractor for EpisodeJobs {
-    async fn extract_group(&self, group: GroupId) -> Result<usize, JobError> {
-        EpisodeJobs::extract_group(self, group).await
-    }
-}
 
 /// The deletions and listings maintenance needs from storage.
 #[async_trait]

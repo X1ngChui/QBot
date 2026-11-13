@@ -277,20 +277,27 @@ impl Config {
         }
     }
 
-    /// The recurring schedules: the nightly run always, the report when someone receives it.
-    pub fn recurrences(&self) -> Vec<qbot_sched::Recurrence> {
+    /// The maintenance schedules in the bot's zone: the nightly run always, the report when
+    /// someone receives it.
+    pub fn schedules(
+        &self,
+        zone: &qbot_sched::Zone,
+    ) -> Vec<(qbot_sched::JobKind, qbot_sched::Repeat)> {
         let m = &self.maintenance;
+        let scheduled = |kind, rule: &str| {
+            let rule = rule.parse().ok()?;
+            Some((
+                kind,
+                qbot_sched::Repeat {
+                    rule,
+                    zone: zone.clone(),
+                },
+            ))
+        };
         let mut out = Vec::new();
-        if let Ok(nightly) =
-            qbot_sched::Recurrence::new("nightly", &m.nightly_cron, qbot_sched::JobKind::Nightly)
-        {
-            out.push(nightly);
-        }
-        if !self.bot.owners.is_empty()
-            && let Ok(report) =
-                qbot_sched::Recurrence::new("report", &m.report_cron, qbot_sched::JobKind::Report)
-        {
-            out.push(report);
+        out.extend(scheduled(qbot_sched::JobKind::Nightly, &m.nightly));
+        if !self.bot.owners.is_empty() {
+            out.extend(scheduled(qbot_sched::JobKind::Report, &m.report));
         }
         out
     }

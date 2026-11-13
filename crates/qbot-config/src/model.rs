@@ -258,8 +258,8 @@ pub struct SearchProvider {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Maintenance {
-    pub nightly_cron: String,
-    pub report_cron: String,
+    pub nightly: String,
+    pub report: String,
     /// Verified backups kept; 0 makes none.
     pub backups: usize,
     /// Where `pg_dump` and `pg_restore` are; empty finds them on `PATH`.

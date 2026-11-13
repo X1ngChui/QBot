@@ -320,7 +320,7 @@ half_life_episodes = { lasting = 200, ongoing = 0, current = 10 }
 [memory.capacity]
 per_member = 3
 [maintenance]
-nightly_cron = "every night"
+nightly = "every night"
 "#,
     );
     let found = errors(load(&root, &MapEnv::default()));
@@ -345,7 +345,7 @@ nightly_cron = "every night"
         "memory.rank.half_life_episodes",
         "memory.capacity",
         "memory.roster_days",
-        "maintenance.nightly_cron",
+        "maintenance.nightly",
     ] {
         assert!(
             keys.contains(&expected.to_owned()),
@@ -973,24 +973,35 @@ fn maintenance_settings_convert_and_validate() {
     let root = scratch();
     let loaded = load(&root, &MapEnv::default()).unwrap();
     // No owners by default, so the nightly pipeline is scheduled and the report is not.
+    let zone = qbot_sched::Zone::get("Asia/Shanghai").unwrap();
+    let scheduled = |config: &qbot_config::Config| -> Vec<(qbot_sched::JobKind, String)> {
+        config
+            .schedules(&zone)
+            .into_iter()
+            .map(|(kind, repeat)| {
+                assert_eq!(repeat.zone, zone, "in the bot's zone");
+                (kind, repeat.rule.to_string())
+            })
+            .collect()
+    };
     assert_eq!(
-        loaded
-            .config
-            .recurrences()
-            .iter()
-            .map(|r| r.name.as_str())
-            .collect::<Vec<_>>(),
-        ["nightly"]
+        scheduled(&loaded.config),
+        [(qbot_sched::JobKind::Nightly, "daily@02:30".to_owned())]
     );
-    let with_owner = load(&root, &MapEnv::new([("QBOT__BOT__OWNERS", "[1]")])).unwrap();
+    let with_owner = load(
+        &root,
+        &MapEnv::new([
+            ("QBOT__BOT__OWNERS", "[1]"),
+            ("QBOT__MAINTENANCE__REPORT", "mon,fri@09:00"),
+        ]),
+    )
+    .unwrap();
     assert_eq!(
-        with_owner
-            .config
-            .recurrences()
-            .iter()
-            .map(|r| r.name.as_str())
-            .collect::<Vec<_>>(),
-        ["nightly", "report"]
+        scheduled(&with_owner.config),
+        [
+            (qbot_sched::JobKind::Nightly, "daily@02:30".to_owned()),
+            (qbot_sched::JobKind::Report, "mon,fri@09:00".to_owned()),
+        ]
     );
 
     let paths = with_owner.config.paths(&with_owner.layout);
@@ -1019,8 +1030,8 @@ fn maintenance_settings_convert_and_validate() {
     let keys: Vec<String> = errors(load(
         &root,
         &MapEnv::new([
-            ("QBOT__MAINTENANCE__NIGHTLY_CRON", "every night"),
-            ("QBOT__MAINTENANCE__REPORT_CRON", "61 * * * *"),
+            ("QBOT__MAINTENANCE__NIGHTLY", "every night"),
+            ("QBOT__MAINTENANCE__REPORT", "daily@25:00"),
         ]),
     ))
     .into_iter()
@@ -1030,8 +1041,8 @@ fn maintenance_settings_convert_and_validate() {
     })
     .collect();
     assert!(
-        keys.contains(&"maintenance.nightly_cron".to_owned())
-            && keys.contains(&"maintenance.report_cron".to_owned()),
+        keys.contains(&"maintenance.nightly".to_owned())
+            && keys.contains(&"maintenance.report".to_owned()),
         "{keys:?}"
     );
 }

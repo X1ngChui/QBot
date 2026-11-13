@@ -9,7 +9,6 @@ license.workspace = true
 qbot-core.workspace = true
 qbot-i18n.workspace = true
 qbot-llm.workspace = true
-qbot-memory.workspace = true
 qbot-sched.workspace = true
 qbot-store.workspace = true
 async-trait.workspace = true

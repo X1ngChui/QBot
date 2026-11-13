@@ -51,8 +51,8 @@ locale = "en"
 # summary_batches = 9
 
 # [maintenance]
-# nightly_cron = "30 2 * * *"
-# report_cron = "0 0 * * *"
+# nightly = "daily@02:30"
+# report = "daily@00:00"
 # backups = 14
 
 # [database]

@@ -4,8 +4,10 @@
 //! claimed task can always start; without capacity it simply stays pending. Group tasks are
 //! at-most-once (a claim is never replayed); a repeating task is one timer, so at most one of its
 //! occurrences runs at a time, and once one ends the timer is pending again at the next
-//! occurrence after now. Background jobs are idempotent and retried with backoff. One loop sleeps until the next due instant and is woken early by task changes and
-//! by freed capacity. On shutdown a running job is dropped where it is: its claim stays, and
+//! occurrence after now. Background jobs are idempotent and retried with backoff; a maintenance
+//! schedule is a job that repeats by a rule the same way, kept at startup from the configuration.
+//! One loop sleeps until the next due instant and is woken early by task changes and by freed
+//! capacity. On shutdown a running job is dropped where it is: its claim stays, and
 //! the next start puts it back in the queue.
 
 use std::collections::HashSet;
@@ -43,6 +45,10 @@ pub struct SchedulerConfig {
     /// Delay before retry `n` (1-based); the last entry repeats.
     pub job_backoff: Vec<Duration>,
     pub max_concurrent_jobs: usize,
+    /// The maintenance schedules: one repeating job of each kind is kept, due by its rule. A
+    /// schedule seen for the first time starts at its next occurrence, never for the past; one
+    /// missed while the process was down runs once when it comes back.
+    pub schedules: Vec<(JobKind, Repeat)>,
 }
 
 impl Default for SchedulerConfig {
@@ -52,6 +58,7 @@ impl Default for SchedulerConfig {
             max_job_attempts: 5,
             job_backoff: [60, 300, 1800, 3600].map(Duration::from_secs).to_vec(),
             max_concurrent_jobs: 2,
+            schedules: Vec::new(),
         }
     }
 }
@@ -114,28 +121,34 @@ impl Scheduler {
         }
     }
 
-    /// Recover from a previous process, then tick until `shutdown`.
+    /// Recover what a previous process left running, then see that every maintenance schedule
+    /// has its job.
+    pub async fn start(&self) -> Result<(), StoreError> {
+        let now = self.clock.now();
+        let recovery = self.store.recover(now).await?;
+        if recovery != crate::store::Recovery::default() {
+            tracing::warn!(
+                interrupted = recovery.interrupted,
+                rescheduled = recovery.rescheduled,
+                requeued = recovery.requeued,
+                "scheduled work left running by the previous process was recovered"
+            );
+        }
+        for (kind, repeat) in &self.cfg.schedules {
+            self.store
+                .schedule_job(*kind, repeat, repeat.first_at_or_after(now))
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Start (see [`Scheduler::start`]), then tick until `shutdown`.
     pub async fn run(&self, shutdown: CancellationToken) {
-        loop {
-            match self.store.recover(self.clock.now()).await {
-                Ok(recovery) => {
-                    if recovery != crate::store::Recovery::default() {
-                        tracing::warn!(
-                            interrupted = recovery.interrupted,
-                            rescheduled = recovery.rescheduled,
-                            requeued = recovery.requeued,
-                            "scheduled work left running by the previous process was recovered"
-                        );
-                    }
-                    break;
-                }
-                Err(error) => {
-                    tracing::error!(%error, "scheduled work could not be recovered; retrying");
-                    tokio::select! {
-                        () = shutdown.cancelled() => return,
-                        () = tokio::time::sleep(STORE_RETRY) => {}
-                    }
-                }
+        while let Err(error) = self.start().await {
+            tracing::error!(%error, "scheduled work could not be recovered; retrying");
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                () = tokio::time::sleep(STORE_RETRY) => {}
             }
         }
         loop {
@@ -297,7 +310,12 @@ impl Scheduler {
     }
 
     fn start_job(&self, timer: Timer) {
-        let TimerKind::Job { kind, group } = timer.kind else {
+        let TimerKind::Job {
+            kind,
+            group,
+            repeat,
+        } = timer.kind
+        else {
             return;
         };
         self.active
@@ -312,7 +330,7 @@ impl Scheduler {
             self.clock.clone(),
         );
         let (cfg, id, attempts) = (self.cfg.clone(), timer.id, timer.attempts);
-        let stop = self.stop.clone();
+        let (occurrence, stop) = (timer.due_at, self.stop.clone());
         self.spawn(async move {
             // The job's slot is given back however the task ends, a panicking job included.
             let _slot = Slot { active, wake };
@@ -347,24 +365,31 @@ impl Scheduler {
                 }),
             };
             drop(heartbeat);
-            let recorded = match result {
-                Ok(()) => store.finish(id, TimerOutcome::JobOk).await,
+            let outcome = match result {
+                Ok(()) => TimerOutcome::JobOk,
                 Err(error) if attempts >= cfg.max_job_attempts => {
                     tracing::error!(?kind, attempts, error = %error.0, "job failed; giving up");
-                    store.finish(id, TimerOutcome::JobFailed(error.0)).await
+                    TimerOutcome::JobFailed(error.0)
                 }
                 Err(error) => {
                     tracing::warn!(?kind, attempts, error = %error.0, "job failed; will retry");
-                    store
-                        .retry_job(id, clock.now().plus(backoff(&cfg, attempts)))
-                        .await
+                    let again = clock.now().plus(backoff(&cfg, attempts));
+                    if let Err(error) = store.retry_job(id, again).await {
+                        // The claim stays and its lease runs out, so the job is taken up again:
+                        // it is idempotent.
+                        tracing::error!(%error, ?kind, "a job's retry could not be recorded");
+                    }
+                    return;
                 }
             };
-            if let Err(error) = recorded {
-                // The claim stays and its lease runs out, so the job is taken up again: it is
-                // idempotent.
-                tracing::error!(%error, ?kind, "a job's outcome could not be recorded");
-            }
+            // Done, or given up on: a scheduled job waits for its next occurrence.
+            let finished = Finished {
+                id,
+                occurrence,
+                repeat,
+                outcome,
+            };
+            finished.record(&*store, &*clock, &stop).await;
         });
     }
 
@@ -373,7 +398,7 @@ impl Scheduler {
     }
 }
 
-/// A group task's run that ended, to be recorded.
+/// A group task's run or a job that ended, to be recorded.
 struct Finished {
     id: TimerId,
     occurrence: UnixMillis,
@@ -382,7 +407,7 @@ struct Finished {
 }
 
 impl Finished {
-    /// Record the outcome: a one-shot task is done; a repeating task is pending again at its
+    /// Record the outcome: a one-shot timer is done; a repeating one is pending again at its
     /// next occurrence after now. A store that fails is tried again until it answers or the
     /// scheduler stops, since a repeating task left claimed would not come due again until a
     /// restart. A retry that finds the claim already gone means an earlier try went through.

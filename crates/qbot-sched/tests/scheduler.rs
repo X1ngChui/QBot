@@ -202,7 +202,7 @@ async fn an_unfinished_claim_is_interrupted_on_restart_never_replayed() {
     let wake = wake_in(&r, "claimed when the process died", 10).await;
     let job = r
         .store
-        .insert_job(r.clock_now(), JobKind::Decay, Some(group()))
+        .insert_job(r.clock_now(), JobKind::Extract, Some(group()))
         .await
         .unwrap()
         .id;
@@ -245,7 +245,7 @@ async fn jobs_retry_with_backoff_and_then_fail_for_good() {
         .extend((0..10).map(|_| Err(JobError("disk full".into()))));
     let id = r
         .store
-        .insert_job(r.clock_now(), JobKind::Backup, None)
+        .insert_job(r.clock_now(), JobKind::Nightly, None)
         .await
         .unwrap()
         .id;
@@ -336,7 +336,7 @@ async fn concurrent_jobs_are_bounded() {
     *r.jobs.hold.lock().unwrap() = Duration::from_secs(100);
     for _ in 0..3 {
         r.store
-            .insert_job(r.clock_now(), JobKind::Cleanup, None)
+            .insert_job(r.clock_now(), JobKind::Report, None)
             .await
             .unwrap();
     }
@@ -453,7 +453,7 @@ async fn a_job_longer_than_its_lease_is_not_taken_over_while_it_runs() {
     *r.jobs.hold.lock().unwrap() = Duration::from_secs(300);
     let id = r
         .store
-        .insert_job(r.clock_now(), JobKind::Backup, None)
+        .insert_job(r.clock_now(), JobKind::Nightly, None)
         .await
         .unwrap()
         .id;
@@ -521,7 +521,7 @@ async fn a_job_that_comes_due_between_two_clock_readings_is_not_stranded() {
 async fn a_store_that_cannot_say_what_comes_due_next_is_asked_again() {
     let r = rig(vec![], 4);
     r.store
-        .insert_job(r.clock_now().plus(mins(10)), JobKind::Backup, None)
+        .insert_job(r.clock_now().plus(mins(10)), JobKind::Nightly, None)
         .await
         .unwrap();
     r.store.fail_next_due(1);

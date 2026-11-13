@@ -435,9 +435,12 @@ impl PgAdmin {
         .fetch_one(&self.pool)
         .await?;
         let jobs = sqlx::query(
-            "SELECT count(*) FILTER (WHERE kind = 'job' AND state = 'pending')::bigint AS pending, \
-                    count(*) FILTER (WHERE kind = 'job' AND state = 'done' AND outcome = 'job_failed' \
-                                     AND created_ms >= $1 AND created_ms < $2)::bigint AS failed, \
+            "SELECT count(*) FILTER (WHERE kind = 'job' AND state = 'pending' \
+                                     AND (repeat_kind IS NULL OR attempts > 0))::bigint AS pending, \
+                    count(*) FILTER (WHERE kind = 'job' AND ((state = 'done' AND outcome = 'job_failed' \
+                                     AND created_ms >= $1 AND created_ms < $2) \
+                                     OR (last_outcome = 'job_failed' \
+                                     AND last_due_ms >= $1 AND last_due_ms < $2)))::bigint AS failed, \
                     count(*) FILTER (WHERE kind = 'wake' AND ((state = 'interrupted' \
                                      AND created_ms >= $1 AND created_ms < $2) \
                                      OR (last_outcome = 'ran' AND last_outcome_detail = 'interrupted' \

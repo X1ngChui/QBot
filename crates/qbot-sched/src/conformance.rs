@@ -41,7 +41,7 @@ pub async fn run(store: &dyn TimerStore) {
     finishing(store).await;
     jobs(store).await;
     next_due_and_recovery(store).await;
-    leases_and_recurrences(store).await;
+    leases_and_schedules(store).await;
     repeating(store).await;
 }
 
@@ -350,25 +350,27 @@ async fn jobs(store: &dyn TimerStore) {
     drain(store).await;
     let lease = Duration::from_secs(60);
     let job = store
-        .insert_job(at(100), JobKind::Decay, Some(group(5001)))
+        .insert_job(at(100), JobKind::Extract, Some(group(5001)))
         .await
         .unwrap();
     assert_eq!(
         job.kind,
         TimerKind::Job {
-            kind: JobKind::Decay,
-            group: Some(group(5001))
+            kind: JobKind::Extract,
+            group: Some(group(5001)),
+            repeat: None,
         }
     );
     let global = store
-        .insert_job(at(110), JobKind::Backup, None)
+        .insert_job(at(110), JobKind::Nightly, None)
         .await
         .unwrap();
     assert_eq!(
         global.kind,
         TimerKind::Job {
-            kind: JobKind::Backup,
-            group: None
+            kind: JobKind::Nightly,
+            group: None,
+            repeat: None,
         }
     );
 
@@ -498,12 +500,12 @@ async fn next_due_and_recovery(store: &dyn TimerStore) {
     );
 }
 
-async fn leases_and_recurrences(store: &dyn TimerStore) {
+async fn leases_and_schedules(store: &dyn TimerStore) {
     drain(store).await;
 
     // A claimed job's lease can be extended, and only while it is claimed.
     let job = store
-        .insert_job(at(0), JobKind::Backup, None)
+        .insert_job(at(0), JobKind::Nightly, None)
         .await
         .unwrap();
     assert!(
@@ -548,84 +550,119 @@ async fn leases_and_recurrences(store: &dyn TimerStore) {
         Err(StoreError::NotFound)
     );
 
-    // A recurrence fires each occurrence once, in order, and never for the past of a new schedule.
+    // A schedule keeps one repeating job of its kind, due at the first occurrence given.
+    drain(store).await;
+    let daily = Repeat {
+        rule: Rule::Daily(TimeOfDay::new(2, 30).unwrap()),
+        zone: Zone::get("Asia/Shanghai").unwrap(),
+    };
+    let lease = Duration::from_secs(5);
+    store
+        .schedule_job(JobKind::Nightly, &daily, at(1000))
+        .await
+        .unwrap();
+    store
+        .schedule_job(JobKind::Nightly, &daily, at(5000))
+        .await
+        .unwrap();
+    let nightly = store.claim_due_job(at(2000), lease).await.unwrap().unwrap();
+    assert_eq!(
+        (nightly.due_at, nightly.attempts, &nightly.kind),
+        (
+            at(1000),
+            1,
+            &TimerKind::Job {
+                kind: JobKind::Nightly,
+                group: None,
+                repeat: Some(daily.clone()),
+            }
+        ),
+        "the same rule again neither adds a job nor moves the one there is"
+    );
     assert!(
         store
-            .fire_recurrence("nightly", at(1000), JobKind::Nightly)
+            .claim_due_job(at(2000), lease)
             .await
             .unwrap()
-    );
-    assert!(
-        !store
-            .fire_recurrence("nightly", at(1000), JobKind::Nightly)
-            .await
-            .unwrap(),
-        "the same occurrence twice"
-    );
-    assert!(
-        !store
-            .fire_recurrence("nightly", at(900), JobKind::Nightly)
-            .await
-            .unwrap(),
-        "an earlier one after a later one"
-    );
-    assert!(
-        store
-            .fire_recurrence("nightly", at(2000), JobKind::Nightly)
-            .await
-            .unwrap()
-    );
-    assert!(
-        store
-            .fire_recurrence("report", at(1000), JobKind::Report)
-            .await
-            .unwrap(),
-        "schedules are independent"
-    );
-    store.seed_recurrence("fresh", at(5000)).await.unwrap();
-    assert!(
-        !store
-            .fire_recurrence("fresh", at(5000), JobKind::Cleanup)
-            .await
-            .unwrap(),
-        "a seeded occurrence is considered done"
-    );
-    store.seed_recurrence("fresh", at(1)).await.unwrap();
-    assert!(
-        !store
-            .fire_recurrence("fresh", at(4000), JobKind::Cleanup)
-            .await
-            .unwrap(),
-        "seeding never moves a schedule back"
-    );
-    assert!(
-        store
-            .fire_recurrence("fresh", at(6000), JobKind::Cleanup)
-            .await
-            .unwrap()
+            .is_none(),
+        "one job per schedule"
     );
 
-    let mut fired = Vec::new();
-    while let Some(t) = store
-        .claim_due_job(at(100_000), Duration::from_secs(1))
+    // A failed attempt is the same occurrence again; when the occurrence is over the job is
+    // pending at the next one, and its attempts start over.
+    store.retry_job(nightly.id, at(2100)).await.unwrap();
+    let again = store.claim_due_job(at(2100), lease).await.unwrap().unwrap();
+    assert_eq!((again.id, again.attempts), (nightly.id, 2));
+    assert!(matches!(
+        store
+            .finish_occurrence(nightly.id, at(1000), TimerOutcome::JobOk, at(9000))
+            .await,
+        Err(StoreError::NotPending(TimerState::Claimed { .. }))
+    ));
+    store
+        .finish_occurrence(
+            nightly.id,
+            at(2100),
+            TimerOutcome::JobFailed("no space left".into()),
+            at(9000),
+        )
         .await
-        .unwrap()
-    {
-        let TimerKind::Job { kind, .. } = t.kind else {
+        .unwrap();
+    let pending = store.get(nightly.id).await.unwrap().unwrap();
+    assert_eq!(
+        (&pending.state, pending.due_at, pending.attempts),
+        (&TimerState::Pending, at(9000), 0)
+    );
+    assert_eq!(pending.repeat(), Some(&daily));
+    assert!(matches!(
+        store
+            .finish_occurrence(nightly.id, at(2100), TimerOutcome::JobOk, at(9500))
+            .await,
+        Err(StoreError::NotPending(TimerState::Pending))
+    ));
+
+    // A changed rule replaces the old one, and the pending job comes due by it.
+    store
+        .schedule_job(JobKind::Nightly, &hourly(), at(3000))
+        .await
+        .unwrap();
+    let moved = store.get(nightly.id).await.unwrap().unwrap();
+    assert_eq!((moved.repeat(), moved.due_at), (Some(&hourly()), at(3000)));
+
+    // Each kind has its own job, and a job queued by hand is not a schedule.
+    store
+        .schedule_job(JobKind::Report, &daily, at(4000))
+        .await
+        .unwrap();
+    let once = store
+        .insert_job(at(3500), JobKind::Nightly, None)
+        .await
+        .unwrap();
+    let mut due = Vec::new();
+    while let Some(t) = store.claim_due_job(at(4000), lease).await.unwrap() {
+        let TimerKind::Job { kind, repeat, .. } = &t.kind else {
             panic!()
         };
-        fired.push((t.due_at, kind));
-        store.finish(t.id, TimerOutcome::JobOk).await.unwrap();
+        due.push((t.due_at, *kind, repeat.is_some()));
     }
     assert_eq!(
-        fired,
+        due,
         [
-            (at(1000), JobKind::Nightly),
-            (at(1000), JobKind::Report),
-            (at(2000), JobKind::Nightly),
-            (at(6000), JobKind::Cleanup)
+            (at(3000), JobKind::Nightly, true),
+            (at(3500), JobKind::Nightly, false),
+            (at(4000), JobKind::Report, true),
         ]
     );
+    store.finish(once.id, TimerOutcome::JobOk).await.unwrap();
+
+    // A scheduled job the process died during is queued again: jobs are idempotent.
+    assert_eq!(store.recover(at(4000)).await.unwrap().requeued, 2);
+    let requeued = store.get(nightly.id).await.unwrap().unwrap();
+    assert_eq!(
+        (&requeued.state, requeued.due_at),
+        (&TimerState::Pending, at(3000))
+    );
+    assert!(requeued.repeat().is_some());
 }
 
 fn hourly() -> Repeat {

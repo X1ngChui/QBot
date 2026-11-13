@@ -5,14 +5,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use qbot_core::{AccountId, Clock, GroupId, UnixMillis};
+use qbot_core::{AccountId, Clock, UnixMillis};
 use qbot_i18n::Locales;
 use qbot_llm::{CallKind, Purpose};
 use qbot_ops::{
-    Extractor, Housekeeping, Operations, OpsConfig, OpsError, Parts, ReportSink, ReportSource,
-    render_report,
+    Housekeeping, Operations, OpsConfig, OpsError, Parts, ReportSink, ReportSource, render_report,
 };
-use qbot_sched::{JobError, JobKind, JobRunner};
 use qbot_store::{ReportData, UsageLine, UsageSummary};
 
 #[derive(Debug)]
@@ -23,25 +21,8 @@ impl Clock for Fixed {
     }
 }
 
-fn group(n: i64) -> GroupId {
-    GroupId::new(n).unwrap()
-}
-
 fn owner(n: i64) -> AccountId {
     AccountId::new(n).unwrap()
-}
-
-#[derive(Default)]
-struct Extract {
-    done: Mutex<Vec<GroupId>>,
-}
-
-#[async_trait]
-impl Extractor for Extract {
-    async fn extract_group(&self, g: GroupId) -> Result<usize, JobError> {
-        self.done.lock().unwrap().push(g);
-        Ok(2)
-    }
 }
 
 #[derive(Default)]
@@ -215,7 +196,6 @@ impl qbot_ops::PlatformCache for Cache {
 struct Rig {
     ops: Operations,
     cache: Arc<Cache>,
-    extract: Arc<Extract>,
     house: Arc<House>,
     sink: Arc<Sink>,
     source: Arc<Source>,
@@ -225,7 +205,6 @@ struct Rig {
 const NOON: i64 = 1_791_086_400_000;
 
 fn rig(owners: Vec<AccountId>) -> Rig {
-    let extract = Arc::new(Extract::default());
     let house = Arc::new(House::default());
     let sink = Arc::new(Sink::default());
     let source = Arc::new(Source(data(), Mutex::default()));
@@ -239,7 +218,6 @@ fn rig(owners: Vec<AccountId>) -> Rig {
             zone: jiff::tz::TimeZone::get("Asia/Shanghai").unwrap(),
         },
         clock: Arc::new(Fixed(AtomicI64::new(NOON))),
-        extractor: extract.clone(),
         housekeeping: house.clone(),
         report: source.clone(),
         sink: sink.clone(),
@@ -249,7 +227,6 @@ fn rig(owners: Vec<AccountId>) -> Rig {
     Rig {
         ops,
         cache,
-        extract,
         house,
         sink,
         source,
@@ -259,11 +236,7 @@ fn rig(owners: Vec<AccountId>) -> Rig {
 #[tokio::test]
 async fn the_nightly_pipeline_runs_every_stage_even_after_a_failure() {
     let r = rig(vec![owner(1)]);
-    r.ops.run(JobKind::Nightly, None).await.unwrap();
-    assert!(
-        r.extract.done.lock().unwrap().is_empty(),
-        "the night extracts nothing: filled batches queue their own extraction"
-    );
+    r.ops.nightly().await.unwrap();
     // Decay and cleanup ran, with cutoffs counted back from now.
     let day = 86_400_000;
     assert_eq!(
@@ -277,28 +250,23 @@ async fn the_nightly_pipeline_runs_every_stage_even_after_a_failure() {
 
     // A failed upkeep stage fails the night, so it is retried.
     r.house.broken.store(true, Ordering::SeqCst);
-    let error = r.ops.run(JobKind::Nightly, None).await.unwrap_err();
+    let error = r.ops.nightly().await.unwrap_err();
     assert!(error.0.contains("cleanup: "), "{error}");
 }
 
 #[tokio::test]
 async fn a_clean_night_succeeds_and_skips_backup_when_it_is_switched_off() {
     let r = rig(vec![owner(1)]);
-    r.ops.run(JobKind::Nightly, None).await.unwrap();
-    // Running the backup job itself while backups are off is an error, not a silent no-op.
-    let error = r.ops.run(JobKind::Backup, None).await.unwrap_err();
+    r.ops.nightly().await.unwrap();
+    // Asking for a backup while backups are off is an error, not a silent no-op.
+    let error = r.ops.backup().await.unwrap_err();
     assert!(error.0.contains("switched off"), "{error}");
-    assert!(
-        r.ops.run(JobKind::Extract, None).await.is_err(),
-        "an extract job needs a group"
-    );
-    assert_eq!(r.ops.run(JobKind::Extract, Some(group(9))).await, Ok(()));
 }
 
 #[tokio::test]
 async fn the_daily_report_covers_the_previous_local_day_and_reaches_every_owner() {
     let r = rig(vec![owner(1), owner(2)]);
-    r.ops.run(JobKind::Report, None).await.unwrap();
+    r.ops.daily_report().await.unwrap();
     // Yesterday in Shanghai: 2026-10-03 00:00 to 2026-10-04 00:00 local.
     let day = 86_400_000;
     let midnight = NOON - 12 * 3_600_000;
@@ -316,7 +284,7 @@ async fn the_daily_report_covers_the_previous_local_day_and_reaches_every_owner(
 async fn an_owner_who_cannot_be_reached_fails_the_job_without_blocking_the_others() {
     let r = rig(vec![owner(1), owner(2), owner(3)]);
     r.sink.refuse.lock().unwrap().push(2);
-    let error = r.ops.run(JobKind::Report, None).await.unwrap_err();
+    let error = r.ops.daily_report().await.unwrap_err();
     assert!(error.0.contains("2: not connected"), "{error}");
     assert_eq!(
         r.sink
@@ -332,7 +300,7 @@ async fn an_owner_who_cannot_be_reached_fails_the_job_without_blocking_the_other
     assert!(
         nobody
             .ops
-            .run(JobKind::Report, None)
+            .daily_report()
             .await
             .unwrap_err()
             .0
@@ -391,11 +359,11 @@ fn the_report_reads_as_a_short_summary() {
 #[tokio::test]
 async fn the_nightly_cleanup_asks_the_platform_to_clean_its_cache_best_effort() {
     let r = rig(vec![owner(1)]);
-    r.ops.run(JobKind::Nightly, None).await.unwrap();
+    r.ops.nightly().await.unwrap();
     assert_eq!(*r.cache.cleaned.lock().unwrap(), 1);
     // A platform that cannot be reached does not fail the night.
     *r.cache.down.lock().unwrap() = true;
-    r.ops.run(JobKind::Cleanup, None).await.unwrap();
+    r.ops.cleanup().await.unwrap();
     assert_eq!(*r.cache.cleaned.lock().unwrap(), 1);
 }
 

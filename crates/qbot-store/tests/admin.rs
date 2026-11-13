@@ -184,7 +184,14 @@ async fn the_daily_report_and_housekeeping_read_what_happened() {
         .execute(db.pool())
         .await
         .unwrap();
-    sqlx::query("INSERT INTO timer (kind, due_ms, state, created_ms, job_kind, outcome, outcome_detail) VALUES ('job', 0, 'done', $1, 'backup', 'job_failed', 'disk full'), ('job', $1, 'pending', $1, 'nightly', NULL, NULL)")
+    sqlx::query("INSERT INTO timer (kind, due_ms, state, created_ms, job_kind, outcome, outcome_detail) VALUES ('job', 0, 'done', $1, 'extract', 'job_failed', 'disk full'), ('job', $1, 'pending', $1, 'extract', NULL, NULL)")
+        .bind(T0)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    // A schedule waiting for its next occurrence is not queued work; its last occurrence, given
+    // up on within the day, is a failed job.
+    sqlx::query("INSERT INTO timer (kind, due_ms, state, created_ms, job_kind, repeat_kind, repeat_minute, repeat_zone, last_due_ms, last_outcome, last_outcome_detail) VALUES ('job', $1 + 86400000, 'pending', 0, 'nightly', 'daily', 150, 'UTC', $1, 'job_failed', 'disk full')")
         .bind(T0)
         .execute(db.pool())
         .await
@@ -237,7 +244,7 @@ async fn the_daily_report_and_housekeeping_read_what_happened() {
     );
     assert_eq!(
         (report.groups_new, report.jobs_pending, report.jobs_failed),
-        (2, 1, 1)
+        (2, 1, 2)
     );
     // Outside the window nothing is counted as activity.
     let empty = admin

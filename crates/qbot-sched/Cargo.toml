@@ -6,9 +6,6 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-chrono.workspace = true
-chrono-tz.workspace = true
-croner.workspace = true
 jiff.workspace = true
 qbot-core.workspace = true
 qbot-context.workspace = true

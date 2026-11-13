@@ -652,12 +652,11 @@ async fn an_archive_with_a_gap_is_refused_not_papered_over() {
 }
 
 #[tokio::test]
-async fn groups_are_independent_and_only_extract_jobs_are_accepted() {
-    use qbot_sched::{JobKind, JobRunner};
+async fn groups_are_independent() {
     let (_, store, job) = jobs(answers(2), 10, 1);
     store.add_lines(group(), lines(1..=10));
     store.add_lines(GroupId::new(2).unwrap(), lines(1..=10));
-    job.run(JobKind::Extract, Some(group())).await.unwrap();
+    job.extract_group(group()).await.unwrap();
     assert_eq!(store.covered_through(group()).await.unwrap(), 10);
     assert_eq!(
         store
@@ -666,8 +665,6 @@ async fn groups_are_independent_and_only_extract_jobs_are_accepted() {
             .unwrap(),
         0
     );
-    assert!(job.run(JobKind::Extract, None).await.is_err());
-    assert!(job.run(JobKind::Backup, Some(group())).await.is_err());
 }
 
 #[tokio::test]

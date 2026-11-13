@@ -41,7 +41,6 @@ async fn migrations_are_idempotent_and_the_expected_tables_exist() {
             "name_ruling",
             "name_set",
             "note",
-            "recurrence",
             "run",
             "run_item",
             "slice_skip",
@@ -113,13 +112,15 @@ async fn constraints_reject_invalid_rows() {
         )
         .await
     );
-    assert!(rejected(&db, "INSERT INTO timer (kind, due_ms, state, created_ms, job_kind) VALUES ('job', 0, 'done', 0, 'decay')").await);
-    assert!(rejected(&db, "INSERT INTO timer (kind, due_ms, state, created_ms, job_kind, lease_until_ms) VALUES ('job', 0, 'pending', 0, 'decay', 5)").await);
+    assert!(rejected(&db, "INSERT INTO timer (kind, due_ms, state, created_ms, job_kind) VALUES ('job', 0, 'done', 0, 'nightly')").await);
+    assert!(rejected(&db, "INSERT INTO timer (kind, due_ms, state, created_ms, job_kind, lease_until_ms) VALUES ('job', 0, 'pending', 0, 'nightly', 5)").await);
     assert!(rejected(&db, "INSERT INTO timer (kind, due_ms, state, created_ms, job_kind) VALUES ('job', 0, 'pending', 0, 'mystery')").await);
-    sqlx::query("INSERT INTO timer (kind, due_ms, state, created_ms, job_kind) VALUES ('job', 0, 'pending', 0, 'decay')").execute(db.pool()).await.unwrap();
+    // A stage of the nightly run is not a job by itself.
+    assert!(rejected(&db, "INSERT INTO timer (kind, due_ms, state, created_ms, job_kind) VALUES ('job', 0, 'pending', 0, 'backup')").await);
+    sqlx::query("INSERT INTO timer (kind, due_ms, state, created_ms, job_kind) VALUES ('job', 0, 'pending', 0, 'nightly')").execute(db.pool()).await.unwrap();
 
-    // Repeat rules: each kind has exactly its own fields and a zone, only on wakes; a last run
-    // only on a repeating task.
+    // Repeat rules: each kind has exactly its own fields and a zone; a last run only on a
+    // repeating timer, ended as its kind of timer ends.
     let wake = "INSERT INTO timer (kind, due_ms, state, created_ms, group_id, intent, chain_id, chain_depth, origin";
     let values = "VALUES ('wake', 0, 'pending', 0, 1, 'x', 1, 0, 'model'";
     for bad in [
@@ -140,7 +141,20 @@ async fn constraints_reject_invalid_rows() {
         let sql = format!("{wake}, {}", bad.replace("{v}", values));
         assert!(rejected(&db, &sql).await, "{sql}");
     }
-    assert!(rejected(&db, "INSERT INTO timer (kind, due_ms, state, created_ms, job_kind, repeat_kind, repeat_minute, repeat_zone) VALUES ('job', 0, 'pending', 0, 'decay', 'daily', 60, 'UTC')").await);
+    // A job repeats by a rule too (a maintenance schedule), and its last occurrence ends as a job.
+    let job = "INSERT INTO timer (kind, due_ms, state, created_ms, job_kind, repeat_kind, repeat_minute, repeat_zone";
+    assert!(
+        rejected(
+            &db,
+            &format!("{job}) VALUES ('job', 0, 'pending', 0, 'nightly', 'daily', 60, NULL)")
+        )
+        .await
+    );
+    assert!(rejected(&db, &format!("{job}, last_due_ms, last_outcome) VALUES ('job', 0, 'pending', 0, 'nightly', 'daily', 60, 'UTC', 0, 'ran')")).await);
+    sqlx::query(&format!("{job}, last_due_ms, last_outcome, last_outcome_detail) VALUES ('job', 0, 'pending', 0, 'report', 'daily', 60, 'UTC', 0, 'job_failed', 'no owner reachable')"))
+        .execute(db.pool())
+        .await
+        .unwrap();
     for good in [
         "repeat_kind, repeat_interval_ms, repeat_zone) {v}, 'interval', 3600000, 'UTC')",
         "repeat_kind, repeat_minute, repeat_zone, last_due_ms, last_outcome, last_outcome_detail) {v}, 'daily', 0, 'Asia/Shanghai', 0, 'ran', 'completed')",

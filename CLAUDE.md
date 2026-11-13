@@ -74,9 +74,10 @@ paid API. Build the image with `docker build -f deploy/Dockerfile .`; deployment
   with age; embeddings are an index each group's extraction completes for the configured model.
   Notes written by hand are a separate store.
 - **Durable work:** one `timer` table in `qbot-sched`: group tasks (at most once, interrupted on
-  restart, never replayed) and jobs (leased, retried), plus cron schedules fired exactly once per
-  occurrence. Extraction is a group job queued by each filled batch; `qbot-ops` runs the nightly decay,
-  backup and cleanup, and the report.
+  restart, never replayed) and jobs (leased, retried). Either may repeat by a rule: one timer
+  that returns to pending at its next occurrence. Extraction is a group job queued by each filled
+  batch; the nightly decay, backup and cleanup and the daily report (`qbot-ops`) are scheduled
+  jobs; `qbot-app` maps each job kind to its code.
 - **Layering:** `qbot-core`/`qbot-context` are pure; a port is defined by the crate that needs it.
   Ports of the core crates (agent, sched, memory, tools) are implemented by `qbot-store`
   (Postgres) or `qbot-gateway` (OneBot); an outer crate implements its own port over

@@ -809,24 +809,23 @@ fn fake_pg_tools(dir: &Path) {
     );
 }
 
-/// A daily cron expression (with a seconds field) that next fires `seconds` from now in Shanghai.
-/// A daily schedule a few seconds from now that already ran for yesterday's occurrence, so it
-/// fires exactly once for today's whether the bot is up before that moment or starts after it (a
-/// schedule with no history starts from now and would skip an occurrence it started late for).
-async fn schedule_in(db: &Database, name: &str, seconds: i64) -> String {
-    let now = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(seconds);
-    let at = jiff::Timestamp::from_second(now.as_second())
-        .unwrap()
-        .to_zoned(jiff::tz::TimeZone::get("Asia/Shanghai").unwrap());
+/// A maintenance schedule as an earlier run of the bot left it: its job with the default rule
+/// (`minute` of the day, in the deployment's zone), whose occurrence comes due `seconds` from
+/// now. Starting the bot keeps a job whose rule is the configured one, so it runs then.
+async fn schedule_in(db: &Database, kind: &str, minute: i32, seconds: i64) {
+    let due = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(seconds);
     let store = qbot_store::Store::connect(&db.url).await.unwrap();
     store.migrate().await.unwrap();
-    sqlx::query("INSERT INTO recurrence (name, last_fired_ms) VALUES ($1, $2)")
-        .bind(name)
-        .bind(at.timestamp().as_millisecond() - 86_400_000)
-        .execute(store.pool())
-        .await
-        .unwrap();
-    format!("{} {} {} * * *", at.second(), at.minute(), at.hour())
+    sqlx::query(
+        "INSERT INTO timer (kind, due_ms, state, created_ms, job_kind, repeat_kind, repeat_minute, repeat_zone) \
+         VALUES ('job', $1, 'pending', 0, $2, 'daily', $3, 'Asia/Shanghai')",
+    )
+    .bind(due.as_millisecond())
+    .bind(kind)
+    .bind(minute)
+    .execute(store.pool())
+    .await
+    .unwrap();
 }
 
 #[cfg(unix)]
@@ -836,17 +835,16 @@ async fn the_nightly_pipeline_and_the_daily_report_run_on_schedule() {
     let (root, tools) = (scratch(), scratch());
     fake_pg_tools(&tools);
     let llm = mock_llm(Arc::new(SimServer::new([]))).await;
-    let (nightly, report) = (
-        schedule_in(&db, "nightly", 3).await,
-        schedule_in(&db, "report", 5).await,
-    );
+    // The defaults: the nightly run at 02:30, the report at midnight.
+    schedule_in(&db, "nightly", 150, 3).await;
+    schedule_in(&db, "report", 0, 5).await;
     deployment_with(
         &db,
         llm,
         &root,
         None,
         &format!(
-            "[maintenance]\nnightly_cron = \"{nightly}\"\nreport_cron = \"{report}\"\nbackups = 2\npostgres_bin_dir = \"{}\"\n",
+            "[maintenance]\nbackups = 2\npostgres_bin_dir = \"{}\"\n",
             tools.display()
         ),
     );
@@ -911,12 +909,16 @@ async fn the_nightly_pipeline_and_the_daily_report_run_on_schedule() {
         cleaned, 1,
         "NapCat is asked to clean its cache once a night"
     );
-    // Both jobs finished, the dump is in the backups directory, and each occurrence fired once.
+    // Both occurrences ended well and each job waits for its next one, the dump is in the
+    // backups directory, and each schedule still has the one job.
     let jobs_ok = || async {
-        let done: i64 = sqlx::query_scalar("SELECT count(*) FROM timer WHERE kind = 'job' AND state = 'done' AND outcome = 'job_ok'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let done: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM timer WHERE kind = 'job' AND state = 'pending' AND attempts = 0 \
+               AND last_outcome = 'job_ok' AND due_ms > last_due_ms + 3600000",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         done == 2
     };
     for _ in 0..200 {
@@ -927,7 +929,7 @@ async fn the_nightly_pipeline_and_the_daily_report_run_on_schedule() {
     }
     if !jobs_ok().await {
         let rows: Vec<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT job_kind, state, outcome, outcome_detail FROM timer WHERE kind = 'job' ORDER BY job_kind",
+            "SELECT job_kind, state, last_outcome, last_outcome_detail FROM timer WHERE kind = 'job' ORDER BY job_kind",
         )
         .fetch_all(&pool)
         .await
@@ -946,12 +948,6 @@ async fn the_nightly_pipeline_and_the_daily_report_run_on_schedule() {
         .collect();
     assert_eq!(dumps.len(), 1, "{dumps:?}");
     assert!(dumps[0].starts_with("qbot-") && dumps[0].ends_with(".dump"));
-    let recurrences: i64 = sqlx::query_scalar("SELECT count(*) FROM recurrence")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(recurrences, 2);
-
     bot.stop.cancel();
     tokio::time::timeout(Duration::from_secs(30), bot.finished)
         .await

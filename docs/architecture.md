@@ -82,7 +82,7 @@ qbot-tools     the model's tools
 qbot-media     picture description and voice transcription service
 qbot-asr       in-process speech recognition (sherpa-onnx, SenseVoice)
 qbot-prompt    instructions, personas, history tiers, chat rendering
-qbot-sched     timers, group tasks, recurring schedules, the scheduler loop
+qbot-sched     timers, group tasks, jobs, repeat rules, the scheduler loop
 qbot-agent     supervisor, run loop, tool trait and executor, ports, a simulated group
 qbot-memory    identity, names, episodes, extraction, consolidation, memories, recall, notes
 qbot-store     Postgres adapters for every port, the schema, the lease
@@ -511,7 +511,7 @@ the `media_ref` row the platform reference came in.
 ## 10. Scheduling (`qbot-sched`)
 
 - One `timer` table. A `wake` is a group task: at most once, never replayed (a claim open at
-  startup is marked interrupted). A `job` (extract, nightly, decay, backup, cleanup, report) is
+  startup is marked interrupted). A `job` (extract, nightly, report) is
   idempotent: claimed with a lease renewed while it runs (a failed renewal is tried again at the
   next beat, a third of the lease later), retried with backoff, failed for good after five
   attempts, each failure logged. A job that panics counts as a failed attempt. A job running at
@@ -556,10 +556,18 @@ the `media_ref` row the platform reference came in.
   run) and `cancel_task` as named. There is no separate task lookup: it would show the line
   `list_tasks` shows (owners see finished tasks with `/tasks`). Each refuses an argument that belongs to another (a
   `rule` given to `schedule_task`), so a mistaken call is explained rather than half done.
-- **Recurring schedules** (`maintenance.nightly_cron`, `report_cron`, croner with the bot's time
-  zone) turn each occurrence into a job through one atomic store step, so an occurrence fires once
-  however often the process restarts; one missed while down fires once on startup. The loop fires
-  the occurrence it slept toward even when the timer wakes a moment early.
+- **Maintenance schedules** (`maintenance.nightly`, `maintenance.report`) are repeating jobs: a
+  job timer with a rule in the same grammar and the same `Repeat` a repeating task has
+  (`daily@02:30`, `mon,thu@08:00`, `6h`), read in `bot.timezone`. One mechanism serves both: when
+  an occurrence is over (done, or given up on after its attempts) the same compare-and-set
+  returns the timer to pending at the rule's next occurrence after now, with its attempts
+  starting over. The scheduler keeps one job per schedule when it starts
+  (`TimerStore::schedule_job`): a schedule seen for the first time is due at its next
+  occurrence, never for the past; one whose rule changed takes the new rule; one already there
+  is left alone, so occurrences missed while the bot was down are made up by a single run. Which
+  code a job kind runs is one table in the composition root (`qbot-app`'s `Jobs`). A retried
+  attempt is the same occurrence, so an interval rule continues from the last attempt; the
+  daily and weekly rules the schedules use are wall-clock times and do not shift.
 - **The scheduler loop** takes one clock reading per tick for claiming and for deciding what comes
   due next, so a timer due between two readings is not mistaken for a blocked one. A store error
   (claiming, reading when the next timer comes due, recording an outcome) is logged, and the
@@ -781,7 +789,7 @@ spend.
   lets commands finish, drops media work (its markers stay bare) and running jobs (queued again
   at the next start), writes the usage records, and releases the lease. Nothing waits out a
   model call, so the container stops within its grace period. The process also stops, with an
-  error, if the gateway server, the scheduler or the recurring schedules end by themselves or the
+  error, if the gateway server, or the scheduler ends by itself or the
   lease is lost, so the container restarts instead of running deaf. While no platform connection
   is attached, a WARN is logged after ten minutes and then hourly: an expired QQ session is
   otherwise silent. Startup closes a stored run it cannot read as interrupted rather than refusing

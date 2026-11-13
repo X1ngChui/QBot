@@ -3,10 +3,9 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use qbot_core::{GroupId, MessageId, SliceGrid};
 use qbot_llm::{Attribution, Purpose, attributed};
-use qbot_sched::{JobError, JobKind, JobRunner};
+use qbot_sched::JobError;
 
 use crate::build::EpisodeBuilder;
 use crate::consolidate::Consolidator;
@@ -27,7 +26,7 @@ const RULING_USES: usize = 8;
 /// Lines shown before and after a use: what the line was said into, and who took it up.
 const AROUND_USE: (u64, u64) = (6, 4);
 
-/// Runs `JobKind::Extract` for a group: extracts every complete slice that has no episode yet,
+/// A group's extraction job: extracts every complete slice that has no episode yet,
 /// oldest first. Idempotent: an extracted slice is covered and is never extracted again, and a
 /// crash between slices loses nothing. A slice that can never be extracted is recorded as
 /// skipped, so it does not hold back the group's later slices. With the new slices done, a run
@@ -534,15 +533,4 @@ fn members(parts: &[&[SliceLine]]) -> Vec<SliceMember> {
         }
     }
     found.into_values().collect()
-}
-
-#[async_trait]
-impl JobRunner for EpisodeJobs {
-    async fn run(&self, kind: JobKind, group: Option<GroupId>) -> Result<(), JobError> {
-        match (kind, group) {
-            (JobKind::Extract, Some(group)) => self.extract_group(group).await.map(|_| ()),
-            (JobKind::Extract, None) => Err(JobError("an extract job needs a group".into())),
-            (other, _) => Err(JobError(format!("{other:?} is not an episode job"))),
-        }
-    }
 }

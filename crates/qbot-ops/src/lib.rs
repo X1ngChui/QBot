@@ -2,11 +2,10 @@
 //!
 //! - the **nightly pipeline** (decay, backup, cleanup including the chat platform's file cache,
 //!   in that order, each stage independent of the others' success);
-//! - a group's **extraction** job, queued by each filled batch;
 //! - **verified backups** of the database with rotation;
 //! - the **daily report** to the owners.
 //!
-//! Each is a timer job (see `qbot-sched`), run by [`Operations`]. Everything touching the outside
+//! The nightly pipeline and the report are scheduled jobs (see `qbot-sched`). Everything touching the outside
 //! world is behind a port so the logic is tested without a database, a dump tool or a chat
 //! connection.
 
@@ -22,5 +21,5 @@ pub use backup::{
 };
 pub use operations::{Operations, OpsConfig, Parts};
 pub use pg::{PgHousekeeping, PgReportSource};
-pub use ports::{Extractor, Housekeeping, OpsError, PlatformCache, ReportSink, ReportSource};
+pub use ports::{Housekeeping, OpsError, PlatformCache, ReportSink, ReportSource};
 pub use report::{render_report, usage_lines};

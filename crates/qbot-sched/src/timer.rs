@@ -1,4 +1,5 @@
-//! The timer model: one durable concept for group tasks and background jobs.
+//! The timer model: one durable concept for group tasks and background jobs. Either may repeat
+//! by a rule: the timer then returns to pending at its next occurrence after each run.
 
 use qbot_agent::Chain;
 use qbot_context::RunEnd;
@@ -40,10 +41,8 @@ pub enum JobKind {
     Nightly,
     /// Extract every complete slice of one group.
     Extract,
-    Decay,
-    Backup,
+    /// The daily report to the owners.
     Report,
-    Cleanup,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +51,8 @@ pub enum TimerKind {
     Job {
         kind: JobKind,
         group: Option<GroupId>,
+        /// A maintenance schedule: the job comes due again by this rule after each occurrence.
+        repeat: Option<Repeat>,
     },
 }
 
@@ -145,6 +146,14 @@ impl Timer {
         match &self.kind {
             TimerKind::Wake(spec) => Some(spec),
             TimerKind::Job { .. } => None,
+        }
+    }
+
+    /// The rule a repeating task or job comes due by.
+    pub fn repeat(&self) -> Option<&Repeat> {
+        match &self.kind {
+            TimerKind::Wake(spec) => spec.repeat.as_ref(),
+            TimerKind::Job { repeat, .. } => repeat.as_ref(),
         }
     }
 }

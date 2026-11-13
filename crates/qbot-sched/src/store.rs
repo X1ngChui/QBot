@@ -11,6 +11,7 @@ use qbot_core::{ChainId, GroupId, TimerId, UnixMillis};
 
 use qbot_context::RunEnd;
 
+use crate::repeat::Repeat;
 use crate::timer::{
     JobKind, LastRun, NewWake, Timer, TimerKind, TimerOutcome, TimerState, WakeEdit, WakeSpec,
 };
@@ -85,10 +86,11 @@ pub trait TimerStore: Send + Sync {
         lease: Duration,
     ) -> Result<Option<Timer>, StoreError>;
     async fn finish(&self, id: TimerId, outcome: TimerOutcome) -> Result<(), StoreError>;
-    /// Record how the running occurrence `occurrence` of a repeating task ended and return the
-    /// task to pending, due at `next`. One compare-and-set on the claim: a second call for the
-    /// same occurrence finds nothing to change (`NotPending`). A task cancelled while the
-    /// occurrence ran keeps its cancellation and only records the outcome.
+    /// Record how the running occurrence `occurrence` of a repeating task or job ended and
+    /// return it to pending, due at `next`. One compare-and-set on the claim: a second call for
+    /// the same occurrence finds nothing to change (`NotPending`). A task cancelled while the
+    /// occurrence ran keeps its cancellation and only records the outcome. A job's attempts
+    /// start over with its next occurrence.
     async fn finish_occurrence(
         &self,
         id: TimerId,
@@ -100,18 +102,17 @@ pub trait TimerStore: Send + Sync {
     async fn retry_job(&self, id: TimerId, at: UnixMillis) -> Result<(), StoreError>;
     /// Push a claimed job's lease out to `until`, so a long job is not taken over while it runs.
     async fn extend_lease(&self, id: TimerId, until: UnixMillis) -> Result<(), StoreError>;
-    /// Turn one occurrence of a recurring schedule into a job due at `occurrence`, unless that
-    /// occurrence (or a later one) has already been fired. Returns whether a job was created.
-    /// The check and the insert are one atomic step.
-    async fn fire_recurrence(
+    /// Keep the one repeating job of `kind`. When none is pending or running, one is created
+    /// due at `first`. An existing one whose rule differs takes the new rule and, while
+    /// pending, comes due at `first`; one with the same rule is left as it is, so an occurrence
+    /// missed while the process was down is still due and runs once. Called at startup for
+    /// every configured schedule.
+    async fn schedule_job(
         &self,
-        name: &str,
-        occurrence: UnixMillis,
         kind: JobKind,
-    ) -> Result<bool, StoreError>;
-    /// Record that `occurrence` of a schedule needs no job (a new schedule starts from now, not
-    /// from the past). Does nothing if the schedule already has a record.
-    async fn seed_recurrence(&self, name: &str, occurrence: UnixMillis) -> Result<(), StoreError>;
+        repeat: &Repeat,
+        first: UnixMillis,
+    ) -> Result<(), StoreError>;
     /// Earliest instant at which something may need attention.
     async fn next_due(&self) -> Result<Option<UnixMillis>, StoreError>;
     /// Startup recovery at `now`. Safe only while this process holds the exclusive runtime lease.
@@ -125,7 +126,6 @@ pub trait TimerStore: Send + Sync {
 struct Inner {
     timers: BTreeMap<TimerId, Timer>,
     next_id: u64,
-    recurrences: BTreeMap<String, UnixMillis>,
     /// Reads of the next due instant that fail, as an unreachable database would.
     next_due_failures: usize,
 }
@@ -224,7 +224,11 @@ impl TimerStore for MemoryTimerStore {
         let timer = Timer {
             id,
             due_at,
-            kind: TimerKind::Job { kind, group },
+            kind: TimerKind::Job {
+                kind,
+                group,
+                repeat: None,
+            },
             state: TimerState::Pending,
             attempts: 0,
         };
@@ -381,7 +385,7 @@ impl TimerStore for MemoryTimerStore {
         let mut inner = self.lock();
         let timer = inner.timers.get_mut(&id).ok_or(StoreError::NotFound)?;
         let matches = timer.due_at == occurrence
-            && timer.wake().is_some_and(|w| w.repeat.is_some())
+            && timer.repeat().is_some()
             && matches!(
                 timer.state,
                 TimerState::Claimed { .. } | TimerState::Cancelled
@@ -393,11 +397,14 @@ impl TimerStore for MemoryTimerStore {
             timer.state = TimerState::Pending;
             timer.due_at = next;
         }
-        if let TimerKind::Wake(spec) = &mut timer.kind {
-            spec.last = Some(LastRun {
-                due_at: occurrence,
-                outcome,
-            });
+        match &mut timer.kind {
+            TimerKind::Wake(spec) => {
+                spec.last = Some(LastRun {
+                    due_at: occurrence,
+                    outcome,
+                });
+            }
+            TimerKind::Job { .. } => timer.attempts = 0,
         }
         Ok(())
     }
@@ -428,41 +435,44 @@ impl TimerStore for MemoryTimerStore {
         }
     }
 
-    async fn fire_recurrence(
+    async fn schedule_job(
         &self,
-        name: &str,
-        occurrence: UnixMillis,
         kind: JobKind,
-    ) -> Result<bool, StoreError> {
+        repeat: &Repeat,
+        first: UnixMillis,
+    ) -> Result<(), StoreError> {
         let mut inner = self.lock();
-        if inner
-            .recurrences
-            .get(name)
-            .is_some_and(|last| *last >= occurrence)
-        {
-            return Ok(false);
+        let existing = inner.timers.values_mut().find(|t| {
+            t.state.is_active()
+                && matches!(&t.kind, TimerKind::Job { kind: k, repeat: Some(_), .. } if *k == kind)
+        });
+        if let Some(timer) = existing {
+            if timer.repeat() != Some(repeat) {
+                if let TimerKind::Job { repeat: rule, .. } = &mut timer.kind {
+                    *rule = Some(repeat.clone());
+                }
+                if timer.state.is_pending() {
+                    timer.due_at = first;
+                }
+            }
+            return Ok(());
         }
-        inner.recurrences.insert(name.to_owned(), occurrence);
         inner.next_id += 1;
         let id = TimerId::new(inner.next_id);
         inner.timers.insert(
             id,
             Timer {
                 id,
-                due_at: occurrence,
-                kind: TimerKind::Job { kind, group: None },
+                due_at: first,
+                kind: TimerKind::Job {
+                    kind,
+                    group: None,
+                    repeat: Some(repeat.clone()),
+                },
                 state: TimerState::Pending,
                 attempts: 0,
             },
         );
-        Ok(true)
-    }
-
-    async fn seed_recurrence(&self, name: &str, occurrence: UnixMillis) -> Result<(), StoreError> {
-        self.lock()
-            .recurrences
-            .entry(name.to_owned())
-            .or_insert(occurrence);
         Ok(())
     }
 

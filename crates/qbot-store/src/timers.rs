@@ -132,10 +132,7 @@ fn job_kind_text(kind: JobKind) -> &'static str {
     match kind {
         JobKind::Extract => "extract",
         JobKind::Nightly => "nightly",
-        JobKind::Decay => "decay",
-        JobKind::Backup => "backup",
         JobKind::Report => "report",
-        JobKind::Cleanup => "cleanup",
     }
 }
 
@@ -143,10 +140,7 @@ fn job_kind_parse(text: &str) -> Result<JobKind, StoreError> {
     Ok(match text {
         "extract" => JobKind::Extract,
         "nightly" => JobKind::Nightly,
-        "decay" => JobKind::Decay,
-        "backup" => JobKind::Backup,
         "report" => JobKind::Report,
-        "cleanup" => JobKind::Cleanup,
         other => return Err(StoreError::corrupt(format!("unknown job kind {other:?}"))),
     })
 }
@@ -229,7 +223,11 @@ fn to_timer(row: &PgRow) -> Result<Timer, StoreError> {
                 .get::<Option<i64>, _>("group_id")
                 .map(|g| GroupId::new(g).map_err(|e| StoreError::corrupt(e.to_string())))
                 .transpose()?;
-            TimerKind::Job { kind, group }
+            TimerKind::Job {
+                kind,
+                group,
+                repeat: repeat_parse(row)?,
+            }
         }
         other => return Err(StoreError::corrupt(format!("unknown timer kind {other:?}"))),
     };
@@ -525,8 +523,10 @@ impl TimerStore for PgTimerStore {
             "UPDATE timer SET \
                 state = CASE WHEN state = 'claimed' THEN 'pending' ELSE state END, \
                 due_ms = CASE WHEN state = 'claimed' THEN $3 ELSE due_ms END, \
+                attempts = CASE WHEN kind = 'job' THEN 0 ELSE attempts END, \
+                lease_until_ms = NULL, \
                 last_due_ms = due_ms, last_outcome = $4, last_outcome_detail = $5 \
-             WHERE id = $1 AND due_ms = $2 AND kind = 'wake' AND repeat_kind IS NOT NULL \
+             WHERE id = $1 AND due_ms = $2 AND repeat_kind IS NOT NULL \
                AND state IN ('claimed', 'cancelled')",
         )
         .bind(id_i64(id)?)
@@ -574,43 +574,56 @@ impl TimerStore for PgTimerStore {
         Ok(())
     }
 
-    async fn fire_recurrence(
+    async fn schedule_job(
         &self,
-        name: &str,
-        occurrence: UnixMillis,
         kind: JobKind,
-    ) -> Result<bool, TimerStoreError> {
-        let result = sqlx::query(
-            "WITH advanced AS ( \
-                INSERT INTO recurrence (name, last_fired_ms) VALUES ($1, $2) \
-                ON CONFLICT (name) DO UPDATE SET last_fired_ms = EXCLUDED.last_fired_ms \
-                  WHERE recurrence.last_fired_ms < EXCLUDED.last_fired_ms \
-                RETURNING 1) \
-             INSERT INTO timer (kind, due_ms, state, created_ms, job_kind) \
-             SELECT 'job', $2, 'pending', $3, $4 FROM advanced",
-        )
-        .bind(name)
-        .bind(occurrence.get())
-        .bind(self.clock.now().get())
-        .bind(job_kind_text(kind))
-        .execute(&self.pool)
-        .await
-        .map_err(backend)?;
-        Ok(result.rows_affected() > 0)
-    }
-
-    async fn seed_recurrence(
-        &self,
-        name: &str,
-        occurrence: UnixMillis,
+        repeat: &Repeat,
+        first: UnixMillis,
     ) -> Result<(), TimerStoreError> {
-        sqlx::query("INSERT INTO recurrence (name, last_fired_ms) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING")
-            .bind(name)
-            .bind(occurrence.get())
-            .execute(&self.pool)
+        let (repeat_kind, interval, minute, days, zone) = repeat_columns(Some(repeat))?;
+        let mut tx = self.pool.begin().await.map_err(backend)?;
+        // Every right-hand side reads the row as it was: the job moves only when its rule does.
+        let kept = sqlx::query(
+            "UPDATE timer SET \
+                repeat_kind = $2, repeat_interval_ms = $3, repeat_minute = $4, repeat_days = $5, \
+                repeat_zone = $6, \
+                due_ms = CASE WHEN state = 'pending' \
+                    AND (repeat_kind, repeat_interval_ms, repeat_minute, repeat_days, repeat_zone) \
+                        IS DISTINCT FROM ($2::text, $3::bigint, $4::integer, $5::smallint, $6::text) \
+                    THEN $7 ELSE due_ms END \
+             WHERE kind = 'job' AND job_kind = $1 AND repeat_kind IS NOT NULL \
+               AND state IN ('pending', 'claimed')",
+        )
+        .bind(job_kind_text(kind))
+        .bind(repeat_kind)
+        .bind(interval)
+        .bind(minute)
+        .bind(days)
+        .bind(&zone)
+        .bind(first.get())
+        .execute(&mut *tx)
+        .await
+        .map_err(backend)?
+        .rows_affected();
+        if kept == 0 {
+            sqlx::query(
+                "INSERT INTO timer (kind, due_ms, state, created_ms, job_kind, repeat_kind, \
+                                    repeat_interval_ms, repeat_minute, repeat_days, repeat_zone) \
+                 VALUES ('job', $1, 'pending', $2, $3, $4, $5, $6, $7, $8)",
+            )
+            .bind(first.get())
+            .bind(self.clock.now().get())
+            .bind(job_kind_text(kind))
+            .bind(repeat_kind)
+            .bind(interval)
+            .bind(minute)
+            .bind(days)
+            .bind(&zone)
+            .execute(&mut *tx)
             .await
             .map_err(backend)?;
-        Ok(())
+        }
+        tx.commit().await.map_err(backend)
     }
 
     async fn next_due(&self) -> Result<Option<UnixMillis>, TimerStoreError> {

@@ -93,7 +93,7 @@ Postgres, a mock Responses server and a simulated NapCat.
 | `qbot-context` | the canonical transcript and its projection |
 | `qbot-llm` | provider contract, Responses/DeepSeek adapter, embeddings, web search, fakes |
 | `qbot-agent` | run loop, tool contract, supervisor |
-| `qbot-sched` | timers: group tasks, background jobs, recurring schedules |
+| `qbot-sched` | timers: group tasks, background jobs, repeat rules |
 | `qbot-tools` | the model's tools |
 | `qbot-memory` | identity, names, episodes, extraction, memories, recall, notes |
 | `qbot-store` | Postgres adapters, the schema, the lease |

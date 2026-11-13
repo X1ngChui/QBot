@@ -219,13 +219,11 @@ impl Config {
         }
 
         let mt = &self.maintenance;
-        for (key, expression) in [
-            ("maintenance.nightly_cron", &mt.nightly_cron),
-            ("maintenance.report_cron", &mt.report_cron),
+        for (key, rule) in [
+            ("maintenance.nightly", &mt.nightly),
+            ("maintenance.report", &mt.report),
         ] {
-            if let Err(error) =
-                qbot_sched::Recurrence::new("check", expression, qbot_sched::JobKind::Nightly)
-            {
+            if let Err(error) = rule.parse::<qbot_sched::Rule>() {
                 c.that(false, key, &error.to_string());
             }
         }

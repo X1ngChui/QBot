@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use common::*;
 use qbot_core::{GroupId, TimerId, UnixMillis};
 use qbot_sched::{
-    JobKind, MemoryTimerStore, NewWake, Origin, Recovery, Rule, Scheduler, SchedulerConfig,
+    JobKind, MemoryTimerStore, NewWake, Origin, Recovery, Repeat, Rule, Scheduler, SchedulerConfig,
     StoreError, TaskLimits, TaskService, Timer, TimerOutcome, TimerState, TimerStore, WakeEdit,
     Zone,
 };
@@ -106,16 +106,8 @@ impl TimerStore for FlakyLease {
         }
         self.inner.extend_lease(id, until).await
     }
-    async fn fire_recurrence(
-        &self,
-        n: &str,
-        o: UnixMillis,
-        k: JobKind,
-    ) -> Result<bool, StoreError> {
-        self.inner.fire_recurrence(n, o, k).await
-    }
-    async fn seed_recurrence(&self, n: &str, o: UnixMillis) -> Result<(), StoreError> {
-        self.inner.seed_recurrence(n, o).await
+    async fn schedule_job(&self, k: JobKind, r: &Repeat, f: UnixMillis) -> Result<(), StoreError> {
+        self.inner.schedule_job(k, r, f).await
     }
     async fn next_due(&self) -> Result<Option<UnixMillis>, StoreError> {
         self.inner.next_due().await

@@ -2,14 +2,12 @@
 //! model with one scheduler. Storage is a trait; the in-memory store defines the semantics.
 
 pub mod conformance;
-mod recurring;
 mod repeat;
 mod scheduler;
 mod service;
 mod store;
 mod timer;
 
-pub use recurring::{Recurrence, RecurrenceError, Recurring};
 pub use repeat::{
     Repeat, RepeatError, Rule, TimeOfDay, WEEKDAY_CODES, Weekdays, Zone, interval_text,
 };
