@@ -11,6 +11,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use common::*;
 use qbot_core::{GroupId, RunId};
+use qbot_llm::fake::FakeReply;
 use qbot_llm::responses::sim::SimStep;
 use qbot_llm::responses::{HttpResponse, ResponsesConfig, ResponsesProvider, StateMode, Transport};
 use qbot_llm::{
@@ -153,25 +154,42 @@ async fn a_provider_without_cache_figures_says_so() {
 }
 
 #[tokio::test]
-async fn an_unreadable_answer_is_still_counted_with_its_tokens() {
-    let raw = SimStep::Raw(serde_json::json!({
-        "id": "r", "status": "completed", "model": "m",
-        "output": [{"type": "function_call", "id": "fc", "call_id": "c1", "name": "send_messages",
-                    "arguments": "{\"messages\": [\"he said \"hi\"\"]}", "status": "completed"}],
-        "usage": {"input_tokens": 100, "output_tokens": 20}
-    }));
-    let (_, provider, meter) = metered_provider(true, StateMode::Stateless, vec![raw]);
+async fn an_unreadable_answer_is_asked_for_again_once_and_counted_with_its_tokens() {
+    let raw = || {
+        SimStep::Raw(serde_json::json!({
+            "id": "r", "status": "completed", "model": "m",
+            "output": [{"type": "function_call", "id": "fc", "call_id": "c1", "name": "send_messages",
+                        "arguments": "{\"messages\": [\"he said \"hi\"\"]}", "status": "completed"}],
+            "usage": {"input_tokens": 100, "output_tokens": 20}
+        }))
+    };
+    // Unreadable, then readable: one call, two requests, both answers' tokens.
+    let good = SimStep::Reply(FakeReply::new().call("send_messages", serde_json::json!({})));
+    let (_, provider, meter) = metered_provider(true, StateMode::Stateless, vec![raw(), good]);
     let (tools, conv) = (tools(), base_conversation());
+    let response = provider
+        .respond(request(&conv, &tools, None))
+        .await
+        .unwrap();
+    assert_eq!(response.calls().count(), 1);
+    let call = &meter.calls()[0];
+    assert_eq!(
+        (meter.calls().len(), call.requests, call.error),
+        (1, 2, None)
+    );
+
+    // Unreadable twice: the error, after the one re-ask.
+    let (_, provider, meter) = metered_provider(true, StateMode::Stateless, vec![raw(), raw()]);
     let error = provider
         .respond(request(&conv, &tools, None))
         .await
         .unwrap_err();
     assert!(matches!(error, LlmError::MalformedCall(_)), "{error:?}");
     let call = &meter.calls()[0];
-    assert_eq!(call.error, Some("malformed_call"));
+    assert_eq!((call.requests, call.error), (2, Some("malformed_call")));
     assert_eq!(
         call.tokens.map(|t| (t.input_tokens, t.output_tokens)),
-        Some((100, 20)),
+        Some((200, 40)),
         "billed tokens are recorded although the answer was unusable"
     );
 }

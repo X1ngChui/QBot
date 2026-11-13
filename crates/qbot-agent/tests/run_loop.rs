@@ -828,23 +828,16 @@ async fn provider_calls_a_tool_makes_are_attributed_to_the_run_and_its_turn() {
 }
 
 #[tokio::test]
-async fn an_unreadable_tool_call_is_asked_for_again_once() {
-    let unreadable = || {
+async fn a_tool_call_the_provider_could_not_read_ends_the_run() {
+    // The adapter asks again by itself; what still comes back unreadable is a model error.
+    let h = harness(vec![
         Step::Fail(LlmError::MalformedCall(
             "send_messages arguments are not JSON".into(),
-        ))
-    };
-    // Unreadable, then readable: the reply goes out.
-    let h = harness(vec![unreadable(), reply_ok(say("hi"))]);
+        )),
+        reply_ok(say("hi")),
+    ]);
     h.world.say(1, 1, "hello");
     let report = run_once(&h, addressed(1, 101)).await;
-    assert_eq!((report.end, report.sends), (RunEnd::Delivered, 1));
-    assert_eq!(h.meter.calls().len(), 2, "both calls are recorded");
-
-    // Unreadable twice in a turn: the run ends rather than looping.
-    let h = harness(vec![unreadable(), unreadable(), reply_ok(say("hi"))]);
-    h.world.say(1, 1, "hello");
-    let report = run_once(&h, addressed(1, 101)).await;
-    assert_eq!(report.end, RunEnd::ModelError);
-    assert_eq!(h.meter.calls().len(), 2);
+    assert_eq!((report.end, report.sends), (RunEnd::ModelError, 0));
+    assert_eq!(h.meter.calls().len(), 1, "the run does not repeat the call");
 }

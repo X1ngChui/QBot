@@ -564,15 +564,34 @@ async fn malformed_output_is_a_protocol_error_not_a_guess() {
         respond_with(vec![raw(vec![call("a", "{}"), call("a", "{}")])]).await,
         Err(LlmError::Protocol(_))
     ));
-    // A call whose arguments cannot be read is its own error: the caller may ask again.
+    // A call whose arguments cannot be read is its own error, after the request was sent again.
     assert!(matches!(
-        respond_with(vec![raw(vec![call("a", "not json")])]).await,
+        respond_with(vec![
+            raw(vec![call("a", "not json")]),
+            raw(vec![call("a", "not json")])
+        ])
+        .await,
         Err(LlmError::MalformedCall(_))
     ));
     assert!(matches!(
-        respond_with(vec![raw(vec![call("a", "[1]")])]).await,
+        respond_with(vec![
+            raw(vec![call("a", "[1]")]),
+            raw(vec![call("a", "[1]")])
+        ])
+        .await,
         Err(LlmError::MalformedCall(_))
     ));
+    assert_eq!(
+        respond_with(vec![
+            raw(vec![call("a", "not json")]),
+            raw(vec![call("a", "{}")])
+        ])
+        .await
+        .map(|response| response.calls().count())
+        .ok(),
+        Some(1),
+        "the second answer is the turn"
+    );
     assert!(matches!(
         respond_with(vec![raw(vec![call("a b", "{}")])]).await,
         Err(LlmError::Protocol(_))

@@ -1214,12 +1214,8 @@ async fn extract_lines(ex: &EpisodeExtractor) -> Result<Extracted, ExtractError>
 
 #[tokio::test]
 async fn a_lost_answer_is_asked_for_again_and_a_later_good_one_is_kept() {
-    // Cut off at the output limit, then arguments that are not JSON, then a good answer.
-    let (fake, ex) = extractor(vec![
-        cut_off(),
-        Step::Fail(LlmError::Protocol("arguments are not JSON".into())),
-        answer(good_answer()),
-    ]);
+    // Cut off at the output limit twice, then a good answer.
+    let (fake, ex) = extractor(vec![cut_off(), cut_off(), answer(good_answer())]);
     let out = extract_lines(&ex).await.unwrap();
     assert_eq!(out.attempts, 3);
     assert_eq!(out.title, "Deploy pipeline");

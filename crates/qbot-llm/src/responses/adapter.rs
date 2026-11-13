@@ -234,19 +234,35 @@ impl Provider for ResponsesProvider {
     async fn respond(&self, request: Request<'_>) -> Result<Response, LlmError> {
         let started = Instant::now();
         let call = async {
-            let response = self.dispatch(&request).await?;
-            let value: Value = serde_json::from_slice(&response.body)
-                .map_err(|e| LlmError::Protocol(format!("response is not JSON: {e}")))?;
-            // Billed whether or not the output is usable, so counted before it is checked.
-            meter::add_tokens(parse_usage(value.get("usage")));
-            let parsed = parse_response(self.info.id.as_str(), &value, &self.info.model)?;
-            Self::assemble(
-                &self.info,
-                self.cfg.state,
-                request.conversation,
-                parsed,
-                started,
-            )
+            // An answer whose tool call cannot be read is lost, not wrong: nothing ran, so the
+            // same request is sent again, once, like any other failure that passes by itself.
+            let mut asked_again = false;
+            loop {
+                let response = self.dispatch(&request).await?;
+                let value: Value = serde_json::from_slice(&response.body)
+                    .map_err(|e| LlmError::Protocol(format!("response is not JSON: {e}")))?;
+                // Billed whether or not the output is usable, so counted before it is checked.
+                meter::add_tokens(parse_usage(value.get("usage")));
+                match parse_response(self.info.id.as_str(), &value, &self.info.model) {
+                    Err(LlmError::MalformedCall(detail)) if !asked_again => {
+                        tracing::info!(
+                            model = %self.info.model,
+                            %detail,
+                            "the model's tool call could not be read; asking again"
+                        );
+                        asked_again = true;
+                    }
+                    parsed => {
+                        return Self::assemble(
+                            &self.info,
+                            self.cfg.state,
+                            request.conversation,
+                            parsed?,
+                            started,
+                        );
+                    }
+                }
+            }
         };
         let bounded = async {
             match self.cfg.timeout {

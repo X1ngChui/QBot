@@ -169,20 +169,6 @@ impl EpisodeExtractor {
                     accepted = kept;
                     response
                 }
-                // An answer that came back unreadable (arguments that are not JSON) is lost,
-                // not wrong: the model can do it right on another try.
-                (Err(LlmError::MalformedCall(detail) | LlmError::Protocol(detail)), kept)
-                    if attempt < MAX_ATTEMPTS =>
-                {
-                    accepted = kept;
-                    tracing::warn!(
-                        group = ctx.group.get(),
-                        attempt,
-                        %detail,
-                        "extraction answer unreadable; asking again"
-                    );
-                    continue;
-                }
                 (Err(error), None) => return Err(error.into()),
                 (Err(error), Some(kept)) => {
                     tracing::warn!(

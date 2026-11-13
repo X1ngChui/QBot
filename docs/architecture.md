@@ -278,10 +278,7 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
   a tool that ends it (`send_messages` by default, `stay_silent`), the deadline, `max_turns`, or a
   model error. A run that ends on a model or environment error (the archive, the run log, an
   opened context) logs the cause as a warning; its record keeps the end and the error class.
-  A model turn whose tool call cannot be read (arguments that are not JSON, typically a quotation
-  mark left unescaped) is asked for again once: nothing ran, so the same request is safe to
-  repeat. Every run logs one INFO line when it ends (trigger, end, duration, turns, sends,
-  tokens).
+  Every run logs one INFO line when it ends (trigger, end, duration, turns, sends, tokens).
 - **Speaking.** Only `send_messages` reaches the group: `{messages: [text, ..], end_turn?}`, each
   item one QQ message in the chat's own marker syntax (`[reply:ID]` first, `[at:N]`,
   `[face:N]`; `[dice]`, `[rps]`, `[contact:N]` alone, never a game result), parsed strictly with
@@ -591,7 +588,10 @@ the `media_ref` row the platform reference came in.
   spending the whole deadline: before this bound, 11% of picture calls were lost that way.
 - **Errors** are one taxonomy (`Auth`, `RateLimited`, `Unavailable`, `Timeout`, `ContextTooLong`,
   `QuotaExhausted`, `Protocol`, `MalformedCall`, ...). Retries live in the adapter: bounded, transient failures
-  only (a connection error, a status that says to try again), honoring Retry-After. A used-up plan (HTTP 402, Tavily 432/433)
+  only (a connection error, a status that says to try again), honoring Retry-After. A model turn
+  whose tool call cannot be read (arguments that are not JSON, typically a quotation mark left
+  unescaped) is such a failure too: nothing ran, so the adapter sends the same request again,
+  once, for every caller alike (replies, extraction, rulings). A used-up plan (HTTP 402, Tavily 432/433)
   is `QuotaExhausted` and never retried.
 - **Embeddings**: an OpenAI-compatible endpoint, split into requests of `max_batch` inputs,
   vectors normalized and checked for width.

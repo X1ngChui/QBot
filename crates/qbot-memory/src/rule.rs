@@ -27,7 +27,7 @@ pub const TOOL_NAME: &str = "submit_ruling";
 
 const SYSTEM: &str = include_str!("../../../prompts/rule_name.md");
 
-/// Model calls for one ruling: the answer and one more try when it cannot be read. A ruling can
+/// Model calls for one ruling: the answer and one more try when it holds no ruling. A ruling can
 /// wait for the next run; a slice of chat cannot.
 const ATTEMPTS: u32 = 2;
 
@@ -125,12 +125,7 @@ impl NameRuler {
                     media: None,
                 })
                 .await;
-            let response = match response {
-                Ok(response) => response,
-                Err(LlmError::MalformedCall(_) | LlmError::Protocol(_)) => continue,
-                Err(error) => return Err(error.into()),
-            };
-            let args = response
+            let args = response?
                 .calls()
                 .find(|call| call.name == TOOL_NAME)
                 .and_then(|call| serde_json::from_value::<RulingArgs>(call.arguments.clone()).ok());
