@@ -1,3 +1,6 @@
+# The one place the Rust version is chosen: rustup follows it locally and in CI, and
+# deploy/Dockerfile builds on the same release (RUST_VERSION there names the base image).
+# A floating channel lets a new release reformat or lint code nobody changed.
 [toolchain]
-channel = "stable"
+channel = "1.99"
 components = ["clippy", "rustfmt"]

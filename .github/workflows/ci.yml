@@ -26,9 +26,8 @@ jobs:
       QBOT_TEST_DATABASE_URL: postgres://qbot_test:testpw@127.0.0.1:15432/qbot_test_admin
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy, rustfmt
+      # The toolchain rust-toolchain.toml pins, with its components.
+      - run: rustup toolchain install
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace

@@ -10,6 +10,7 @@
 #   /var/lib/qbot    persistent state (a volume: models, backups)
 #   /run/secrets     credentials     (mounted secret files, or environment variables)
 
+# The release rust-toolchain.toml pins.
 ARG RUST_VERSION=1.99
 FROM rust:${RUST_VERSION}-bookworm AS build
 WORKDIR /src
