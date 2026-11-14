@@ -151,9 +151,10 @@ is what the group shows: the group nickname, else the account nickname.
 - *Display names are recorded.* Every member line keeps the display name it was sent under
   (`chat_line.sender_name`, from the event's `sender.card`, else `sender.nickname`). From the
   archive the bot knows what each member is shown as now and was shown as before: members keep
-  calling each other by old and shortened display names. The current name is also read live from
-  NapCat for the members of a run's conversation (`qbot_agent::Directory`), for the trigger note
-  and command replies, because a name changes apart from any line.
+  calling each other by old and shortened display names. The name is read live from NapCat
+  (`qbot_agent::Directory`) only where the archive has none or a person reads it directly: for
+  a member of a run's conversation the roster cannot name (in the trigger note), and in command
+  replies.
 - *Names are a ledger of references* (`qbot_memory::names`; `name_reference`, `name_set`,
   `name_ruling`, `held_claim`). A reference records that, in one episode, one line used an
   expression for a person (a member, the bot, someone outside, or `unknown`), how, and what

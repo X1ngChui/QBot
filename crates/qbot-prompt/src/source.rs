@@ -237,8 +237,8 @@ impl PromptContext {
         self
     }
 
-    /// Tell every run what the members in its chat are called now, so it can name people
-    /// instead of writing their member numbers.
+    /// Tell every run what the members in its chat are called whom the roster does not name,
+    /// so it can name people instead of writing their member numbers.
     pub fn with_directory(mut self, directory: Arc<dyn Directory>) -> Self {
         self.directory = Some(directory);
         self
@@ -512,9 +512,9 @@ impl PromptContext {
     }
 
     /// The current group display name of every member in `here`, one per line in member order,
-    /// asked of the platform now (in parallel) and kept nowhere: names change apart from every
-    /// record. Empty without a directory. A member the platform cannot name is listed as
-    /// unavailable.
+    /// asked of the platform now (in parallel) and kept nowhere. For the members the roster
+    /// cannot name; the others are named there, from the archive. Empty without a directory. A
+    /// member the platform cannot name is listed as unavailable.
     async fn names(&self, group: GroupId, here: &BTreeMap<MemberNo, AccountId>) -> String {
         let Some(directory) = &self.directory else {
             return String::new();
@@ -771,13 +771,33 @@ impl ContextSource for PromptContext {
         instructions.extend(self.knowledge_instruction(group).await?);
         let here = self.people_here(group, &window, trigger).await?;
         let members = self.named_members(group, &window, &here, &people).await?;
-        // Every speaker of the visible chat is named, and everyone else the conversation involves.
-        let mut named = here.clone();
-        named.extend(window.iter().filter_map(|line| match line.speaker {
-            Speaker::Member { account, number } => Some((number, account)),
-            Speaker::Bot => None,
-        }));
-        let names = self.names(group, &named).await;
+        // Everyone who speaks in the visible chat and everyone else the conversation involves
+        // has a name the model can use. The roster says what its people are shown as, from
+        // their own lines; the platform is asked only about those it does not name (someone
+        // mentioned who never wrote, a line from before display names were kept).
+        let summarized = |index: usize| {
+            recaps
+                .iter()
+                .any(|r| r.when == RecapWhen::Open && r.lines.contains(&index))
+        };
+        let mut unnamed = here.clone();
+        unnamed.extend(
+            window
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !summarized(*index))
+                .filter_map(|(_, line)| match line.speaker {
+                    Speaker::Member { account, number } => Some((number, account)),
+                    Speaker::Bot => None,
+                }),
+        );
+        let listed: BTreeSet<MemberNo> = people
+            .people
+            .iter()
+            .flat_map(|p| p.shown.iter().map(|s| s.member))
+            .collect();
+        unnamed.retain(|number, _| !listed.contains(number));
+        let names = self.names(group, &unnamed).await;
         let remembered = self.memories_here(group, &here).await?;
         let undelivered_note = Instruction {
             role: InstructionRole::Developer,

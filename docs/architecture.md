@@ -359,11 +359,17 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
      changes a record, or with the day (activity and rank are counted as of the start of the
      UTC day);
   3. the chat, which grows by whole batches;
-  4. last the trigger note (the time, the trigger, a task's intent, the current group display
-     names of the members in the visible chat and the run's conversation, read live through
-     `with_directory`, and what
-     is remembered about them and what members wrote about them), which is different for every
-     run.
+  4. last the trigger note (the time, the trigger, a task's intent, what is remembered about
+     the members of the run's conversation and what members wrote about them, and the display
+     names of those of them the roster cannot name), which is different for every run.
+- **What a member is called has one source**, the archive: every line keeps the display name it
+  was sent under, and the roster in the cached prefix shows each listed person by it. Only a
+  member of the visible chat or the run's conversation whom the roster does not name (someone
+  mentioned who never wrote, a line from before names were kept) is asked of the platform
+  (`with_directory`) and named in the trigger note. Before, every speaker of the loaded window
+  was asked of the platform on every run and listed in the uncached note, the people behind
+  summarized lines included. A member who renamed and has not written since is shown under the
+  earlier name until their next line.
 - **Roster** (`PgArchive::people`, one read model; memory.md section 7): who is who, one entry
   per listed person (spoke within `memory.roster_days`, linked, blocked, or named with `/name`;
   at most `memory.roster_people`), in member order: their numbered accounts here and which are

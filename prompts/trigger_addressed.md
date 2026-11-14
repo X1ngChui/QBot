@@ -7,7 +7,7 @@ That message has since been recalled: what it said is gone. Call `stay_silent` u
 You have already replied since that message (your lines after it in the chat). If what you sent answers it, call `stay_silent` rather than saying it again; otherwise answer only what is still open.
 {% endif %}
 {% if names %}
-Names in this chat now:
+Members here that "People in this group" does not name, as QQ shows them now:
 {{names}}
 {% endif %}
 {% if people %}

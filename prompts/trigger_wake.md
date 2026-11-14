@@ -7,7 +7,7 @@ Intent:
 This task repeats by itself: its next run is already scheduled, so do only what this run needs and do not schedule the next one.
 {% endif %}
 {% if names %}
-Names in this chat now:
+Members here that "People in this group" does not name, as QQ shows them now:
 {{names}}
 {% endif %}
 {% if people %}

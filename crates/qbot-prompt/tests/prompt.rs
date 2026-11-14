@@ -1184,7 +1184,53 @@ async fn the_trigger_note_names_the_members_in_the_chat_so_numbers_stay_internal
     assert_eq!(named.instructions, plain.instructions);
     let plain_note = plain.trigger_note.unwrap().text;
     assert!(!plain_note.contains("- member:"), "{plain_note}");
-    assert!(!plain_note.contains("Names in this chat"), "{plain_note}");
+    assert!(!plain_note.contains("does not name"), "{plain_note}");
+
+    // A member the roster shows by a display name is named there, in the cached prefix: the
+    // platform is asked only about the others.
+    let asked = Arc::new(Asked::default());
+    let listed = GroupPeople {
+        people: vec![qbot_prompt::Person {
+            members: vec![(MemberNo::new(2), AccountId::new(11).unwrap())],
+            shown: vec![qbot_prompt::ShownName {
+                member: MemberNo::new(2),
+                text: "Alice".into(),
+                last: UnixMillis::new(at),
+            }],
+            ..Default::default()
+        }],
+        names: Vec::new(),
+    };
+    let with_roster = ctx(Some(asked.clone()))
+        .with_people(Arc::new(FixedPeople(listed)))
+        .open(g, &trigger)
+        .await
+        .unwrap();
+    assert_eq!(*asked.0.lock().unwrap(), [22], "only the member not listed");
+    let note = with_roster.trigger_note.unwrap().text;
+    assert!(
+        !note.contains("- member:2:") && note.contains("- member:7: Seven"),
+        "{note}"
+    );
+    assert!(
+        with_roster
+            .instructions
+            .iter()
+            .any(|i| i.text.contains("member:2") && i.text.contains("Alice")),
+        "the roster names the listed member"
+    );
+}
+
+/// A platform that names everyone "Seven" and records whom it was asked about.
+#[derive(Default)]
+struct Asked(std::sync::Mutex<Vec<i64>>);
+
+#[async_trait]
+impl qbot_agent::Directory for Asked {
+    async fn display_name(&self, _: GroupId, account: AccountId) -> Option<String> {
+        self.0.lock().unwrap().push(account.get());
+        Some("Seven".into())
+    }
 }
 
 #[tokio::test]
