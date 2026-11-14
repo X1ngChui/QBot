@@ -47,7 +47,7 @@ fn rendering_substitutes_arguments_and_picks_plural_forms() {
             runs: 1,
             tokens: 90
         }),
-        "1. Alice  one reply, 90 tokens"
+        "1. Alice  1 reply, 90 tokens"
     );
     assert_eq!(
         en.render(&Msg::MembersRow {
@@ -72,11 +72,14 @@ fn rendering_substitutes_arguments_and_picks_plural_forms() {
 
     let zh = Locales::load("zh-CN", std::path::Path::new("/nonexistent")).unwrap();
     assert_eq!(zh.active().tag(), "zh-CN");
-    assert!(zh.render(&Msg::OwnerOnly {}).contains("owner"));
+    assert!(
+        zh.render(&Msg::OwnerOnly {})
+            .contains("\u{6240}\u{6709}\u{8005}")
+    );
     assert_eq!(zh.render(&Msg::ListSeparator {}), "\u{3001}");
     assert_eq!(
         zh.render(&Msg::MentionsExact { count: 2 }),
-        "\u{9700}\u{8981}\u{51C6}\u{786E} @ 2 \u{4E2A}\u{8D26}\u{53F7}\u{3002}"
+        "\u{8BF7} @ \u{6070}\u{597D} 2 \u{4E2A}\u{8D26}\u{53F7}\u{3002}"
     );
 }
 

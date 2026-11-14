@@ -516,7 +516,7 @@ async fn a_platform_message_becomes_a_stored_reply_and_commands_change_behaviour
     );
     assert_eq!(
         action["params"]["message"][2],
-        json!({"type": "text", "data": {"text": " Muted this group."}})
+        json!({"type": "text", "data": {"text": " This group is now muted."}})
     );
     accept(&mut napcat, &action, 9002).await;
 

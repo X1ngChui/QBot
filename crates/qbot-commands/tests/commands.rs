@@ -505,32 +505,29 @@ async fn help_lists_commands_by_category_and_explains_one() {
     let rig = rig().await;
     let all = rig.say(ALICE, "/help", &[]).await;
     assert!(all.starts_with("Available commands:"), "{all}");
+    assert!(all.contains("/who  Show a member's record"), "{all}");
     assert!(
-        all.contains("/who  Show what is on record about a member"),
+        all.contains("/mute  Mute or unmute the bot in this group (owner or delegated admin)"),
         "{all}"
     );
     assert!(
-        all.contains("/mute  Mute or unmute the bot here (owner or delegated admin)"),
-        "{all}"
-    );
-    assert!(
-        all.contains("/admin  Choose this group's delegated admins (owner only)"),
+        all.contains("/admin  Manage this group's delegated admins (owner only)"),
         "{all}"
     );
     assert!(
         rig.say(ALICE, "/help block", &[])
             .await
-            .contains("Bot owner, or an admin a bot owner delegated in this group")
+            .contains("Access: bot owners and this group's delegated admins")
     );
     assert!(all.contains("[Administration]"), "{all}");
     let one = rig.say(ALICE, "/help tasks", &[]).await;
     assert!(
-        one.contains("Bot owner only") && one.contains("/tasks add"),
+        one.contains("Access: bot owners only") && one.contains("/tasks add"),
         "{one}"
     );
     assert_eq!(
         rig.say(ALICE, "/help nope", &[]).await,
-        "There is no command called \"nope\"."
+        "Unknown command \"nope\". Send /help for the list."
     );
     assert_eq!(
         rig.say(ALICE, "/help a b", &[]).await,
@@ -544,7 +541,7 @@ async fn owner_only_commands_are_refused_for_members() {
     for text in ["/tasks", "/runs", "/logs", "/admin"] {
         assert_eq!(
             rig.say(ALICE, text, &[]).await,
-            "This action needs bot-owner permission.",
+            "Only a bot owner can do this.",
             "{text}"
         );
     }
@@ -553,7 +550,7 @@ async fn owner_only_commands_are_refused_for_members() {
     }
     assert_eq!(
         rig.say(ALICE, "/stats global", &[]).await,
-        "This action needs bot-owner permission."
+        "Only a bot owner can do this."
     );
 }
 
@@ -562,7 +559,7 @@ async fn who_shows_a_record_and_enforces_scope_rules() {
     let rig = rig().await;
     let me = rig.say(ALICE, "/who", &[]).await;
     assert!(
-        me.contains("Account record | Alice | exact account")
+        me.contains("Account record | Alice | single account")
             && me.contains("Messages in this group: 10"),
         "{me}"
     );
@@ -572,15 +569,15 @@ async fn who_shows_a_record_and_enforces_scope_rules() {
     );
     assert_eq!(
         rig.say(ALICE, "/who --bogus", &[]).await,
-        "Unknown option. Send /help for the current syntax."
+        "Unknown option. See /help for the syntax."
     );
     assert_eq!(
         rig.say(ALICE, "/who --linked --linked", &[]).await,
-        "--linked may be given only once."
+        "Use --linked only once."
     );
     assert_eq!(
         rig.say(ALICE, "/who", &[BOB]).await,
-        "You can only act on your own account or on accounts you have confirmed as linked."
+        "You can act only on your own account and the accounts linked to it."
     );
     assert!(
         rig.say(OWNER, "/who", &[BOB]).await.contains("| Bob |"),
@@ -600,7 +597,7 @@ async fn names_are_set_listed_and_removed_with_how_each_was_used() {
     let rig = rig().await;
     assert_eq!(
         rig.say(ALICE, "/name", &[]).await,
-        "Alice has no names on record."
+        "No names are on record for Alice."
     );
     assert_eq!(
         rig.say(ALICE, "/name add Al the  Great", &[]).await,
@@ -627,7 +624,7 @@ async fn names_are_set_listed_and_removed_with_how_each_was_used() {
     let list = rig.say(ALICE, "/name", &[]).await;
     assert_eq!(
         list,
-        "Names of Alice:\n- Al the Great (set with /name)\n- Boss (others call them so in 2 conversation(s), last 2027-01-15; also used for Bob)",
+        "Names of Alice:\n- Al the Great (set with /name)\n- Boss (used by others in 2 conversations, last on 2027-01-15; also used for Bob)",
     );
     assert!(
         rig.say(ALICE, "/who", &[])
@@ -636,7 +633,7 @@ async fn names_are_set_listed_and_removed_with_how_each_was_used() {
     );
     assert_eq!(
         rig.say(BOB, "/name add Al the Great", &[]).await,
-        "\"Al the Great\" already refers to someone else in this group."
+        "\"Al the Great\" is already used for someone else in this group."
     );
     assert_eq!(
         rig.say(ALICE, "/name add", &[]).await,
@@ -652,7 +649,7 @@ async fn names_are_set_listed_and_removed_with_how_each_was_used() {
     );
     assert_eq!(
         rig.say(ALICE, "/name remove Al the Great", &[]).await,
-        "Alice has no active name \"Al the Great\" in this scope."
+        "Alice has no name \"Al the Great\" in this scope."
     );
     // A removed name chat uses again is not learned again.
     assert_eq!(
@@ -665,12 +662,12 @@ async fn names_are_set_listed_and_removed_with_how_each_was_used() {
         .unwrap();
     assert_eq!(
         rig.say(ALICE, "/name", &[]).await,
-        "Alice has no names on record."
+        "No names are on record for Alice."
     );
     let long = format!("/name add {}", "x".repeat(65));
     assert_eq!(
         rig.say(ALICE, &long, &[]).await,
-        "A name can be at most 64 characters."
+        "A name can have at most 64 characters."
     );
 }
 
@@ -687,11 +684,11 @@ async fn linking_needs_an_invitation_and_the_invited_account_to_confirm() {
     );
     assert_eq!(
         rig.say(ALICE, "/link", &[ALICE]).await,
-        "An account cannot be linked with itself."
+        "An account cannot be linked to itself."
     );
     assert_eq!(
         rig.say(ALICE, "/link", &[BOB]).await,
-        "Invited Bob to link. The invited account should send /link confirm in this group within 600 seconds."
+        "Invited Bob to link. The invited account must send /link confirm in this group within 600 seconds."
     );
     assert_eq!(
         rig.say(CAROL, "/link confirm", &[]).await,
@@ -699,11 +696,11 @@ async fn linking_needs_an_invitation_and_the_invited_account_to_confirm() {
     );
     assert_eq!(
         rig.say(ALICE, "/link confirm", &[]).await,
-        "Only the invited account can confirm."
+        "Only the invited account can confirm the invitation."
     );
     assert_eq!(
         rig.say(BOB, "/link confirm", &[]).await,
-        "Link confirmed. Both accounts are now linked."
+        "Link confirmed. The two accounts are now linked."
     );
     // Now linked: Alice may act on Bob, and /who --linked shows the pair.
     assert!(
@@ -713,15 +710,15 @@ async fn linking_needs_an_invitation_and_the_invited_account_to_confirm() {
     );
     assert_eq!(
         rig.say(ALICE, "/link cancel", &[]).await,
-        "There is no pending invitation involving this account in this group."
+        "This account has no pending link invitation in this group."
     );
     assert_eq!(
         rig.say(ALICE, "/unlink", &[]).await,
-        "Unlinked this account; the others stay linked."
+        "This account was unlinked. The other accounts stay linked."
     );
     assert_eq!(
         rig.say(ALICE, "/unlink", &[]).await,
-        "This account is not linked to another account in this group, so there is nothing to detach."
+        "This account is not linked to any other account in this group."
     );
     assert_eq!(
         rig.identity
@@ -743,7 +740,7 @@ async fn a_link_made_in_another_group_is_not_this_groups_to_see_or_use() {
     assert!(!who.contains("Linked accounts"), "{who}");
     assert_eq!(
         rig.say(ALICE, "/who", &[BOB]).await,
-        "You can only act on your own account or on accounts you have confirmed as linked."
+        "You can act only on your own account and the accounts linked to it."
     );
     let top = rig.say(ALICE, "/top --linked", &[]).await;
     assert!(
@@ -756,11 +753,11 @@ async fn a_link_made_in_another_group_is_not_this_groups_to_see_or_use() {
     );
     assert_eq!(
         rig.say(OWNER, "/name", &[BOB]).await,
-        "Bob has no names on record."
+        "No names are on record for Bob."
     );
     assert_eq!(
         rig.say(ALICE, "/unlink", &[]).await,
-        "This account is not linked to another account in this group, so there is nothing to detach."
+        "This account is not linked to any other account in this group."
     );
     assert!(
         rig.say(ALICE, "/link", &[BOB])
@@ -788,11 +785,11 @@ async fn owners_link_and_unlink_other_accounts_directly() {
     let rig = rig().await;
     assert_eq!(
         rig.say(ALICE, "/link", &[BOB, CAROL]).await,
-        "Linking two other accounts directly needs bot-owner permission; use /link @account to invite."
+        "Only a bot owner can link two other accounts directly. Use /link @account to send an invitation."
     );
     assert_eq!(
         rig.say(OWNER, "/link", &[ALICE, 999]).await,
-        "Account 999 has no record and cannot be linked."
+        "There is no record of account 999, so it cannot be linked."
     );
     assert_eq!(
         rig.say(OWNER, "/link", &[ALICE, BOB]).await,
@@ -804,15 +801,15 @@ async fn owners_link_and_unlink_other_accounts_directly() {
     );
     assert_eq!(
         rig.say(ALICE, "/unlink", &[BOB]).await,
-        "Detaching another account needs bot-owner permission; /unlink detaches only your own."
+        "Only a bot owner can unlink another account. /unlink unlinks your own."
     );
     assert_eq!(
         rig.say(OWNER, "/unlink", &[BOB]).await,
-        "Detached the selected account; the others stay linked."
+        "The selected account was unlinked. The other accounts stay linked."
     );
     assert_eq!(
         rig.say(OWNER, "/unlink", &[BOB]).await,
-        "This account is not linked to another account in this group, so there is nothing to detach."
+        "This account is not linked to any other account in this group."
     );
     assert_eq!(
         rig.say(OWNER, "/unlink", &[ALICE, BOB]).await,
@@ -827,7 +824,10 @@ async fn mute_reports_and_changes_state() {
         rig.say(OWNER, "/mute", &[]).await,
         "This group is not muted."
     );
-    assert_eq!(rig.say(OWNER, "/mute on", &[]).await, "Muted this group.");
+    assert_eq!(
+        rig.say(OWNER, "/mute on", &[]).await,
+        "This group is now muted."
+    );
     assert_eq!(
         rig.say(OWNER, "/mute on", &[]).await,
         "This group is already muted."
@@ -863,11 +863,11 @@ async fn blocking_supports_durations_scopes_and_protects_owners() {
     );
     assert_eq!(
         rig.say(OWNER, "/block add 30m", &[BOB]).await,
-        "Blocked replies to Bob | exact account | until 01-15 16:30."
+        "Blocked replies to Bob | single account | until 01-15 16:30."
     );
     assert_eq!(
         rig.say(OWNER, "/block add", &[CAROL]).await,
-        "Blocked replies to member 4 | exact account | until removed."
+        "Blocked replies to member 4 | single account | until removed."
     );
     let list = rig.say(OWNER, "/block", &[]).await;
     assert!(
@@ -876,7 +876,7 @@ async fn blocking_supports_durations_scopes_and_protects_owners() {
     );
     assert_eq!(
         rig.say(OWNER, "/block add 5x", &[BOB]).await,
-        "Invalid duration; use 30m, 12h or 3d."
+        "Invalid duration. Use a value such as 30m, 12h or 3d."
     );
     assert_eq!(
         rig.say(OWNER, "/block add 1d 2d", &[BOB]).await,
@@ -896,11 +896,11 @@ async fn blocking_supports_durations_scopes_and_protects_owners() {
     );
     assert_eq!(
         rig.say(OWNER, "/block remove", &[BOB]).await,
-        "Removed the reply block: Bob | exact account."
+        "Removed the reply block: Bob | single account."
     );
     assert_eq!(
         rig.say(OWNER, "/block remove", &[BOB]).await,
-        "There is no reply block on Bob in scope: exact account."
+        "There is no reply block on Bob (single account)."
     );
 
     // --linked covers every account linked to the person right now.
@@ -932,7 +932,7 @@ async fn members_stats_and_top_summarise_the_group() {
                 "Replies, model: 5 calls (5 requests, 0 failed); 1000 tokens in (400 cached, 40%), 50 out"
             )
             && stats.contains("Memory, model: 1 call (1 request, 0 failed); 3000 tokens in (cache not reported), 90 out")
-            && stats.contains("All provider calls: 6 (6 requests, 0 failed); 4000 tokens in, 140 out")
+            && stats.contains("Provider calls in total: 6 (6 requests, 0 failed); 4000 tokens in, 140 out")
             && stats.contains("Group replies: enabled"),
         "{stats}"
     );
@@ -947,7 +947,7 @@ async fn members_stats_and_top_summarise_the_group() {
     );
     let top = rig.say(ALICE, "/top 2", &[]).await;
     assert!(
-        top.starts_with("Most active requesters this month | exact account"),
+        top.starts_with("Most active members this month | single account"),
         "{top}"
     );
     assert!(
@@ -989,7 +989,7 @@ async fn tasks_can_be_created_listed_changed_and_cancelled() {
         .await;
     assert!(
         created.starts_with(
-            "Created the task:\n1\nState: pending | Due: 2027-01-15T16:30:00+08:00\nremind everyone"
+            "Task created:\n1\nState: pending | Due: 2027-01-15T16:30:00+08:00\nremind everyone"
         ),
         "{created}"
     );
@@ -1009,14 +1009,14 @@ async fn tasks_can_be_created_listed_changed_and_cancelled() {
         .say(OWNER, "/tasks edit 1 --in 2h -- new text", &[])
         .await;
     assert!(
-        edited.starts_with("Changed the task:")
+        edited.starts_with("Task updated:")
             && edited.contains("new text")
             && edited.contains("2027-01-15T18:00:00+08:00"),
         "{edited}"
     );
     assert_eq!(
         rig.say(OWNER, "/tasks edit 1", &[]).await,
-        "Editing a task needs new content, a new time or a new rule."
+        "Nothing to change. Give new content, a new time or a new rule."
     );
     assert!(
         rig.say(OWNER, "/tasks cancel 1", &[])
@@ -1025,15 +1025,15 @@ async fn tasks_can_be_created_listed_changed_and_cancelled() {
     );
     assert_eq!(
         rig.say(OWNER, "/tasks cancel 1", &[]).await,
-        "This group has no such task, or it is no longer pending and so cannot be cancelled."
+        "No such task in this group, or it is no longer pending and cannot be cancelled."
     );
     assert_eq!(
         rig.say(OWNER, "/tasks edit 1 -- x", &[]).await,
-        "This group has no such task, or it is no longer pending and so cannot be changed."
+        "No such task in this group, or it is no longer pending and cannot be changed."
     );
     assert_eq!(
         rig.say(OWNER, "/tasks show 999", &[]).await,
-        "This group has no such task."
+        "No such task in this group."
     );
 }
 
@@ -1043,10 +1043,10 @@ async fn task_arguments_are_validated_with_specific_messages() {
     assert_eq!(
         rig.say(OWNER, "/tasks add --in 1m -- soon", &[])
             .await
-            .split(';')
+            .split('.')
             .next()
             .unwrap(),
-        "The time is too soon"
+        "That time is too soon"
     );
     assert_eq!(
         rig.say(OWNER, "/tasks add --in 30m", &[]).await,
@@ -1072,19 +1072,19 @@ async fn task_arguments_are_validated_with_specific_messages() {
     assert_eq!(
         rig.say(OWNER, "/tasks add --in 30m --in 40m -- x", &[])
             .await,
-        "Each of --at, --in and --every is accepted once, and no other options."
+        "Use each of --at, --in and --every at most once. No other options are accepted."
     );
     assert_eq!(
         rig.say(OWNER, "/tasks add --when 30m -- x", &[]).await,
-        "Each of --at, --in and --every is accepted once, and no other options."
+        "Use each of --at, --in and --every at most once. No other options are accepted."
     );
     assert_eq!(
         rig.say(OWNER, "/tasks add --in 30m --", &[]).await,
-        "The task content must not be empty."
+        "The task content cannot be empty."
     );
     assert_eq!(
         rig.say(OWNER, "/tasks add --in 99x -- x", &[]).await,
-        "Invalid duration; use 30m, 12h or 3d."
+        "Invalid duration. Use a value such as 30m, 12h or 3d."
     );
     assert!(
         rig.say(OWNER, "/tasks add --at tomorrow -- x", &[])
@@ -1110,15 +1110,15 @@ async fn task_arguments_are_validated_with_specific_messages() {
     );
     assert_eq!(
         rig.say(OWNER, "/tasks list 0", &[]).await,
-        "Numbers and page numbers must be whole numbers from 1 to 10000. See /help."
+        "Numbers must be whole numbers from 1 to 10000. See /help."
     );
     assert_eq!(
         rig.say(OWNER, "/tasks list 2", &[]).await,
-        "There are no tasks on this page; look at an earlier page."
+        "This page has no tasks. Try an earlier page."
     );
     assert_eq!(
         rig.say(OWNER, "/tasks", &[BOB]).await,
-        "/tasks manages this group's tasks only and takes no member targets."
+        "/tasks manages this group's tasks and does not take mentions."
     );
 }
 
@@ -1172,7 +1172,7 @@ async fn who_shows_memories_with_their_source_and_forget_removes_one_by_its_id()
     let who = rig.say(ALICE, "/who", &[]).await;
     assert!(
         who.contains(&format!(
-            "Remembered from chat (2):\n{} likes cats (they said so; 1 conversation(s), last 2027-01-15)\n{} lives in Hangzhou (they said so; 1 conversation(s), last 2027-01-15)\nRemove a note with /note remove N, a memory with /forget ID (for example /forget m12), everything remembered about them with /forget all.",
+            "Remembered from chat (2):\n{} likes cats (said by them; 1 conversation, last on 2027-01-15)\n{} lives in Hangzhou (said by them; 1 conversation, last on 2027-01-15)\nTo remove: a note with /note remove N; one memory with /forget ID (for example /forget m12); every memory about this member with /forget all.",
             cats.label(),
             home.label()
         )),
@@ -1182,7 +1182,7 @@ async fn who_shows_memories_with_their_source_and_forget_removes_one_by_its_id()
         rig.say(ALICE, &format!("/forget {}", tea.label()), &[])
             .await,
         format!(
-            "There is no memory {} in that scope. Send /who to see the list.",
+            "There is no memory {} in this scope. Send /who to see the list.",
             tea.label()
         )
     );
@@ -1193,7 +1193,7 @@ async fn who_shows_memories_with_their_source_and_forget_removes_one_by_its_id()
     assert_eq!(
         rig.say(ALICE, &format!("/forget {}", cats.label()), &[BOB])
             .await,
-        "You can only act on your own account or on accounts you have confirmed as linked."
+        "You can act only on your own account and the accounts linked to it."
     );
     assert_eq!(
         rig.say(ALICE, &format!("/forget {}", cats.label()), &[])
@@ -1216,7 +1216,7 @@ async fn who_shows_memories_with_their_source_and_forget_removes_one_by_its_id()
     rig.remember(Some(BOB), None, "plays go", 4).await;
     assert_eq!(
         rig.say(OWNER, "/forget all", &[BOB]).await,
-        "Forgot everything remembered about Bob (2)."
+        "Forgot all 2 memories about Bob."
     );
     assert!(
         rig.say(OWNER, "/who", &[BOB])
@@ -1267,7 +1267,7 @@ async fn who_lists_memories_that_no_longer_hold_so_they_can_be_forgotten() {
     let who = rig.say(ALICE, "/who", &[]).await;
     assert!(
         who.contains(&format!(
-            "Remembered from chat (1):\n{} lives in Ningbo (they said so; 1 conversation(s), last 2027-01-15)\nNo longer holds, still kept (2):\n{} lives in Hangzhou (replaced 2027-01-15)\n{} plays chess (said to have ended 2027-01-15)\nRemove a note",
+            "Remembered from chat (1):\n{} lives in Ningbo (said by them; 1 conversation, last on 2027-01-15)\nNo longer current, still kept (2):\n{} lives in Hangzhou (replaced on 2027-01-15)\n{} plays chess (ended as of 2027-01-15)\nTo remove: a note",
             new.label(),
             old.label(),
             quit.label()
@@ -1281,7 +1281,7 @@ async fn who_lists_memories_that_no_longer_hold_so_they_can_be_forgotten() {
     );
     let who = rig.say(ALICE, "/who", &[]).await;
     assert!(
-        who.contains("No longer holds, still kept (1):") && !who.contains("Hangzhou"),
+        who.contains("No longer current, still kept (1):") && !who.contains("Hangzhou"),
         "{who}"
     );
     // History alone is still listed, with the hint.
@@ -1290,14 +1290,14 @@ async fn who_lists_memories_that_no_longer_hold_so_they_can_be_forgotten() {
     let who = rig.say(ALICE, "/who", &[]).await;
     assert!(
         who.contains("Remembered from chat: nothing")
-            && who.contains("plays chess (said to have ended")
+            && who.contains("plays chess (ended as of")
             && who.contains("/forget ID"),
         "{who}"
     );
     assert!(
         !rig.say(OWNER, "/who", &[BOB])
             .await
-            .contains("No longer holds"),
+            .contains("No longer current"),
         "nothing closed, no section"
     );
 }
@@ -1324,7 +1324,7 @@ async fn notes_are_written_listed_edited_and_removed_by_hand() {
     assert!(list.contains("2. on call this week (by Alice,"), "{list}");
     assert_eq!(
         rig.say(ALICE, "/note edit 2 off call now", &[]).await,
-        "Changed note 2."
+        "Updated note 2."
     );
     assert_eq!(
         rig.notes
@@ -1340,12 +1340,12 @@ async fn notes_are_written_listed_edited_and_removed_by_hand() {
     );
     assert_eq!(
         rig.say(ALICE, "/note remove 5", &[]).await,
-        "There is no note 5 in that scope. Send /note to see the list."
+        "There is no note 5 in this scope. Send /note to see the list."
     );
     // Members manage their own notes; owners anyone's, and the author is recorded.
     assert_eq!(
         rig.say(ALICE, "/note add likes tea", &[BOB]).await,
-        "You can only act on your own account or on accounts you have confirmed as linked."
+        "You can act only on your own account and the accounts linked to it."
     );
     assert_eq!(
         rig.say(OWNER, "/note add new member", &[BOB]).await,
@@ -1357,11 +1357,11 @@ async fn notes_are_written_listed_edited_and_removed_by_hand() {
     rig.say(BOB, "/note add three", &[]).await;
     assert_eq!(
         rig.say(BOB, "/note add four", &[]).await,
-        "An account can have at most 3 notes; remove one first."
+        "An account can have at most 3 notes. Remove one first."
     );
     assert_eq!(
         rig.say(ALICE, "/note add", &[]).await,
-        "A note needs some text."
+        "The note text cannot be empty."
     );
     assert!(
         rig.say(ALICE, "/note frobnicate", &[])
@@ -1428,7 +1428,7 @@ async fn group_shows_what_is_remembered_about_it_and_only_owners_forget_it() {
     let group = rig.say(ALICE, "/group", &[]).await;
     assert!(
         group.contains(&format!(
-            "Remembered about this group:\n{} 3D printing (members said so; 1 conversation(s), last 2027-01-15)\n{} printer room: the room with the 3D printer (members said so; 1 conversation(s), last 2027-01-15)",
+            "Remembered about this group:\n{} 3D printing (said by members; 1 conversation, last on 2027-01-15)\n{} printer room: the room with the 3D printer (said by members; 1 conversation, last on 2027-01-15)",
             about.label(),
             room.label()
         )),
@@ -1437,7 +1437,7 @@ async fn group_shows_what_is_remembered_about_it_and_only_owners_forget_it() {
     assert_eq!(
         rig.say(ALICE, &format!("/forget group {}", room.label()), &[])
             .await,
-        "This action needs bot-owner permission."
+        "Only a bot owner can do this."
     );
     assert_eq!(
         rig.say(OWNER, &format!("/forget group {}", mine.label()), &[])
@@ -1478,12 +1478,12 @@ async fn runs_lists_this_groups_runs_and_shows_one_runs_steps() {
     );
     assert_eq!(
         rig.say(OWNER, "/runs 41", &[]).await,
-        "This group has no run 41.",
+        "This group has no run #41.",
         "another group's run cannot be opened"
     );
     assert_eq!(
         rig.say(OWNER, "/runs abc", &[]).await,
-        "This group has no run abc."
+        "This group has no run #abc."
     );
 }
 
@@ -1513,7 +1513,10 @@ async fn logs_shows_the_latest_warnings_and_errors() {
 #[tokio::test]
 async fn muted_groups_and_blocked_members_get_no_command_replies() {
     let rig = rig().await;
-    assert_eq!(rig.say(OWNER, "/mute on", &[]).await, "Muted this group.");
+    assert_eq!(
+        rig.say(OWNER, "/mute on", &[]).await,
+        "This group is now muted."
+    );
     let before = rig.sent.0.lock().unwrap().len();
     rig.router.run(rig.request(BOB, "/help", &[])).await;
     assert_eq!(
@@ -1546,7 +1549,7 @@ async fn muted_groups_and_blocked_members_get_no_command_replies() {
     );
 }
 
-const DELEGATED_ONLY: &str = "This action needs bot-owner permission, or to be an admin a bot owner delegated in this group.";
+const DELEGATED_ONLY: &str = "Only a bot owner or a delegated admin of this group can do this.";
 
 #[tokio::test]
 async fn owners_grant_list_and_revoke_delegated_admins_per_group() {
@@ -1557,7 +1560,7 @@ async fn owners_grant_list_and_revoke_delegated_admins_per_group() {
     );
     assert_eq!(
         rig.say(OWNER, "/admin add", &[ADAM]).await,
-        "Adam is now a delegated admin of this group (see /help admin for what that allows)."
+        "Adam is now a delegated admin of this group. See /help admin for the permissions."
     );
     assert_eq!(
         rig.say(OWNER, "/admin add", &[ADAM]).await,
@@ -1574,11 +1577,11 @@ async fn owners_grant_list_and_revoke_delegated_admins_per_group() {
     );
     assert_eq!(
         rig.say(OWNER, "/admin add", &[OWNER]).await,
-        "Bot owners already have every permission."
+        "Bot owners already have all permissions."
     );
     assert_eq!(
         rig.say(OWNER, "/admin add", &[BOT]).await,
-        "The bot cannot be an admin."
+        "The bot cannot be a delegated admin."
     );
     assert_eq!(
         rig.say(OWNER, "/admin add", &[]).await,
@@ -1603,7 +1606,10 @@ async fn owners_grant_list_and_revoke_delegated_admins_per_group() {
 async fn a_delegated_admin_mutes_and_blocks_in_their_group_and_nothing_more() {
     let rig = rig().await;
     rig.say(OWNER, "/admin add", &[ADAM]).await;
-    assert_eq!(rig.say(ADAM, "/mute on", &[]).await, "Muted this group.");
+    assert_eq!(
+        rig.say(ADAM, "/mute on", &[]).await,
+        "This group is now muted."
+    );
     assert_eq!(rig.say(ADAM, "/mute", &[]).await, "This group is muted.");
     assert_eq!(
         rig.say(ADAM, "/mute off", &[]).await,
@@ -1638,18 +1644,18 @@ async fn a_delegated_admin_mutes_and_blocks_in_their_group_and_nothing_more() {
     ] {
         assert_eq!(
             rig.say(ADAM, text, &[target]).await,
-            "This action needs bot-owner permission.",
+            "Only a bot owner can do this.",
             "{text}"
         );
     }
     assert_eq!(
         rig.say(ADAM, "/admin", &[]).await,
-        "This action needs bot-owner permission."
+        "Only a bot owner can do this."
     );
     for text in ["/tasks", "/runs", "/logs", "/stats global"] {
         assert_eq!(
             rig.say(ADAM, text, &[]).await,
-            "This action needs bot-owner permission.",
+            "Only a bot owner can do this.",
             "{text}"
         );
     }
@@ -1728,11 +1734,11 @@ async fn a_delegated_admin_blocks_only_ordinary_members() {
     rig.say(OWNER, "/admin add", &[AVA]).await;
     assert_eq!(
         rig.say(ADAM, "/block add", &[AVA]).await,
-        "A delegated admin can block only ordinary members, not another delegated admin."
+        "Delegated admins can block only ordinary members, not other delegated admins."
     );
     assert_eq!(
         rig.say(ADAM, "/block add 3d", &[AVA]).await,
-        "A delegated admin can block only ordinary members, not another delegated admin."
+        "Delegated admins can block only ordinary members, not other delegated admins."
     );
     assert_eq!(
         rig.say(OWNER, "/block", &[]).await,
@@ -1743,7 +1749,7 @@ async fn a_delegated_admin_blocks_only_ordinary_members() {
     rig.say(OWNER, "/link", &[BOB, AVA]).await;
     assert_eq!(
         rig.say(ADAM, "/block add --linked", &[BOB]).await,
-        "A delegated admin can block only ordinary members, not another delegated admin."
+        "Delegated admins can block only ordinary members, not other delegated admins."
     );
     assert_eq!(
         rig.say(OWNER, "/block", &[]).await,
@@ -1768,7 +1774,8 @@ async fn a_bot_owners_block_is_not_a_delegated_admins_to_change_or_lift() {
     let rig = rig().await;
     rig.say(OWNER, "/admin add", &[ADAM]).await;
     rig.say(OWNER, "/block add", &[BOB]).await;
-    let refused = "A bot owner set the block on Bob; only a bot owner can change or lift it.";
+    let refused =
+        "The block on Bob was set by a bot owner. Only a bot owner can change or remove it.";
     assert_eq!(rig.say(ADAM, "/block remove", &[BOB]).await, refused);
     assert_eq!(
         rig.say(ADAM, "/block add 30m", &[BOB]).await,
@@ -1801,7 +1808,7 @@ async fn a_bot_owners_block_is_not_a_delegated_admins_to_change_or_lift() {
     );
     assert_eq!(
         rig.say(ADAM, "/block remove", &[ALICE]).await,
-        "A bot owner set the block on Alice; only a bot owner can change or lift it."
+        "The block on Alice was set by a bot owner. Only a bot owner can change or remove it."
     );
     assert!(
         rig.say(OWNER, "/block remove", &[BOB])
@@ -1810,9 +1817,8 @@ async fn a_bot_owners_block_is_not_a_delegated_admins_to_change_or_lift() {
     );
 }
 
-const ADMIN_TARGET: &str = "A delegated admin can act only on ordinary members of this group, not on a bot owner or another delegated admin.";
-const OWN_ONLY: &str =
-    "You can only act on your own account or on accounts you have confirmed as linked.";
+const ADMIN_TARGET: &str = "Delegated admins can act only on ordinary members of this group, not on bot owners or other delegated admins.";
+const OWN_ONLY: &str = "You can act only on your own account and the accounts linked to it.";
 
 #[tokio::test]
 async fn members_act_on_themselves_and_nobody_else() {
@@ -1866,7 +1872,7 @@ async fn a_delegated_admin_manages_ordinary_members_of_its_group() {
     assert_eq!(
         rig.say(ADAM, "/note edit 1 keeps the rules well", &[BOB])
             .await,
-        "Changed note 1."
+        "Updated note 1."
     );
     assert!(
         rig.say(ADAM, "/note remove 1", &[BOB])
@@ -1894,13 +1900,13 @@ async fn a_delegated_admin_manages_ordinary_members_of_its_group() {
     rig.say(OWNER, "/note add trusted with the keys", &[ALICE])
         .await;
     rig.say(ADAM, "/note add new here", &[ALICE]).await;
-    let protected = "A bot owner wrote that note; only a bot owner or the member it is about can change or remove it.";
+    let protected = "This note was written by a bot owner. Only a bot owner or the member it is about can change or remove it.";
     assert_eq!(rig.say(ADAM, "/note edit 1 x", &[ALICE]).await, protected);
     assert_eq!(rig.say(ADAM, "/note remove 1", &[ALICE]).await, protected);
     assert_eq!(rig.say(ADAM, "/note clear", &[ALICE]).await, protected);
     assert_eq!(
         rig.say(ADAM, "/note edit 2 settling in", &[ALICE]).await,
-        "Changed note 2."
+        "Updated note 2."
     );
     assert!(
         rig.say(ALICE, "/note remove 1", &[])
@@ -1943,24 +1949,24 @@ async fn a_delegated_admin_takes_no_owner_level_action() {
     ] {
         assert_eq!(
             rig.say(ADAM, text, &[]).await,
-            "This action needs bot-owner permission.",
+            "Only a bot owner can do this.",
             "{text}"
         );
     }
     for (text, mentions) in [("/admin add", &[ALICE][..]), ("/admin remove", &[ADAM][..])] {
         assert_eq!(
             rig.say(ADAM, text, mentions).await,
-            "This action needs bot-owner permission.",
+            "Only a bot owner can do this.",
             "{text}"
         );
     }
     assert_eq!(
         rig.say(ADAM, "/link", &[ALICE, BOB]).await,
-        "Linking two other accounts directly needs bot-owner permission; use /link @account to invite."
+        "Only a bot owner can link two other accounts directly. Use /link @account to send an invitation."
     );
     assert_eq!(
         rig.say(ADAM, "/unlink", &[BOB]).await,
-        "Detaching another account needs bot-owner permission; /unlink detaches only your own."
+        "Only a bot owner can unlink another account. /unlink unlinks your own."
     );
 }
 
@@ -1986,7 +1992,7 @@ async fn a_delegated_admin_cannot_manage_bot_owners_or_other_admins() {
     }
     assert_eq!(
         rig.say(ADAM, "/block add", &[BOB]).await,
-        "A delegated admin can block only ordinary members, not another delegated admin."
+        "Delegated admins can block only ordinary members, not other delegated admins."
     );
     assert_eq!(
         rig.say(ADAM, "/block add", &[CAROL]).await,
@@ -2050,7 +2056,7 @@ async fn repeating_tasks_are_made_shown_changed_and_cancelled_by_bot_owners_only
         assert_eq!(
             rig.say(sender, "/tasks add --every daily@09:00 -- x", &[])
                 .await,
-            "This action needs bot-owner permission.",
+            "Only a bot owner can do this.",
             "permissions are unchanged"
         );
     }
@@ -2064,7 +2070,7 @@ async fn repeating_tasks_are_made_shown_changed_and_cancelled_by_bot_owners_only
         .await;
     assert!(
         created.starts_with(
-            "Created the task:\n1\nState: pending | Due: 2027-01-16T09:00:00+08:00\nsay good morning\nRepeats every day at 09:00 (Asia/Shanghai); the due time is the next run."
+            "Task created:\n1\nState: pending | Due: 2027-01-16T09:00:00+08:00\nsay good morning\nRepeats every day at 09:00 (Asia/Shanghai). Due is the next run."
         ),
         "{created}"
     );
@@ -2110,12 +2116,12 @@ async fn repeating_tasks_are_made_shown_changed_and_cancelled_by_bot_owners_only
     assert_eq!(
         rig.say(OWNER, "/tasks add --every sometimes -- x", &[])
             .await,
-        "--every needs an interval (2h, 3d), daily@HH:MM, or days@HH:MM such as mon,thu@20:30."
+        "Invalid rule. --every takes an interval (2h, 3d), daily@HH:MM, or days and a time such as mon,thu@20:30."
     );
     assert_eq!(
         rig.say(OWNER, "/tasks add --every daily@09:00 --every 2h -- x", &[])
             .await,
-        "Each of --at, --in and --every is accepted once, and no other options."
+        "Use each of --at, --in and --every at most once. No other options are accepted."
     );
 
     // Another group sees and changes none of it.
@@ -2125,18 +2131,18 @@ async fn repeating_tasks_are_made_shown_changed_and_cancelled_by_bot_owners_only
     );
     assert_eq!(
         rig.say_in(901, OWNER, "/tasks cancel 1", &[]).await,
-        "This group has no such task, or it is no longer pending and so cannot be cancelled."
+        "No such task in this group, or it is no longer pending and cannot be cancelled."
     );
     assert_eq!(
         rig.say_in(901, OWNER, "/tasks edit 1 --every 2h", &[])
             .await,
-        "This group has no such task, or it is no longer pending and so cannot be changed."
+        "No such task in this group, or it is no longer pending and cannot be changed."
     );
 
     let cancelled = rig.say(OWNER, "/tasks cancel 1", &[]).await;
     assert!(
         cancelled.starts_with(
-            "Cancelled the repeating task; nothing more is scheduled for it, and a run already under way finishes:"
+            "Repeating task cancelled. No further runs are scheduled; a run already in progress will finish."
         ) && cancelled.contains("State: cancelled"),
         "{cancelled}"
     );

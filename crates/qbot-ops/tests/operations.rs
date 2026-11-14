@@ -320,21 +320,21 @@ fn the_report_reads_as_a_short_summary() {
     assert_eq!(
         text,
         "Daily report | 2026-10-03\n\
-         Replies: 12 (10 addressed, 2 scheduled, 0 on its own)\n\
-         How runs ended: delivered 9, deadline 3\n\
+         Replies: 12 (addressed 10, scheduled 2, spontaneous 0)\n\
+         Run outcomes: delivered 9, deadline 3\n\
          Model errors: timeout 3\n\
-         Tool calls: 20 (1 not ok)\n\
-         Replies, model: 30 calls (32 requests, 3 failed); 2000 tokens in (1500 cached, 75%), 300 out\n\
-         Replies, web search: 2 calls (2 requests, 0 failed); 2 credits\n\
-         Memory, model: 3 calls (4 requests, 0 failed); 9000 tokens in (cache not reported), 800 out\n\
-         Memory, embeddings: 3 calls (3 requests, 0 failed); 120 tokens\n\
-         Pictures, model: 5 calls (5 requests, 1 failed); 4000 tokens in (0 cached, 0%), 200 out\n\
-         Replies, page reading: 1 call (1 request, 0 failed); credits not reported\n\
-         All provider calls: 44 (47 requests, 4 failed); 15120 tokens in, 1300 out; 2 credits\n\
-         Chat: 480 messages archived; replied in 3 groups\n\
+         Tool calls: 20 (1 unsuccessful)\n\
+         - Replies, model: 30 calls (32 requests, 3 failed); 2000 tokens in (1500 cached, 75%), 300 out\n\
+         - Replies, web search: 2 calls (2 requests, 0 failed); 2 credits\n\
+         - Memory, model: 3 calls (4 requests, 0 failed); 9000 tokens in (cache not reported), 800 out\n\
+         - Memory, embeddings: 3 calls (3 requests, 0 failed); 120 tokens\n\
+         - Pictures, model: 5 calls (5 requests, 1 failed); 4000 tokens in (0 cached, 0%), 200 out\n\
+         - Replies, page reading: 1 call (1 request, 0 failed); credits not reported\n\
+         Provider calls in total: 44 (47 requests, 4 failed); 15120 tokens in, 1300 out; 2 credits\n\
+         Chat: 480 messages archived; replies sent in 3 groups\n\
          Groups: 1 new, 1 muted\n\
          Memory: 4 new episodes\n\
-         Jobs: 0 pending, 1 failed; 0 scheduled tasks interrupted\n\
+         Background jobs: 0 pending, 1 failed; 0 scheduled tasks interrupted\n\
          Last backup: 5 hours ago"
     );
     let quiet = render_report(
@@ -346,7 +346,7 @@ fn the_report_reads_as_a_short_summary() {
     );
     assert!(
         !quiet.contains("backup")
-            && !quiet.contains("How runs ended")
+            && !quiet.contains("Run outcomes")
             && quiet.contains("Provider calls: none"),
         "{quiet}"
     );
@@ -403,12 +403,12 @@ fn counts_of_one_read_in_the_singular() {
         Some(Duration::from_secs(3600)),
     );
     for expected in [
-        "Chat: 1 message archived; replied in 1 group",
+        "Chat: 1 message archived; replies sent in 1 group",
         "Memory: 1 new episode\n",
         "0 failed; 1 scheduled task interrupted",
         "Replies, model: 1 call (1 request, 0 failed); 1 token in (1 cached, 100%), 1 out",
         "Replies, web search: 1 call (1 request, 0 failed); 1 credit",
-        "All provider calls: 2 (2 requests, 0 failed); 1 token in, 1 out; 1 credit",
+        "Provider calls in total: 2 (2 requests, 0 failed); 1 token in, 1 out; 1 credit",
         "Last backup: 1 hour ago",
     ] {
         assert!(text.contains(expected), "{expected:?} in:\n{text}");
