@@ -12,7 +12,6 @@ use qbot_context::{
 };
 use qbot_core::CallId;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -116,17 +115,6 @@ impl Renderer for PlainRenderer {
     }
 }
 
-/// Identity of a conversation prefix, used to decide whether a continuation still applies.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ConvDigest(String);
-
-impl ConvDigest {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConversationError {
     #[error("conversation is empty")]
@@ -188,11 +176,6 @@ impl Conversation {
         Self { items }
     }
 
-    /// Digest of the first `n` items.
-    pub fn digest_prefix(&self, n: usize) -> ConvDigest {
-        digest_items(&self.items[..n.min(self.items.len())])
-    }
-
     /// Checks the pairing rules every provider relies on: each assistant turn's calls are
     /// answered immediately, in call order, before anything else.
     pub fn validate(&self) -> Result<(), ConversationError> {
@@ -230,23 +213,6 @@ impl Conversation {
             Err(ConversationError::EndsOnPendingCalls)
         }
     }
-}
-
-/// Digest of `items` in order, each by its JSON form.
-pub(crate) fn digest_items<'a>(items: impl IntoIterator<Item = &'a ConvItem>) -> ConvDigest {
-    let mut hasher = Sha256::new();
-    for item in items {
-        // Serializing these types cannot fail: every map in them has string keys.
-        hasher.update(serde_json::to_vec(item).unwrap_or_default());
-        hasher.update(b"\n");
-    }
-    ConvDigest(
-        hasher
-            .finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect(),
-    )
 }
 
 fn instruction_message(instruction: &Instruction) -> Message {

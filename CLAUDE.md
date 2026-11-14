@@ -63,7 +63,7 @@ paid API. Build the image with `docker build -f deploy/Dockerfile .`; deployment
   waiting for its echo) or ends with `stay_silent`; text without a tool call gets one note and a forced tool turn. Every tool call
   executes (no dedup). Tools live in `qbot-tools` (and `open_images` in `qbot-media`).
 - **Providers:** `qbot-llm` is the only place vendors are named: text and vision through the
-  Responses API (DeepSeek and OpenAI-style dialects, typed capabilities), embeddings, Tavily search.
+  Responses API (one adapter, for DeepSeek, which keeps no state), embeddings, Tavily search.
   No local output-token caps; reasoning items never leave the adapter.
 - **Memory:** `qbot-memory`. The archive is the source of truth (each member line keeps the display
   name it was sent under). Episodes summarize fixed slices of whole batches, extracted with

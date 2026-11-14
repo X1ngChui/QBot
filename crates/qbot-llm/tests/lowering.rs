@@ -102,21 +102,6 @@ fn a_run_lowers_to_a_valid_provider_conversation() {
 }
 
 #[test]
-fn prefix_digests_pin_a_continuation_to_unchanged_history() {
-    let build = |old: &str| {
-        let mut t = Transcript::new();
-        t.append(Item::Chat(ChatBatch::new(vec![line(1, 1, old)])))
-            .unwrap();
-        t.append(call("a")).unwrap();
-        t.append(result("a", Outcome::Ok, "x")).unwrap();
-        Conversation::lower(&project(&t).unwrap(), &PlainRenderer)
-    };
-    let (a, b, c) = (build("one"), build("one"), build("two"));
-    assert_eq!(a.digest_prefix(2), b.digest_prefix(2));
-    assert_ne!(a.digest_prefix(2), c.digest_prefix(2));
-}
-
-#[test]
 fn only_trusted_instructions_reach_the_provider_with_authority() {
     let instruction = |role, text: &str| {
         Item::Instruction(Instruction {

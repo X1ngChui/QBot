@@ -130,8 +130,7 @@ clips_per_minute = 20
 reply_wait_secs = 25
 
 [providers.text]
-# deepseek | openai_responses
-kind = "deepseek"
+# DeepSeek's Responses API.
 endpoint = "https://api.deepseek.com"
 model = "deepseek-flash"
 api_key_secret = "TEXT_API_KEY"
@@ -143,8 +142,7 @@ extraction_reasoning = "low"
 [providers.vision]
 # Describes pictures. Off, pictures stay bare `[image]` markers.
 enabled = false
-# deepseek (images go through its Files API) | openai_responses (sent inline)
-kind = "deepseek"
+# DeepSeek's Responses API; pictures go through its Files API.
 endpoint = "https://api.deepseek.com"
 model = "deepseek-flash"
 api_key_secret = "VISION_API_KEY"

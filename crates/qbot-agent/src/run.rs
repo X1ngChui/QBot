@@ -12,8 +12,8 @@ use std::time::Duration;
 use qbot_context::{ChatBatch, Item, Meta, RunEnd, Summary, ToolCall, Transcript, project};
 use qbot_core::{Clock, GroupId, ItemSeq, RunId};
 use qbot_llm::{
-    Attribution, Continuation, Conversation, ForcedToolChoice, LlmError, Provider, Purpose,
-    ReasoningEffort, Renderer, Request, ToolChoice, Usage, attributed,
+    Attribution, Conversation, ForcedToolChoice, LlmError, Provider, Purpose, ReasoningEffort,
+    Renderer, Request, ToolChoice, Usage, attributed,
 };
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -83,7 +83,6 @@ struct Run<'a> {
     view: ChatView,
     state: RunState,
     cursor: ArchiveCursor,
-    continuation: Option<Continuation>,
     usage: Usage,
     turns: u32,
     tool_calls: u32,
@@ -107,7 +106,6 @@ pub async fn execute(deps: &RunDeps, input: &RunInput, cancel: &CancellationToke
         view: ChatView::default(),
         state: RunState::default(),
         cursor: input.context.cursor,
-        continuation: None,
         usage: Usage::ZERO,
         turns: 0,
         tool_calls: 0,
@@ -295,7 +293,6 @@ impl Run<'_> {
                 tool_choice: choice.clone(),
                 parallel_tool_calls: true,
                 reasoning,
-                continuation: self.continuation.as_ref(),
                 media: self.deps.media.as_deref(),
             };
             // The provider records the call itself (`qbot_llm::meter`), attributed to this turn.
@@ -320,7 +317,6 @@ impl Run<'_> {
             }
         };
         self.usage += response.usage;
-        self.continuation = Some(response.continuation);
 
         let calls: Vec<ToolCall> = response.turn.calls().cloned().collect();
         if let Err(error) = self.transcript.append(Item::Assistant(response.turn)) {

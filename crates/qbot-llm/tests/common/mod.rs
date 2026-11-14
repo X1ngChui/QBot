@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use qbot_llm::fake::{FakeProvider, FakeReply, Step};
 use qbot_llm::responses::sim::{SimServer, SimStep};
-use qbot_llm::responses::{ResponsesConfig, ResponsesProvider, RetryPolicy, StateMode};
+use qbot_llm::responses::{ResponsesConfig, ResponsesProvider, RetryPolicy};
 use qbot_llm::{
-    Content, Continuation, ConvItem, Conversation, Message, Provider, ReasoningEffort, Request,
-    Response, Role, ToolChoice, ToolOutput, ToolSpec, ToolStatus,
+    Content, ConvItem, Conversation, Message, Provider, ReasoningEffort, Request, Response, Role,
+    ToolChoice, ToolOutput, ToolSpec, ToolStatus,
 };
 use serde_json::json;
 
@@ -40,18 +40,13 @@ pub fn base_conversation() -> Conversation {
     ])
 }
 
-pub fn request<'a>(
-    conversation: &'a Conversation,
-    tools: &'a [ToolSpec],
-    continuation: Option<&'a Continuation>,
-) -> Request<'a> {
+pub fn request<'a>(conversation: &'a Conversation, tools: &'a [ToolSpec]) -> Request<'a> {
     Request {
         conversation,
         tools,
         tool_choice: ToolChoice::Auto,
         parallel_tool_calls: true,
         reasoning: ReasoningEffort::Low,
-        continuation,
         media: None,
     }
 }
@@ -89,33 +84,23 @@ pub fn fast_retry() -> RetryPolicy {
     }
 }
 
-pub fn sim_provider(
-    deepseek: bool,
-    state: StateMode,
-    script: Vec<SimStep>,
-) -> (Arc<SimServer>, Arc<ResponsesProvider>) {
+pub fn sim_provider(script: Vec<SimStep>) -> (Arc<SimServer>, Arc<ResponsesProvider>) {
     let server = Arc::new(SimServer::new(script));
-    let mut cfg = if deepseek {
-        ResponsesConfig::deepseek("deepseek-test")
-    } else {
-        ResponsesConfig::standard("gpt-test", state)
-    };
+    let mut cfg = ResponsesConfig::new("deepseek-test");
     cfg.retry = fast_retry();
-    let provider = ResponsesProvider::new(cfg, server.clone()).unwrap();
+    let provider = ResponsesProvider::new(cfg, server.clone());
     (server, Arc::new(provider))
 }
 
 /// [`sim_provider`] recording its calls on a meter.
 pub fn metered_provider(
-    deepseek: bool,
-    state: StateMode,
     script: Vec<SimStep>,
 ) -> (
     Arc<SimServer>,
     Arc<ResponsesProvider>,
     Arc<qbot_llm::MemoryMeter>,
 ) {
-    let (server, provider) = sim_provider(deepseek, state, script);
+    let (server, provider) = sim_provider(script);
     let meter = qbot_llm::MemoryMeter::new();
     let provider = Arc::into_inner(provider)
         .expect("only reference")
@@ -131,22 +116,7 @@ pub fn sim_steps(replies: &[FakeReply]) -> Vec<SimStep> {
 pub fn all_providers(replies: &[FakeReply]) -> Vec<(&'static str, Arc<dyn Provider>)> {
     let fake_steps = || replies.iter().cloned().map(Step::Reply).collect::<Vec<_>>();
     vec![
-        ("fake-stateless", Arc::new(FakeProvider::new(fake_steps()))),
-        (
-            "fake-stateful",
-            Arc::new(FakeProvider::new(fake_steps()).stateful()),
-        ),
-        (
-            "deepseek",
-            sim_provider(true, StateMode::Stateless, sim_steps(replies)).1,
-        ),
-        (
-            "openai-stateless",
-            sim_provider(false, StateMode::Stateless, sim_steps(replies)).1,
-        ),
-        (
-            "openai-server-state",
-            sim_provider(false, StateMode::ServerState, sim_steps(replies)).1,
-        ),
+        ("fake", Arc::new(FakeProvider::new(fake_steps()))),
+        ("deepseek", sim_provider(sim_steps(replies)).1),
     ]
 }

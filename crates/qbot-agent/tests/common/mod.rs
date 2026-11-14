@@ -164,21 +164,11 @@ pub fn tool_set(world: &Arc<SimWorld>, order: &Order, max_sends: u32) -> ToolSet
 }
 
 pub fn harness(script: Vec<Step>) -> Harness {
-    harness_with(script, RunLimits::default(), false, 4)
+    harness_with(script, RunLimits::default(), 4)
 }
 
-pub fn harness_with(
-    script: Vec<Step>,
-    limits: RunLimits,
-    stateful: bool,
-    max_sends: u32,
-) -> Harness {
-    let fake = if stateful {
-        FakeProvider::new(script).stateful()
-    } else {
-        FakeProvider::new(script)
-    };
-    harness_from(fake, limits, max_sends)
+pub fn harness_with(script: Vec<Step>, limits: RunLimits, max_sends: u32) -> Harness {
+    harness_from(FakeProvider::new(script), limits, max_sends)
 }
 
 /// A harness around a provider that was set up by the caller.

@@ -157,9 +157,9 @@ async fn pictures_are_described_as_themselves_and_a_repost_is_not_described_agai
         &qbot_llm::net::Route::Direct,
     )
     .unwrap();
-    let mut cfg = ResponsesConfig::deepseek("deepseek-flash");
+    let mut cfg = ResponsesConfig::new("deepseek-flash");
     cfg.timeout = Some(Duration::from_secs(120));
-    let vision = Arc::new(ResponsesProvider::new(cfg, Arc::new(transport)).unwrap());
+    let vision = Arc::new(ResponsesProvider::new(cfg, Arc::new(transport)));
     // As production writes them: the instructions in the deployment's writing language.
     let instructions = qbot_prompt::describe_image_instructions("Simplified Chinese").unwrap();
     let describer = Arc::new(Counted {

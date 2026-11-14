@@ -22,8 +22,8 @@ locale = "en"
 # [gateway]
 # listen = "0.0.0.0:6199"
 
-# Describe pictures with a vision model (DeepSeek by default; for an OpenAI-style model set
-# kind = "openai_responses" with its endpoint and model). Needs secrets/vision_api_key and a
+# Describe pictures with a vision model on DeepSeek's Responses API (another endpoint or
+# model of that dialect can be set). Needs secrets/vision_api_key and a
 # `vision_api_key` entry under `secrets:` in the compose file.
 # [providers.vision]
 # enabled = true

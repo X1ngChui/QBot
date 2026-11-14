@@ -12,7 +12,7 @@ use qbot_core::{AccountId, HistoryWindow, SliceGrid};
 use qbot_llm::ReasoningEffort;
 use qbot_llm::embedding::EmbeddingConfig;
 use qbot_llm::net::Route;
-use qbot_llm::responses::{ResponsesConfig, RetryPolicy, StateMode};
+use qbot_llm::responses::{ResponsesConfig, RetryPolicy};
 use qbot_llm::search::TavilyConfig;
 use qbot_media::MediaConfig;
 use qbot_memory::{Capacity, HalfLives, RecallParams};
@@ -21,7 +21,7 @@ use qbot_tools::ToolSettings;
 
 use crate::error::{ConfigError, ConfigErrors};
 use crate::load::Layout;
-use crate::model::{Config, ProviderKind, Reasoning, SearchDepth, Service};
+use crate::model::{Config, Reasoning, SearchDepth, Service};
 
 /// Replies that may wait for a model slot, per slot. Beyond that a trigger is dropped: a reply
 /// that waits longer than the queue drains would mostly miss its deadline anyway.
@@ -72,15 +72,6 @@ fn depth(d: SearchDepth) -> qbot_llm::search::SearchDepth {
     match d {
         SearchDepth::Basic => qbot_llm::search::SearchDepth::Basic,
         SearchDepth::Advanced => qbot_llm::search::SearchDepth::Advanced,
-    }
-}
-
-/// A Responses API model in the dialect of `kind`. DeepSeek keeps no server-side state; an
-/// OpenAI-style provider continues from its stored previous response.
-fn responses(kind: ProviderKind, model: &str) -> ResponsesConfig {
-    match kind {
-        ProviderKind::Deepseek => ResponsesConfig::deepseek(model),
-        ProviderKind::OpenaiResponses => ResponsesConfig::standard(model, StateMode::ServerState),
     }
 }
 
@@ -231,7 +222,7 @@ impl Config {
 
     pub fn text_provider(&self) -> ResponsesConfig {
         let t = &self.providers.text;
-        let base = responses(t.kind, &t.model);
+        let base = ResponsesConfig::new(&t.model);
         ResponsesConfig {
             timeout: Some(TEXT_CALL_DEADLINE),
             retry: RetryPolicy {
@@ -244,9 +235,8 @@ impl Config {
 
     pub fn vision_provider(&self) -> ResponsesConfig {
         let v = &self.providers.vision;
-        let base = responses(v.kind, &v.model);
+        let base = ResponsesConfig::new(&v.model);
         ResponsesConfig {
-            state: StateMode::Stateless,
             timeout: Some(VISION_CALL_DEADLINE),
             retry: RetryPolicy {
                 attempt_timeout: Some(VISION_ATTEMPT),

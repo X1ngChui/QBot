@@ -4,9 +4,6 @@ use std::time::Duration;
 use qbot_context::AssistantTurn;
 use serde::{Deserialize, Serialize};
 
-use crate::capability::ProviderId;
-use crate::conversation::{ConvDigest, ConvItem, Conversation, digest_items};
-
 /// Prompt-cache accounting. Absence is typed, never a silent zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -91,51 +88,11 @@ pub struct ResponseMeta {
     pub latency: Duration,
 }
 
-/// Opaque state a provider needs to continue a conversation. Callers store it and pass it back
-/// unchanged; whether it carries a server handle or nothing at all is the adapter's business.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Continuation {
-    pub(crate) provider: ProviderId,
-    pub(crate) model: String,
-    /// Number of conversation items the provider has already seen, including this response.
-    pub(crate) covers: usize,
-    /// The provider's state: its handle, and the digest of the prefix it covers. `None` for a
-    /// stateless provider, which replays everything and so needs neither.
-    pub(crate) state: Option<(String, ConvDigest)>,
-}
-
-impl Continuation {
-    pub(crate) fn after(
-        provider: ProviderId,
-        model: String,
-        conversation: &Conversation,
-        turn: &AssistantTurn,
-        handle: Option<String>,
-    ) -> Self {
-        let state = handle.map(|handle| {
-            let turn = ConvItem::Assistant(turn.clone());
-            let digest = digest_items(conversation.items().iter().chain([&turn]));
-            (handle, digest)
-        });
-        Self {
-            provider,
-            model,
-            covers: conversation.len() + 1,
-            state,
-        }
-    }
-
-    pub fn handle(&self) -> Option<&str> {
-        self.state.as_ref().map(|(handle, _)| handle.as_str())
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct Response {
     pub turn: AssistantTurn,
     pub finish: FinishReason,
     pub usage: Usage,
-    pub continuation: Continuation,
     pub meta: ResponseMeta,
 }
 

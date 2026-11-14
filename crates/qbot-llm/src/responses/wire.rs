@@ -8,26 +8,14 @@ use serde_json::{Value, json};
 use crate::capability::{ForcedToolChoice, ProviderInfo};
 use crate::conversation::{Content, ConvItem, Message, Role, ToolOutput};
 use crate::error::LlmError;
-use crate::provider::ReplayPlan;
 use crate::request::{ReasoningEffort, Request, ToolChoice};
 
-use super::{Flavor, ResponsesConfig, StateMode};
+use super::ResponsesConfig;
 
-/// How an image goes on the wire: inline as a data URL, or as a file uploaded earlier.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ImageSource {
-    Url(String),
-    File(String),
-}
-
-/// Image keys that appear in the items that will actually be sent.
-pub(crate) fn image_keys(request: &Request<'_>, plan: &ReplayPlan) -> Vec<String> {
-    let from = match plan {
-        ReplayPlan::Full => 0,
-        ReplayPlan::Delta { from, .. } => *from,
-    };
+/// The image keys of the conversation, each once.
+pub(crate) fn image_keys(request: &Request<'_>) -> Vec<String> {
     let mut keys = Vec::new();
-    for item in &request.conversation.items()[from..] {
+    for item in request.conversation.items() {
         let content: &[Content] = match item {
             ConvItem::Message(m) => &m.content,
             ConvItem::ToolResult(o) => &o.content,
@@ -48,8 +36,7 @@ pub(crate) fn build_body(
     cfg: &ResponsesConfig,
     info: &ProviderInfo,
     request: &Request<'_>,
-    plan: &ReplayPlan,
-    images: &HashMap<String, ImageSource>,
+    images: &HashMap<String, String>,
 ) -> Result<Value, LlmError> {
     let caps = &info.capabilities;
     if matches!(
@@ -69,20 +56,16 @@ pub(crate) fn build_body(
         }
     }
 
-    let (from, previous) = match plan {
-        ReplayPlan::Full => (0, None),
-        ReplayPlan::Delta { from, handle } => (*from, Some(handle.as_str())),
-    };
     let mut input = Vec::new();
-    for item in &request.conversation.items()[from..] {
-        convert_item(cfg, info, item, images, &mut input)?;
+    for item in request.conversation.items() {
+        convert_item(info, item, images, &mut input)?;
     }
 
     let mut body = json!({
         "model": cfg.model,
         "input": input,
         "stream": false,
-        "store": cfg.state == StateMode::ServerState,
+        "store": false,
         "parallel_tool_calls": request.parallel_tool_calls,
     });
     let map = body
@@ -118,71 +101,44 @@ pub(crate) fn build_body(
             ToolChoice::Auto | ToolChoice::None => {}
         }
     }
-    if let Some(id) = previous {
-        map.insert("previous_response_id".into(), json!(id));
-    }
-    match cfg.flavor {
-        Flavor::DeepSeek => {
-            let effort = match request.reasoning {
-                ReasoningEffort::Off => "none",
-                ReasoningEffort::Low => "low",
-                ReasoningEffort::Medium => "high",
-                ReasoningEffort::High => "max",
-            };
-            map.insert("reasoning".into(), json!({ "effort": effort }));
-        }
-        Flavor::Standard => {
-            let effort = match request.reasoning {
-                ReasoningEffort::Off => None,
-                ReasoningEffort::Low => Some("low"),
-                ReasoningEffort::Medium => Some("medium"),
-                ReasoningEffort::High => Some("high"),
-            };
-            if let Some(effort) = effort {
-                map.insert("reasoning".into(), json!({ "effort": effort }));
-            }
-            if cfg.state == StateMode::Stateless {
-                map.insert("include".into(), json!(["reasoning.encrypted_content"]));
-            }
-        }
-    }
+    let effort = match request.reasoning {
+        ReasoningEffort::Off => "none",
+        ReasoningEffort::Low => "low",
+        ReasoningEffort::Medium => "high",
+        ReasoningEffort::High => "max",
+    };
+    map.insert("reasoning".into(), json!({ "effort": effort }));
     Ok(body)
 }
 
 fn convert_item(
-    cfg: &ResponsesConfig,
     info: &ProviderInfo,
     item: &ConvItem,
-    images: &HashMap<String, ImageSource>,
+    images: &HashMap<String, String>,
     out: &mut Vec<Value>,
 ) -> Result<(), LlmError> {
     match item {
-        ConvItem::Message(message) => out.push(message_item(cfg, message, images)?),
+        ConvItem::Message(message) => out.push(message_item(message, images)?),
         ConvItem::Assistant(turn) => assistant_items(info, turn, out)?,
         ConvItem::ToolResult(output) => out.push(output_item(output, images)?),
     }
     Ok(())
 }
 
-fn role_name(cfg: &ResponsesConfig, role: Role) -> &'static str {
+fn role_name(role: Role) -> &'static str {
     match role {
         Role::System => "system",
-        Role::User => "user",
         // DeepSeek has no developer role; the instruction is delivered as a user message.
-        Role::Developer if cfg.flavor == Flavor::DeepSeek => "user",
-        Role::Developer => "developer",
+        Role::User | Role::Developer => "user",
     }
 }
 
-fn content_part(
-    content: &Content,
-    images: &HashMap<String, ImageSource>,
-) -> Result<Value, LlmError> {
+/// `images` holds the uploaded file id of every image key.
+fn content_part(content: &Content, images: &HashMap<String, String>) -> Result<Value, LlmError> {
     match content {
         Content::Text(text) => Ok(json!({ "type": "input_text", "text": text })),
         Content::Image { key } => match images.get(key) {
-            Some(ImageSource::Url(url)) => Ok(json!({ "type": "input_image", "image_url": url })),
-            Some(ImageSource::File(id)) => Ok(json!({ "type": "input_image", "file_id": id })),
+            Some(id) => Ok(json!({ "type": "input_image", "file_id": id })),
             None => Err(LlmError::InvalidRequest(format!(
                 "image {key:?} was not loaded"
             ))),
@@ -190,12 +146,8 @@ fn content_part(
     }
 }
 
-fn message_item(
-    cfg: &ResponsesConfig,
-    message: &Message,
-    images: &HashMap<String, ImageSource>,
-) -> Result<Value, LlmError> {
-    let role = role_name(cfg, message.role);
+fn message_item(message: &Message, images: &HashMap<String, String>) -> Result<Value, LlmError> {
+    let role = role_name(message.role);
     if let [Content::Text(text)] = message.content.as_slice() {
         return Ok(json!({ "role": role, "content": text }));
     }
@@ -207,10 +159,7 @@ fn message_item(
     Ok(json!({ "role": role, "content": parts }))
 }
 
-fn output_item(
-    output: &ToolOutput,
-    images: &HashMap<String, ImageSource>,
-) -> Result<Value, LlmError> {
+fn output_item(output: &ToolOutput, images: &HashMap<String, String>) -> Result<Value, LlmError> {
     let all_text = output.content.iter().all(|c| matches!(c, Content::Text(_)));
     let value = if all_text {
         let joined: Vec<&str> = output

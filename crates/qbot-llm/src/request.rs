@@ -3,7 +3,6 @@ use async_trait::async_trait;
 use crate::capability::ProviderInfo;
 use crate::conversation::{Content, ConvItem, Conversation};
 use crate::error::LlmError;
-use crate::response::Continuation;
 
 /// A tool the model may call. The schema is JSON Schema for the arguments object.
 #[derive(Debug, Clone, PartialEq)]
@@ -41,10 +40,7 @@ pub struct LoadedMedia {
     pub bytes: Vec<u8>,
 }
 
-/// One model call: the complete logical conversation plus an optional continuation.
-///
-/// The conversation is always complete. A provider that keeps state uses the continuation to
-/// send only the new tail; one that does not simply ignores it.
+/// One model call. The conversation is always complete: every call replays it.
 pub struct Request<'a> {
     pub conversation: &'a Conversation,
     pub tools: &'a [ToolSpec],
@@ -53,7 +49,6 @@ pub struct Request<'a> {
     /// How much the model reasons before answering. The output length is left to the provider:
     /// a local cap only adds a way for a long but valid answer to be cut off.
     pub reasoning: ReasoningEffort,
-    pub continuation: Option<&'a Continuation>,
     pub media: Option<&'a dyn MediaStore>,
 }
 
@@ -79,7 +74,7 @@ pub fn validate_request(info: &ProviderInfo, request: &Request<'_>) -> Result<()
         ConvItem::Assistant(_) => false,
     });
     if has_images {
-        if info.capabilities.image_input.is_none() {
+        if !info.capabilities.image_input {
             return Err(LlmError::Unsupported("image input"));
         }
         if request.media.is_none() {

@@ -293,7 +293,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     // Every provider records each call it makes in the usage records, whatever the work.
     let meter: Arc<dyn Meter> = recorder.sink();
     let provider: Arc<dyn Provider> = Arc::new(
-        ResponsesProvider::new(config.text_provider(), Arc::new(text_transport))?
+        ResponsesProvider::new(config.text_provider(), Arc::new(text_transport))
             .with_meter(meter.clone()),
     );
     let embed_transport = ReqwestTransport::new(
@@ -393,7 +393,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     })
     .map_err(|e| RunError::Tools(e.to_string()))?;
     // The model may look at pictures itself only if it accepts images at all.
-    let (tools, media_store) = if provider.info().capabilities.image_input.is_some() {
+    let (tools, media_store) = if provider.info().capabilities.image_input {
         let store = Arc::new(ArchivedMedia::new(
             Arc::new(archive.clone()),
             fetcher.clone(),
@@ -526,7 +526,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
             &config.route(Service::Vision),
         )?;
         let vision = Arc::new(
-            ResponsesProvider::new(config.vision_provider(), Arc::new(transport))?
+            ResponsesProvider::new(config.vision_provider(), Arc::new(transport))
                 .with_meter(meter.clone()),
         );
         let instructions = describe_image_instructions(&writing_language)?;

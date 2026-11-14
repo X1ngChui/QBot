@@ -1,16 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-/// How a capability is delivered to the upper layers.
-///
-/// Both variants give identical semantics. `Emulated` means the adapter reconstructs the
-/// behavior locally because the vendor does not provide it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Realization {
-    Native,
-    Emulated,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ProviderId(String);
@@ -39,19 +28,13 @@ pub struct ReasoningInfo {
     pub effort_control: bool,
 }
 
-/// Required features are [`Realization`]s: a provider that cannot deliver one natively or by
-/// emulation cannot be used. Optional features are `Option`/`bool` and are typed as absent.
+/// What the callers of a provider decide by. Everything else (tool calls, the roles a
+/// conversation uses, replaying the conversation) every provider delivers, in its adapter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
-    pub tool_calls: Realization,
-    pub parallel_tool_calls: Realization,
-    /// `Native`: the provider keeps conversation state and accepts a handle.
-    /// `Emulated`: the adapter replays the full conversation every call.
-    pub continuation: Realization,
-    pub developer_role: Realization,
     pub reasoning: ReasoningInfo,
-    /// Image content in messages and tool results; `None` means unavailable.
-    pub image_input: Option<Realization>,
+    /// Image content in messages and tool results.
+    pub image_input: bool,
     /// Usage reports how many input tokens were served from the prompt cache.
     pub cache_metrics: bool,
     /// When `ToolChoice::Required` and `ToolChoice::Named` are honored. `Auto` and `None` always

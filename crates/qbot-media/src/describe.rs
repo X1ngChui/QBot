@@ -77,7 +77,6 @@ impl Describer for LlmDescriber {
             parallel_tool_calls: false,
             // A description is a sentence or two; there is nothing to reason through.
             reasoning: ReasoningEffort::Off,
-            continuation: None,
             media: Some(&store),
         };
         let response = self.provider.respond(request).await.map_err(classify)?;

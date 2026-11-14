@@ -137,6 +137,21 @@ async fn mock_llm_counting(sim: Arc<SimServer>) -> (SocketAddr, Arc<AtomicUsize>
             .body(Body::from(answer.body))
             .unwrap()
     }
+    /// The Files API: whatever is posted is one uploaded picture.
+    async fn upload(State(mock): State<Mock>, body: axum::body::Bytes) -> Response {
+        let upload = qbot_llm::responses::Upload {
+            file_name: "image".into(),
+            mime: "image/png".into(),
+            bytes: body.to_vec(),
+            fields: Vec::new(),
+        };
+        let answer = mock.sim.upload("/files", &upload).await.unwrap();
+        Response::builder()
+            .status(StatusCode::from_u16(answer.status).unwrap())
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(answer.body))
+            .unwrap()
+    }
     async fn embed(State(mock): State<Mock>, body: axum::Json<Value>) -> axum::Json<Value> {
         mock.embedded.fetch_add(1, Ordering::SeqCst);
         embeddings(body).await
@@ -144,6 +159,7 @@ async fn mock_llm_counting(sim: Arc<SimServer>) -> (SocketAddr, Arc<AtomicUsize>
     let embedded = Arc::new(AtomicUsize::new(0));
     let app = Router::new()
         .route("/responses", post(handle))
+        .route("/files", post(upload))
         .route("/embeddings", post(embed))
         .route(
             "/pic",
@@ -265,8 +281,6 @@ endpoint = "http://{llm}"
 
 [providers.vision]
 enabled = true
-# The mock serves the standard Responses dialect (pictures sent inline), not DeepSeek's uploads.
-kind = "openai_responses"
 endpoint = "http://{llm}"
 
 [media]
@@ -706,9 +720,10 @@ async fn pictures_and_voice_reach_the_model_as_words() {
     let requests = sim.requests();
     assert!(
         requests[0].to_string().contains("input_image")
-            && requests[0].to_string().contains("data:image/png;base64,"),
-        "the vision call carries the picture"
+            && requests[0].to_string().contains("\"file_id\":\"file-1\""),
+        "the vision call carries the picture, as the file uploaded for it"
     );
+    assert_eq!(sim.uploads().len(), 1, "the picture was uploaded once");
     assert!(
         requests[0]
             .to_string()
@@ -754,9 +769,10 @@ async fn pictures_and_voice_reach_the_model_as_words() {
             .contains("[image:A red bicycle leaning against a brick wall]")
     );
     assert_eq!(sim.requests().len(), 3, "one vision call, two replies");
+    // An upload is a request of the call it serves.
     assert_usage_complete(
         &pool,
-        sim.requests().len(),
+        sim.requests().len() + sim.uploads().len(),
         0,
         &[("picture", "model"), ("reply", "model")],
     )
@@ -1240,11 +1256,6 @@ async fn the_model_can_open_a_picture_and_mentions_become_member_numbers() {
     ]));
     let llm = mock_llm(sim.clone()).await;
     deployment(&db, llm, &root, None);
-    // A text model on the standard Responses dialect takes images, so open_images is offered.
-    write(
-        &root.join("etc/conf.d/50-text.toml"),
-        "[providers.text]\nkind = \"openai_responses\"\nmodel = \"vision-capable\"\n",
-    );
     let bot = launch(&db, &root).await;
     let pool = db.pool().await;
     let mut napcat = connect(bot.addr, "sesame").await.unwrap();
@@ -1274,12 +1285,12 @@ async fn the_model_can_open_a_picture_and_mentions_become_member_numbers() {
     let tools = requests[1]["tools"].to_string();
     assert!(
         tools.contains("open_images"),
-        "offered to an image-capable model: {tools}"
+        "offered, since the model takes images: {tools}"
     );
     let second = requests[2].to_string();
     assert!(
-        second.contains("input_image") && second.contains("data:image/png;base64,"),
-        "the opened picture went to the model: {second}"
+        second.contains("input_image") && second.contains("\"file_id\":\"file-"),
+        "the opened picture went to the model as an uploaded file: {second}"
     );
 
     // The mentioned account got a member number, and its id never reached the archive.

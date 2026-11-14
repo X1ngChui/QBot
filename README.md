@@ -27,8 +27,8 @@ stays out of the way.
 
 QBot connects to QQ through [NapCat](https://github.com/NapNeko/NapCatQQ) (OneBot v11, reverse
 WebSocket) and stores everything in PostgreSQL 17 with pgvector. The language model, vision model,
-embeddings and web search are configurable providers (DeepSeek, OpenAI-style Responses APIs,
-DashScope embeddings, Tavily).
+embeddings and web search are providers behind one crate (DeepSeek's Responses API, an
+OpenAI-compatible embeddings endpoint such as DashScope, Tavily).
 
 ## Running it
 

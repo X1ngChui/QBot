@@ -46,9 +46,9 @@ fn live_extractor() -> EpisodeExtractor {
         &qbot_llm::net::Route::Direct,
     )
     .unwrap();
-    let mut cfg = ResponsesConfig::deepseek(model);
+    let mut cfg = ResponsesConfig::new(model);
     cfg.timeout = Some(Duration::from_secs(180));
-    let provider = Arc::new(ResponsesProvider::new(cfg, Arc::new(transport)).unwrap());
+    let provider = Arc::new(ResponsesProvider::new(cfg, Arc::new(transport)));
     EpisodeExtractor::new(provider)
 }
 

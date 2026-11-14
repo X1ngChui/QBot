@@ -1,11 +1,9 @@
 //! A scripted provider that implements the whole contract with no network.
 //!
 //! It validates every request exactly as a real adapter would, simulates prefix-cache usage
-//! from the conversation it is given, optionally keeps "server state" so continuations are
-//! exercised, and records everything it was asked. Milestone-4 tests drive the agent loop with it.
+//! from the conversation it is given, and records everything it was asked.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -14,15 +12,13 @@ use qbot_context::{AssistantPart, AssistantTurn, OpaqueReasoning, ToolCall};
 use qbot_core::CallId;
 use serde_json::Value;
 
-use crate::capability::{
-    Capabilities, ForcedToolChoice, ProviderId, ProviderInfo, Realization, ReasoningInfo,
-};
+use crate::capability::{Capabilities, ForcedToolChoice, ProviderId, ProviderInfo, ReasoningInfo};
 use crate::conversation::{ConvItem, Conversation};
 use crate::error::LlmError;
 use crate::meter::{self, CallKind, Meter};
-use crate::provider::{Provider, ReplayPlan, plan_replay};
+use crate::provider::Provider;
 use crate::request::{Request, ToolChoice, validate_request};
-use crate::response::{CacheUsage, Continuation, FinishReason, Response, ResponseMeta, Usage};
+use crate::response::{CacheUsage, FinishReason, Response, ResponseMeta, Usage};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FakePart {
@@ -87,7 +83,6 @@ impl From<FakeReply> for Step {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Recorded {
     pub conversation: Conversation,
-    pub plan: ReplayPlan,
     pub tool_names: Vec<String>,
     pub tool_choice: ToolChoice,
     pub reasoning: crate::ReasoningEffort,
@@ -98,15 +93,10 @@ struct Inner {
     script: VecDeque<Step>,
     recorded: Vec<Recorded>,
     next_call: u64,
-    next_handle: u64,
-    handles: HashMap<String, usize>,
     last_conversation: Option<Conversation>,
 }
 
-static INSTANCES: AtomicU64 = AtomicU64::new(1);
-
 pub struct FakeProvider {
-    instance: u64,
     info: ProviderInfo,
     inner: Mutex<Inner>,
     meter: Option<Arc<dyn Meter>>,
@@ -121,29 +111,24 @@ impl std::fmt::Debug for FakeProvider {
 }
 
 impl FakeProvider {
-    /// A stateless provider (full replay every call), like DeepSeek.
+    /// A provider that takes the whole conversation every call, like the real one.
     pub fn new(script: impl IntoIterator<Item = Step>) -> Self {
         let info = ProviderInfo {
             id: ProviderId::new("fake"),
             model: "fake-model".to_owned(),
             capabilities: Capabilities {
-                tool_calls: Realization::Native,
-                parallel_tool_calls: Realization::Native,
-                continuation: Realization::Emulated,
-                developer_role: Realization::Native,
                 reasoning: ReasoningInfo {
                     produces: true,
                     replay_required: false,
                     visible_summary: true,
                     effort_control: true,
                 },
-                image_input: None,
+                image_input: false,
                 cache_metrics: true,
                 forced_tool_choice: ForcedToolChoice::Always,
             },
         };
         Self {
-            instance: INSTANCES.fetch_add(1, Ordering::Relaxed),
             info,
             inner: Mutex::new(Inner {
                 script: script.into_iter().collect(),
@@ -160,15 +145,9 @@ impl FakeProvider {
         self
     }
 
-    /// Make the fake keep server-side state, so continuations produce delta plans.
     /// Declare when forced tool choice is honored, as a real provider would.
     pub fn forced_tool_choice(mut self, forced: ForcedToolChoice) -> Self {
         self.info.capabilities.forced_tool_choice = forced;
-        self
-    }
-
-    pub fn stateful(mut self) -> Self {
-        self.info.capabilities.continuation = Realization::Native;
         self
     }
 
@@ -192,20 +171,8 @@ impl FakeProvider {
         validate_request(&self.info, request)?;
         let conversation = request.conversation;
         let mut inner = self.lock();
-        let plan = plan_replay(&self.info, conversation, request.continuation);
-        if let (Some(cont), true) = (
-            request.continuation,
-            self.info.capabilities.continuation == Realization::Native,
-        ) && let Some(handle) = cont.handle()
-            && !inner.handles.contains_key(handle)
-        {
-            return Err(LlmError::InvalidRequest(format!(
-                "unknown continuation handle {handle:?}"
-            )));
-        }
         inner.recorded.push(Recorded {
             conversation: conversation.clone(),
-            plan,
             tool_names: request.tools.iter().map(|t| t.name.clone()).collect(),
             tool_choice: request.tool_choice.clone(),
             reasoning: request.reasoning,
@@ -273,21 +240,6 @@ impl FakeProvider {
         let output_tokens = tokens_of(&turn_json(&turn)) + 1;
         inner.last_conversation = Some(conversation.clone());
 
-        let handle = if self.info.capabilities.continuation == Realization::Native {
-            inner.next_handle += 1;
-            let handle = format!("fake-{}-resp-{}", self.instance, inner.next_handle);
-            inner.handles.insert(handle.clone(), conversation.len() + 1);
-            Some(handle)
-        } else {
-            None
-        };
-        let continuation = Continuation::after(
-            self.info.id.clone(),
-            self.info.model.clone(),
-            conversation,
-            &turn,
-            handle.clone(),
-        );
         let response = Response {
             turn,
             finish,
@@ -298,10 +250,9 @@ impl FakeProvider {
                 reasoning_tokens: Some(0),
                 reported: true,
             },
-            continuation,
             meta: ResponseMeta {
                 model: self.info.model.clone(),
-                provider_response_id: handle,
+                provider_response_id: None,
                 latency: Duration::ZERO,
             },
         };

@@ -13,7 +13,7 @@ use common::*;
 use qbot_core::{GroupId, RunId};
 use qbot_llm::fake::FakeReply;
 use qbot_llm::responses::sim::SimStep;
-use qbot_llm::responses::{HttpResponse, ResponsesConfig, ResponsesProvider, StateMode, Transport};
+use qbot_llm::responses::{HttpResponse, ResponsesConfig, ResponsesProvider, Transport};
 use qbot_llm::{
     Attribution, CacheUsage, CallKind, LlmError, MemoryMeter, Provider, Purpose, attributed,
 };
@@ -25,8 +25,7 @@ fn group() -> GroupId {
 
 #[tokio::test]
 async fn a_call_carries_the_work_it_was_made_for() {
-    let (_, provider, meter) =
-        metered_provider(true, StateMode::Stateless, sim_steps(&[first_reply()]));
+    let (_, provider, meter) = metered_provider(sim_steps(&[first_reply()]));
     let (tools, conv) = (tools(), base_conversation());
     let reply = Attribution {
         purpose: Purpose::Reply,
@@ -34,7 +33,7 @@ async fn a_call_carries_the_work_it_was_made_for() {
         run: Some(RunId::new(7)),
         turn: Some(2),
     };
-    let response = attributed(reply, provider.respond(request(&conv, &tools, None)))
+    let response = attributed(reply, provider.respond(request(&conv, &tools)))
         .await
         .unwrap();
 
@@ -56,13 +55,9 @@ async fn a_call_carries_the_work_it_was_made_for() {
 
 #[tokio::test]
 async fn a_call_outside_any_work_is_still_recorded_unattributed() {
-    let (_, provider, meter) =
-        metered_provider(true, StateMode::Stateless, sim_steps(&[first_reply()]));
+    let (_, provider, meter) = metered_provider(sim_steps(&[first_reply()]));
     let (tools, conv) = (tools(), base_conversation());
-    provider
-        .respond(request(&conv, &tools, None))
-        .await
-        .unwrap();
+    provider.respond(request(&conv, &tools)).await.unwrap();
     assert_eq!(meter.calls().len(), 1);
     assert_eq!(meter.calls()[0].attribution, None);
 }
@@ -78,10 +73,10 @@ async fn a_failed_call_counts_every_request_and_no_tokens() {
         };
         3
     ];
-    let (_, provider, meter) = metered_provider(true, StateMode::Stateless, steps);
+    let (_, provider, meter) = metered_provider(steps);
     let (tools, conv) = (tools(), base_conversation());
     let work = Attribution::group(Purpose::Extraction, group());
-    let error = attributed(work, provider.respond(request(&conv, &tools, None)))
+    let error = attributed(work, provider.respond(request(&conv, &tools)))
         .await
         .unwrap_err();
     assert_eq!(error, LlmError::Unavailable);
@@ -105,14 +100,13 @@ impl Transport for Hang {
 #[tokio::test(start_paused = true)]
 async fn a_call_cut_off_by_its_caller_is_recorded_as_cancelled() {
     let meter = MemoryMeter::new();
-    let provider = ResponsesProvider::new(ResponsesConfig::deepseek("m"), Arc::new(Hang))
-        .unwrap()
-        .with_meter(meter.clone());
+    let provider =
+        ResponsesProvider::new(ResponsesConfig::new("m"), Arc::new(Hang)).with_meter(meter.clone());
     let (tools, conv) = (tools(), base_conversation());
     let work = Attribution::group(Purpose::Picture, group());
     let cut = tokio::time::timeout(
         Duration::from_secs(1),
-        attributed(work, provider.respond(request(&conv, &tools, None))),
+        attributed(work, provider.respond(request(&conv, &tools))),
     )
     .await;
     assert!(cut.is_err(), "the caller gave up");
@@ -128,25 +122,18 @@ async fn a_call_cut_off_by_its_caller_is_recorded_as_cancelled() {
 
 #[tokio::test]
 async fn a_provider_without_cache_figures_says_so() {
-    let (_, provider, meter) = metered_provider(
-        false,
-        StateMode::Stateless,
-        vec![SimStep::Raw(serde_json::json!({
-            "id": "resp_1",
-            "status": "completed",
-            "model": "gpt-test",
-            "output": [{
-                "type": "message", "id": "msg_1", "status": "completed", "role": "assistant",
-                "content": [{"type": "output_text", "text": "hi"}]
-            }],
-            "usage": {"input_tokens": 10, "output_tokens": 2}
-        }))],
-    );
+    let (_, provider, meter) = metered_provider(vec![SimStep::Raw(serde_json::json!({
+        "id": "resp_1",
+        "status": "completed",
+        "model": "gpt-test",
+        "output": [{
+            "type": "message", "id": "msg_1", "status": "completed", "role": "assistant",
+            "content": [{"type": "output_text", "text": "hi"}]
+        }],
+        "usage": {"input_tokens": 10, "output_tokens": 2}
+    }))]);
     let (tools, conv) = (tools(), base_conversation());
-    provider
-        .respond(request(&conv, &tools, None))
-        .await
-        .unwrap();
+    provider.respond(request(&conv, &tools)).await.unwrap();
     assert_eq!(
         meter.calls()[0].tokens.map(|t| t.cache),
         Some(CacheUsage::NotReported)
@@ -165,12 +152,9 @@ async fn an_unreadable_answer_is_asked_for_again_once_and_counted_with_its_token
     };
     // Unreadable, then readable: one call, two requests, both answers' tokens.
     let good = SimStep::Reply(FakeReply::new().call("send_messages", serde_json::json!({})));
-    let (_, provider, meter) = metered_provider(true, StateMode::Stateless, vec![raw(), good]);
+    let (_, provider, meter) = metered_provider(vec![raw(), good]);
     let (tools, conv) = (tools(), base_conversation());
-    let response = provider
-        .respond(request(&conv, &tools, None))
-        .await
-        .unwrap();
+    let response = provider.respond(request(&conv, &tools)).await.unwrap();
     assert_eq!(response.calls().count(), 1);
     let call = &meter.calls()[0];
     assert_eq!(
@@ -179,11 +163,8 @@ async fn an_unreadable_answer_is_asked_for_again_once_and_counted_with_its_token
     );
 
     // Unreadable twice: the error, after the one re-ask.
-    let (_, provider, meter) = metered_provider(true, StateMode::Stateless, vec![raw(), raw()]);
-    let error = provider
-        .respond(request(&conv, &tools, None))
-        .await
-        .unwrap_err();
+    let (_, provider, meter) = metered_provider(vec![raw(), raw()]);
+    let error = provider.respond(request(&conv, &tools)).await.unwrap_err();
     assert!(matches!(error, LlmError::MalformedCall(_)), "{error:?}");
     let call = &meter.calls()[0];
     assert_eq!((call.requests, call.error), (2, Some("malformed_call")));

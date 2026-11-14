@@ -10,9 +10,6 @@ use serde_json::Value;
 use crate::error::LlmError;
 use crate::response::{CacheUsage, FinishReason, Usage};
 
-/// Marker message for a server that no longer knows our `previous_response_id`.
-pub(crate) const STATE_LOST: &str = "previous_response_not_found";
-
 pub(crate) struct Parsed {
     pub turn: AssistantTurn,
     pub finish: FinishReason,
@@ -249,7 +246,6 @@ pub(crate) fn map_error(
         }
         "content_filter" | "content_policy_violation" => return LlmError::ContentFiltered,
         "invalid_api_key" | "authentication_error" => return LlmError::Auth,
-        "previous_response_not_found" => return LlmError::InvalidRequest(STATE_LOST.into()),
         _ => {}
     }
     match status {

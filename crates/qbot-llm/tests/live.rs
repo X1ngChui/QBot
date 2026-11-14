@@ -58,9 +58,9 @@ fn deepseek_with(key_file: &str, key: Option<String>) -> ResponsesProvider {
         &qbot_llm::net::Route::Direct,
     )
     .unwrap();
-    let mut cfg = ResponsesConfig::deepseek(env_or("QBOT_LIVE_TEXT_MODEL", "deepseek-flash"));
+    let mut cfg = ResponsesConfig::new(env_or("QBOT_LIVE_TEXT_MODEL", "deepseek-flash"));
     cfg.timeout = Some(Duration::from_secs(120));
-    ResponsesProvider::new(cfg, Arc::new(transport)).unwrap()
+    ResponsesProvider::new(cfg, Arc::new(transport))
 }
 
 fn deepseek() -> ResponsesProvider {
@@ -81,7 +81,6 @@ fn request<'a>(conversation: &'a Conversation, tools: &'a [ToolSpec]) -> Request
         tool_choice: ToolChoice::Auto,
         parallel_tool_calls: true,
         reasoning: ReasoningEffort::Low,
-        continuation: None,
         media: None,
     }
 }
@@ -192,9 +191,7 @@ async fn a_tool_call_and_its_result_continue_the_conversation_by_full_replay() {
         }));
     }
     let conv2 = Conversation::new(items);
-    let mut req = request(&conv2, &tools);
-    req.continuation = Some(&first.continuation);
-    let second = provider.respond(req).await.unwrap();
+    let second = provider.respond(request(&conv2, &tools)).await.unwrap();
     report("after tool result", &second);
     assert_eq!(second.finish, FinishReason::Stop);
     let text = second.turn.text().to_lowercase();
@@ -406,9 +403,9 @@ async fn deepseek_sees_each_uploaded_picture_and_reuses_an_upload_only_for_the_s
         .unwrap(),
         uploads: AtomicUsize::new(0),
     });
-    let mut cfg = ResponsesConfig::deepseek(env_or("QBOT_LIVE_TEXT_MODEL", "deepseek-flash"));
+    let mut cfg = ResponsesConfig::new(env_or("QBOT_LIVE_TEXT_MODEL", "deepseek-flash"));
     cfg.timeout = Some(Duration::from_secs(120));
-    let provider = ResponsesProvider::new(cfg, transport.clone()).unwrap();
+    let provider = ResponsesProvider::new(cfg, transport.clone());
     let media = Pictures {
         loads: AtomicUsize::new(0),
     };
@@ -534,9 +531,9 @@ async fn provider_errors_are_normalized() {
         &qbot_llm::net::Route::Direct,
     )
     .unwrap();
-    let mut cfg = ResponsesConfig::deepseek("no-such-model-qbot");
+    let mut cfg = ResponsesConfig::new("no-such-model-qbot");
     cfg.timeout = Some(Duration::from_secs(60));
-    let unknown = ResponsesProvider::new(cfg, Arc::new(transport)).unwrap();
+    let unknown = ResponsesProvider::new(cfg, Arc::new(transport));
     let error = unknown.respond(request(&conv, &[])).await.unwrap_err();
     eprintln!("[errors] unknown model -> {error:?}");
     assert!(
@@ -558,9 +555,9 @@ async fn provider_errors_are_normalized() {
         &qbot_llm::net::Route::Direct,
     )
     .unwrap();
-    let mut cfg = ResponsesConfig::deepseek(env_or("QBOT_LIVE_TEXT_MODEL", "deepseek-flash"));
+    let mut cfg = ResponsesConfig::new(env_or("QBOT_LIVE_TEXT_MODEL", "deepseek-flash"));
     cfg.timeout = Some(Duration::from_millis(50));
-    let hurried = ResponsesProvider::new(cfg, Arc::new(transport)).unwrap();
+    let hurried = ResponsesProvider::new(cfg, Arc::new(transport));
     let conv = Conversation::new(vec![msg(Role::User, "Write a long poem about the sea.")]);
     let error = hurried.respond(request(&conv, &[])).await.unwrap_err();
     eprintln!("[errors] 50 ms deadline -> {error:?}");
@@ -606,12 +603,10 @@ async fn a_transient_failure_is_retried_and_the_retry_reaches_the_real_provider(
         inner,
         failed: std::sync::atomic::AtomicBool::new(false),
     };
-    let mut cfg = ResponsesConfig::deepseek(env_or("QBOT_LIVE_TEXT_MODEL", "deepseek-flash"));
+    let mut cfg = ResponsesConfig::new(env_or("QBOT_LIVE_TEXT_MODEL", "deepseek-flash"));
     cfg.timeout = Some(Duration::from_secs(120));
     let meter = qbot_llm::MemoryMeter::new();
-    let provider = ResponsesProvider::new(cfg, Arc::new(transport))
-        .unwrap()
-        .with_meter(meter.clone());
+    let provider = ResponsesProvider::new(cfg, Arc::new(transport)).with_meter(meter.clone());
     let response = provider.respond(request(&conv, &[])).await.unwrap();
     report("retry", &response);
     assert_eq!(response.finish, FinishReason::Stop);

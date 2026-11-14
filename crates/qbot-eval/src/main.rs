@@ -83,11 +83,9 @@ fn provider(model: &str) -> Result<Arc<ResponsesProvider>, String> {
         &qbot_llm::net::Route::Direct,
     )
     .map_err(|e| e.to_string())?;
-    let mut cfg = ResponsesConfig::deepseek(model);
+    let mut cfg = ResponsesConfig::new(model);
     cfg.timeout = Some(Duration::from_secs(180));
-    Ok(Arc::new(
-        ResponsesProvider::new(cfg, Arc::new(transport)).map_err(|e| e.to_string())?,
-    ))
+    Ok(Arc::new(ResponsesProvider::new(cfg, Arc::new(transport))))
 }
 
 /// The deployment's persona if there is one, else the shipped example.

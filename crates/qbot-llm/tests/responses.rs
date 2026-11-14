@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use common::*;
 use qbot_llm::fake::FakeReply;
 use qbot_llm::responses::sim::SimStep;
-use qbot_llm::responses::{HttpResponse, ResponsesConfig, ResponsesProvider, StateMode, Transport};
+use qbot_llm::responses::{HttpResponse, ResponsesConfig, ResponsesProvider, Transport};
 use qbot_llm::{
     Content, ConvItem, Conversation, FinishReason, LlmError, MediaStore, Provider, ReasoningEffort,
     ToolChoice,
@@ -17,14 +17,11 @@ use qbot_llm::{
 use serde_json::{Value, json};
 
 #[tokio::test]
-async fn deepseek_request_shape() {
-    let (server, provider) = sim_provider(true, StateMode::Stateless, sim_steps(&[second_reply()]));
+async fn request_shape() {
+    let (server, provider) = sim_provider(sim_steps(&[second_reply()]));
     let tools = tools();
     let conv = base_conversation();
-    provider
-        .respond(request(&conv, &tools, None))
-        .await
-        .unwrap();
+    provider.respond(request(&conv, &tools)).await.unwrap();
 
     let body = &server.requests()[0];
     assert_eq!(body["model"], "deepseek-test");
@@ -37,10 +34,9 @@ async fn deepseek_request_shape() {
     );
     assert_eq!(body["reasoning"], json!({ "effort": "low" }));
     assert!(
-        body.get("include").is_none(),
-        "no encrypted-content include on the DeepSeek dialect"
+        body.get("previous_response_id").is_none(),
+        "no state is kept"
     );
-    assert!(body.get("previous_response_id").is_none());
     assert!(body.get("tool_choice").is_none());
     assert_eq!(
         body["tools"][0],
@@ -49,7 +45,8 @@ async fn deepseek_request_shape() {
             "parameters": tools[0].schema, "strict": false,
         })
     );
-    // The developer role is emulated as a user message; plain text stays a string.
+    // There is no developer role: such a message goes as a user message. Plain text stays a
+    // string.
     assert_eq!(
         body["input"][0],
         json!({ "role": "system", "content": "You are a group member." })
@@ -61,39 +58,30 @@ async fn deepseek_request_shape() {
 }
 
 #[tokio::test]
-async fn reasoning_effort_maps_per_dialect() {
-    for (deepseek, effort, expected) in [
-        (true, ReasoningEffort::Off, Some("none")),
-        (true, ReasoningEffort::Medium, Some("high")),
-        (true, ReasoningEffort::High, Some("max")),
-        (false, ReasoningEffort::Off, None),
-        (false, ReasoningEffort::Medium, Some("medium")),
+async fn reasoning_effort_maps_to_the_providers_words() {
+    for (effort, expected) in [
+        (ReasoningEffort::Off, Some("none")),
+        (ReasoningEffort::Low, Some("low")),
+        (ReasoningEffort::Medium, Some("high")),
+        (ReasoningEffort::High, Some("max")),
     ] {
-        let (server, provider) =
-            sim_provider(deepseek, StateMode::Stateless, sim_steps(&[second_reply()]));
+        let (server, provider) = sim_provider(sim_steps(&[second_reply()]));
         let (tools, conv) = (tools(), base_conversation());
-        let mut req = request(&conv, &tools, None);
+        let mut req = request(&conv, &tools);
         req.reasoning = effort;
         provider.respond(req).await.unwrap();
         let sent = server.requests()[0]["reasoning"]["effort"]
             .as_str()
             .map(str::to_owned);
-        assert_eq!(sent.as_deref(), expected, "deepseek={deepseek} {effort:?}");
+        assert_eq!(sent.as_deref(), expected, "{effort:?}");
     }
 }
 
 #[tokio::test]
 async fn own_output_items_are_echoed_back_verbatim() {
-    let (server, provider) = sim_provider(
-        true,
-        StateMode::Stateless,
-        sim_steps(&[first_reply(), second_reply()]),
-    );
+    let (server, provider) = sim_provider(sim_steps(&[first_reply(), second_reply()]));
     let (tools, conv0) = (tools(), base_conversation());
-    let first = provider
-        .respond(request(&conv0, &tools, None))
-        .await
-        .unwrap();
+    let first = provider.respond(request(&conv0, &tools)).await.unwrap();
     let native = first
         .turn
         .replay()
@@ -102,10 +90,7 @@ async fn own_output_items_are_echoed_back_verbatim() {
         .clone();
 
     let conv1 = extend(&conv0, &first, "sent #2");
-    provider
-        .respond(request(&conv1, &tools, Some(&first.continuation)))
-        .await
-        .unwrap();
+    provider.respond(request(&conv1, &tools)).await.unwrap();
 
     let input = server.requests()[1]["input"].as_array().unwrap().clone();
     let echoed: Vec<Value> = input[3..5].to_vec();
@@ -122,119 +107,28 @@ async fn own_output_items_are_echoed_back_verbatim() {
 }
 
 #[tokio::test]
-async fn standard_stateless_asks_for_encrypted_reasoning_and_keeps_the_developer_role() {
-    let (server, provider) =
-        sim_provider(false, StateMode::Stateless, sim_steps(&[second_reply()]));
-    let (tools, conv) = (tools(), base_conversation());
-    provider
-        .respond(request(&conv, &tools, None))
-        .await
-        .unwrap();
-    let body = &server.requests()[0];
-    assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
-    assert_eq!(body["input"][1]["role"], "developer");
-}
-
-#[tokio::test]
-async fn server_state_sends_only_the_delta_and_falls_back_when_the_prefix_changes() {
-    let replies = [first_reply(), second_reply(), second_reply()];
-    let (server, provider) = sim_provider(false, StateMode::ServerState, sim_steps(&replies));
-    let (tools, conv0) = (tools(), base_conversation());
-    let first = provider
-        .respond(request(&conv0, &tools, None))
-        .await
-        .unwrap();
-    assert_eq!(server.requests()[0]["store"], true);
-    let handle = first.continuation.handle().unwrap().to_owned();
-    assert_eq!(
-        Some(handle.as_str()),
-        first.meta.provider_response_id.as_deref()
-    );
-
-    let conv1 = extend(&conv0, &first, "sent #2");
-    let second = provider
-        .respond(request(&conv1, &tools, Some(&first.continuation)))
-        .await
-        .unwrap();
-    let delta = &server.requests()[1];
-    assert_eq!(delta["previous_response_id"], handle.as_str());
-    assert_eq!(
-        delta["input"].as_array().unwrap().len(),
-        1,
-        "only the new tool output is sent"
-    );
-    assert_eq!(delta["input"][0]["type"], "function_call_output");
-
-    // Changing an earlier item (as elision would) invalidates the continuation: full replay.
-    let mut items = conv1.items().to_vec();
-    items[2] = common::message(qbot_llm::Role::User, "[msg:1] member:1: hello bot (edited)");
-    let edited = Conversation::new(items);
-    provider
-        .respond(request(&edited, &tools, Some(&second.continuation)))
-        .await
-        .unwrap();
-    let full = &server.requests()[2];
-    assert!(full.get("previous_response_id").is_none());
-    assert_eq!(full["input"].as_array().unwrap().len(), 6);
-}
-
-#[tokio::test]
-async fn a_forgotten_server_state_handle_is_absorbed_with_one_full_resend() {
-    let (_, first_provider) =
-        sim_provider(false, StateMode::ServerState, sim_steps(&[first_reply()]));
-    let (server, provider, meter) =
-        metered_provider(false, StateMode::ServerState, sim_steps(&[second_reply()]));
-    let (tools, conv0) = (tools(), base_conversation());
-    let first = first_provider
-        .respond(request(&conv0, &tools, None))
-        .await
-        .unwrap();
-
-    // The second server has never seen this response id.
-    let conv1 = extend(&conv0, &first, "sent #2");
-    let response = provider
-        .respond(request(&conv1, &tools, Some(&first.continuation)))
-        .await
-        .unwrap();
-    assert_eq!(response.turn.text(), "all done");
-    let requests = server.requests();
-    assert_eq!(requests.len(), 2);
-    assert!(requests[0].get("previous_response_id").is_some());
-    assert!(requests[1].get("previous_response_id").is_none());
-    let calls = meter.calls();
-    assert_eq!(calls.len(), 1, "one call, recorded once");
-    assert_eq!(
-        calls[0].requests, 2,
-        "the refused delta and the full resend"
-    );
-}
-
-#[tokio::test]
 async fn forced_tool_choice_follows_capabilities() {
     let (tools, conv) = (tools(), base_conversation());
 
-    let (_, deepseek) = sim_provider(true, StateMode::Stateless, sim_steps(&[second_reply()]));
-    let mut req = request(&conv, &tools, None);
+    let (_, deepseek) = sim_provider(sim_steps(&[second_reply()]));
+    let mut req = request(&conv, &tools);
     req.tool_choice = ToolChoice::Required;
     assert_eq!(
         deepseek.respond(req).await.unwrap_err(),
         LlmError::Unsupported("forced tool choice with reasoning on")
     );
     // With reasoning off DeepSeek takes it.
-    let (server, deepseek) = sim_provider(true, StateMode::Stateless, sim_steps(&[second_reply()]));
-    let mut req = request(&conv, &tools, None);
+    let (server, deepseek) = sim_provider(sim_steps(&[second_reply()]));
+    let mut req = request(&conv, &tools);
     req.tool_choice = ToolChoice::Required;
     req.reasoning = ReasoningEffort::Off;
     deepseek.respond(req).await.unwrap();
     assert_eq!(server.requests()[0]["tool_choice"], json!("required"));
 
-    let (server, standard) = sim_provider(
-        false,
-        StateMode::Stateless,
-        sim_steps(&[first_reply(), second_reply()]),
-    );
-    let mut req = request(&conv, &tools, None);
+    let (server, standard) = sim_provider(sim_steps(&[first_reply(), second_reply()]));
+    let mut req = request(&conv, &tools);
     req.tool_choice = ToolChoice::Named("send_message".into());
+    req.reasoning = ReasoningEffort::Off;
     standard.respond(req).await.unwrap();
     let body = &server.requests()[0];
     assert_eq!(
@@ -243,7 +137,7 @@ async fn forced_tool_choice_follows_capabilities() {
     );
 
     // `None` is emulated by declaring no tools.
-    let mut req = request(&conv, &tools, None);
+    let mut req = request(&conv, &tools);
     req.tool_choice = ToolChoice::None;
     standard.respond(req).await.unwrap();
     assert!(server.requests()[1].get("tools").is_none());
@@ -263,48 +157,8 @@ impl MediaStore for OneImage {
 }
 
 #[tokio::test]
-async fn images_become_data_urls_on_providers_that_accept_them() {
-    let (server, provider) =
-        sim_provider(false, StateMode::Stateless, sim_steps(&[second_reply()]));
-    let tools = tools();
-    let mut items = base_conversation().items().to_vec();
-    items.push(ConvItem::Message(qbot_llm::Message {
-        role: qbot_llm::Role::User,
-        content: vec![
-            Content::Text("look".into()),
-            Content::Image {
-                key: "pic-1".into(),
-            },
-        ],
-    }));
-    let conv = Conversation::new(items);
-    let media = OneImage;
-    let mut req = request(&conv, &tools, None);
-    req.media = Some(&media);
-    provider.respond(req).await.unwrap();
-    let last = server.requests()[0]["input"]
-        .as_array()
-        .unwrap()
-        .last()
-        .unwrap()
-        .clone();
-    assert_eq!(
-        last["content"][0],
-        json!({ "type": "input_text", "text": "look" })
-    );
-    assert_eq!(
-        last["content"][1],
-        json!({ "type": "input_image", "image_url": "data:image/png;base64,AQID" })
-    );
-}
-
-#[tokio::test]
-async fn deepseek_takes_images_as_uploaded_files_and_uploads_each_once() {
-    let (server, provider) = sim_provider(
-        true,
-        StateMode::Stateless,
-        sim_steps(&[second_reply(), second_reply()]),
-    );
+async fn images_go_as_uploaded_files_and_each_is_uploaded_once() {
+    let (server, provider) = sim_provider(sim_steps(&[second_reply(), second_reply()]));
     let tools = tools();
     let mut items = base_conversation().items().to_vec();
     items.push(ConvItem::Message(qbot_llm::Message {
@@ -319,7 +173,7 @@ async fn deepseek_takes_images_as_uploaded_files_and_uploads_each_once() {
     let conv = Conversation::new(items);
     let media = OneImage;
     for _ in 0..2 {
-        let mut req = request(&conv, &tools, None);
+        let mut req = request(&conv, &tools);
         req.media = Some(&media);
         provider.respond(req).await.unwrap();
     }
@@ -360,12 +214,9 @@ impl MediaStore for Pixels {
 }
 
 #[tokio::test]
-async fn deepseek_reuses_an_upload_by_content_never_by_the_callers_key() {
-    let (server, provider) = sim_provider(
-        true,
-        StateMode::Stateless,
-        sim_steps(&[second_reply(), second_reply(), second_reply()]),
-    );
+async fn an_upload_is_reused_by_content_never_by_the_callers_key() {
+    let (server, provider) =
+        sim_provider(sim_steps(&[second_reply(), second_reply(), second_reply()]));
     let tools = tools();
     let with_image = |key: &str| {
         let mut items = base_conversation().items().to_vec();
@@ -383,7 +234,7 @@ async fn deepseek_reuses_an_upload_by_content_never_by_the_callers_key() {
         (with_image("other"), Pixels(vec![1, 1, 1])),
     ];
     for (conv, media) in &calls {
-        let mut req = request(conv, &tools, None);
+        let mut req = request(conv, &tools);
         req.media = Some(media);
         provider.respond(req).await.unwrap();
     }
@@ -416,9 +267,9 @@ fn http(status: u16, code: &'static str) -> SimStep {
 }
 
 async fn respond_with(steps: Vec<SimStep>) -> Result<qbot_llm::Response, LlmError> {
-    let (_, provider) = sim_provider(true, StateMode::Stateless, steps);
+    let (_, provider) = sim_provider(steps);
     let (tools, conv) = (tools(), base_conversation());
-    provider.respond(request(&conv, &tools, None)).await
+    provider.respond(request(&conv, &tools)).await
 }
 
 #[tokio::test]
@@ -470,9 +321,9 @@ async fn transient_errors_retry_with_backoff_and_honor_retry_after() {
         second_reply().into(),
     ];
     let started = tokio::time::Instant::now();
-    let (_, provider, meter) = metered_provider(true, StateMode::Stateless, steps);
+    let (_, provider, meter) = metered_provider(steps);
     let (tools, conv) = (tools(), base_conversation());
-    let response = provider.respond(request(&conv, &tools, None)).await;
+    let response = provider.respond(request(&conv, &tools)).await;
     assert!(response.is_ok());
     let calls = meter.calls();
     assert_eq!(calls.len(), 1, "one call, recorded once");
@@ -502,17 +353,11 @@ async fn retries_are_bounded() {
 
 #[tokio::test]
 async fn non_transient_errors_are_not_retried() {
-    let (server, provider) = sim_provider(
-        true,
-        StateMode::Stateless,
-        vec![http(401, "invalid_api_key"), second_reply().into()],
-    );
+    let (server, provider) =
+        sim_provider(vec![http(401, "invalid_api_key"), second_reply().into()]);
     let (tools, conv) = (tools(), base_conversation());
     assert_eq!(
-        provider
-            .respond(request(&conv, &tools, None))
-            .await
-            .unwrap_err(),
+        provider.respond(request(&conv, &tools)).await.unwrap_err(),
         LlmError::Auth
     );
     assert_eq!(server.requests().len(), 1);
@@ -634,45 +479,24 @@ impl Transport for Hang {
 
 #[tokio::test(start_paused = true)]
 async fn a_hung_connection_times_out() {
-    let mut cfg = ResponsesConfig::deepseek("m");
+    let mut cfg = ResponsesConfig::new("m");
     cfg.timeout = Some(Duration::from_secs(5));
-    let provider = ResponsesProvider::new(cfg, Arc::new(Hang)).unwrap();
+    let provider = ResponsesProvider::new(cfg, Arc::new(Hang));
     let (tools, conv) = (tools(), base_conversation());
     assert_eq!(
-        provider
-            .respond(request(&conv, &tools, None))
-            .await
-            .unwrap_err(),
+        provider.respond(request(&conv, &tools)).await.unwrap_err(),
         LlmError::Timeout
     );
 }
 
 #[test]
-fn the_deepseek_dialect_cannot_be_given_server_state() {
-    let mut cfg = ResponsesConfig::deepseek("m");
-    cfg.state = StateMode::ServerState;
-    assert!(matches!(
-        ResponsesProvider::new(cfg, Arc::new(Hang)),
-        Err(LlmError::Unsupported(_))
-    ));
-}
-
-#[test]
-fn capabilities_describe_native_versus_emulated() {
-    use qbot_llm::Realization::{Emulated, Native};
-    let hang: Arc<dyn Transport> = Arc::new(Hang);
-    let deepseek = ResponsesProvider::new(ResponsesConfig::deepseek("m"), hang.clone()).unwrap();
-    let caps = deepseek.info().capabilities;
+fn the_adapter_says_what_callers_decide_by() {
+    let provider = ResponsesProvider::new(ResponsesConfig::new("m"), Arc::new(Hang));
+    let info = provider.info();
+    assert_eq!(info.id.as_str(), "deepseek");
+    assert!(info.capabilities.image_input && info.capabilities.cache_metrics);
     assert_eq!(
-        (caps.continuation, caps.developer_role, caps.image_input),
-        (Emulated, Emulated, Some(Emulated))
-    );
-    let openai =
-        ResponsesProvider::new(ResponsesConfig::standard("m", StateMode::ServerState), hang)
-            .unwrap();
-    let caps = openai.info().capabilities;
-    assert_eq!(
-        (caps.continuation, caps.developer_role, caps.image_input),
-        (Native, Native, Some(Native))
+        info.capabilities.forced_tool_choice,
+        qbot_llm::ForcedToolChoice::WithoutReasoning
     );
 }

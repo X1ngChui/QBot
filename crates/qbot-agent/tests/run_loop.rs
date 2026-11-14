@@ -9,7 +9,7 @@ use common::*;
 use qbot_agent::{OutSegment, RunLimits, UsageDetail};
 use qbot_context::{ErrorKind, Item, Meta, Outcome, Part, RefusalReason, RunEnd};
 use qbot_llm::fake::{FakeReply, Step};
-use qbot_llm::{Content, ConvItem, FinishReason, LlmError, Provider, ReplayPlan};
+use qbot_llm::{Content, ConvItem, FinishReason, LlmError, Provider};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -208,7 +208,6 @@ async fn a_send_beyond_the_limit_is_refused_by_the_tool_not_the_loop() {
             reply_ok(FakeReply::new().text("done")),
         ],
         RunLimits::default(),
-        false,
         1,
     );
     h.world.say(1, 1, "hello");
@@ -348,7 +347,7 @@ async fn the_step_limit_ends_a_run_that_never_stops_calling_tools() {
     let script = (0..5)
         .map(|i| reply_ok(FakeReply::new().call("echo", json!({ "text": i.to_string() }))))
         .collect();
-    let h = harness_with(script, limits, false, 4);
+    let h = harness_with(script, limits, 4);
     h.world.say(1, 1, "hello");
     let report = run_once(&h, addressed(1, 101)).await;
     assert_eq!(report.end, RunEnd::StepLimit);
@@ -400,13 +399,13 @@ async fn the_run_log_mirrors_the_transcript_and_a_log_failure_ends_the_run() {
 }
 
 #[tokio::test]
-async fn the_prefix_and_tools_stay_identical_across_turns_and_continuations_use_deltas() {
+async fn the_prefix_and_tools_stay_identical_across_turns() {
     let script = vec![
         reply_ok(FakeReply::new().call("echo", json!({"text":"a"}))),
         reply_ok(FakeReply::new().call("echo", json!({"text":"b"}))),
         reply_ok(FakeReply::new().text("done")),
     ];
-    let h = harness_with(script, RunLimits::default(), true, 4);
+    let h = harness(script);
     h.world.say(1, 1, "hello");
     run_once(&h, addressed(1, 101)).await;
 
@@ -421,14 +420,11 @@ async fn the_prefix_and_tools_stay_identical_across_turns_and_continuations_use_
     for pair in recorded.windows(2) {
         let n = pair[0].conversation.len();
         assert_eq!(
-            pair[0].conversation.digest_prefix(n),
-            pair[1].conversation.digest_prefix(n),
+            pair[0].conversation.items(),
+            &pair[1].conversation.items()[..n],
             "append-only prefix"
         );
     }
-    assert_eq!(recorded[0].plan, ReplayPlan::Full);
-    assert!(matches!(recorded[1].plan, ReplayPlan::Delta { .. }));
-    assert!(matches!(recorded[2].plan, ReplayPlan::Delta { .. }));
 }
 
 #[tokio::test]
@@ -447,8 +443,8 @@ async fn earlier_turns_are_never_rewritten_so_every_request_extends_the_last() {
     for pair in recorded.windows(2) {
         let n = pair[0].conversation.len();
         assert_eq!(
-            pair[0].conversation.digest_prefix(n),
-            pair[1].conversation.digest_prefix(n),
+            pair[0].conversation.items(),
+            &pair[1].conversation.items()[..n],
             "an earlier request is an exact prefix of the next, so the provider cache keeps hitting"
         );
     }
@@ -776,7 +772,6 @@ impl qbot_agent::Tool for Ask {
             tool_choice: qbot_llm::ToolChoice::Auto,
             parallel_tool_calls: false,
             reasoning: qbot_llm::ReasoningEffort::Off,
-            continuation: None,
             media: None,
         };
         self.0.respond(request).await.unwrap();

@@ -316,8 +316,8 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
 - **Forced tool choice is a provider capability** (`ForcedToolChoice`). DeepSeek refuses a
   forced choice with reasoning on, and refuses a reasoning turn after one without it (both
   measured on the live API, pinned by an ignored live test), so on DeepSeek the forced turn and
-  the rest of that run go without reasoning. OpenAI-style providers declare `Always`; a
-  provider that declares `Never` gets `Auto` and the note alone.
+  the rest of that run go without reasoning. A provider that declares `Always` is forced as it
+  is; one that declares `Never` gets `Auto` and the note alone.
 - **Executor.** Reads run concurrently, then writes (sends included) one at a time in call order; a refused call gets
   a typed refusal; every call executes (no deduplication), so the prompt teaches the model not to
   repeat a write. A call with invalid arguments is marked as not run (nothing happened, correct
@@ -504,7 +504,7 @@ the `media_ref` row the platform reference came in.
   position as the chat shows it. The bytes are fetched again from the platform through the stored
   reference and kept in a 64 MiB in-memory cache for the runs in flight; this works while QQ still
   serves the picture (NapCat's own file cache is cleaned nightly). It is offered only when the
-  text model takes images. OpenAI-style providers take data URLs. DeepSeek takes images through
+  text model takes images. DeepSeek takes images through
   its Files API: the adapter keys uploads by `sha256(bytes)` (a request's image keys name pictures
   only within its own media store), uploads each picture once per process for its 30-day lifetime,
   and shares one upload between concurrent requests; the cache belongs to one provider instance,
@@ -583,13 +583,14 @@ the `media_ref` row the platform reference came in.
 
 - One `Provider` trait with one method, `respond`. A request carries the complete logical
   conversation (lowered from the transcript view through a renderer), the tools, the tool choice,
-  the reasoning effort and an optional continuation; the answer is one whole turn. Nothing is
+  and the reasoning effort; the answer is one whole turn. Nothing is
   streamed: every consumer (sending a message, running tools, storing an episode, a picture's
   description) needs the complete turn, and no person watches it being written.
-- **Continuation is opaque.** A stateful provider sends only the new tail after verifying the
-  covered prefix is unchanged; a stateless one replays everything. DeepSeek is stateless; an
-  OpenAI-style provider continues from its stored previous response.
-- **Capabilities are typed** (`Realization::{Native, Emulated}`, forced tool choice, image input,
+- **One adapter**, for DeepSeek's Responses API (`qbot_llm::responses`). The API keeps no
+  state, so every call replays the whole conversation, which is what keeps the provider's
+  prefix cache hitting. What it lacks the adapter absorbs: a developer message goes as a user
+  message, and an image goes as an uploaded file.
+- **Capabilities are what callers decide by** (when a tool call can be forced, image input,
   cache metrics); an unsupported request fails with `LlmError::Unsupported`.
 - **Reasoning items never leave the adapter**; a turn keeps the provider's raw output to echo back
   to the same provider.
@@ -696,7 +697,7 @@ The schema holds only what a deployment may choose:
 | `memory` | slice batches; group memories and memories per person shown; who the roster lists (days, people); recall's max distance and half-life; how fast memories of each durability lose rank (episodes); how many memories a group keeps per member and about itself |
 | `media` | voice transcription on or off; pictures and clips per minute per group; how long a reply waits for them |
 | `network` | an outbound proxy and the services that use it |
-| `providers.*` | text (kind, endpoint, model, reasoning of replies and of extraction), vision, embedding (model, width, batch), search (depths) |
+| `providers.*` | text (endpoint, model, reasoning of replies and of extraction), vision, embedding (model, width, batch), search (depths) |
 | `maintenance` | nightly and report schedules, backups kept, client tools directory, record retention, NapCat cache cleanup |
 
 Settings that depend on each other are checked together at startup:
@@ -714,7 +715,7 @@ Derived rather than configured:
   the group's next one;
 - record retention: one `maintenance.records_keep_days` for finished runs and finished
   scheduled tasks, the two operational records;
-- the provider's state mode (from its kind), the writing language (from the locale), and the
+- the writing language (from the locale) and the
   directory layout (fixed under the configuration and data directories).
 
 Everything else is a constant in the crate it governs, the `Default` of that crate's settings
@@ -848,7 +849,6 @@ through it.
   25 ms in the largest group (35,000 lines) and under 1 ms in a group of 700, the planner using
   the `(group_id, seq)` index where it helps. A `pg_trgm` index with `ILIKE` terms is the step
   if an archive grows by orders of magnitude.
-- OpenAI-style providers are covered by the simulated server, not by a live test.
 - Runs of different members overlap (decision 1), and nothing tells a run what another is
   answering until that one has replied: two members asking the same thing within the same
   seconds can both be answered (13 such pairs in 30 days before the turn-taking rule).

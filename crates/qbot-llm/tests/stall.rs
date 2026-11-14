@@ -34,7 +34,7 @@ impl Transport for HangOnce {
 
 #[tokio::test(start_paused = true)]
 async fn a_stalled_request_is_cut_off_and_tried_again_within_the_call_deadline() {
-    let mut cfg = ResponsesConfig::deepseek("m");
+    let mut cfg = ResponsesConfig::new("m");
     cfg.timeout = Some(Duration::from_secs(120));
     cfg.retry = fast_retry();
     cfg.retry.attempt_timeout = Some(Duration::from_secs(40));
@@ -43,12 +43,10 @@ async fn a_stalled_request_is_cut_off_and_tried_again_within_the_call_deadline()
         server: SimServer::new(vec![SimStep::Reply(first_reply())]),
     });
     let meter = MemoryMeter::new();
-    let provider = ResponsesProvider::new(cfg, transport)
-        .unwrap()
-        .with_meter(meter.clone());
+    let provider = ResponsesProvider::new(cfg, transport).with_meter(meter.clone());
     let (tools, conv) = (tools(), base_conversation());
     let started = tokio::time::Instant::now();
-    let result = provider.respond(request(&conv, &tools, None)).await;
+    let result = provider.respond(request(&conv, &tools)).await;
     assert!(result.is_ok(), "{:?}", result.err());
     let waited = started.elapsed();
     assert!(

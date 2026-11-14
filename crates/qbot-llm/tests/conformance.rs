@@ -20,7 +20,7 @@ async fn a_tool_loop_behaves_identically_on_every_provider() {
         let tools = tools();
         let conv0 = base_conversation();
         let first = provider
-            .respond(request(&conv0, &tools, None))
+            .respond(request(&conv0, &tools))
             .await
             .unwrap_or_else(|e| panic!("{name}: {e}"));
 
@@ -49,7 +49,7 @@ async fn a_tool_loop_behaves_identically_on_every_provider() {
 
         let conv1 = extend(&conv0, &first, "sent #2");
         let second = provider
-            .respond(request(&conv1, &tools, Some(&first.continuation)))
+            .respond(request(&conv1, &tools))
             .await
             .unwrap_or_else(|e| panic!("{name}: {e}"));
         assert_eq!(second.finish, FinishReason::Stop, "{name}");
@@ -68,16 +68,13 @@ async fn a_broken_transcript_fails_the_same_way_before_any_network() {
 
         // A call with no result.
         let mut conv = base_conversation();
-        let first = provider
-            .respond(request(&conv, &tools, None))
-            .await
-            .unwrap();
+        let first = provider.respond(request(&conv, &tools)).await.unwrap();
         let mut items = conv.items().to_vec();
         items.push(ConvItem::Assistant(first.turn.clone()));
         conv = Conversation::new(items);
         assert!(
             matches!(
-                provider.respond(request(&conv, &tools, None)).await,
+                provider.respond(request(&conv, &tools)).await,
                 Err(LlmError::InvalidConversation(_))
             ),
             "{name}: unanswered call"
@@ -97,11 +94,8 @@ async fn images_without_support_or_media_are_rejected_uniformly() {
             }],
         }));
         let conv = Conversation::new(items);
-        let err = provider
-            .respond(request(&conv, &tools, None))
-            .await
-            .unwrap_err();
-        let supported = provider.info().capabilities.image_input.is_some();
+        let err = provider.respond(request(&conv, &tools)).await.unwrap_err();
+        let supported = provider.info().capabilities.image_input;
         match (supported, &err) {
             (false, LlmError::Unsupported(_)) | (true, LlmError::InvalidRequest(_)) => {}
             _ => panic!("{name}: unexpected {err:?}"),
@@ -116,15 +110,12 @@ async fn a_transcript_survives_a_provider_switch() {
     let producer = FakeProvider::new([first_reply().into()]);
     let tools = tools();
     let conv0 = base_conversation();
-    let first = producer
-        .respond(request(&conv0, &tools, None))
-        .await
-        .unwrap();
+    let first = producer.respond(request(&conv0, &tools)).await.unwrap();
     let conv1 = extend(&conv0, &first, "sent #2");
 
     for (name, provider) in all_providers(&[second_reply()]) {
         let response = provider
-            .respond(request(&conv1, &tools, Some(&first.continuation)))
+            .respond(request(&conv1, &tools))
             .await
             .unwrap_or_else(|e| panic!("{name}: {e}"));
         assert_eq!(response.turn.text(), "all done", "{name}");
@@ -157,7 +148,7 @@ async fn foreign_reasoning_and_hand_built_turns_are_rebuilt_from_parts() {
     let tools = tools();
     for (name, provider) in all_providers(&[second_reply()]) {
         provider
-            .respond(request(&conv, &tools, None))
+            .respond(request(&conv, &tools))
             .await
             .unwrap_or_else(|e| panic!("{name}: {e}"));
     }

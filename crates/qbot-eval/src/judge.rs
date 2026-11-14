@@ -176,7 +176,6 @@ pub async fn judge(
                 tool_choice: ToolChoice::Auto,
                 parallel_tool_calls: false,
                 reasoning: ReasoningEffort::Medium,
-                continuation: None,
                 media: None,
             })
             .await

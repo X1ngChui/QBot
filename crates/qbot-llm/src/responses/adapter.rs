@@ -3,31 +3,27 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use base64::Engine;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::capability::{
-    Capabilities, ForcedToolChoice, ProviderId, ProviderInfo, Realization, ReasoningInfo,
-};
-use crate::conversation::Conversation;
+use crate::capability::{Capabilities, ForcedToolChoice, ProviderId, ProviderInfo, ReasoningInfo};
 use crate::error::LlmError;
 use crate::meter::{self, CallKind, Meter};
-use crate::provider::{Provider, ReplayPlan, plan_replay};
+use crate::provider::Provider;
 use crate::request::{Request, validate_request};
-use crate::response::{Continuation, Response, ResponseMeta};
+use crate::response::{Response, ResponseMeta};
 
-use super::parse::{Parsed, STATE_LOST, parse_response, parse_usage};
+use super::ResponsesConfig;
+use super::parse::{parse_response, parse_usage};
 use super::retry::{post_with_retry, upload_with_retry};
 use super::transport::{HttpResponse, Transport, Upload};
-use super::wire::{ImageSource, build_body, image_keys};
-use super::{Flavor, ResponsesConfig, StateMode};
+use super::wire::{build_body, image_keys};
 
 pub struct ResponsesProvider {
     info: ProviderInfo,
     cfg: ResponsesConfig,
     transport: Arc<dyn Transport>,
-    /// SHA-256 of an image's bytes to its uploaded file id (DeepSeek), until shortly before the
+    /// SHA-256 of an image's bytes to its uploaded file id, until shortly before the
     /// file expires. Keyed by content: a request's image keys name pictures only within its own
     /// media store, while this outlives every request.
     uploads: moka::future::Cache<String, String>,
@@ -49,53 +45,26 @@ impl std::fmt::Debug for ResponsesProvider {
 }
 
 impl ResponsesProvider {
-    pub fn new(cfg: ResponsesConfig, transport: Arc<dyn Transport>) -> Result<Self, LlmError> {
-        if cfg.flavor == Flavor::DeepSeek && cfg.state == StateMode::ServerState {
-            return Err(LlmError::Unsupported(
-                "server-side state on the DeepSeek dialect",
-            ));
-        }
-        let deepseek = cfg.flavor == Flavor::DeepSeek;
+    pub fn new(cfg: ResponsesConfig, transport: Arc<dyn Transport>) -> Self {
         let capabilities = Capabilities {
-            tool_calls: Realization::Native,
-            parallel_tool_calls: Realization::Native,
-            continuation: if cfg.state == StateMode::ServerState {
-                Realization::Native
-            } else {
-                Realization::Emulated
-            },
-            developer_role: if deepseek {
-                Realization::Emulated
-            } else {
-                Realization::Native
-            },
             reasoning: ReasoningInfo {
                 produces: true,
                 replay_required: true,
                 visible_summary: false,
                 effort_control: true,
             },
-            // DeepSeek takes images only as uploaded files; the adapter uploads them.
-            image_input: Some(if deepseek {
-                Realization::Emulated
-            } else {
-                Realization::Native
-            }),
+            // Images go through the Files API; the adapter uploads them.
+            image_input: true,
             cache_metrics: true,
-            // Measured against the live API: DeepSeek refuses forced tool choice in thinking mode.
-            forced_tool_choice: if deepseek {
-                ForcedToolChoice::WithoutReasoning
-            } else {
-                ForcedToolChoice::Always
-            },
+            // Measured against the live API: a forced tool choice is refused in thinking mode.
+            forced_tool_choice: ForcedToolChoice::WithoutReasoning,
         };
-        let id = ProviderId::new(if deepseek { "deepseek" } else { "openai" });
         let info = ProviderInfo {
-            id,
+            id: ProviderId::new("deepseek"),
             model: cfg.model.clone(),
             capabilities,
         };
-        Ok(Self {
+        Self {
             info,
             cfg,
             transport,
@@ -103,7 +72,7 @@ impl ResponsesProvider {
                 .time_to_live(UPLOAD_REUSE)
                 .build(),
             meter: None,
-        })
+        }
     }
 
     /// Record every call on `meter`.
@@ -112,31 +81,25 @@ impl ResponsesProvider {
         self
     }
 
+    /// The uploaded file id of every image in the conversation.
     async fn load_images(
         &self,
         request: &Request<'_>,
-        plan: &ReplayPlan,
-    ) -> Result<HashMap<String, ImageSource>, LlmError> {
+    ) -> Result<HashMap<String, String>, LlmError> {
         let mut out = HashMap::new();
-        for key in image_keys(request, plan) {
+        for key in image_keys(request) {
             let media = request
                 .media
                 .ok_or_else(|| LlmError::InvalidRequest("images require a media store".into()))?;
             let loaded = media.load(&key).await?;
-            let source = if self.cfg.flavor == Flavor::DeepSeek {
-                let digest = format!("{:x}", Sha256::digest(&loaded.bytes));
-                // Concurrent requests with the same picture share one upload.
-                let id = self
-                    .uploads
-                    .try_get_with(digest, self.upload(&loaded))
-                    .await
-                    .map_err(|error| (*error).clone())?;
-                ImageSource::File(id)
-            } else {
-                let encoded = base64::engine::general_purpose::STANDARD.encode(&loaded.bytes);
-                ImageSource::Url(format!("data:{};base64,{encoded}", loaded.mime))
-            };
-            out.insert(key, source);
+            let digest = format!("{:x}", Sha256::digest(&loaded.bytes));
+            // Concurrent requests with the same picture share one upload.
+            let id = self
+                .uploads
+                .try_get_with(digest, self.upload(&loaded))
+                .await
+                .map_err(|error| (*error).clone())?;
+            out.insert(key, id);
         }
         Ok(out)
     }
@@ -169,59 +132,12 @@ impl ResponsesProvider {
             .ok_or_else(|| LlmError::Protocol("the upload returned no file id".into()))
     }
 
-    /// Plan, build and send. If the server has forgotten our state handle, resend in full once.
+    /// Build and send the whole conversation.
     async fn dispatch(&self, request: &Request<'_>) -> Result<HttpResponse, LlmError> {
         validate_request(&self.info, request)?;
-        let mut plan = plan_replay(&self.info, request.conversation, request.continuation);
-        loop {
-            let images = self.load_images(request, &plan).await?;
-            let body = build_body(&self.cfg, &self.info, request, &plan, &images)?;
-            match post_with_retry(&*self.transport, &self.cfg.retry, "/responses", &body).await {
-                Ok(response) => return Ok(response),
-                Err(LlmError::InvalidRequest(message))
-                    if message == STATE_LOST && matches!(plan, ReplayPlan::Delta { .. }) =>
-                {
-                    plan = ReplayPlan::Full;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-
-    fn assemble(
-        info: &ProviderInfo,
-        state: StateMode,
-        conversation: &Conversation,
-        parsed: Parsed,
-        started: Instant,
-    ) -> Result<Response, LlmError> {
-        let handle = match state {
-            StateMode::Stateless => None,
-            StateMode::ServerState => Some(
-                parsed
-                    .response_id
-                    .clone()
-                    .ok_or_else(|| LlmError::Protocol("server-state response has no id".into()))?,
-            ),
-        };
-        let continuation = Continuation::after(
-            info.id.clone(),
-            info.model.clone(),
-            conversation,
-            &parsed.turn,
-            handle,
-        );
-        Ok(Response {
-            turn: parsed.turn,
-            finish: parsed.finish,
-            usage: parsed.usage,
-            continuation,
-            meta: ResponseMeta {
-                model: parsed.model,
-                provider_response_id: parsed.response_id,
-                latency: started.elapsed(),
-            },
-        })
+        let images = self.load_images(request).await?;
+        let body = build_body(&self.cfg, &self.info, request, &images)?;
+        post_with_retry(&*self.transport, &self.cfg.retry, "/responses", &body).await
     }
 }
 
@@ -253,13 +169,17 @@ impl Provider for ResponsesProvider {
                         asked_again = true;
                     }
                     parsed => {
-                        return Self::assemble(
-                            &self.info,
-                            self.cfg.state,
-                            request.conversation,
-                            parsed?,
-                            started,
-                        );
+                        let parsed = parsed?;
+                        return Ok(Response {
+                            turn: parsed.turn,
+                            finish: parsed.finish,
+                            usage: parsed.usage,
+                            meta: ResponseMeta {
+                                model: parsed.model,
+                                provider_response_id: parsed.response_id,
+                                latency: started.elapsed(),
+                            },
+                        });
                     }
                 }
             }

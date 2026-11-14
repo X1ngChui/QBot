@@ -1,10 +1,10 @@
 //! An in-process stand-in for a Responses server, used to test the adapter end to end.
 //!
 //! It enforces the request rules real servers enforce (call/output pairing, reasoning followed
-//! by its item, known `previous_response_id`), simulates prompt-cache usage, and can inject HTTP
+//! by its item), simulates prompt-cache usage, and can inject HTTP
 //! errors, failed and incomplete responses, and malformed output.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
@@ -51,7 +51,6 @@ struct Inner {
     script: VecDeque<SimStep>,
     requests: Vec<Value>,
     next_id: u64,
-    responses: HashMap<String, u64>,
     last_input: Vec<Value>,
     uploads: Vec<SimUpload>,
 }
@@ -235,29 +234,6 @@ impl Transport for SimServer {
                 &format!("unknown file {id}"),
             ));
         }
-        let previous = body.get("previous_response_id").and_then(Value::as_str);
-        let carried: u64 = match previous {
-            Some(id) => match inner.responses.get(id) {
-                Some(size) if body.get("store") == Some(&json!(true)) => *size,
-                Some(_) => {
-                    return Ok(error_response(
-                        400,
-                        None,
-                        "invalid_request_error",
-                        "state was not stored",
-                    ));
-                }
-                None => {
-                    return Ok(error_response(
-                        404,
-                        None,
-                        "previous_response_not_found",
-                        "unknown response",
-                    ));
-                }
-            },
-            None => 0,
-        };
         let Some(step) = inner.script.pop_front() else {
             return Ok(error_response(
                 500,
@@ -294,27 +270,19 @@ impl Transport for SimServer {
         };
 
         let input: Vec<Value> = body["input"].as_array().cloned().unwrap_or_default();
-        let input_tokens = carried + tokens(&Value::Array(input.clone()));
-        // A stateful server already holds the carried prefix; otherwise the cache is the common
-        // prefix with the previous request's input.
-        let hit: u64 = if carried > 0 {
-            carried
-        } else {
-            input
-                .iter()
-                .zip(inner.last_input.iter())
-                .take_while(|(a, b)| a == b)
-                .map(|(a, _)| tokens(a))
-                .sum()
-        };
+        let input_tokens = tokens(&Value::Array(input.clone()));
+        // The cache is the common prefix with the previous request's input.
+        let hit: u64 = input
+            .iter()
+            .zip(inner.last_input.iter())
+            .take_while(|(a, b)| a == b)
+            .map(|(a, _)| tokens(a))
+            .sum();
         inner.last_input = input;
         let items = output_items(&mut inner, &reply, status == "incomplete");
         inner.next_id += 1;
         let id = format!("resp_{}", inner.next_id);
         let output_tokens = tokens(&Value::Array(items.clone()));
-        inner
-            .responses
-            .insert(id.clone(), input_tokens + output_tokens);
 
         let mut response = json!({
             "id": id, "object": "response", "status": status, "model": body["model"],

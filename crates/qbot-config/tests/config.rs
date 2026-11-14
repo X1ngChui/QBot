@@ -621,7 +621,7 @@ half_life_days = 30
 [media]
 reply_wait_secs = 10
 [providers.text]
-kind = "openai_responses"
+model = "deepseek-pro"
 reasoning = "high"
 extraction_reasoning = "medium"
 "#,
@@ -665,19 +665,13 @@ extraction_reasoning = "medium"
         Duration::from_secs(30 * 86_400)
     );
     let t = c.text_provider();
-    assert_eq!(t.flavor, qbot_llm::responses::Flavor::Standard);
-    assert_eq!(
-        t.state,
-        qbot_llm::responses::StateMode::ServerState,
-        "an OpenAI-style provider continues from its stored response"
-    );
+    assert_eq!(t.model, "deepseek-pro");
     assert!(t.timeout.is_some(), "every text call has a deadline");
     assert_eq!(c.reply_reasoning(), qbot_llm::ReasoningEffort::High);
     let v = c.vision_provider();
-    assert_eq!(
-        v.state,
-        qbot_llm::responses::StateMode::Stateless,
-        "each picture is its own conversation"
+    assert!(
+        v.timeout < t.timeout,
+        "a picture's description has a shorter deadline than a text call"
     );
 }
 

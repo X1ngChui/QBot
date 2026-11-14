@@ -121,7 +121,6 @@ impl NameRuler {
                     tool_choice: ToolChoice::Auto,
                     parallel_tool_calls: false,
                     reasoning: self.reasoning,
-                    continuation: None,
                     media: None,
                 })
                 .await;

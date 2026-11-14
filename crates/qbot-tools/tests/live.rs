@@ -67,7 +67,7 @@ async fn the_model_searches_the_web_and_answers_from_the_results() {
     let tool = WebSearchTool::new(search);
     let specs = ToolSet::new().with(tool.clone()).unwrap().specs();
 
-    let mut cfg = ResponsesConfig::deepseek("deepseek-flash");
+    let mut cfg = ResponsesConfig::new("deepseek-flash");
     cfg.timeout = Some(Duration::from_secs(120));
     let model = ResponsesProvider::new(
         cfg,
@@ -79,15 +79,13 @@ async fn the_model_searches_the_web_and_answers_from_the_results() {
             )
             .unwrap(),
         ),
-    )
-    .unwrap();
+    );
     let request = |conversation| Request {
         conversation,
         tools: &specs,
         tool_choice: ToolChoice::Auto,
         parallel_tool_calls: true,
         reasoning: ReasoningEffort::Low,
-        continuation: None,
         media: None,
     };
 
