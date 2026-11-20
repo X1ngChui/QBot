@@ -29,22 +29,17 @@ async fn migrations_are_idempotent_and_the_expected_tables_exist() {
             "group_admin",
             "group_block",
             "group_state",
-            "held_claim",
             "history_window",
             "link_invitation",
             "media_cache",
             "media_ref",
             "member_number",
             "memory",
-            "memory_evidence",
-            "name_reference",
-            "name_removed",
-            "name_ruling",
-            "name_set",
-            "note",
+            "observation",
             "run",
             "run_item",
             "slice_skip",
+            "suppression",
             "timer",
             "usage_event"
         ]
@@ -169,177 +164,72 @@ async fn constraints_reject_invalid_rows() {
     assert!(rejected(&db, "INSERT INTO chat_line (group_id, ordinal, message_id, speaker, at_ms, text) VALUES (1, 1, 5, 'bot', 0, 'same ordinal')").await);
     assert!(rejected(&db, "INSERT INTO chat_line (group_id, ordinal, message_id, speaker, at_ms, text) VALUES (1, 0, 6, 'bot', 0, 'zero')").await);
 
-    // names: a reference points at known accounts and names a member exactly when it says
-    // so; how a line uses a name and what shows whom it means are closed sets; one reading of
-    // an expression per episode and line. A name is set once per member, a ruling names a
-    // member exactly when it is for one.
-    sqlx::query("INSERT INTO account (account_id, first_seen_ms) VALUES (7, 0)")
+    // memories: a name is a member's, a term the group's; a memory entered by hand says who
+    // entered it; the state's time and replacement agree with it; two current memories of one
+    // subject and kind never share a key.
+    sqlx::query("INSERT INTO account (account_id, first_seen_ms) VALUES (7, 0), (77, 0)")
         .execute(db.pool())
         .await
         .unwrap();
-    let reference = |rest: &str| {
+    let memory = |rest: &str| {
         format!(
-            "INSERT INTO name_reference (group_id, episode_id, message_id, ordinal, speaker_account, key, text, who, account_id, basis, grounds, at_ms) VALUES {rest}"
+            "INSERT INTO memory (group_id, subject_account, kind, with_account, term, text, key, durability, origin, set_by, state, replaced_by, closed_ms, first_ms, last_ms) VALUES {rest}"
         )
     };
     for (row, why) in [
         (
-            "(1, 1, 1, 1, 99, 'x', 'x', 'unknown', NULL, 'about', 'none', 0)",
-            "unknown speaker",
+            "(1, 7, 'statement', NULL, 'GG', 't', 'k', 'lasting', 'chat', NULL, 'current', NULL, NULL, 0, 0)",
+            "a term is the group's",
         ),
         (
-            "(1, 1, 1, 1, 7, 'x', 'x', 'member', 99, 'about', 'content', 0)",
-            "unknown account",
+            "(1, NULL, 'name', NULL, NULL, 't', 'k', 'lasting', 'chat', NULL, 'current', NULL, NULL, 0, 0)",
+            "the group has no names",
         ),
         (
-            "(1, 1, 1, 1, 7, 'x', 'x', 'member', NULL, 'about', 'content', 0)",
-            "a member is named",
+            "(1, 7, 'fact', NULL, NULL, 't', 'k', 'lasting', 'chat', NULL, 'current', NULL, NULL, 0, 0)",
+            "closed set of kinds",
         ),
         (
-            "(1, 1, 1, 1, 7, 'x', 'x', 'unknown', 7, 'about', 'none', 0)",
-            "and nobody else is",
+            "(1, 7, 'statement', NULL, NULL, 't', 'k', 'lasting', 'guess', NULL, 'current', NULL, NULL, 0, 0)",
+            "closed set of origins",
         ),
         (
-            "(1, 1, 1, 1, 7, 'x', 'x', 'unknown', NULL, 'set', 'none', 0)",
-            "closed set of uses",
+            "(1, 7, 'statement', NULL, NULL, 't', 'k', 'lasting', 'hand', NULL, 'current', NULL, NULL, 0, 0)",
+            "who entered it by hand",
         ),
         (
-            "(1, 1, 1, 1, 7, 'x', 'x', 'unknown', NULL, 'about', 'hunch', 0)",
-            "closed set of grounds",
+            "(1, 7, 'statement', NULL, NULL, 't', 'k', 'lasting', 'chat', 7, 'current', NULL, NULL, 0, 0)",
+            "only by hand",
         ),
         (
-            "(1, 1, 1, 1, 7, 'x', 'x', 'everyone', NULL, 'about', 'none', 0)",
-            "closed set of referents",
+            "(1, 7, 'statement', 7, NULL, 't', 'k', 'lasting', 'chat', NULL, 'current', NULL, NULL, 0, 0)",
+            "a second member is another member",
         ),
         (
-            "(1, 1, 1, 1, 7, '', '', 'unknown', NULL, 'about', 'none', 0)",
-            "empty expression",
+            "(1, 7, 'statement', NULL, NULL, 't', 'k', 'forever', 'chat', NULL, 'current', NULL, NULL, 0, 0)",
+            "closed set of durabilities",
+        ),
+        (
+            "(1, 7, 'statement', NULL, NULL, 't', 'k', 'lasting', 'chat', NULL, 'ended', NULL, NULL, 0, 0)",
+            "an end has its time",
+        ),
+        (
+            "(1, 7, 'statement', NULL, NULL, 't', 'k', 'lasting', 'chat', NULL, 'current', NULL, 5, 0, 0)",
+            "a current memory has none",
+        ),
+        (
+            "(1, 7, 'statement', NULL, NULL, 't', 'k', 'lasting', 'chat', NULL, 'current', NULL, NULL, 5, 0)",
+            "first before last",
+        ),
+        (
+            "(1, 7, 'statement', NULL, NULL, '', 'k', 'lasting', 'chat', NULL, 'current', NULL, NULL, 0, 0)",
+            "empty text",
         ),
     ] {
-        assert!(rejected(&db, &reference(row)).await, "{why}");
+        assert!(rejected(&db, &memory(row)).await, "{why}");
     }
-    sqlx::query(&reference(
-        "(1, 1, 1, 1, 7, 'x', 'X', 'member', 7, 'own', 'self', 0)",
-    ))
-    .execute(db.pool())
-    .await
-    .unwrap();
-    assert!(
-        rejected(
-            &db,
-            &reference("(1, 1, 1, 1, 7, 'x', 'x', 'unknown', NULL, 'about', 'none', 0)")
-        )
-        .await,
-        "one reading per episode and line"
-    );
-    sqlx::query(&reference(
-        "(1, 1, 2, 2, 7, 'x', 'x', 'unknown', NULL, 'about', 'none', 0)",
-    ))
-    .execute(db.pool())
-    .await
-    .unwrap();
-    let set = "INSERT INTO name_set (group_id, account_id, key, text, at_ms) VALUES";
-    assert!(
-        rejected(&db, &format!("{set} (1, 99, 'x', 'x', 0)")).await,
-        "unknown account"
-    );
-    sqlx::query(&format!("{set} (1, 7, 'x', 'x', 0)"))
-        .execute(db.pool())
-        .await
-        .unwrap();
-    assert!(
-        rejected(&db, &format!("{set} (1, 7, 'x', 'x', 1)")).await,
-        "set once"
-    );
-    let ruling =
-        "INSERT INTO name_ruling (group_id, key, text, verdict, account_id, seen, at_ms) VALUES";
-    assert!(
-        rejected(
-            &db,
-            &format!("{ruling} (1, 'x', 'x', 'member', NULL, 3, 0)")
-        )
-        .await
-    );
-    assert!(rejected(&db, &format!("{ruling} (1, 'x', 'x', 'outside', 7, 3, 0)")).await);
-    assert!(rejected(&db, &format!("{ruling} (1, 'x', 'x', 'maybe', NULL, 3, 0)")).await);
-    sqlx::query(&format!("{ruling} (1, 'x', 'x', 'member', 7, 3, 0)"))
-        .execute(db.pool())
-        .await
-        .unwrap();
-    assert!(
-        rejected(
-            &db,
-            &format!("{ruling} (1, 'x', 'x', 'general', NULL, 3, 0)")
-        )
-        .await,
-        "one ruling per expression"
-    );
-    assert!(
-        rejected(
-            &db,
-            "INSERT INTO held_claim (group_id, key, name, text, durability, episode_id, message_id, quote, at_ms) VALUES (1, 'x', 'x', 'keeps bees', 'forever', 1, 1, 'q', 0)"
-        )
-        .await,
-        "closed set of durabilities"
-    );
-
-    // memories: a member memory has no term; the state's time and replacement agree with it;
-    // two current memories of one subject never share a key; evidence once per episode.
-    let memory = |rest: &str| {
-        format!(
-            "INSERT INTO memory (group_id, subject_account, term, text, key, durability, state, replaced_by, closed_ms, first_ms, last_ms) VALUES {rest}"
-        )
-    };
-    assert!(
-        rejected(
-            &db,
-            &memory("(1, 7, 'GG', 't', 'k', 'lasting', 'current', NULL, NULL, 0, 0)")
-        )
-        .await,
-        "a term is the group's"
-    );
-    assert!(
-        rejected(
-            &db,
-            &memory("(1, 7, NULL, 't', 'k', 'forever', 'current', NULL, NULL, 0, 0)")
-        )
-        .await,
-        "closed set of durabilities"
-    );
-    assert!(
-        rejected(
-            &db,
-            &memory("(1, 7, NULL, 't', 'k', 'lasting', 'ended', NULL, NULL, 0, 0)")
-        )
-        .await,
-        "an end has its time"
-    );
-    assert!(
-        rejected(
-            &db,
-            &memory("(1, 7, NULL, 't', 'k', 'lasting', 'current', NULL, 5, 0, 0)")
-        )
-        .await,
-        "a current memory has none"
-    );
-    assert!(
-        rejected(
-            &db,
-            &memory("(1, 7, NULL, 't', 'k', 'lasting', 'current', NULL, NULL, 5, 0)")
-        )
-        .await,
-        "first before last"
-    );
-    assert!(
-        rejected(
-            &db,
-            &memory("(1, 7, NULL, '', 'k', 'lasting', 'current', NULL, NULL, 0, 0)")
-        )
-        .await,
-        "empty text"
-    );
     sqlx::query(&memory(
-        "(1, 7, NULL, 't', 'k', 'lasting', 'current', NULL, NULL, 0, 0)",
+        "(1, 7, 'statement', 77, NULL, 't', 'k', 'lasting', 'chat', NULL, 'current', NULL, NULL, 0, 0)",
     ))
     .execute(db.pool())
     .await
@@ -347,26 +237,54 @@ async fn constraints_reject_invalid_rows() {
     assert!(
         rejected(
             &db,
-            &memory("(1, 7, NULL, 'T', 'k', 'lasting', 'current', NULL, NULL, 0, 0)")
+            &memory("(1, 7, 'statement', NULL, NULL, 'T', 'k', 'lasting', 'hand', 7, 'current', NULL, NULL, 0, 0)")
         )
         .await,
         "the same memory twice"
     );
     sqlx::query(&memory(
-        "(1, 7, NULL, 'T', 'k', 'lasting', 'ended', NULL, 3, 0, 0)",
+        "(1, 7, 'name', NULL, NULL, 'k', 'k', 'lasting', 'hand', 8, 'current', NULL, NULL, 0, 0)",
     ))
     .execute(db.pool())
     .await
     .unwrap();
     sqlx::query(&memory(
-        "(1, NULL, 'GG', 't', 'k', 'ongoing', 'current', NULL, NULL, 0, 0)",
+        "(1, 7, 'statement', NULL, NULL, 'T', 'k', 'lasting', 'chat', NULL, 'ended', NULL, 3, 0, 0)",
     ))
     .execute(db.pool())
     .await
     .unwrap();
-    assert!(rejected(&db, &memory("(1, 7, NULL, 'u', 'u', 'lasting', 'ended', (SELECT min(memory_id) FROM memory), 3, 0, 0)")).await, "only a replaced memory has a replacement");
-    sqlx::query("INSERT INTO memory_evidence (memory_id, episode_id, message_id, author_account, quote, at_ms) VALUES ((SELECT min(memory_id) FROM memory), 1, 1, 7, 'q', 0)").execute(db.pool()).await.unwrap();
-    assert!(rejected(&db, "INSERT INTO memory_evidence (memory_id, episode_id, message_id, author_account, quote, at_ms) VALUES ((SELECT min(memory_id) FROM memory), 1, 2, 7, 'q', 0)").await, "one support per episode");
+    sqlx::query(&memory(
+        "(1, NULL, 'statement', NULL, 'GG', 't', 'k', 'ongoing', 'ruling', NULL, 'current', NULL, NULL, 0, 0)",
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert!(rejected(&db, &memory("(1, 7, 'statement', NULL, NULL, 'u', 'u', 'lasting', 'chat', NULL, 'ended', (SELECT min(memory_id) FROM memory), 3, 0, 0)")).await, "only a replaced memory has a replacement");
+
+    // What was forgotten: once per subject, kind and key.
+    let forgotten = "INSERT INTO suppression (group_id, subject_account, kind, text, key, messages, by_account, at_ms) VALUES";
+    assert!(
+        rejected(
+            &db,
+            &format!("{forgotten} (1, 7, 'fact', 't', 'k', '{{}}', 7, 0)")
+        )
+        .await
+    );
+    sqlx::query(&format!(
+        "{forgotten} (1, 7, 'statement', 't', 'k', '{{1,2}}', 7, 0)"
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert!(
+        rejected(
+            &db,
+            &format!("{forgotten} (1, 7, 'statement', 'T', 'k', '{{}}', 8, 1)")
+        )
+        .await,
+        "once"
+    );
 
     // episodes: ranges are valid and never overlap within a group; embeddings match their width.
     let episode = |first: i64, last: i64, group: i64| {
@@ -395,6 +313,48 @@ async fn constraints_reject_invalid_rows() {
         .unwrap();
     assert!(rejected(&db, "INSERT INTO episode_embedding (episode_id, model, dims, embedding) VALUES ((SELECT min(episode_id) FROM episode), 'm', 3, '[1,2]')").await, "width must match dims");
     sqlx::query("INSERT INTO episode_embedding (episode_id, model, dims, embedding) VALUES ((SELECT min(episode_id) FROM episode), 'm', 2, '[1,2]')").execute(db.pool()).await.unwrap();
+
+    // observations: about a member names the member, about a name names it; a name's use says
+    // how it was used, a statement how long it lasts; each cites an episode.
+    let observation = |rest: &str| {
+        format!(
+            "INSERT INTO observation (group_id, episode_id, message_id, ordinal, author_account, quote, at_ms, about, about_account, about_name, kind, text, basis, grounds, anchored, durability) VALUES {rest}"
+        )
+    };
+    for (row, why) in [
+        (
+            "(1, (SELECT min(episode_id) FROM episode), 1, 1, 7, 'q', 0, 'member', NULL, NULL, 'statement', 't', NULL, NULL, NULL, 'lasting')",
+            "a member is named",
+        ),
+        (
+            "(1, (SELECT min(episode_id) FROM episode), 1, 1, 7, 'q', 0, 'name', NULL, NULL, 'statement', 't', NULL, NULL, NULL, 'lasting')",
+            "a name is named",
+        ),
+        (
+            "(1, (SELECT min(episode_id) FROM episode), 1, 1, 7, 'q', 0, 'member', 7, NULL, 'name', 't', NULL, 'self', false, NULL)",
+            "a use says how",
+        ),
+        (
+            "(1, (SELECT min(episode_id) FROM episode), 1, 1, 7, 'q', 0, 'member', 7, NULL, 'name', 't', 'set', 'self', false, NULL)",
+            "closed set of uses",
+        ),
+        (
+            "(1, (SELECT min(episode_id) FROM episode), 1, 1, 7, 'q', 0, 'group', NULL, NULL, 'statement', 't', NULL, NULL, NULL, NULL)",
+            "a statement says how long it lasts",
+        ),
+        (
+            "(1, 999999, 1, 1, 7, 'q', 0, 'group', NULL, NULL, 'statement', 't', NULL, NULL, NULL, 'lasting')",
+            "an episode that exists",
+        ),
+    ] {
+        assert!(rejected(&db, &observation(row)).await, "{why}");
+    }
+    sqlx::query(&observation(
+        "(1, (SELECT min(episode_id) FROM episode), 1, 1, 7, 'q', 0, 'name', NULL, 'Old Ray', 'name', 'Old Ray', 'about', 'none', false, NULL)",
+    ))
+    .execute(db.pool())
+    .await
+    .unwrap();
     assert!(rejected(&db, "INSERT INTO episode_embedding (episode_id, model, dims, embedding) VALUES ((SELECT min(episode_id) FROM episode), 'm', 2, '[3,4]')").await, "one vector per episode and model");
 
     // links: stored once, lower account first, between known accounts.

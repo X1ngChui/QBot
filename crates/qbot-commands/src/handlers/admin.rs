@@ -284,14 +284,17 @@ pub(crate) async fn members(cx: &Cx<'_>) -> Reply {
     let mut lines = vec![cx.t(&Msg::MembersHeader {
         total: total.to_string(),
     })];
-    for row in rows {
-        // The names people use most for them, set ones first.
-        let mut names = cx
-            .deps
-            .names
-            .names(cx.group(), Some(&[row.account]))
+    let known = qbot_memory::known_names(
+        &cx.deps
+            .memories
+            .names(cx.group())
             .await
-            .map_err(|e| Fail::Storage(e.to_string()))?;
+            .map_err(|e| Fail::Storage(e.to_string()))?,
+    );
+    for row in rows {
+        // The names people use most for them, those entered by hand first.
+        let mut names: Vec<&qbot_memory::KnownName> =
+            known.iter().filter(|n| n.account == row.account).collect();
         names.sort_by(|a, b| b.set.cmp(&a.set).then(b.uses().cmp(&a.uses())));
         let names: Vec<String> = names
             .into_iter()

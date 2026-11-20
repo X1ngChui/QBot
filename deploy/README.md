@@ -165,8 +165,8 @@ The bot runs its own maintenance; nothing outside the container is needed.
   has no vector for (a new embedding model needs no other step). A failed batch is logged and
   tried again with backoff; lines it did not read are read by the next one. Lines the provider
   refuses for good are skipped (`lines skipped` in the log) and simply have no episode. What
-  members say is learned at the next batch; commands such as `/name`, `/block` and `/forget`
-  take effect at once.
+  members say is learned at the next batch; commands such as `/memory` and `/block` take effect
+  at once.
 - **Nightly run**, in order: decay (cached picture descriptions older than 15 days; learned memory is not expired), a verified
   `pg_dump`, then cleanup (finished timers and runs after `maintenance.records_keep_days`, NapCat's file cache). Every
   stage runs even if an earlier one failed. A failed decay, backup or cleanup fails the job, which

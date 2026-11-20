@@ -10,10 +10,15 @@ use std::time::Duration;
 
 use qbot_core::{AccountId, MessageId, UnixMillis};
 use qbot_llm::responses::{KeySource, ReqwestTransport, ResponsesConfig, ResponsesProvider};
+use std::collections::BTreeMap;
+
+use qbot_llm::ConvItem;
+use qbot_memory::decide::{Candidate, DecideCase, Decided, Decision, Ref};
 use qbot_memory::findings::Findings;
-use qbot_memory::findings::MemoryAction;
+use qbot_memory::memories::Obs;
 use qbot_memory::{
-    Background, BatchReader, MemoryId, NameBasis, Planned, Referent, SliceLine, Stretch,
+    About, Background, BatchReader, Durability, Kind, Memory, MemoryId, MemoryState, NameBasis,
+    Observation, ObservationId, Origin, Planned, Referent, Said, SliceLine, Stretch,
 };
 
 fn secret(file: &str) -> String {
@@ -55,10 +60,12 @@ fn live_reader() -> BatchReader {
     BatchReader::new(provider, "English")
 }
 
-/// What one batch made of the lines: its episodes, and their findings together.
+/// What one batch made of the lines: its episodes, their findings together, and the prefix every
+/// call of the batch begins with.
 struct Read {
     episodes: Vec<Planned>,
     findings: Findings,
+    prefix: Vec<ConvItem>,
 }
 
 impl Read {
@@ -103,12 +110,106 @@ async fn read(reader: &BatchReader, lines: &[SliceLine], background: &Background
             found.attempts, found.usage, found.value.findings, found.value.dropped
         );
         findings.references.extend(found.value.findings.references);
-        findings.memories.extend(found.value.findings.memories);
+        findings.statements.extend(found.value.findings.statements);
     }
     Read {
         episodes: planned.value,
         findings,
+        prefix,
     }
+}
+
+/// A memory a member said of themselves once, as the store keeps it.
+fn remembered(id: i64, account: i64, text: &str, durability: Durability) -> Memory {
+    let subject = AccountId::new(account).unwrap();
+    Memory {
+        id: MemoryId::new(id),
+        group: qbot_core::GroupId::new(900).unwrap(),
+        subject: Some(subject),
+        kind: Kind::Statement,
+        with: None,
+        term: None,
+        text: text.into(),
+        durability,
+        origin: Origin::Chat,
+        state: MemoryState::Current,
+        first: UnixMillis::new(1_790_000_000_000),
+        last: UnixMillis::new(1_790_000_000_000),
+        support: vec![Observation {
+            id: ObservationId::new(id),
+            episode: qbot_memory::EpisodeId::new(id),
+            message: MessageId::new(id).unwrap(),
+            ordinal: 1,
+            author: subject,
+            quote: text.into(),
+            at: UnixMillis::new(1_790_000_000_000),
+            about: About::Member(subject),
+            said: Said::Statement {
+                text: text.into(),
+                term: None,
+                durability,
+                with: None,
+            },
+        }],
+    }
+}
+
+/// Decide, per member the statements are about, against what is known about them.
+async fn decide(
+    reader: &BatchReader,
+    read: &Read,
+    lines: &[SliceLine],
+    known: &[Memory],
+    background: &Background,
+) -> BTreeMap<AccountId, (Vec<Candidate>, Decided)> {
+    let numbers: BTreeMap<AccountId, u32> = lines
+        .iter()
+        .filter_map(|l| Some((l.speaker?, l.member_no?)))
+        .collect();
+    let mut cases: BTreeMap<AccountId, Vec<Candidate>> = BTreeMap::new();
+    for (index, one) in read.findings.statements.iter().enumerate() {
+        let About::Member(account) = one.about else {
+            continue;
+        };
+        let line = lines
+            .iter()
+            .position(|l| l.message == one.message)
+            .map_or_else(String::new, |i| format!("#{}", i + 1));
+        cases.entry(account).or_default().push(Candidate {
+            obs: Obs::New(index),
+            author: one.author,
+            at: one.at,
+            line,
+            quote: one.quote.clone(),
+            text: one.text.clone(),
+            term: one.term.clone(),
+            durability: one.durability,
+            with: one.with,
+        });
+    }
+    let mut out = BTreeMap::new();
+    for (account, candidates) in cases {
+        let memories: Vec<Memory> = known
+            .iter()
+            .filter(|m| m.subject == Some(account))
+            .cloned()
+            .collect();
+        let case = DecideCase {
+            subject: Some(account),
+            memories: &memories,
+            forgotten: &[],
+            candidates: &candidates,
+            numbers: &numbers,
+            zone: &background.zone,
+        };
+        let answer = reader.decide(&read.prefix, &case).await.unwrap();
+        eprintln!(
+            "[batch] decide member {account:?}: attempts={} {:#?}",
+            answer.attempts, answer.value
+        );
+        out.insert(account, (candidates, answer.value));
+    }
+    out
 }
 
 #[tokio::test]
@@ -163,7 +264,6 @@ async fn a_real_model_writes_a_valid_episode_with_findings() {
                ## About the group\n\nFriends from the same university who chat about food and trips."
             .into(),
         zone: jiff::tz::TimeZone::get("Asia/Shanghai").unwrap(),
-        known: vec![(MemoryId::new(7), AccountId::new(1002).ok())],
         ..Default::default()
     };
     let out = read(&reader, &target, &background).await;
@@ -180,29 +280,30 @@ async fn a_real_model_writes_a_valid_episode_with_findings() {
             .expect("evidence names a target line");
         assert!(source.text.contains(&e.quote), "{e:?}");
     }
-    let member_one = AccountId::new(1001).ok();
+    let member_one = About::Member(AccountId::new(1001).unwrap());
     assert!(
-        out.findings.memories.iter().any(|m| {
-            let text = m.text.as_deref().unwrap_or_default().to_lowercase();
-            m.subject == member_one
-                && m.action == MemoryAction::New
-                && (text.contains("cat") || text.contains("\u{732b}"))
+        out.findings.statements.iter().any(|m| {
+            let text = m.text.to_lowercase();
+            m.about == member_one && (text.contains("cat") || text.contains("\u{732b}"))
         }),
         "member 1 said they like cats"
     );
     assert!(
-        out.findings.memories.iter().any(|m| m.subject.is_none()
-            && m.term
-                .as_deref()
-                .is_some_and(|t| t.contains("\u{55b5}\u{7ad9}"))),
+        out.findings
+            .statements
+            .iter()
+            .any(|m| m.about == About::Group
+                && m.term
+                    .as_deref()
+                    .is_some_and(|t| t.contains("\u{55b5}\u{7ad9}"))),
         "the group's name for the cafe is a group term"
     );
     assert!(
         !out.findings
-            .memories
+            .statements
             .iter()
-            .any(|m| m.subject == member_one && m.message == target[0].message),
-        "a business trip next week is a plan, not a memory"
+            .any(|m| m.about == member_one && m.message == target[0].message),
+        "a business trip next week is a plan, not something to remember"
     );
 }
 
@@ -265,10 +366,10 @@ async fn a_real_model_ends_confirms_dates_plans_and_skips_what_passes() {
                Friends from the same university who chat about games and trips."
             .into(),
         zone: jiff::tz::TimeZone::get("Asia/Shanghai").unwrap(),
-        earlier: Some((
+        recent: vec![(
             "Weekend plans".into(),
             "member:3 suggested a hike at the weekend; member:1 asked where to meet.".into(),
-        )),
+        )],
         quoted: vec![SliceLine {
             ordinal: 0,
             message: MessageId::new(420).unwrap(),
@@ -280,35 +381,48 @@ async fn a_real_model_ends_confirms_dates_plans_and_skips_what_passes() {
             )
         }],
         bot_names: vec!["Bobo".into()],
-        known: vec![
-            (MemoryId::new(3), AccountId::new(1001).ok()),
-            (MemoryId::new(5), AccountId::new(1002).ok()),
-        ],
         ..Default::default()
     };
     let out = read(&reader, &target, &background).await;
+    let known = [
+        remembered(
+            3,
+            1001,
+            "\u{5728}\u{73a9}\u{539f}\u{795e}",
+            Durability::Current,
+        ),
+        remembered(
+            5,
+            1002,
+            "\u{4f4f}\u{5728}\u{676d}\u{5dde}\u{5e02}",
+            Durability::Lasting,
+        ),
+    ];
+    let decided = decide(&reader, &out, &target, &known, &background).await;
 
-    let (one, two) = (AccountId::new(1001).ok(), AccountId::new(1002).ok());
-    let about = |who, id: i64| {
-        out.findings
-            .memories
-            .iter()
-            .filter(move |m| m.subject == who && m.id == Some(MemoryId::new(id)))
+    let (one, two) = (AccountId::new(1001).unwrap(), AccountId::new(1002).unwrap());
+    let decisions = |who: AccountId| {
+        decided
+            .get(&who)
+            .map(|(_, d)| d.decisions.clone())
+            .unwrap_or_default()
     };
     assert!(
-        about(one, 3).any(|m| m.action == MemoryAction::Ended),
-        "member 1 stopped playing the game"
+        decisions(one).contains(&Decision::End(MemoryId::new(3))),
+        "member 1 stopped playing the game: {:?}",
+        decisions(one)
     );
     assert!(
-        about(two, 5).any(|m| m.action == MemoryAction::Same),
-        "living in Hangzhou, said again in other words, supports the memory"
+        decisions(two).contains(&Decision::Support(Ref::Memory(MemoryId::new(5)))),
+        "living in Hangzhou, said again in other words, supports the memory: {:?}",
+        decisions(two)
     );
     assert!(
-        !out.findings
-            .memories
+        !decisions(two)
             .iter()
-            .any(|m| m.subject == two && m.action == MemoryAction::New),
-        "neither the mood nor the city is a new memory"
+            .any(|d| matches!(d, Decision::New { .. })),
+        "neither the mood nor the city is a new memory: {:?}",
+        decisions(two)
     );
     assert!(
         !out.findings.references.iter().any(|n| {

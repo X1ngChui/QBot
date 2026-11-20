@@ -18,10 +18,12 @@ use qbot_core::{AccountId, ChainId, Clock, GroupId, MessageId, RunId, TimerId, U
 use qbot_llm::embedding::FakeEmbedder;
 use qbot_llm::search::{FakeSearch, PageRead, SearchHit, SearchResults};
 use qbot_llm::{Provider, ReasoningEffort, Usage};
+use qbot_memory::memories::{
+    Changes, Commit, HandMemory, NewMemory, NewObservation, Obs, Op, Target,
+};
 use qbot_memory::{
-    Change, Durability, EpisodeId, Grounds, InMemoryMemoryStore, MemoryEpisodeStore, MemoryId,
-    MemoryNameStore, MemoryNoteStore, MemoryStore, NameBasis, NameStore, NoteStore, Recall,
-    RecallParams, Reference, Referent, Statement, Support,
+    About, Durability, Grounds, InMemoryStore, Kind, MemoryId, MemoryStore, NameBasis, Origin,
+    Recall, RecallParams, Said, known_names,
 };
 use qbot_prompt::{
     GroupPeople, HistorySource, MemoryView, PeopleSource, Person, Personas, PromptContext,
@@ -245,12 +247,12 @@ fn render(segments: &[OutSegment], scenario: &Scenario, accounts: &[(u32, Accoun
 async fn scenario_people(
     scenario: &Scenario,
     accounts: &[(u32, AccountId)],
-    names: &dyn NameStore,
+    memories: &dyn MemoryStore,
     group: GroupId,
     now: UnixMillis,
 ) -> Result<GroupPeople, String> {
     use qbot_core::MemberNo;
-    let all = names.names(group, None).await.map_err(|e| e.to_string())?;
+    let all = known_names(&memories.names(group).await.map_err(|e| e.to_string())?);
     let number_of = |account: AccountId| {
         accounts
             .iter()
@@ -354,8 +356,12 @@ impl Runner {
         world.set_time(now.now());
 
         // What the bot keeps about the group and its people.
-        let memories = Arc::new(InMemoryMemoryStore::default());
-        let mut episode = 0;
+        let memories = Arc::new(InMemoryStore::default());
+        let mut seeded = Seeding {
+            store: &memories,
+            group,
+            next: 1_000_000,
+        };
         let mut ids: Vec<MemoryId> = Vec::new();
         for (i, m) in scenario.memories.iter().enumerate() {
             let subject = m.member.map(account_of).transpose()?;
@@ -369,90 +375,87 @@ impl Runner {
                 .and_then(Durability::parse)
                 .unwrap_or(Durability::Ongoing);
             let last = UnixMillis::new(now.now().get() - i64::from(m.days_ago) * 86_400_000);
-            let mut id = None;
             // Each supporting conversation a week before the next, the last one `days_ago`.
-            for k in (0..m.episodes.max(1)).rev() {
-                episode += 1;
-                let statement = Statement {
-                    subject,
-                    term: m.term.clone(),
-                    text: m.text.clone(),
-                    durability,
-                    support: Support {
-                        episode: EpisodeId::new(episode),
-                        message: MessageId::new(episode).map_err(|e| e.to_string())?,
-                        author: Some(author),
-                        quote: m.text.clone(),
-                        at: UnixMillis::new(last.get() - i64::from(k) * 7 * 86_400_000),
-                    },
-                };
-                let change = match (m.replaces, id) {
-                    (Some(r), None) => Change::Replace {
-                        id: ids[r - 1],
-                        with: statement,
-                    },
-                    _ => Change::New(statement),
-                };
-                id = memories
-                    .apply(group, &[change])
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .first()
-                    .copied();
-            }
-            ids.push(id.ok_or_else(|| format!("memory {} was not stored", i + 1))?);
+            let ats: Vec<UnixMillis> = (0..m.episodes.max(1))
+                .rev()
+                .map(|k| UnixMillis::new(last.get() - i64::from(k) * 7 * 86_400_000))
+                .collect();
+            let replaces = m.replaces.map(|r| ids[r - 1]);
+            let said = Said::Statement {
+                text: m.text.clone(),
+                term: m.term.clone(),
+                durability,
+                with: None,
+            };
+            let id = seeded
+                .remember(subject, Kind::Statement, said, author, &ats, replaces)
+                .await
+                .map_err(|e| format!("memory {}: {e}", i + 1))?;
+            ids.push(id);
         }
-        let notes = Arc::new(MemoryNoteStore::default());
         for note in &scenario.notes {
             let about = account_of(note.member)?;
-            notes
-                .add(group, about, &note.text, about, now.now())
+            memories
+                .add(
+                    group,
+                    &HandMemory {
+                        subject: Some(about),
+                        kind: Kind::Statement,
+                        term: None,
+                        text: note.text.clone(),
+                        by: about,
+                        at: now.now(),
+                    },
+                )
                 .await
                 .map_err(|e| e.to_string())?;
         }
-        let name_store = MemoryNameStore::default();
         for n in &scenario.names {
             let about = account_of(n.member)?;
-            match n.basis.as_deref().and_then(NameBasis::parse) {
-                Some(NameBasis::Set) => name_store
-                    .set(group, &n.name, &[about], now.now())
+            if n.basis.as_deref() == Some("set") {
+                memories
+                    .add(
+                        group,
+                        &HandMemory {
+                            subject: Some(about),
+                            kind: Kind::Name,
+                            term: None,
+                            text: n.name.clone(),
+                            by: about,
+                            at: now.now(),
+                        },
+                    )
                     .await
-                    .map_err(|e| e.to_string())?,
-                basis => {
-                    let basis = basis.unwrap_or(NameBasis::Addressed);
-                    let uses: Vec<Reference> = (0..n.episodes.max(1))
-                        .map(|k| {
-                            episode += 1;
-                            Ok(Reference {
-                                episode: EpisodeId::new(episode),
-                                message: MessageId::new(episode).map_err(|e| e.to_string())?,
-                                ordinal: u64::try_from(episode).unwrap_or(0),
-                                // Who said it plays no part in what a scenario is shown.
-                                speaker: about,
-                                text: n.name.clone(),
-                                referent: Referent::Member(about),
-                                basis,
-                                grounds: match basis {
-                                    NameBasis::Own => Grounds::Own,
-                                    NameBasis::About => Grounds::Content,
-                                    _ => Grounds::Marker,
-                                },
-                                anchored: false,
-                                shown_by: Vec::new(),
-                                at: UnixMillis::new(
-                                    now.now().get() - i64::from(k) * 3 * 86_400_000,
-                                ),
-                            })
-                        })
-                        .collect::<Result<_, String>>()?;
-                    name_store
-                        .record(group, &uses)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                }
+                    .map_err(|e| e.to_string())?;
+                continue;
             }
+            let basis = n
+                .basis
+                .as_deref()
+                .and_then(NameBasis::parse)
+                .unwrap_or(NameBasis::Addressed);
+            let ats: Vec<UnixMillis> = (0..n.episodes.max(1))
+                .map(|k| UnixMillis::new(now.now().get() - i64::from(k) * 3 * 86_400_000))
+                .collect();
+            let said = Said::Name {
+                text: n.name.clone(),
+                basis,
+                grounds: match basis {
+                    NameBasis::Own => Grounds::Own,
+                    NameBasis::About => Grounds::Content,
+                    NameBasis::Addressed => Grounds::Marker,
+                },
+                anchored: false,
+                shown_by: Vec::new(),
+            };
+            // Who said it plays no part in what a scenario is shown.
+            seeded
+                .remember(Some(about), Kind::Name, said, about, &ats, None)
+                .await
+                .map_err(|e| format!("name {}: {e}", n.name))?;
         }
-        let people = scenario_people(scenario, &accounts, &name_store, group, now.now()).await?;
+        let people =
+            scenario_people(scenario, &accounts, memories.as_ref(), group, now.now()).await?;
         let names = Arc::new(Names(
             scenario
                 .members
@@ -489,7 +492,7 @@ impl Runner {
             Arc::new(Notify::new()),
             qbot_sched::Zone::get(TIMEZONE).map_err(|e| e.to_string())?,
         );
-        let episodes = Arc::new(MemoryEpisodeStore::default());
+        let episodes = Arc::new(InMemoryStore::default());
         let recall = Arc::new(Recall::new(
             episodes.clone(),
             Arc::new(FakeEmbedder::new(64)),
@@ -516,7 +519,6 @@ impl Runner {
             // memory.group_memories and memory.person_memories by default
             .with_memories(
                 memories.clone(),
-                notes.clone(),
                 MemoryView {
                     group_memories: 40,
                     person_memories: 8,
@@ -788,4 +790,102 @@ fn checks(
         });
     }
     out
+}
+
+/// Seeds what a scenario says is known, as a batch would have stored it.
+struct Seeding<'a> {
+    store: &'a InMemoryStore,
+    group: GroupId,
+    /// The next ordinal for a seeded episode: past any scenario's chat.
+    next: u64,
+}
+
+impl Seeding<'_> {
+    /// One memory, said in one conversation at each of `ats` (an episode each), replacing
+    /// `replaces` when given.
+    async fn remember(
+        &mut self,
+        subject: Option<AccountId>,
+        kind: Kind,
+        said: Said,
+        author: AccountId,
+        ats: &[UnixMillis],
+        replaces: Option<MemoryId>,
+    ) -> Result<MemoryId, String> {
+        let (text, term, durability) = match &said {
+            Said::Statement {
+                text,
+                term,
+                durability,
+                ..
+            } => (text.clone(), term.clone(), *durability),
+            Said::Name { text, .. } => (text.clone(), None, Durability::Lasting),
+        };
+        let about = subject.map_or(About::Group, About::Member);
+        let mut episodes = Vec::new();
+        let mut observations = Vec::new();
+        let mut ops = vec![Op::Create(NewMemory {
+            subject,
+            kind,
+            with: None,
+            term: term.clone(),
+            text: text.clone(),
+            durability,
+            origin: Origin::Chat,
+            at: ats.first().copied().unwrap_or(UnixMillis::new(0)),
+        })];
+        for (index, at) in ats.iter().enumerate() {
+            self.next += 1;
+            let mut episode =
+                qbot_memory::conformance::episode(self.group, self.next, self.next, "seeded");
+            episode.started = *at;
+            episode.ended = *at;
+            episode.participants = vec![author];
+            episodes.push((episode, vec![1.0, 0.0], "seeded".to_owned()));
+            observations.push(NewObservation {
+                episode: index,
+                message: MessageId::new(i64::try_from(self.next).unwrap_or(i64::MAX))
+                    .map_err(|e| e.to_string())?,
+                ordinal: self.next,
+                author,
+                quote: text.clone(),
+                at: *at,
+                about: about.clone(),
+                said: said.clone(),
+            });
+            ops.push(Op::Support {
+                obs: Obs::New(index),
+                memory: Target::Created(0),
+            });
+        }
+        if let Some(old) = replaces {
+            ops.push(Op::Close {
+                memory: old,
+                by: Some(Target::Created(0)),
+                at: ats.first().copied().unwrap_or(UnixMillis::new(0)),
+            });
+        }
+        let at = ats.last().copied().unwrap_or(UnixMillis::new(0));
+        self.store
+            .commit(&Commit {
+                group: self.group,
+                read: at,
+                at,
+                episodes,
+                skipped: None,
+                observations,
+                changes: vec![Changes { subject, ops }],
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        self.store
+            .current(self.group, &[subject], kind)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .rev()
+            .find(|m| m.text == text && m.term == term)
+            .map(|m| m.id)
+            .ok_or_else(|| "it was not stored".to_owned())
+    }
 }

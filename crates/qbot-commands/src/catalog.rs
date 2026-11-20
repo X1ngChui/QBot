@@ -1,21 +1,14 @@
 use qbot_i18n::Msg;
 
-/// Every command. Names say what a command is about; related things that are kept apart (notes
-/// people write, memory the bot learned) have separate commands, so no command acts on both.
+/// Every command. Names say what a command is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
-    /// Everything on record about a member.
-    Who,
-    /// Notes people wrote by hand.
-    Note,
-    /// The names a member is called by.
-    Name,
-    /// Removes what the bot remembers from chat (memories about a member or the group).
-    Forget,
+    /// Everything the bot knows about a member or the group (names and statements, read from
+    /// chat or entered by hand): viewing it, and adding, correcting, closing or forgetting an
+    /// entry.
+    Memory,
     Link,
     Unlink,
-    /// What the bot learned about the group.
-    Group,
     Stats,
     Top,
     Tasks,
@@ -42,14 +35,10 @@ pub enum Category {
 
 impl Command {
     /// In the order `/help` lists them; commands of one category are adjacent.
-    pub const ALL: [Command; 17] = [
-        Command::Who,
-        Command::Note,
-        Command::Name,
-        Command::Forget,
+    pub const ALL: [Command; 13] = [
+        Command::Memory,
         Command::Link,
         Command::Unlink,
-        Command::Group,
         Command::Stats,
         Command::Top,
         Command::Tasks,
@@ -64,13 +53,9 @@ impl Command {
 
     pub fn name(self) -> &'static str {
         match self {
-            Command::Who => "who",
-            Command::Note => "note",
-            Command::Name => "name",
-            Command::Forget => "forget",
+            Command::Memory => "memory",
             Command::Link => "link",
             Command::Unlink => "unlink",
-            Command::Group => "group",
             Command::Stats => "stats",
             Command::Top => "top",
             Command::Tasks => "tasks",
@@ -84,8 +69,9 @@ impl Command {
         }
     }
 
-    /// Commands only owners may use at all. Some member commands have owner-only forms
-    /// (`/link @a @b`, `/unlink @a`, `/forget group N`), checked by their handlers.
+    /// Commands only owners may use at all. Some member commands have forms reserved to owners
+    /// or delegated admins (`/link @a @b`, `/unlink @a`, changing what is known about the
+    /// group), checked by their handlers.
     pub fn owner_only(self) -> bool {
         matches!(
             self,
@@ -113,17 +99,14 @@ impl Command {
     /// Commands that act on a member (`@account`, else the sender), where a delegated admin
     /// may reach the group's ordinary members.
     pub fn targets_members(self) -> bool {
-        matches!(
-            self,
-            Command::Who | Command::Note | Command::Name | Command::Forget
-        )
+        matches!(self, Command::Memory)
     }
 
     pub fn category(self) -> Category {
         match self {
-            Command::Who | Command::Note | Command::Name | Command::Forget => Category::Profile,
+            Command::Memory => Category::Profile,
             Command::Link | Command::Unlink => Category::Identity,
-            Command::Group | Command::Stats | Command::Top => Category::Group,
+            Command::Stats | Command::Top => Category::Group,
             Command::Tasks
             | Command::Members
             | Command::Block
@@ -150,13 +133,9 @@ impl Command {
 
     pub fn what(self) -> Msg {
         match self {
-            Command::Who => Msg::WhatWho {},
-            Command::Note => Msg::WhatNote {},
-            Command::Name => Msg::WhatName {},
-            Command::Forget => Msg::WhatForget {},
+            Command::Memory => Msg::WhatMemory {},
             Command::Link => Msg::WhatLink {},
             Command::Unlink => Msg::WhatUnlink {},
-            Command::Group => Msg::WhatGroup {},
             Command::Stats => Msg::WhatStats {},
             Command::Top => Msg::WhatTop {},
             Command::Tasks => Msg::WhatTasks {},
@@ -172,13 +151,9 @@ impl Command {
 
     pub fn detail(self) -> Msg {
         match self {
-            Command::Who => Msg::DetailWho {},
-            Command::Note => Msg::DetailNote {},
-            Command::Name => Msg::DetailName {},
-            Command::Forget => Msg::DetailForget {},
+            Command::Memory => Msg::DetailMemory {},
             Command::Link => Msg::DetailLink {},
             Command::Unlink => Msg::DetailUnlink {},
-            Command::Group => Msg::DetailGroup {},
             Command::Stats => Msg::DetailStats {},
             Command::Top => Msg::DetailTop {},
             Command::Tasks => Msg::DetailTasks {},

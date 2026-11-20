@@ -1033,9 +1033,14 @@ async fn the_scheduled_batch_turns_archived_chat_into_stored_episodes() {
         findings(
             json!({"references": [{"line": 1, "text": "Tess", "refers": "member:1", "role": "self",
                                         "basis": "self", "shown_by": []}],
-                        "memories": [{"about": "member:1", "action": "new", "text": "likes planning trips",
+                        "statements": [{"about": "member:1", "text": "likes planning trips",
                                       "durability": "ongoing", "line": 1, "quote": "plan the trip"}]}),
         ),
+        // What was said about the member, decided against what is known about them.
+        SimStep::Reply(FakeReply::new().call(
+            "submit_decisions",
+            json!({"decisions": [{"statement": "o1", "action": "new"}]}),
+        )),
         // The reply run looks and stays silent.
         SimStep::Reply(FakeReply::new().call("stay_silent", json!({}))),
         // The second batch, numbering its own lines from 1.
@@ -1080,12 +1085,10 @@ async fn the_scheduled_batch_turns_archived_chat_into_stored_episodes() {
         &mut napcat,
         // Stored and applied: its findings are consolidated once every call of the batch is done.
         eventually("the batch to store and apply the episode", || async {
-            sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM episode WHERE consolidated_ms IS NOT NULL",
-            )
-            .fetch_one(&pool)
-            .await
-            .unwrap()
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM episode")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
                 == 1
         }),
     )
@@ -1113,15 +1116,27 @@ async fn the_scheduled_batch_turns_archived_chat_into_stored_episodes() {
             .await
             .unwrap();
     assert_eq!(shown.as_deref(), Some("Tester 3"));
-    let name: (i64, i64, String, String) =
-        sqlx::query_as("SELECT group_id, account_id, key, basis FROM name_reference")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(name, (900, 3, "tess".to_owned(), "own".to_owned()));
+    let name: (i64, i64, String, String, String) = sqlx::query_as(
+        "SELECT m.group_id, m.subject_account, m.key, m.origin, o.basis \
+         FROM memory m JOIN observation o USING (memory_id) WHERE m.kind = 'name'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        name,
+        (
+            900,
+            3,
+            "tess".to_owned(),
+            "chat".to_owned(),
+            "own".to_owned()
+        )
+    );
     let memory: (i64, i64, String, String, Option<i64>) = sqlx::query_as(
-        "SELECT m.memory_id, m.subject_account, m.text, m.state, e.author_account \
-         FROM memory m JOIN memory_evidence e USING (memory_id) WHERE m.group_id = 900",
+        "SELECT m.memory_id, m.subject_account, m.text, m.state, o.author_account \
+         FROM memory m JOIN observation o USING (memory_id) \
+         WHERE m.group_id = 900 AND m.kind = 'statement'",
     )
     .fetch_one(&pool)
     .await
@@ -1151,7 +1166,16 @@ async fn the_scheduled_batch_turns_archived_chat_into_stored_episodes() {
             .await
             .unwrap();
     assert_eq!(windows, 1);
-    assert_eq!(sim.requests().len(), 2, "the episodes, then their findings");
+    assert_eq!(
+        sim.requests().len(),
+        3,
+        "the episodes, their findings, then the decision about the member"
+    );
+    let decided = sim.requests()[2].to_string();
+    assert!(
+        decided.contains("Task: decide") && decided.contains("likes planning trips"),
+        "{decided}"
+    );
 
     // Three more lines, then a mention starts a reply. The batch is made due now: the scheduler
     // looks again when the reply's run ends, so the second batch reads lines 4-7 after it.
@@ -1178,17 +1202,15 @@ async fn the_scheduled_batch_turns_archived_chat_into_stored_episodes() {
     answering_names(
         &mut napcat,
         eventually("the second episode", || async {
-            sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM episode WHERE consolidated_ms IS NOT NULL",
-            )
-            .fetch_one(&pool)
-            .await
-            .unwrap()
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM episode")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
                 == 2
         }),
     )
     .await;
-    let seen = sim.requests()[2]["input"].to_string();
+    let seen = sim.requests()[3]["input"].to_string();
     assert!(
         seen.contains("Members discussed planning a trip together."),
         "the summarized lines are shown as their summary: {seen}"
@@ -1208,7 +1230,7 @@ async fn the_scheduled_batch_turns_archived_chat_into_stored_episodes() {
     );
     // The next batch saw the member as their lines were sent and what is remembered about them,
     // with the id a later statement can name.
-    let next = sim.requests()[3].to_string();
+    let next = sim.requests()[4].to_string();
     assert!(
         next.contains("lines sent as \\\"Tester 3\\\"")
             && next.contains(&format!("m{} (ongoing) likes planning trips", memory.0))

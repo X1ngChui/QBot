@@ -154,11 +154,6 @@ impl Config {
         }
     }
 
-    /// Earlier episodes a group's batch reads again with the current method.
-    pub fn reread_per_batch(&self) -> usize {
-        usize::try_from(self.memory.reread_per_batch).unwrap_or(usize::MAX)
-    }
-
     pub fn recall_params(&self) -> RecallParams {
         RecallParams {
             max_distance: self.memory.recall.max_distance,

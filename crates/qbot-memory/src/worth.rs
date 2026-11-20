@@ -1,25 +1,19 @@
-//! How much a memory is worth where room is limited (what a run is shown, what a full subject
+//! How much a statement is worth where room is limited (what a run is shown, what a full subject
 //! keeps), on its group's own conversational clock. Worth is never shown and says nothing about
-//! truth; what readers see is a memory's provenance.
+//! truth; what readers see is a statement's provenance.
 //!
-//! `worth = n / (n + 1) * 0.5^(k / h)`: `n` distinct supporting episodes (said again counts),
-//! `k` episodes its subject took part in since the last support (for a group memory, every
-//! episode of the group), `h` the half-life of its durability in episodes. A quiet member's or
-//! group's clock does not move, so what they said keeps its place; a memory replaced or ended is
-//! worth nothing beside current ones.
+//! `worth = n / (n + 1) * 0.5^(k / h)`: `n` distinct supporting episodes (said again counts; at
+//! least one), `k` episodes its subject took part in since the last support (for a group
+//! statement, every episode of the group), `h` the half-life of its durability in episodes. A
+//! quiet member's or group's clock does not move, so what they said keeps its place; a memory
+//! replaced or ended is worth nothing beside current ones. What a person entered by hand, and
+//! names, are not weighed: they are always shown and never give way.
 
 use std::collections::BTreeSet;
 
 use qbot_core::{AccountId, UnixMillis};
 
-use crate::memories::{Durability, Memory, MemoryId, MemoryState};
-
-/// The moment ranking is computed for in what replies are shown: the start of `now`'s UTC day, so
-/// ageing changes the cached prompt prefix at most once a day.
-pub fn as_of_day(now: UnixMillis) -> UnixMillis {
-    const DAY_MS: i64 = 86_400_000;
-    UnixMillis::new(now.get() - now.get().rem_euclid(DAY_MS))
-}
+use crate::memories::{Durability, Kind, Memory, MemoryId, MemoryState};
 
 /// A group's conversation as a clock: when each of its episodes ended and who took part, in chat
 /// order.
@@ -76,12 +70,16 @@ impl HalfLives {
         }
     }
 
-    /// The memory's worth as of `until`. A replaced or ended memory is worth 0.
+    /// The memory's worth as of `until`. A replaced or ended memory is worth 0; one entered by
+    /// hand outweighs every other.
     pub fn worth(&self, memory: &Memory, activity: &Activity, until: UnixMillis) -> f64 {
         if !memory.is_current() {
             return 0.0;
         }
-        let n = f64::from(memory.episodes());
+        if memory.origin.is_hand() {
+            return f64::INFINITY;
+        }
+        let n = f64::from(memory.episodes().max(1));
         let k = f64::from(activity.since(memory.subject, memory.last, until));
         let h = self.of(memory.durability).max(f64::MIN_POSITIVE);
         n / (n + 1.0) * 0.5_f64.powf(k / h)
@@ -107,7 +105,7 @@ impl HalfLives {
     }
 }
 
-/// Memories one subject keeps at most.
+/// Statements read from chat one subject keeps at most.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Capacity {
     pub per_member: usize,
@@ -133,23 +131,30 @@ impl Capacity {
         }
     }
 
-    /// What one subject's memories give up to fit its room, as of `until`: replaced and ended
-    /// memories first (the longest closed first), then current ones by least worth, never one in
-    /// `keep` (what the episode being applied touched). A subject may stay over its room by what
+    /// What one subject's statements read from chat give up to fit its room once `adding` more
+    /// join them, as of `until`:
+    /// replaced and ended ones first (the longest closed first), then current ones by least
+    /// worth, never one in `keep` (what the batch being applied touched). Names and what a person
+    /// entered by hand neither count nor give way. A subject may stay over its room by what
     /// `keep` holds.
     pub fn evictions(
         &self,
         memories: &[Memory],
+        adding: usize,
         keep: &BTreeSet<MemoryId>,
         half_lives: &HalfLives,
         activity: &Activity,
         until: UnixMillis,
     ) -> Vec<MemoryId> {
+        let memories: Vec<&Memory> = memories
+            .iter()
+            .filter(|m| m.kind == Kind::Statement && !m.origin.is_hand())
+            .collect();
         let Some(subject) = memories.first().map(|m| m.subject) else {
             return Vec::new();
         };
         let room = self.of(subject);
-        if memories.len() <= room {
+        if memories.len() + adding <= room {
             return Vec::new();
         }
         let closed = |m: &Memory| match m.state {
@@ -159,7 +164,7 @@ impl Capacity {
         let mut candidates: Vec<(&Memory, f64)> = memories
             .iter()
             .filter(|m| !keep.contains(&m.id))
-            .map(|m| (m, half_lives.worth(m, activity, until)))
+            .map(|m| (*m, half_lives.worth(m, activity, until)))
             .collect();
         // Closed ones first, oldest closed first; then the least worth, the least recently
         // supported, the older.
@@ -174,7 +179,7 @@ impl Capacity {
         });
         candidates
             .into_iter()
-            .take(memories.len() - room)
+            .take(memories.len() + adding - room)
             .map(|(m, _)| m.id)
             .collect()
     }

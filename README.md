@@ -9,13 +9,13 @@ stays out of the way.
   messages, or a due group task starts a reply; optionally it also joins in on its own now and then
   (`replies.spontaneous_chance`, off by default). The model decides whether to say anything, whom to mention
   and what to quote, and sends real QQ messages (mentions, quotes, faces, dice, contact cards).
-- **Memory grounded in the chat.** The archive of every message is the source of truth. Episodes
-  summarize fixed stretches of it; the names people use for one another and memories about
-  members and the group are extracted from verbatim quotes, checked by code, and kept with who
-  said them and when; a later statement replaces or ends a memory, and what nobody repeats makes
-  way as the conversation moves on. Notes members write by hand are kept separately. Members see
-  what is kept about them and remove notes, names and memories (a removed memory can be learned
-  again from later chat).
+- **Memory grounded in the chat.** The archive of every message is the source of truth. Once a
+  night the bot divides each group's day into conversations, summarizes them, and learns the names
+  people use for one another and what is said about members and the group, each from a verbatim
+  quote checked by code and kept with who said it and when. A later statement replaces or ends a
+  memory with its history kept, and what nobody repeats makes way as the conversation moves on.
+  With one command, `/memory`, members see everything known about them and add, correct, end or
+  forget any of it; a forgotten memory is never learned again.
 - **Identity, not nicknames.** Accounts belong to people; linking needs confirmation; every member
   has a stable number in the group, so people sharing a name are never confused.
 - **Pictures and voice.** Pictures are described once and archived as text, and the model can look
@@ -95,7 +95,7 @@ Postgres, a mock Responses server and a simulated NapCat.
 | `qbot-agent` | run loop, tool contract, supervisor |
 | `qbot-sched` | timers: group tasks, background jobs, repeat rules |
 | `qbot-tools` | the model's tools |
-| `qbot-memory` | identity, names, episodes, the daily batch, memories, recall, notes |
+| `qbot-memory` | identity, names, episodes, the daily batch, memories, recall |
 | `qbot-store` | Postgres adapters, the schema, the lease |
 | `qbot-config` | layered, typed configuration and secrets |
 | `qbot-i18n` | member-facing text: typed messages and validated catalogs (`locales/`) |
@@ -105,7 +105,7 @@ Postgres, a mock Responses server and a simulated NapCat.
 | `qbot-asr` | in-process speech recognition (SenseVoice via sherpa-onnx) |
 | `qbot-ops` | the nightly run, verified backups, the daily report |
 | `qbot-gateway` | OneBot v11: frames, rendering, triggers, delivery, the WebSocket server |
-| `qbot-commands` | `/who /note /name /forget /group /link /unlink /stats /top /tasks /members /block /mute /runs /logs /help` |
+| `qbot-commands` | `/memory /link /unlink /stats /top /tasks /members /block /mute /admin /runs /logs /help` |
 | `qbot-eval` | reply-quality evaluation against the real model |
 | `qbot-app` | the `qbot` binary and the composition root |
 

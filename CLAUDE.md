@@ -66,17 +66,19 @@ paid API. Build the image with `docker build -f deploy/Dockerfile .`; deployment
   Responses API (one adapter, for DeepSeek, which keeps no state), embeddings, Tavily search.
   No local output-token caps; reasoning items never leave the adapter.
 - **Memory:** `qbot-memory`. The archive is the source of truth (each member line keeps the display
-  name it was sent under). Once a day each group's batch divides the new lines into episodes at
-  boundaries the model chooses (checked to hold every line once) and reads their validated
-  findings over one shared prompt prefix; consolidation applies them, in chat order, after every
-  call is done: name uses (who a line used a name for, and how)
-  and memory changes (new, the same, changed, ended; each memory keeps its supporting lines and
-  its history). The cached prefix shows who is who; a run's opening note shows the memories of the
-  people in its chat; `about_member` reaches the rest. Recall ranks episodes by similarity decaying
+  name it was sent under). One store (`memory`) holds everything known about members and the
+  group: names and statements, learned from chat or entered by hand, each current, replaced or
+  ended, with its supporting observations. Once a day each group's batch reads the new lines, a day
+  at a time and without command traffic, over one shared prompt prefix: episodes at boundaries the
+  model chooses (checked to hold every line once), each episode's observations (name uses and
+  statements), rulings on names nobody could place, and one decision per subject (support, new,
+  replace, end, reject; code enforces who may close what); then one transaction commits it all.
+  `/memory` is authoritative: what it forgets is a suppression, never learned again. The cached
+  prefix shows who is who; a run's opening note shows the memories of the people in its chat;
+  `about_member` and `about_group` reach the rest. Recall ranks episodes by similarity decaying
   with age; embeddings are an index each group's batch completes for the configured model.
   Replies show history as of the last batch: its newest summaries, then raw lines from just before
   what it summarized; a request the provider refuses as too long halves the raw part.
-  Notes written by hand are a separate store.
 - **Durable work:** one `timer` table in `qbot-sched`: group tasks (at most once, interrupted on
   restart, never replayed) and jobs (leased, retried). Either may repeat by a rule: one timer
   that returns to pending at its next occurrence. The memory batch (`memory.batch`, off-peak),
@@ -115,8 +117,9 @@ paid API. Build the image with `docker build -f deploy/Dockerfile .`; deployment
 - **Schema:** `crates/qbot-store/migrations/`, forward-only: production runs it, so a change is a
   new numbered file, never an edit to an applied one. The in-memory store implementations
   define the semantics, and shared conformance suites run against both.
-- **New command:** catalog in `qbot-commands/src/catalog.rs`, handler, `Msg` texts in both catalogs,
-  a test in `crates/qbot-commands/tests/commands.rs`, and the table in `docs/architecture.md`.
+- **New command:** catalog in `qbot-commands/src/catalog.rs`, handler, `Msg` texts in both catalogs
+  (each written natively for its language, not translated word for word), a test in
+  `crates/qbot-commands/tests/commands.rs`, and the table in `docs/architecture.md`.
 - Comments describe the present, not history. Tests, docs and examples use invented names and
   group numbers.
 - Commit messages: one line saying what changed (and why if not obvious), naming the crate,

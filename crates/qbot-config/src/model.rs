@@ -130,8 +130,6 @@ pub struct Memory {
     /// When each group's batch runs (a repeat rule in `bot.timezone`, as `/tasks --every` writes
     /// it): episodes, names and memories are made then and only then.
     pub batch: String,
-    /// Earlier episodes a group's batch reads again with the current method.
-    pub reread_per_batch: u32,
     /// Group memories every reply is shown, the most worth first.
     pub group_memories: u32,
     /// Memories a run is shown per member of its conversation, the most worth first.

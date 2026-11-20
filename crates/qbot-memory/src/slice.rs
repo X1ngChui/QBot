@@ -3,11 +3,10 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use qbot_core::{AccountId, GroupId, MessageId, UnixMillis};
 
-use crate::memories::MemoryId;
 use crate::store::MemoryError;
 
-/// An archived line as the memory pipeline sees it. `ordinal` is the dense per-group number the
-/// batch grid is built on.
+/// An archived line as the memory pipeline sees it. `ordinal` is the line's dense per-group
+/// number in the archive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SliceLine {
     pub ordinal: u64,
@@ -46,9 +45,9 @@ pub struct Background {
     /// Empty when nothing is known.
     pub text: String,
     pub zone: TimeZone,
-    /// The title and summary of the group's episode just before the slice: what the
-    /// conversation was about when the slice begins.
-    pub earlier: Option<(String, String)>,
+    /// The titles and summaries of the group's newest episodes before the lines, oldest first:
+    /// what the chat was about when the lines begin.
+    pub recent: Vec<(String, String)>,
     /// Lines the slice and its context quote (`[reply:ID]`) from before what is shown, oldest
     /// first: without them a reply such as "agreed" means nothing.
     pub quoted: Vec<SliceLine>,
@@ -57,8 +56,6 @@ pub struct Background {
     /// Accounts of the members `text` lists, by number: whom a line may be recorded as naming
     /// besides those who wrote the lines.
     pub accounts: Vec<(u32, AccountId)>,
-    /// The current memories `text` lists, with their subjects: the ones a statement may name.
-    pub known: Vec<(MemoryId, Option<AccountId>)>,
 }
 
 impl Default for Background {
@@ -66,11 +63,10 @@ impl Default for Background {
         Self {
             text: String::new(),
             zone: TimeZone::UTC,
-            earlier: None,
+            recent: Vec::new(),
             quoted: Vec::new(),
             bot_names: Vec::new(),
             accounts: Vec::new(),
-            known: Vec::new(),
         }
     }
 }

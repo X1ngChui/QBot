@@ -6,11 +6,12 @@
 //! the last message, the task, differs, so the provider's prefix cache serves all of a group's
 //! calls after the first, and every group's calls share the instructions.
 //!
-//! The tasks: divide the lines into episodes, find the references and memories of each episode,
-//! rule on names nobody could place, and read an earlier stretch again. Code checks each answer
-//! against what it owns (episode boundaries that hold every line once and in order, quotes copied
-//! from the lines, the rules of [`crate::findings`]) and sends a rejected answer back with the
-//! reasons, a bounded number of times.
+//! The tasks: divide the lines into episodes, find the references and statements of each
+//! episode, rule on names nobody could place, and decide per subject how the statements relate
+//! to what is known. Code checks each answer against what it owns (episode boundaries that hold
+//! every line once and in order, quotes copied from the lines, the rules of
+//! [`crate::findings`] and [`crate::decide`]) and sends a rejected answer back with the reasons,
+//! a bounded number of times.
 
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -26,14 +27,15 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::decide::{DecideArgs, DecideCase, Decided, check as check_decisions};
 use crate::episode::Evidence;
-use crate::findings::{Checked, FindingContext, MemoryArg, ReferenceArg, validate_findings};
-use crate::names::{Ruling, name_key};
-use crate::rule::{RulingArgs, RulingCase, render as render_case, ruling};
+use crate::findings::{Checked, FindingContext, ReferenceArg, StatementArg, validate_findings};
+use crate::names::{Verdict, name_key};
+use crate::rule::{RulingArgs, RulingCase, render as render_case, verdict};
 use crate::slice::{Background, SliceLine};
 
 /// Version of the prompt and validation rules, recorded on every episode.
-pub const METHOD: &str = "batch-v1";
+pub const METHOD: &str = "batch-v2";
 
 /// Model calls for one task: the first answer and up to two corrections or retries. Bounds a
 /// model that never produces a valid answer, so one bad stretch cannot stall a group.
@@ -42,6 +44,7 @@ pub const MAX_ATTEMPTS: u32 = 3;
 pub const EPISODES_TOOL: &str = "submit_episodes";
 pub const FINDINGS_TOOL: &str = "submit_findings";
 pub const RULING_TOOL: &str = "submit_ruling";
+pub const DECIDE_TOOL: &str = "submit_decisions";
 
 /// The instructions; `{language}` is filled per reader.
 const SYSTEM: &str = include_str!("../../../prompts/batch.md");
@@ -71,7 +74,7 @@ pub struct FindingsArgs {
     #[serde(default)]
     pub references: Vec<ReferenceArg>,
     #[serde(default)]
-    pub memories: Vec<MemoryArg>,
+    pub statements: Vec<StatementArg>,
 }
 
 /// What a group's batch reads: the lines since its previous batch, numbered from 1.
@@ -83,16 +86,6 @@ pub struct Stretch<'a> {
     pub lines: &'a [SliceLine],
     /// Who the people are and what the group is, as of before the batch.
     pub background: &'a Background,
-}
-
-/// An earlier episode's lines, read again: numbered from 1, with context around them.
-#[derive(Debug, Clone, Copy)]
-pub struct Earlier<'a> {
-    pub previous: &'a [SliceLine],
-    pub target: &'a [SliceLine],
-    pub next: &'a [SliceLine],
-    /// Older lines these quote.
-    pub quoted: &'a [SliceLine],
 }
 
 /// An episode as the model divided the stretch: lines `first..=last`, numbered from 1.
@@ -182,12 +175,29 @@ fn tools() -> Vec<ToolSpec> {
             qbot_llm::schema::tool_schema::<FindingsArgs>(finding_parameters()),
         ),
         spec(
+            DECIDE_TOOL,
+            say(Text::DecideTool {}),
+            qbot_llm::schema::tool_schema::<DecideArgs>(vec![
+                ("decisions", say(Text::DecideParamDecisions {})),
+                ("decisions.statement", say(Text::DecideParamStatement {})),
+                ("decisions.action", say(Text::DecideParamAction {})),
+                ("decisions.memory", say(Text::DecideParamMemory {})),
+                ("decisions.text", say(Text::DecideParamText {})),
+                ("decisions.durability", say(Text::DecideParamDurability {})),
+                ("decisions.reason", say(Text::DecideParamReason {})),
+                ("merges", say(Text::DecideParamMerges {})),
+                ("merges.memory", say(Text::DecideParamMergeMemory {})),
+                ("merges.into", say(Text::DecideParamMergeInto {})),
+            ]),
+        ),
+        spec(
             RULING_TOOL,
             say(Text::RuleToolDescription {}),
             qbot_llm::schema::tool_schema::<RulingArgs>(vec![
                 ("verdict", say(Text::RuleParamVerdict {})),
                 ("lines", say(Text::RuleParamLines {})),
                 ("reason", say(Text::RuleParamReason {})),
+                ("meaning", say(Text::RuleParamMeaning {})),
             ]),
         ),
     ]
@@ -227,18 +237,17 @@ fn finding_parameters() -> Vec<(&'static str, String)> {
             "references.shown_by",
             say(Text::ExtractParamReferenceShownBy {}),
         ),
-        ("memories", say(Text::ExtractParamMemories {})),
-        ("memories.about", say(Text::ExtractParamMemoryAbout {})),
-        ("memories.action", say(Text::ExtractParamMemoryAction {})),
-        ("memories.id", say(Text::ExtractParamMemoryId {})),
-        ("memories.term", say(Text::ExtractParamMemoryTerm {})),
-        ("memories.text", say(Text::ExtractParamMemoryText {})),
+        ("statements", say(Text::ExtractParamStatements {})),
+        ("statements.about", say(Text::ExtractParamStatementAbout {})),
+        ("statements.text", say(Text::ExtractParamStatementText {})),
         (
-            "memories.durability",
-            say(Text::ExtractParamMemoryDurability {}),
+            "statements.durability",
+            say(Text::ExtractParamStatementDurability {}),
         ),
-        ("memories.line", say(Text::ExtractParamLine {})),
-        ("memories.quote", say(Text::ExtractParamQuote {})),
+        ("statements.term", say(Text::ExtractParamStatementTerm {})),
+        ("statements.with", say(Text::ExtractParamStatementWith {})),
+        ("statements.line", say(Text::ExtractParamLine {})),
+        ("statements.quote", say(Text::ExtractParamQuote {})),
     ]
 }
 
@@ -315,22 +324,26 @@ fn numbered(
     }
 }
 
-/// Today's lines as the model reads them: what the chat was about before, lines quoted from
-/// further back, the lines just before, then the lines read, numbered.
+/// Today's lines as the model reads them: what the chat was about in the conversations before,
+/// lines quoted from further back, the lines just before, then the lines read, numbered.
 pub fn render_stretch(stretch: &Stretch<'_>) -> String {
     let background = stretch.background;
     let zone = &background.zone;
     let mut out = String::new();
-    if let Some((title, summary)) = &background.earlier {
-        let _ = writeln!(
-            out,
-            "{}\n",
+    if !background.recent.is_empty() {
+        let _ = writeln!(out, "{}", say(Text::BatchEarlier {}));
+        for (title, summary) in &background.recent {
             // Written from chat: escaped like it, and on one line so it opens no section.
-            say(Text::ExtractEarlier {
-                title: one_line(title),
-                summary: one_line(summary),
-            })
-        );
+            let _ = writeln!(
+                out,
+                "{}",
+                say(Text::BatchEarlierItem {
+                    title: one_line(title),
+                    summary: one_line(summary),
+                })
+            );
+        }
+        out.push('\n');
     }
     if !background.quoted.is_empty() {
         let _ = writeln!(out, "{}", say(Text::ExtractQuoted {}));
@@ -460,7 +473,7 @@ fn findings_check(arguments: Value, cx: &FindingContext<'_>) -> Check<Checked> {
             error: error.to_string(),
         })]),
         Ok(args) => {
-            let checked = validate_findings(&args.references, &args.memories, cx);
+            let checked = validate_findings(&args.references, &args.statements, cx);
             if checked.dropped.is_empty() {
                 Check::Accept(checked)
             } else {
@@ -560,7 +573,6 @@ impl BatchReader {
             first: planned.first,
             quoted: &background.quoted,
             accounts: &background.accounts,
-            known: &background.known,
             bot_names: &bot_names,
         };
         let task = say(Text::BatchTaskFindings {
@@ -575,56 +587,12 @@ impl BatchReader {
         .await
     }
 
-    /// The references and memories of an earlier episode's lines, read again.
-    pub async fn reread(
-        &self,
-        prefix: &[ConvItem],
-        background: &Background,
-        earlier: &Earlier<'_>,
-    ) -> Result<Answer<Checked>, BatchError> {
-        let zone = &background.zone;
-        let mut lines = String::new();
-        if !earlier.quoted.is_empty() {
-            let _ = writeln!(lines, "{}", say(Text::ExtractQuoted {}));
-            for line in earlier.quoted {
-                let _ = writeln!(lines, "{}", line.render(zone));
-            }
-            lines.push('\n');
-        }
-        numbered(
-            &mut lines,
-            zone,
-            earlier.previous,
-            earlier.target,
-            earlier.next,
-            |from, to, zone| say(Text::BatchEarlierStretch { from, to, zone }),
-        );
-        let bot_names = bot_keys(background);
-        let cx = FindingContext {
-            parts: [earlier.previous, earlier.target, earlier.next],
-            first: 1,
-            quoted: earlier.quoted,
-            accounts: &background.accounts,
-            known: &background.known,
-            bot_names: &bot_names,
-        };
-        let task = say(Text::BatchTaskReread {
-            last: earlier.target.len().to_string(),
-            lines: lines.trim_end().to_owned(),
-        });
-        self.ask(prefix, task, FINDINGS_TOOL, |arguments| {
-            findings_check(arguments, &cx)
-        })
-        .await
-    }
-
-    /// Rule on a name nobody could place; the ruling is dated `at`.
+    /// Rule on a name nobody could place.
     pub async fn ruling(
         &self,
         prefix: &[ConvItem],
         case: &RulingCase<'_>,
-        at: UnixMillis,
-    ) -> Result<Answer<Ruling>, BatchError> {
+    ) -> Result<Answer<Verdict>, BatchError> {
         let task = say(Text::BatchTaskRuling {
             case: render_case(case).trim_end().to_owned(),
         });
@@ -633,10 +601,36 @@ impl BatchReader {
             task,
             RULING_TOOL,
             |arguments| match serde_json::from_value::<RulingArgs>(arguments) {
-                Ok(args) => Check::Accept(ruling(case, &args, at)),
+                Ok(args) => Check::Accept(verdict(case, &args)),
                 Err(error) => Check::Reject(vec![say(Text::ExtractBadArguments {
                     error: error.to_string(),
                 })]),
+            },
+        )
+        .await
+    }
+
+    /// Decide how one subject's statements relate to what is known about them.
+    pub async fn decide(
+        &self,
+        prefix: &[ConvItem],
+        case: &DecideCase<'_>,
+    ) -> Result<Answer<Decided>, BatchError> {
+        let task = say(Text::BatchTaskDecide {
+            case: crate::decide::render(case).trim_end().to_owned(),
+        });
+        self.ask(
+            prefix,
+            task,
+            DECIDE_TOOL,
+            |arguments| match serde_json::from_value::<DecideArgs>(arguments) {
+                Err(error) => Check::Reject(vec![say(Text::ExtractBadArguments {
+                    error: error.to_string(),
+                })]),
+                Ok(args) => match check_decisions(case, &args) {
+                    Ok(decided) => Check::Accept(decided),
+                    Err(problems) => Check::Reject(problems),
+                },
             },
         )
         .await

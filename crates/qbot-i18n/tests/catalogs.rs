@@ -25,11 +25,11 @@ fn rendering_substitutes_arguments_and_picks_plural_forms() {
         "Usage: /top [--linked] [count]"
     );
     assert_eq!(
-        en.render(&Msg::ForgetDone {
+        en.render(&Msg::MemoryEnded {
             id: "m12".into(),
             text: "likes cats".into()
         }),
-        "Forgot m12: likes cats"
+        "Marked m12 as no longer true: likes cats"
     );
     assert_eq!(
         en.render(&Msg::MentionsExact { count: 1 }),
@@ -58,7 +58,7 @@ fn rendering_substitutes_arguments_and_picks_plural_forms() {
     );
     // No invisible bidi isolation marks around arguments.
     assert!(
-        !en.render(&Msg::WhoMessages { count: "3".into() })
+        !en.render(&Msg::MemoryMessages { count: "3".into() })
             .contains(['\u{2068}', '\u{2069}'])
     );
     // Leading and trailing blanks survive where the wording needs them.
@@ -150,16 +150,16 @@ fn a_translation_may_omit_a_variable_but_not_invent_one() {
             .join("\n")
     };
     // Dropping a variable the code supplies is allowed (some languages do not need it).
-    Locale::parse("en", &with("forget-done", "forget-done = { $text }")).unwrap();
+    Locale::parse("en", &with("memory-ended", "memory-ended = { $text }")).unwrap();
     // Inventing one is an error.
     let errors = Locale::parse(
         "en",
-        &with("forget-done", "forget-done = { $text } { $nope }"),
+        &with("memory-ended", "memory-ended = { $text } { $nope }"),
     )
     .unwrap_err()
     .0;
     assert!(
-        matches!(&errors[0], LocaleError::Unrenderable { id, .. } if id == "forget-done"),
+        matches!(&errors[0], LocaleError::Unrenderable { id, .. } if id == "memory-ended"),
         "{errors:?}"
     );
 }

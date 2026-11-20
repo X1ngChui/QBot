@@ -1,8 +1,8 @@
 mod admin;
+mod help;
 mod identity;
-mod notes;
+mod memory;
 mod ops;
-mod profile;
 mod tasks;
 
 use jiff::Timestamp;
@@ -15,10 +15,10 @@ use crate::fail::Fail;
 use crate::router::{Cx, Standing};
 
 pub(crate) use admin::{admin, block, members, mute, stats, top};
+pub(crate) use help::help;
 pub(crate) use identity::{link, unlink};
-pub(crate) use notes::note;
+pub(crate) use memory::memory;
 pub(crate) use ops::{logs, runs};
-pub(crate) use profile::{forget, group, help, name, who};
 pub(crate) use tasks::tasks;
 
 pub(crate) type Reply = Result<String, Fail>;
@@ -87,6 +87,16 @@ impl Cx<'_> {
             Standing::Unknown => Err(Msg::AuthorityUnknown {}.into()),
             Standing::BotOwner | Standing::Member => Err(Msg::OwnAccountsOnly {}.into()),
         }
+    }
+
+    /// Whether the sender may act on `account` without mentioning it: their own person, a bot
+    /// owner on anyone, a delegated admin on the group's ordinary members.
+    pub async fn may_act_on(&self, account: AccountId) -> Result<bool, Fail> {
+        if self.owner || !self.on_someone_else(account).await? {
+            return Ok(true);
+        }
+        Ok(self.standing == Standing::DelegatedAdmin
+            && self.rank_of(account).await? == Rank::Member)
     }
 
     /// Whether the command acts on someone other than the sender's own person: a delegated

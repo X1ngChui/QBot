@@ -1,10 +1,10 @@
-//! Episodes and their embeddings on Postgres.
+//! Episodes and their embeddings on Postgres: the episode side of [`PgMemoryStore`] (what is
+//! known about people is in `memories.rs`).
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use qbot_core::{AccountId, Clock, GroupId, MessageId, UnixMillis};
-use qbot_memory::findings::Findings;
 use qbot_memory::worth::Activity;
 use qbot_memory::{
     Episode, EpisodeId, EpisodeStore, Evidence, Hit, MemoryError, NewEpisode, SliceLine,
@@ -13,12 +13,12 @@ use qbot_memory::{
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
 
-fn backend(error: impl std::fmt::Display) -> MemoryError {
+pub(crate) fn backend(error: impl std::fmt::Display) -> MemoryError {
     MemoryError::Backend(error.to_string())
 }
 
 /// `23P01` is exclusion_violation: the range overlaps another slice of the group.
-fn insert_error(error: sqlx::Error) -> MemoryError {
+pub(crate) fn insert_error(error: sqlx::Error) -> MemoryError {
     if let sqlx::Error::Database(db) = &error
         && db.code().as_deref() == Some("23P01")
     {
@@ -27,11 +27,11 @@ fn insert_error(error: sqlx::Error) -> MemoryError {
     backend(error)
 }
 
-fn u64_of(value: i64) -> Result<u64, MemoryError> {
+pub(crate) fn u64_of(value: i64) -> Result<u64, MemoryError> {
     u64::try_from(value).map_err(backend)
 }
 
-fn i64_of(value: u64) -> Result<i64, MemoryError> {
+pub(crate) fn i64_of(value: u64) -> Result<i64, MemoryError> {
     i64::try_from(value).map_err(backend)
 }
 
@@ -43,7 +43,7 @@ fn vector_text(vector: &[f32]) -> String {
 
 const EPISODE_COLS: &str = "e.episode_id, e.group_id, e.first_ordinal, e.last_ordinal, \
     e.first_message, e.last_message, e.started_ms, e.ended_ms, e.line_count, e.participants, e.title, e.summary, \
-    e.evidence, e.method, e.model, e.created_ms, e.findings";
+    e.evidence, e.method, e.model, e.created_ms";
 
 fn to_episode(row: &PgRow) -> Result<Episode, MemoryError> {
     let participants = row
@@ -70,7 +70,6 @@ fn to_episode(row: &PgRow) -> Result<Episode, MemoryError> {
             evidence,
             method: row.get("method"),
             model: row.get("model"),
-            findings: serde_json::from_value(row.get("findings")).map_err(backend)?,
         },
     })
 }
@@ -93,10 +92,11 @@ fn slice_line(row: &PgRow) -> Result<SliceLine, MemoryError> {
     })
 }
 
-/// One writer of a group's slices at a time. Each table's exclusion constraint decides overlap
-/// within it, but concurrent inserts checking it can deadlock on each other, and overlap between
-/// episodes and skipped slices is checked by query; under the lock both become `Overlap`.
-async fn lock_slices(
+/// One writer of a group's episodes and skipped stretches at a time. Each table's exclusion
+/// constraint decides overlap within it, but concurrent inserts checking it can deadlock on each
+/// other, and overlap between episodes and skipped stretches is checked by query; under the lock
+/// both become `Overlap`.
+pub(crate) async fn lock_slices(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     group: GroupId,
 ) -> Result<(), MemoryError> {
@@ -106,6 +106,73 @@ async fn lock_slices(
         .await
         .map_err(backend)?;
     Ok(())
+}
+
+/// Whether `first..=last` overlaps an episode or a skipped stretch of the group.
+pub(crate) async fn taken(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    group: GroupId,
+    first: i64,
+    last: i64,
+) -> Result<bool, MemoryError> {
+    let skipped: bool = sqlx::query(
+        "SELECT EXISTS (SELECT 1 FROM slice_skip WHERE group_id = $1 \
+            AND int8range(first_ordinal, last_ordinal, '[]') && int8range($2, $3, '[]')) AS skipped",
+    )
+    .bind(group.get())
+    .bind(first)
+    .bind(last)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(backend)?
+    .get("skipped");
+    Ok(skipped || episode_overlaps(tx, group, first, last).await?)
+}
+
+/// Store an episode and its embedding in `tx`.
+pub(crate) async fn insert_episode(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    episode: &NewEpisode,
+    vector: &[f32],
+    embed_model: &str,
+    created: UnixMillis,
+) -> Result<Episode, MemoryError> {
+    let evidence = serde_json::to_value(&episode.evidence).map_err(backend)?;
+    let participants: Vec<i64> = episode.participants.iter().map(|a| a.get()).collect();
+    let row = sqlx::query(&format!(
+        "WITH e AS (INSERT INTO episode (group_id, first_ordinal, last_ordinal, first_message, \
+            last_message, started_ms, ended_ms, line_count, participants, title, summary, evidence, method, model, created_ms) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15) RETURNING *) \
+         SELECT {EPISODE_COLS} FROM e"
+    ))
+    .bind(episode.group.get())
+    .bind(i64_of(episode.first_ordinal)?)
+    .bind(i64_of(episode.last_ordinal)?)
+    .bind(episode.first_message.get())
+    .bind(episode.last_message.get())
+    .bind(episode.started.get())
+    .bind(episode.ended.get())
+    .bind(i32::try_from(episode.line_count).map_err(backend)?)
+    .bind(participants)
+    .bind(&episode.title)
+    .bind(&episode.summary)
+    .bind(evidence)
+    .bind(&episode.method)
+    .bind(&episode.model)
+    .bind(created.get())
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(insert_error)?;
+    let stored = to_episode(&row)?;
+    sqlx::query("INSERT INTO episode_embedding (episode_id, model, dims, embedding) VALUES ($1, $2, $3, $4::vector)")
+        .bind(stored.id.get())
+        .bind(embed_model)
+        .bind(i32::try_from(vector.len()).map_err(backend)?)
+        .bind(vector_text(vector))
+        .execute(&mut **tx)
+        .await
+        .map_err(backend)?;
+    Ok(stored)
 }
 
 async fn episode_overlaps(
@@ -127,26 +194,28 @@ async fn episode_overlaps(
     .get("taken"))
 }
 
+/// Episodes and what is known about people and the group, on Postgres: one store, since a
+/// batch's commit spans both.
 #[derive(Clone)]
-pub struct PgEpisodeStore {
-    pool: PgPool,
-    clock: Arc<dyn Clock>,
+pub struct PgMemoryStore {
+    pub(crate) pool: PgPool,
+    pub(crate) clock: Arc<dyn Clock>,
 }
 
-impl std::fmt::Debug for PgEpisodeStore {
+impl std::fmt::Debug for PgMemoryStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PgEpisodeStore").finish_non_exhaustive()
+        f.debug_struct("PgMemoryStore").finish_non_exhaustive()
     }
 }
 
-impl PgEpisodeStore {
+impl PgMemoryStore {
     pub fn new(pool: PgPool, clock: Arc<dyn Clock>) -> Self {
         Self { pool, clock }
     }
 }
 
 #[async_trait]
-impl EpisodeStore for PgEpisodeStore {
+impl EpisodeStore for PgMemoryStore {
     async fn groups(&self) -> Result<Vec<GroupId>, MemoryError> {
         let rows: Vec<i64> =
             sqlx::query_scalar("SELECT DISTINCT group_id FROM chat_line ORDER BY group_id")
@@ -171,19 +240,6 @@ impl EpisodeStore for PgEpisodeStore {
             })
         })
         .transpose()
-    }
-
-    async fn batched(&self, group: GroupId, at: UnixMillis) -> Result<(), MemoryError> {
-        sqlx::query(
-            "INSERT INTO history_window (group_id, batched_ms, cut) VALUES ($1, $2, 0) \
-             ON CONFLICT (group_id) DO UPDATE SET batched_ms = EXCLUDED.batched_ms, cut = 0",
-        )
-        .bind(group.get())
-        .bind(at.get())
-        .execute(&self.pool)
-        .await
-        .map_err(backend)?;
-        Ok(())
     }
 
     async fn cut(&self, group: GroupId, ordinal: u64, at: UnixMillis) -> Result<(), MemoryError> {
@@ -290,38 +346,6 @@ impl EpisodeStore for PgEpisodeStore {
         u64_of(last.unwrap_or(0))
     }
 
-    async fn skip_slice(
-        &self,
-        group: GroupId,
-        first_ordinal: u64,
-        last_ordinal: u64,
-        reason: &str,
-    ) -> Result<(), MemoryError> {
-        if first_ordinal > last_ordinal {
-            return Err(MemoryError::InvalidRange);
-        }
-        let (first, last) = (i64_of(first_ordinal)?, i64_of(last_ordinal)?);
-        let mut tx = self.pool.begin().await.map_err(backend)?;
-        lock_slices(&mut tx, group).await?;
-        if episode_overlaps(&mut tx, group, first, last).await? {
-            return Err(MemoryError::Overlap);
-        }
-        sqlx::query(
-            "INSERT INTO slice_skip (group_id, first_ordinal, last_ordinal, reason, created_ms) \
-             VALUES ($1, $2, $3, $4, $5)",
-        )
-        .bind(group.get())
-        .bind(first)
-        .bind(last)
-        .bind(reason)
-        .bind(self.clock.now().get())
-        .execute(&mut *tx)
-        .await
-        .map_err(insert_error)?;
-        tx.commit().await.map_err(backend)?;
-        Ok(())
-    }
-
     async fn insert(
         &self,
         episode: &NewEpisode,
@@ -333,56 +357,15 @@ impl EpisodeStore for PgEpisodeStore {
         }
         let mut tx = self.pool.begin().await.map_err(backend)?;
         lock_slices(&mut tx, episode.group).await?;
-        let skipped: bool = sqlx::query(
-            "SELECT EXISTS (SELECT 1 FROM slice_skip WHERE group_id = $1 \
-                AND int8range(first_ordinal, last_ordinal, '[]') && int8range($2, $3, '[]')) AS skipped",
-        )
-        .bind(episode.group.get())
-        .bind(i64_of(episode.first_ordinal)?)
-        .bind(i64_of(episode.last_ordinal)?)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(backend)?
-        .get("skipped");
-        if skipped {
+        let (first, last) = (
+            i64_of(episode.first_ordinal)?,
+            i64_of(episode.last_ordinal)?,
+        );
+        if taken(&mut tx, episode.group, first, last).await? {
             return Err(MemoryError::Overlap);
         }
-        let evidence = serde_json::to_value(&episode.evidence).map_err(backend)?;
-        let participants: Vec<i64> = episode.participants.iter().map(|a| a.get()).collect();
-        let row = sqlx::query(&format!(
-            "WITH e AS (INSERT INTO episode (group_id, first_ordinal, last_ordinal, first_message, \
-                last_message, started_ms, ended_ms, line_count, participants, title, summary, evidence, method, model, created_ms, findings) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING *) \
-             SELECT {EPISODE_COLS} FROM e"
-        ))
-        .bind(episode.group.get())
-        .bind(i64_of(episode.first_ordinal)?)
-        .bind(i64_of(episode.last_ordinal)?)
-        .bind(episode.first_message.get())
-        .bind(episode.last_message.get())
-        .bind(episode.started.get())
-        .bind(episode.ended.get())
-        .bind(i32::try_from(episode.line_count).map_err(backend)?)
-        .bind(participants)
-        .bind(&episode.title)
-        .bind(&episode.summary)
-        .bind(evidence)
-        .bind(&episode.method)
-        .bind(&episode.model)
-        .bind(self.clock.now().get())
-        .bind(serde_json::to_value(&episode.findings).map_err(backend)?)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(insert_error)?;
-        let stored = to_episode(&row)?;
-        sqlx::query("INSERT INTO episode_embedding (episode_id, model, dims, embedding) VALUES ($1, $2, $3, $4::vector)")
-            .bind(stored.id.get())
-            .bind(embed_model)
-            .bind(i32::try_from(vector.len()).map_err(backend)?)
-            .bind(vector_text(vector))
-            .execute(&mut *tx)
-            .await
-            .map_err(backend)?;
+        let stored =
+            insert_episode(&mut tx, episode, vector, embed_model, self.clock.now()).await?;
         tx.commit().await.map_err(backend)?;
         Ok(stored)
     }
@@ -434,68 +417,6 @@ impl EpisodeStore for PgEpisodeStore {
                 other => backend(other),
             })?;
         tx.commit().await.map_err(backend)?;
-        Ok(())
-    }
-
-    async fn unconsolidated(&self, group: GroupId) -> Result<Vec<Episode>, MemoryError> {
-        let rows = sqlx::query(&format!(
-            "SELECT {EPISODE_COLS} FROM episode e WHERE e.group_id = $1 AND e.consolidated_ms IS NULL ORDER BY e.first_ordinal"
-        ))
-        .bind(group.get())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(backend)?;
-        rows.iter().map(to_episode).collect()
-    }
-
-    async fn mark_consolidated(&self, id: EpisodeId) -> Result<(), MemoryError> {
-        sqlx::query("UPDATE episode SET consolidated_ms = $2 WHERE episode_id = $1 AND consolidated_ms IS NULL")
-            .bind(id.get())
-            .bind(self.clock.now().get())
-            .execute(&self.pool)
-            .await
-            .map_err(backend)?;
-        Ok(())
-    }
-
-    async fn read_otherwise(
-        &self,
-        group: GroupId,
-        method: &str,
-        limit: usize,
-    ) -> Result<Vec<Episode>, MemoryError> {
-        let rows = sqlx::query(&format!(
-            "SELECT {EPISODE_COLS} FROM episode e WHERE e.group_id = $1 AND e.method <> $2 \
-             ORDER BY e.first_ordinal LIMIT $3"
-        ))
-        .bind(group.get())
-        .bind(method)
-        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(backend)?;
-        rows.iter().map(to_episode).collect()
-    }
-
-    async fn reread(
-        &self,
-        id: EpisodeId,
-        method: &str,
-        findings: &Findings,
-    ) -> Result<(), MemoryError> {
-        let done = sqlx::query(
-            "UPDATE episode SET method = $2, findings = $3, consolidated_ms = NULL \
-             WHERE episode_id = $1",
-        )
-        .bind(id.get())
-        .bind(method)
-        .bind(serde_json::to_value(findings).map_err(backend)?)
-        .execute(&self.pool)
-        .await
-        .map_err(backend)?;
-        if done.rows_affected() == 0 {
-            return Err(MemoryError::NotFound);
-        }
         Ok(())
     }
 

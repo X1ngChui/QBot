@@ -19,16 +19,6 @@ command-display_fallback = 账号 { $account }
 command-display_member = 成员 { $number }
 command-scope_exact = 单个账号
 command-scope_linked = 关联账号
-usage-who = 用法：/who [--linked] [@账号]
-usage-name_list = 用法：/name [--linked] [@账号]
-usage-name_edit = 用法：/name { $action } [--linked] [@账号] 称呼
-usage-note =
-    用法：/note [--linked] [@账号]
-    /note add [@账号] 内容
-    /note edit [--linked] [@账号] 编号 内容
-    /note remove [--linked] [@账号] 编号
-    /note clear [--linked] [@账号]
-usage-group = 用法：/group
 usage-runs = 用法：/runs [运行编号]
 usage-logs = 用法：/logs [条数]
 usage-link_confirm = 用法：/link confirm
@@ -48,7 +38,7 @@ usage-block_remove = 用法：/block remove [--linked] @账号
 usage-mute = 用法：/mute [status|on|off]
 usage-help = 用法：/help [指令名]
 help-header = 可用指令：
-help-category_profile = 成员资料
+help-category_profile = 记忆
 help-category_identity = 身份
 help-category_group = 本群
 help-category_admin = 管理
@@ -66,23 +56,6 @@ help-detail =
     { $access }
 
     { $detail }
-what-who = 查看成员资料
-what-name = 管理成员的称呼
-what-note = 管理成员备注
-detail-note =
-    /note [--linked] [@账号]
-    /note add [@账号] 内容
-    /note edit [--linked] [@账号] 编号 内容
-    /note remove [--linked] [@账号] 编号
-    /note clear [--linked] [@账号]
-
-    备注由人手写，按原文保存。机器人会读取备注，但不会修改；备注与机器人从聊天中记住的内容相互独立（见 /forget）。
-    编号以同一范围内 /note 或 /who 显示的为准。
-
-    谁可以管理备注：
-    - 成员：自己账号的备注。
-    - 授权管理员：还包括本群普通成员的备注，机器人所有者写的除外。
-    - 机器人所有者：所有备注。
 what-admin = 管理本群的授权管理员
 detail-admin =
     /admin
@@ -91,10 +64,10 @@ detail-admin =
 
     授权管理员仅在本群拥有以下权限：
     - 使用 /mute、/block 和 /members。
-    - 管理普通成员的称呼、备注和记忆（/who、/name、/note、/forget）。
+    - 管理对普通成员和本群的了解（/memory）。
 
     限制：
-    - 不能操作机器人所有者或其他授权管理员，也不能改动机器人所有者写的备注或设置的屏蔽。
+    - 不能操作机器人所有者或其他授权管理员，也不能改动机器人所有者添加的内容或设置的屏蔽。
     - 只有机器人所有者可以添加或移除授权管理员。
     - 权限只属于该账号本身，不延伸到它的关联账号。
 usage-admin = 用法：/admin、/admin add @账号 或 /admin remove @账号
@@ -106,7 +79,6 @@ admin-already = { $label } 已是本群授权管理员。
 admin-removed = { $label } 不再是本群授权管理员。
 admin-remove_none = { $label } 不是本群授权管理员。
 admin-bot = 机器人不能成为授权管理员。
-note-owner_authored = 这条备注由机器人所有者写下，只有机器人所有者或备注所指的成员本人可以修改或删除。
 admin-bot_owner = 机器人所有者已拥有全部权限。
 what-link = 关联自己的账号
 detail-link =
@@ -170,7 +142,6 @@ detail-mute =
     /mute [status|on|off]
 
     静音期间机器人不在本群回复。只发送 /mute 可查看当前状态。
-what-group = 查看机器人记住的本群信息
 what-runs = 查看最近的运行记录
 detail-runs =
     /runs
@@ -188,16 +159,6 @@ detail-help =
 
     /help 列出你可以使用的指令；/help 指令名 说明该指令的用法。
 who-no_record = 本群暂无该账号的记录。
-who-title = 账号资料｜{ $display }｜{ $scope }
-who-messages = 本群发言：{ $count } 条
-who-linked = 关联账号：{ $count } 个
-name-none = { $display } 暂无称呼记录。
-name-removed = 已移除 { $display } 的称呼「{ $name }」。
-name-remove_none = 此范围内 { $display } 没有称呼「{ $name }」。
-name-taken = 「{ $name }」在本群已用于称呼其他人。
-name-empty_name = 称呼不能为空。
-name-too_long = 称呼最多 { $max } 个字符。
-name-added = 已记录：{ $display } 也叫「{ $name }」。
 link-confirmed = 关联已确认，两个账号现已关联。
 link-cancelled = 已取消本群待确认的关联邀请。
 link-nothing_pending = 当前账号在本群没有待确认的关联邀请。
@@ -318,19 +279,6 @@ tasks-too_many = 本群待执行任务已达上限（{ $limit } 个）。
 tasks-chain_deep = 后续任务的连续层数已达上限（{ $limit } 层）。
 tasks-nothing_to_change = 没有可修改的内容。请提供新的内容、时间或规则。
 tasks-empty_intent = 任务内容不能为空。
-who-notes = 成员备注（{ $count } 条）：
-who-no_notes = 成员备注：无
-who-note_line = { $index }. { $text }
-note-none = 此范围内没有关于 { $display } 的备注。
-note-header = 关于 { $display } 的备注｜{ $scope }：
-note-line = { $index }. { $text }（{ $author }，{ $time }）
-note-added = 已添加关于 { $display } 的第 { $index } 条备注。
-note-edited = 已更新第 { $index } 条备注。
-note-removed = 已删除第 { $index } 条备注：{ $text }
-note-cleared = 已删除关于 { $display } 的 { $count } 条备注。
-note-no_such = 此范围内没有第 { $index } 条备注。发送 /note 查看列表。
-note-empty = 备注内容不能为空。
-note-too_many = 每个账号最多 { $max } 条备注，请先删除一条。
 runs-empty = 本群暂无运行记录。
 runs-header = 本群最近的运行（{ $count } 次）：
 runs-row = #{ $id } { $time } { $trigger }｜{ $end }｜{ $turns } 轮，工具调用 { $tools } 次，发出 { $sends } 条｜{ $tokens } Token
@@ -380,75 +328,63 @@ report-jobs = 后台任务：待执行 { $pending }，失败 { $failed }；被�
 report-backup_age = 最近备份：{ $hours } 小时前
 report-backup_none = 最近备份：未找到
 
-who-names = 称呼（{ $count } 个）：
-who-shown = 群名片：{ $names }
-name-header = { $display } 的称呼：
-name-line = - { $text }（{ $how }）
-name-how_set = 用 /name 设定
-name-how_own = 本人在 { $count } 段对话中这样自称
-name-how_others = 别人在 { $count } 段对话中这样称呼，最近 { $date }
-name-how_shared = 也用于称呼 { $members }
-who-memories = 从聊天中记住的（{ $count } 条）：
-who-no_memories = 从聊天中记住的：无
-who-history = 已不成立、仍保留的（{ $count } 条）：
-memory-replaced_line = { $id } { $text }（{ $date } 被新的说法取代）
-memory-ended_line = { $id } { $text }（{ $date } 起不再如此）
-memory-line = { $id } { $text }（{ $source }；{ $count } 段对话，最近 { $date }）
+memory-replaced_line = { $id } { $text }（{ $date } 已被新的说法取代）
+memory-ended_line = { $id } { $text }（{ $date } 起不再成立）
+memory-line = { $id } { $text }（{ $source }，见于 { $count } 段对话，最近一次 { $date }）
 memory-source_own = 本人说的
 memory-source_others = 别人说的
 memory-source_both = 本人和别人都说过
-memory-source_members = 群成员说的
-who-hint = 删除方法：备注用 /note remove 编号；单条记忆用 /forget 编号（如 /forget m12）；关于此人的全部记忆用 /forget all。
-group-empty = 机器人还没有记住关于本群的内容。
-group-header = 机器人记住的本群信息：
-group-hint = 机器人所有者可用 /forget group 编号 删除某一条。
-forget-done = 已删除 { $id }：{ $text }
-forget-no_such = 此范围内没有记忆 { $id }。发送 /who 查看列表。
-forget-group_done = 已删除 { $id }：{ $text }
-forget-group_no_such = 没有群记忆 { $id }。发送 /group 查看列表。
-forget-all_done = 已删除关于 { $display } 的全部记忆（{ $count } 条）。
-usage-forget = 用法：/forget [--linked] [@账号] 编号，/forget all [--linked] [@账号]，或 /forget group 编号
-what-forget = 删除机器人从聊天中记住的内容
-detail-forget =
-    /forget [--linked] [@账号] 编号
-    /forget all [--linked] [@账号]
-    /forget group 编号（仅所有者）
+memory-source_members = 群友说的
+usage-memory = 用法：/memory [@账号 | group]，或 /memory add | name | fix | end | forget ……（详见 /help memory）
+what-memory = 查看和管理机器人对成员或本群的记忆
+detail-memory =
+    /memory [@账号]：查看关于某位成员的记忆（称呼、内容和已不成立的条目）
+    /memory group：查看关于本群的记忆
+    /memory add [@账号 | group] 内容：手动记下一条
+    /memory name [@账号] 称呼：记下该成员的一个称呼
+    /memory fix 编号 内容：更正一条，原条目留档备查
+    /memory end 编号：标记为不再成立
+    /memory forget 编号：忘掉一条，以后聊天里再提到也不会再记住
+    /memory forget all [@账号]：忘掉关于某位成员的全部内容
 
-    删除机器人自己从聊天中记住的内容及其来源：
-    - /forget 编号：/who 中同一范围内该编号的记忆。
-    - /forget all：关于该成员的全部记忆。
-    - /forget group 编号：/group 中该编号的群记忆。
-    备注和称呼不受影响，请分别用 /note 和 /name remove 管理。
+    机器人每天从聊天中整理一次记忆；手动添加的内容立即生效，聊天不会覆盖它。编号形如 m12。
 
-    谁可以删除：
-    - 成员：关于自己的记忆。
-    - 授权管理员：还包括本群普通成员的记忆。
-    - 机器人所有者：所有记忆。
-detail-who =
-    /who [--linked] [@账号]
-
-    显示关于某位成员的记录：
-    - 大家对他的称呼；
-    - 成员写下的备注；
-    - 机器人从聊天中记住的内容，以及是谁说的、何时说的。已被新的说法取代或不再成立的记忆也会列出，直到被删除。
-    默认只显示单个账号；--linked 包括其关联账号。
-
-    谁可以查看：
-    - 成员：自己的记录。
-    - 授权管理员：还包括本群普通成员的记录。
-    - 机器人所有者：任何人的记录。
-detail-name =
-    /name [--linked] [@账号]
-    /name add [--linked] [@账号] 称呼
-    /name remove [--linked] [@账号] 称呼
-
-    列出大家对某位成员的称呼及其来源：用 /name 设定、本人自称，或别人在对话中这样称呼。用 /name 移除的称呼不会被再次自动学习，除非有人重新添加。--linked 作用于所有关联账号背后的同一个人。
-
-    谁可以管理称呼：
-    - 成员：自己的称呼。
-    - 授权管理员：还包括本群普通成员的称呼。
-    - 机器人所有者：任何人的称呼。
-detail-group =
-    /group
-
-    显示机器人记住的本群信息：群里常用的说法、本群的情况，以及各自被提到的次数和最近一次的时间。机器人所有者可用 /forget group 编号 删除某一条。
+    谁可以修改：
+    - 成员：关于自己（及关联账号）的内容。
+    - 授权管理员：另外还有本群的普通成员和本群本身，但不能改动机器人所有者为他人添加的内容。
+    - 机器人所有者：全部内容。
+memory-title = 关于 { $display } 的记忆
+memory-group_title = 关于本群的记忆
+memory-messages = 在本群发过 { $count } 条消息
+memory-linked = 已关联 { $count } 个账号
+memory-names = 称呼（{ $count } 个）：
+memory-name_line = { $id } { $text }（{ $how }）
+memory-name_hand = 手动添加
+memory-name_own = 本人在 { $count } 段对话中这样自称
+memory-name_others = 别人在 { $count } 段对话中这样叫，最近一次 { $date }
+memory-how_separator = ；
+memory-known = 记得的内容（{ $count } 条）：
+memory-nothing = 记得的内容：暂无
+memory-hand_line = { $id } { $text }（{ $by } 于 { $date } 手动添加）
+memory-history = 已不成立，留档备查（{ $count } 条）：
+memory-hint = 要修改某条，请在 /memory fix、end 或 forget 后加上编号，例如 /memory forget m12。详见 /help memory
+memory-added = 已记下关于 { $display } 的这条内容，编号 { $id }。
+memory-added_group = 已记下关于本群的这条内容，编号 { $id }。
+memory-name_added = 已记下：{ $display } 也叫「{ $name }」（{ $id }）。
+memory-known_already = 这条已经记过了，编号 { $id }。
+memory-empty = 内容不能为空。
+memory-too_long = 每条最多 { $max } 个字符，一句话就够了。
+memory-name_too_long = 称呼最多 { $max } 个字符。
+memory-fixed = 已更正为 { $new } { $text }。原来的 { $old } 留档备查。
+memory-ended = 已标记为不再成立：{ $id } { $text }
+memory-forgot = 已忘掉 { $id }：{ $text }。以后聊天里再提到，也不会再记住。
+memory-forgot_all =
+    { $count ->
+        [0] 关于 { $display } 还没有记下任何内容。
+       *[other] 已忘掉关于 { $display } 的 { $count } 条内容。以后聊天里再提到，也不会再记住。
+    }
+memory-no_such = 找不到你能修改的 { $id }。发送 /memory 查看编号。
+memory-not_current = { $id } 已经不成立了，只能用 forget 删除。
+memory-owner_entered = 这条是机器人所有者添加的，只有机器人所有者或当事人本人可以修改。
+memory-group_admins = 只有机器人所有者和授权管理员可以修改本群的记忆。
+memory-too_many = 每人最多手动添加 { $max } 条，请先删掉一条。

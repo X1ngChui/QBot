@@ -12,8 +12,6 @@ mod identity;
 mod lease;
 mod media;
 mod memories;
-mod names;
-mod notes;
 mod people;
 mod policy;
 mod runlog;
@@ -27,14 +25,11 @@ pub use admin::{
     BlockRule, BlockedBy, PgAdmin, ReportData, RosterRow, TopRow, UsageLine, UsageSummary,
 };
 pub use archive::{Appended, MediaRefRow, NewLine, NewSpeaker, PgArchive};
-pub use episodes::PgEpisodeStore;
+pub use episodes::PgMemoryStore;
 pub use error::StoreError;
 pub use identity::PgIdentityStore;
 pub use lease::{DEFAULT_KEY, LeaseError, LeaseWatch, RuntimeLease};
 pub use media::PgMediaCache;
-pub use memories::PgMemoryStore;
-pub use names::PgNameStore;
-pub use notes::PgNoteStore;
 pub use people::{GroupPeople, Person, RosterSettings, ShownName};
 pub use policy::PgGroupPolicy;
 pub use runlog::{PgRunLog, RunRecord, TriggerKind};

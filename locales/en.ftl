@@ -29,16 +29,6 @@ command-display_fallback = account { $account }
 command-display_member = member { $number }
 command-scope_exact = single account
 command-scope_linked = linked accounts
-usage-who = Usage: /who [--linked] [@account]
-usage-name_list = Usage: /name [--linked] [@account]
-usage-name_edit = Usage: /name { $action } [--linked] [@account] name
-usage-note =
-    Usage: /note [--linked] [@account]
-    /note add [@account] text
-    /note edit [--linked] [@account] N text
-    /note remove [--linked] [@account] N
-    /note clear [--linked] [@account]
-usage-group = Usage: /group
 usage-runs = Usage: /runs [run number]
 usage-logs = Usage: /logs [count]
 usage-link_confirm = Usage: /link confirm
@@ -58,7 +48,7 @@ usage-block_remove = Usage: /block remove [--linked] @account
 usage-mute = Usage: /mute [status|on|off]
 usage-help = Usage: /help [command]
 help-header = Available commands:
-help-category_profile = Profiles
+help-category_profile = Memory
 help-category_identity = Identity
 help-category_group = This group
 help-category_admin = Administration
@@ -76,23 +66,6 @@ help-detail =
     { $access }
 
     { $detail }
-what-who = Show a member's record
-what-name = Manage the names a member goes by
-what-note = Manage notes about a member
-detail-note =
-    /note [--linked] [@account]
-    /note add [@account] text
-    /note edit [--linked] [@account] N text
-    /note remove [--linked] [@account] N
-    /note clear [--linked] [@account]
-
-    Notes are written by people and kept exactly as written. The bot reads them but never changes them. They are separate from what the bot learns from chat (see /forget).
-    N is the note's number in /note or /who for the same scope.
-
-    Who can manage notes:
-    - Members: notes about their own accounts.
-    - Delegated admins: also notes about ordinary members of this group, except notes a bot owner wrote.
-    - Bot owners: all notes.
 what-admin = Manage this group's delegated admins
 detail-admin =
     /admin
@@ -101,10 +74,10 @@ detail-admin =
 
     A delegated admin has extra permissions in this group only:
     - Use /mute, /block and /members.
-    - Manage the names, notes and memories of ordinary members (/who, /name, /note, /forget).
+    - Manage what is known about ordinary members and about this group (/memory).
 
     Limits:
-    - No action on a bot owner or another delegated admin, or on a bot owner's notes and blocks.
+    - No action on a bot owner or another delegated admin, or on what a bot owner entered or blocked.
     - Only a bot owner can add or remove delegated admins.
     - The permission belongs to that account alone, not to accounts linked to it.
 usage-admin = Usage: /admin, /admin add @account or /admin remove @account
@@ -116,7 +89,6 @@ admin-already = { $label } is already a delegated admin of this group.
 admin-removed = { $label } is no longer a delegated admin of this group.
 admin-remove_none = { $label } is not a delegated admin of this group.
 admin-bot = The bot cannot be a delegated admin.
-note-owner_authored = This note was written by a bot owner. Only a bot owner or the member it is about can change or remove it.
 admin-bot_owner = Bot owners already have all permissions.
 what-link = Link your accounts
 detail-link =
@@ -180,7 +152,6 @@ detail-mute =
     /mute [status|on|off]
 
     While the group is muted the bot does not reply here. /mute alone shows the current state.
-what-group = Show what the bot remembers about this group
 what-runs = Show recent bot runs
 detail-runs =
     /runs
@@ -198,16 +169,6 @@ detail-help =
 
     /help lists the commands you can use; /help <command> explains one.
 who-no_record = There is no record of this account in this group.
-who-title = Account record | { $display } | { $scope }
-who-messages = Messages in this group: { $count }
-who-linked = Linked accounts: { $count }
-name-none = No names are on record for { $display }.
-name-removed = Removed the name "{ $name }" from { $display }.
-name-remove_none = { $display } has no name "{ $name }" in this scope.
-name-taken = "{ $name }" is already used for someone else in this group.
-name-empty_name = The name cannot be empty.
-name-too_long = A name can have at most { $max } characters.
-name-added = Recorded: { $display } is also called "{ $name }".
 link-confirmed = Link confirmed. The two accounts are now linked.
 link-cancelled = The pending link invitation in this group was cancelled.
 link-nothing_pending = This account has no pending link invitation in this group.
@@ -341,23 +302,6 @@ tasks-too_many = This group already has the maximum of { $limit } pending tasks.
 tasks-chain_deep = The follow-up chain has reached its limit of { $limit } tasks.
 tasks-nothing_to_change = Nothing to change. Give new content, a new time or a new rule.
 tasks-empty_intent = The task content cannot be empty.
-who-notes = Notes written by people ({ $count }):
-who-no_notes = Notes written by people: none
-who-note_line = { $index }. { $text }
-note-none = There are no notes about { $display } in this scope.
-note-header = Notes about { $display } | { $scope }:
-note-line = { $index }. { $text } (by { $author }, { $time })
-note-added = Added note { $index } about { $display }.
-note-edited = Updated note { $index }.
-note-removed = Removed note { $index }: { $text }
-note-cleared =
-    { $count ->
-        [one] Removed 1 note about { $display }.
-       *[other] Removed { $count } notes about { $display }.
-    }
-note-no_such = There is no note { $index } in this scope. Send /note to see the list.
-note-empty = The note text cannot be empty.
-note-too_many = An account can have at most { $max } notes. Remove one first.
 runs-empty = This group has no runs yet.
 runs-header = Latest runs of this group ({ $count }):
 runs-row = #{ $id } { $time } { $trigger } | { $end } | { $turns } turns, { $tools } tool calls, { $sends } sent | { $tokens } tokens
@@ -458,25 +402,6 @@ report-backup_age = Last backup: { $hours } { $hours ->
     } ago
 report-backup_none = Last backup: none found
 
-who-names = Names ({ $count }):
-who-shown = Shown as: { $names }
-name-header = Names of { $display }:
-name-line = - { $text } ({ $how })
-name-how_set = set with /name
-name-how_own =
-    used for themselves in { $count } { $count ->
-        [one] conversation
-       *[other] conversations
-    }
-name-how_others =
-    used by others in { $count } { $count ->
-        [one] conversation
-       *[other] conversations
-    }, last on { $date }
-name-how_shared = also used for { $members }
-who-memories = Remembered from chat ({ $count }):
-who-no_memories = Remembered from chat: nothing
-who-history = No longer current, still kept ({ $count }):
 memory-replaced_line = { $id } { $text } (replaced on { $date })
 memory-ended_line = { $id } { $text } (ended as of { $date })
 memory-line =
@@ -488,61 +413,65 @@ memory-source_own = said by them
 memory-source_others = said by others
 memory-source_both = said by them and by others
 memory-source_members = said by members
-who-hint = To remove: a note with /note remove N; one memory with /forget ID (for example /forget m12); every memory about this member with /forget all.
-group-empty = Nothing is remembered about this group yet.
-group-header = Remembered about this group:
-group-hint = Bot owners can remove an entry with /forget group ID.
-forget-done = Forgot { $id }: { $text }
-forget-no_such = There is no memory { $id } in this scope. Send /who to see the list.
-forget-group_done = Forgot { $id }: { $text }
-forget-group_no_such = There is no group memory { $id }. Send /group to see the list.
-forget-all_done =
+usage-memory = Usage: /memory [@account | group], or /memory add | name | fix | end | forget ... (see /help memory)
+what-memory = What the bot knows about a member or this group
+detail-memory =
+    /memory [@account]: what is known about a member (names, facts, what no longer holds)
+    /memory group: what is known about this group
+    /memory add [@account | group] text: add something by hand
+    /memory name [@account] name: add a name people call them
+    /memory fix ID text: correct an entry; the old one is kept as history
+    /memory end ID: mark an entry as no longer true
+    /memory forget ID: delete an entry; it is never learned again from chat
+    /memory forget all [@account]: delete everything about a member
+
+    The bot learns from chat once a day; what you enter here counts at once, and chat never overrides it. IDs look like m12.
+
+    Who can change what:
+    - Members: what is about them (and their linked accounts).
+    - Delegated admins: also ordinary members of this group, and the group itself, but not what a bot owner entered about someone else.
+    - Bot owners: everything.
+memory-title = What I know about { $display }
+memory-group_title = What I know about this group
+memory-messages = Messages in this group: { $count }
+memory-linked = Linked accounts: { $count }
+memory-names = Names ({ $count }):
+memory-name_line = { $id } { $text } ({ $how })
+memory-name_hand = entered by hand
+memory-name_own =
     { $count ->
-        [one] Forgot the 1 memory about { $display }.
-       *[other] Forgot all { $count } memories about { $display }.
+        [one] they use it themselves in 1 conversation
+       *[other] they use it themselves in { $count } conversations
     }
-usage-forget = Usage: /forget [--linked] [@account] ID, /forget all [--linked] [@account], or /forget group ID
-what-forget = Delete what the bot remembers from chat
-detail-forget =
-    /forget [--linked] [@account] ID
-    /forget all [--linked] [@account]
-    /forget group ID (owner only)
-
-    Deletes what the bot learned from chat on its own, together with its sources:
-    - /forget ID: the memory with that ID in /who (same scope).
-    - /forget all: every memory about the member.
-    - /forget group ID: the group memory with that ID in /group.
-    Notes and names are not affected; use /note and /name remove for those.
-
-    Who can forget:
-    - Members: memories about themselves.
-    - Delegated admins: also memories about ordinary members of this group.
-    - Bot owners: all memories.
-detail-who =
-    /who [--linked] [@account]
-
-    Shows what is on record about a member:
-    - the names people use for them;
-    - notes people wrote;
-    - what the bot remembers from chat, with who said it and when. Memories that a later statement replaced or ended are listed too, until they are forgotten.
-    By default only the exact account is shown; --linked includes its linked accounts.
-
-    Who can view:
-    - Members: their own record.
-    - Delegated admins: also ordinary members of this group.
-    - Bot owners: anyone.
-detail-name =
-    /name [--linked] [@account]
-    /name add [--linked] [@account] name
-    /name remove [--linked] [@account] name
-
-    Lists the names people use for a member and how each is used: set with /name, used by the member, or used by others in conversation. A name removed with /name is not learned again unless someone adds it back. --linked applies to the person behind all linked accounts.
-
-    Who can manage names:
-    - Members: their own.
-    - Delegated admins: also ordinary members of this group.
-    - Bot owners: anyone.
-detail-group =
-    /group
-
-    Shows what the bot remembers about this group: the terms it uses and what the group is about, with how often and when each was last said. Bot owners can remove an entry with /forget group ID.
+memory-name_others =
+    { $count ->
+        [one] others use it in 1 conversation, last on { $date }
+       *[other] others use it in { $count } conversations, last on { $date }
+    }
+memory-how_separator = ;{ " " }
+memory-known = Known ({ $count }):
+memory-nothing = Known: nothing yet
+memory-hand_line = { $id } { $text } (entered by { $by }, { $date })
+memory-history = No longer true, kept as history ({ $count }):
+memory-hint = To change an entry: /memory fix, end or forget with its id (for example /memory forget m12). Details: /help memory
+memory-added = Added { $id } about { $display }.
+memory-added_group = Added { $id } about this group.
+memory-name_added = Added { $id }: { $display } is also called "{ $name }".
+memory-known_already = That is already known as { $id }.
+memory-empty = The text cannot be empty.
+memory-too_long = An entry can have at most { $max } characters: one short sentence.
+memory-name_too_long = A name can have at most { $max } characters.
+memory-fixed = Corrected { $old }: now { $new } { $text }. The old entry is kept as no longer true.
+memory-ended = Marked { $id } as no longer true: { $text }
+memory-forgot = Forgot { $id }: { $text }. It will not be learned again.
+memory-forgot_all =
+    { $count ->
+        [0] Nothing was known about { $display }.
+        [one] Forgot the 1 entry about { $display }. It will not be learned again.
+       *[other] Forgot all { $count } entries about { $display }. They will not be learned again.
+    }
+memory-no_such = There is no entry { $id } you can change here. Send /memory to see the list.
+memory-not_current = { $id } is already no longer true; it can only be forgotten.
+memory-owner_entered = A bot owner entered this. Only a bot owner or the member it is about can change it.
+memory-group_admins = Only bot owners and delegated admins can change what is known about this group.
+memory-too_many = At most { $max } entries can be added by hand for one person. Forget one first.

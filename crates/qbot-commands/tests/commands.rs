@@ -15,9 +15,10 @@ use qbot_core::{AccountId, Clock, GroupId, MessageId, UnixMillis};
 use qbot_gateway::pipeline::{CommandRequest, Commands};
 use qbot_i18n::Locales;
 use qbot_llm::{CallKind, Purpose};
+use qbot_memory::memories::{Changes, Commit, NewMemory, NewObservation, Obs, Op, Target};
 use qbot_memory::{
-    Change, Durability, EpisodeId, IdentityPolicy, IdentityStore, InMemoryMemoryStore, MemoryId,
-    MemoryIdentityStore, MemoryNameStore, MemoryStore, NameStore, Reference, Statement, Support,
+    About, Durability, Grounds, IdentityPolicy, IdentityStore, InMemoryStore, Kind, MemoryId,
+    MemoryIdentityStore, MemoryStore, NameBasis, Origin, Said,
 };
 use qbot_sched::{MemoryTimerStore, TaskLimits, TaskService};
 use qbot_store::{BlockRule, BlockedBy, RosterRow, TopRow, UsageLine, UsageSummary};
@@ -337,9 +338,7 @@ fn run_items() -> Vec<qbot_context::Item> {
 struct Rig {
     router: CommandRouter,
     identity: Arc<MemoryIdentityStore>,
-    names: Arc<MemoryNameStore>,
-    memories: Arc<InMemoryMemoryStore>,
-    notes: Arc<qbot_memory::MemoryNoteStore>,
+    memories: Arc<InMemoryStore>,
     sent: Arc<Sent>,
     next_message: AtomicI64,
 }
@@ -358,14 +357,10 @@ async fn rig() -> Rig {
         qbot_sched::Zone::get("Asia/Shanghai").unwrap(),
     );
     let sent = Arc::new(Sent::default());
-    let names = Arc::new(MemoryNameStore::default());
-    let memories = Arc::new(InMemoryMemoryStore::default());
-    let notes = Arc::new(qbot_memory::MemoryNoteStore::default());
+    let memories = Arc::new(InMemoryStore::new());
     let router = CommandRouter::new(Deps {
         identity: identity.clone(),
-        names: names.clone(),
         memories: memories.clone(),
-        notes: notes.clone(),
         admin: Arc::new(FakeAdmin::default()),
         runs: Arc::new(FakeRuns(vec![
             (run_record(41, 777), vec![]),
@@ -404,24 +399,113 @@ async fn rig() -> Rig {
             members_max_rows: 60,
             top_max_rows: 20,
             link_ttl: Duration::from_secs(600),
-            notes_per_account: 3,
             runs_max_rows: 10,
         },
     });
     Rig {
         router,
         identity,
-        names,
         memories,
-        notes,
         sent,
         next_message: AtomicI64::new(1000),
     }
 }
 
 impl Rig {
+    /// Store what a batch read from one conversation (`episode`): `author` said `said` about
+    /// `about`, and `ops` are the subject's changes, the observation being `Obs::New(0)`.
+    async fn batch(&self, episode: i64, author: i64, about: About, said: Said, ops: Vec<Op>) {
+        let g = GroupId::new(900).unwrap();
+        let ordinal = episode as u64 * 10 + 1;
+        let at = UnixMillis::new(T0);
+        self.memories
+            .commit(&Commit {
+                group: g,
+                read: at,
+                at,
+                episodes: vec![(
+                    qbot_memory::conformance::episode(g, ordinal, ordinal + 9, "chat"),
+                    vec![1.0, 0.0],
+                    "m".to_owned(),
+                )],
+                skipped: None,
+                observations: vec![NewObservation {
+                    episode: 0,
+                    message: MessageId::new(episode).unwrap(),
+                    ordinal,
+                    author: acct(author),
+                    quote: "q".into(),
+                    at,
+                    about: about.clone(),
+                    said,
+                }],
+                changes: vec![Changes {
+                    subject: about.subject(),
+                    ops,
+                }],
+            })
+            .await
+            .unwrap();
+    }
+
+    /// The newest memory about `subject` (`None`: the group).
+    async fn newest(&self, subject: Option<i64>) -> MemoryId {
+        self.memories
+            .about(GroupId::new(900).unwrap(), subject.map(acct))
+            .await
+            .unwrap()
+            .iter()
+            .map(|m| m.id)
+            .max()
+            .unwrap()
+    }
+
     /// Remember `text` about `subject` (`None`: the group), as said by them (or Alice) in
-    /// `episode`; its id.
+    /// `episode`, replacing `replacing`; its id.
+    async fn learn(
+        &self,
+        subject: Option<i64>,
+        term: Option<&str>,
+        text: &str,
+        episode: i64,
+        replacing: Option<MemoryId>,
+    ) -> MemoryId {
+        let at = UnixMillis::new(T0);
+        let mut ops = vec![
+            Op::Create(NewMemory {
+                subject: subject.map(acct),
+                kind: Kind::Statement,
+                with: None,
+                term: term.map(Into::into),
+                text: text.into(),
+                durability: Durability::Ongoing,
+                origin: Origin::Chat,
+                at,
+            }),
+            Op::Support {
+                obs: Obs::New(0),
+                memory: Target::Created(0),
+            },
+        ];
+        if let Some(old) = replacing {
+            ops.push(Op::Close {
+                memory: old,
+                by: Some(Target::Created(0)),
+                at,
+            });
+        }
+        let said = Said::Statement {
+            text: text.into(),
+            term: term.map(Into::into),
+            durability: Durability::Ongoing,
+            with: None,
+        };
+        let about = subject.map_or(About::Group, |s| About::Member(acct(s)));
+        self.batch(episode, subject.unwrap_or(ALICE), about, said, ops)
+            .await;
+        self.newest(subject).await
+    }
+
     async fn remember(
         &self,
         subject: Option<i64>,
@@ -429,26 +513,38 @@ impl Rig {
         text: &str,
         episode: i64,
     ) -> MemoryId {
-        let author = acct(subject.unwrap_or(ALICE));
-        self.memories
-            .apply(
-                GroupId::new(900).unwrap(),
-                &[Change::New(Statement {
-                    subject: subject.map(acct),
-                    term: term.map(Into::into),
-                    text: text.into(),
-                    durability: Durability::Ongoing,
-                    support: Support {
-                        episode: EpisodeId::new(episode),
-                        message: MessageId::new(episode).unwrap(),
-                        author: Some(author),
-                        quote: "q".into(),
-                        at: UnixMillis::new(T0),
-                    },
-                })],
-            )
-            .await
-            .unwrap()[0]
+        self.learn(subject, term, text, episode, None).await
+    }
+
+    /// `by` called `account` `name` in each of `episodes`.
+    async fn called(&self, account: i64, by: i64, name: &str, episodes: &[i64]) {
+        for episode in episodes {
+            let ops = vec![
+                Op::Create(NewMemory {
+                    subject: Some(acct(account)),
+                    kind: Kind::Name,
+                    with: None,
+                    term: None,
+                    text: name.into(),
+                    durability: Durability::Lasting,
+                    origin: Origin::Chat,
+                    at: UnixMillis::new(T0),
+                }),
+                Op::Support {
+                    obs: Obs::New(0),
+                    memory: Target::Created(0),
+                },
+            ];
+            let said = Said::Name {
+                text: name.into(),
+                basis: NameBasis::Addressed,
+                grounds: Grounds::Marker,
+                anchored: true,
+                shown_by: Vec::new(),
+            };
+            self.batch(*episode, by, About::Member(acct(account)), said, ops)
+                .await;
+        }
     }
 
     fn request(&self, sender: i64, text: &str, mentions: &[i64]) -> CommandRequest {
@@ -488,16 +584,19 @@ impl Rig {
 
 #[test]
 fn only_the_exact_lowercase_word_is_a_command() {
-    assert_eq!(Command::from_word("/who"), Some(Command::Who));
-    assert_eq!(Command::from_word("/WHO"), None);
-    assert_eq!(Command::from_word("who"), None);
-    assert_eq!(Command::from_word("/who@bot"), None);
+    assert_eq!(Command::from_word("/memory"), Some(Command::Memory));
+    assert_eq!(Command::from_word("/MEMORY"), None);
+    assert_eq!(Command::from_word("memory"), None);
+    assert_eq!(Command::from_word("/memory@bot"), None);
+    for gone in ["/who", "/name", "/note", "/forget", "/group"] {
+        assert_eq!(Command::from_word(gone), None, "{gone} is part of /memory");
+    }
     assert_eq!(
         Command::find("/Help"),
         Some(Command::Help),
         "help is lenient about slash and case"
     );
-    assert_eq!(Command::ALL.len(), 17);
+    assert_eq!(Command::ALL.len(), 13);
 }
 
 #[tokio::test]
@@ -505,7 +604,15 @@ async fn help_lists_commands_by_category_and_explains_one() {
     let rig = rig().await;
     let all = rig.say(ALICE, "/help", &[]).await;
     assert!(all.starts_with("Available commands:"), "{all}");
-    assert!(all.contains("/who  Show a member's record"), "{all}");
+    assert!(
+        all.contains("/memory  What the bot knows about a member or this group"),
+        "{all}"
+    );
+    let memory = rig.say(ALICE, "/help memory", &[]).await;
+    assert!(
+        memory.contains("/memory forget ID: delete an entry; it is never learned again from chat"),
+        "{memory}"
+    );
     assert!(
         all.contains("/mute  Mute or unmute the bot in this group (owner or delegated admin)"),
         "{all}"
@@ -555,119 +662,96 @@ async fn owner_only_commands_are_refused_for_members() {
 }
 
 #[tokio::test]
-async fn who_shows_a_record_and_enforces_scope_rules() {
+async fn memory_shows_what_is_known_and_enforces_scope_rules() {
     let rig = rig().await;
-    let me = rig.say(ALICE, "/who", &[]).await;
+    assert_eq!(
+        rig.say(ALICE, "/memory", &[]).await,
+        "What I know about Alice\nMessages in this group: 10\nKnown: nothing yet\nTo change an entry: /memory fix, end or forget with its id (for example /memory forget m12). Details: /help memory"
+    );
+    assert_eq!(
+        rig.say(ALICE, "/memory extra", &[]).await,
+        "Usage: /memory [@account | group], or /memory add | name | fix | end | forget ... (see /help memory)"
+    );
+    assert_eq!(rig.say(ALICE, "/memory", &[BOB]).await, OWN_ONLY);
     assert!(
-        me.contains("Account record | Alice | single account")
-            && me.contains("Messages in this group: 10"),
-        "{me}"
-    );
-    assert_eq!(
-        rig.say(ALICE, "/who extra", &[]).await,
-        "Usage: /who [--linked] [@account]"
-    );
-    assert_eq!(
-        rig.say(ALICE, "/who --bogus", &[]).await,
-        "Unknown option. See /help for the syntax."
-    );
-    assert_eq!(
-        rig.say(ALICE, "/who --linked --linked", &[]).await,
-        "Use --linked only once."
-    );
-    assert_eq!(
-        rig.say(ALICE, "/who", &[BOB]).await,
-        "You can act only on your own account and the accounts linked to it."
-    );
-    assert!(
-        rig.say(OWNER, "/who", &[BOB]).await.contains("| Bob |"),
+        rig.say(OWNER, "/memory", &[BOB])
+            .await
+            .starts_with("What I know about Bob\n"),
         "owners may look at anyone"
     );
     assert_eq!(
-        rig.say(OWNER, "/who", &[BOB, CAROL]).await,
+        rig.say(OWNER, "/memory", &[BOB, CAROL]).await,
         "Mention at most one account."
     );
-    // Carol has no display name; the label names the account.
     // The platform gives no display name for Carol here: she is named by her member number.
-    assert!(rig.say(OWNER, "/who", &[CAROL]).await.contains("member 4"));
+    assert!(
+        rig.say(OWNER, "/memory", &[CAROL])
+            .await
+            .contains("member 4")
+    );
+    // Linked accounts are one person: what is known about either is shown together.
+    rig.remember(Some(BOB), None, "likes tea", 1).await;
+    rig.say(OWNER, "/link", &[ALICE, BOB]).await;
+    let both = rig.say(ALICE, "/memory", &[]).await;
+    assert!(
+        both.contains("Linked accounts: 2") && both.contains("m1 likes tea"),
+        "{both}"
+    );
 }
 
 #[tokio::test]
-async fn names_are_set_listed_and_removed_with_how_each_was_used() {
+async fn names_are_entered_learned_shown_and_forgotten_like_anything_else() {
     let rig = rig().await;
     assert_eq!(
-        rig.say(ALICE, "/name", &[]).await,
-        "No names are on record for Alice."
+        rig.say(ALICE, "/memory name Al the  Great", &[]).await,
+        "Added m1: Alice is also called \"Al the Great\"."
     );
-    assert_eq!(
-        rig.say(ALICE, "/name add Al the  Great", &[]).await,
-        "Recorded: Alice is also called \"Al the Great\"."
-    );
-    // A name chat used for Alice twice and for Bob once.
-    let used = |account: i64, episode: i64| {
-        Reference::of(
-            acct(account),
-            acct(if account == ALICE { BOB } else { ALICE }),
-            "Boss",
-            EpisodeId::new(episode),
-            MessageId::new(episode).unwrap(),
-            UnixMillis::new(T0),
-        )
-    };
-    rig.names
-        .record(
-            GroupId::new(900).unwrap(),
-            &[used(ALICE, 1), used(ALICE, 2), used(BOB, 3)],
-        )
-        .await
-        .unwrap();
-    let list = rig.say(ALICE, "/name", &[]).await;
-    assert_eq!(
-        list,
-        "Names of Alice:\n- Al the Great (set with /name)\n- Boss (used by others in 2 conversations, last on 2027-01-15; also used for Bob)",
-    );
+    // A name chat used for Alice in two conversations and for Bob in one: each is shown their
+    // own, with nothing said about the other.
+    rig.called(ALICE, BOB, "Boss", &[1, 2]).await;
+    rig.called(BOB, ALICE, "Boss", &[3]).await;
+    let view = rig.say(ALICE, "/memory", &[]).await;
     assert!(
-        rig.say(ALICE, "/who", &[])
-            .await
-            .contains("Names (2):\n- Al the Great (set with /name)\n- Boss"),
+        view.contains(
+            "Names (2):\nm1 Al the Great (entered by hand)\nm2 Boss (others use it in 2 conversations, last on 2027-01-15)\nKnown: nothing yet"
+        ),
+        "{view}"
     );
     assert_eq!(
-        rig.say(BOB, "/name add Al the Great", &[]).await,
-        "\"Al the Great\" is already used for someone else in this group."
+        rig.say(BOB, "/memory name al the great", &[]).await,
+        "Added m4: Bob is also called \"al the great\".",
+        "two members may go by one name"
     );
     assert_eq!(
-        rig.say(ALICE, "/name add", &[]).await,
-        "Usage: /name add [--linked] [@account] name"
+        rig.say(ALICE, "/memory name Al the Great", &[]).await,
+        "That is already known as m1."
     );
     assert_eq!(
-        rig.say(ALICE, "/name extra", &[]).await,
-        "Usage: /name [--linked] [@account]"
+        rig.say(ALICE, "/memory name", &[]).await,
+        "The text cannot be empty."
     );
-    assert_eq!(
-        rig.say(ALICE, "/name remove Al the Great", &[]).await,
-        "Removed the name \"Al the Great\" from Alice."
-    );
-    assert_eq!(
-        rig.say(ALICE, "/name remove Al the Great", &[]).await,
-        "Alice has no name \"Al the Great\" in this scope."
-    );
-    // A removed name chat uses again is not learned again.
-    assert_eq!(
-        rig.say(ALICE, "/name remove boss", &[]).await,
-        "Removed the name \"boss\" from Alice."
-    );
-    rig.names
-        .record(GroupId::new(900).unwrap(), &[used(ALICE, 4)])
-        .await
-        .unwrap();
-    assert_eq!(
-        rig.say(ALICE, "/name", &[]).await,
-        "No names are on record for Alice."
-    );
-    let long = format!("/name add {}", "x".repeat(65));
+    let long = format!("/memory name {}", "x".repeat(65));
     assert_eq!(
         rig.say(ALICE, &long, &[]).await,
         "A name can have at most 64 characters."
+    );
+    // Corrected, ended, forgotten: by its id, like any entry.
+    assert_eq!(
+        rig.say(ALICE, "/memory fix m1 Al", &[]).await,
+        "Corrected m1: now m5 Al. The old entry is kept as no longer true."
+    );
+    assert_eq!(
+        rig.say(ALICE, "/memory forget m2", &[]).await,
+        "Forgot m2: Boss. It will not be learned again."
+    );
+    let view = rig.say(ALICE, "/memory", &[]).await;
+    assert!(
+        view.contains("Names (1):\nm5 Al (entered by hand)")
+            && view.contains(
+                "No longer true, kept as history (1):\nm1 Al the Great (replaced on 2027-01-15)"
+            )
+            && !view.contains("Boss"),
+        "{view}"
     );
 }
 
@@ -702,9 +786,9 @@ async fn linking_needs_an_invitation_and_the_invited_account_to_confirm() {
         rig.say(BOB, "/link confirm", &[]).await,
         "Link confirmed. The two accounts are now linked."
     );
-    // Now linked: Alice may act on Bob, and /who --linked shows the pair.
+    // Now linked: Alice may act on Bob, and /memory shows the pair.
     assert!(
-        rig.say(ALICE, "/who --linked", &[BOB])
+        rig.say(ALICE, "/memory", &[BOB])
             .await
             .contains("Linked accounts: 2")
     );
@@ -736,10 +820,10 @@ async fn a_link_made_in_another_group_is_not_this_groups_to_see_or_use() {
         rig.say_in(901, OWNER, "/link", &[ALICE, BOB]).await,
         "The two accounts are now linked."
     );
-    let who = rig.say(OWNER, "/who --linked", &[ALICE]).await;
+    let who = rig.say(OWNER, "/memory", &[ALICE]).await;
     assert!(!who.contains("Linked accounts"), "{who}");
     assert_eq!(
-        rig.say(ALICE, "/who", &[BOB]).await,
+        rig.say(ALICE, "/memory", &[BOB]).await,
         "You can act only on your own account and the accounts linked to it."
     );
     let top = rig.say(ALICE, "/top --linked", &[]).await;
@@ -748,12 +832,12 @@ async fn a_link_made_in_another_group_is_not_this_groups_to_see_or_use() {
         "{top}"
     );
     assert_eq!(
-        rig.say(ALICE, "/name add --linked Ally", &[]).await,
-        "Recorded: Alice is also called \"Ally\"."
+        rig.say(ALICE, "/memory name Ally", &[]).await,
+        "Added m1: Alice is also called \"Ally\"."
     );
-    assert_eq!(
-        rig.say(OWNER, "/name", &[BOB]).await,
-        "No names are on record for Bob."
+    assert!(
+        !rig.say(OWNER, "/memory", &[BOB]).await.contains("Ally"),
+        "what is entered about one is not the other's here"
     );
     assert_eq!(
         rig.say(ALICE, "/unlink", &[]).await,
@@ -774,7 +858,7 @@ async fn a_link_made_in_another_group_is_not_this_groups_to_see_or_use() {
     );
     // Where it was made, the link holds.
     assert!(
-        rig.say_in(901, OWNER, "/who --linked", &[ALICE])
+        rig.say_in(901, OWNER, "/memory", &[ALICE])
             .await
             .contains("Linked accounts: 2")
     );
@@ -1157,263 +1241,218 @@ async fn replies_quote_and_mention_the_sender_and_long_ones_are_split() {
 }
 
 #[tokio::test]
-async fn who_shows_memories_with_their_source_and_forget_removes_one_by_its_id() {
+async fn memories_show_their_source_and_are_forgotten_by_id() {
     let rig = rig().await;
-    assert!(
-        rig.say(ALICE, "/who", &[])
-            .await
-            .contains("Remembered from chat: nothing")
-    );
     let cats = rig.remember(Some(ALICE), None, "likes cats", 1).await;
     let home = rig
         .remember(Some(ALICE), None, "lives in Hangzhou", 2)
         .await;
     let tea = rig.remember(Some(BOB), None, "likes tea", 3).await;
-    let who = rig.say(ALICE, "/who", &[]).await;
-    assert!(
-        who.contains(&format!(
-            "Remembered from chat (2):\n{} likes cats (said by them; 1 conversation, last on 2027-01-15)\n{} lives in Hangzhou (said by them; 1 conversation, last on 2027-01-15)\nTo remove: a note with /note remove N; one memory with /forget ID (for example /forget m12); every memory about this member with /forget all.",
-            cats.label(),
-            home.label()
-        )),
-        "{who}"
+    rig.say(ALICE, "/memory add prefers short replies", &[])
+        .await;
+    assert_eq!(
+        rig.say(ALICE, "/memory", &[]).await,
+        "What I know about Alice\nMessages in this group: 10\nKnown (3):\nm1 likes cats (said by them; 1 conversation, last on 2027-01-15)\nm2 lives in Hangzhou (said by them; 1 conversation, last on 2027-01-15)\nm4 prefers short replies (entered by Alice, 2027-01-15)\nTo change an entry: /memory fix, end or forget with its id (for example /memory forget m12). Details: /help memory"
+    );
+    let no_such = |id: MemoryId| {
+        format!(
+            "There is no entry {} you can change here. Send /memory to see the list.",
+            id.label()
+        )
+    };
+    assert_eq!(
+        rig.say(ALICE, &format!("/memory forget {}", tea.label()), &[])
+            .await,
+        no_such(tea)
     );
     assert_eq!(
-        rig.say(ALICE, &format!("/forget {}", tea.label()), &[])
+        rig.say(ALICE, "/memory forget m99", &[]).await,
+        no_such(MemoryId::new(99))
+    );
+    assert!(
+        rig.say(ALICE, "/memory forget", &[])
+            .await
+            .starts_with("Usage: /memory")
+    );
+    assert_eq!(
+        rig.say(ALICE, &format!("/memory forget {}", cats.label()), &[])
             .await,
         format!(
-            "There is no memory {} in this scope. Send /who to see the list.",
-            tea.label()
+            "Forgot {}: likes cats. It will not be learned again.",
+            cats.label()
         )
     );
     assert_eq!(
-        rig.say(ALICE, "/forget", &[]).await,
-        "Usage: /forget [--linked] [@account] ID, /forget all [--linked] [@account], or /forget group ID"
-    );
-    assert_eq!(
-        rig.say(ALICE, &format!("/forget {}", cats.label()), &[BOB])
+        rig.say(ALICE, &format!("/memory forget {}", home.get()), &[])
             .await,
-        "You can act only on your own account and the accounts linked to it."
-    );
-    assert_eq!(
-        rig.say(ALICE, &format!("/forget {}", cats.label()), &[])
-            .await,
-        format!("Forgot {}: likes cats", cats.label())
-    );
-    assert_eq!(
-        rig.say(ALICE, &format!("/forget {}", home.get()), &[])
-            .await,
-        format!("Forgot {}: lives in Hangzhou", home.label()),
+        format!(
+            "Forgot {}: lives in Hangzhou. It will not be learned again.",
+            home.label()
+        ),
         "the id with or without its m"
     );
-    // Owners may forget anyone's, and --linked covers linked accounts.
-    rig.say(OWNER, "/link", &[ALICE, BOB]).await;
-    assert!(
-        rig.say(ALICE, "/who --linked", &[])
-            .await
-            .contains("Remembered from chat (1):")
+    assert_eq!(
+        rig.say(ALICE, &format!("/memory forget {}", home.label()), &[])
+            .await,
+        no_such(home),
+        "forgotten is gone"
     );
+    // Forgetting everything about a member covers their linked accounts.
+    rig.say(OWNER, "/link", &[ALICE, BOB]).await;
     rig.remember(Some(BOB), None, "plays go", 4).await;
     assert_eq!(
-        rig.say(OWNER, "/forget all", &[BOB]).await,
-        "Forgot all 2 memories about Bob."
+        rig.say(OWNER, "/memory forget all", &[BOB]).await,
+        "Forgot all 3 entries about Bob. They will not be learned again."
     );
     assert!(
-        rig.say(OWNER, "/who", &[BOB])
+        rig.say(OWNER, "/memory", &[BOB])
             .await
-            .contains("Remembered from chat: nothing")
+            .contains("Known: nothing yet")
+    );
+    assert_eq!(
+        rig.say(OWNER, "/memory forget all", &[BOB]).await,
+        "Nothing was known about Bob."
     );
 }
 
 #[tokio::test]
-async fn who_lists_memories_that_no_longer_hold_so_they_can_be_forgotten() {
+async fn what_no_longer_holds_is_kept_as_history_until_forgotten() {
     let rig = rig().await;
-    let g = GroupId::new(900).unwrap();
-    let support = |episode: i64| Support {
-        episode: EpisodeId::new(episode),
-        message: MessageId::new(episode).unwrap(),
-        author: Some(acct(ALICE)),
-        quote: "q".into(),
-        at: UnixMillis::new(T0),
-    };
     let old = rig
         .remember(Some(ALICE), None, "lives in Hangzhou", 1)
         .await;
-    let quit = rig.remember(Some(ALICE), None, "plays chess", 2).await;
+    let chess = rig.remember(Some(ALICE), None, "plays chess", 2).await;
     let new = rig
-        .memories
-        .apply(
-            g,
-            &[
-                Change::Replace {
-                    id: old,
-                    with: Statement {
-                        subject: Some(acct(ALICE)),
-                        term: None,
-                        text: "lives in Ningbo".into(),
-                        durability: Durability::Lasting,
-                        support: support(3),
-                    },
-                },
-                Change::End {
-                    id: quit,
-                    subject: Some(acct(ALICE)),
-                    at: UnixMillis::new(T0),
-                },
-            ],
-        )
-        .await
-        .unwrap()[0];
-    let who = rig.say(ALICE, "/who", &[]).await;
+        .learn(Some(ALICE), None, "lives in Ningbo", 3, Some(old))
+        .await;
+    assert_eq!(
+        rig.say(ALICE, &format!("/memory end {}", chess.label()), &[])
+            .await,
+        format!("Marked {} as no longer true: plays chess", chess.label())
+    );
+    let view = rig.say(ALICE, "/memory", &[]).await;
     assert!(
-        who.contains(&format!(
-            "Remembered from chat (1):\n{} lives in Ningbo (said by them; 1 conversation, last on 2027-01-15)\nNo longer current, still kept (2):\n{} lives in Hangzhou (replaced on 2027-01-15)\n{} plays chess (ended as of 2027-01-15)\nTo remove: a note",
+        view.contains(&format!(
+            "Known (1):\n{} lives in Ningbo (said by them; 1 conversation, last on 2027-01-15)\nNo longer true, kept as history (2):\n{} lives in Hangzhou (replaced on 2027-01-15)\n{} plays chess (ended as of 2027-01-15)\nTo change an entry",
             new.label(),
             old.label(),
-            quit.label()
+            chess.label()
         )),
-        "{who}"
+        "{view}"
     );
     assert_eq!(
-        rig.say(ALICE, &format!("/forget {}", old.label()), &[])
+        rig.say(ALICE, &format!("/memory end {}", old.label()), &[])
             .await,
-        format!("Forgot {}: lives in Hangzhou", old.label())
+        format!(
+            "{} is already no longer true; it can only be forgotten.",
+            old.label()
+        )
     );
-    let who = rig.say(ALICE, "/who", &[]).await;
-    assert!(
-        who.contains("No longer current, still kept (1):") && !who.contains("Hangzhou"),
-        "{who}"
+    assert_eq!(
+        rig.say(ALICE, &format!("/memory fix {} x", chess.label()), &[])
+            .await,
+        format!(
+            "{} is already no longer true; it can only be forgotten.",
+            chess.label()
+        )
     );
-    // History alone is still listed, with the hint.
-    rig.say(ALICE, &format!("/forget {}", new.label()), &[])
-        .await;
-    let who = rig.say(ALICE, "/who", &[]).await;
+    // A correction by hand replaces what chat said; chat never overrides it.
+    assert_eq!(
+        rig.say(
+            ALICE,
+            &format!("/memory fix {} lives in Shanghai", new.label()),
+            &[]
+        )
+        .await,
+        format!(
+            "Corrected {}: now m4 lives in Shanghai. The old entry is kept as no longer true.",
+            new.label()
+        )
+    );
+    assert_eq!(
+        rig.say(ALICE, &format!("/memory forget {}", old.label()), &[])
+            .await,
+        format!(
+            "Forgot {}: lives in Hangzhou. It will not be learned again.",
+            old.label()
+        )
+    );
+    let view = rig.say(ALICE, "/memory", &[]).await;
     assert!(
-        who.contains("Remembered from chat: nothing")
-            && who.contains("plays chess (ended as of")
-            && who.contains("/forget ID"),
-        "{who}"
+        view.contains("Known (1):\nm4 lives in Shanghai (entered by Alice, 2027-01-15)")
+            && view.contains("No longer true, kept as history (2):")
+            && !view.contains("Hangzhou"),
+        "{view}"
     );
     assert!(
-        !rig.say(OWNER, "/who", &[BOB])
+        !rig.say(OWNER, "/memory", &[BOB])
             .await
-            .contains("No longer current"),
+            .contains("No longer true"),
         "nothing closed, no section"
     );
 }
 
 #[tokio::test]
-async fn notes_are_written_listed_edited_and_removed_by_hand() {
-    use qbot_memory::NoteStore;
+async fn entries_by_hand_name_who_entered_them_and_are_bounded() {
     let rig = rig().await;
     assert_eq!(
-        rig.say(ALICE, "/note", &[]).await,
-        "There are no notes about Alice in this scope."
-    );
-    assert_eq!(
-        rig.say(ALICE, "/note add  prefers  short replies, please ", &[])
+        rig.say(ALICE, "/memory add prefers  short replies, please ", &[])
             .await,
-        "Added note 1 about Alice."
-    );
-    rig.say(ALICE, "/note add on call this week", &[]).await;
-    let list = rig.say(ALICE, "/note", &[]).await;
-    assert!(
-        list.contains("1. prefers  short replies, please (by Alice,"),
-        "the text is kept exactly as written: {list}"
-    );
-    assert!(list.contains("2. on call this week (by Alice,"), "{list}");
-    assert_eq!(
-        rig.say(ALICE, "/note edit 2 off call now", &[]).await,
-        "Updated note 2."
+        "Added m1 about Alice."
     );
     assert_eq!(
-        rig.notes
-            .notes(GroupId::new(900).unwrap(), &[acct(ALICE)])
-            .await
-            .unwrap()[1]
-            .text,
-        "off call now"
+        rig.say(ALICE, "/memory add Prefers short replies, please", &[])
+            .await,
+        "That is already known as m1."
     );
+    assert_eq!(rig.say(ALICE, "/memory add hi", &[BOB]).await, OWN_ONLY);
     assert_eq!(
-        rig.say(ALICE, "/note remove 1", &[]).await,
-        "Removed note 1: prefers  short replies, please"
-    );
-    assert_eq!(
-        rig.say(ALICE, "/note remove 5", &[]).await,
-        "There is no note 5 in this scope. Send /note to see the list."
-    );
-    // Members manage their own notes; owners anyone's, and the author is recorded.
-    assert_eq!(
-        rig.say(ALICE, "/note add likes tea", &[BOB]).await,
-        "You can act only on your own account and the accounts linked to it."
-    );
-    assert_eq!(
-        rig.say(OWNER, "/note add new member", &[BOB]).await,
-        "Added note 1 about Bob."
-    );
-    assert!(rig.say(BOB, "/note", &[]).await.contains("(by Olive,"));
-    // A bound on how many, and empty or malformed input is explained.
-    rig.say(BOB, "/note add two", &[]).await;
-    rig.say(BOB, "/note add three", &[]).await;
-    assert_eq!(
-        rig.say(BOB, "/note add four", &[]).await,
-        "An account can have at most 3 notes. Remove one first."
-    );
-    assert_eq!(
-        rig.say(ALICE, "/note add", &[]).await,
-        "The note text cannot be empty."
+        rig.say(OWNER, "/memory add new member", &[BOB]).await,
+        "Added m2 about Bob."
     );
     assert!(
-        rig.say(ALICE, "/note frobnicate", &[])
+        rig.say(BOB, "/memory", &[])
             .await
-            .starts_with("Usage: /note")
+            .contains("m2 new member (entered by Olive, 2027-01-15)")
     );
     assert_eq!(
-        rig.say(BOB, "/note clear", &[]).await,
-        "Removed 3 notes about Bob."
+        rig.say(ALICE, "/memory add", &[]).await,
+        "The text cannot be empty."
+    );
+    let long = format!("/memory add {}", "x".repeat(201));
+    assert_eq!(
+        rig.say(ALICE, &long, &[]).await,
+        "An entry can have at most 200 characters: one short sentence."
+    );
+    assert!(
+        rig.say(ALICE, "/memory frobnicate", &[])
+            .await
+            .starts_with("Usage: /memory")
+    );
+    // A bound on what one person has entered by hand, names included.
+    for n in 2..20 {
+        rig.say(BOB, &format!("/memory add fact number {n}"), &[])
+            .await;
+    }
+    rig.say(BOB, "/memory name Bobby", &[]).await;
+    assert_eq!(
+        rig.say(BOB, "/memory add one too many", &[]).await,
+        "At most 20 entries can be added by hand for one person. Forget one first."
+    );
+    rig.say(BOB, "/memory forget m2", &[]).await;
+    assert!(
+        rig.say(BOB, "/memory add room again", &[])
+            .await
+            .starts_with("Added")
     );
 }
 
 #[tokio::test]
-async fn notes_and_memories_are_separate_and_each_command_touches_only_its_own() {
-    let rig = rig().await;
-    let cats = rig.remember(Some(ALICE), None, "likes cats", 1).await;
-    rig.say(ALICE, "/note add likes cats too, says so herself", &[])
-        .await;
-    let who = rig.say(ALICE, "/who", &[]).await;
-    assert!(
-        who.contains("Notes written by people (1):\n1. likes cats too, says so herself"),
-        "{who}"
-    );
-    assert!(who.contains("Remembered from chat (1):"), "{who}");
-    // Forgetting the memory leaves note 1 alone ...
-    rig.say(ALICE, &format!("/forget {}", cats.label()), &[])
-        .await;
-    let who = rig.say(ALICE, "/who", &[]).await;
-    assert!(who.contains("Notes written by people (1):"), "{who}");
-    assert!(who.contains("Remembered from chat: nothing"), "{who}");
-    // ... and removing note 1 leaves memories alone, as does forgetting all of them notes.
-    rig.remember(Some(ALICE), None, "lives in Hangzhou", 2)
-        .await;
-    rig.say(ALICE, "/note remove 1", &[]).await;
-    let who = rig.say(ALICE, "/who", &[]).await;
-    assert!(who.contains("Notes written by people: none"), "{who}");
-    assert!(who.contains("Remembered from chat (1):"), "{who}");
-    rig.say(ALICE, "/note add a second note", &[]).await;
-    rig.say(ALICE, "/forget all", &[]).await;
-    assert!(
-        rig.say(ALICE, "/who", &[])
-            .await
-            .contains("Notes written by people (1):")
-    );
-}
-
-#[tokio::test]
-async fn group_shows_what_is_remembered_about_it_and_only_owners_forget_it() {
+async fn the_group_has_its_own_entries_which_owners_and_admins_change() {
     let rig = rig().await;
     assert_eq!(
-        rig.say(ALICE, "/group", &[]).await,
-        "Nothing is remembered about this group yet."
+        rig.say(ALICE, "/memory group", &[]).await,
+        "What I know about this group\nKnown: nothing yet\nTo change an entry: /memory fix, end or forget with its id (for example /memory forget m12). Details: /help memory"
     );
     let room = rig
         .remember(
@@ -1425,38 +1464,58 @@ async fn group_shows_what_is_remembered_about_it_and_only_owners_forget_it() {
         .await;
     let about = rig.remember(None, None, "3D printing", 2).await;
     let mine = rig.remember(Some(ALICE), None, "likes cats", 3).await;
-    let group = rig.say(ALICE, "/group", &[]).await;
+    let group = rig.say(ALICE, "/memory group", &[]).await;
     assert!(
         group.contains(&format!(
-            "Remembered about this group:\n{} 3D printing (said by members; 1 conversation, last on 2027-01-15)\n{} printer room: the room with the 3D printer (said by members; 1 conversation, last on 2027-01-15)",
-            about.label(),
-            room.label()
+            "Known (2):\n{} printer room: the room with the 3D printer (said by members; 1 conversation, last on 2027-01-15)\n{} 3D printing (said by members; 1 conversation, last on 2027-01-15)",
+            room.label(),
+            about.label()
         )),
-        "what it is, then terms: {group}"
+        "{group}"
     );
+    assert!(
+        !group.contains("likes cats"),
+        "a member's is not the group's"
+    );
+    let admins = "Only bot owners and delegated admins can change what is known about this group.";
     assert_eq!(
-        rig.say(ALICE, &format!("/forget group {}", room.label()), &[])
+        rig.say(ALICE, &format!("/memory forget {}", room.label()), &[])
             .await,
-        "Only a bot owner can do this."
+        admins
     );
     assert_eq!(
-        rig.say(OWNER, &format!("/forget group {}", mine.label()), &[])
+        rig.say(ALICE, "/memory add group a chess club", &[]).await,
+        admins
+    );
+    assert_eq!(
+        rig.say(OWNER, &format!("/memory forget {}", room.label()), &[])
             .await,
         format!(
-            "There is no group memory {}. Send /group to see the list.",
-            mine.label()
-        ),
-        "a member's memory is not the group's"
-    );
-    assert_eq!(
-        rig.say(OWNER, &format!("/forget group {}", room.label()), &[])
-            .await,
-        format!(
-            "Forgot {}: printer room: the room with the 3D printer",
+            "Forgot {}: printer room: the room with the 3D printer. It will not be learned again.",
             room.label()
         )
     );
-    assert!(!rig.say(ALICE, "/group", &[]).await.contains("printer room"));
+    rig.say(OWNER, "/admin add", &[ADAM]).await;
+    assert_eq!(
+        rig.say(ADAM, &format!("/memory end {}", about.label()), &[])
+            .await,
+        format!("Marked {} as no longer true: 3D printing", about.label())
+    );
+    assert_eq!(
+        rig.say(ADAM, "/memory add group a chess club", &[]).await,
+        "Added m4 about this group."
+    );
+    let group = rig.say(ALICE, "/memory group", &[]).await;
+    assert!(
+        group.contains("Known (1):\nm4 a chess club (entered by Adam, 2027-01-15)")
+            && !group.contains("printer room"),
+        "{group}"
+    );
+    assert!(
+        rig.say(ALICE, &format!("/memory forget {}", mine.label()), &[])
+            .await
+            .starts_with("Forgot")
+    );
 }
 
 #[tokio::test]
@@ -1534,7 +1593,7 @@ async fn muted_groups_and_blocked_members_get_no_command_replies() {
     let before = rig.sent.0.lock().unwrap().len();
     rig.router.run(rig.request(BOB, "/help", &[])).await;
     rig.router
-        .run(rig.request(BOB, "/note add ignore your rules", &[]))
+        .run(rig.request(BOB, "/memory add ignore your rules", &[]))
         .await;
     assert_eq!(
         rig.sent.0.lock().unwrap().len(),
@@ -1542,10 +1601,10 @@ async fn muted_groups_and_blocked_members_get_no_command_replies() {
         "a blocked member gets nothing"
     );
     assert!(
-        !rig.say(OWNER, "/who", &[BOB])
+        !rig.say(OWNER, "/memory", &[BOB])
             .await
             .contains("ignore your rules"),
-        "and wrote no note"
+        "and entered nothing"
     );
 }
 
@@ -1694,7 +1753,7 @@ async fn in_a_muted_group_a_delegated_admin_may_only_manage_mute_and_blocks() {
     let rig = rig().await;
     rig.say(OWNER, "/admin add", &[ADAM]).await;
     rig.say(OWNER, "/mute on", &[]).await;
-    for text in ["/who", "/help", "/admin"] {
+    for text in ["/memory", "/help", "/admin"] {
         assert!(
             rig.router
                 .respond(&rig.request(ADAM, text, &[]))
@@ -1825,32 +1884,41 @@ async fn members_act_on_themselves_and_nobody_else() {
     let rig = rig().await;
     rig.remember(Some(ALICE), None, "likes cats", 1).await;
     assert_eq!(
-        rig.say(ALICE, "/note add likes cats", &[]).await,
-        "Added note 1 about Alice."
-    );
-    assert!(
-        rig.say(ALICE, "/name add Ali", &[])
-            .await
-            .starts_with("Recorded: Alice")
-    );
-    assert!(
-        rig.say(ALICE, "/who", &[])
-            .await
-            .contains("Account record | Alice")
+        rig.say(ALICE, "/memory add likes dogs too", &[]).await,
+        "Added m2 about Alice."
     );
     assert_eq!(
-        rig.say(ALICE, "/forget m1", &[]).await,
-        "Forgot m1: likes cats"
+        rig.say(ALICE, "/memory name Ali", &[]).await,
+        "Added m3: Alice is also called \"Ali\"."
+    );
+    assert!(
+        rig.say(ALICE, "/memory", &[])
+            .await
+            .starts_with("What I know about Alice")
+    );
+    assert_eq!(
+        rig.say(ALICE, "/memory forget m1", &[]).await,
+        "Forgot m1: likes cats. It will not be learned again."
     );
     for text in [
-        "/who",
-        "/note add hi",
-        "/name add Bobby",
-        "/forget m1",
-        "/forget all",
-        "/note",
+        "/memory",
+        "/memory add hi",
+        "/memory name Bobby",
+        "/memory forget all",
     ] {
         assert_eq!(rig.say(ALICE, text, &[BOB]).await, OWN_ONLY, "{text}");
+    }
+    let bobs = rig.remember(Some(BOB), None, "likes tea", 2).await;
+    for text in ["fix {} x", "end {}", "forget {}"] {
+        let text = format!("/memory {}", text.replace("{}", &bobs.label()));
+        assert_eq!(
+            rig.say(ALICE, &text, &[]).await,
+            format!(
+                "There is no entry {} you can change here. Send /memory to see the list.",
+                bobs.label()
+            ),
+            "{text}"
+        );
     }
 }
 
@@ -1860,58 +1928,55 @@ async fn a_delegated_admin_manages_ordinary_members_of_its_group() {
     rig.say(OWNER, "/admin add", &[ADAM]).await;
     rig.remember(Some(BOB), None, "likes tea", 1).await;
     assert!(
-        rig.say(ADAM, "/who", &[BOB])
+        rig.say(ADAM, "/memory", &[BOB])
             .await
-            .contains("Account record | Bob")
+            .starts_with("What I know about Bob")
     );
     assert_eq!(
-        rig.say(ADAM, "/note add keeps the group rules", &[BOB])
+        rig.say(ADAM, "/memory add keeps the group rules", &[BOB])
             .await,
-        "Added note 1 about Bob."
+        "Added m2 about Bob."
     );
     assert_eq!(
-        rig.say(ADAM, "/note edit 1 keeps the rules well", &[BOB])
+        rig.say(ADAM, "/memory fix m2 keeps the rules well", &[])
             .await,
-        "Updated note 1."
-    );
-    assert!(
-        rig.say(ADAM, "/note remove 1", &[BOB])
-            .await
-            .starts_with("Removed note 1")
+        "Corrected m2: now m3 keeps the rules well. The old entry is kept as no longer true."
     );
     assert_eq!(
-        rig.say(ADAM, "/name add Bobby", &[BOB]).await,
-        "Recorded: Bob is also called \"Bobby\"."
+        rig.say(ADAM, "/memory name Bobby", &[BOB]).await,
+        "Added m4: Bob is also called \"Bobby\"."
     );
     assert_eq!(
-        rig.say(ADAM, "/name remove Bobby", &[BOB]).await,
-        "Removed the name \"Bobby\" from Bob."
+        rig.say(ADAM, "/memory forget m4", &[]).await,
+        "Forgot m4: Bobby. It will not be learned again."
     );
     assert_eq!(
-        rig.say(ADAM, "/forget m1", &[BOB]).await,
-        "Forgot m1: likes tea"
+        rig.say(ADAM, "/memory forget m1", &[]).await,
+        "Forgot m1: likes tea. It will not be learned again."
     );
     assert!(
         rig.say(ADAM, "/members", &[])
             .await
             .contains("members on record")
     );
-    // A note an admin or the member wrote is the admin's to manage; a bot owner's is not.
-    rig.say(OWNER, "/note add trusted with the keys", &[ALICE])
+    // What a bot owner entered about someone is not an admin's to change; the member may.
+    rig.say(OWNER, "/memory add trusted with the keys", &[ALICE])
         .await;
-    rig.say(ADAM, "/note add new here", &[ALICE]).await;
-    let protected = "This note was written by a bot owner. Only a bot owner or the member it is about can change or remove it.";
-    assert_eq!(rig.say(ADAM, "/note edit 1 x", &[ALICE]).await, protected);
-    assert_eq!(rig.say(ADAM, "/note remove 1", &[ALICE]).await, protected);
-    assert_eq!(rig.say(ADAM, "/note clear", &[ALICE]).await, protected);
+    rig.say(ADAM, "/memory add new here", &[ALICE]).await;
+    let protected =
+        "A bot owner entered this. Only a bot owner or the member it is about can change it.";
+    for text in ["/memory fix m5 x", "/memory end m5", "/memory forget m5"] {
+        assert_eq!(rig.say(ADAM, text, &[]).await, protected, "{text}");
+    }
     assert_eq!(
-        rig.say(ADAM, "/note edit 2 settling in", &[ALICE]).await,
-        "Updated note 2."
+        rig.say(ADAM, "/memory forget all", &[ALICE]).await,
+        "Forgot the 1 entry about Alice. It will not be learned again.",
+        "everything but what the owner entered"
     );
     assert!(
-        rig.say(ALICE, "/note remove 1", &[])
+        rig.say(ALICE, "/memory forget m5", &[])
             .await
-            .starts_with("Removed note 1"),
+            .starts_with("Forgot m5"),
         "the member it is about may"
     );
 }
@@ -1920,7 +1985,12 @@ async fn a_delegated_admin_manages_ordinary_members_of_its_group() {
 async fn a_delegated_admin_has_no_reach_outside_its_group() {
     let rig = rig().await;
     rig.say(OWNER, "/admin add", &[ADAM]).await;
-    for text in ["/who", "/note add hi", "/name add Bobby", "/forget 1"] {
+    for text in [
+        "/memory",
+        "/memory add hi",
+        "/memory name Bobby",
+        "/memory forget all",
+    ] {
         assert_eq!(
             rig.say_in(901, ADAM, text, &[BOB]).await,
             OWN_ONLY,
@@ -1932,7 +2002,7 @@ async fn a_delegated_admin_has_no_reach_outside_its_group() {
     rig.say_in(901, OWNER, "/link", &[ADAM, CAROL]).await;
     rig.say(OWNER, "/link", &[ADAM, ALICE]).await;
     for sender in [CAROL, ALICE] {
-        assert_eq!(rig.say(sender, "/note add hi", &[BOB]).await, OWN_ONLY);
+        assert_eq!(rig.say(sender, "/memory add hi", &[BOB]).await, OWN_ONLY);
     }
 }
 
@@ -1940,13 +2010,7 @@ async fn a_delegated_admin_has_no_reach_outside_its_group() {
 async fn a_delegated_admin_takes_no_owner_level_action() {
     let rig = rig().await;
     rig.say(OWNER, "/admin add", &[ADAM]).await;
-    for text in [
-        "/tasks",
-        "/runs",
-        "/logs",
-        "/stats global",
-        "/forget group 1",
-    ] {
+    for text in ["/tasks", "/runs", "/logs", "/stats global"] {
         assert_eq!(
             rig.say(ADAM, text, &[]).await,
             "Only a bot owner can do this.",
@@ -1975,8 +2039,14 @@ async fn a_delegated_admin_cannot_manage_bot_owners_or_other_admins() {
     let rig = rig().await;
     rig.say(OWNER, "/admin add", &[ADAM]).await;
     rig.say(OWNER, "/admin add", &[AVA]).await;
+    let owners = rig.remember(Some(OWNER), None, "likes chess", 1).await;
     for target in [OWNER, AVA] {
-        for text in ["/who", "/note", "/note add hi", "/name add X", "/forget 1"] {
+        for text in [
+            "/memory",
+            "/memory add hi",
+            "/memory name X",
+            "/memory forget all",
+        ] {
             assert_eq!(
                 rig.say(ADAM, text, &[target]).await,
                 ADMIN_TARGET,
@@ -1988,8 +2058,20 @@ async fn a_delegated_admin_cannot_manage_bot_owners_or_other_admins() {
     rig.say(OWNER, "/link", &[OWNER, CAROL]).await;
     rig.say(OWNER, "/link", &[AVA, BOB]).await;
     for target in [CAROL, BOB] {
-        assert_eq!(rig.say(ADAM, "/note add hi", &[target]).await, ADMIN_TARGET);
+        assert_eq!(
+            rig.say(ADAM, "/memory add hi", &[target]).await,
+            ADMIN_TARGET
+        );
     }
+    assert_eq!(
+        rig.say(ADAM, &format!("/memory forget {}", owners.label()), &[])
+            .await,
+        format!(
+            "There is no entry {} you can change here. Send /memory to see the list.",
+            owners.label()
+        ),
+        "by its id neither"
+    );
     assert_eq!(
         rig.say(ADAM, "/block add", &[BOB]).await,
         "Delegated admins can block only ordinary members, not other delegated admins."
@@ -2000,14 +2082,14 @@ async fn a_delegated_admin_cannot_manage_bot_owners_or_other_admins() {
     );
     // An admin still manages themselves.
     assert_eq!(
-        rig.say(ADAM, "/note add my own note", &[]).await,
-        "Added note 1 about Adam."
+        rig.say(ADAM, "/memory add my own note", &[]).await,
+        "Added m2 about Adam."
     );
     // In a muted group none of it is answered.
     rig.say(OWNER, "/mute on", &[]).await;
     assert!(
         rig.router
-            .respond(&rig.request(ADAM, "/note add hi", &[ALICE]))
+            .respond(&rig.request(ADAM, "/memory add hi", &[ALICE]))
             .await
             .is_none()
     );
@@ -2017,24 +2099,24 @@ async fn a_delegated_admin_cannot_manage_bot_owners_or_other_admins() {
 async fn bot_owners_keep_full_authority_over_everyone() {
     let rig = rig().await;
     rig.say(OWNER, "/admin add", &[ADAM]).await;
-    rig.say(ADAM, "/note add written by an admin", &[ALICE])
+    rig.say(ADAM, "/memory add written by an admin", &[ALICE])
         .await;
     assert_eq!(
-        rig.say(OWNER, "/note remove 1", &[ALICE]).await,
-        "Removed note 1: written by an admin"
+        rig.say(OWNER, "/memory forget m1", &[]).await,
+        "Forgot m1: written by an admin. It will not be learned again."
     );
     assert_eq!(
-        rig.say(OWNER, "/note add about an admin", &[ADAM]).await,
-        "Added note 1 about Adam."
+        rig.say(OWNER, "/memory add about an admin", &[ADAM]).await,
+        "Added m2 about Adam."
     );
     assert!(
-        rig.say(OWNER, "/who", &[ADAM])
+        rig.say(OWNER, "/memory", &[ADAM])
             .await
-            .contains("Account record | Adam")
+            .starts_with("What I know about Adam")
     );
     assert_eq!(
-        rig.say(OWNER, "/name add Ad", &[ADAM]).await,
-        "Recorded: Adam is also called \"Ad\"."
+        rig.say(OWNER, "/memory name Ad", &[ADAM]).await,
+        "Added m3: Adam is also called \"Ad\"."
     );
     assert!(
         rig.say(OWNER, "/block add", &[ADAM])
@@ -2042,9 +2124,9 @@ async fn bot_owners_keep_full_authority_over_everyone() {
             .starts_with("Blocked replies to Adam")
     );
     assert!(
-        rig.say_in(901, OWNER, "/who", &[ALICE])
+        rig.say_in(901, OWNER, "/memory", &[ALICE])
             .await
-            .contains("Account record | Alice")
+            .starts_with("What I know about Alice")
     );
 }
 

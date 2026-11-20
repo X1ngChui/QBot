@@ -77,24 +77,20 @@ carry_lines = 90
 [memory]
 # When each group's batch runs, in bot.timezone, written as /tasks --every writes a rule
 # (daily@HH:MM, days@HH:MM, an interval). The batch reads everything said since the previous one,
-# divides it into episodes, records the names and memories it holds, rules on names nobody could
-# place and reads earlier episodes again. It is the only time these change (besides members' own
-# commands), so pick a quiet hour; at a provider's off-peak hours it also costs less.
+# divides it into episodes, and updates what is known about the members and the group (names and
+# statements). It is the only time these change (besides members' /memory commands), so pick a
+# quiet hour; at a provider's off-peak hours it also costs less.
 batch = "daily@04:00"
-# Episodes whose names and memories an earlier version read are read again by the current one,
-# this many in each group's batch, the oldest first, until none is left. Each is one model call.
-# 0 leaves earlier chat as it was read.
-reread_per_batch = 10
 # Memories about the group (its terms, what it is about) every reply is shown, the most worth
 # first. The block is part of every reply's cached prefix.
 group_memories = 40
 # Memories every run is shown per member of its conversation (who wrote or was mentioned in its
-# newest lines), the most worth first; the rest stay kept and reach /who, about_member and the
-# extractor.
+# newest lines), the most worth first, after everything entered by hand about them; the rest stay
+# kept and reach /memory, about_member and the batch.
 person_memories = 8
 # The roster every reply's cached prefix lists (what members are shown as, the names people use
-# for them): members who spoke within this many days, or are linked, blocked or have a name set
-# with /name; at most roster_people people, the most recently active first.
+# for them): members who spoke within this many days, or are linked, blocked or have a name entered
+# by hand; at most roster_people people, the most recently active first.
 roster_days = 30
 roster_people = 80
 

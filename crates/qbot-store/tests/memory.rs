@@ -13,7 +13,7 @@ use qbot_llm::FakeEmbedder;
 use qbot_llm::fake::{FakeProvider, FakeReply, Step};
 use qbot_memory::identity::IdentityPolicy;
 use qbot_memory::{BatchReader, EpisodeJobs, EpisodeStore, Recall, RecallParams};
-use qbot_store::{Appended, NewLine, NewSpeaker, PgArchive, PgEpisodeStore, PgIdentityStore};
+use qbot_store::{Appended, NewLine, NewSpeaker, PgArchive, PgIdentityStore, PgMemoryStore};
 use serde_json::json;
 use sqlx::Row;
 
@@ -246,13 +246,19 @@ async fn identity_stays_consistent_under_concurrency() {
 // ----- episodes on Postgres -----
 
 #[tokio::test]
-async fn the_postgres_episode_store_satisfies_the_episode_store_contract() {
+async fn the_postgres_store_satisfies_the_store_contracts() {
+    use qbot_memory::IdentityStore;
     let db = db!();
-    qbot_memory::conformance::run(&PgEpisodeStore::new(
-        db.pool().clone(),
-        ManualClock::new(T0),
-    ))
-    .await;
+    // What is known is about accounts the store has seen.
+    let identity = PgIdentityStore::new(db.pool().clone(), IdentityPolicy::default());
+    for account in 1..=40 {
+        identity
+            .seen(AccountId::new(account).unwrap(), UnixMillis::new(T0))
+            .await
+            .unwrap();
+    }
+    let store = PgMemoryStore::new(db.pool().clone(), ManualClock::new(T0));
+    qbot_memory::conformance::run(&store, &store).await;
     db.drop_db().await;
 }
 
@@ -260,7 +266,7 @@ async fn the_postgres_episode_store_satisfies_the_episode_store_contract() {
 async fn two_workers_storing_the_same_range_cannot_both_store_it() {
     use qbot_memory::conformance::episode;
     let db = db!();
-    let store = Arc::new(PgEpisodeStore::new(db.pool().clone(), ManualClock::new(T0)));
+    let store = Arc::new(PgMemoryStore::new(db.pool().clone(), ManualClock::new(T0)));
     let tasks: Vec<_> = (0..8)
         .map(|_| {
             let store = store.clone();
@@ -297,7 +303,7 @@ async fn two_workers_storing_the_same_range_cannot_both_store_it() {
 async fn pgvector_ranks_by_cosine_distance_in_a_real_exact_scan() {
     use qbot_memory::conformance::episode;
     let db = db!();
-    let store = PgEpisodeStore::new(db.pool().clone(), ManualClock::new(T0));
+    let store = PgMemoryStore::new(db.pool().clone(), ManualClock::new(T0));
     let g = group(1);
     for (i, v) in [
         [1.0f32, 0.0, 0.0],
@@ -336,7 +342,7 @@ async fn deleting_an_episode_removes_its_embedding_and_lines_carry_member_number
     use qbot_memory::conformance::episode;
     let db = db!();
     let archive = PgArchive::new(db.pool().clone());
-    let store = PgEpisodeStore::new(db.pool().clone(), ManualClock::new(T0));
+    let store = PgMemoryStore::new(db.pool().clone(), ManualClock::new(T0));
     let g = group(1);
     archive.append(member(g, 1, 10, "from ten")).await.unwrap();
     archive
@@ -458,10 +464,11 @@ async fn lines_become_episodes_which_recall_finds_and_read_episode_opens() {
             .unwrap();
     }
 
-    let store = Arc::new(PgEpisodeStore::new(db.pool().clone(), clock.clone()));
+    let store = Arc::new(PgMemoryStore::new(db.pool().clone(), clock.clone()));
     let fake = Arc::new(FakeProvider::new(batch_answers()));
     let embedder = Arc::new(FakeEmbedder::new(64));
     let job = EpisodeJobs::new(
+        store.clone(),
         store.clone(),
         BatchReader::new(fake.clone(), "English"),
         embedder.clone(),
@@ -623,37 +630,6 @@ async fn lines_become_episodes_which_recall_finds_and_read_episode_opens() {
     db.drop_db().await;
 }
 
-#[tokio::test]
-async fn the_postgres_name_and_memory_stores_satisfy_their_contracts() {
-    use qbot_memory::IdentityStore;
-    let db = db!();
-    let identity = PgIdentityStore::new(db.pool().clone(), IdentityPolicy::default());
-    for account in 1..=40 {
-        identity
-            .seen(AccountId::new(account).unwrap(), UnixMillis::new(T0))
-            .await
-            .unwrap();
-    }
-    qbot_memory::names_conformance::run(&qbot_store::PgNameStore::new(db.pool().clone())).await;
-    qbot_memory::memories_conformance::run(&qbot_store::PgMemoryStore::new(db.pool().clone()))
-        .await;
-    db.drop_db().await;
-}
-
-#[tokio::test]
-async fn the_postgres_note_store_satisfies_the_note_contract() {
-    use qbot_memory::IdentityStore;
-    let db = db!();
-    let identity = PgIdentityStore::new(db.pool().clone(), IdentityPolicy::default());
-    let accounts = [601, 602, 603].map(|n| AccountId::new(n).unwrap());
-    for account in accounts {
-        identity.seen(account, UnixMillis::new(T0)).await.unwrap();
-    }
-    qbot_memory::notes_conformance::run(&qbot_store::PgNoteStore::new(db.pool().clone()), accounts)
-        .await;
-    db.drop_db().await;
-}
-
 // ----- member numbers and the people of a group -----
 
 /// Each account's number in `g`, read straight from the table.
@@ -712,13 +688,7 @@ async fn a_member_number_survives_everything_that_happens_to_its_account() {
         .unwrap();
     policy.block(g, account(602), None).await.unwrap();
     policy.unblock(g, account(602)).await.unwrap();
-    {
-        use qbot_memory::NameStore;
-        qbot_store::PgNameStore::new(db.pool().clone())
-            .set(g, "Tester", &[account(601)], UnixMillis::new(T0))
-            .await
-            .unwrap();
-    }
+    hand_name(&db, g, account(601), "Tester", UnixMillis::new(T0)).await;
     for i in 0..5 {
         archive
             .append(member(g, 10 + i, 601, "more"))
@@ -745,14 +715,13 @@ async fn a_member_number_survives_everything_that_happens_to_its_account() {
 
 #[tokio::test]
 async fn the_roster_lists_who_is_who_in_its_group_only() {
-    use qbot_memory::{EpisodeId, IdentityStore, NameStore, Reference};
-    use qbot_store::{PgNameStore, RosterSettings};
+    use qbot_memory::IdentityStore;
+    use qbot_store::RosterSettings;
     let db = db!();
     let clock = ManualClock::new(T0);
     let archive = PgArchive::new(db.pool().clone());
     let identity = PgIdentityStore::new(db.pool().clone(), IdentityPolicy::default());
     let policy = qbot_store::PgGroupPolicy::new(db.pool().clone(), clock.clone());
-    let names = PgNameStore::new(db.pool().clone());
     let (g, other) = (group(60), group(61));
     let account = |n: i64| AccountId::new(n).unwrap();
     const DAY: i64 = 86_400_000;
@@ -828,22 +797,10 @@ async fn the_roster_lists_who_is_who_in_its_group_only() {
     );
 
     // Names people use, each under its member, only this group's.
-    names.set(g, "Boss", &[account(702)], now).await.unwrap();
-    names
-        .set(other, "Elsewhere", &[account(701)], now)
-        .await
-        .unwrap();
-    let used = |episode: i64| {
-        Reference::of(
-            account(701),
-            account(702),
-            "Annie",
-            EpisodeId::new(episode),
-            MessageId::new(episode).unwrap(),
-            now,
-        )
-    };
-    names.record(g, &[used(1), used(2)]).await.unwrap();
+    hand_name(&db, g, account(702), "Boss", now).await;
+    hand_name(&db, other, account(701), "Elsewhere", now).await;
+    // Two conversations in which 702 called 701 "Annie".
+    used_name(&db, g, account(701), account(702), "Annie", now, 2).await;
     identity
         .link(g, account(701), account(702), now)
         .await
@@ -877,7 +834,7 @@ async fn the_roster_lists_who_is_who_in_its_group_only() {
     // anyone asked for.
     let later = UnixMillis::new(T0 + 40 * DAY);
     policy.block(g, account(704), None).await.unwrap();
-    names.set(g, "Cee", &[account(703)], later).await.unwrap();
+    hand_name(&db, g, account(703), "Cee", later).await;
     let members = |people: &qbot_store::GroupPeople| {
         people
             .people
@@ -942,4 +899,92 @@ async fn the_roster_lists_who_is_who_in_its_group_only() {
         "the same records give the same roster"
     );
     db.drop_db().await;
+}
+
+/// A name entered by hand for `account`.
+async fn hand_name(db: &TestDb, g: GroupId, account: AccountId, name: &str, at: UnixMillis) {
+    use qbot_memory::{HandMemory, Kind, MemoryStore};
+    PgMemoryStore::new(db.pool().clone(), ManualClock::new(T0))
+        .add(
+            g,
+            &HandMemory {
+                subject: Some(account),
+                kind: Kind::Name,
+                term: None,
+                text: name.into(),
+                by: account,
+                at,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// A name `speaker` used for `account` in `conversations` episodes, stored as a batch stores it.
+async fn used_name(
+    db: &TestDb,
+    g: GroupId,
+    account: AccountId,
+    speaker: AccountId,
+    name: &str,
+    at: UnixMillis,
+    conversations: u64,
+) {
+    use qbot_memory::memories::{Changes, Commit, NewMemory, NewObservation, Obs, Op, Target};
+    use qbot_memory::{About, Durability, Grounds, Kind, MemoryStore, NameBasis, Origin, Said};
+    let mut ops = vec![Op::Create(NewMemory {
+        subject: Some(account),
+        kind: Kind::Name,
+        with: None,
+        term: None,
+        text: name.into(),
+        durability: Durability::Lasting,
+        origin: Origin::Chat,
+        at,
+    })];
+    let mut episodes = Vec::new();
+    let mut observations = Vec::new();
+    for n in 0..conversations {
+        let ordinal = 10_000 + n;
+        episodes.push((
+            qbot_memory::conformance::episode(g, ordinal, ordinal, "names"),
+            vec![1.0, 0.0],
+            "m".to_owned(),
+        ));
+        observations.push(NewObservation {
+            episode: n as usize,
+            message: MessageId::new(ordinal as i64).unwrap(),
+            ordinal,
+            author: speaker,
+            quote: name.into(),
+            at,
+            about: About::Member(account),
+            said: Said::Name {
+                text: name.into(),
+                basis: NameBasis::Addressed,
+                grounds: Grounds::Marker,
+                anchored: false,
+                shown_by: Vec::new(),
+            },
+        });
+        ops.push(Op::Support {
+            obs: Obs::New(n as usize),
+            memory: Target::Created(0),
+        });
+    }
+    PgMemoryStore::new(db.pool().clone(), ManualClock::new(T0))
+        .commit(&Commit {
+            group: g,
+            read: at,
+            at,
+            episodes,
+            skipped: None,
+            observations,
+            changes: vec![Changes {
+                subject: Some(account),
+                ops,
+            }],
+        })
+        .await
+        .unwrap();
 }

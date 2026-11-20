@@ -10,11 +10,10 @@ use qbot_agent::{
 use qbot_context::{ChatLine, Instruction, InstructionRole, Speaker};
 use qbot_core::marker::{RECALLED, escape_markers};
 use qbot_core::{AccountId, Clock, GroupId, HistoryWindow, MemberNo, UnixMillis};
-use qbot_memory::memories::{Memory, MemoryState, MemoryStore};
-use qbot_memory::worth::{Activity, as_of_day};
+use qbot_memory::memories::{About, Kind, Memory, MemoryState, MemoryStore, Said};
+use qbot_memory::worth::Activity;
 use qbot_memory::{
-    Background, EpisodeStore, HistoryPart, MemoryError, NameStore, NoteStore, SliceBackground,
-    SliceMember, compose,
+    Background, EpisodeStore, HistoryPart, MemoryError, SliceBackground, SliceMember, compose,
 };
 use qbot_store::{GroupPeople, PgArchive, RosterSettings};
 use qbot_tools::{MemberRecord, MemberRecords};
@@ -119,10 +118,9 @@ impl PeopleSource for ArchivePeople {
     }
 }
 
-/// What the bot remembers and what members wrote, and how much of it a run is shown.
+/// What the bot knows about people and the group, and how much of it a run is shown.
 struct Records {
     memories: Arc<dyn MemoryStore>,
-    notes: Arc<dyn NoteStore>,
     view: MemoryView,
 }
 
@@ -150,7 +148,6 @@ const PEOPLE_HERE_LINES: usize = 50;
 pub struct PromptContext {
     people: Option<Arc<dyn PeopleSource>>,
     records: Option<Records>,
-    names: Option<Arc<dyn NameStore>>,
     directory: Option<Arc<dyn Directory>>,
     episodes: Option<Arc<dyn EpisodeStore>>,
     history: Arc<dyn HistorySource>,
@@ -187,7 +184,6 @@ impl PromptContext {
         Ok(Self {
             people: None,
             records: None,
-            names: None,
             directory: None,
             episodes: None,
             history,
@@ -217,26 +213,10 @@ impl PromptContext {
         self
     }
 
-    /// Show every run what is remembered: the group's memories in the cached prefix, and the
-    /// memories and notes of the people in its chat in its opening note.
-    pub fn with_memories(
-        mut self,
-        memories: Arc<dyn MemoryStore>,
-        notes: Arc<dyn NoteStore>,
-        view: MemoryView,
-    ) -> Self {
-        self.records = Some(Records {
-            memories,
-            notes,
-            view,
-        });
-        self
-    }
-
-    /// Tell the extractor which names the group uses for someone nobody could place yet, so
-    /// every further use of them is recorded.
-    pub fn with_names(mut self, names: Arc<dyn NameStore>) -> Self {
-        self.names = Some(names);
+    /// Show every run what is known: the group's memories in the cached prefix, and the
+    /// memories of the people in its chat in its opening note.
+    pub fn with_memories(mut self, memories: Arc<dyn MemoryStore>, view: MemoryView) -> Self {
+        self.records = Some(Records { memories, view });
         self
     }
 
@@ -394,11 +374,11 @@ impl PromptContext {
     /// record does or with the day, so it sits in the cached prefix. What members wrote or were
     /// called is escaped like chat and kept on its line.
     fn people_instruction(&self, people: &GroupPeople) -> Result<Option<Instruction>, EnvError> {
-        let owners = NameIndex::of(people);
+        let names_shown = NameIndex::of(people);
         let entries: Vec<String> = people
             .people
             .iter()
-            .filter_map(|p| roster_entry(&self.zone, p, &owners))
+            .filter_map(|p| roster_entry(&self.zone, p, &names_shown))
             .collect();
         if entries.is_empty() {
             return Ok(None);
@@ -426,7 +406,7 @@ impl PromptContext {
         let env = |e: MemoryError| EnvError(e.to_string());
         let memories = records
             .memories
-            .current(group, &[None])
+            .current(group, &[None], Kind::Statement)
             .await
             .map_err(env)?;
         if memories.is_empty() {
@@ -567,9 +547,9 @@ impl PromptContext {
             .join("\n")
     }
 
-    /// What is remembered about the people `here` and what members wrote about them: for each,
-    /// the notes and the memories most worth showing, as of the start of the day. Empty when
-    /// nothing is kept about any of them.
+    /// What is known about the people `here`: for each, what was entered by hand and the
+    /// memories from chat most worth showing, as of the group's last batch. Empty when nothing
+    /// is kept about any of them.
     async fn memories_here(
         &self,
         group: GroupId,
@@ -582,19 +562,17 @@ impl PromptContext {
             return Ok(String::new());
         }
         let env = |e: MemoryError| EnvError(e.to_string());
-        let accounts: Vec<AccountId> = here.values().copied().collect();
-        let subjects: Vec<Option<AccountId>> = accounts.iter().copied().map(Some).collect();
+        let subjects: Vec<Option<AccountId>> = here.values().copied().map(Some).collect();
         let memories = records
             .memories
-            .current(group, &subjects)
+            .current(group, &subjects, Kind::Statement)
             .await
             .map_err(env)?;
-        let notes = records.notes.notes(group, &accounts).await.map_err(env)?;
-        if memories.is_empty() && notes.is_empty() {
+        if memories.is_empty() {
             return Ok(String::new());
         }
         let activity = self.activity(group).await.map_err(env)?;
-        let as_of = as_of_day(self.clock.now());
+        let as_of = self.as_of(group).await?;
         let mut entries = Vec::new();
         for (number, account) in here {
             let mine: Vec<Memory> = memories
@@ -602,34 +580,21 @@ impl PromptContext {
                 .filter(|m| m.subject == Some(*account))
                 .cloned()
                 .collect();
-            let theirs: Vec<String> = notes
-                .iter()
-                .filter(|n| n.account == *account)
-                .map(|n| {
-                    say(Text::PromptPersonNote {
-                        text: line(&n.text),
-                        date: date(&self.zone, n.updated),
-                    })
-                })
-                .collect();
-            if mine.is_empty() && theirs.is_empty() {
+            if mine.is_empty() {
                 continue;
             }
             entries.push(say(Text::PromptMemoryPerson {
                 member: number.get().to_string(),
             }));
-            if !theirs.is_empty() {
-                entries.push(say(Text::PromptPersonNotes {
-                    notes: theirs.join("; "),
-                }));
-            }
+            // What a person entered by hand is always shown; it ranks first.
+            let by_hand = mine.iter().filter(|m| m.origin.is_hand()).count();
             entries.extend(
                 records
                     .view
                     .half_lives
                     .ranked(&mine, &activity, as_of)
                     .into_iter()
-                    .take(records.view.person_memories)
+                    .take(by_hand + records.view.person_memories)
                     .map(|m| memory_item(&self.zone, m)),
             );
         }
@@ -861,15 +826,38 @@ impl ContextSource for PromptContext {
     }
 }
 
-/// Names nobody could place that the extractor is told about: the ones a ruling waits on, the
-/// most used first; more would crowd the people the lines involve.
+/// Names nobody could place that the batch is told about, the most used first; more would
+/// crowd the people the lines involve.
 const OPEN_NAMES_SHOWN: usize = 12;
 
-/// What the extractor is told about a slice: the involved members as the group knows them (the
-/// display names their lines were sent under, the names people use for them, linked accounts, a
-/// block, what is remembered about them with ids) and what the group is (the bot's names, the
-/// operator's background, what is remembered about the group with ids). Notes are left out:
-/// they are what members wrote about each other, not needed to read a conversation.
+/// The names pending uses were made of nobody could place, the most used first, as last
+/// written.
+fn open_names_shown(pending: &[qbot_memory::Observation]) -> Vec<String> {
+    let mut seen: BTreeMap<String, (usize, String)> = BTreeMap::new();
+    for one in pending {
+        if let (About::Name(_), Said::Name { text, .. }) = (&one.about, &one.said) {
+            let entry = seen
+                .entry(qbot_memory::name_key(text).unwrap_or_default())
+                .or_insert((0, text.clone()));
+            entry.0 += 1;
+            entry.1 = text.clone();
+        }
+    }
+    let mut open: Vec<(usize, String, String)> = seen
+        .into_iter()
+        .map(|(key, (count, text))| (count, key, text))
+        .collect();
+    open.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    open.into_iter()
+        .take(OPEN_NAMES_SHOWN)
+        .map(|(_, _, text)| text)
+        .collect()
+}
+
+/// What the batch is told about the lines it reads: the involved members as the group knows them
+/// (the display names their lines were sent under, the names people use for them, linked
+/// accounts, a block, what is known about them with ids) and what the group is (the bot's names,
+/// the operator's background, what is known about the group with ids).
 #[async_trait]
 impl SliceBackground for PromptContext {
     async fn background(
@@ -908,11 +896,16 @@ impl SliceBackground for PromptContext {
             .roster(group, self.clock.now(), &accounts)
             .await
             .map_err(backend)?;
-        let owners = NameIndex::of(&people);
+        let names_shown = NameIndex::of(&people);
         let mut subjects: Vec<Option<AccountId>> = accounts.iter().copied().map(Some).collect();
         subjects.push(None);
         let memories = match &self.records {
-            Some(records) => records.memories.current(group, &subjects).await?,
+            Some(records) => {
+                records
+                    .memories
+                    .current(group, &subjects, Kind::Statement)
+                    .await?
+            }
             None => Vec::new(),
         };
         let activity = self.activity(group).await?;
@@ -922,7 +915,6 @@ impl SliceBackground for PromptContext {
             .map(|r| r.view.half_lives)
             .unwrap_or_default();
         let until = self.clock.now();
-        let mut known = Vec::new();
 
         let mut entries = Vec::new();
         for (number, account, shown) in &involved {
@@ -947,8 +939,8 @@ impl SliceBackground for PromptContext {
                 let names: Vec<String> = person
                     .names
                     .iter()
-                    .filter(|n| Some(n.account) == *account && owners.shows(n))
-                    .map(|n| name_entry(&self.zone, n, &owners, &own))
+                    .filter(|n| Some(n.account) == *account && names_shown.shows(n))
+                    .map(|n| name_entry(&self.zone, n))
                     .collect();
                 if !names.is_empty() {
                     details.push(say(Text::ExtractBackgroundCalled {
@@ -978,8 +970,7 @@ impl SliceBackground for PromptContext {
                     details: details.join("; "),
                 })
             });
-            // Every current memory, the most worth first: any of them can be confirmed, changed
-            // or ended.
+            // Every current memory, the most worth first.
             if let Some(account) = account {
                 let mine: Vec<Memory> = memories
                     .iter()
@@ -989,7 +980,6 @@ impl SliceBackground for PromptContext {
                 if !mine.is_empty() {
                     entries.push(say(Text::ExtractBackgroundRemembered {}));
                     for memory in half_lives.ranked(&mine, &activity, until) {
-                        known.push((memory.id, memory.subject));
                         entries.push(background_item(&self.zone, memory));
                     }
                 }
@@ -1001,7 +991,6 @@ impl SliceBackground for PromptContext {
         let mut others = Vec::new();
         let mut other_accounts = Vec::new();
         for person in &people.people {
-            let own: Vec<MemberNo> = person.members.iter().map(|(n, _)| *n).collect();
             for (number, account) in &person.members {
                 if involved_numbers.contains(&number.get()) {
                     continue;
@@ -1021,8 +1010,8 @@ impl SliceBackground for PromptContext {
                 let names: Vec<String> = person
                     .names
                     .iter()
-                    .filter(|n| n.account == *account && owners.shows(n))
-                    .map(|n| name_entry(&self.zone, n, &owners, &own))
+                    .filter(|n| n.account == *account && names_shown.shows(n))
+                    .map(|n| name_entry(&self.zone, n))
                     .collect();
                 if !names.is_empty() {
                     details.push(say(Text::ExtractBackgroundCalled {
@@ -1050,13 +1039,13 @@ impl SliceBackground for PromptContext {
                 entries: others.join("\n"),
             }));
         }
-        if let Some(names) = &self.names {
-            let open = names.open(group, OPEN_NAMES_SHOWN).await?;
+        if let Some(records) = &self.records {
+            let open = open_names_shown(&records.memories.pending(group).await?);
             if !open.is_empty() {
                 sections.push(say(Text::ExtractBackgroundOpen {
                     names: open
                         .iter()
-                        .map(|o| format!("\"{}\"", line(&o.text)))
+                        .map(|name| format!("\"{}\"", line(name)))
                         .collect::<Vec<_>>()
                         .join(", "),
                 }));
@@ -1086,7 +1075,6 @@ impl SliceBackground for PromptContext {
         if !ours.is_empty() {
             about.push(say(Text::ExtractBackgroundGroupRemembered {}));
             for memory in half_lives.ranked(&ours, &activity, until) {
-                known.push((memory.id, None));
                 about.push(background_item(&self.zone, memory));
             }
         }
@@ -1103,13 +1091,13 @@ impl SliceBackground for PromptContext {
                 .filter_map(|(n, a, _)| a.map(|a| (*n, a)))
                 .chain(other_accounts)
                 .collect(),
-            known,
             ..Background::default()
         })
     }
 }
 
-/// `about_member`: everything kept about one member, from the same records replies use.
+/// `about_member` and `about_group`: everything kept about one member or about the group, from
+/// the same records replies use.
 #[async_trait]
 impl MemberRecords for PromptContext {
     async fn describe(
@@ -1131,7 +1119,7 @@ impl MemberRecords for PromptContext {
             .roster(group, self.clock.now(), &[account])
             .await
             .map_err(|e| e.0)?;
-        let owners = NameIndex::of(&people);
+        let names_shown = NameIndex::of(&people);
         let mut out = vec![format!("member:{}", member.get())];
         if let Some(person) = people
             .people
@@ -1153,8 +1141,8 @@ impl MemberRecords for PromptContext {
             let names: Vec<String> = person
                 .names
                 .iter()
-                .filter(|n| n.account == account && owners.shows(n))
-                .map(|n| name_entry(&self.zone, n, &owners, &own))
+                .filter(|n| n.account == account && names_shown.shows(n))
+                .map(|n| name_entry(&self.zone, n))
                 .collect();
             if !names.is_empty() {
                 out.push(say(Text::AboutMemberCalled {
@@ -1176,29 +1164,14 @@ impl MemberRecords for PromptContext {
         }
         let mut anything = out.len() > 1;
         if let Some(records) = &self.records {
-            let notes = records
-                .notes
-                .notes(group, &[account])
-                .await
-                .map_err(|e| e.to_string())?;
-            if !notes.is_empty() {
-                out.push(say(Text::AboutMemberNotes {}));
-                out.extend(notes.iter().map(|n| {
-                    format!(
-                        "  - {}",
-                        say(Text::PromptPersonNote {
-                            text: line(&n.text),
-                            date: date(&self.zone, n.updated),
-                        })
-                    )
-                }));
-                anything = true;
-            }
-            let all = records
+            let all: Vec<Memory> = records
                 .memories
                 .about(group, Some(account))
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .filter(|m| m.kind == Kind::Statement)
+                .collect();
             let current: Vec<Memory> = all.iter().filter(|m| m.is_current()).cloned().collect();
             if !current.is_empty() {
                 let activity = self.activity(group).await.map_err(|e| e.to_string())?;
@@ -1213,19 +1186,9 @@ impl MemberRecords for PromptContext {
                 );
                 anything = true;
             }
-            let mut closed: Vec<&Memory> = all.iter().filter(|m| !m.is_current()).collect();
-            closed.sort_by_key(|m| std::cmp::Reverse(closed_at(m)));
-            if !closed.is_empty() {
-                out.push(say(Text::AboutMemberHistory {}));
-                out.extend(closed.into_iter().map(|m| {
-                    let (text, date) = (line(&m.display()), date(&self.zone, closed_at(m)));
-                    say(match m.state {
-                        MemoryState::Replaced { .. } => Text::AboutMemberReplaced { text, date },
-                        _ => Text::AboutMemberEnded { text, date },
-                    })
-                }));
-                anything = true;
-            }
+            let before = out.len();
+            self.history_lines(&all, &mut out);
+            anything |= out.len() > before;
         }
         if !anything {
             out.push(say(Text::AboutMemberNothing {}));
@@ -1234,6 +1197,53 @@ impl MemberRecords for PromptContext {
             account,
             text: out.join("\n"),
         }))
+    }
+
+    async fn describe_group(&self, group: GroupId) -> Result<String, String> {
+        let mut out = Vec::new();
+        if let Some(records) = &self.records {
+            let all: Vec<Memory> = records
+                .memories
+                .about(group, None)
+                .await
+                .map_err(|e| e.to_string())?;
+            let current: Vec<Memory> = all.iter().filter(|m| m.is_current()).cloned().collect();
+            if !current.is_empty() {
+                let activity = self.activity(group).await.map_err(|e| e.to_string())?;
+                out.extend(
+                    records
+                        .view
+                        .half_lives
+                        .ranked(&current, &activity, self.clock.now())
+                        .into_iter()
+                        .map(|m| group_item(&self.zone, m)),
+                );
+            }
+            self.history_lines(&all, &mut out);
+        }
+        if out.is_empty() {
+            out.push(say(Text::AboutGroupNothing {}));
+        }
+        Ok(out.join("\n"))
+    }
+}
+
+impl PromptContext {
+    /// What no longer holds, the most recently closed first, as the record tools write it.
+    fn history_lines(&self, all: &[Memory], out: &mut Vec<String>) {
+        let mut closed: Vec<&Memory> = all.iter().filter(|m| !m.is_current()).collect();
+        closed.sort_by_key(|m| std::cmp::Reverse(closed_at(m)));
+        if closed.is_empty() {
+            return;
+        }
+        out.push(say(Text::AboutMemberHistory {}));
+        out.extend(closed.into_iter().map(|m| {
+            let (text, date) = (line(&m.display()), date(&self.zone, closed_at(m)));
+            say(match m.state {
+                MemoryState::Replaced { .. } => Text::AboutMemberReplaced { text, date },
+                _ => Text::AboutMemberEnded { text, date },
+            })
+        }));
     }
 }
 

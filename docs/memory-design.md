@@ -1,223 +1,183 @@
-# Active memory: design record
+# Memory: design record
 
-Why active memory (what QBot learns from group chat and brings into its own context unasked) is
-built the way [memory.md](memory.md) describes. Episodes and the archive are not the subject
-here; they are inputs. This record covers the requirements, what was measured, the alternatives
-weighed and the migration.
+Why memory (what QBot learns from group chat, and what people enter or remove by hand) is built
+the way [memory.md](memory.md) describes: the evidence, the requirements, the research, the
+decisions and what was rejected. Episodes and the archive are inputs here.
 
 ## 1. Evidence from the deployment
 
-Read-only aggregates over the production database (2026-11-03, 9 groups, 636 episodes):
+Read-only aggregates over the production database (counts only, no member text).
 
-- **Names.** 77 stored names: 2 set by a person, 75 learned from chat. 60 of the 75 rest on one
-  episode, 8 on two, 7 on three or more. In the busiest group 5 name texts point at two or three
-  accounts at once, every one a learned lead (evidence counts such as 1/8/12 or 1/2/2), and 15
-  accounts have more than one name (up to 8). Each was shown as an independent belief "about 67%
-  likely", so a name used twelve times for one member and once for another looked the same.
-- **Where names came from.** Of 122 name findings, 68 were taken from a line the named member
-  wrote and 54 from a line that @-mentions them; there was no check that the line actually uses
-  the name *for* that member (writing a name in your own line usually names someone else).
-- **Display names were never recorded.** Every message event carries the sender's group
-  nickname and account nickname, but only the live name was asked of the platform. The extractor
-  saw today's display name for lines written months ago, and nothing knew that a member was
-  shown as something else before, though members keep calling each other by old and shortened
-  display names.
-- **Facts.** 506 active member facts by 28 fixed predicates; 94% single-support, so almost
-  every fact showed the same "about 67% likely". The largest classes were `wants` and `uses`
-  (92 each), mostly passing wishes. 573 of 575 fact evidence lines were written by the subject.
-- **What every reply carried.** The people block listed everyone with a record (up to 29 people
-  in one group, 16 facts each), whoever was talking, in every run.
+- **Before the rework (2026-11-03, 9 groups, 636 episodes).** 77 stored names, 75 learned, 60 of
+  them on one episode; names shown as independent beliefs "about 67% likely". 506 member facts in
+  28 fixed predicates, 94% single-support; the largest classes were passing wishes. Display names
+  were never recorded, so nothing knew a member had been shown as something else before.
+- **Reference ledger (2026-11).** 3,900 references to members, 758 distinct (member, name) pairs
+  over 91 members, 38 names used for two or more members: names are a large share of what is
+  learned about people, and shared names are ordinary. Many learned names were wrong.
+- **Relations.** 3 of 766 current member memories, and 21 of 1,028 statements, named another
+  member; 129 of 452 group memories named a member, so names and group vocabulary overlapped.
+- **How the chat looks.** Lines per group-day: median 30, p90 388, max 1,521. 89% of replies
+  quote a line within 5 lines, 99% within 30, 0.6% one on an earlier day. 67% of member lines have
+  three or more speakers in the ten minutes before. Command lines 0.9%, bot lines 18%; three
+  group-days in the whole archive had chat on both sides of 04:00.
+- **Forgetting left no trace.** 11 past `/forget`s deleted rows without recording what was
+  forgotten, so nothing could keep it from being learned again.
 
 ## 2. Requirements
 
-Derived from what an AI member of a shared group chat needs, not from the existing design.
-
-1. **Reference.** When someone writes a name, the bot must be able to tell whom it means, and
-   when a name could mean several members, see that it could. Remembered things are always about
-   one member account (or the group), never about a name.
-2. **Grounding.** Every remembered item traces to the lines it came from: who said it, when, the
-   quote. Derived text never stands without its source.
-3. **Time.** Things change: a new statement must be able to replace an old one without erasing
-   that the old one was said; the bot must see how old something is.
-4. **Honest standing.** The model must see *why* it believes something (they said it
-   themselves, someone else said it, how often, how recently), not a number that looks precise.
-5. **Relevance.** A reply needs what matters to the people in the conversation, not everything
-   about everyone; anything else must be reachable on demand.
-6. **Correction and erasure.** Members see what is kept about them and remove it; removal deletes
-   the item and its evidence; a name a person removed stays removed.
-7. **Isolation.** Nothing learned in one group appears in, or influences, another.
-8. **Untrusted content.** Memory carries what members said: it is material, never instruction,
-   and never forms a marker.
-9. **Bounded.** Storage per member and per group, and the tokens memory adds to a run, are
-   bounded; what makes way follows the group's own conversation, not the calendar.
-10. **Cost.** No model call beyond the one extraction call per episode that already exists; the
-    cached prompt prefix stays stable within a day.
+1. **Durable over months.** Near-duplicates converge; what changes is replaced with history kept;
+   extraction mistakes are checked and correctable; growth is bounded.
+2. **Never half-applied.** A failed or repeated batch leaves the same state as one clean run.
+3. **People are authoritative.** What a person enters, corrects or forgets wins over anything
+   read from chat, now and later, in any wording.
+4. **Reference.** When someone writes a name, the bot can tell whom it means from the
+   conversation; what is remembered is about a member account or the group, never about a name.
+5. **Grounding and provenance.** Every learned item cites the lines it came from; readers see
+   where it comes from, not a probability.
+6. **Context.** Every model call sees the whole day it reads and what came before.
+7. **Relevance and isolation.** A reply carries what matters to the people talking; the rest is
+   on demand; nothing crosses groups.
+8. **Untrusted content.** Memory carries what members said: material, never instruction.
+9. **Simple and cheap.** As few mechanisms as hold up; a few extra calls a night on a cached
+   prefix at most.
 
 ## 3. Research
 
-- **Multi-party memory is its own problem.** GroupMemBench (2026) finds the best memory systems
-  at 46% on multi-party conversations, worst on knowledge updates (27%) and term ambiguity
-  (38%), and a BM25 baseline matching most of them: fact extraction "strips away the identity of
-  the speaker and the threading structure". SpeakerMem-R1 (2026) keeps speaker-labelled verbatim
-  messages beside derived per-person and per-group state and combines them at query time; its
-  ablations show the two tracks are complementary.
-- **Updates as history, not deletion.** Zep / Graphiti (Rasmussen et al. 2025) is bi-temporal:
-  a contradicted fact gets an invalidation time and is kept. Mem0 (Chhikara et al. 2025) began
-  with model-chosen ADD / UPDATE / DELETE / NOOP and has since moved to ADD-only with temporal
-  context, because UPDATE and DELETE destroyed history. MemoryAgentBench (ICLR 2026) shows
-  conflict resolution is where current methods fail most.
-- **Memory the agent maintains and the agent looks up.** MemGPT / Letta separate a small core
-  memory always in context from archival memory searched by tools; A-MEM links notes and lets new
-  ones revise old ones. Generative Agents rank records by recency, importance and relevance.
-- **Names in chat.** IRC studies (Ecker) find nicknames are mostly addressing markers, members
-  use several variants of one another's names, and which part of a name survives shortening is
-  unpredictable: names are matched against the current user list. Dickey (1997) separates forms
-  of address from terms of reference: a name used *to* someone and a name used *about* someone
-  are different evidence.
-- **Product practice.** ChatGPT and Claude both expose memory as items a person can see and
-  delete, separate from chat history; Claude scopes memory per project, which is the analogue of
-  per-group memory here.
+- **Updates as history.** Zep / Graphiti keeps contradicted facts with an invalidation time. Mem0
+  moved from model-chosen ADD / UPDATE / DELETE to add-only with temporal context, because
+  UPDATE and DELETE destroyed history. MemoryAgentBench finds conflict resolution is where memory
+  methods fail most, and a last-write resolver recovers much of it.
+- **Propose, verify, commit.** EGMemory separates proposing memory changes from verifying them
+  against evidence and committing them; HaluMem shows extraction and update errors compound
+  across stages, so each stage is checked before anything is written.
+- **Multi-party chat.** GroupMemBench finds memory systems at 46% on multi-party conversations
+  and a BM25 baseline matching most of them: fact extraction strips speaker identity and threading.
+  SpeakerMem-R1 keeps speaker-labelled messages beside per-person state. Tan et al. find models
+  lose track of who said what in multi-party chat; whole-context reading with a focused task
+  beats isolated slices (Lost in the Middle limits how much one call should be asked at once).
+- **Segmentation.** SeCom and Nemori segment conversations into topical units with every turn in
+  one unit; LightMem compresses inside units rather than dropping turns.
+- **Offline consolidation.** Sleep-time Compute moves consolidation off the request path; a
+  nightly batch is that.
+- **Graphs.** Graphiti resolves entities by name similarity (exact, MinHash, embedding) before a
+  model decides, with no notion of an alias; GraphRAG-Bench finds graphs help multi-hop reasoning
+  and underperform plain retrieval on simple lookup; Mem0's graph variant gained about 2% on
+  LoCoMo; mention-to-character linking in multi-party dialogue (SemEval-2018 Task 4) remains hard.
+- **Forgetting.** Deployment-time memorization and Agentic Unlearning show deleted content returns
+  through re-extraction and backflow (memory written into chat read back into memory) unless the
+  deletion is recorded and checked. Product memory (OpenAI) exposes items people can see and
+  delete. MINJA shows memory can be poisoned through ordinary interaction: what is remembered
+  stays material, never instruction.
+- **Sarcasm and jokes** are hard to detect (SarcasmBench); a decision may reject a statement as a
+  joke, and code does not try.
 
 ## 4. Decisions
 
-### 4.1 Identity: what the platform shows is evidence; names are a reference index
+### 4.1 One store, as a deliberately small temporal graph
 
-The platform's display name is the most reliable name evidence there is, so it is recorded: each
-member line keeps the display name it was sent under (`chat_line.sender_name`). From the archive
-the bot knows what each member is shown as now and was shown as before.
+Names, statements, group vocabulary and what people enter by hand are one table, `memory`:
+subject (a member or the group), an optional second member, kind (`name` or `statement`),
+origin (`chat`, `ruling`, `hand`), durability and validity (current, replaced by, ended). Nodes
+are members and the group only: identity comes from QQ accounts and `/link`, so people never
+need entity resolution. Edges are memories with a validity period and their evidence. There are
+no topic, event or outsider nodes and no predicate ontology: topics and events are episodes,
+which are time-bounded, summarized, found by similarity and never need merging.
 
-Names people use in conversation are not beliefs attached to an account but **uses**: "in this
-episode, this line used name X for member N, as their own name / addressing them / talking about
-them". A name is resolved by looking at all its uses together: `X` used in eight conversations
-for member 3 and once for member 7 is shown exactly so, and a name used for several members is
-marked as shared instead of being a confident claim about each. The basis of a use is checked in
-code against the line's structure: *self* only on the member's own line, *addressed* only on a line
-that @-mentions the member or replies to their message, *about* only on someone else's line. A name a
-person set (`/name`) is a use with basis *set*; a name a person removed is suppressed for that
-member until a person sets it again.
+A full knowledge graph was rejected. Our hard problem is whom a name means, which a graph's
+similarity-based entity resolution does not solve (a QQ nickname rarely resembles an account
+name); our reads are per person, not multi-hop; and everything relevant to one conversation fits
+in the prompt (a group has at most about a hundred people, each with at most 30 memories).
 
-A week of production showed where this still guessed: 16 of 23 learned uses were *about*, and 12
-of those came from lines that neither mention nor answer anyone, so only the extractor's reading
-tied the name to the member (and a line that mentions someone can as well be naming a third
-person). A name others use is therefore shown to a model only with an anchor (set by a person,
-given by the member, answered to by the member, or part of their display name), or once two
-conversations used it for that member and nobody else has a claim to it. Unanchored uses are
-still recorded: dropping them would make a nickname unrelated to any display name unlearnable.
+### 4.2 Observations are added; decisions are made once a night, per subject
 
-### 4.1a Names and profiles are one reading: the reference ledger
+Each episode's reading only lists observations: a name use or a statement, its line, author and
+quote. It decides nothing about existing memories. After all episodes are read, one call per
+subject sees its memories with ids (current and closed), what was forgotten, and every statement
+about it from the day in chat order, and decides each once: support, new, replace, end, reject
+with a reason, or merge. The latest sincere statement wins; what it changed is kept as history.
+Code verifies and never judges: ids, one decision each, and the authority rule (hand entries are
+never closed by chat; only a member's own word closes what they said about themselves or ends
+their name).
 
-Measured on the production archive (counts only), of the lines in which another member writes a
-name the group already knows for someone, 11% reply to or @-mention that member, 19% are said
-to someone else, and 69% carry no reply or @ at all; 16 of the 40 members named that way are never
-named on a line that points at them. Learning names from reply/@ structure alone is precise but
-misses most real address, and "the named member speaks next" is barely above what they do after
-any line (27% against 13% when they had been silent). Deciding whether a later line answers an
-earlier one is itself a semantic judgement, so it is made by the model reading the conversation,
-not by a distance rule.
+Names are formed by code, keyed by their normalized text, with no model merging. A name nobody
+could place is held under the name until a ruling places it, then its uses and statements are
+filed with the member.
 
-Names and what is known about people draw on the same evidence (who speaks, who answers whom,
-what is said of a person, how they are addressed), so one reading records both: for every place a
-member's words name a person, a **reference** (the expression, who is meant or `unknown`, how
-the line uses it, and what showed it: a marker, an answer the model points at, content that fits
-one person, the speaker's own word, or a name already listed), and the statements about people
-beside it. Code checks what the lines can check: the expression is in the member's own words, a
-marker is really there, an answer is a line that person wrote.
+### 4.3 The whole day in every call; one commit per group
 
-Semantics is allowed in reading a conversation and in judging across conversations, never in
-accepting a name from one line. A name is shown when something outside the reading ties it to the
-member (set, their own word, a marker or their reply, a display name), when separate
-conversations agree and at least one of them showed it in the chat rather than by what is already
-believed (a name resting only on fitting someone's profile would confirm itself), or when a
-**ruling** places it: an expression several conversations used for someone none of them could
-place is put to a model with its uses side by side and the roster with what is remembered; a
-ruling for a member must cite lines that were shown. A statement about a person known only by an
-unplaced name is **held** and filed under the member once the name is theirs.
+Every call of a group's batch starts with the same cached prefix: instructions, group state,
+the eight newest summaries and the lines before, and the whole day. Each call then asks one
+focused thing. All calls come first; then one transaction writes episodes, observations, memory
+changes, room and the batch time. A failure writes nothing; a rerun after the commit finds
+nothing new. This replaced the "stored but not applied" recovery and re-reading old episodes.
 
-A knowledge graph was considered and rejected: its entity merging resolves aliases mainly by
-surface similarity, which a QQ nickname rarely has with an account name; it stores triples that
-lose the wording a reader needs; and it ties facts to episodes rather than lines. Here members
-are entities by account id, the only merge is "the person called X is member N", which is a
-reversible ruling that re-points references, and every name and claim cites lines.
+The model divides the day into contiguous episodes with every line once: the check guards against
+truncated or lazy output, and extraction does not depend on the boundaries. Skipping lines and
+holding back an unfinished conversation were rejected: real noise is rare (0.8% sticker-only
+lines) and conversations almost never cross 04:00. A backlog is read a day at a time; a day too
+long is split at its longest silence. Command traffic is left out by code: `/memory` replies print
+what is known and must not be read back into it.
 
-### 4.2 Memories: items with provenance and history
+### 4.4 People manage memory with one command
 
-A memory is one short statement about one member (or the group) in the bot's own words, with its
-evidence: each supporting line, its author and quote. The extractor sees the subject's current
-memories with their ids and says for each statement whether it is *new*, *the same* as memory
-`m12` (support), *changes* `m12` (a new memory replaces it; the old is kept as superseded, with
-the time), or *ends* `m12` (no longer holds). Code checks every id belongs to that subject in that
-group and is current. The model makes the semantic call it already sees the material for; nothing
-is computed from string normalisation or a predicate table.
+Before, `/who`, `/name`, `/note`, `/forget` and `/group` each touched a different slice of what is
+now one store. `/memory` views, adds (a statement or a name), corrects, ends and forgets any
+entry by its id. Notes fold in as statements entered by hand: they are what a person registered,
+so they are shown with who entered them, ranked first, and never changed by chat. `/link` and
+`/block` stay separate: identity and admission, not memory.
 
-A memory has a durability (*lasting*: where someone lives, works or studies, family, names;
-*ongoing*: tastes, hobbies, long-running interests; *current*: what someone is playing, reading
-or working towards these weeks), which sets how fast it loses rank, never how true it is.
+### 4.5 Forgetting is a recorded suppression
 
-### 4.3 Standing is shown as provenance, not probability
+`/memory forget` deletes the memory and its observations and records a suppression that keeps
+the forgotten text, hidden from everyone. Code drops observations citing the lines it rested on
+and refuses the same normalized text; the nightly decision sees the forgotten texts and rejects
+restatements in other words. A batch that read before the forget leaves that subject alone until
+its next run. Keeping the text is what makes a paraphrase recognizable; it never appears in a
+reply, a command reply or any prompt but that subject's decision. Entering it again by hand lifts
+the suppression.
 
-What the model reads for each memory: who said it (they themselves, or another member), in how
-many conversations, and when last. A replaced memory is not shown in replies; `about_member`
-shows recent history ("previously: ..."). There is no confidence percentage: with one statement
-behind almost everything, a computed probability was the same number everywhere and implied a
-precision nobody had.
+### 4.6 Duplicate names are ordinary
 
-### 4.4 Ranking and capacity follow the conversation
+Several members may go by the same name. The roster lists each member's names on their own
+evidence; whom a line means is read from the conversation by the model, which needs no marking
+of shared names (marking them made it hesitate where context was clear), and a person may enter a
+name another member already has.
 
-Rank (never shown) is `n / (n + 1) * 0.5^(k / h)`: `n` distinct supporting episodes, `k` episodes
-the subject has taken part in since the last support (every group episode for group memories),
-`h` the durability's half-life in episodes. A quiet member's or group's memories keep their rank.
-Each subject keeps at most `memory.capacity` memories; after an episode is applied, a subject over
-its room loses replaced and ended memories first, then the lowest ranked, never what that episode
-touched.
+### 4.7 Standing as provenance; rank and room follow the conversation
 
-### 4.5 Injection: identity always, memories for the people present, the rest on demand
-
-- **Cached prefix (stable within a day):** "People in this group": for each member active recently
-  or with a record, what they are shown as (now and before), the names others use for them with
-  their counts and sharing, names set by a person, linked accounts, blocks. Then "Learned about
-  this group": the group's terms and group memories, ranked.
-- **Each run's opening note:** for the members in the visible chat (speakers, mentioned members,
-  the sender), notes members wrote and the best-ranked memories, with provenance.
-- **On demand:** `about_member(member)` returns everything kept about one member, for anyone not
-  in view.
-
-### 4.6 Erasure and isolation
-
-`/forget N` deletes memory N and its evidence; `/forget all` deletes every memory about a member
-(the sender's own accounts, or a member an admin or owner may manage, as every profile command);
-`/name remove` deletes a name's uses and suppresses it. Every table is keyed by group and every query filters by it; a memory's evidence
-must be a line of that group. Episodes keep their findings as records of the extraction; a deleted
-memory is not re-learned from an episode already applied.
+Kept from the earlier design: what a reader sees is where an item comes from, not a probability;
+rank decays with the subject's own conversation, not the calendar; each subject keeps a bounded
+room, and eviction gives up closed memories first, then the lowest ranked, never what the batch
+touched. Replies carry the roster and group knowledge in the cached prefix, the memories of the
+people talking in the opening note, and the rest through `about_member` and `about_group`.
 
 ## 5. Alternatives rejected
 
 | Alternative | Why not |
 | --- | --- |
-| Keep per-(name, account) beliefs, tune thresholds | the failure is structural: independent per-account confidence cannot express that one name is shared or that one referent dominates |
-| Names only from `/name` and display names (no learning) | members call each other by nicknames no display name contains; those would be unresolvable |
-| Model resolves names freely without stored evidence | the same name resolved differently on every run, with nothing to show members or correct |
-| Fixed predicate triples (the previous design) | a closed list forces a fit (`wants`, `uses` became noise), rewording needed exact-value matching, and conflicts needed a slot table |
-| Per-member profile text rewritten by the model each episode (Letta-style blocks) | drift and compounding errors; no per-item provenance; a removed item can survive in rewritten prose |
-| No derived memory, only search at answer time | identity must be known before the model can search; the model would rediscover the same facts every run at tool cost |
-| Model-chosen DELETE on contradiction | destroys the record that the old value was said (Mem0 moved away from it) |
-| Confidence probability per item (the previous design) | 94% of items had one statement; a number the same everywhere carries no information |
-| Every person's memories in the cached prefix | relevance and privacy: what is not about the people talking is not needed and invites mentioning it |
+| Full knowledge graph (Graphiti-style) | similarity-based entity resolution does not find aliases; reads are per person; topic and event nodes need merging that compounds errors |
+| Separate stores for names, notes and memories | five commands each touching a slice; `/forget` could not cover what it did not know about |
+| Per-episode new / same / changed / ended with ids | each episode decided alone, so one night's statements could contradict each other; replaced by one decision per subject over the whole day |
+| Model-chosen DELETE on contradiction | destroys the record that the old value was said |
+| Per-member profile text rewritten nightly (Letta-style blocks) | drift and compounding errors; no per-item provenance; a forgotten item can survive in rewritten prose |
+| Deletion without a record | what was forgotten is learned again from the archive or a paraphrase |
+| Marking shared names | duplicates are ordinary; the conversation shows whom a name means |
+| A write tool for the reply model | memory changes are a person's to make, with the command's permissions; a chat request is read nightly |
 
 ## 6. Migration
 
-One forward migration:
+Migration `0020_one_store.sql` drops the old memory tables (`memory`, `memory_evidence`,
+`name_reference`, `name_set`, `name_ruling`, `held_claim`, `name_removed`, `note`) and the
+episodes' stored findings, and creates `memory`, `observation` and `suppression`. Learned and
+hand-set names, notes and memories start from scratch: many learned names were wrong, and past
+forgets left no record, so nothing is rebuilt from the archive. Episodes, the archive, links and
+blocks are untouched; the bot relearns as people talk, from the next batch on.
 
-- `chat_line.sender_name` is added; older lines have none (unknown), new lines are filled by the
-  gateway from the event.
-- Names: names set by a person become *set* uses, removed ones become suppressions; names learned
-  from chat are dropped (their evidence never said how the name was used, 60 of 75 rested on one
-  episode, and they caused the ambiguity). Learned names come back as episodes are extracted.
-- Facts: each active member fact becomes a memory `predicate: value` with its evidence (author
-  from the archive line); of competing claims for one single-valued attribute the most recently
-  supported stays current and the others are superseded by it; facts said to have ended become
-  ended memories; forgotten facts are dropped. Group terms and topics become group memories.
-  Durability follows the old decay class (stable, default, fast).
-- The old `alias`, `alias_evidence`, `fact` and `fact_evidence` tables are dropped. Configuration
-  keys `memory.person_facts`, `memory.group_terms`, `memory.facts.*` and `memory.capacity.*` are
-  replaced (no deployment overrides them).
-- Episodes, the archive, notes, links and blocks are untouched.
+## Sources
+
+- Memory: [Mem0](https://arxiv.org/abs/2504.19413) and [its add-only algorithm](https://mem0.ai/blog/mem0-the-token-efficient-memory-algorithm), [Zep / Graphiti](https://arxiv.org/abs/2501.13956), [EGMemory](https://arxiv.org/abs/2609.23465), [HaluMem](https://arxiv.org/abs/2511.03506), [MemoryAgentBench](https://arxiv.org/abs/2507.05257) and [a last-write resolver](https://arxiv.org/abs/2610.09193), [LongMemEval](https://arxiv.org/abs/2410.10813), [Sleep-time Compute](https://arxiv.org/abs/2504.13171), [a memory survey](https://arxiv.org/abs/2505.00675), [Chain-of-Verification](https://arxiv.org/abs/2309.11495), [SarcasmBench](https://arxiv.org/abs/2408.11319), [MINJA](https://arxiv.org/abs/2503.03704)
+- Multi-party chat and segmentation: [GroupMemBench](https://arxiv.org/abs/2605.14498), [SpeakerMem-R1](https://arxiv.org/abs/2609.26780), [Tan et al.](https://arxiv.org/abs/2310.16301), [Lost in the Middle](https://aclanthology.org/2024.tacl-1.9/), [SeCom](https://arxiv.org/abs/2502.05589), [Nemori](https://arxiv.org/abs/2508.03341), [LightMem](https://arxiv.org/abs/2510.18866), [EverMemBench](https://arxiv.org/abs/2602.01313), [T-Mem](https://arxiv.org/abs/2610.12874)
+- Graphs: [Graphiti](https://github.com/getzep/graphiti), [GraphRAG-Bench](https://arxiv.org/abs/2506.05690), [SemEval-2018 Task 4](https://aclanthology.org/S18-1007/), [graph vs. vector memory](https://arxiv.org/abs/2601.07978)
+- Forgetting: [deployment-time memorization](https://arxiv.org/abs/2606.10062), [Agentic Unlearning](https://arxiv.org/abs/2602.17692), [OpenAI memory FAQ](https://help.openai.com/en/articles/8590148-memory-faq)
+- Tool design: [Anthropic, Writing effective tools for agents](https://www.anthropic.com/engineering/writing-tools-for-agents), [Claude docs, Define tools](https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools), [OpenAI, Function calling](https://developers.openai.com/api/docs/guides/function-calling)

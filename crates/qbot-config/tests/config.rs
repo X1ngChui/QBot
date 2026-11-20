@@ -71,10 +71,7 @@ fn the_baked_in_defaults_are_a_complete_valid_configuration() {
         (3, 180, 4)
     );
     assert_eq!((c.history.summaries, c.history.carry_lines), (8, 90));
-    assert_eq!(
-        (c.memory.batch.as_str(), c.memory.reread_per_batch),
-        ("daily@04:00", 10)
-    );
+    assert_eq!(c.memory.batch.as_str(), "daily@04:00");
     assert!(c.to_toml_roundtrip());
 }
 

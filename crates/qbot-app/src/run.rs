@@ -33,10 +33,7 @@ use qbot_media::{
     ArchivedMedia, Describer, LlmDescriber, MediaDeps, MediaService, OpenImages, PgLineEditor,
     Transcriber,
 };
-use qbot_memory::consolidate::Consolidator;
-use qbot_memory::{
-    BatchReader, EpisodeJobs, EpisodeStore, IdentityStore, MemoryStore, NameStore, Recall,
-};
+use qbot_memory::{BatchReader, EpisodeJobs, EpisodeStore, IdentityStore, MemoryStore, Recall};
 use qbot_ops::{BackupError, Operations, Parts, PgHousekeeping, PgReportSource, check_tools};
 use qbot_prompt::{
     PersonaError, Personas, PromptContext, PromptError, PromptRenderer, PromptSettings,
@@ -44,9 +41,8 @@ use qbot_prompt::{
 };
 use qbot_sched::{JobError, JobKind, JobRunner, Scheduler, SchedulerConfig, TaskService};
 use qbot_store::{
-    DEFAULT_KEY, LeaseError, PgAdmin, PgArchive, PgEpisodeStore, PgGroupPolicy, PgIdentityStore,
-    PgMediaCache, PgMemoryStore, PgNameStore, PgRunLog, PgTimerStore, PgUsageSink, RuntimeLease,
-    Store, StoreError,
+    DEFAULT_KEY, LeaseError, PgAdmin, PgArchive, PgGroupPolicy, PgIdentityStore, PgMediaCache,
+    PgMemoryStore, PgRunLog, PgTimerStore, PgUsageSink, RuntimeLease, Store, StoreError,
 };
 use std::net::SocketAddr;
 
@@ -241,12 +237,10 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     let timers = Arc::new(PgTimerStore::new(pool.clone(), clock.clone()));
     let identity: Arc<dyn IdentityStore> =
         Arc::new(PgIdentityStore::new(pool.clone(), Default::default()));
-    let episodes: Arc<dyn EpisodeStore> =
-        Arc::new(PgEpisodeStore::new(pool.clone(), clock.clone()));
-    let names: Arc<dyn NameStore> = Arc::new(PgNameStore::new(pool.clone()));
-    let memories: Arc<dyn MemoryStore> = Arc::new(PgMemoryStore::new(pool.clone()));
-    let notes: Arc<dyn qbot_memory::NoteStore> =
-        Arc::new(qbot_store::PgNoteStore::new(pool.clone()));
+    // Episodes and what is known about people are one store: a batch commits to both at once.
+    let memory_store = Arc::new(PgMemoryStore::new(pool.clone(), clock.clone()));
+    let episodes: Arc<dyn EpisodeStore> = memory_store.clone();
+    let memories: Arc<dyn MemoryStore> = memory_store;
     let recorder = PgUsageSink::start(pool.clone(), clock.clone());
 
     // A run that was open when the previous process died has no end; close it before serving.
@@ -332,7 +326,6 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
         )))
         .with_memories(
             memories.clone(),
-            notes.clone(),
             qbot_prompt::MemoryView {
                 group_memories: config.group_memories(),
                 person_memories: config.person_memories(),
@@ -340,7 +333,6 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
             },
         )
         .with_bot_nicknames(&config.bot.nicknames)
-        .with_names(names.clone())
         .with_directory(directory.clone())
         .with_episodes(episodes.clone()),
     );
@@ -433,18 +425,20 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     let writing_language = locales.render(&Msg::WritingLanguage {});
     let reader = BatchReader::new(provider.clone(), writing_language.clone())
         .with_reasoning(config.extraction_reasoning());
-    let episode_jobs = EpisodeJobs::new(episodes.clone(), reader, embedder.clone(), clock.clone())
-        .with_consolidator(Arc::new(
-            Consolidator::new(names.clone(), memories.clone()).with_capacity(
-                episodes.clone(),
-                config.half_lives(),
-                config.memory_capacity(),
-            ),
-        ))
-        // The batch reads the group as replies do: the same people and knowledge.
-        .with_background(prompt.clone())
-        .with_rulings(names.clone())
-        .with_reread(config.reread_per_batch());
+    let episode_jobs = EpisodeJobs::new(
+        episodes.clone(),
+        memories.clone(),
+        reader,
+        embedder.clone(),
+        clock.clone(),
+    )
+    .with_room(config.half_lives(), config.memory_capacity())
+    // The batch reads the group as replies do: the same people and knowledge.
+    .with_background(prompt.clone())
+    // Command traffic is not conversation, and its replies print what is known.
+    .with_commands(Arc::new(|word: &str| {
+        qbot_commands::Command::from_word(word).is_some()
+    }));
     let operations = Operations::new(Parts {
         cfg: ops_config,
         clock: clock.clone(),
@@ -519,9 +513,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     // Commands and the pipeline.
     let commands = Arc::new(CommandRouter::new(Deps {
         identity: identity.clone(),
-        names: names.clone(),
         memories: memories.clone(),
-        notes: notes.clone(),
         admin: Arc::new(PgGroupAdmin::new(admin, policy)),
         runs: Arc::new(run_log.clone()),
         logs: logs.unwrap_or_else(|| Arc::new(NoLogs)),

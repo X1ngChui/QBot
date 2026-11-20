@@ -1,6 +1,7 @@
 //! How what is kept about people reads to a model: the roster (who is shown as what, the names
-//! people use for whom), memories with their provenance, notes. Shared by the reply prompt, the
-//! extractor's background and `about_member`, so all three say the same thing the same way.
+//! people use for whom) and memories with their provenance (from chat, or entered by hand).
+//! Shared by the reply prompt, the batch's background and `about_member`, so all three say the
+//! same thing the same way.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -8,7 +9,7 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use qbot_core::marker::escape_markers;
 use qbot_core::{AccountId, MemberNo, UnixMillis};
-use qbot_memory::memories::Memory;
+use qbot_memory::memories::{Memory, Origin};
 use qbot_memory::names::{KnownName, name_key};
 use qbot_memory::worth::HalfLives;
 use qbot_store::{GroupPeople, Person};
@@ -45,58 +46,31 @@ fn numbers(members: impl IntoIterator<Item = MemberNo>) -> String {
 
 /// The group's names as prompts may show them.
 ///
-/// A name others use for a member is shown when something ties it to them: a person set it, a
-/// ruling over its uses placed it, the member used it for themselves, the chat's structure tied
-/// it to them, or it is part of a display name of theirs. Without such an anchor it is one
+/// A name others use for a member is shown when something ties it to them: a person entered
+/// it, a ruling over its uses placed it, the member used it for themselves, the chat's structure
+/// tied it to them, or it is part of a display name of theirs. Without such an anchor it is one
 /// reading of a conversation, so it is kept but not shown until separate conversations agree on
-/// it ([`KnownName::corroborated`]) and no other person has a claim to it (an anchor, as much
-/// agreement, or it being their display name).
+/// it ([`KnownName::corroborated`]). Two members may go by the same name; which one a line means
+/// is the conversation's to show.
 #[derive(Debug, Default)]
 pub(crate) struct NameIndex {
     /// The names shown, by account and key.
     shown: BTreeSet<(AccountId, String)>,
-    /// Which members each shown name (and each listed member's current display name) stands for.
-    owners: BTreeMap<String, BTreeSet<MemberNo>>,
 }
 
 impl NameIndex {
     pub(crate) fn of(people: &GroupPeople) -> Self {
-        // The person each account belongs to (linked accounts are one), and the display names
-        // each account's lines were sent under.
-        let mut person: BTreeMap<AccountId, usize> = BTreeMap::new();
+        // The display names each account's lines were sent under.
         let mut displayed: BTreeMap<AccountId, Vec<String>> = BTreeMap::new();
-        let mut owners: BTreeMap<String, BTreeSet<MemberNo>> = BTreeMap::new();
-        // Display names that are someone's now, by key: a claim to the name like any other.
-        let mut current: BTreeMap<String, BTreeSet<usize>> = BTreeMap::new();
-        for (index, p) in people.people.iter().enumerate() {
-            let mut latest: BTreeSet<MemberNo> = BTreeSet::new();
+        for p in &people.people {
             for (number, account) in &p.members {
-                person.insert(*account, index);
                 for shown in p.shown.iter().filter(|s| s.member == *number) {
-                    let Ok(key) = name_key(&shown.text) else {
-                        continue;
-                    };
-                    // Shown names are the most recent first: a member's first is the current one.
-                    if latest.insert(shown.member) {
-                        owners.entry(key.clone()).or_default().insert(*number);
-                        current.entry(key.clone()).or_default().insert(index);
+                    if let Ok(key) = name_key(&shown.text) {
+                        displayed.entry(*account).or_default().push(key);
                     }
-                    displayed.entry(*account).or_default().push(key);
                 }
             }
         }
-        // Accounts the roster does not list are each their own person.
-        let unlisted = people.people.len();
-        let person_of = |account: AccountId| {
-            person.get(&account).copied().unwrap_or_else(|| {
-                unlisted
-                    + people
-                        .names
-                        .iter()
-                        .position(|(_, n)| n.account == account)
-                        .unwrap_or_default()
-            })
-        };
         let anchored = |name: &KnownName| {
             name.vouched()
                 || (name.key.chars().count() >= 2
@@ -104,21 +78,14 @@ impl NameIndex {
                         .get(&name.account)
                         .is_some_and(|keys| keys.iter().any(|k| k.contains(&name.key))))
         };
-        let strong = |name: &KnownName| anchored(name) || name.corroborated();
-        let mut shown = BTreeSet::new();
-        for (number, name) in &people.names {
-            let me = person_of(name.account);
-            let contested = people.names.iter().any(|(_, other)| {
-                other.key == name.key && person_of(other.account) != me && strong(other)
-            }) || current
-                .get(&name.key)
-                .is_some_and(|theirs| theirs.iter().any(|p| *p != me));
-            if anchored(name) || (name.corroborated() && !contested) {
-                shown.insert((name.account, name.key.clone()));
-                owners.entry(name.key.clone()).or_default().insert(*number);
-            }
-        }
-        Self { shown, owners }
+        let shown = people
+            .names
+            .iter()
+            .map(|(_, name)| name)
+            .filter(|name| anchored(name) || name.corroborated())
+            .map(|name| (name.account, name.key.clone()))
+            .collect();
+        Self { shown }
     }
 
     /// Whether prompts show this name for its member.
@@ -127,14 +94,9 @@ impl NameIndex {
     }
 }
 
-/// How a name is used for a member: set by a person, given by them, used by others, and the
-/// other members it is also used for.
-pub(crate) fn name_entry(
-    zone: &TimeZone,
-    name: &KnownName,
-    index: &NameIndex,
-    own_members: &[MemberNo],
-) -> String {
+/// How a name is used for a member: entered by a person, placed by a ruling, given by them,
+/// used by others.
+pub(crate) fn name_entry(zone: &TimeZone, name: &KnownName) -> String {
     let mut how = Vec::new();
     if name.set {
         how.push(say(Text::PromptNameSet {}));
@@ -152,19 +114,6 @@ pub(crate) fn name_entry(
         how.push(say(Text::PromptNameOthers {
             count: others.to_string(),
             date: date(zone, name.last),
-        }));
-    }
-    let shared: Vec<MemberNo> = index
-        .owners
-        .get(&name.key)
-        .into_iter()
-        .flatten()
-        .copied()
-        .filter(|n| !own_members.contains(n))
-        .collect();
-    if !shared.is_empty() {
-        how.push(say(Text::PromptNameShared {
-            members: numbers(shared),
         }));
     }
     say(Text::PromptNameEntry {
@@ -219,7 +168,7 @@ pub(crate) fn roster_entry(zone: &TimeZone, person: &Person, index: &NameIndex) 
     }
     let names: Vec<String> = names_beyond_shown(person, index)
         .into_iter()
-        .map(|n| name_entry(zone, n, index, &members))
+        .map(|n| name_entry(zone, n))
         .collect();
     if !names.is_empty() {
         out.push(say(Text::PromptPersonCalled {
@@ -236,9 +185,17 @@ pub(crate) fn roster_entry(zone: &TimeZone, person: &Person, index: &NameIndex) 
     known.then(|| out.join("\n"))
 }
 
-/// Who said a memory: for a member, they themselves, others (to them), or both; for the group,
-/// its members.
+/// Where a memory comes from: entered by hand (by its member or by someone else), or said in
+/// chat: for a member, by they themselves, others (to them), or both; for the group, its
+/// members.
 pub(crate) fn source(memory: &Memory) -> String {
+    if let Origin::Hand { by } = memory.origin {
+        return say(if memory.subject == Some(by) {
+            Text::PromptMemoryHandOwn {}
+        } else {
+            Text::PromptMemoryHandOthers {}
+        });
+    }
     if memory.subject.is_none() {
         return say(Text::PromptMemoryMembers {});
     }
@@ -254,17 +211,41 @@ pub(crate) fn source(memory: &Memory) -> String {
 
 /// A memory as a reply reads it, with its provenance.
 pub(crate) fn memory_item(zone: &TimeZone, memory: &Memory) -> String {
+    if memory.origin.is_hand() {
+        return say(Text::PromptMemoryHand {
+            text: line(&memory.display()),
+            source: source(memory),
+            date: date(zone, memory.first),
+        });
+    }
     say(Text::PromptMemoryItem {
         text: line(&memory.display()),
         source: source(memory),
-        count: memory.episodes().to_string(),
+        count: memory.episodes().max(1).to_string(),
         date: date(zone, memory.last),
     })
 }
 
 /// A group memory as the learned-knowledge block reads it.
 pub(crate) fn group_item(zone: &TimeZone, memory: &Memory) -> String {
-    let (count, date) = (memory.episodes().to_string(), date(zone, memory.last));
+    if memory.origin.is_hand() {
+        let date = date(zone, memory.first);
+        return match &memory.term {
+            Some(term) => say(Text::PromptGroupHandTerm {
+                term: line(term),
+                text: line(&memory.text),
+                date,
+            }),
+            None => say(Text::PromptGroupHand {
+                text: line(&memory.text),
+                date,
+            }),
+        };
+    }
+    let (count, date) = (
+        memory.episodes().max(1).to_string(),
+        date(zone, memory.last),
+    );
     match &memory.term {
         Some(term) => say(Text::PromptGroupTerm {
             term: line(term),
@@ -280,14 +261,21 @@ pub(crate) fn group_item(zone: &TimeZone, memory: &Memory) -> String {
     }
 }
 
-/// A memory as the extractor reads it: with its id, so a statement can name it.
+/// A memory as the batch reads it: with its id.
 pub(crate) fn background_item(zone: &TimeZone, memory: &Memory) -> String {
+    if memory.origin.is_hand() {
+        return say(Text::ExtractBackgroundHand {
+            id: memory.id.label(),
+            text: line(&memory.display()),
+            source: source(memory),
+        });
+    }
     say(Text::ExtractBackgroundMemory {
         id: memory.id.label(),
         durability: memory.durability.as_str().to_owned(),
         text: line(&memory.display()),
         source: source(memory),
-        count: memory.episodes().to_string(),
+        count: memory.episodes().max(1).to_string(),
         date: date(zone, memory.last),
     })
 }

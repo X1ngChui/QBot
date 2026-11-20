@@ -1,4 +1,5 @@
-//! Tools over long-term memory: find episodes by meaning, then read one in full.
+//! Tools over long-term memory: find episodes by meaning, then read one in full; everything kept
+//! about one member, or about the group itself.
 
 use std::sync::Arc;
 
@@ -178,7 +179,8 @@ pub struct MemberRecord {
     pub text: String,
 }
 
-/// Where `about_member` reads from: the names, notes and memories kept about a member.
+/// Where `about_member` and `about_group` read from: the names and memories kept about a member,
+/// and what is known about the group itself.
 #[async_trait]
 pub trait MemberRecords: Send + Sync {
     /// Everything kept about member `member` of `group`, rendered; `None` when the group has no
@@ -188,6 +190,9 @@ pub trait MemberRecords: Send + Sync {
         group: qbot_core::GroupId,
         member: MemberNo,
     ) -> Result<Option<MemberRecord>, String>;
+
+    /// Everything known about `group` itself, rendered.
+    async fn describe_group(&self, group: qbot_core::GroupId) -> Result<String, String>;
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -242,7 +247,48 @@ impl Tool for AboutMember {
     }
 }
 
-/// Add the memory tools to a tool set; `about_member` when there are member records to read.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AboutGroupArgs {}
+
+/// Everything known about the group itself: the run's instructions carry only the most used.
+#[derive(Clone)]
+pub struct AboutGroup(pub Arc<dyn MemberRecords>);
+
+impl std::fmt::Debug for AboutGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AboutGroup").finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl Tool for AboutGroup {
+    type Args = AboutGroupArgs;
+    const NAME: &'static str = "about_group";
+
+    fn description(&self) -> String {
+        say(Text::AboutGroupDescription {})
+    }
+
+    fn parameters(&self) -> Vec<(&'static str, String)> {
+        Vec::new()
+    }
+
+    fn effect(&self) -> Effect {
+        Effect::Read
+    }
+
+    async fn call(&self, cx: &ToolCx<'_>, _: AboutGroupArgs) -> Result<ToolOutput, ToolError> {
+        let text = self
+            .0
+            .describe_group(cx.group)
+            .await
+            .map_err(ToolError::Unavailable)?;
+        Ok(ToolOutput::text(text))
+    }
+}
+
+/// Add the memory tools to a tool set; `about_member` and `about_group` when there are records
+/// to read.
 pub fn add_memory_tools(
     set: ToolSet,
     recall: Arc<Recall>,
@@ -251,7 +297,9 @@ pub fn add_memory_tools(
 ) -> Result<ToolSet, ToolSetError> {
     let set = set.with(RecallEpisodes(recall))?.with(ReadEpisode(store))?;
     match members {
-        Some(records) => set.with(AboutMember(records)),
+        Some(records) => set
+            .with(AboutMember(records.clone()))?
+            .with(AboutGroup(records)),
         None => Ok(set),
     }
 }

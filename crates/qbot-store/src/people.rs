@@ -16,7 +16,7 @@ use sqlx::Row;
 
 use crate::archive::PgArchive;
 use crate::error::StoreError;
-use crate::names::known_names;
+use crate::memories::group_names;
 
 /// Which members the roster lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,7 +168,7 @@ impl PgArchive {
             }
         }
 
-        let all_names = known_names(pool, group, None).await.map_err(corrupt)?;
+        let all_names = group_names(pool, group).await.map_err(corrupt)?;
         let mut names = Vec::new();
         for name in all_names {
             let account = name.account.get();

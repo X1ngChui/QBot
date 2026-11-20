@@ -7,8 +7,6 @@
 use qbot_core::{AccountId, GroupId, MessageId, UnixMillis};
 use serde::{Deserialize, Serialize};
 
-use crate::findings::Findings;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct EpisodeId(i64);
@@ -48,11 +46,6 @@ pub struct NewEpisode {
     /// Which prompt and rules produced it.
     pub method: String,
     pub model: String,
-    /// Name uses and memory changes found in its lines, validated, waiting to be (or already)
-    /// applied to the name index and the memories. Stored with the episode so nothing found is
-    /// lost between the two.
-    #[serde(default)]
-    pub findings: Findings,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

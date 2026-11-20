@@ -140,7 +140,6 @@ mod tests {
                     evidence: Vec::new(),
                     method: String::new(),
                     model: String::new(),
-                    findings: Default::default(),
                 },
             },
             distance,

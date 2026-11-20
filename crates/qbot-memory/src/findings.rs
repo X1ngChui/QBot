@@ -1,18 +1,19 @@
-//! What an episode's extraction found besides the summary: the expressions its lines use for
-//! people (references) and statements worth remembering about members and the group. The model
-//! reads who is meant; code checks what can be checked against the lines themselves (the
+//! What the batch's reading of one episode found besides its summary: the names its lines use
+//! for people (references) and statements worth remembering about members and the group. The
+//! model reads who is meant; code checks what can be checked against the lines themselves (the
 //! expression is in the member's words, a marker is where it is said to be, an answer is a line
-//! the person wrote) and decides what is kept.
+//! the person wrote) and decides what is kept. How a statement relates to what is already known
+//! is decided later, per subject, with all of the night's statements about it in view.
 
 use std::collections::{HashMap, HashSet};
 
-use qbot_core::{AccountId, MessageId};
+use qbot_core::{AccountId, MessageId, UnixMillis};
 use qbot_wording::{Text, say};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::memories::{Durability, MAX_MEMORY_CHARS, MAX_TERM_CHARS, MemoryId, memory_key};
-use crate::names::{Grounds, NameBasis, NameTextError, Referent, name_key};
+use crate::memories::{About, Durability, MAX_MEMORY_CHARS, MAX_TERM_CHARS, memory_key};
+use crate::names::{Grounds, NameBasis, NameTextError, Referent, name_key, tidy_name};
 use crate::slice::SliceLine;
 
 /// An expression a line uses for a person.
@@ -20,11 +21,12 @@ use crate::slice::SliceLine;
 pub struct ReferenceFinding {
     pub message: MessageId,
     pub ordinal: u64,
+    pub at: UnixMillis,
     pub speaker: AccountId,
     /// The expression as written.
     pub text: String,
     pub referent: Referent,
-    /// How the line uses it; never [`NameBasis::Set`].
+    /// How the line uses it.
     pub basis: NameBasis,
     pub grounds: Grounds,
     /// The line is said to the member (it replies to them or mentions them), or they reply to it.
@@ -34,54 +36,33 @@ pub struct ReferenceFinding {
     pub shown_by: Vec<MessageId>,
 }
 
-/// What a statement does to what is remembered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum MemoryAction {
-    /// Not remembered yet.
-    New,
-    /// Says again what memory `id` says.
-    Same,
-    /// Memory `id` holds no longer; this replaces it.
-    Changed,
-    /// Memory `id` holds no longer, and nothing replaces it.
-    Ended,
-}
-
 /// A statement about a member, the group, or a person known only by a name.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MemoryFinding {
-    /// `None`: the group, or (with `name`) a person nobody has placed yet.
-    pub subject: Option<AccountId>,
-    /// The name of a person the lines did not let the reader place: the statement is held until
-    /// the name is some member's.
-    #[serde(default)]
-    pub name: Option<String>,
-    pub action: MemoryAction,
-    /// The memory a `same`, `changed` or `ended` statement is about.
-    pub id: Option<MemoryId>,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatementFinding {
+    pub about: About,
+    pub text: String,
     /// For a group term.
     pub term: Option<String>,
-    /// For `new` and `changed`.
-    pub text: Option<String>,
-    pub durability: Option<Durability>,
+    pub durability: Durability,
+    /// A second member the statement involves.
+    pub with: Option<AccountId>,
     pub message: MessageId,
+    pub ordinal: u64,
+    pub at: UnixMillis,
     /// Who wrote the line.
     pub author: AccountId,
     pub quote: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Findings {
-    #[serde(default)]
     pub references: Vec<ReferenceFinding>,
-    #[serde(default)]
-    pub memories: Vec<MemoryFinding>,
+    pub statements: Vec<StatementFinding>,
 }
 
 impl Findings {
     pub fn is_empty(&self) -> bool {
-        self.references.is_empty() && self.memories.is_empty()
+        self.references.is_empty() && self.statements.is_empty()
     }
 }
 
@@ -120,17 +101,14 @@ pub struct ReferenceArg {
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct MemoryArg {
+pub struct StatementArg {
     pub about: String,
-    pub action: MemoryAction,
-    #[serde(default)]
-    pub id: Option<String>,
+    pub text: String,
+    pub durability: Durability,
     #[serde(default)]
     pub term: Option<String>,
     #[serde(default)]
-    pub text: Option<String>,
-    #[serde(default)]
-    pub durability: Option<Durability>,
+    pub with: Option<String>,
     pub line: u32,
     pub quote: String,
 }
@@ -147,8 +125,6 @@ pub struct FindingContext<'a> {
     pub quoted: &'a [SliceLine],
     /// Accounts of members the background lists who wrote none of the lines.
     pub accounts: &'a [(u32, AccountId)],
-    /// The current memories the extractor was shown, with their subjects.
-    pub known: &'a [(MemoryId, Option<AccountId>)],
     /// Normalized names of the bot.
     pub bot_names: &'a [String],
 }
@@ -438,6 +414,7 @@ fn reference(
     Ok(ReferenceFinding {
         message: line.message,
         ordinal: line.ordinal,
+        at: line.at,
         speaker,
         text: text.to_owned(),
         referent,
@@ -448,16 +425,16 @@ fn reference(
     })
 }
 
-fn memory(
+fn statement(
     cx: &FindingContext<'_>,
     members: &HashMap<u32, AccountId>,
     references: &[ReferenceFinding],
-    arg: &MemoryArg,
-) -> Result<MemoryFinding, String> {
+    arg: &StatementArg,
+) -> Result<StatementFinding, String> {
     let (line, author, quote) = source(cx.target(), cx.first, arg.line, &arg.quote)?;
     let about = arg.about.trim();
-    let (subject, name) = if about == "group" {
-        (None, None)
+    let subject = if about == "group" {
+        About::Group
     } else if let Some(name) = about.strip_prefix("name:") {
         // A person the lines name but do not place: the statement waits for the name.
         let name = name.trim();
@@ -471,10 +448,7 @@ fn memory(
                 name: name.to_owned(),
             }));
         }
-        if arg.action != MemoryAction::New {
-            return Err(say(Text::ExtractFindingNameAction {}));
-        }
-        (None, Some(name.to_owned()))
+        About::Name(tidy_name(name))
     } else {
         let number = member_number(about).ok_or_else(|| {
             say(Text::ExtractFindingAbout {
@@ -492,34 +466,46 @@ fn memory(
                 member: number.to_string(),
             }));
         }
-        (Some(account), None)
+        About::Member(account)
     };
-    let id = match (arg.action, arg.id.as_deref().map(str::trim)) {
-        (MemoryAction::New, _) => None,
-        (action, None | Some("")) => {
-            return Err(say(Text::ExtractFindingNoId {
-                action: format!("{action:?}").to_lowercase(),
-            }));
-        }
-        (_, Some(raw)) => {
-            let id = MemoryId::parse(raw)
-                .filter(|id| cx.known.contains(&(*id, subject)))
-                .ok_or_else(|| {
-                    say(Text::ExtractFindingUnknownId {
-                        id: raw.to_owned(),
-                        about: about.to_owned(),
-                    })
-                })?;
-            Some(id)
+    let with = match arg.with.as_deref().map(str::trim).filter(|w| !w.is_empty()) {
+        None => None,
+        Some(raw) => {
+            let About::Member(account) = subject else {
+                return Err(say(Text::ExtractFindingWithNotMember {}));
+            };
+            let number = member_number(raw).ok_or_else(|| {
+                say(Text::ExtractFindingAbout {
+                    about: raw.to_owned(),
+                })
+            })?;
+            let other = account_of(members, number)?;
+            if other == account {
+                return Err(say(Text::ExtractFindingWithSelf {}));
+            }
+            Some(other)
         }
     };
+    let text = arg.text.trim();
+    if text.is_empty() {
+        return Err(say(Text::ExtractFindingEmptyText {}));
+    }
+    if text.chars().count() > MAX_MEMORY_CHARS {
+        return Err(say(Text::ExtractFindingTextTooLong {
+            max: MAX_MEMORY_CHARS.to_string(),
+        }));
+    }
     let term = match arg.term.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
         None => None,
-        Some(_) if subject.is_some() || name.is_some() => {
+        Some(_) if subject != About::Group => {
             return Err(say(Text::ExtractFindingTermForMember {}));
         }
         Some(term) if term.chars().count() > MAX_TERM_CHARS => {
             return Err(say(Text::ExtractFindingTermTooLong {}));
+        }
+        // A name a member is called by is a reference to them, never the group's vocabulary.
+        Some(_) if text.contains("member:") => {
+            return Err(say(Text::ExtractFindingTermNamesMember {}));
         }
         Some(term) => {
             // The quote shows what the term means; the term itself only has to be written
@@ -536,33 +522,15 @@ fn memory(
             Some(term.to_owned())
         }
     };
-    let (text, durability) = match arg.action {
-        MemoryAction::New | MemoryAction::Changed => {
-            let text = arg.text.as_deref().map(str::trim).unwrap_or_default();
-            if text.is_empty() {
-                return Err(say(Text::ExtractFindingEmptyText {}));
-            }
-            if text.chars().count() > MAX_MEMORY_CHARS {
-                return Err(say(Text::ExtractFindingTextTooLong {
-                    max: MAX_MEMORY_CHARS.to_string(),
-                }));
-            }
-            let Some(durability) = arg.durability else {
-                return Err(say(Text::ExtractFindingNoDurability {}));
-            };
-            (Some(text.to_owned()), Some(durability))
-        }
-        MemoryAction::Same | MemoryAction::Ended => (None, None),
-    };
-    Ok(MemoryFinding {
-        subject,
-        name,
-        action: arg.action,
-        id,
+    Ok(StatementFinding {
+        about: subject,
+        text: text.to_owned(),
         term,
-        text,
-        durability,
+        durability: arg.durability,
+        with,
         message: line.message,
+        ordinal: line.ordinal,
+        at: line.at,
         author,
         quote,
     })
@@ -572,7 +540,7 @@ fn memory(
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Checked {
     pub findings: Findings,
-    /// Statements not kept: worth one correction, since each is a memory lost.
+    /// Statements not kept: worth one correction, since each is something learned lost.
     pub dropped: Vec<String>,
     /// References not kept. A reference is one record among many, so these are logged and sent
     /// back only alongside a statement's correction.
@@ -583,7 +551,7 @@ pub struct Checked {
 /// episode: a summary is worth keeping even when an item proposed beside it is not.
 pub fn validate_findings(
     references: &[ReferenceArg],
-    memories: &[MemoryArg],
+    statements: &[StatementArg],
     cx: &FindingContext<'_>,
 ) -> Checked {
     let members = cx.members();
@@ -604,42 +572,24 @@ pub fn validate_findings(
         }
     }
 
-    let mut lines = Vec::new();
-    for (index, arg) in memories.iter().enumerate() {
-        match memory(cx, &members, &checked.findings.references, arg) {
-            Ok(finding) => {
-                lines.push(arg.line);
-                checked.findings.memories.push(finding);
-            }
-            Err(reason) => checked.dropped.push(problem("memories", index, reason)),
+    for (index, arg) in statements.iter().enumerate() {
+        match statement(cx, &members, &checked.findings.references, arg) {
+            Ok(finding) => checked.findings.statements.push(finding),
+            Err(reason) => checked.dropped.push(problem("statements", index, reason)),
         }
     }
-    // One stretch of chat says one thing about each memory and each new statement: its last
-    // line ("I quit it" ... "back on it again"), so applying the episode never both supports and
-    // ends one memory.
-    type Said = (Option<AccountId>, Option<String>, String);
-    let what = |f: &MemoryFinding| -> Said {
-        let name = f.name.as_deref().and_then(|n| name_key(n).ok());
-        match (f.id, &f.text) {
-            (Some(id), _) => (f.subject, name, format!("#{}", id.get())),
-            (None, text) => (
-                f.subject,
-                name,
-                memory_key(f.term.as_deref(), text.as_deref().unwrap_or_default()),
-            ),
-        }
-    };
-    let mut last: HashMap<Said, u32> = HashMap::new();
-    for (finding, line) in checked.findings.memories.iter().zip(&lines) {
-        let entry = last.entry(what(finding)).or_insert(*line);
-        *entry = (*entry).max(*line);
+    // One stretch of chat says one thing once: the same statement about the same subject is
+    // kept from its last line.
+    let key = |f: &StatementFinding| (f.about.clone(), memory_key(f.term.as_deref(), &f.text));
+    let mut last: HashMap<(About, String), u64> = HashMap::new();
+    for f in &checked.findings.statements {
+        let entry = last.entry(key(f)).or_insert(f.ordinal);
+        *entry = (*entry).max(f.ordinal);
     }
     let mut seen = HashSet::new();
-    let mut at = lines.into_iter();
-    checked.findings.memories.retain(|finding| {
-        let line = at.next().unwrap_or_default();
-        let key = what(finding);
-        last.get(&key) == Some(&line) && seen.insert(key)
-    });
+    checked
+        .findings
+        .statements
+        .retain(|f| last.get(&key(f)) == Some(&f.ordinal) && seen.insert(key(f)));
     checked
 }
