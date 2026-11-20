@@ -23,6 +23,8 @@ pub enum AppendError {
     SummarySplitsCall(CallId),
     #[error("summary range would hide an instruction")]
     SummaryCoversInstruction,
+    #[error("a trim must name a chat item and leave out more of it than before, at most all")]
+    BadTrim,
     #[error("transcript is too long to index")]
     TooLong,
 }

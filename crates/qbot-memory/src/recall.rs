@@ -127,11 +127,8 @@ mod tests {
                 created: ended,
                 episode: NewEpisode {
                     group: GroupId::new(1).unwrap(),
-                    first_batch: 0,
-                    last_batch: 0,
                     first_ordinal: 1,
                     last_ordinal: 10,
-                    batch_lines: 10,
                     first_message: message,
                     last_message: message,
                     started: ended,

@@ -327,6 +327,7 @@ messages! {
     "runs-detail" => RunsDetail { id: u64, time: String, trigger: String, end: String, tokens: u64 },
     "runs-step_chat" => RunsStepChat { count: u64 },
     "runs-step_summary" => RunsStepSummary { text: String },
+    "runs-step_trim" => RunsStepTrim { count: u64 },
     "runs-step_text" => RunsStepText { text: String },
     "runs-step_call" => RunsStepCall { name: String, args: String },
     "runs-step_result" => RunsStepResult { outcome: String, text: String },

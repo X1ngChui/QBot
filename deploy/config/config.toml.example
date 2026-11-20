@@ -44,11 +44,13 @@ locale = "en"
 # [media]
 # transcribe_voice = false
 
-# How much chat a reply sees, in batches of lines (also the unit memory is built in).
+# When the daily memory batch runs (a quiet hour, in bot.timezone), and how much chat a reply sees
+# around it: the newest episode summaries, then everything since just before the last batch.
+# [memory]
+# batch = "daily@04:00"
 # [history]
-# batch_lines = 30
-# raw_batches = 4
-# summary_batches = 9
+# summaries = 8
+# carry_lines = 90
 
 # [maintenance]
 # nightly = "daily@02:30"

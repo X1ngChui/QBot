@@ -238,7 +238,7 @@ pub(crate) fn map_error(
     retry_after: Option<Duration>,
 ) -> LlmError {
     match code {
-        "context_length_exceeded" => return LlmError::ContextTooLong,
+        "context_length_exceeded" => return LlmError::context_too_long(message),
         "rate_limit_exceeded" => return LlmError::RateLimited { retry_after },
         "timeout" => return LlmError::Timeout,
         "internal_error" | "internal_server_error" | "server_error" | "temporarily_unavailable" => {
@@ -247,6 +247,13 @@ pub(crate) fn map_error(
         "content_filter" | "content_policy_violation" => return LlmError::ContentFiltered,
         "invalid_api_key" | "authentication_error" => return LlmError::Auth,
         _ => {}
+    }
+    // Some providers report it only in the message of a generic invalid request.
+    if message
+        .to_ascii_lowercase()
+        .contains("maximum context length")
+    {
+        return LlmError::context_too_long(message);
     }
     match status {
         Some(401 | 403) => LlmError::Auth,

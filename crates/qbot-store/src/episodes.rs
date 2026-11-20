@@ -8,6 +8,7 @@ use qbot_memory::findings::Findings;
 use qbot_memory::worth::Activity;
 use qbot_memory::{
     Episode, EpisodeId, EpisodeStore, Evidence, Hit, MemoryError, NewEpisode, SliceLine,
+    WindowState,
 };
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Row};
@@ -40,7 +41,7 @@ fn vector_text(vector: &[f32]) -> String {
     format!("[{}]", parts.join(","))
 }
 
-const EPISODE_COLS: &str = "e.episode_id, e.group_id, e.first_batch, e.last_batch, e.first_ordinal, e.last_ordinal, e.batch_lines, \
+const EPISODE_COLS: &str = "e.episode_id, e.group_id, e.first_ordinal, e.last_ordinal, \
     e.first_message, e.last_message, e.started_ms, e.ended_ms, e.line_count, e.participants, e.title, e.summary, \
     e.evidence, e.method, e.model, e.created_ms, e.findings";
 
@@ -56,11 +57,8 @@ fn to_episode(row: &PgRow) -> Result<Episode, MemoryError> {
         created: UnixMillis::new(row.get("created_ms")),
         episode: NewEpisode {
             group: GroupId::new(row.get("group_id")).map_err(backend)?,
-            first_batch: u64_of(row.get("first_batch"))?,
-            last_batch: u64_of(row.get("last_batch"))?,
             first_ordinal: u64_of(row.get("first_ordinal"))?,
             last_ordinal: u64_of(row.get("last_ordinal"))?,
-            batch_lines: u32::try_from(row.get::<i32, _>("batch_lines")).map_err(backend)?,
             first_message: MessageId::new(row.get("first_message")).map_err(backend)?,
             last_message: MessageId::new(row.get("last_message")).map_err(backend)?,
             started: UnixMillis::new(row.get("started_ms")),
@@ -149,6 +147,78 @@ impl PgEpisodeStore {
 
 #[async_trait]
 impl EpisodeStore for PgEpisodeStore {
+    async fn groups(&self) -> Result<Vec<GroupId>, MemoryError> {
+        let rows: Vec<i64> =
+            sqlx::query_scalar("SELECT DISTINCT group_id FROM chat_line ORDER BY group_id")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(backend)?;
+        rows.into_iter()
+            .map(|g| GroupId::new(g).map_err(backend))
+            .collect()
+    }
+
+    async fn window(&self, group: GroupId) -> Result<Option<WindowState>, MemoryError> {
+        let row = sqlx::query("SELECT batched_ms, cut FROM history_window WHERE group_id = $1")
+            .bind(group.get())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(backend)?;
+        row.map(|row| {
+            Ok(WindowState {
+                batched: UnixMillis::new(row.get("batched_ms")),
+                cut: u64_of(row.get("cut"))?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn batched(&self, group: GroupId, at: UnixMillis) -> Result<(), MemoryError> {
+        sqlx::query(
+            "INSERT INTO history_window (group_id, batched_ms, cut) VALUES ($1, $2, 0) \
+             ON CONFLICT (group_id) DO UPDATE SET batched_ms = EXCLUDED.batched_ms, cut = 0",
+        )
+        .bind(group.get())
+        .bind(at.get())
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn cut(&self, group: GroupId, ordinal: u64, at: UnixMillis) -> Result<(), MemoryError> {
+        sqlx::query(
+            "INSERT INTO history_window (group_id, batched_ms, cut) VALUES ($1, $2, $3) \
+             ON CONFLICT (group_id) DO UPDATE SET cut = greatest(history_window.cut, EXCLUDED.cut)",
+        )
+        .bind(group.get())
+        .bind(at.get())
+        .bind(i64_of(ordinal)?)
+        .execute(&self.pool)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn before(
+        &self,
+        group: GroupId,
+        ordinal: u64,
+        limit: usize,
+    ) -> Result<Vec<Episode>, MemoryError> {
+        let rows = sqlx::query(&format!(
+            "SELECT * FROM (SELECT {EPISODE_COLS} FROM episode e WHERE e.group_id = $1 AND e.last_ordinal < $2 \
+             ORDER BY e.first_ordinal DESC LIMIT $3) x ORDER BY first_ordinal"
+        ))
+        .bind(group.get())
+        .bind(i64_of(ordinal)?)
+        .bind(i64::try_from(limit).map_err(backend)?)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(backend)?;
+        rows.iter().map(to_episode).collect()
+    }
+
     async fn lines(
         &self,
         group: GroupId,
@@ -258,8 +328,7 @@ impl EpisodeStore for PgEpisodeStore {
         vector: &[f32],
         embed_model: &str,
     ) -> Result<Episode, MemoryError> {
-        if episode.first_ordinal > episode.last_ordinal || episode.first_batch > episode.last_batch
-        {
+        if episode.first_ordinal > episode.last_ordinal {
             return Err(MemoryError::InvalidRange);
         }
         let mut tx = self.pool.begin().await.map_err(backend)?;
@@ -281,17 +350,14 @@ impl EpisodeStore for PgEpisodeStore {
         let evidence = serde_json::to_value(&episode.evidence).map_err(backend)?;
         let participants: Vec<i64> = episode.participants.iter().map(|a| a.get()).collect();
         let row = sqlx::query(&format!(
-            "WITH e AS (INSERT INTO episode (group_id, first_batch, last_batch, first_ordinal, last_ordinal, batch_lines, first_message, \
+            "WITH e AS (INSERT INTO episode (group_id, first_ordinal, last_ordinal, first_message, \
                 last_message, started_ms, ended_ms, line_count, participants, title, summary, evidence, method, model, created_ms, findings) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19) RETURNING *) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING *) \
              SELECT {EPISODE_COLS} FROM e"
         ))
         .bind(episode.group.get())
-        .bind(i64_of(episode.first_batch)?)
-        .bind(i64_of(episode.last_batch)?)
         .bind(i64_of(episode.first_ordinal)?)
         .bind(i64_of(episode.last_ordinal)?)
-        .bind(i32::try_from(episode.batch_lines).map_err(backend)?)
         .bind(episode.first_message.get())
         .bind(episode.last_message.get())
         .bind(episode.started.get())

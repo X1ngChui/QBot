@@ -213,6 +213,15 @@ pub struct Summary {
     pub text: String,
 }
 
+/// Leaves the first `lines` lines of the chat item `item` out of the model's view, and says how
+/// many were left out: the start of a raw part the provider found too long. The originals stay
+/// in the transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Trim {
+    pub item: ItemSeq,
+    pub lines: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Item {
@@ -222,6 +231,7 @@ pub enum Item {
     ToolResult(ToolResult),
     Meta(Meta),
     Summary(Summary),
+    Trim(Trim),
 }
 
 impl Item {
@@ -233,6 +243,7 @@ impl Item {
             Item::ToolResult(_) => "tool_result",
             Item::Meta(_) => "meta",
             Item::Summary(_) => "summary",
+            Item::Trim(_) => "trim",
         }
     }
 }

@@ -72,19 +72,20 @@ fn member_no(n: i32) -> Result<MemberNo, StoreError> {
 const SHOWN_PER_ACCOUNT: usize = 4;
 
 impl PgArchive {
-    /// The group's roster as of `now` (a block that has run out is not in force), with the people
-    /// of `include` listed whatever their activity. Activity and display names count lines up to
-    /// the start of `now`'s UTC day, so the roster changes by activity at most once a day and
-    /// stays in the cached prompt prefix in between.
+    /// The group's roster as of `as_of` (activity, display names and blocks then), with the people
+    /// of `include` listed whatever their activity. Replies read it as of the group's last batch,
+    /// so it changes only when a batch or a member's command changes a record, and stays in the
+    /// cached prompt prefix in between.
     pub async fn people(
         &self,
         group: GroupId,
-        now: UnixMillis,
+        as_of: UnixMillis,
         settings: RosterSettings,
         include: &[AccountId],
     ) -> Result<GroupPeople, StoreError> {
         let (pool, g) = (self.pool(), group.get());
-        let as_of = qbot_memory::worth::as_of_day(now).get();
+        let now = as_of;
+        let as_of = as_of.get();
         // Listed whatever their activity: those asked for, and those with a record that matters
         // for how the group is answered (a link, a block, a name a person set).
         let mut forced: HashSet<i64> = include.iter().map(|a| a.get()).collect();

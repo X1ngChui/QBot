@@ -12,6 +12,8 @@ pub enum ViewItem {
     Instruction(Instruction),
     Chat(ChatBatch),
     Summary(String),
+    /// How many lines a trim left out before the chat that follows.
+    Trimmed(u32),
     Assistant(AssistantTurn),
     ToolResult(ToolResult),
 }
@@ -59,7 +61,16 @@ pub fn project(transcript: &Transcript) -> Result<View, ProjectError> {
         }
         match item {
             Item::Instruction(instruction) => out.push(ViewItem::Instruction(instruction.clone())),
-            Item::Chat(batch) => out.push(ViewItem::Chat(batch.clone())),
+            Item::Chat(batch) => match transcript.trimmed(index) {
+                0 => out.push(ViewItem::Chat(batch.clone())),
+                cut => {
+                    out.push(ViewItem::Trimmed(cut));
+                    let kept = &batch.lines()[cut as usize..];
+                    if !kept.is_empty() {
+                        out.push(ViewItem::Chat(ChatBatch::new(kept.to_vec())));
+                    }
+                }
+            },
             Item::Assistant(turn) => {
                 out.push(ViewItem::Assistant(turn.clone()));
                 for call in turn.calls() {
@@ -68,7 +79,7 @@ pub fn project(transcript: &Transcript) -> Result<View, ProjectError> {
                     ));
                 }
             }
-            Item::ToolResult(_) | Item::Meta(_) | Item::Summary(_) => {}
+            Item::ToolResult(_) | Item::Meta(_) | Item::Summary(_) | Item::Trim(_) => {}
         }
     }
     Ok(View { items: out })

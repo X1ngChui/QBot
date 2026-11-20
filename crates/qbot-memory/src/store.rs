@@ -24,8 +24,40 @@ pub enum MemoryError {
     Backend(String),
 }
 
+/// What a group's view of its history hangs on between two batches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowState {
+    /// When the group's last batch ran: what runs are shown of who is who and what the group
+    /// knows is as of then.
+    pub batched: UnixMillis,
+    /// Where a run that the provider found too long moved the start of the raw part; 0 when no
+    /// run did since the batch.
+    pub cut: u64,
+}
+
 #[async_trait]
 pub trait EpisodeStore: Send + Sync {
+    /// Every group with archived lines.
+    async fn groups(&self) -> Result<Vec<GroupId>, MemoryError>;
+
+    /// The group's window state; `None` before its first batch.
+    async fn window(&self, group: GroupId) -> Result<Option<WindowState>, MemoryError>;
+
+    /// Record that the group's batch ran at `at`: its raw part starts over from the new cut.
+    async fn batched(&self, group: GroupId, at: UnixMillis) -> Result<(), MemoryError>;
+
+    /// Move the start of the group's raw part to `ordinal`, never back. Holds until the next
+    /// batch.
+    async fn cut(&self, group: GroupId, ordinal: u64, at: UnixMillis) -> Result<(), MemoryError>;
+
+    /// The `limit` newest episodes of the group that end before `ordinal`, in chat order.
+    async fn before(
+        &self,
+        group: GroupId,
+        ordinal: u64,
+        limit: usize,
+    ) -> Result<Vec<Episode>, MemoryError>;
+
     /// Archived lines with ordinals in `first..=last`, ascending. Only lines that exist.
     async fn lines(
         &self,
@@ -46,13 +78,13 @@ pub trait EpisodeStore: Send + Sync {
     /// The highest archived ordinal of the group, 0 when empty.
     async fn last_ordinal(&self, group: GroupId) -> Result<u64, MemoryError>;
 
-    /// The last ordinal of the group's newest slice, an episode or a skipped one; 0 when there
-    /// is none.
+    /// The last ordinal covered by the group's newest episode or skipped stretch; 0 when there
+    /// is none. Everything up to it was read by a batch.
     async fn covered_through(&self, group: GroupId) -> Result<u64, MemoryError>;
 
-    /// Record that the slice `first_ordinal..=last_ordinal` will have no episode (extraction gave
-    /// up on it for good), so it counts as covered. Slices of a group never overlap, whether
-    /// episodes or skipped.
+    /// Record that the lines `first_ordinal..=last_ordinal` will have no episode (the batch gave
+    /// up on them for good), so they count as covered. Episodes and skipped stretches of a group
+    /// never overlap.
     async fn skip_slice(
         &self,
         group: GroupId,
@@ -151,6 +183,7 @@ pub trait EpisodeStore: Send + Sync {
 struct Inner {
     lines: Vec<(GroupId, SliceLine)>,
     episodes: Vec<(Episode, String, Vec<f32>)>,
+    windows: std::collections::HashMap<GroupId, WindowState>,
     next_id: i64,
     consolidated: std::collections::HashSet<EpisodeId>,
     skipped: Vec<(GroupId, u64, u64)>,
@@ -211,6 +244,56 @@ pub(crate) fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 
 #[async_trait]
 impl EpisodeStore for MemoryEpisodeStore {
+    async fn groups(&self) -> Result<Vec<GroupId>, MemoryError> {
+        let mut groups: Vec<GroupId> = self.lock().lines.iter().map(|(g, _)| *g).collect();
+        groups.sort();
+        groups.dedup();
+        Ok(groups)
+    }
+
+    async fn window(&self, group: GroupId) -> Result<Option<WindowState>, MemoryError> {
+        Ok(self.lock().windows.get(&group).copied())
+    }
+
+    async fn batched(&self, group: GroupId, at: UnixMillis) -> Result<(), MemoryError> {
+        self.lock().windows.insert(
+            group,
+            WindowState {
+                batched: at,
+                cut: 0,
+            },
+        );
+        Ok(())
+    }
+
+    async fn cut(&self, group: GroupId, ordinal: u64, at: UnixMillis) -> Result<(), MemoryError> {
+        let mut inner = self.lock();
+        let state = inner.windows.entry(group).or_insert(WindowState {
+            batched: at,
+            cut: 0,
+        });
+        state.cut = state.cut.max(ordinal);
+        Ok(())
+    }
+
+    async fn before(
+        &self,
+        group: GroupId,
+        ordinal: u64,
+        limit: usize,
+    ) -> Result<Vec<Episode>, MemoryError> {
+        let mut found: Vec<Episode> = self
+            .lock()
+            .episodes
+            .iter()
+            .filter(|(e, _, _)| e.episode.group == group && e.episode.last_ordinal < ordinal)
+            .map(|(e, _, _)| e.clone())
+            .collect();
+        found.sort_by_key(|e| e.episode.first_ordinal);
+        let skip = found.len().saturating_sub(limit);
+        Ok(found.split_off(skip))
+    }
+
     async fn lines(
         &self,
         group: GroupId,
@@ -302,8 +385,7 @@ impl EpisodeStore for MemoryEpisodeStore {
         embed_model: &str,
     ) -> Result<Episode, MemoryError> {
         let mut inner = self.lock();
-        if episode.first_ordinal > episode.last_ordinal || episode.first_batch > episode.last_batch
-        {
+        if episode.first_ordinal > episode.last_ordinal {
             return Err(MemoryError::InvalidRange);
         }
         if inner.taken(episode.group, episode.first_ordinal, episode.last_ordinal) {

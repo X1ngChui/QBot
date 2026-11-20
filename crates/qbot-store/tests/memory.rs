@@ -8,16 +8,11 @@ use std::sync::Arc;
 use common::*;
 use qbot_agent::sim::MemorySink;
 use qbot_agent::{ChatView, RunState, ToolCx, ToolSet, Trigger};
-use qbot_core::{
-    AccountId, BatchGrid, GroupId, MessageId, RunId, SliceGrid, SystemClock, UnixMillis,
-};
+use qbot_core::{AccountId, GroupId, MessageId, RunId, SystemClock, UnixMillis};
 use qbot_llm::FakeEmbedder;
 use qbot_llm::fake::{FakeProvider, FakeReply, Step};
 use qbot_memory::identity::IdentityPolicy;
-use qbot_memory::{
-    BuilderConfig, EpisodeBuilder, EpisodeExtractor, EpisodeJobs, EpisodeStore, Recall,
-    RecallParams,
-};
+use qbot_memory::{BatchReader, EpisodeJobs, EpisodeStore, Recall, RecallParams};
 use qbot_store::{Appended, NewLine, NewSpeaker, PgArchive, PgEpisodeStore, PgIdentityStore};
 use serde_json::json;
 use sqlx::Row;
@@ -262,7 +257,7 @@ async fn the_postgres_episode_store_satisfies_the_episode_store_contract() {
 }
 
 #[tokio::test]
-async fn two_workers_extracting_the_same_slice_cannot_both_store_it() {
+async fn two_workers_storing_the_same_range_cannot_both_store_it() {
     use qbot_memory::conformance::episode;
     let db = db!();
     let store = Arc::new(PgEpisodeStore::new(db.pool().clone(), ManualClock::new(T0)));
@@ -271,7 +266,7 @@ async fn two_workers_extracting_the_same_slice_cannot_both_store_it() {
             let store = store.clone();
             tokio::spawn(async move {
                 store
-                    .insert(&episode(group(1), 1, 30, "same slice"), &[1.0, 0.0], "m")
+                    .insert(&episode(group(1), 1, 30, "same range"), &[1.0, 0.0], "m")
                     .await
             })
         })
@@ -419,27 +414,35 @@ async fn deleting_an_episode_removes_its_embedding_and_lines_carry_member_number
 
 // ----- the whole memory pipeline on Postgres -----
 
+const TOPICS: [&str; 3] = [
+    "deploy pipeline rollback staging",
+    "dinner pasta recipe cooking kitchen",
+    "holiday coast trip planning beach",
+];
+
+/// Twenty lines on each topic in turn.
 fn topic_line(ordinal: u64) -> String {
-    let slice = (ordinal - 1) / 20; // 10 lines per batch, 2 batches per slice
-    let topic = [
-        "deploy pipeline rollback staging",
-        "dinner pasta recipe cooking kitchen",
-        "holiday coast trip planning beach",
-    ][slice as usize % 3];
+    let topic = TOPICS[((ordinal - 1) / 20) as usize % 3];
     format!("line {ordinal} {topic}")
 }
 
-fn answer(slice: usize) -> Step {
-    let topic = [
-        "deploy pipeline rollback staging",
-        "dinner pasta recipe cooking kitchen",
-        "holiday coast trip planning beach",
-    ][slice % 3];
-    let first = slice as u64 * 20 + 1;
-    Step::Reply(FakeReply::new().call(
-        "submit_episode",
-        json!({ "title": format!("Talk about {topic}"), "summary": format!("The group discussed {topic}."), "evidence": [{ "line": 2, "quote": format!("line {} {topic}", first + 1) }] }),
-    ))
+/// The batch's division of 100 lines into five episodes of twenty, then each one's findings.
+fn batch_answers() -> Vec<Step> {
+    let episodes: Vec<_> = (0..5u32)
+        .map(|i| {
+            let topic = TOPICS[i as usize % 3];
+            let first = i * 20 + 1;
+            json!({ "first_line": first, "last_line": first + 19,
+                    "title": format!("Talk about {topic}"),
+                    "summary": format!("The group discussed {topic}."),
+                    "evidence": [{ "line": first + 1, "quote": format!("line {} {topic}", first + 1) }] })
+        })
+        .collect();
+    let mut steps = vec![Step::Reply(
+        FakeReply::new().call("submit_episodes", json!({ "episodes": episodes })),
+    )];
+    steps.extend((0..5).map(|_| Step::Reply(FakeReply::new().call("submit_findings", json!({})))));
+    steps
 }
 
 #[tokio::test]
@@ -456,40 +459,31 @@ async fn lines_become_episodes_which_recall_finds_and_read_episode_opens() {
     }
 
     let store = Arc::new(PgEpisodeStore::new(db.pool().clone(), clock.clone()));
-    let fake = Arc::new(FakeProvider::new((0..6).map(answer).collect::<Vec<_>>()));
+    let fake = Arc::new(FakeProvider::new(batch_answers()));
     let embedder = Arc::new(FakeEmbedder::new(64));
-    let builder = EpisodeBuilder::new(
-        EpisodeExtractor::new(fake.clone()),
+    let job = EpisodeJobs::new(
+        store.clone(),
+        BatchReader::new(fake.clone(), "English"),
         embedder.clone(),
-        BuilderConfig::default(),
+        clock.clone(),
     );
-    let grid = SliceGrid {
-        grid: BatchGrid {
-            lines_per_batch: 10,
-        },
-        slice_batches: 2,
-        previous_context_batches: 1,
-        next_context_batches: 1,
-        retained_raw_batches: 10,
-    };
-    let job = EpisodeJobs::new(store.clone(), builder, grid);
 
-    assert_eq!(
-        job.extract_group(g).await.unwrap(),
-        5,
-        "100 lines = 5 slices of 20"
-    );
-    assert_eq!(job.extract_group(g).await.unwrap(), 0, "idempotent");
+    assert_eq!(job.run().await.unwrap(), 5, "every group's batch");
+    assert_eq!(job.batch_group(g).await.unwrap(), 0, "nothing new");
+    assert_eq!(fake.recorded().len(), 6);
     let episodes = store.within(g, 1, 100).await.unwrap();
     let ranges: Vec<_> = episodes
         .iter()
         .map(|e| (e.episode.first_ordinal, e.episode.last_ordinal))
         .collect();
     assert_eq!(ranges, [(1, 20), (21, 40), (41, 60), (61, 80), (81, 100)]);
-    assert!(
-        episodes
-            .iter()
-            .all(|e| e.episode.batch_lines == 10 && e.episode.line_count == 20)
+    assert!(episodes.iter().all(|e| e.episode.line_count == 20));
+    assert_eq!(
+        store.window(g).await.unwrap(),
+        Some(qbot_memory::WindowState {
+            batched: UnixMillis::new(T0),
+            cut: 0
+        })
     );
 
     // Recall finds the right episode by meaning.
@@ -583,7 +577,7 @@ async fn lines_become_episodes_which_recall_finds_and_read_episode_opens() {
     assert_eq!(
         body.lines().count(),
         21,
-        "the summary line plus the 20 lines of exactly that slice"
+        "the summary line plus the 20 lines of exactly that episode"
     );
     assert!(body.contains("holiday coast trip") && body.contains("member:"));
     assert!(
@@ -814,9 +808,9 @@ async fn the_roster_lists_who_is_who_in_its_group_only() {
             .collect::<Vec<_>>()
     };
     let now = UnixMillis::new(T0 + 3 * DAY);
-    // A line sent today counts from tomorrow: the roster changes by activity once a day.
+    // A line sent after the batch the roster is shown as of counts from the next batch.
     archive
-        .append(named(g, 7, 705, now.get() - 1, "Edward"))
+        .append(named(g, 7, 705, now.get() + 1, "Edward"))
         .await
         .unwrap();
     let people = archive.people(g, now, settings, &[]).await.unwrap();

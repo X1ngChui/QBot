@@ -140,6 +140,9 @@ pub struct MemoryArg {
 pub struct FindingContext<'a> {
     /// The context before, the target and the context after.
     pub parts: [&'a [SliceLine]; 3],
+    /// The number the first target line is shown with (`#first`); the target's lines are
+    /// numbered on from it.
+    pub first: u32,
     /// Older lines the shown ones quote.
     pub quoted: &'a [SliceLine],
     /// Accounts of members the background lists who wrote none of the lines.
@@ -248,9 +251,12 @@ fn own_words(text: &str) -> String {
     out
 }
 
-/// The target line a finding cites, if it is something a member said.
-fn said(target: &[SliceLine], line: u32) -> Result<(&SliceLine, AccountId), String> {
-    let Some(found) = target.get((line as usize).wrapping_sub(1)) else {
+/// The target line a finding cites (numbered from `first`), if it is something a member said.
+fn said(target: &[SliceLine], first: u32, line: u32) -> Result<(&SliceLine, AccountId), String> {
+    let Some(found) = line
+        .checked_sub(first)
+        .and_then(|index| target.get(index as usize))
+    else {
         return Err(say(Text::ExtractFindingLine {
             line: line.to_string(),
         }));
@@ -271,10 +277,11 @@ fn said(target: &[SliceLine], line: u32) -> Result<(&SliceLine, AccountId), Stri
 /// The target line a statement cites, if it is a member's message that contains the quote.
 fn source<'a>(
     target: &'a [SliceLine],
+    first: u32,
     line: u32,
     quote: &str,
 ) -> Result<(&'a SliceLine, AccountId, String), String> {
-    let (found, speaker) = said(target, line)?;
+    let (found, speaker) = said(target, first, line)?;
     let quote = quote.trim();
     if quote.is_empty() || !found.text.contains(quote) {
         return Err(say(Text::ExtractFindingQuote {
@@ -321,7 +328,7 @@ fn reference(
     shown: &HashMap<String, AccountId>,
     arg: &ReferenceArg,
 ) -> Result<ReferenceFinding, String> {
-    let (line, speaker) = said(cx.target(), arg.line)?;
+    let (line, speaker) = said(cx.target(), cx.first, arg.line)?;
     let text = arg.text.trim();
     let key = name_key(text).map_err(|e| match e {
         NameTextError::Empty => say(Text::ExtractFindingNameEmpty {}),
@@ -447,7 +454,7 @@ fn memory(
     references: &[ReferenceFinding],
     arg: &MemoryArg,
 ) -> Result<MemoryFinding, String> {
-    let (line, author, quote) = source(cx.target(), arg.line, &arg.quote)?;
+    let (line, author, quote) = source(cx.target(), cx.first, arg.line, &arg.quote)?;
     let about = arg.about.trim();
     let (subject, name) = if about == "group" {
         (None, None)

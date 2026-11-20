@@ -39,6 +39,11 @@ struct World {
     pending_chatter: Vec<(AccountId, MemberNo, String)>,
     dice: u32,
     recaps: Vec<crate::env::Recap>,
+    /// Where the raw part starts in the window offered to runs; after the recaps when unset.
+    raw: Option<usize>,
+    /// Where runs left the raw part starting (archive ordinals, the window's first line being 1),
+    /// in order.
+    cuts: Vec<u64>,
     undelivered_note: Option<Instruction>,
     /// Timestamp for the next line, advancing a second per line; 0 uses the message number.
     time: i64,
@@ -147,6 +152,16 @@ impl SimWorld {
             text: note.to_owned(),
             template_hash: "sim".into(),
         });
+    }
+
+    /// Where the raw part of the window offered to runs begins (an index into the window).
+    pub fn set_raw(&self, raw: usize) {
+        self.lock().raw = Some(raw);
+    }
+
+    /// Where runs left the raw part starting, in order.
+    pub fn cuts(&self) -> Vec<u64> {
+        self.lock().cuts.clone()
     }
 
     /// Recaps offered to runs, as the prompt layer would from episodes.
@@ -360,8 +375,20 @@ impl ContextSource for SimWorld {
             trigger_note,
             cursor,
             recaps: world.recaps.clone(),
+            raw: world
+                .raw
+                .unwrap_or_else(|| world.recaps.iter().map(|r| r.lines.end).max().unwrap_or(0)),
+            raw_ordinal: 1 + world
+                .raw
+                .unwrap_or_else(|| world.recaps.iter().map(|r| r.lines.end).max().unwrap_or(0))
+                as u64,
             undelivered_note: world.undelivered_note.clone(),
         })
+    }
+
+    async fn cut(&self, _group: GroupId, from: u64) -> Result<(), EnvError> {
+        self.lock().cuts.push(from);
+        Ok(())
     }
 }
 

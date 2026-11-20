@@ -70,15 +70,11 @@ fn the_baked_in_defaults_are_a_complete_valid_configuration() {
         ),
         (3, 180, 4)
     );
+    assert_eq!((c.history.summaries, c.history.carry_lines), (8, 90));
     assert_eq!(
-        (
-            c.history.batch_lines,
-            c.history.raw_batches,
-            c.history.summary_batches
-        ),
-        (30, 4, 9)
+        (c.memory.batch.as_str(), c.memory.reread_per_batch),
+        ("daily@04:00", 10)
     );
-    assert_eq!(c.memory.slice_batches, 3);
     assert!(c.to_toml_roundtrip());
 }
 
@@ -134,7 +130,7 @@ fn layers_apply_in_a_fixed_order_and_override_key_by_key() {
     );
     assert_eq!(c.providers.text.model, "m-one");
     assert_eq!(
-        c.history.batch_lines, 30,
+        c.history.carry_lines, 90,
         "a key nobody sets keeps its default"
     );
     assert_eq!(
@@ -311,7 +307,7 @@ dims = 0
 [media]
 images_per_minute = 0
 [memory]
-slice_batches = 0
+batch = "now and then"
 roster_people = 0
 [memory.recall]
 max_distance = 1.0
@@ -340,7 +336,7 @@ nightly = "every night"
         "providers.text.endpoint",
         "providers.embedding.dims",
         "media.images_per_minute",
-        "memory.slice_batches",
+        "memory.batch",
         "memory.recall.max_distance",
         "memory.rank.half_life_episodes",
         "memory.capacity",
@@ -607,11 +603,10 @@ concurrency = 2
 deadline_secs = 45
 max_messages = 2
 [history]
-batch_lines = 20
-raw_batches = 4
-summary_batches = 0
+summaries = 0
+carry_lines = 30
 [memory]
-slice_batches = 4
+batch = "daily@03:30"
 group_memories = 12
 person_memories = 7
 roster_days = 10
@@ -634,17 +629,15 @@ extraction_reasoning = "medium"
         "the queue is derived from the concurrency"
     );
     assert_eq!(c.tool_settings().max_sends_per_run, 2);
-    let grid = c.slice_grid();
-    assert_eq!(grid.grid.lines_per_batch, 20);
+    let zone = qbot_sched::Zone::get("UTC").unwrap();
     assert_eq!(
-        (
-            grid.slice_batches,
-            grid.previous_context_batches,
-            grid.next_context_batches
-        ),
-        (4, 1, 1)
+        c.schedules(&zone)
+            .into_iter()
+            .map(|(kind, repeat)| (kind, repeat.rule.to_string()))
+            .collect::<Vec<_>>()[0],
+        (qbot_sched::JobKind::Extract, "daily@03:30".to_owned()),
+        "the memory batch is a scheduled job"
     );
-    assert_eq!(grid.retained_raw_batches, 4, "the verbatim tier");
     assert_eq!((c.group_memories(), c.person_memories()), (12, 7));
     assert_eq!(
         (c.roster_recent_ms(), c.roster_people()),
@@ -655,9 +648,8 @@ extraction_reasoning = "medium"
     assert_eq!(
         c.history_window(),
         qbot_core::HistoryWindow {
-            batch_lines: 20,
-            raw_batches: 4,
-            summary_batches: 0
+            summaries: 0,
+            carry_lines: 30
         }
     );
     assert_eq!(
@@ -980,7 +972,10 @@ fn maintenance_settings_convert_and_validate() {
     };
     assert_eq!(
         scheduled(&loaded.config),
-        [(qbot_sched::JobKind::Nightly, "daily@02:30".to_owned())]
+        [
+            (qbot_sched::JobKind::Extract, "daily@04:00".to_owned()),
+            (qbot_sched::JobKind::Nightly, "daily@02:30".to_owned())
+        ]
     );
     let with_owner = load(
         &root,
@@ -993,6 +988,7 @@ fn maintenance_settings_convert_and_validate() {
     assert_eq!(
         scheduled(&with_owner.config),
         [
+            (qbot_sched::JobKind::Extract, "daily@04:00".to_owned()),
             (qbot_sched::JobKind::Nightly, "daily@02:30".to_owned()),
             (qbot_sched::JobKind::Report, "mon,fri@09:00".to_owned()),
         ]
@@ -1048,8 +1044,6 @@ fn settings_that_depend_on_each_other_are_checked_together() {
         &root,
         &MapEnv::new([
             ("QBOT__BOT__ACCOUNT", "10001"),
-            ("QBOT__HISTORY__RAW_BATCHES", "2"),
-            ("QBOT__MEMORY__SLICE_BATCHES", "3"),
             ("QBOT__REPLIES__DEADLINE_SECS", "20"),
             ("QBOT__MEDIA__REPLY_WAIT_SECS", "20"),
             ("QBOT__REPLIES__SPONTANEOUS_CHANCE", "1.5"),
@@ -1063,11 +1057,7 @@ fn settings_that_depend_on_each_other_are_checked_together() {
     .collect();
     assert_eq!(
         keys,
-        [
-            "replies.spontaneous_chance",
-            "memory.slice_batches",
-            "media.reply_wait_secs"
-        ],
-        "a slice wider than the verbatim tier, a media wait as long as the reply deadline, a chance above 1"
+        ["replies.spontaneous_chance", "media.reply_wait_secs"],
+        "a media wait as long as the reply deadline, a chance above 1"
     );
 }

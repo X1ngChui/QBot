@@ -1,19 +1,18 @@
 //! Memory: who people are (identity, names), what happened (episodes) and what the bot remembers
 //! about members and the group (memories).
 //!
-//! An *episode* is the summary of one fixed slice of a group's chat: a configured number of whole
-//! chat batches, on the same batch grid the history window uses. It owns exactly that range; the
-//! neighboring batches are shown to the extractor as context only. Episodes are the unit of
-//! long-term recall and, because a summary never changes and covers whole batches, also the
-//! natural stand-in for older chat when context has to shrink. Each episode's extraction also
-//! finds the names its lines use for members and the statements worth remembering, which
-//! consolidation applies to the name index and the memories.
+//! Once a day each group's *batch* reads everything archived since its previous batch and divides
+//! it into *episodes*, one per conversation. An episode owns exactly its lines and its summary
+//! never changes: episodes are the unit of long-term recall and the stand-in for older chat in
+//! what replies are shown. The batch also finds the names the lines use for people and the
+//! statements worth remembering, which consolidation applies to the name ledger and the
+//! memories. Nothing else writes them, so what replies are shown of a group stays the same from
+//! one batch to the next.
 
-pub mod build;
+pub mod batch;
 pub mod conformance;
 pub mod consolidate;
 pub mod episode;
-pub mod extract;
 pub mod findings;
 pub mod history;
 pub mod identity;
@@ -32,15 +31,17 @@ pub mod slice;
 pub mod store;
 pub mod worth;
 
-pub use build::{BuildError, BuilderConfig, Built, EpisodeBuilder};
+pub use batch::{
+    Answer, BatchError, BatchReader, Earlier, MAX_ATTEMPTS, METHOD, Planned, Stretch,
+    check_episodes,
+};
 pub use episode::{Episode, EpisodeId, Evidence, Hit, NewEpisode};
-pub use extract::{EpisodeExtractor, ExtractError, Extracted, MAX_ATTEMPTS, METHOD, SliceContext};
 pub use history::{HistoryPart, compose};
 pub use identity::{
     IdentityError, IdentityPolicy, Invitation, InvitationState, LinkError, LinkOutcome,
 };
 pub use identity_store::{IdentityStore, MemoryIdentityStore};
-pub use jobs::EpisodeJobs;
+pub use jobs::{EpisodeJobs, embedding_text};
 pub use memories::{
     Change, Durability, InMemoryMemoryStore, Memory, MemoryId, MemoryState, MemoryStore, Statement,
     Support,
@@ -51,7 +52,6 @@ pub use names::{
 };
 pub use notes::{MemoryNoteStore, Note, NoteId, NoteStore};
 pub use recall::{Recall, RecallError, RecallParams, rank};
-pub use rule::NameRuler;
 pub use slice::{Background, SliceBackground, SliceLine, SliceMember};
-pub use store::{EpisodeStore, MemoryEpisodeStore, MemoryError};
+pub use store::{EpisodeStore, MemoryEpisodeStore, MemoryError, WindowState};
 pub use worth::{Activity, Capacity, HalfLives};

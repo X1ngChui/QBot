@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use qbot_agent::{ArchiveCursor, Chain, ContextSource, EnvError, RecapWhen, Trigger};
+use qbot_agent::{ArchiveCursor, Chain, ContextSource, EnvError, Trigger};
 use qbot_context::{ChatBatch, ChatLine, InstructionRole, Outcome, Speaker};
 use qbot_core::{
     AccountId, ChainId, GroupId, HistoryWindow, MemberNo, MessageId, TimerId, UnixMillis,
@@ -977,9 +977,9 @@ async fn about_member_tells_everything_kept_about_one_member_with_its_history() 
     assert!(ctx.describe(g, MemberNo::new(3)).await.unwrap().is_none());
 }
 
-/// A context over `n` lines (ordinal = message id), batches of two: the newest two batches
-/// verbatim, the two before them as summaries.
-async fn tiered(n: i64, episodes: &[(u64, u64, &str)]) -> PromptContext {
+/// A context over `n` lines (ordinal = message id) with the given episodes: two summaries
+/// before the raw part, which carries the last `carry` summarized lines.
+async fn windowed(n: i64, episodes: &[(u64, u64, &str)], carry: u32) -> PromptContext {
     use qbot_memory::{EpisodeStore, MemoryEpisodeStore, conformance::episode};
 
     let g = GroupId::new(900).unwrap();
@@ -999,15 +999,22 @@ async fn tiered(n: i64, episodes: &[(u64, u64, &str)]) -> PromptContext {
         Arc::new(Clock0),
         PromptSettings {
             window: HistoryWindow {
-                batch_lines: 2,
-                raw_batches: 2,
-                summary_batches: 2,
+                summaries: 2,
+                carry_lines: carry,
             },
             timezone: "UTC".into(),
         },
     )
     .unwrap()
     .with_episodes(store)
+}
+
+fn texts(opened: &qbot_agent::OpenedContext) -> Vec<&str> {
+    opened.window.iter().map(|l| l.text.as_str()).collect()
+}
+
+fn recap_ranges(opened: &qbot_agent::OpenedContext) -> Vec<std::ops::Range<usize>> {
+    opened.recaps.iter().map(|r| r.lines.clone()).collect()
 }
 
 fn addressed(message: i64) -> Trigger {
@@ -1018,54 +1025,43 @@ fn addressed(message: i64) -> Trigger {
 }
 
 #[tokio::test]
-async fn history_is_raw_then_summarized_then_left_out_by_batch_count() {
+async fn history_is_the_newest_summaries_then_the_raw_part_from_the_last_batch() {
     let g = GroupId::new(900).unwrap();
-    // 13 lines: batch 6 (13-14) is being filled. Raw: batches 5-6 (lines 11-13). Summaries:
-    // batches 3-4 (lines 7-10). Lines 1-6 are left out, except that an episode ending in the
-    // summary tier is shown whole, so its lines are loaded from where it begins.
-    let ctx = tiered(
-        13,
-        &[
-            (1, 4, "too old"),
-            (5, 8, "trip"),
-            (9, 10, "lunch"),
-            (11, 12, "now"),
-        ],
-    )
-    .await;
+    let story = [
+        (1, 4, "too old"),
+        (5, 8, "trip"),
+        (9, 10, "lunch"),
+        (11, 12, "now"),
+    ];
+    // The batch summarized lines 1-12; line 13 is newer. Two carried lines: the raw part begins
+    // at line 11, after the two newest summaries; nothing older is loaded.
+    let ctx = windowed(13, &story, 2).await;
     let opened = ctx.open(g, &addressed(13)).await.unwrap();
-    let texts: Vec<_> = opened.window.iter().map(|l| l.text.as_str()).collect();
-    assert_eq!(texts.first(), Some(&"line 5"), "nothing older is loaded");
-    assert_eq!(texts.len(), 9);
-    let recaps: Vec<_> = opened
-        .recaps
-        .iter()
-        .map(|r| (r.lines.clone(), r.when))
-        .collect();
     assert_eq!(
-        recaps,
-        vec![
-            (0..4, RecapWhen::Open),
-            (4..6, RecapWhen::Open),
-            (6..8, RecapWhen::Overflow),
-        ],
-        "summary-tier episodes apply at once; a raw-tier episode only as the fallback"
+        texts(&opened),
+        [
+            "line 5", "line 6", "line 7", "line 8", "line 9", "line 10", "line 11", "line 12",
+            "line 13"
+        ]
     );
+    assert_eq!(recap_ranges(&opened), [0..4, 4..6]);
+    assert_eq!((opened.raw, opened.raw_ordinal), (6, 11));
     assert!(opened.recaps[0].text.contains("summary of trip"));
     assert!(
         opened.recaps[0].text.starts_with("episode 2, "),
         "a summary names its episode, so read_episode can open it: {}",
         opened.recaps[0].text
     );
-    assert!(!opened.recaps.iter().any(|r| r.text.contains("too old")));
 
-    // The trigger is never summarized, even by the fallback.
-    let opened = ctx.open(g, &addressed(12)).await.unwrap();
-    assert_eq!(
-        opened.recaps.len(),
-        2,
-        "the episode holding the trigger stays raw"
-    );
+    // Three carried lines: the raw part begins where the episode holding the first of them does.
+    let opened = windowed(13, &story, 3)
+        .await
+        .open(g, &addressed(13))
+        .await
+        .unwrap();
+    assert_eq!(texts(&opened).first(), Some(&"line 1"));
+    assert_eq!(recap_ranges(&opened), [0..4, 4..8]);
+    assert_eq!((opened.raw, opened.raw_ordinal), (8, 9));
 
     // The same history always gives the same view.
     assert_eq!(ctx.open(g, &addressed(13)).await.unwrap(), {
@@ -1074,37 +1070,63 @@ async fn history_is_raw_then_summarized_then_left_out_by_batch_count() {
 }
 
 #[tokio::test]
-async fn summary_tier_lines_without_an_episode_yet_stay_verbatim() {
+async fn the_raw_part_grows_until_the_next_batch_and_starts_no_earlier_than_a_cut() {
     let g = GroupId::new(900).unwrap();
-    let ctx = tiered(13, &[(9, 10, "lunch")]).await;
-    let opened = ctx.open(g, &addressed(13)).await.unwrap();
-    let texts: Vec<_> = opened.window.iter().map(|l| l.text.as_str()).collect();
-    assert_eq!(
-        texts.first(),
-        Some(&"line 7"),
-        "the summary tier starts at batch 3"
-    );
-    let recaps: Vec<_> = opened.recaps.iter().map(|r| r.lines.clone()).collect();
-    assert_eq!(
-        recaps,
-        vec![2..4],
-        "lines 7-8 have no episode yet and are shown as they are"
-    );
+    let story = [
+        (1, 4, "too old"),
+        (5, 8, "trip"),
+        (9, 10, "lunch"),
+        (11, 12, "now"),
+    ];
+    // Lines since the batch only add to the raw part; the view before it stays the same.
+    let ctx = windowed(20, &story, 2).await;
+    let opened = ctx.open(g, &addressed(20)).await.unwrap();
+    assert_eq!(recap_ranges(&opened), [0..4, 4..6]);
+    assert_eq!((opened.raw, opened.raw_ordinal), (6, 11));
+    assert_eq!(opened.window.len(), 16);
 
-    // An episode that reaches into the raw tier is not a summary-tier episode.
-    let ctx = tiered(13, &[(9, 12, "straddles")]).await;
+    // A too-long request moved the raw part's start into the episode of lines 11-12: the
+    // summaries stay, and the lines before the cut that no summary holds are left out.
+    ctx.cut(g, 12).await.unwrap();
+    let opened = ctx.open(g, &addressed(20)).await.unwrap();
+    assert_eq!(recap_ranges(&opened), [0..4, 4..6]);
+    assert_eq!((opened.raw, opened.raw_ordinal), (6, 12));
+    assert_eq!(texts(&opened)[5..7], ["line 10", "line 12"]);
+    // Past what the batch summarized, likewise; and a cut only moves forward.
+    ctx.cut(g, 15).await.unwrap();
+    ctx.cut(g, 13).await.unwrap();
+    let opened = ctx.open(g, &addressed(20)).await.unwrap();
+    assert_eq!((opened.raw, opened.raw_ordinal), (6, 15));
+    assert_eq!(texts(&opened)[5..7], ["line 10", "line 15"]);
+}
+
+#[tokio::test]
+async fn lines_no_summary_holds_are_not_shown_before_the_raw_part() {
+    let g = GroupId::new(900).unwrap();
+    // Lines 5-8 have no episode (the batch gave up on them).
+    let ctx = windowed(13, &[(1, 4, "lunch"), (9, 12, "trip")], 2).await;
     let opened = ctx.open(g, &addressed(13)).await.unwrap();
     assert_eq!(
-        opened.recaps.iter().map(|r| r.when).collect::<Vec<_>>(),
-        vec![RecapWhen::Overflow]
+        texts(&opened),
+        [
+            "line 1", "line 2", "line 3", "line 4", "line 9", "line 10", "line 11", "line 12",
+            "line 13"
+        ]
     );
+    assert_eq!(recap_ranges(&opened).len(), 1);
+    assert_eq!(opened.recaps[0].lines, 0..4);
+    assert_eq!((opened.raw, opened.raw_ordinal), (4, 9));
 
-    // A new batch moves every boundary by one batch.
-    let ctx = tiered(15, &[]).await;
-    let opened = ctx.open(g, &addressed(15)).await.unwrap();
+    // Before the first batch everything is raw.
+    let opened = windowed(5, &[], 2)
+        .await
+        .open(g, &addressed(5))
+        .await
+        .unwrap();
+    assert!(opened.recaps.is_empty());
     assert_eq!(
-        opened.window.first().map(|l| l.text.as_str()),
-        Some("line 9")
+        (opened.window.len(), opened.raw, opened.raw_ordinal),
+        (5, 0, 1)
     );
 }
 
@@ -1267,15 +1289,18 @@ async fn memory_written_from_chat_keeps_the_chats_standing_when_it_comes_back() 
     let mut poisoned = episode(g, 5, 8, "trip");
     poisoned.summary = injected.into();
     store.insert(&poisoned, &[1.0, 0.0], "m").await.unwrap();
+    store
+        .insert(&episode(g, 9, 12, "later"), &[1.0, 0.0], "m")
+        .await
+        .unwrap();
     let ctx = PromptContext::new(
         Arc::new(FixedHistory(lines)),
         Personas::single(persona("Bobo", "")),
         Arc::new(Clock0),
         PromptSettings {
             window: HistoryWindow {
-                batch_lines: 2,
-                raw_batches: 2,
-                summary_batches: 2,
+                summaries: 2,
+                carry_lines: 2,
             },
             timezone: "UTC".into(),
         },

@@ -36,8 +36,8 @@ R9. Commands without model calls for members and owners (section 12).
 R10. Group tasks: durable timers owned by the group, bounded, waking the agent with fresh
 context; one-shot, or repeating by a rule the scheduler keeps (never by the model), each
 occurrence run at most once.
-R11. Operations: extraction as chat fills batches, nightly upkeep (cache decay, verified
-backups, cleanup), a daily report to the owners, and single-instance exclusivity.
+R11. Operations: a daily memory batch, nightly upkeep (cache decay, verified backups,
+cleanup), a daily report to the owners, and single-instance exclusivity.
 R12. Observability: every provider call (model turns of replies, extraction and picture
 description, embeddings, web searches and page reads) is counted with its requests, tokens, cache
 hits, credits and latency, by the work it served; a run that fails logs why (`/logs`). Nothing
@@ -81,17 +81,17 @@ qbot-ops       nightly run, backups, report, NapCat cache
 qbot-tools     the model's tools
 qbot-media     picture description and voice transcription service
 qbot-asr       in-process speech recognition (sherpa-onnx, SenseVoice)
-qbot-prompt    instructions, personas, history tiers, chat rendering
+qbot-prompt    instructions, personas, the history window, chat rendering
 qbot-sched     timers, group tasks, jobs, repeat rules, the scheduler loop
 qbot-agent     supervisor, run loop, tool trait and executor, ports, a simulated group
-qbot-memory    identity, names, episodes, extraction, consolidation, memories, recall, notes
+qbot-memory    identity, names, episodes, the batch, consolidation, memories, recall, notes
 qbot-store     Postgres adapters for every port, the schema, the lease
 qbot-llm       provider contract, Responses/DeepSeek adapter, embeddings, web search, fakes
 qbot-config    typed, layered configuration and secrets
 qbot-i18n      member-facing message catalogs (Fluent)
 qbot-wording   model-facing short texts (`prompts/wording.toml`)
 qbot-context   the canonical transcript and its projection (pure)
-qbot-core      ids, time, the batch grid, markers (pure)
+qbot-core      ids, time, the history window, markers (pure)
 qbot-eval      reply-quality evaluation against the real model (run by hand)
 ```
 
@@ -189,8 +189,7 @@ scheduler and memory depend on no database or platform. Its Postgres adapter liv
   line) submits a run. A nickname counts in Chinese text wherever it appears (jieba always cuts
   it out), in Latin text as a whole word; so a member who talks *about* the bot by a nickname
   that is an ordinary word starts a run too. Mute and block are decided by the supervisor for
-  runs and by the command router for commands, not here. A filled batch queues the group's
-  extraction job.
+  runs and by the command router for commands, not here.
 - **Delivery**: `send_group_msg`, correlated by `echo` token, then a wait for the platform's
   report of the bot's own message (`message_sent`), which is how dice and rock-paper-scissors
   results become known. A failed send is returned to the model as an error of one of two kinds:
@@ -226,9 +225,10 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
 - Blocking never removes context: a blocked member's lines are shown as anyone's, the block is
   enforced at admission, and the instructions list who is blocked.
 - Projection is pure: the visible view of the transcript, lowered by the provider adapter. A
-  `Summary` stands in for a range of chat items (the summary history tier, and the
-  `ContextTooLong` fallback); the originals stay in the transcript. An earlier turn's view never
-  changes, so the provider's prefix cache keeps hitting.
+  `Summary` stands in for a range of chat items (an episode before the raw part), and a `Trim`
+  leaves out the older lines of the raw part when the provider refuses a request as too long;
+  the originals stay in the transcript. An earlier turn's view never changes, so the provider's
+  prefix cache keeps hitting.
 - Runs are stored as `run` and `run_item` rows as they grow. Startup closes runs left open by a
   crashed process: pending calls get `Interrupted`, the run ends `interrupted`.
 
@@ -350,15 +350,15 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
 - **Instructions** are minijinja templates in `prompts/*.md` with a closed set of slots per
   template (a test holds them equal): the reply rules, the guide to reading chat markers, the
   persona block, the roster (people block), the learned group knowledge, the three trigger notes,
-  picture description, extraction.
+  picture description, the memory batch.
 - **Order is stable to volatile**, so runs of a group share the longest prefix the provider can
   cache:
   1. the reply rules, the legend, and the persona with its group background (fixed per
      deployment);
-  2. the roster and learned knowledge, which change only when a command or an extraction
-     changes a record, or with the day (activity and rank are counted as of the start of the
-     UTC day);
-  3. the chat, which grows by whole batches;
+  2. the roster and learned knowledge, which change only when a command changes a record or
+     with the group's daily batch (activity and rank are counted as of the last batch);
+  3. the chat: the summaries the batch left, then the raw part, which only grows until the
+     next batch;
   4. last the trigger note (the time, the trigger, a task's intent, what is remembered about
      the members of the run's conversation and what members wrote about them, and the display
      names of those of them the roster cannot name), which is different for every run.
@@ -381,10 +381,19 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
   wrote and the `memory.person_memories` (8) memories of most rank, each with who said it, in how
   many conversations and when last. Anyone else is reached with `about_member`.
 - **Personas** are TOML files: `default.toml`, or `group_<id>.toml` replacing it for one group.
-- **History tiers.** A run sees whole batches counted back from the batch being filled: the newest
-  `history.raw_batches` verbatim, the `history.summary_batches` before them as the summaries of
-  the episodes that cover them (a batch no episode covers yet stays verbatim), nothing older; that
-  is reached through `search_history` and `recall_episodes`. The tiers move a batch at a time.
+- **History window.** Anchored at the group's last batch: the raw part starts
+  `history.carry_lines` (90) lines before the last line the batch summarized, at the start of the
+  episode holding that line, and runs to the newest line; the `history.summaries` (8) newest
+  episodes before it are shown as their summaries; lines before the raw part that no shown
+  summary holds (a stretch the batch gave up on) are left out, and nothing older is shown. That is
+  reached through `search_history` and `recall_episodes`. Between batches the window only grows,
+  so every run of the day reuses the cached prefix. There is no size cap: when the provider
+  refuses a request as longer than its context, the run leaves out the older half of the raw
+  part's estimated tokens (or, when the error states the limit and the request's size, as much
+  as brings the request to about half the room left), retries, halves again if it must, and ends
+  when no raw line is left; the new start is stored for the group (`history_window.cut`) until
+  the next batch, so later runs do not hit the limit again. The summaries and the instructions
+  are never cut.
   A summary names its episode (`episode 12, ...`), so `read_episode` can open its messages; before
   it did, 12 of 20 `read_episode` calls in a month were refused ids the model had guessed.
 - **Group knowledge** enters as an instruction: the `memory.group_memories` (40) group memories
@@ -435,12 +444,13 @@ enum Outcome { Ok, Error(ErrorKind), Refused(RefusalReason), Interrupted }
 
 ## 8. Memory
 
-Described in [memory.md](memory.md). In short: the archive is the source of truth; an episode
-summarizes one fixed slice of whole batches and is never rewritten; extraction returns the
-episode and its findings in one validated tool call; consolidation turns findings into name uses
-and changes to memories (new, the same, replaced, ended); recall ranks episodes by similarity decaying with age; embeddings are
-a derived index each group's extraction completes for the configured embedding model before
-it extracts.
+Described in [memory.md](memory.md). In short: the archive is the source of truth; once a day
+(`memory.batch`, off-peak) each group's batch divides the lines since its last batch into
+episodes at boundaries the model chooses (checked to hold every line exactly once), reads each
+episode's findings, and only then stores and applies them in chat order; an episode is never
+rewritten; consolidation turns findings into name uses and changes to memories (new, the same,
+replaced, ended); recall ranks episodes by similarity decaying with age; embeddings are a
+derived index each batch completes for the configured embedding model first.
 
 **Groups are separate.** Except the owners' `/stats global` (totals of runs, provider calls and
 tokens over all groups), nothing learned or stored in one group becomes visible in, or changes
@@ -625,7 +635,7 @@ the `media_ref` row the platform reference came in.
   per response. So a retried call is one record with all its requests, and no response is
   counted twice. The work a call serves is declared around it, not passed to the adapter:
   `attributed(Attribution, ..)` wraps a reply run's model turns and tool turns (purpose `reply`,
-  the run and the turn), a group's extraction job (`extraction`) and a picture description
+  the run and the turn), the memory batch (`extraction`) and a picture description
   (`picture`). A call made outside any such scope is still recorded, as unattributed, with a
   warning. Search providers report plan credits, not tokens; a provider that does not report
   its cache use is `CacheUsage::NotReported`, stored as NULL, never as zero.
@@ -693,26 +703,24 @@ The schema holds only what a deployment may choose:
 | `gateway` | listen address, access token secret |
 | `database` | host, port, name, user, ssl mode, password secret |
 | `replies` | concurrency, deadline, messages per reply, the chance of a spontaneous run |
-| `history` | batch lines, raw and summary batches |
-| `memory` | slice batches; group memories and memories per person shown; who the roster lists (days, people); recall's max distance and half-life; how fast memories of each durability lose rank (episodes); how many memories a group keeps per member and about itself |
+| `history` | summaries shown, lines carried raw past the last batch |
+| `memory` | the batch's schedule and its re-reads; group memories and memories per person shown; who the roster lists (days, people); recall's max distance and half-life; how fast memories of each durability lose rank (episodes); how many memories a group keeps per member and about itself |
 | `media` | voice transcription on or off; pictures and clips per minute per group; how long a reply waits for them |
 | `network` | an outbound proxy and the services that use it |
 | `providers.*` | text (endpoint, model, reasoning of replies and of extraction), vision, embedding (model, width, batch), search (depths) |
 | `maintenance` | nightly and report schedules, backups kept, client tools directory, record retention, NapCat cache cleanup |
 
 Settings that depend on each other are checked together at startup:
-- `memory.slice_batches` is at most `history.raw_batches`, so an episode exists before its chat
-  leaves the verbatim tier;
 - `media.reply_wait_secs` is less than `replies.deadline_secs`, since the wait counts against
   the deadline;
 - `replies.spontaneous_chance` is from 0 to 1.
 
 Derived rather than configured:
 - the reply queue: ten waiting runs per model slot of `replies.concurrency`;
-- the extraction's context: one batch on either side of a slice, within the verbatim tier;
-- extraction cadence: every filled batch queues its group's extraction, which extracts each
-  completed slice; nothing else extracts, so a slice missed by a failed job is extracted by
-  the group's next one;
+- the batch's context: the 30 lines before the new ones, the summary of the episode they
+  continue, and older lines the new ones quote;
+- batch cadence: one job on `memory.batch` reads every group in turn; nothing else reads chat
+  into memory, so lines a failed batch left are read by the next one;
 - record retention: one `maintenance.records_keep_days` for finished runs and finished
   scheduled tasks, the two operational records;
 - the writing language (from the locale) and the
@@ -734,7 +742,8 @@ error is left to that error. The local limits and why they exist:
 | Messages per reply | configured | a product rule against flooding the group |
 | Task minimum delay, pending, chain depth | 5 min, 50, 24 | stop the model scheduling itself in a loop or filling the table |
 | Repeating task interval | 1 h | every occurrence is a model run in the group, and a series never ends by itself |
-| Extraction attempts | 3 | bounds the calls on a slice the model cannot summarize; after them the slice is skipped, so it cannot stall the group |
+| Batch attempts | 3 per call | bounds the calls on lines the model cannot divide or read; after them the lines are skipped, so they cannot stall the group |
+| Rulings and re-reads per batch | 6; configured (10) | each is a model call on the group's shared prefix; what is left waits for the next batch |
 | Media per minute per group | configured | resource isolation between groups |
 | Media workers, queue, picture size, clip length | 4, 32, 8 MiB, 300 s | CPU and memory isolation; pictures and clips are untrusted input of any size |
 | Opened-picture cache | 64 MiB | memory bound for bytes fetched on demand |
@@ -755,8 +764,8 @@ error is left to that error. The local limits and why they exist:
 | Per-call deadlines | 10 min text, 2 min picture, 30 s embedding, 20 s search | a hung connection must not stall the nightly run |
 | Connect timeout | 10 s | a hung connect is invisible to the provider |
 
-Not limited, deliberately: model output length, context size (history is a batch-count policy;
-`ContextTooLong` is the fallback that summarizes the verbatim tier once), tool calls per turn,
+Not limited, deliberately: model output length, context size (the raw part grows until the
+next batch; a `ContextTooLong` refusal halves it, section 7), tool calls per turn,
 tool result size beyond the inputs above, chat folded into a run between turns, task horizon, and
 spend.
 
@@ -769,9 +778,9 @@ spend.
   shared conformance suites (`qbot_memory::conformance`, `qbot_sched::conformance`, ...) run
   against both.
 - Member numbers are assigned densely under a per-group advisory lock and are immutable: a
-  trigger rejects any update, delete or truncate of `member_number`. A group's slices cannot
-  overlap, whether episodes or skipped (`slice_skip`): range exclusion constraints, and a check
-  across the two tables under the group's slice lock. One current memory per subject and key
+  trigger rejects any update, delete or truncate of `member_number`. A group's ranges cannot
+  overlap, whether episodes or skipped stretches (`slice_skip`): range exclusion constraints, and
+  a check across the two tables under the group's lock. One current memory per subject and key
   (a partial unique index), and one name use per member, name and episode.
 - **Single instance**: the process takes a Postgres advisory-lock session lease before it migrates
   or recovers anything, checks it every ten seconds, and shuts down if it loses it. A check that does not answer within the interval
@@ -781,8 +790,9 @@ spend.
 
 ## 16. Operations (`qbot-ops`)
 
-- **Extraction** is a group's own job, queued by each filled batch (memory.md section 2); the
-  nightly run does not extract.
+- **The memory batch** is one scheduled job (`memory.batch`, daily at 04:00 by default, an
+  off-peak hour) that reads each group in turn (memory.md section 2); the nightly run does not
+  read chat.
 - **Nightly**: decay (cached picture descriptions older than 15 days; memories are not aged by
   the calendar: their rank follows the conversation and is computed on read), a verified backup, cleanup (finished tasks and finished
   runs after `maintenance.records_keep_days`, NapCat's file cache through its `clean_cache`
@@ -832,9 +842,9 @@ through it.
 4. No cap on chat folded into a run between turns until real use shows a problem.
 5. Evaluation is written in English; test conversations may be in Chinese.
 6. Speech recognition runs in the process.
-7. The archive is the source of truth. Derived memory survives a change of extraction model; only
-   an incompatible embedding model or width calls for re-embedding, which each group's next
-   extraction does.
+7. The archive is the source of truth. Derived memory survives a change of the batch's model;
+   only an incompatible embedding model or width calls for re-embedding, which each group's next
+   batch does.
 
 ## 19. Known gaps
 
@@ -858,12 +868,11 @@ through it.
   only the commands limit what a member may look up, and the reply rules what the bot passes on.
 - Names in lines archived before display names were recorded have none: what a member was shown
   as before that is unknown.
-- A slice the provider refuses with an error that is not classed as permanent is tried again on
-  every filled batch, and holds back that group's later slices.
-- What is said in a group is learned only when its slice is complete: a group that stops
-  talking keeps its last, incomplete slice unextracted (still verbatim in the history and
-  searchable), and after an embedding change a group that fills no batch keeps its old
-  episodes unembedded until it does.
+- Lines whose batch the provider refuses with an error that is not classed as permanent are
+  read again by the next day's batch, together with that day's lines.
+- What is said in a group is learned at the next batch, up to a day later; until then it is
+  in the raw part of the history and searchable. Commands (`/name`, `/block`, `/forget`, notes)
+  take effect at once.
 - A picture in a line `search_history` or `read_episode` showed cannot be opened with
   `open_images`, which reaches only the run's visible chat.
 - A quote of an old message a search found names it by NapCat's message id, a 31-bit hash

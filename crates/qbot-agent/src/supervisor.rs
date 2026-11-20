@@ -579,7 +579,15 @@ async fn drive(
         context,
         deadline,
     };
-    execute(&inner.deps, &input, &inner.cancel).await
+    let report = execute(&inner.deps, &input, &inner.cancel).await;
+    // A raw part the provider found too long stays shorter for the group's later runs. If that
+    // cannot be recorded, the next run is cut again: nothing is lost.
+    if let Some(from) = report.cut
+        && let Err(error) = inner.source.cut(input.group, from).await
+    {
+        tracing::warn!(group = input.group.get(), %error, "the shorter raw part could not be recorded");
+    }
+    report
 }
 
 /// Close the record of a run that never reached the model.
@@ -612,6 +620,7 @@ fn unstarted(run: RunId, group: GroupId, end: RunEnd) -> RunReport {
         turns: 0,
         tool_calls: 0,
         sends: 0,
+        cut: None,
         transcript: Transcript::new(),
     }
 }

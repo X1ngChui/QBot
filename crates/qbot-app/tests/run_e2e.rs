@@ -957,7 +957,11 @@ async fn the_nightly_pipeline_and_the_daily_report_run_on_schedule() {
             .fetch_all(&pool)
             .await
             .unwrap();
-    assert_eq!(kinds, ["nightly", "report"]);
+    assert_eq!(
+        kinds,
+        ["extract", "nightly", "report"],
+        "the configured schedules, the memory batch among them"
+    );
     let dumps: Vec<_> = std::fs::read_dir(root.join("data/backups"))
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
@@ -1012,39 +1016,47 @@ async fn a_missing_backup_tool_stops_startup_with_a_clear_error() {
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
-async fn a_filled_batch_turns_archived_chat_into_a_stored_episode() {
+async fn the_scheduled_batch_turns_archived_chat_into_stored_episodes() {
     let Some(db) = database().await else { return };
     let root = scratch();
-    // The extractor's model answers with a valid episode: a title, a summary, and a quote copied
-    // exactly from the first line; the member who wrote it gives a name and is remembered for
-    // something.
+    let findings =
+        |args: serde_json::Value| SimStep::Reply(FakeReply::new().call("submit_findings", args));
     let sim = Arc::new(SimServer::new([
+        // The first batch: one episode of the three lines, with a quote copied exactly from the
+        // first; the member who wrote it gives a name and is remembered for something.
         SimStep::Reply(FakeReply::new().call(
-            "submit_episode",
-            json!({"title": "Planning a trip", "summary": "Members discussed planning a trip together.",
-                   "evidence": [{"line": 1, "quote": "plan the trip"}],
-                   "references": [{"line": 1, "text": "Tess", "refers": "member:1", "role": "self",
-                                   "basis": "self", "shown_by": []}],
-                   "memories": [{"about": "member:1", "action": "new", "text": "likes planning trips",
-                                 "durability": "ongoing", "line": 1, "quote": "plan the trip"}]}),
+            "submit_episodes",
+            json!({"episodes": [{"first_line": 1, "last_line": 3, "title": "Planning a trip",
+                   "summary": "Members discussed planning a trip together.",
+                   "evidence": [{"line": 1, "quote": "plan the trip"}]}]}),
         )),
-        SimStep::Reply(FakeReply::new().call(
-            "submit_episode",
-            json!({"title": "Packing", "summary": "Members talked about what to pack.",
-                   "evidence": [{"line": 1, "quote": "pack light"}]}),
-        )),
+        findings(
+            json!({"references": [{"line": 1, "text": "Tess", "refers": "member:1", "role": "self",
+                                        "basis": "self", "shown_by": []}],
+                        "memories": [{"about": "member:1", "action": "new", "text": "likes planning trips",
+                                      "durability": "ongoing", "line": 1, "quote": "plan the trip"}]}),
+        ),
         // The reply run looks and stays silent.
         SimStep::Reply(FakeReply::new().call("stay_silent", json!({}))),
+        // The second batch, numbering its own lines from 1.
+        SimStep::Reply(FakeReply::new().call(
+            "submit_episodes",
+            json!({"episodes": [{"first_line": 1, "last_line": 4, "title": "Packing",
+                   "summary": "Members talked about what to pack.",
+                   "evidence": [{"line": 1, "quote": "pack light"}]}]}),
+        )),
+        findings(json!({})),
     ]));
     let (llm, embedded) = mock_llm_counting(sim.clone()).await;
-    // One-line batches and three-batch slices: the third line completes a slice, and the batch
-    // it fills queues the extraction at once.
+    // The batch's schedule (the default, 04:00) is due a few seconds after the start; replies
+    // carry no summarized line, so they show every episode as its summary.
+    schedule_in(&db, "extract", 240, 6).await;
     deployment_with(
         &db,
         llm,
         &root,
         None,
-        "[history]\nbatch_lines = 1\n[maintenance]\nbackups = 0\n",
+        "[history]\ncarry_lines = 0\n[maintenance]\nbackups = 0\n",
     );
     let bot = launch(&db, &root).await;
     let pool = db.pool().await;
@@ -1066,19 +1078,16 @@ async fn a_filled_batch_turns_archived_chat_into_a_stored_episode() {
 
     answering_names(
         &mut napcat,
-        // Stored and applied: its findings are consolidated right after the episode is stored.
-        eventually(
-            "the filled batch to store and apply the episode",
-            || async {
-                sqlx::query_scalar::<_, i64>(
-                    "SELECT count(*) FROM episode WHERE consolidated_ms IS NOT NULL",
-                )
-                .fetch_one(&pool)
-                .await
-                .unwrap()
-                    == 1
-            },
-        ),
+        // Stored and applied: its findings are consolidated once every call of the batch is done.
+        eventually("the batch to store and apply the episode", || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM episode WHERE consolidated_ms IS NOT NULL",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+                == 1
+        }),
     )
     .await;
     let (group, first, last, title, quote): (i64, i64, i64, String, String) = sqlx::query_as(
@@ -1121,24 +1130,31 @@ async fn a_filled_batch_turns_archived_chat_into_a_stored_episode() {
         (memory.1, memory.2.as_str(), memory.3.as_str(), memory.4),
         (3, "likes planning trips", "current", Some(3))
     );
-    // Every filled batch queued a job (three lines, three batches); the first two had no
-    // complete slice yet and found nothing to do.
+    // The job is done and waits for its next occurrence; the window remembers the batch.
     answering_names(
         &mut napcat,
-        eventually("the extraction jobs to be done", || async {
-            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM timer WHERE job_kind = 'extract' AND state = 'done' AND outcome = 'job_ok'")
-                .fetch_one(&pool)
-                .await
-                .unwrap()
-                == 3
+        eventually("the batch job to wait for tomorrow", || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM timer WHERE job_kind = 'extract' AND state = 'pending' \
+                   AND last_outcome = 'job_ok' AND due_ms > last_due_ms",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+                == 1
         }),
     )
     .await;
-    assert_eq!(sim.requests().len(), 1, "the slice was extracted once");
+    let windows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM history_window WHERE group_id = 900 AND cut = 0")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(windows, 1);
+    assert_eq!(sim.requests().len(), 2, "the episodes, then their findings");
 
-    // Three more lines complete the next slice; then a mention starts a reply. With one-line
-    // batches and four verbatim batches, lines 4-7 are shown as they are and lines 1-3 (the
-    // summary tier) only through their episode.
+    // Three more lines, then a mention starts a reply. The batch is made due now: the scheduler
+    // looks again when the reply's run ends, so the second batch reads lines 4-7 after it.
     for (id, text) in [(4, "pack light"), (5, "sunscreen too"), (6, "and a hat")] {
         napcat
             .send(group_message(
@@ -1149,17 +1165,11 @@ async fn a_filled_batch_turns_archived_chat_into_a_stored_episode() {
             .await
             .unwrap();
     }
-    answering_names(
-        &mut napcat,
-        eventually("the second episode", || async {
-            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM episode")
-                .fetch_one(&pool)
-                .await
-                .unwrap()
-                == 2
-        }),
-    )
-    .await;
+    sqlx::query("UPDATE timer SET due_ms = $1 WHERE job_kind = 'extract' AND state = 'pending'")
+        .bind(jiff::Timestamp::now().as_millisecond())
+        .execute(&pool)
+        .await
+        .unwrap();
     napcat
         .send(group_message(7, 2, json!([{"type": "at", "data": {"qq": "100"}}, {"type": "text", "data": {"text": " any tips?"}}])))
         .await
@@ -1167,13 +1177,21 @@ async fn a_filled_batch_turns_archived_chat_into_a_stored_episode() {
     // The reply asks for the display names of the members it shows, as every run does.
     answering_names(
         &mut napcat,
-        eventually("the reply request", || async { sim.requests().len() == 3 }),
+        eventually("the second episode", || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM episode WHERE consolidated_ms IS NOT NULL",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+                == 2
+        }),
     )
     .await;
     let seen = sim.requests()[2]["input"].to_string();
     assert!(
         seen.contains("Members discussed planning a trip together."),
-        "the older slice is shown as its summary: {seen}"
+        "the summarized lines are shown as their summary: {seen}"
     );
     assert!(
         !seen.contains("we should plan the trip together"),
@@ -1183,21 +1201,18 @@ async fn a_filled_batch_turns_archived_chat_into_a_stored_episode() {
         seen.contains("pack light") && seen.contains("any tips?"),
         "{seen}"
     );
-    assert!(
-        !seen.contains("Members talked about what to pack."),
-        "an episode still in the verbatim tier is not summarized"
-    );
     let asked = sim.requests()[0].to_string();
     assert!(
-        asked.contains("we should plan the trip together") && asked.contains("submit_episode"),
+        asked.contains("we should plan the trip together") && asked.contains("submit_episodes"),
         "{asked}"
     );
-    // The next slice's extractor saw the member as their lines were sent and what is remembered
-    // about them, with the id a later statement can name.
-    let next = sim.requests()[1].to_string();
+    // The next batch saw the member as their lines were sent and what is remembered about them,
+    // with the id a later statement can name.
+    let next = sim.requests()[3].to_string();
     assert!(
         next.contains("lines sent as \\\"Tester 3\\\"")
-            && next.contains(&format!("m{} (ongoing) likes planning trips", memory.0)),
+            && next.contains(&format!("m{} (ongoing) likes planning trips", memory.0))
+            && next.contains("any tips?"),
         "{next}"
     );
     // The reply's opening note carries what is remembered about the people in its chat.
@@ -1205,7 +1220,7 @@ async fn a_filled_batch_turns_archived_chat_into_a_stored_episode() {
         seen.contains("likes planning trips (they said so; 1 conversation(s)"),
         "{seen}"
     );
-    // Extraction (its model calls and the episodes' embeddings) is accounted for beside the
+    // The batch (its model calls and the episodes' embeddings) is accounted for beside the
     // reply, request for request.
     answering_names(
         &mut napcat,

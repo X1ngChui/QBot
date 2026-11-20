@@ -62,6 +62,12 @@ impl Renderer for PromptRenderer {
         format!("[summary of earlier conversation]\n{text}")
     }
 
+    fn trimmed(&self, lines: u32) -> String {
+        say(Text::PromptTrimmed {
+            count: lines.to_string(),
+        })
+    }
+
     fn outcome_note(&self, outcome: &Outcome) -> Option<String> {
         match outcome {
             Outcome::Ok => None,

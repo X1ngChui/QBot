@@ -583,3 +583,27 @@ async fn a_block_or_mute_set_while_a_run_waits_its_turn_holds() {
     assert_eq!((waited.end, waited.turns), (RunEnd::Cancelled, 0));
     assert_eq!(h.fake.recorded().len(), 2, "no model call after the block");
 }
+
+#[tokio::test]
+async fn where_a_run_left_the_raw_part_starting_is_recorded_for_later_runs() {
+    let h = harness(vec![
+        qbot_llm::fake::Step::Fail(qbot_llm::LlmError::ContextTooLong {
+            limit: None,
+            requested: None,
+        }),
+        reply_ok(say("hi")),
+    ]);
+    let sup = supervisor(&h, cfg(8, 4, 60));
+    for text in ["line 1", "line 2", "line 3", "line 4"] {
+        h.world.say(1, 1, text);
+    }
+    let report = sup
+        .submit(request(1, 104))
+        .await
+        .unwrap()
+        .finished()
+        .await
+        .unwrap();
+    assert_eq!(report.end, RunEnd::Delivered);
+    assert_eq!(h.world.cuts(), [3], "the newest two of four lines are kept");
+}

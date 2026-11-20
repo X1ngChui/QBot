@@ -15,7 +15,7 @@ pub use error::{AppendError, LoadError, ProjectError};
 pub use item::{
     AssistantPart, AssistantTurn, ErrorKind, Instruction, InstructionRole, Item, Meta,
     NativeReplay, OpaqueReasoning, Outcome, Part, RefusalReason, RunEnd, Summary, ToolCall,
-    ToolResult,
+    ToolResult, Trim,
 };
 pub use project::{View, ViewItem, project};
 pub use transcript::Transcript;

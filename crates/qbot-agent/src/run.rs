@@ -9,7 +9,9 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use qbot_context::{ChatBatch, Item, Meta, RunEnd, Summary, ToolCall, Transcript, project};
+use qbot_context::{
+    ChatBatch, ChatLine, Item, Meta, RunEnd, Summary, ToolCall, Transcript, Trim, project,
+};
 use qbot_core::{Clock, GroupId, ItemSeq, RunId};
 use qbot_llm::{
     Attribution, Conversation, ForcedToolChoice, LlmError, Provider, Purpose, ReasoningEffort,
@@ -19,8 +21,8 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::env::{
-    Archive, ArchiveCursor, OpenedContext, RecapWhen, RunLog, RunSummary, Trigger, UsageDetail,
-    UsageEvent, UsageSink,
+    Archive, ArchiveCursor, OpenedContext, RunLog, RunSummary, Trigger, UsageDetail, UsageEvent,
+    UsageSink,
 };
 use crate::executor::{RunLimits, execute_turn};
 use crate::tool::{ChatView, RunState, ToolCx, ToolSet};
@@ -71,6 +73,9 @@ pub struct RunReport {
     pub turns: u32,
     pub tool_calls: u32,
     pub sends: u32,
+    /// Where the run left the group's raw part starting (an archive ordinal), when the provider
+    /// found it too long: later runs start there too.
+    pub cut: Option<u64>,
     pub transcript: Transcript,
 }
 
@@ -92,8 +97,9 @@ struct Run<'a> {
     /// Reasoning was switched off for a forced turn; it stays off for the rest of the run, as
     /// `ForcedToolChoice::WithoutReasoning` requires.
     reasoning_off: bool,
-    /// Chat items an episode recap replaces only if the provider finds the context too long.
-    recaps: Vec<(ItemSeq, String)>,
+    /// The chat item holding the window's raw part, and how many of its lines are left out.
+    raw_item: Option<ItemSeq>,
+    trimmed: u32,
 }
 
 pub async fn execute(deps: &RunDeps, input: &RunInput, cancel: &CancellationToken) -> RunReport {
@@ -110,7 +116,8 @@ pub async fn execute(deps: &RunDeps, input: &RunInput, cancel: &CancellationToke
         turns: 0,
         tool_calls: 0,
         error: None,
-        recaps: Vec::new(),
+        raw_item: None,
+        trimmed: 0,
         nudged: false,
         reasoning_off: false,
     };
@@ -154,6 +161,7 @@ pub async fn execute(deps: &RunDeps, input: &RunInput, cancel: &CancellationToke
         turns: run.turns,
         tool_calls: run.tool_calls,
         sends: run.state.sends(),
+        cut: (run.trimmed > 0).then(|| input.context.raw_ordinal + u64::from(run.trimmed)),
         transcript: run.transcript,
     }
 }
@@ -225,21 +233,24 @@ impl Run<'_> {
             }
             let lines = context.window[recap.lines.clone()].to_vec();
             let seq = self.append(Item::Chat(ChatBatch::new(lines)))?;
-            match recap.when {
-                RecapWhen::Open => {
-                    self.append(Item::Summary(Summary {
-                        from: seq,
-                        to: ItemSeq::new(seq.get() + 1),
-                        text: recap.text.clone(),
-                    }))?;
-                }
-                RecapWhen::Overflow => self.recaps.push((seq, recap.text.clone())),
-            }
+            self.append(Item::Summary(Summary {
+                from: seq,
+                to: ItemSeq::new(seq.get() + 1),
+                text: recap.text.clone(),
+            }))?;
             start = recap.lines.end;
         }
-        if start < context.window.len() || context.recaps.is_empty() {
-            let lines = context.window[start..].to_vec();
+        // The raw part is a chat item of its own, so a provider that finds the request too long
+        // can have lines left out at its start.
+        let raw = context.raw.clamp(start, context.window.len());
+        if raw > start {
+            let lines = context.window[start..raw].to_vec();
             self.append(Item::Chat(ChatBatch::new(lines)))?;
+        }
+        if raw < context.window.len() || context.window.is_empty() {
+            let lines = context.window[raw..].to_vec();
+            let seq = self.append(Item::Chat(ChatBatch::new(lines)))?;
+            self.raw_item = (raw < context.window.len()).then_some(seq);
         }
         if let Some(note) = &context.trigger_note {
             self.append(Item::Instruction(note.clone()))?;
@@ -297,10 +308,13 @@ impl Run<'_> {
             };
             // The provider records the call itself (`qbot_llm::meter`), attributed to this turn.
             let call = attributed(self.attribution(), self.deps.provider.respond(request));
-            match self.bounded(call).await? {
-                Err(LlmError::ContextTooLong) if !self.recaps.is_empty() => self.compact().await?,
-                answer => break answer,
+            let answer = self.bounded(call).await?;
+            if let Err(LlmError::ContextTooLong { limit, requested }) = &answer
+                && self.trim(*limit, *requested).await?
+            {
+                continue;
             }
+            break answer;
         };
         let response = match answer {
             Ok(response) => response,
@@ -408,17 +422,56 @@ impl Run<'_> {
         self.persist().await
     }
 
-    /// The fallback when the context is too long despite the history policy: replace the raw
-    /// chat items episodes cover with their recaps, once. The originals stay in the transcript.
-    async fn compact(&mut self) -> Result<(), RunEnd> {
-        for (seq, text) in std::mem::take(&mut self.recaps) {
-            self.append(Item::Summary(Summary {
-                from: seq,
-                to: ItemSeq::new(seq.get() + 1),
-                text,
-            }))?;
+    /// The provider found the request too long: leave out lines at the start of the raw part
+    /// so it keeps about half the room it has. With the provider's limit and the request's size,
+    /// the raw part keeps half of what fits beside the rest of the request; without them, half of
+    /// itself. Halving rather than cutting to just under the limit leaves room to grow: the next
+    /// cut, and the full-price re-send of what follows it, can come only after as many new tokens
+    /// as were kept. Returns whether anything was left out; nothing is when the raw part is gone
+    /// already, and the error then ends the run.
+    async fn trim(&mut self, limit: Option<u64>, requested: Option<u64>) -> Result<bool, RunEnd> {
+        let Some(item) = self.raw_item else {
+            return Ok(false);
+        };
+        let lines = &self.input.context.window[self.input.context.raw..];
+        let trimmed = self.trimmed as usize;
+        if trimmed >= lines.len() {
+            return Ok(false);
         }
-        self.persist().await
+        let sizes: Vec<u64> = lines[trimmed..].iter().map(estimated_tokens).collect();
+        let shown: u64 = sizes.iter().sum();
+        let keep = match (limit, requested) {
+            // What fits beside the rest of the request is limit - (requested - shown).
+            (Some(limit), Some(requested)) if requested > limit => {
+                (limit + shown).saturating_sub(requested) / 2
+            }
+            _ => shown / 2,
+        }
+        .min(shown / 2);
+        let mut kept = 0;
+        let mut sum = 0;
+        for size in sizes.iter().rev() {
+            if sum + size > keep {
+                break;
+            }
+            sum += size;
+            kept += 1;
+        }
+        let cut = (lines.len() - kept).max(trimmed + 1);
+        let cut = u32::try_from(cut).unwrap_or(u32::MAX);
+        tracing::info!(
+            group = self.input.group.get(),
+            run = self.input.run.get(),
+            limit,
+            requested,
+            left_out = cut,
+            kept = lines.len() - cut as usize,
+            "the request was too long; earlier raw lines are left out"
+        );
+        self.append(Item::Trim(Trim { item, lines: cut }))?;
+        self.trimmed = cut;
+        self.persist().await?;
+        Ok(true)
     }
 
     fn append(&mut self, item: Item) -> Result<ItemSeq, RunEnd> {
@@ -479,4 +532,20 @@ impl Run<'_> {
             result = tokio::time::timeout_at(self.input.deadline, future) => result.map_err(|_| RunEnd::Deadline),
         }
     }
+}
+
+/// About how many tokens a chat line takes: providers' rule of thumb is about 0.6 tokens for a
+/// CJK character and 0.3 for any other, and the line's header (`[msg:ID] MM-DD HH:MM member:N:`)
+/// adds about 14.
+fn estimated_tokens(line: &ChatLine) -> u64 {
+    let (mut wide, mut other) = (0u64, 0u64);
+    for c in line.text.chars() {
+        if matches!(c, '\u{2e80}'..='\u{9fff}' | '\u{ac00}'..='\u{d7af}' | '\u{f900}'..='\u{faff}' | '\u{ff00}'..='\u{ffef}')
+        {
+            wide += 1;
+        } else {
+            other += 1;
+        }
+    }
+    (wide * 6 + other * 3) / 10 + 14
 }

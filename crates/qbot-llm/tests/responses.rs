@@ -284,7 +284,10 @@ async fn http_errors_are_normalized() {
         respond_with(vec![http(400, "context_length_exceeded")])
             .await
             .unwrap_err(),
-        LlmError::ContextTooLong
+        LlmError::ContextTooLong {
+            limit: None,
+            requested: None
+        }
     );
     assert_eq!(
         respond_with(vec![http(400, "content_policy_violation")])

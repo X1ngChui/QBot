@@ -120,29 +120,10 @@ impl Config {
             "must be from 0 (never) to 1 (every line)",
         );
 
-        let h = &self.history;
-        c.that(
-            h.batch_lines >= 1,
-            "history.batch_lines",
-            "must be at least 1",
-        );
-        c.that(
-            h.raw_batches >= 1,
-            "history.raw_batches",
-            "must be at least 1: the batch being filled is always shown",
-        );
-
         let m = &self.memory;
-        c.that(
-            m.slice_batches >= 1,
-            "memory.slice_batches",
-            "must be at least 1",
-        );
-        c.that(
-            m.slice_batches <= h.raw_batches,
-            "memory.slice_batches",
-            "must be at most history.raw_batches: an episode must exist before its chat leaves the verbatim tier",
-        );
+        if let Err(error) = m.batch.parse::<qbot_sched::Rule>() {
+            c.that(false, "memory.batch", &error.to_string());
+        }
         c.that(
             m.recall.max_distance > 0.0 && m.recall.max_distance < 1.0,
             "memory.recall.max_distance",

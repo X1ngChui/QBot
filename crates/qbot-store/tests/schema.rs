@@ -30,6 +30,7 @@ async fn migrations_are_idempotent_and_the_expected_tables_exist() {
             "group_block",
             "group_state",
             "held_claim",
+            "history_window",
             "link_invitation",
             "media_cache",
             "media_ref",
@@ -370,8 +371,8 @@ async fn constraints_reject_invalid_rows() {
     // episodes: ranges are valid and never overlap within a group; embeddings match their width.
     let episode = |first: i64, last: i64, group: i64| {
         format!(
-            "INSERT INTO episode (group_id, first_batch, last_batch, first_ordinal, last_ordinal, batch_lines, first_message, last_message, started_ms, ended_ms, line_count, participants, title, summary, evidence, method, model, created_ms) \
-         VALUES ({group}, 0, 0, {first}, {last}, 10, 1, 2, 0, 0, 5, '{{}}', 't', 's', '[]', 'm', 'm', 0)"
+            "INSERT INTO episode (group_id, first_ordinal, last_ordinal, first_message, last_message, started_ms, ended_ms, line_count, participants, title, summary, evidence, method, model, created_ms) \
+         VALUES ({group}, {first}, {last}, 1, 2, 0, 0, 5, '{{}}', 't', 's', '[]', 'm', 'm', 0)"
         )
     };
     assert!(rejected(&db, &episode(10, 5, 1)).await, "reversed range");

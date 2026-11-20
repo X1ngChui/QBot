@@ -535,75 +535,101 @@ async fn a_wake_trigger_carries_its_intent_as_a_lower_trust_note() {
     assert!(note.unwrap().contains("check on the build"));
 }
 
-#[tokio::test]
-async fn a_context_too_long_error_falls_back_to_recaps_of_raw_episodes_once() {
-    let h = harness(vec![
-        Step::Fail(LlmError::ContextTooLong),
-        reply_ok(say("hi")),
-    ]);
-    for text in ["line one", "line two", "line three", "hello bot"] {
+fn too_long(limit: Option<u64>, requested: Option<u64>) -> Step {
+    Step::Fail(LlmError::ContextTooLong { limit, requested })
+}
+
+/// Two summarized lines, then a raw part of four lines of equal size; the last one addresses the
+/// bot.
+fn summarized_and_raw(h: &Harness) {
+    for text in ["old one", "old two", "line 1", "line 2", "line 3", "line 4"] {
         h.world.say(1, 1, text);
     }
     h.world.set_recaps(vec![qbot_agent::Recap {
         lines: 0..2,
         text: "they planned a picnic".into(),
-        when: qbot_agent::RecapWhen::Overflow,
     }]);
-    let report = run_once(&h, addressed(1, 103)).await;
+}
+
+#[tokio::test]
+async fn a_too_long_request_leaves_out_the_older_half_of_the_raw_part_and_later_runs_start_there() {
+    let h = harness(vec![too_long(None, None), reply_ok(say("hi"))]);
+    summarized_and_raw(&h);
+    let report = run_once(&h, addressed(1, 106)).await;
     assert_eq!(report.end, RunEnd::Delivered);
 
     let recorded = h.fake.recorded();
-    assert_eq!(recorded.len(), 2, "one retry after compacting");
+    assert_eq!(recorded.len(), 2, "one retry after leaving lines out");
     let (first, second) = (
         format!("{:?}", recorded[0].conversation),
         format!("{:?}", recorded[1].conversation),
     );
-    assert!(first.contains("line one") && !first.contains("picnic"));
-    assert!(second.contains("picnic"), "{second}");
-    assert!(!second.contains("line one") && !second.contains("line two"));
-    assert!(second.contains("line three") && second.contains("hello bot"));
-
-    // The originals stay in the transcript; the summary names exactly their chat item.
-    let items = report.transcript.items();
-    let summary = items
-        .iter()
-        .find_map(|i| match i {
-            Item::Summary(s) => Some(s),
-            _ => None,
-        })
-        .unwrap();
-    assert_eq!(summary.to.get(), summary.from.get() + 1);
-    assert!(matches!(&items[summary.from.index()], Item::Chat(c) if c.lines().len() == 2));
-    assert_eq!(
-        items.iter().filter(|i| matches!(i, Item::Chat(_))).count(),
-        2
+    assert!(first.contains("line 1") && first.contains("picnic"));
+    assert!(
+        second.contains("picnic"),
+        "the summaries are never cut: {second}"
     );
+    assert!(!second.contains("line 1") && !second.contains("line 2"));
+    assert!(second.contains("line 3") && second.contains("line 4"));
+    assert!(second.contains("2 earlier lines left out"), "{second}");
+
+    // The originals stay in the transcript; the run reports where the raw part now starts, for
+    // later runs (the supervisor records it): the window's lines are ordinals 1 to 6, the raw
+    // part began at 3 and now begins at 5.
+    let items = report.transcript.items();
+    assert!(
+        items
+            .iter()
+            .any(|i| matches!(i, Item::Trim(t) if t.lines == 2))
+    );
+    assert_eq!(report.cut, Some(5));
 }
 
 #[tokio::test]
-async fn context_too_long_without_recaps_or_after_compacting_ends_the_run() {
-    let h = harness(vec![Step::Fail(LlmError::ContextTooLong)]);
+async fn a_stated_limit_and_size_cut_to_half_the_room_at_once() {
+    // Four raw lines of about 15 tokens each: 60 shown. The request is 20 over a 1000-token
+    // limit, so 40 fit beside the rest, and half of that (one line) is kept.
+    let h = harness(vec![too_long(Some(1000), Some(1020)), reply_ok(say("hi"))]);
+    summarized_and_raw(&h);
+    let report = run_once(&h, addressed(1, 106)).await;
+    assert_eq!(report.end, RunEnd::Delivered);
+    let second = format!("{:?}", h.fake.recorded()[1].conversation);
+    assert!(
+        !second.contains("line 3") && second.contains("line 4"),
+        "{second}"
+    );
+    assert_eq!(report.cut, Some(6));
+}
+
+#[tokio::test]
+async fn cutting_halves_again_until_the_raw_part_is_gone_and_then_the_run_ends() {
+    let h = harness(vec![
+        too_long(None, None),
+        too_long(None, None),
+        too_long(None, None),
+        too_long(None, None),
+        reply_ok(say("never")),
+    ]);
+    summarized_and_raw(&h);
+    let report = run_once(&h, addressed(1, 106)).await;
+    assert_eq!(report.end, RunEnd::ModelError);
+    assert!(matches!(
+        report.error,
+        Some(LlmError::ContextTooLong { .. })
+    ));
+    // Four lines: two left out, then one more, then the last; the fourth rejection has nothing
+    // left to cut.
+    assert_eq!(h.fake.recorded().len(), 4);
+    assert_eq!(report.cut, Some(7), "every raw line left out");
+
+    // Without a raw part there is nothing to cut at all.
+    let h = harness(vec![too_long(None, None)]);
     h.world.say(1, 1, "hello bot");
+    h.world.set_raw(1);
     let report = run_once(&h, addressed(1, 101)).await;
     assert_eq!(report.end, RunEnd::ModelError);
     assert_eq!(h.fake.recorded().len(), 1);
-
-    let h = harness(vec![
-        Step::Fail(LlmError::ContextTooLong),
-        Step::Fail(LlmError::ContextTooLong),
-        reply_ok(say("never")),
-    ]);
-    h.world.say(1, 1, "old");
-    h.world.say(1, 1, "hello bot");
-    h.world.set_recaps(vec![qbot_agent::Recap {
-        lines: 0..1,
-        text: "earlier".into(),
-        when: qbot_agent::RecapWhen::Overflow,
-    }]);
-    let report = run_once(&h, addressed(1, 101)).await;
-    assert_eq!(report.end, RunEnd::ModelError);
-    assert_eq!(report.error, Some(LlmError::ContextTooLong));
-    assert_eq!(h.fake.recorded().len(), 2, "compaction is applied once");
+    assert_eq!(report.cut, None);
 }
 
 #[tokio::test]
@@ -612,18 +638,10 @@ async fn older_batches_are_shown_as_their_summaries_from_the_first_request() {
     for text in ["old one", "old two", "recent", "hello bot"] {
         h.world.say(1, 1, text);
     }
-    h.world.set_recaps(vec![
-        qbot_agent::Recap {
-            lines: 0..2,
-            text: "they argued about lunch".into(),
-            when: qbot_agent::RecapWhen::Open,
-        },
-        qbot_agent::Recap {
-            lines: 2..3,
-            text: "fallback only".into(),
-            when: qbot_agent::RecapWhen::Overflow,
-        },
-    ]);
+    h.world.set_recaps(vec![qbot_agent::Recap {
+        lines: 0..2,
+        text: "they argued about lunch".into(),
+    }]);
     let report = run_once(&h, addressed(1, 103)).await;
     assert_eq!(report.end, RunEnd::Delivered);
 
@@ -633,10 +651,6 @@ async fn older_batches_are_shown_as_their_summaries_from_the_first_request() {
     assert!(seen.contains("argued about lunch"), "{seen}");
     assert!(!seen.contains("old one") && !seen.contains("old two"));
     assert!(seen.contains("recent") && seen.contains("hello bot"));
-    assert!(
-        !seen.contains("fallback only"),
-        "an overflow recap waits for an overflow"
-    );
 
     // The summarized lines are still in the transcript, hidden behind the summary.
     let items = report.transcript.items();

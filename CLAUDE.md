@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 QBot is an AI member for QQ group chats: a Rust service (`qbot run`) that NapCat (OneBot v11)
 connects to over a reverse WebSocket, backed by PostgreSQL 17 + pgvector. Read
 `docs/architecture.md` before larger changes; it is the authoritative design doc, with
-`docs/memory.md` for identity, names, episodes, extraction, memories and recall
+`docs/memory.md` for identity, names, episodes, the daily batch, memories and recall
 (`docs/memory-design.md` records why). Develop on `dev`; `main` is the
 released line. The earlier Python implementation is kept on the `py` branch for reference only.
 
@@ -66,18 +66,22 @@ paid API. Build the image with `docker build -f deploy/Dockerfile .`; deployment
   Responses API (one adapter, for DeepSeek, which keeps no state), embeddings, Tavily search.
   No local output-token caps; reasoning items never leave the adapter.
 - **Memory:** `qbot-memory`. The archive is the source of truth (each member line keeps the display
-  name it was sent under). Episodes summarize fixed slices of whole batches, extracted with
-  validated findings that consolidation applies: name uses (who a line used a name for, and how)
+  name it was sent under). Once a day each group's batch divides the new lines into episodes at
+  boundaries the model chooses (checked to hold every line once) and reads their validated
+  findings over one shared prompt prefix; consolidation applies them, in chat order, after every
+  call is done: name uses (who a line used a name for, and how)
   and memory changes (new, the same, changed, ended; each memory keeps its supporting lines and
   its history). The cached prefix shows who is who; a run's opening note shows the memories of the
   people in its chat; `about_member` reaches the rest. Recall ranks episodes by similarity decaying
-  with age; embeddings are an index each group's extraction completes for the configured model.
+  with age; embeddings are an index each group's batch completes for the configured model.
+  Replies show history as of the last batch: its newest summaries, then raw lines from just before
+  what it summarized; a request the provider refuses as too long halves the raw part.
   Notes written by hand are a separate store.
 - **Durable work:** one `timer` table in `qbot-sched`: group tasks (at most once, interrupted on
   restart, never replayed) and jobs (leased, retried). Either may repeat by a rule: one timer
-  that returns to pending at its next occurrence. Extraction is a group job queued by each filled
-  batch; the nightly decay, backup and cleanup and the daily report (`qbot-ops`) are scheduled
-  jobs; `qbot-app` maps each job kind to its code.
+  that returns to pending at its next occurrence. The memory batch (`memory.batch`, off-peak),
+  the nightly decay, backup and cleanup and the daily report (`qbot-ops`) are scheduled jobs;
+  `qbot-app` maps each job kind to its code.
 - **Layering:** `qbot-core`/`qbot-context` are pure; a port is defined by the crate that needs it.
   Ports of the core crates (agent, sched, memory, tools) are implemented by `qbot-store`
   (Postgres) or `qbot-gateway` (OneBot); an outer crate implements its own port over

@@ -117,17 +117,21 @@ pub struct Replies {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct History {
-    pub batch_lines: u32,
-    pub raw_batches: u32,
-    pub summary_batches: u32,
+    /// Episode summaries shown before the raw chat.
+    pub summaries: u32,
+    /// Lines from before the last batch shown raw, so a reply just after it still sees the
+    /// conversation it continues.
+    pub carry_lines: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Memory {
-    pub slice_batches: u32,
-    /// Earlier episodes a run of extraction reads again with the current method.
-    pub reread_per_run: u32,
+    /// When each group's batch runs (a repeat rule in `bot.timezone`, as `/tasks --every` writes
+    /// it): episodes, names and memories are made then and only then.
+    pub batch: String,
+    /// Earlier episodes a group's batch reads again with the current method.
+    pub reread_per_batch: u32,
     /// Group memories every reply is shown, the most worth first.
     pub group_memories: u32,
     /// Memories a run is shown per member of its conversation, the most worth first.

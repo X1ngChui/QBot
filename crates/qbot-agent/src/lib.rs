@@ -10,8 +10,8 @@ pub mod tool;
 
 pub use env::{
     Archive, ArchiveCursor, ArchivedLine, Chain, ContextSource, Delivered, Delivery, DeliveryError,
-    Directory, EnvError, GroupPolicy, HistoryQuery, OpenedContext, OutSegment, Recap, RecapWhen,
-    RunLog, RunSummary, TextQuery, Trigger, UsageDetail, UsageEvent, UsageSink,
+    Directory, EnvError, GroupPolicy, HistoryQuery, OpenedContext, OutSegment, Recap, RunLog,
+    RunSummary, TextQuery, Trigger, UsageDetail, UsageEvent, UsageSink,
 };
 pub use executor::{Executed, RunLimits, execute_turn};
 pub use run::{RunDeps, RunInput, RunReport, execute};

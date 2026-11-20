@@ -62,24 +62,29 @@ max_messages = 4
 spontaneous_chance = 0.0
 
 [history]
-# What a reply is shown of the chat, in batches of lines. Batches are also the unit memory is
-# extracted in. Treat it as fixed once a group has memory: after a change, extraction resumes
-# at the next whole batch of the new grid, so up to one batch of lines gets no episode.
-batch_lines = 30
-# The newest batches, shown line by line (counting the one being filled).
-raw_batches = 4
-# The batches before those, shown as summaries of the episodes that cover them (a batch no
-# episode covers yet stays verbatim). 0 shows none. Older chat is reached through tools.
-summary_batches = 9
+# What a reply is shown of the chat between two of the group's memory batches (memory.batch):
+# the summaries of the newest episodes, then the chat line by line from just before the last
+# batch to now. Nothing in it moves until the next batch, so every reply shares the cached prompt
+# prefix of the one before. Older chat is reached through tools. The raw part grows all day; only
+# when the provider rejects a request as too long does a reply leave out its older half, and later
+# replies start there too until the next batch.
+# Episode summaries shown before the raw chat. 0 shows none.
+summaries = 8
+# Lines from before the last batch shown raw (from the start of the episode holding the first of
+# them), so a reply just after the batch still sees the conversation it continues.
+carry_lines = 90
 
 [memory]
-# Batches summarized into one episode, at most history.raw_batches (the episode must exist
-# before its chat leaves the verbatim tier).
-slice_batches = 3
+# When each group's batch runs, in bot.timezone, written as /tasks --every writes a rule
+# (daily@HH:MM, days@HH:MM, an interval). The batch reads everything said since the previous one,
+# divides it into episodes, records the names and memories it holds, rules on names nobody could
+# place and reads earlier episodes again. It is the only time these change (besides members' own
+# commands), so pick a quiet hour; at a provider's off-peak hours it also costs less.
+batch = "daily@04:00"
 # Episodes whose names and memories an earlier version read are read again by the current one,
-# this many per run of a group's extraction (a run follows each filled batch), the oldest first,
-# until none is left. Each is one extraction call. 0 leaves earlier chat as it was read.
-reread_per_run = 4
+# this many in each group's batch, the oldest first, until none is left. Each is one model call.
+# 0 leaves earlier chat as it was read.
+reread_per_batch = 10
 # Memories about the group (its terms, what it is about) every reply is shown, the most worth
 # first. The block is part of every reply's cached prefix.
 group_memories = 40

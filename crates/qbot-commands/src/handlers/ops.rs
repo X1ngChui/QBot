@@ -95,6 +95,9 @@ pub(crate) async fn runs(cx: &Cx<'_>) -> Reply {
                     Item::Summary(summary) => lines.push(cx.t(&Msg::RunsStepSummary {
                         text: args::preview(&summary.text, 60),
                     })),
+                    Item::Trim(trim) => lines.push(cx.t(&Msg::RunsStepTrim {
+                        count: u64::from(trim.lines),
+                    })),
                     Item::Assistant(turn) => {
                         for part in turn.parts() {
                             match part {

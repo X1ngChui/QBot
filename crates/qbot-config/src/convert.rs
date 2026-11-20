@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use qbot_agent::SupervisorConfig;
-use qbot_core::{AccountId, HistoryWindow, SliceGrid};
+use qbot_core::{AccountId, HistoryWindow};
 use qbot_llm::ReasoningEffort;
 use qbot_llm::embedding::EmbeddingConfig;
 use qbot_llm::net::Route;
@@ -149,19 +149,14 @@ impl Config {
 
     pub fn history_window(&self) -> HistoryWindow {
         HistoryWindow {
-            batch_lines: self.history.batch_lines,
-            raw_batches: self.history.raw_batches,
-            summary_batches: self.history.summary_batches,
+            summaries: self.history.summaries,
+            carry_lines: self.history.carry_lines,
         }
     }
 
-    pub fn slice_grid(&self) -> SliceGrid {
-        SliceGrid::for_window(self.history_window(), self.memory.slice_batches)
-    }
-
-    /// Earlier episodes a run of extraction reads again with the current method.
-    pub fn reread_per_run(&self) -> usize {
-        usize::try_from(self.memory.reread_per_run).unwrap_or(usize::MAX)
+    /// Earlier episodes a group's batch reads again with the current method.
+    pub fn reread_per_batch(&self) -> usize {
+        usize::try_from(self.memory.reread_per_batch).unwrap_or(usize::MAX)
     }
 
     pub fn recall_params(&self) -> RecallParams {
@@ -267,8 +262,8 @@ impl Config {
         }
     }
 
-    /// The maintenance schedules in the bot's zone: the nightly run always, the report when
-    /// someone receives it.
+    /// The scheduled jobs in the bot's zone: the memory batch and the nightly run always, the
+    /// report when someone receives it.
     pub fn schedules(
         &self,
         zone: &qbot_sched::Zone,
@@ -285,6 +280,7 @@ impl Config {
             ))
         };
         let mut out = Vec::new();
+        out.extend(scheduled(qbot_sched::JobKind::Extract, &self.memory.batch));
         out.extend(scheduled(qbot_sched::JobKind::Nightly, &m.nightly));
         if !self.bot.owners.is_empty() {
             out.extend(scheduled(qbot_sched::JobKind::Report, &m.report));

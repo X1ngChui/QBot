@@ -1,4 +1,4 @@
-//! Live extraction against the real text model. Ignored by default; run with
+//! The batch's reading against the real text model. Ignored by default; run with
 //! `cargo test -p qbot-memory --test live -- --ignored --nocapture`. The key is read from
 //! `deploy/secrets/text_api_key` (or `QBOT_LIVE_SECRETS_DIR`) into memory only.
 
@@ -10,8 +10,11 @@ use std::time::Duration;
 
 use qbot_core::{AccountId, MessageId, UnixMillis};
 use qbot_llm::responses::{KeySource, ReqwestTransport, ResponsesConfig, ResponsesProvider};
+use qbot_memory::findings::Findings;
 use qbot_memory::findings::MemoryAction;
-use qbot_memory::{EpisodeExtractor, MemoryId, NameBasis, Referent, SliceContext, SliceLine};
+use qbot_memory::{
+    Background, BatchReader, MemoryId, NameBasis, Planned, Referent, SliceLine, Stretch,
+};
 
 fn secret(file: &str) -> String {
     let dir = std::env::var_os("QBOT_LIVE_SECRETS_DIR").map_or_else(
@@ -36,7 +39,7 @@ fn line(ordinal: u64, account: i64, member: u32, text: &str) -> SliceLine {
     }
 }
 
-fn live_extractor() -> EpisodeExtractor {
+fn live_reader() -> BatchReader {
     let endpoint = std::env::var("QBOT_LIVE_TEXT_ENDPOINT")
         .unwrap_or_else(|_| "https://api.deepseek.com".into());
     let model = std::env::var("QBOT_LIVE_TEXT_MODEL").unwrap_or_else(|_| "deepseek-flash".into());
@@ -49,24 +52,69 @@ fn live_extractor() -> EpisodeExtractor {
     let mut cfg = ResponsesConfig::new(model);
     cfg.timeout = Some(Duration::from_secs(180));
     let provider = Arc::new(ResponsesProvider::new(cfg, Arc::new(transport)));
-    EpisodeExtractor::new(provider)
+    BatchReader::new(provider, "English")
 }
 
-fn report(out: &qbot_memory::Extracted) {
+/// What one batch made of the lines: its episodes, and their findings together.
+struct Read {
+    episodes: Vec<Planned>,
+    findings: Findings,
+}
+
+impl Read {
+    fn summary(&self) -> String {
+        self.episodes
+            .iter()
+            .map(|e| e.summary.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// Divide the lines into episodes and read each one's findings, after one shared prefix.
+async fn read(reader: &BatchReader, lines: &[SliceLine], background: &Background) -> Read {
+    let stretch = Stretch {
+        previous: &[],
+        lines,
+        background,
+    };
+    let prefix = reader.prefix(&stretch);
+    let planned = reader.episodes(&prefix, &stretch).await.unwrap();
     eprintln!(
-        "[extract] model={} attempts={} usage={:?}",
-        out.model, out.attempts, out.usage
+        "[batch] model={} attempts={} usage={:?}",
+        planned.model, planned.attempts, planned.usage
     );
-    eprintln!("[extract] title={:?}", out.title);
-    eprintln!("[extract] summary={:?}", out.summary);
-    eprintln!("[extract] findings={:#?}", out.findings);
-    eprintln!("[extract] dropped={:?}", out.dropped);
+    let mut findings = Findings::default();
+    for (i, episode) in planned.value.iter().enumerate() {
+        eprintln!(
+            "[batch] episode {} #{}-#{} {:?}: {:?}",
+            i + 1,
+            episode.first,
+            episode.last,
+            episode.title,
+            episode.summary
+        );
+        let found = reader
+            .findings(&prefix, &stretch, episode, i + 1)
+            .await
+            .unwrap();
+        eprintln!(
+            "[batch] attempts={} usage={:?} findings={:#?} dropped={:?}",
+            found.attempts, found.usage, found.value.findings, found.value.dropped
+        );
+        findings.references.extend(found.value.findings.references);
+        findings.memories.extend(found.value.findings.memories);
+    }
+    Read {
+        episodes: planned.value,
+        findings,
+    }
 }
 
 #[tokio::test]
 #[ignore = "calls paid provider APIs"]
 async fn a_real_model_writes_a_valid_episode_with_findings() {
-    let extractor = live_extractor();
+    let reader = live_reader();
     let target = vec![
         line(
             1,
@@ -106,7 +154,7 @@ async fn a_real_model_writes_a_valid_episode_with_findings() {
         ),
     ];
     // As the prompt layer writes it: the members as the group knows them, and the group.
-    let background = qbot_memory::Background {
+    let background = Background {
         text: "## Who is who\n\nThe members these lines involve, as the group knows them.\n\n\
                - member:1: lines sent as \"\u{5c0f}\u{6797}\"\n\
                - member:2: lines sent as \"\u{963f}\u{6770}\"\n  remembered:\n  \
@@ -118,19 +166,14 @@ async fn a_real_model_writes_a_valid_episode_with_findings() {
         known: vec![(MemoryId::new(7), AccountId::new(1002).ok())],
         ..Default::default()
     };
-    let ctx = SliceContext {
-        group: qbot_core::GroupId::new(900).unwrap(),
-        previous: &[],
-        target: &target,
-        next: &[],
-        background: &background,
-    };
-    let out = extractor.extract(&ctx, "English").await.unwrap();
-    report(&out);
+    let out = read(&reader, &target, &background).await;
 
-    assert!(!out.title.trim().is_empty() && !out.summary.trim().is_empty());
-    assert!(!out.evidence.is_empty());
-    for e in &out.evidence {
+    assert!(
+        out.episodes
+            .iter()
+            .all(|e| !e.title.trim().is_empty() && !e.summary.trim().is_empty())
+    );
+    for e in out.episodes.iter().flat_map(|e| &e.evidence) {
         let source = target
             .iter()
             .find(|l| l.message == e.message)
@@ -163,13 +206,13 @@ async fn a_real_model_writes_a_valid_episode_with_findings() {
     );
 }
 
-/// The judgement the extractor is asked for: something that ended, something said again in other
-/// words, a plan said relative to the slice's day, a reply to a line from further back, a passing
+/// The judgement the batch is asked for: something that ended, something said again in other
+/// words, a plan said relative to the lines' day, a reply to a line from further back, a passing
 /// mood, and a member addressing the bot by its name.
 #[tokio::test]
 #[ignore = "calls paid provider APIs"]
 async fn a_real_model_ends_confirms_dates_plans_and_skips_what_passes() {
-    let extractor = live_extractor();
+    let reader = live_reader();
     let target = vec![
         // "Bobo, I don't play Genshin any more, sold the account last week."
         line(
@@ -209,8 +252,8 @@ async fn a_real_model_ends_confirms_dates_plans_and_skips_what_passes() {
             "\u{6211}\u{8fd8}\u{662f}\u{4f4f}\u{5728}\u{676d}\u{5dde}",
         ),
     ];
-    // As the prompt layer and the extraction job write it.
-    let background = qbot_memory::Background {
+    // As the prompt layer and the batch write it.
+    let background = Background {
         text: "## Who is who\n\nThe members these lines involve, as the group knows them.\n\n\
                - member:1: lines sent as \"\u{5c0f}\u{6797}\"\n  remembered:\n  \
                - m3 (current) \u{5728}\u{73a9}\u{539f}\u{795e}: they said so, 3 conversation(s), last 2026-12-20\n\
@@ -243,15 +286,7 @@ async fn a_real_model_ends_confirms_dates_plans_and_skips_what_passes() {
         ],
         ..Default::default()
     };
-    let ctx = SliceContext {
-        group: qbot_core::GroupId::new(900).unwrap(),
-        previous: &[],
-        target: &target,
-        next: &[],
-        background: &background,
-    };
-    let out = extractor.extract(&ctx, "English").await.unwrap();
-    report(&out);
+    let out = read(&reader, &target, &background).await;
 
     let (one, two) = (AccountId::new(1001).ok(), AccountId::new(1002).ok());
     let about = |who, id: i64| {
@@ -281,11 +316,11 @@ async fn a_real_model_ends_confirms_dates_plans_and_skips_what_passes() {
         }),
         "the bot's name is no member's name"
     );
-    // The slice is on 2027-01-15 in Shanghai, so tomorrow is the 16th.
+    // The lines are on 2027-01-15 in Shanghai, so tomorrow is the 16th.
     assert!(
-        out.summary.contains("16") && !out.summary.to_lowercase().contains("tomorrow"),
+        out.summary().contains("16") && !out.summary().to_lowercase().contains("tomorrow"),
         "the plan has its date: {}",
-        out.summary
+        out.summary()
     );
 }
 
@@ -294,7 +329,7 @@ async fn a_real_model_ends_confirms_dates_plans_and_skips_what_passes() {
 #[tokio::test]
 #[ignore = "calls paid provider APIs"]
 async fn a_real_model_records_names_with_how_they_were_used() {
-    let extractor = live_extractor();
+    let reader = live_reader();
     let target = vec![
         // member 3: "[at:1] Xiaochuan, are you coming to the dinner on Saturday?"
         line(
@@ -320,7 +355,7 @@ async fn a_real_model_records_names_with_how_they_were_used() {
         // member 3: "haha"
         line(4, 1003, 3, "\u{54c8}\u{54c8}"),
     ];
-    let background = qbot_memory::Background {
+    let background = Background {
         text: "## Who is who\n\nThe members these lines involve, as the group knows them.\n\n\
                - member:1: lines sent as \"\u{738b}\u{5c0f}\u{5ddd}\"\n\
                - member:2: lines sent as \"Echo\"\n\
@@ -330,15 +365,7 @@ async fn a_real_model_records_names_with_how_they_were_used() {
         zone: jiff::tz::TimeZone::get("Asia/Shanghai").unwrap(),
         ..Default::default()
     };
-    let ctx = SliceContext {
-        group: qbot_core::GroupId::new(900).unwrap(),
-        previous: &[],
-        target: &target,
-        next: &[],
-        background: &background,
-    };
-    let out = extractor.extract(&ctx, "English").await.unwrap();
-    report(&out);
+    let out = read(&reader, &target, &background).await;
     let one = AccountId::new(1001).unwrap();
     assert!(
         out.findings

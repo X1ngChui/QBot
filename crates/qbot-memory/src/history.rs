@@ -1,9 +1,9 @@
 //! Composing a model's view of older chat from episodes.
 //!
-//! This is where memory and context compaction meet. An episode owns exact whole batches and its
-//! summary never changes, so older chat lying wholly inside episodes can be shown as those
+//! This is where memory and context compaction meet. An episode owns an exact range of lines and
+//! its summary never changes, so older chat lying wholly inside episodes can be shown as those
 //! summaries instead of raw lines while the recent tail stays raw. The composed view is stable
-//! between requests, so the provider's prefix cache stays valid, and the archive remains the
+//! between batches, so the provider's prefix cache stays valid, and the archive remains the
 //! authority: nothing is rewritten, only what the reader is shown.
 
 use crate::episode::Episode;

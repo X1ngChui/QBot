@@ -159,12 +159,14 @@ The bot runs its own maintenance; nothing outside the container is needed.
   `daily@00:00`) are repeat rules in `bot.timezone`, written as `/tasks --every` writes them. A run missed while the bot was down happens once
   when it comes back; each occurrence runs exactly once however often the bot restarts. A schedule
   that has never run starts from now.
-- **Memory extraction** is not part of it: each filled batch queues its group's extraction,
-  which first embeds any of the group's episodes the configured embedding model has no vector
-  for (a new embedding model needs no other step; a group re-embeds when it next fills a batch).
-  A failed extraction is logged and tried again with backoff and with the group's next filled
-  batch. A slice the provider refuses for good is skipped (`slice skipped` in the log) and its
-  lines simply have no episode.
+- **Memory batch.** `memory.batch` (default `daily@04:00`, an off-peak hour of the provider)
+  reads, group by group, everything said since the previous batch into episodes, names and
+  memories. Each group's batch first embeds any of its episodes the configured embedding model
+  has no vector for (a new embedding model needs no other step). A failed batch is logged and
+  tried again with backoff; lines it did not read are read by the next one. Lines the provider
+  refuses for good are skipped (`lines skipped` in the log) and simply have no episode. What
+  members say is learned at the next batch; commands such as `/name`, `/block` and `/forget`
+  take effect at once.
 - **Nightly run**, in order: decay (cached picture descriptions older than 15 days; learned memory is not expired), a verified
   `pg_dump`, then cleanup (finished timers and runs after `maintenance.records_keep_days`, NapCat's file cache). Every
   stage runs even if an earlier one failed. A failed decay, backup or cleanup fails the job, which

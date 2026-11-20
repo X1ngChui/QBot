@@ -17,8 +17,13 @@ pub enum LlmError {
     Network(String),
     #[error("provider rejected the request: {0}")]
     InvalidRequest(String),
+    /// The request is longer than the model's context window. `limit` and `requested` are the
+    /// sizes in tokens when the provider's message states them.
     #[error("conversation exceeds the model context window")]
-    ContextTooLong,
+    ContextTooLong {
+        limit: Option<u64>,
+        requested: Option<u64>,
+    },
     #[error("response blocked by a content filter")]
     ContentFiltered,
     /// The provider answered, but not in a shape the contract allows.
@@ -42,6 +47,30 @@ pub enum LlmError {
 }
 
 impl LlmError {
+    /// A context-length rejection, with the sizes its message states. Providers word it as
+    /// "maximum context length is N tokens ... you requested M tokens" (or "resulted in M").
+    pub fn context_too_long(message: &str) -> Self {
+        let lower = message.to_ascii_lowercase();
+        let number_after = |marker: &str| -> Option<u64> {
+            let at = lower.find(marker)? + marker.len();
+            let digits: String = lower[at..]
+                .chars()
+                .skip_while(|c| !c.is_ascii_digit())
+                .take_while(|c| c.is_ascii_digit() || *c == ',')
+                .filter(char::is_ascii_digit)
+                .collect();
+            digits.parse().ok()
+        };
+        LlmError::ContextTooLong {
+            limit: number_after("context length is")
+                .or_else(|| number_after("context window is"))
+                .or_else(|| number_after("maximum context length")),
+            requested: number_after("requested")
+                .or_else(|| number_after("resulted in"))
+                .or_else(|| number_after("your request has")),
+        }
+    }
+
     /// Whether repeating the same request may succeed. Only transient failures qualify.
     pub fn is_transient(&self) -> bool {
         matches!(
@@ -62,7 +91,7 @@ impl LlmError {
             LlmError::Timeout => "timeout",
             LlmError::Network(_) => "network",
             LlmError::InvalidRequest(_) => "invalid_request",
-            LlmError::ContextTooLong => "context_too_long",
+            LlmError::ContextTooLong { .. } => "context_too_long",
             LlmError::ContentFiltered => "content_filtered",
             LlmError::Protocol(_) => "protocol",
             LlmError::MalformedCall(_) => "malformed_call",
@@ -71,5 +100,40 @@ impl LlmError {
             LlmError::QuotaExhausted(_) => "quota_exhausted",
             LlmError::Other { .. } => "other",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LlmError;
+
+    #[test]
+    fn a_context_length_message_gives_its_sizes_when_it_states_them() {
+        assert_eq!(
+            LlmError::context_too_long(
+                "This model's maximum context length is 1,048,576 tokens. However, you requested \
+                 1200000 tokens (1199000 in the messages, 1000 in the completion)."
+            ),
+            LlmError::ContextTooLong {
+                limit: Some(1_048_576),
+                requested: Some(1_200_000)
+            }
+        );
+        assert_eq!(
+            LlmError::context_too_long(
+                "maximum context length is 65536 tokens, however your messages resulted in 70000 tokens"
+            ),
+            LlmError::ContextTooLong {
+                limit: Some(65_536),
+                requested: Some(70_000)
+            }
+        );
+        assert_eq!(
+            LlmError::context_too_long("the input is too long"),
+            LlmError::ContextTooLong {
+                limit: None,
+                requested: None
+            }
+        );
     }
 }

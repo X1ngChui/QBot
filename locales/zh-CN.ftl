@@ -339,6 +339,7 @@ runs-no_such = 本群没有编号为 #{ $id } 的运行。
 runs-detail = 运行 #{ $id }｜{ $time }｜{ $trigger }｜{ $end }｜{ $tokens } Token
 runs-step_chat = 聊天：{ $count } 行
 runs-step_summary = 摘要：{ $text }
+runs-step_trim = 超出模型上下文：省略了较早的 { $count } 行
 runs-step_text = 模型文本：{ $text }
 runs-step_call = 调用 { $name }：{ $args }
 runs-step_result = 结果（{ $outcome }）：{ $text }

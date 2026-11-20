@@ -67,18 +67,6 @@ impl PipelineConfig {
     }
 }
 
-/// Told when a group's batch fills: older chat is about to leave the verbatim tier, so its
-/// episode should be written.
-#[async_trait]
-pub trait BatchFilled: Send + Sync {
-    async fn filled(&self, group: GroupId);
-}
-
-struct BatchHook {
-    sink: Arc<dyn BatchFilled>,
-    lines: u64,
-}
-
 struct MediaHook {
     service: Arc<MediaService>,
     /// How long a reply waits for the group's pictures and clips in flight to be described.
@@ -87,7 +75,6 @@ struct MediaHook {
 
 pub struct Pipeline {
     media: Option<MediaHook>,
-    batches: Option<BatchHook>,
     cfg: PipelineConfig,
     intake: Arc<dyn Intake>,
     commands: Arc<dyn Commands>,
@@ -120,7 +107,6 @@ impl Pipeline {
     ) -> Self {
         Self {
             media: None,
-            batches: None,
             cfg,
             intake,
             commands,
@@ -131,15 +117,6 @@ impl Pipeline {
             stop: CancellationToken::new(),
             queues: Mutex::default(),
         }
-    }
-
-    /// Report every filled batch of `batch_lines` lines.
-    pub fn with_batches(mut self, sink: Arc<dyn BatchFilled>, batch_lines: u32) -> Self {
-        self.batches = Some(BatchHook {
-            sink,
-            lines: u64::from(batch_lines.max(1)),
-        });
-        self
     }
 
     /// Describe pictures and transcribe clips as messages arrive. A reply waits up to `wait` for
@@ -211,10 +188,7 @@ impl Pipeline {
             return;
         };
         let (line, ordinal) = match self.intake.append(incoming).await {
-            Ok(Stored::New { line, ordinal }) => {
-                self.archived(m.group, ordinal);
-                (line, ordinal)
-            }
+            Ok(Stored::New { line, ordinal }) => (line, ordinal),
             Ok(Stored::Duplicate) => {
                 tracing::debug!(
                     group = m.group.get(),
@@ -474,24 +448,10 @@ impl Pipeline {
             media: Vec::new(),
         };
         match self.intake.append(incoming).await {
-            Ok(Stored::New { ordinal, .. }) => self.archived(n.group, ordinal),
-            Ok(Stored::Duplicate) => {}
+            Ok(Stored::New { .. }) | Ok(Stored::Duplicate) => {}
             Err(error) => {
                 tracing::error!(%error, group = n.group.get(), "archiving a notice failed")
             }
-        }
-    }
-
-    /// A line became the group's `ordinal`-th: report a batch it fills, whatever kind of line
-    /// it is.
-    fn archived(&self, group: GroupId, ordinal: u64) {
-        if let Some(hook) = self
-            .batches
-            .as_ref()
-            .filter(|h| ordinal.is_multiple_of(h.lines))
-        {
-            let sink = Arc::clone(&hook.sink);
-            self.tasks.spawn(async move { sink.filled(group).await });
         }
     }
 }

@@ -22,7 +22,7 @@ stays out of the way.
   at an original itself; voice clips are transcribed on the CPU, in the process.
 - **Tools.** Search the group's history, recall earlier conversations by meaning,
   search the web and read pages, open pictures, and manage the group's scheduled tasks.
-- **Operations built in.** Memory extraction as chat goes on, verified nightly backups, a daily report to
+- **Operations built in.** A daily off-peak memory batch, verified nightly backups, a daily report to
   the owners, and a single-instance lease. Usage is counted; nothing refuses work on cost.
 
 QBot connects to QQ through [NapCat](https://github.com/NapNeko/NapCatQQ) (OneBot v11, reverse
@@ -95,7 +95,7 @@ Postgres, a mock Responses server and a simulated NapCat.
 | `qbot-agent` | run loop, tool contract, supervisor |
 | `qbot-sched` | timers: group tasks, background jobs, repeat rules |
 | `qbot-tools` | the model's tools |
-| `qbot-memory` | identity, names, episodes, extraction, memories, recall, notes |
+| `qbot-memory` | identity, names, episodes, the daily batch, memories, recall, notes |
 | `qbot-store` | Postgres adapters, the schema, the lease |
 | `qbot-config` | layered, typed configuration and secrets |
 | `qbot-i18n` | member-facing text: typed messages and validated catalogs (`locales/`) |

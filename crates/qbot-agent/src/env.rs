@@ -136,8 +136,14 @@ pub struct OpenedContext {
     pub trigger_note: Option<Instruction>,
     pub cursor: ArchiveCursor,
     /// Episode summaries standing in for contiguous ranges of window lines. Ranges are disjoint,
-    /// ascending and never cover the trigger message.
+    /// ascending and lie before `raw`.
     pub recaps: Vec<Recap>,
+    /// Where the raw part of the window begins: the lines from it on are shown as they are,
+    /// never summarized. When the provider finds a request too long, the run leaves out lines at
+    /// the start of the raw part.
+    pub raw: usize,
+    /// The archive ordinal of `window[raw]`, so a run can say where the raw part now starts.
+    pub raw_ordinal: u64,
     /// Told to the model when it ends a turn with text but no tool call: the text was meant for
     /// the group and never reached it. Followed by one turn that must call a tool. `None` ends
     /// such a turn silently.
@@ -150,20 +156,18 @@ pub struct OpenedContext {
 pub struct Recap {
     pub lines: std::ops::Range<usize>,
     pub text: String,
-    pub when: RecapWhen,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecapWhen {
-    /// From the start of the run: the history policy shows these lines only as a summary.
-    Open,
-    /// Only if the provider finds the context too long despite the policy: the fallback.
-    Overflow,
 }
 
 #[async_trait]
 pub trait ContextSource: Send + Sync {
     async fn open(&self, group: GroupId, trigger: &Trigger) -> Result<OpenedContext, EnvError>;
+
+    /// A run found the group's raw part too long for the provider and left out its lines
+    /// before the archive ordinal `from`: later runs start the raw part there too, until the
+    /// group's next batch. A source that keeps no such state ignores it.
+    async fn cut(&self, _group: GroupId, _from: u64) -> Result<(), EnvError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -370,6 +370,11 @@ runs-step_chat =
        *[other] chat: { $count } lines
     }
 runs-step_summary = summary: { $text }
+runs-step_trim =
+    { $count ->
+        [one] too long for the model: 1 earlier line left out
+       *[other] too long for the model: { $count } earlier lines left out
+    }
 runs-step_text = model text: { $text }
 runs-step_call = call { $name }: { $args }
 runs-step_result = result ({ $outcome }): { $text }

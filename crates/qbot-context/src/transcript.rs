@@ -4,7 +4,7 @@ use qbot_core::{CallId, ItemSeq};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::error::{AppendError, LoadError};
-use crate::item::{Item, Meta, Outcome, Summary, ToolResult};
+use crate::item::{Item, Meta, Outcome, Summary, ToolResult, Trim};
 
 #[derive(Debug, Clone, Copy)]
 struct CallState {
@@ -20,6 +20,8 @@ pub struct Transcript {
     calls: HashMap<CallId, CallState>,
     pending: Vec<CallId>,
     summaries: Vec<(ItemSeq, Summary)>,
+    /// Lines left out at the start of chat items, by item index.
+    trims: HashMap<usize, u32>,
 }
 
 impl PartialEq for Transcript {
@@ -109,6 +111,11 @@ impl Transcript {
                 self.validate_summary(summary)?;
                 self.summaries.push((seq, summary.clone()));
             }
+            Item::Trim(trim) => {
+                self.require_quiescent()?;
+                self.validate_trim(trim)?;
+                self.trims.insert(trim.item.index(), trim.lines);
+            }
             Item::Meta(_) => {}
         }
         self.items.push(item);
@@ -197,6 +204,22 @@ impl Transcript {
             }
         }
         Ok(())
+    }
+
+    fn validate_trim(&self, trim: &Trim) -> Result<(), AppendError> {
+        let Some(Item::Chat(batch)) = self.items.get(trim.item.index()) else {
+            return Err(AppendError::BadTrim);
+        };
+        let before = self.trims.get(&trim.item.index()).copied().unwrap_or(0);
+        if trim.lines <= before || trim.lines as usize > batch.lines().len() {
+            return Err(AppendError::BadTrim);
+        }
+        Ok(())
+    }
+
+    /// Lines left out at the start of the chat item at `index`.
+    pub(crate) fn trimmed(&self, index: usize) -> u32 {
+        self.trims.get(&index).copied().unwrap_or(0)
     }
 
     pub(crate) fn call_state(&self, id: &CallId) -> Option<(ItemSeq, Option<ItemSeq>)> {

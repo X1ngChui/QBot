@@ -15,11 +15,8 @@ pub fn group(n: i64) -> GroupId {
 pub fn episode(group: GroupId, first: u64, last: u64, title: &str) -> NewEpisode {
     NewEpisode {
         group,
-        first_batch: (first - 1) / 10,
-        last_batch: (last - 1) / 10,
         first_ordinal: first,
         last_ordinal: last,
-        batch_lines: 10,
         first_message: MessageId::new(first as i64).unwrap(),
         last_message: MessageId::new(last as i64).unwrap(),
         started: UnixMillis::new(1_800_000_000_000 + first as i64 * 1000),
@@ -330,4 +327,62 @@ pub async fn run(store: &dyn EpisodeStore) {
             .await,
         Err(MemoryError::NotFound)
     ));
+
+    // The newest episodes before a line, in chat order, at most as many as asked for.
+    let titles = |found: Vec<Episode>| -> Vec<String> {
+        found.into_iter().map(|e| e.episode.title).collect()
+    };
+    assert_eq!(
+        titles(store.before(g, 61, 5).await.unwrap()),
+        ["deploy", "dinner"],
+        "an episode ending at or after the line is not before it"
+    );
+    assert_eq!(titles(store.before(g, 91, 1).await.unwrap()), ["holiday"]);
+    assert!(store.before(g, 1, 5).await.unwrap().is_empty());
+
+    // A group's window: none before its first batch; a cut moves the raw part forward only, and
+    // the next batch starts it over.
+    let w = group(8003);
+    assert_eq!(store.window(w).await.unwrap(), None);
+    let (t1, t2) = (
+        UnixMillis::new(1_800_000_100_000),
+        UnixMillis::new(1_800_000_200_000),
+    );
+    store.batched(w, t1).await.unwrap();
+    assert_eq!(
+        store.window(w).await.unwrap(),
+        Some(crate::store::WindowState {
+            batched: t1,
+            cut: 0
+        })
+    );
+    store.cut(w, 40, t2).await.unwrap();
+    store.cut(w, 30, t2).await.unwrap();
+    assert_eq!(
+        store.window(w).await.unwrap(),
+        Some(crate::store::WindowState {
+            batched: t1,
+            cut: 40
+        }),
+        "never back, and the batch time stays"
+    );
+    store.batched(w, t2).await.unwrap();
+    assert_eq!(
+        store.window(w).await.unwrap(),
+        Some(crate::store::WindowState {
+            batched: t2,
+            cut: 0
+        })
+    );
+    // A cut before any batch starts the group's window at that moment.
+    let v = group(8004);
+    store.cut(v, 7, t2).await.unwrap();
+    assert_eq!(
+        store.window(v).await.unwrap(),
+        Some(crate::store::WindowState {
+            batched: t2,
+            cut: 7
+        })
+    );
+    assert_eq!(store.window(g).await.unwrap(), None, "per group");
 }

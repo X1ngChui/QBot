@@ -116,6 +116,8 @@ impl ContextSource for PgContext {
             },
             cursor,
             recaps: Vec::new(),
+            raw: 0,
+            raw_ordinal: 1,
             undelivered_note: None,
         })
     }

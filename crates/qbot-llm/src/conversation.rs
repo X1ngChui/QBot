@@ -67,6 +67,8 @@ pub enum ConvItem {
 pub trait Renderer: Send + Sync {
     fn chat(&self, batch: &ChatBatch) -> String;
     fn summary(&self, text: &str) -> String;
+    /// The note standing where `lines` lines at the start of the chat were left out.
+    fn trimmed(&self, lines: u32) -> String;
     /// Text prepended to a tool result whose outcome is not a plain success.
     fn outcome_note(&self, outcome: &Outcome) -> Option<String>;
     /// An instant as tools show it (a task's due time, an episode's span): in the zone the chat
@@ -97,6 +99,10 @@ impl Renderer for PlainRenderer {
 
     fn summary(&self, text: &str) -> String {
         format!("[summary of earlier conversation]\n{text}")
+    }
+
+    fn trimmed(&self, lines: u32) -> String {
+        format!("({lines} earlier lines left out)")
     }
 
     fn outcome_note(&self, outcome: &Outcome) -> Option<String> {
@@ -166,6 +172,10 @@ impl Conversation {
                 ViewItem::Summary(text) => ConvItem::Message(Message {
                     role: Role::User,
                     content: vec![Content::Text(renderer.summary(text))],
+                }),
+                ViewItem::Trimmed(lines) => ConvItem::Message(Message {
+                    role: Role::User,
+                    content: vec![Content::Text(renderer.trimmed(*lines))],
                 }),
                 ViewItem::Assistant(turn) => ConvItem::Assistant(turn.clone()),
                 ViewItem::ToolResult(result) => {

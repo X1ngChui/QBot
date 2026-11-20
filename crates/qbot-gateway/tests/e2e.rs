@@ -19,7 +19,7 @@ use qbot_gateway::bridge::Bridge;
 use qbot_gateway::delivery::{DeliveryTimeouts, OneBotDelivery};
 use qbot_gateway::echo::EchoBoard;
 use qbot_gateway::intake::{Incoming, Intake, Stored};
-use qbot_gateway::pipeline::{BatchFilled, CommandRequest, Commands, Pipeline, PipelineConfig};
+use qbot_gateway::pipeline::{CommandRequest, Commands, Pipeline, PipelineConfig};
 use qbot_gateway::server::{GatewayServer, serve};
 use qbot_gateway::trigger::Nicknames;
 use qbot_llm::ReasoningEffort;
@@ -119,23 +119,8 @@ impl Commands for RecordedCommands {
     }
 }
 
-/// Groups whose batch filled, in order.
-#[derive(Default)]
-struct RecordedBatches(Mutex<Vec<GroupId>>);
-
-#[async_trait]
-impl BatchFilled for RecordedBatches {
-    async fn filled(&self, group: GroupId) {
-        self.0.lock().unwrap().push(group);
-    }
-}
-
-/// Lines per batch in the rig.
-const BATCH: u32 = 2;
-
 struct Rig {
     url: String,
-    batches: Arc<RecordedBatches>,
     world: Arc<SimWorld>,
     intake: Arc<MemoryIntake>,
     commands: Arc<RecordedCommands>,
@@ -196,23 +181,19 @@ async fn rig_full(script: Vec<Step>, echo: Duration, spontaneous_chance: f64) ->
     ));
     let intake = Arc::new(MemoryIntake::default());
     let commands = Arc::new(RecordedCommands::default());
-    let batches = Arc::new(RecordedBatches::default());
-    let pipeline = Arc::new(
-        Pipeline::new(
-            PipelineConfig {
-                bot: AccountId::new(BOT).unwrap(),
-                spontaneous_chance,
-                echo_keep: echo,
-                forward_max_lines: 30,
-            },
-            intake.clone(),
-            commands.clone(),
-            supervisor,
-            Nicknames::new(&["Bobo"]),
-            echoes,
-        )
-        .with_batches(batches.clone(), BATCH),
-    );
+    let pipeline = Arc::new(Pipeline::new(
+        PipelineConfig {
+            bot: AccountId::new(BOT).unwrap(),
+            spontaneous_chance,
+            echo_keep: echo,
+            forward_max_lines: 30,
+        },
+        intake.clone(),
+        commands.clone(),
+        supervisor,
+        Nicknames::new(&["Bobo"]),
+        echoes,
+    ));
     let cancel = CancellationToken::new();
     let server = GatewayServer {
         pipeline,
@@ -227,7 +208,6 @@ async fn rig_full(script: Vec<Step>, echo: Duration, spontaneous_chance: f64) ->
     tokio::spawn(serve(listener, server, cancel.clone()));
     Rig {
         url,
-        batches,
         world,
         intake,
         commands,
@@ -613,39 +593,6 @@ async fn sending_without_a_connection_or_after_a_rejection_reports_why() {
     assert!(
         matches!(lost, Err(DeliveryError::Unconfirmed(_))),
         "{lost:?}"
-    );
-    rig.cancel.cancel();
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_batch_filled_by_a_notice_is_reported_like_one_filled_by_a_message() {
-    let rig = rig(vec![]).await;
-    let mut napcat = connect(&rig, Some("sesame")).await.unwrap();
-    napcat
-        .send(group_message(
-            1,
-            7,
-            json!([{"type": "text", "data": {"text": "hi"}}]),
-        ))
-        .await
-        .unwrap();
-    let joined = json!({"post_type": "notice", "notice_type": "group_increase", "time": 1_700_000_001,
-                        "self_id": BOT, "group_id": GROUP, "user_id": 8});
-    napcat
-        .send(Message::text(joined.to_string()))
-        .await
-        .unwrap();
-    for _ in 0..200 {
-        if !rig.batches.0.lock().unwrap().is_empty() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(rig.intake.lines.lock().unwrap().len(), BATCH as usize);
-    assert_eq!(
-        *rig.batches.0.lock().unwrap(),
-        [GroupId::new(GROUP).unwrap()],
-        "the notice was the batch's last line"
     );
     rig.cancel.cancel();
 }

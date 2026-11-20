@@ -21,7 +21,7 @@ use qbot_gateway::delivery::{DeliveryTimeouts, OneBotDelivery};
 use qbot_gateway::directory::OneBotDirectory;
 use qbot_gateway::echo::EchoBoard;
 use qbot_gateway::media::{FetchSettings, OneBotFetcher};
-use qbot_gateway::pipeline::{BatchFilled, Pipeline, PipelineConfig};
+use qbot_gateway::pipeline::{Pipeline, PipelineConfig};
 use qbot_gateway::server::{GatewayServer, serve};
 use qbot_gateway::trigger::Nicknames;
 use qbot_i18n::{LocaleErrors, Locales, Msg};
@@ -35,17 +35,14 @@ use qbot_media::{
 };
 use qbot_memory::consolidate::Consolidator;
 use qbot_memory::{
-    BuilderConfig, EpisodeBuilder, EpisodeExtractor, EpisodeJobs, EpisodeStore, IdentityStore,
-    MemoryStore, NameRuler, NameStore, Recall,
+    BatchReader, EpisodeJobs, EpisodeStore, IdentityStore, MemoryStore, NameStore, Recall,
 };
 use qbot_ops::{BackupError, Operations, Parts, PgHousekeeping, PgReportSource, check_tools};
 use qbot_prompt::{
     PersonaError, Personas, PromptContext, PromptError, PromptRenderer, PromptSettings,
     UnknownZone, describe_image_instructions,
 };
-use qbot_sched::{
-    JobError, JobKind, JobRunner, Scheduler, SchedulerConfig, TaskService, TimerStore,
-};
+use qbot_sched::{JobError, JobKind, JobRunner, Scheduler, SchedulerConfig, TaskService};
 use qbot_store::{
     DEFAULT_KEY, LeaseError, PgAdmin, PgArchive, PgEpisodeStore, PgGroupPolicy, PgIdentityStore,
     PgMediaCache, PgMemoryStore, PgNameStore, PgRunLog, PgTimerStore, PgUsageSink, RuntimeLease,
@@ -127,32 +124,9 @@ impl JobRunner for Jobs {
         match (kind, group) {
             (JobKind::Nightly, _) => self.operations.nightly().await,
             (JobKind::Report, _) => self.operations.daily_report().await,
-            (JobKind::Extract, Some(group)) => self.episodes.extract_group(group).await.map(|_| ()),
-            (JobKind::Extract, None) => Err(JobError("an extract job needs a group".into())),
-        }
-    }
-}
-
-/// Queues a durable extraction job for a group whose batch just filled.
-struct ExtractOnBatch {
-    timers: Arc<PgTimerStore>,
-    clock: Arc<dyn Clock>,
-    wake: Arc<Notify>,
-}
-
-#[async_trait::async_trait]
-impl BatchFilled for ExtractOnBatch {
-    async fn filled(&self, group: GroupId) {
-        match self
-            .timers
-            .insert_job(self.clock.now(), JobKind::Extract, Some(group))
-            .await
-        {
-            Ok(_) => self.wake.notify_one(),
-            // The group's next filled batch queues another.
-            Err(error) => {
-                tracing::warn!(%error, group = group.get(), "an extraction job could not be queued")
-            }
+            // The memory batch of every group, or of one.
+            (JobKind::Extract, None) => self.episodes.run().await.map(|_| ()),
+            (JobKind::Extract, Some(group)) => self.episodes.batch_group(group).await.map(|_| ()),
         }
     }
 }
@@ -457,14 +431,9 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
     let ops_config = config.ops_config(&paths, secrets.database_password.expose(), zone.clone());
     // The language the bot writes in comes with the locale.
     let writing_language = locales.render(&Msg::WritingLanguage {});
-    let builder = EpisodeBuilder::new(
-        EpisodeExtractor::new(provider.clone()).with_reasoning(config.extraction_reasoning()),
-        embedder.clone(),
-        BuilderConfig {
-            language: writing_language.clone(),
-        },
-    );
-    let episode_jobs = EpisodeJobs::new(episodes.clone(), builder, config.slice_grid())
+    let reader = BatchReader::new(provider.clone(), writing_language.clone())
+        .with_reasoning(config.extraction_reasoning());
+    let episode_jobs = EpisodeJobs::new(episodes.clone(), reader, embedder.clone(), clock.clone())
         .with_consolidator(Arc::new(
             Consolidator::new(names.clone(), memories.clone()).with_capacity(
                 episodes.clone(),
@@ -472,13 +441,10 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
                 config.memory_capacity(),
             ),
         ))
-        // Extraction reads the group as replies do: the same people and knowledge.
+        // The batch reads the group as replies do: the same people and knowledge.
         .with_background(prompt.clone())
-        .with_rulings(
-            names.clone(),
-            NameRuler::new(provider.clone()).with_reasoning(config.extraction_reasoning()),
-        )
-        .with_reread(config.reread_per_run());
+        .with_rulings(names.clone())
+        .with_reread(config.reread_per_batch());
     let operations = Operations::new(Parts {
         cfg: ops_config,
         clock: clock.clone(),
@@ -495,13 +461,6 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
                 timeouts.action,
             )) as Arc<dyn qbot_ops::PlatformCache>
         }),
-    });
-    // A filled batch asks for its episode now, so the summary exists before the chat leaves the
-    // verbatim tier.
-    let batch_jobs = Arc::new(ExtractOnBatch {
-        timers: timers.clone(),
-        clock: clock.clone(),
-        wake: wake.clone(),
     });
     let scheduler = Arc::new(Scheduler::new(
         timers,
@@ -585,8 +544,7 @@ pub async fn run(loaded: Loaded, options: Options) -> Result<(), RunError> {
             Nicknames::new(&config.bot.nicknames),
             echoes,
         )
-        .with_media(media.clone(), config.media_wait())
-        .with_batches(batch_jobs, config.history.batch_lines),
+        .with_media(media.clone(), config.media_wait()),
     );
 
     let stop = CancellationToken::new();

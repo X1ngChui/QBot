@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use qbot_agent::{
-    ArchiveCursor, ContextSource, Directory, EnvError, OpenedContext, Recap, RecapWhen, Trigger,
+    ArchiveCursor, ContextSource, Directory, EnvError, OpenedContext, Recap, Trigger,
 };
 use qbot_context::{ChatLine, Instruction, InstructionRole, Speaker};
 use qbot_core::marker::{RECALLED, escape_markers};
@@ -126,11 +126,14 @@ struct Records {
     view: MemoryView,
 }
 
-/// A run's chat: every line it loads, and the episode recaps over some of them.
+/// A run's chat: every line it loads, the episode recaps over some of them, and where the raw
+/// part begins (an index into the lines, and its archive ordinal).
 struct History {
     lines: Vec<(u64, ChatLine)>,
     cursor: ArchiveCursor,
     recaps: Vec<Recap>,
+    raw: usize,
+    raw_ordinal: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -252,14 +255,13 @@ impl PromptContext {
         self
     }
 
-    /// Load the summary and raw tiers and decide which lines episodes stand in for.
-    ///
-    /// Episodes that end in the summary tier replace their lines from the start of the run. The
-    /// lines are still loaded (reaching back to where such an episode begins), so the transcript
-    /// holds the originals; the model sees the summary. Episodes in the raw tier are offered only
-    /// as the fallback for a provider that finds the context too long. No recap ever covers the
-    /// trigger message or what follows it, and lines no episode covers stay verbatim.
-    async fn history(&self, group: GroupId, trigger: &Trigger) -> Result<History, EnvError> {
+    /// Load what a run is shown of the group's history (see [`HistoryWindow`]): the summaries of
+    /// the newest episodes before the raw part, and the raw part, which starts with the lines
+    /// carried from before the group's last batch (from the start of the episode holding the first
+    /// of them), or where a too-long request moved it since, and runs to the newest line. Nothing
+    /// in it moves until the next batch. The summarized lines are still loaded, so the transcript
+    /// holds the originals; the model sees the summary.
+    async fn history(&self, group: GroupId) -> Result<History, EnvError> {
         let env = |e: qbot_memory::MemoryError| EnvError(e.to_string());
         let last = self.history.last_ordinal(group).await?;
         if last == 0 {
@@ -267,53 +269,62 @@ impl PromptContext {
                 lines: Vec::new(),
                 cursor: ArchiveCursor(0),
                 recaps: Vec::new(),
+                raw: 0,
+                raw_ordinal: 1,
             });
         }
-        let grid = self.window.grid();
-        let tiers = self.window.tiers(last);
-        let raw_start = *grid.batch_range(tiers.raw_from).start();
-        let summary_start = *grid.batch_range(tiers.summary_from).start();
-        let summarized = match &self.episodes {
-            Some(store) if summary_start < raw_start => store
-                .ending_within(group, summary_start, raw_start - 1)
-                .await
-                .map_err(env)?,
-            _ => Vec::new(),
+        let (raw_from, summarized) = match &self.episodes {
+            None => (1, Vec::new()),
+            Some(store) => {
+                let covered = store.covered_through(group).await.map_err(env)?;
+                let carry = self.window.carry_from(covered);
+                let holding = if carry <= covered {
+                    store
+                        .ending_within(group, carry, covered)
+                        .await
+                        .map_err(env)?
+                } else {
+                    Vec::new()
+                };
+                let start = holding
+                    .first()
+                    .map_or(carry, |e| e.episode.first_ordinal.min(carry));
+                // The summaries are those before where the batch put the raw part; a cut only
+                // moves the raw part's start, never which summaries are shown.
+                let summarized = store
+                    .before(group, start, self.window.summaries as usize)
+                    .await
+                    .map_err(env)?;
+                let cut = store.window(group).await.map_err(env)?.map_or(0, |w| w.cut);
+                (start.max(cut).min(last + 1), summarized)
+            }
         };
         let load_from = summarized
+            .first()
+            .map_or(raw_from, |e| e.episode.first_ordinal.min(raw_from));
+        let (loaded, cursor) = self.history.lines_from(group, load_from).await?;
+        // Before the raw part only what a summary stands for is shown: lines no summarized
+        // episode holds (a stretch the batch gave up on, lines a too-long request cut) are left
+        // out, and search_history still finds them.
+        let lines: Vec<(u64, ChatLine)> = loaded
+            .into_iter()
+            .filter(|(ordinal, _)| {
+                *ordinal >= raw_from
+                    || summarized.iter().any(|e| {
+                        (e.episode.first_ordinal..=e.episode.last_ordinal).contains(ordinal)
+                    })
+            })
+            .collect();
+        let raw = lines
             .iter()
-            .map(|e| e.episode.first_ordinal)
-            .fold(summary_start, u64::min);
-        let (lines, cursor) = self.history.lines_from(group, load_from).await?;
-        let (Some(first), Some(newest)) = (lines.first(), lines.last()) else {
-            return Ok(History {
-                lines,
-                cursor,
-                recaps: Vec::new(),
-            });
-        };
-        let mut episodes = summarized;
-        if let Some(store) = &self.episodes {
-            episodes.extend(
-                store
-                    .ending_within(group, raw_start.max(first.0), newest.0)
-                    .await
-                    .map_err(env)?,
-            );
-        }
-        let keep_tail = match trigger {
-            Trigger::Addressed { message, .. } => lines
-                .iter()
-                .rposition(|(_, l)| l.message == *message)
-                .map_or(0, |i| lines.len() - i),
-            // Nothing to keep raw for: no message started the run.
-            Trigger::Wake { .. } | Trigger::Spontaneous => 0,
-        };
+            .position(|(ordinal, _)| *ordinal >= raw_from)
+            .unwrap_or(lines.len());
+        let raw_ordinal = lines.get(raw).map_or(raw_from, |(ordinal, _)| *ordinal);
         let mut recaps = Vec::new();
         let mut at = 0;
-        for part in compose(&lines, &episodes, keep_tail) {
+        for part in compose(&lines, &summarized, lines.len() - raw) {
             match part {
-                HistoryPart::Lines(raw) => at += raw.len(),
+                HistoryPart::Lines(shown) => at += shown.len(),
                 HistoryPart::Recap(episode) => {
                     let e = &episode.episode;
                     let count = lines[at..]
@@ -332,11 +343,6 @@ impl PromptContext {
                     recaps.push(Recap {
                         lines: at..at + count,
                         text,
-                        when: if e.last_ordinal < raw_start {
-                            RecapWhen::Open
-                        } else {
-                            RecapWhen::Overflow
-                        },
                     });
                     at += count;
                 }
@@ -346,12 +352,32 @@ impl PromptContext {
             lines,
             cursor,
             recaps,
+            raw,
+            raw_ordinal,
         })
     }
 
-    async fn roster(&self, group: GroupId, include: &[AccountId]) -> Result<GroupPeople, EnvError> {
+    /// The moment what replies are shown of the group is as of: its last batch, or now before
+    /// its first.
+    async fn as_of(&self, group: GroupId) -> Result<UnixMillis, EnvError> {
+        match &self.episodes {
+            Some(store) => Ok(store
+                .window(group)
+                .await
+                .map_err(|e| EnvError(e.to_string()))?
+                .map_or_else(|| self.clock.now(), |w| w.batched)),
+            None => Ok(self.clock.now()),
+        }
+    }
+
+    async fn roster(
+        &self,
+        group: GroupId,
+        as_of: UnixMillis,
+        include: &[AccountId],
+    ) -> Result<GroupPeople, EnvError> {
         match &self.people {
-            Some(source) => source.people(group, self.clock.now(), include).await,
+            Some(source) => source.people(group, as_of, include).await,
             None => Ok(GroupPeople::default()),
         }
     }
@@ -386,10 +412,14 @@ impl PromptContext {
         }))
     }
 
-    /// The learned-knowledge block: the group's memories most worth showing, as of the start of
-    /// the day, listed by term and text so the prefix changes only when what is shown does. It is
-    /// reference material learned from what members said, not a system instruction.
-    async fn knowledge_instruction(&self, group: GroupId) -> Result<Option<Instruction>, EnvError> {
+    /// The learned-knowledge block: the group's memories most worth showing as of `as_of` (its
+    /// last batch), listed by term and text so the prefix changes only when what is shown does.
+    /// It is reference material learned from what members said, not a system instruction.
+    async fn knowledge_instruction(
+        &self,
+        group: GroupId,
+        as_of: UnixMillis,
+    ) -> Result<Option<Instruction>, EnvError> {
         let Some(records) = &self.records else {
             return Ok(None);
         };
@@ -406,7 +436,7 @@ impl PromptContext {
         let mut shown: Vec<&Memory> = records
             .view
             .half_lives
-            .ranked(&memories, &activity, as_of_day(self.clock.now()))
+            .ranked(&memories, &activity, as_of)
             .into_iter()
             .take(records.view.group_memories)
             .collect();
@@ -759,27 +789,28 @@ impl ContextSource for PromptContext {
             lines,
             cursor,
             recaps,
-        } = self.history(group, trigger).await?;
+            raw,
+            raw_ordinal,
+        } = self.history(group).await?;
         let window: Vec<ChatLine> = lines.into_iter().map(|(_, line)| line).collect();
         let env = |e: PromptError| EnvError(e.to_string());
-        let people = self.roster(group, &[]).await?;
+        // Who is who and what the group knows, as of its last batch: they change only when a
+        // batch or a member's command does, so they stay in the cached prefix in between.
+        let as_of = self.as_of(group).await?;
+        let people = self.roster(group, as_of, &[]).await?;
         // Most stable first, so runs share the longest prefix the provider can cache: the
         // persona's fixed instructions, then the roster and the group's memories (both change
         // only when a record does, or with the day), then the chat.
         let mut instructions = self.instructions(group).map_err(env)?;
         instructions.extend(self.people_instruction(&people)?);
-        instructions.extend(self.knowledge_instruction(group).await?);
+        instructions.extend(self.knowledge_instruction(group, as_of).await?);
         let here = self.people_here(group, &window, trigger).await?;
         let members = self.named_members(group, &window, &here, &people).await?;
         // Everyone who speaks in the visible chat and everyone else the conversation involves
         // has a name the model can use. The roster says what its people are shown as, from
         // their own lines; the platform is asked only about those it does not name (someone
         // mentioned who never wrote, a line from before display names were kept).
-        let summarized = |index: usize| {
-            recaps
-                .iter()
-                .any(|r| r.when == RecapWhen::Open && r.lines.contains(&index))
-        };
+        let summarized = |index: usize| recaps.iter().any(|r| r.lines.contains(&index));
         let mut unnamed = here.clone();
         unnamed.extend(
             window
@@ -813,8 +844,20 @@ impl ContextSource for PromptContext {
             members,
             cursor,
             recaps,
+            raw,
+            raw_ordinal,
             undelivered_note: Some(undelivered_note),
         })
+    }
+
+    async fn cut(&self, group: GroupId, from: u64) -> Result<(), EnvError> {
+        match &self.episodes {
+            Some(store) => store
+                .cut(group, from, self.clock.now())
+                .await
+                .map_err(|e| EnvError(e.to_string())),
+            None => Ok(()),
+        }
     }
 }
 
@@ -861,7 +904,10 @@ impl SliceBackground for PromptContext {
             })
             .collect();
         let accounts: Vec<AccountId> = involved.iter().filter_map(|(_, a, _)| *a).collect();
-        let people = self.roster(group, &accounts).await.map_err(backend)?;
+        let people = self
+            .roster(group, self.clock.now(), &accounts)
+            .await
+            .map_err(backend)?;
         let owners = NameIndex::of(&people);
         let mut subjects: Vec<Option<AccountId>> = accounts.iter().copied().map(Some).collect();
         subjects.push(None);
@@ -1081,7 +1127,10 @@ impl MemberRecords for PromptContext {
         else {
             return Ok(None);
         };
-        let people = self.roster(group, &[account]).await.map_err(|e| e.0)?;
+        let people = self
+            .roster(group, self.clock.now(), &[account])
+            .await
+            .map_err(|e| e.0)?;
         let owners = NameIndex::of(&people);
         let mut out = vec![format!("member:{}", member.get())];
         if let Some(person) = people
